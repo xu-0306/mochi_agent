@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+.venv-wsl/
+.venv-win/
+venv/
+env/
+
+# uv
+.uv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+.pyright/
+pyrightconfig.json
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LightClaw runtime data
+~/.lightclaw/
+*.db
+*.db-shm
+*.db-wal
+
+# Node (WebGUI)
+web/node_modules/
+web/.next/
+web/out/
+
+# Logs
+*.log
+logs/
+
+# Model weights (never commit)
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Agent / local workspace state
+.agents/
+.claude/
+.codex/
+.codex
+.gemini/
+
+# Local scratch files
+1.txt
+_YesCode.bat
+_YesCode - C.bat
+交接.md
+
+# Non-release project docs / helpers
+AGENTS.md
+Agent_Comparison.md
+CLAUDE.md
+Mochi_Spec.md
+Makefile
+documents/
+scripts/
+tests/
+web/README.md
+web/next-env.d.ts
+web/tsconfig.tsbuildinfo
+
+# Reference snapshots (large, not required for runtime)
+reference/

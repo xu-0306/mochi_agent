@@ -1,0 +1,1047 @@
+'use client'
+
+import * as React from 'react'
+
+export type UILanguage = 'zh-TW' | 'en'
+export type UILanguageMode = 'auto' | UILanguage
+export type UIFontSize = 'compact' | 'default' | 'large'
+export type UITimezone = 'auto' | string
+export type UIAppearanceMode = 'system' | 'dark' | 'light'
+type UIAppearance = 'dark' | 'light'
+
+export const AUTO_LANGUAGE = 'auto' as const
+export const AUTO_TIMEZONE = 'auto' as const
+export const SYSTEM_APPEARANCE = 'system' as const
+const DEFAULT_LANGUAGE: UILanguage = 'en'
+const DEFAULT_LANGUAGE_MODE: UILanguageMode = AUTO_LANGUAGE
+const DEFAULT_FONT_SIZE: UIFontSize = 'default'
+const DEFAULT_APPEARANCE: UIAppearance = 'dark'
+const DEFAULT_APPEARANCE_MODE: UIAppearanceMode = SYSTEM_APPEARANCE
+const THEME_COLOR_BY_APPEARANCE: Record<UIAppearance, string> = {
+  dark: '#0B0B0F',
+  light: '#FBFBFC',
+}
+
+const LANGUAGE_LOCALE: Record<UILanguage, string> = {
+  'zh-TW': 'zh-TW',
+  en: 'en-US',
+}
+
+type TranslationKey = string
+type TranslationValues = Record<string, string | number | boolean | null | undefined>
+
+type I18nContextValue = {
+  languageMode: UILanguageMode
+  setLanguageMode: (mode: UILanguageMode) => void
+  language: UILanguage
+  setLanguage: (language: UILanguage) => void
+  locale: string
+  fontSize: UIFontSize
+  setFontSize: (fontSize: UIFontSize) => void
+  appearanceMode: UIAppearanceMode
+  setAppearanceMode: (mode: UIAppearanceMode) => void
+  appearance: UIAppearance
+  timezone: UITimezone
+  setTimezone: (timezone: UITimezone) => void
+  resolvedTimeZone: string | undefined
+  t: (key: TranslationKey, values?: TranslationValues) => string
+}
+
+const STORAGE_KEY = 'mochi.ui.preferences.v1'
+
+function interpolate(message: string, values?: TranslationValues): string {
+  if (!values) {
+    return message
+  }
+
+  return message.replace(/\{(\w+)\}/g, (match, key: string) => {
+    const value = values[key]
+    return value === undefined || value === null ? match : String(value)
+  })
+}
+
+const messages: Record<UILanguage, Record<TranslationKey, string>> = {
+  'zh-TW': {
+    'common.available': '可用',
+    'common.close': '關閉',
+    'common.configured': '已設定',
+    'common.disabled': '已停用',
+    'common.enabled': '已啟用',
+    'common.fields': '{count} 個欄位',
+    'common.items': '{count} 個項目',
+    'common.listSummary': '{items} 等 {count} 筆',
+    'common.loading': '載入中…',
+    'common.none': '無',
+    'common.no': '否',
+    'common.notConfigured': '未設定',
+    'common.notReported': '未回報',
+    'common.notSet': '未設定',
+    'common.refresh': '重新整理',
+    'common.reported': '已回報',
+    'common.unavailable': '不可用',
+    'common.unknown': '未知',
+    'common.yes': '是',
+    'chat.disclaimer': 'Mochi 可能犯錯，重要資訊請自行核實',
+    'chat.emptyAssistantResponse': '代理沒有回傳任何內容。',
+    'chat.input.attachFile': '上傳檔案',
+    'chat.input.currentModel': '目前模型',
+    'chat.input.placeholder': '輸入訊息… (Enter 送出，Shift+Enter 換行)',
+    'chat.input.send': '送出 (Enter)',
+    'chat.input.voice': '語音輸入 (⌘⇧V)',
+    'chat.loadingSession': '正在載入對話紀錄…',
+    'chat.moreOptions': '更多選項',
+    'chat.newChat': '新對話',
+    'chat.requestFailed': '無法完成本次對話請求',
+    'chat.settingsShortcut': '設定 (⌘,)',
+    'chat.system.ready': 'Mochi WebGUI 已就緒，送出訊息後會顯示推理、工具呼叫與最終回答事件。',
+    'chat.thinking': '思考中',
+    'chat.voice.assistant': '助理回覆',
+    'chat.voice.close': '關閉',
+    'chat.voice.interrupt': '中斷',
+    'chat.voice.phase.connecting': '連線中',
+    'chat.voice.phase.error': '錯誤',
+    'chat.voice.phase.idle': '待命',
+    'chat.voice.phase.listening': '聆聽中',
+    'chat.voice.phase.ready': '就緒',
+    'chat.voice.phase.synthesizing': '語音合成中',
+    'chat.voice.phase.thinking': '思考中',
+    'chat.voice.phase.transcribing': '語音轉寫中',
+    'chat.voice.record': '開始錄音',
+    'chat.voice.startPrompt': '開始錄音後即可說話。',
+    'chat.voice.stop': '停止',
+    'chat.voice.title': '語音對話',
+    'chat.voice.transcription': '轉寫結果',
+    'chat.voice.waiting': '等待回覆中。',
+    'chat.tool.args': '參數',
+    'chat.tool.error': '錯誤',
+    'chat.tool.failed': '失敗',
+    'chat.tool.result': '結果',
+    'chat.tool.running': '執行中…',
+    'errors.channelsStatusUnavailable': '後端未提供 /v1/channels 狀態端點',
+    'errors.chatApiUnavailable': 'Chat API client 不可用',
+    'errors.filesystemImportUnavailable': 'Filesystem import API client 不可用',
+    'errors.modelConfigureApiUnavailable': 'Model configure API client 不可用',
+    'errors.ollamaDiscoveryApiUnavailable': 'Ollama model discovery API client 不可用',
+    'errors.settingsUpdateApiUnavailable': 'Settings update API client 不可用',
+    'pathPicker.browseBackend': '瀏覽後端',
+    'pathPicker.close': '關閉',
+    'pathPicker.currentFolder': '使用目前資料夾',
+    'pathPicker.description': '透過後端檔案系統清單瀏覽並選擇路徑',
+    'pathPicker.directoryOnly': '僅顯示',
+    'pathPicker.empty': '此路徑沒有可顯示項目',
+    'pathPicker.errorList': '讀取路徑失敗',
+    'pathPicker.errorRoots': '讀取根目錄失敗',
+    'pathPicker.fileDisabledTitle': '目前模式僅可選擇資料夾',
+    'pathPicker.itemNotSelectableTitle': '此項目不可選取',
+    'pathPicker.loading': '載入中…',
+    'pathPicker.loadingRoots': '正在讀取根目錄…',
+    'pathPicker.noPath': '尚未選擇路徑',
+    'pathPicker.parent': '上一層',
+    'pathPicker.refresh': '重新整理',
+    'pathPicker.selectDirectory': '選取資料夾',
+    'pathPicker.selectFile': '選取檔案',
+    'pathPicker.title': '選擇路徑',
+    'settings.action.applyTest': '套用並測試連線',
+    'settings.action.connect': '連線',
+    'settings.action.importLocalModel': '匯入本機模型檔',
+    'settings.action.saveLearning': '保存 Learning',
+    'settings.action.saveMemory': '保存 Memory',
+    'settings.action.saveVoice': '保存 Voice Pipeline',
+    'settings.action.test': '測試',
+    'settings.boolean.enabled': '已啟用',
+    'settings.boolean.notEnabled': '未啟用',
+    'settings.channel.allowedChannelIds': '允許頻道 ID',
+    'settings.channel.allowedChatIds': '允許聊天室 ID',
+    'settings.channel.allowedUserIds': '允許使用者 ID',
+    'settings.channel.channelsRunner': 'Channels Runner',
+    'settings.channel.commands': '常用指令',
+    'settings.channel.enabledExternalChannels': '已啟用外部頻道',
+    'settings.channel.enabledState': '啟用狀態',
+    'settings.channel.localCli': '本機 CLI 通道',
+    'settings.channel.registeredManager': '已註冊到 Manager',
+    'settings.channel.running': '執行中',
+    'settings.channel.token': 'Token',
+    'settings.disabled.connectUnavailable': '後端尚未提供 connect API',
+    'settings.disabled.testUnavailable': '後端尚未提供 test API',
+    'settings.form.apiKey': 'API Key',
+    'settings.form.apiUrl': 'API URL / Ollama Host',
+    'settings.form.backend': 'Backend',
+    'settings.form.device': '裝置',
+    'settings.form.language': '語言',
+    'settings.form.model': '模型',
+    'settings.form.modelName': '模型名稱',
+    'settings.form.speed': '速度',
+    'settings.form.voice': 'Voice',
+    'settings.learning.autoExtract': '自動萃取 Skill',
+    'settings.learning.description': '軌跡、技能庫、會話與保留策略',
+    'settings.learning.enable': '啟用學習',
+    'settings.learning.errorSave': '學習設定保存失敗',
+    'settings.learning.improvementThreshold': '改進門檻',
+    'settings.learning.maxSkills': '技能上限',
+    'settings.learning.minSteps': '最少步數',
+    'settings.learning.placeholder.pluginsDir': '例如 ~/.mochi/plugins',
+    'settings.learning.placeholder.sessionsDir': '例如 ~/.mochi/sessions',
+    'settings.learning.placeholder.skillsDir': '例如 ~/.mochi/skills',
+    'settings.learning.placeholder.workspaceDir': '例如 ~/.mochi',
+    'settings.learning.pluginsDir': 'Plugins 後端目錄',
+    'settings.learning.retentionDays': '軌跡保留天數',
+    'settings.learning.sessionsDir': 'Sessions 後端目錄',
+    'settings.learning.skillsDir': 'Skills 後端目錄',
+    'settings.learning.successSaved': '已保存學習與路徑設定',
+    'settings.learning.title': 'Learning Storage',
+    'settings.learning.workspaceDir': 'Workspace / Trajectories 後端目錄',
+    'settings.memory.dbPath': '記憶 DB 後端路徑',
+    'settings.memory.dbPathHelp': 'SQLite 檔案必須位於後端可存取的位置；Windows/macOS 瀏覽器不能直接提供可給後端 open 的絕對路徑。',
+    'settings.memory.description': 'SQLite 記憶庫與檢索策略',
+    'settings.memory.errorSave': '記憶設定保存失敗',
+    'settings.memory.placeholder.dbPath': '例如 ~/.mochi/memory.db 或 /var/lib/mochi/memory.db',
+    'settings.memory.shortTermMessages': '短期訊息數',
+    'settings.memory.successSaved': '已保存記憶設定',
+    'settings.memory.title': 'Memory Storage',
+    'settings.modelConnection.apiKeyPlaceholderNoKey': 'Ollama 通常不需要 API key',
+    'settings.modelConnection.description': 'API key 只送到後端切換 runtime，不會從設定 API 回傳。',
+    'settings.modelConnection.errorConfigure': '模型設定失敗',
+    'settings.modelConnection.errorDiscover': '無法讀取 Ollama 模型',
+    'settings.modelConnection.refreshOllama': '刷新 Ollama 模型列表',
+    'settings.modelConnection.successDiscovered': '已讀取 {count} 個 Ollama 模型',
+    'settings.modelConnection.successNoModels': 'Ollama 可連線，但尚未回報模型',
+    'settings.modelConnection.successSwitched': '已切換到 {model}',
+    'settings.modelConnection.successSwitchedPersisted': '已切換並保存 {model}',
+    'settings.modelConnection.title': '模型接入',
+    'settings.preferences.timezone.autoWithZone': '跟隨瀏覽器（{timezone}）',
+    'settings.provider.anthropic.description': 'Claude OpenAI SDK compatibility endpoint',
+    'settings.provider.anthropic.note': '目前走 Anthropic OpenAI 相容層；原生 Anthropic API 尚未實作。',
+    'settings.provider.gemini.description': 'Google Gemini OpenAI-compatible endpoint',
+    'settings.provider.gemini.note': '目前走 Gemini 官方 OpenAI-compatible endpoint。',
+    'settings.provider.ollama.description': '本機 Ollama HTTP API',
+    'settings.provider.ollama.note': '連上後會讀取 /api/tags 並使用模型下拉選單。',
+    'settings.provider.openaiCompat.description': 'OpenAI 或其他 /chat/completions 相容服務',
+    'settings.provider.openaiCompat.note': '模型名稱由供應商決定，保留手動輸入。',
+    'settings.voice.description': 'STT/TTS runtime 與本機模型保存位置',
+    'settings.voice.downloadMissing': '缺少模型時準備下載',
+    'settings.voice.enable': '啟用語音',
+    'settings.voice.enableHelp': '保存後新的 voice session 會使用更新後設定。',
+    'settings.voice.errorImport': '模型匯入失敗',
+    'settings.voice.errorSave': '語音設定保存失敗',
+    'settings.voice.importSuccess': '已匯入 {count} 個檔案（{bytes}），並填入後端路徑。請保存 Voice Pipeline 讓設定生效。',
+    'settings.voice.placeholder.sttCacheDir': '例如 ~/.cache/mochi/stt 或 /var/lib/mochi/models/stt',
+    'settings.voice.placeholder.sttModelPath': '例如 /srv/mochi/models/whisper/large-v3 或單一模型檔',
+    'settings.voice.saveSuccess': '已保存語音設定',
+    'settings.voice.saveSuccessWithStatus': '已保存語音設定；模型狀態：{status}',
+    'settings.voice.sttCacheDir': 'STT 後端模型快取/下載目錄',
+    'settings.voice.sttCacheDirHelp': '後端實際讀寫的伺服器路徑。WSL 後端會使用 Linux/WSL 路徑，不是瀏覽器本機路徑。',
+    'settings.voice.sttModelPath': 'STT 後端本地模型路徑（可選覆寫）',
+    'settings.voice.sttModelPathHelp': '手動輸入後端既有模型檔案或資料夾路徑；大型資料夾不再透過瀏覽器枚舉，避免瀏覽器崩潰。',
+    'settings.voice.sttTitle': 'Speech to Text',
+    'settings.voice.ttsTitle': 'Text to Speech',
+    'settings.voice.title': 'Voice Pipeline',
+    'sidebar.collapse': '收合側欄',
+    'sidebar.deleteConversation': '刪除對話',
+    'sidebar.deleteConfirm': '刪除「{title}」？',
+    'sidebar.expand': '展開側欄',
+    'sidebar.newChat': '新對話',
+    'sidebar.newChatShortcut': '新對話 (⌘/)',
+    'sidebar.noResults': '無符合搜尋結果',
+    'sidebar.noSessions': '尚無對話記錄',
+    'sidebar.older': '更早',
+    'sidebar.pinned': '置頂',
+    'sidebar.rename': '重新命名',
+    'sidebar.renameCancel': '取消改名',
+    'sidebar.renameSave': '保存名稱',
+    'sidebar.searchPlaceholder': '搜尋對話… (⌘K)',
+    'app.shortcuts.openInput': '聚焦輸入框 (⌘L)',
+    'app.shortcuts.toggleSidebar': '切換側欄 (⌘B)',
+    'sidebar.settings': '設定',
+    'sidebar.skills': 'Skill 庫',
+    'sidebar.thisWeek': '本週',
+    'sidebar.today': '今天',
+    'skills.card.created': 'Created',
+    'skills.card.delete': '刪除 {name}',
+    'skills.card.noDescription': '無描述',
+    'skills.card.success': 'Success',
+    'skills.card.unknown': 'Unknown',
+    'skills.card.untagged': 'untagged',
+    'skills.card.used': 'Used',
+    'skills.empty': '目前沒有可顯示的 Skill',
+    'skills.errorDelete': '刪除 Skill 失敗',
+    'skills.errorLoad': '載入 Skill 失敗',
+    'skills.loaded': 'Loaded',
+    'skills.noSearchResults': '找不到符合「{query}」的 Skill',
+    'skills.refresh': '重新整理',
+    'skills.searchPlaceholder': '搜尋名稱、描述或標籤',
+    'skills.subtitle': '後端 Skill 索引與使用統計摘要',
+    'skills.tabs.all': '全部',
+    'skills.tabs.highestSuccess': '高成功率',
+    'skills.tabs.mostUsed': '常用',
+    'skills.tabs.recent': '最新',
+    'skills.title': 'Skill 庫',
+    'settings.title': '設定',
+    'settings.subtitle': '後端設定摘要與服務可用性',
+    'settings.errorLoadFailed': '載入設定失敗',
+    'settings.badge.connected': 'Connected',
+    'settings.badge.partial': 'Partial',
+    'settings.stats.primaryModel': '主要模型',
+    'settings.stats.modelEndpoints': '模型端點',
+    'settings.stats.channels': '通道數',
+    'settings.stats.webSurface': 'Web 介面',
+    'settings.stats.configured': '已設定',
+    'settings.stats.notReported': '未回報',
+    'settings.tabs.model': '模型',
+    'settings.tabs.voice': '語音',
+    'settings.tabs.memory': '記憶',
+    'settings.tabs.learning': '學習',
+    'settings.tabs.channels': '通道',
+    'settings.tabs.web': 'Web',
+    'settings.section.modelConfig': '模型設定',
+    'settings.section.discoveredModels': '已發現模型',
+    'settings.section.voicePipeline': '語音管線',
+    'settings.section.runtime': '執行狀態',
+    'settings.section.memory': '記憶',
+    'settings.section.learning': '學習',
+    'settings.section.channels': '通道',
+    'settings.section.web': 'Web',
+    'settings.summary.modelConfig': '只顯示非敏感後端欄位',
+    'settings.summary.discoveredModels': '來自 models API 的可用模型摘要',
+    'settings.summary.voicePipeline': 'STT、TTS 與輸入輸出裝置摘要',
+    'settings.summary.memory': '儲存後端、路徑與保留策略摘要',
+    'settings.summary.learning': 'Skill 萃取與軌跡保留摘要',
+    'settings.summary.channels': '只顯示通道狀態，不暴露 bot token 或 API key',
+    'settings.summary.web': 'Web 服務與前端對接設定摘要',
+    'settings.runtime.voiceFields': '語音欄位',
+    'settings.runtime.settingsSource': '設定來源',
+    'settings.runtime.backend': '後端',
+    'settings.runtime.unavailable': '不可用',
+    'settings.preferences.title': '介面偏好',
+    'settings.preferences.description': '調整語言、外觀、整體字級與時區，偏好只會儲存在目前瀏覽器。',
+    'settings.preferences.language': '介面語言',
+    'settings.preferences.appearance': '外觀模式',
+    'settings.preferences.fontSize': '字級',
+    'settings.preferences.timezone': '時區',
+    'settings.preferences.appearanceHelp': '外觀可跟隨系統，或手動固定為深色/淺色。',
+    'settings.preferences.fontHelp': '字級會影響整個 WebGUI 主要介面。',
+    'settings.preferences.timezoneHelp': '時區只影響顯示層；資料儲存與 API 仍維持 UTC。',
+    'settings.preferences.language.default': '預設 / 自動偵測',
+    'settings.preferences.language.zhTW': '繁體中文',
+    'settings.preferences.language.en': 'English',
+    'settings.preferences.appearance.system': '系統',
+    'settings.preferences.appearance.dark': '深色',
+    'settings.preferences.appearance.light': '淺色',
+    'settings.preferences.font.compact': '緊湊',
+    'settings.preferences.font.default': '預設',
+    'settings.preferences.font.large': '較大',
+    'settings.preferences.timezone.auto': '跟隨瀏覽器',
+    'settings.preferences.timezone.utc': 'UTC',
+    'settings.emptyState': '後端尚未回報可顯示的設定摘要。',
+    'settings.noSummary': '目前沒有可顯示摘要',
+    'settings.modelFallback': '模型',
+  },
+  en: {
+    'common.available': 'Available',
+    'common.close': 'Close',
+    'common.configured': 'Configured',
+    'common.disabled': 'Disabled',
+    'common.enabled': 'Enabled',
+    'common.fields': '{count} fields',
+    'common.items': '{count} items',
+    'common.listSummary': '{items} and {count} total',
+    'common.loading': 'Loading...',
+    'common.none': 'None',
+    'common.no': 'No',
+    'common.notConfigured': 'Not configured',
+    'common.notReported': 'Not reported',
+    'common.notSet': 'Not set',
+    'common.refresh': 'Refresh',
+    'common.reported': 'Reported',
+    'common.unavailable': 'Unavailable',
+    'common.unknown': 'Unknown',
+    'common.yes': 'Yes',
+    'chat.disclaimer': 'Mochi can make mistakes. Verify important information.',
+    'chat.emptyAssistantResponse': 'The agent did not return any content.',
+    'chat.input.attachFile': 'Upload file',
+    'chat.input.currentModel': 'Current model',
+    'chat.input.placeholder': 'Message Mochi... (Enter to send, Shift+Enter for newline)',
+    'chat.input.send': 'Send (Enter)',
+    'chat.input.voice': 'Voice input (⌘⇧V)',
+    'chat.loadingSession': 'Loading conversation history...',
+    'chat.moreOptions': 'More options',
+    'chat.newChat': 'New chat',
+    'chat.requestFailed': 'Unable to complete this chat request',
+    'chat.settingsShortcut': 'Settings (⌘,)',
+    'chat.system.ready': 'Mochi WebGUI is ready. Messages will show reasoning, tool calls, and final answer events.',
+    'chat.thinking': 'Thinking',
+    'chat.voice.assistant': 'Assistant',
+    'chat.voice.close': 'Close',
+    'chat.voice.interrupt': 'Interrupt',
+    'chat.voice.phase.connecting': 'Connecting',
+    'chat.voice.phase.error': 'Error',
+    'chat.voice.phase.idle': 'Idle',
+    'chat.voice.phase.listening': 'Listening',
+    'chat.voice.phase.ready': 'Ready',
+    'chat.voice.phase.synthesizing': 'Synthesizing',
+    'chat.voice.phase.thinking': 'Thinking',
+    'chat.voice.phase.transcribing': 'Transcribing',
+    'chat.voice.record': 'Record',
+    'chat.voice.startPrompt': 'Start recording to speak.',
+    'chat.voice.stop': 'Stop',
+    'chat.voice.title': 'Voice Session',
+    'chat.voice.transcription': 'Transcription',
+    'chat.voice.waiting': 'Waiting for response.',
+    'chat.tool.args': 'Arguments',
+    'chat.tool.error': 'Error',
+    'chat.tool.failed': 'Failed',
+    'chat.tool.result': 'Result',
+    'chat.tool.running': 'Running...',
+    'errors.channelsStatusUnavailable': 'The backend does not expose the /v1/channels status endpoint',
+    'errors.chatApiUnavailable': 'Chat API client is unavailable',
+    'errors.filesystemImportUnavailable': 'Filesystem import API client is unavailable',
+    'errors.modelConfigureApiUnavailable': 'Model configure API client is unavailable',
+    'errors.ollamaDiscoveryApiUnavailable': 'Ollama model discovery API client is unavailable',
+    'errors.settingsUpdateApiUnavailable': 'Settings update API client is unavailable',
+    'pathPicker.browseBackend': 'Browse backend',
+    'pathPicker.close': 'Close',
+    'pathPicker.currentFolder': 'Use current folder',
+    'pathPicker.description': 'Browse the backend filesystem and choose a path',
+    'pathPicker.directoryOnly': 'Directory only',
+    'pathPicker.empty': 'No displayable items in this path',
+    'pathPicker.errorList': 'Failed to read path',
+    'pathPicker.errorRoots': 'Failed to read root directories',
+    'pathPicker.fileDisabledTitle': 'Current mode only allows directories',
+    'pathPicker.itemNotSelectableTitle': 'This item cannot be selected',
+    'pathPicker.loading': 'Loading...',
+    'pathPicker.loadingRoots': 'Reading root directories...',
+    'pathPicker.noPath': 'No path selected',
+    'pathPicker.parent': 'Parent',
+    'pathPicker.refresh': 'Refresh',
+    'pathPicker.selectDirectory': 'Select directory',
+    'pathPicker.selectFile': 'Select file',
+    'pathPicker.title': 'Choose path',
+    'settings.action.applyTest': 'Apply and test connection',
+    'settings.action.connect': 'Connect',
+    'settings.action.importLocalModel': 'Import local model file',
+    'settings.action.saveLearning': 'Save Learning',
+    'settings.action.saveMemory': 'Save Memory',
+    'settings.action.saveVoice': 'Save Voice Pipeline',
+    'settings.action.test': 'Test',
+    'settings.boolean.enabled': 'Enabled',
+    'settings.boolean.notEnabled': 'Disabled',
+    'settings.channel.allowedChannelIds': 'Allowed channel IDs',
+    'settings.channel.allowedChatIds': 'Allowed chat IDs',
+    'settings.channel.allowedUserIds': 'Allowed user IDs',
+    'settings.channel.channelsRunner': 'Channels Runner',
+    'settings.channel.commands': 'Common commands',
+    'settings.channel.enabledExternalChannels': 'Enabled external channels',
+    'settings.channel.enabledState': 'Enabled',
+    'settings.channel.localCli': 'Local CLI channel',
+    'settings.channel.registeredManager': 'Registered with Manager',
+    'settings.channel.running': 'Running',
+    'settings.channel.token': 'Token',
+    'settings.disabled.connectUnavailable': 'The backend does not provide a connect API yet',
+    'settings.disabled.testUnavailable': 'The backend does not provide a test API yet',
+    'settings.form.apiKey': 'API Key',
+    'settings.form.apiUrl': 'API URL / Ollama Host',
+    'settings.form.backend': 'Backend',
+    'settings.form.device': 'Device',
+    'settings.form.language': 'Language',
+    'settings.form.model': 'Model',
+    'settings.form.modelName': 'Model name',
+    'settings.form.speed': 'Speed',
+    'settings.form.voice': 'Voice',
+    'settings.learning.autoExtract': 'Auto-extract Skill',
+    'settings.learning.description': 'Trajectories, skill library, sessions, and retention policies',
+    'settings.learning.enable': 'Enable learning',
+    'settings.learning.errorSave': 'Failed to save learning settings',
+    'settings.learning.improvementThreshold': 'Improvement threshold',
+    'settings.learning.maxSkills': 'Max skills',
+    'settings.learning.minSteps': 'Minimum steps',
+    'settings.learning.placeholder.pluginsDir': 'e.g. ~/.mochi/plugins',
+    'settings.learning.placeholder.sessionsDir': 'e.g. ~/.mochi/sessions',
+    'settings.learning.placeholder.skillsDir': 'e.g. ~/.mochi/skills',
+    'settings.learning.placeholder.workspaceDir': 'e.g. ~/.mochi',
+    'settings.learning.pluginsDir': 'Plugins backend directory',
+    'settings.learning.retentionDays': 'Trajectory retention days',
+    'settings.learning.sessionsDir': 'Sessions backend directory',
+    'settings.learning.skillsDir': 'Skills backend directory',
+    'settings.learning.successSaved': 'Learning and path settings saved',
+    'settings.learning.title': 'Learning Storage',
+    'settings.learning.workspaceDir': 'Workspace / Trajectories backend directory',
+    'settings.memory.dbPath': 'Memory DB backend path',
+    'settings.memory.dbPathHelp': 'The SQLite file must be in a path accessible to the backend. A Windows/macOS browser cannot directly provide an absolute path the backend can open.',
+    'settings.memory.description': 'SQLite memory store and retrieval policy',
+    'settings.memory.errorSave': 'Failed to save memory settings',
+    'settings.memory.placeholder.dbPath': 'e.g. ~/.mochi/memory.db or /var/lib/mochi/memory.db',
+    'settings.memory.shortTermMessages': 'Short-term messages',
+    'settings.memory.successSaved': 'Memory settings saved',
+    'settings.memory.title': 'Memory Storage',
+    'settings.modelConnection.apiKeyPlaceholderNoKey': 'Ollama usually does not need an API key',
+    'settings.modelConnection.description': 'API keys are sent only to the backend for runtime switching and are not returned by the settings API.',
+    'settings.modelConnection.errorConfigure': 'Failed to configure model',
+    'settings.modelConnection.errorDiscover': 'Failed to read Ollama models',
+    'settings.modelConnection.refreshOllama': 'Refresh Ollama model list',
+    'settings.modelConnection.successDiscovered': 'Loaded {count} Ollama models',
+    'settings.modelConnection.successNoModels': 'Ollama is reachable, but it did not report any models',
+    'settings.modelConnection.successSwitched': 'Switched to {model}',
+    'settings.modelConnection.successSwitchedPersisted': 'Switched and saved {model}',
+    'settings.modelConnection.title': 'Model Connection',
+    'settings.preferences.timezone.autoWithZone': 'Browser default ({timezone})',
+    'settings.provider.anthropic.description': 'Claude OpenAI SDK compatibility endpoint',
+    'settings.provider.anthropic.note': 'Uses the Anthropic OpenAI-compatible layer. Native Anthropic API support is not implemented yet.',
+    'settings.provider.gemini.description': 'Google Gemini OpenAI-compatible endpoint',
+    'settings.provider.gemini.note': 'Uses the official Gemini OpenAI-compatible endpoint.',
+    'settings.provider.ollama.description': 'Local Ollama HTTP API',
+    'settings.provider.ollama.note': 'After connection, /api/tags is read and the model dropdown is updated.',
+    'settings.provider.openaiCompat.description': 'OpenAI or another /chat/completions-compatible service',
+    'settings.provider.openaiCompat.note': 'Model names are provider-defined, so manual input remains available.',
+    'settings.voice.description': 'STT/TTS runtime and local model storage',
+    'settings.voice.downloadMissing': 'Prepare downloads when models are missing',
+    'settings.voice.enable': 'Enable voice',
+    'settings.voice.enableHelp': 'New voice sessions will use updated settings after saving.',
+    'settings.voice.errorImport': 'Failed to import model',
+    'settings.voice.errorSave': 'Failed to save voice settings',
+    'settings.voice.importSuccess': 'Imported {count} files ({bytes}) and filled the backend path. Save Voice Pipeline to apply the setting.',
+    'settings.voice.placeholder.sttCacheDir': 'e.g. ~/.cache/mochi/stt or /var/lib/mochi/models/stt',
+    'settings.voice.placeholder.sttModelPath': 'e.g. /srv/mochi/models/whisper/large-v3 or a single model file',
+    'settings.voice.saveSuccess': 'Voice settings saved',
+    'settings.voice.saveSuccessWithStatus': 'Voice settings saved. Model status: {status}',
+    'settings.voice.sttCacheDir': 'STT backend model cache/download directory',
+    'settings.voice.sttCacheDirHelp': 'This is the server path the backend reads and writes. A WSL backend uses Linux/WSL paths, not browser-local paths.',
+    'settings.voice.sttModelPath': 'STT backend local model path (optional override)',
+    'settings.voice.sttModelPathHelp': 'Manually enter an existing backend model file or directory. Large folders are no longer enumerated through the browser to avoid browser crashes.',
+    'settings.voice.sttTitle': 'Speech to Text',
+    'settings.voice.ttsTitle': 'Text to Speech',
+    'settings.voice.title': 'Voice Pipeline',
+    'sidebar.collapse': 'Collapse sidebar',
+    'sidebar.deleteConversation': 'Delete conversation',
+    'sidebar.deleteConfirm': 'Delete "{title}"?',
+    'sidebar.expand': 'Expand sidebar',
+    'sidebar.newChat': 'New chat',
+    'sidebar.newChatShortcut': 'New chat (⌘/)',
+    'sidebar.noResults': 'No matching conversations',
+    'sidebar.noSessions': 'No conversation history',
+    'sidebar.older': 'Older',
+    'sidebar.pinned': 'Pinned',
+    'sidebar.rename': 'Rename',
+    'sidebar.renameCancel': 'Cancel rename',
+    'sidebar.renameSave': 'Save name',
+    'sidebar.searchPlaceholder': 'Search conversations... (⌘K)',
+    'app.shortcuts.openInput': 'Focus input (⌘L)',
+    'app.shortcuts.toggleSidebar': 'Toggle sidebar (⌘B)',
+    'sidebar.settings': 'Settings',
+    'sidebar.skills': 'Skill Library',
+    'sidebar.thisWeek': 'This week',
+    'sidebar.today': 'Today',
+    'skills.card.created': 'Created',
+    'skills.card.delete': 'Delete {name}',
+    'skills.card.noDescription': 'No description',
+    'skills.card.success': 'Success',
+    'skills.card.unknown': 'Unknown',
+    'skills.card.untagged': 'untagged',
+    'skills.card.used': 'Used',
+    'skills.empty': 'No displayable skills yet',
+    'skills.errorDelete': 'Failed to delete skill',
+    'skills.errorLoad': 'Failed to load skills',
+    'skills.loaded': 'Loaded',
+    'skills.noSearchResults': 'No skills match "{query}"',
+    'skills.refresh': 'Refresh',
+    'skills.searchPlaceholder': 'Search name, description, or tags',
+    'skills.subtitle': 'Backend skill index and usage summary',
+    'skills.tabs.all': 'All',
+    'skills.tabs.highestSuccess': 'High success',
+    'skills.tabs.mostUsed': 'Most used',
+    'skills.tabs.recent': 'Recent',
+    'skills.title': 'Skill Library',
+    'settings.title': 'Settings',
+    'settings.subtitle': 'Backend configuration summary and service readiness',
+    'settings.errorLoadFailed': 'Failed to load settings',
+    'settings.badge.connected': 'Connected',
+    'settings.badge.partial': 'Partial',
+    'settings.stats.primaryModel': 'Primary Model',
+    'settings.stats.modelEndpoints': 'Model Endpoints',
+    'settings.stats.channels': 'Channels',
+    'settings.stats.webSurface': 'Web Surface',
+    'settings.stats.configured': 'Configured',
+    'settings.stats.notReported': 'Not reported',
+    'settings.tabs.model': 'Model',
+    'settings.tabs.voice': 'Voice',
+    'settings.tabs.memory': 'Memory',
+    'settings.tabs.learning': 'Learning',
+    'settings.tabs.channels': 'Channels',
+    'settings.tabs.web': 'Web',
+    'settings.section.modelConfig': 'Model Config',
+    'settings.section.discoveredModels': 'Discovered Models',
+    'settings.section.voicePipeline': 'Voice Pipeline',
+    'settings.section.runtime': 'Runtime',
+    'settings.section.memory': 'Memory',
+    'settings.section.learning': 'Learning',
+    'settings.section.channels': 'Channels',
+    'settings.section.web': 'Web',
+    'settings.summary.modelConfig': 'Only non-sensitive backend fields are shown',
+    'settings.summary.discoveredModels': 'Available model summary from the models API',
+    'settings.summary.voicePipeline': 'Summary of STT, TTS, and I/O devices',
+    'settings.summary.memory': 'Storage backend, paths, and retention summary',
+    'settings.summary.learning': 'Skill extraction and trajectory retention summary',
+    'settings.summary.channels': 'Channel status only, without exposing bot tokens or API keys',
+    'settings.summary.web': 'Web service and frontend integration summary',
+    'settings.runtime.voiceFields': 'Voice fields',
+    'settings.runtime.settingsSource': 'Settings source',
+    'settings.runtime.backend': 'Backend',
+    'settings.runtime.unavailable': 'Unavailable',
+    'settings.preferences.title': 'UI Preferences',
+    'settings.preferences.description': 'Adjust language, appearance, font size, and time zone. Preferences are stored in this browser only.',
+    'settings.preferences.language': 'UI language',
+    'settings.preferences.appearance': 'Appearance mode',
+    'settings.preferences.fontSize': 'Font size',
+    'settings.preferences.timezone': 'Time zone',
+    'settings.preferences.appearanceHelp': 'Appearance can follow your system, or be pinned to dark/light.',
+    'settings.preferences.fontHelp': 'Font size affects readability across the main WebGUI.',
+    'settings.preferences.timezoneHelp': 'Time zone affects display only. Storage and API timestamps remain UTC.',
+    'settings.preferences.language.default': 'Default / Auto-detect',
+    'settings.preferences.language.zhTW': 'Traditional Chinese',
+    'settings.preferences.language.en': 'English',
+    'settings.preferences.appearance.system': 'System',
+    'settings.preferences.appearance.dark': 'Dark',
+    'settings.preferences.appearance.light': 'Light',
+    'settings.preferences.font.compact': 'Compact',
+    'settings.preferences.font.default': 'Default',
+    'settings.preferences.font.large': 'Large',
+    'settings.preferences.timezone.auto': 'Browser default',
+    'settings.preferences.timezone.utc': 'UTC',
+    'settings.emptyState': 'No settings summary is available from backend yet.',
+    'settings.noSummary': 'No summary available',
+    'settings.modelFallback': 'Model',
+  },
+}
+
+function normalizeExplicitLanguage(value: unknown): UILanguage | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalized = value.trim().toLowerCase()
+  if (
+    normalized === 'zh'
+    || normalized === 'zh-tw'
+    || normalized === 'zh_tw'
+    || normalized.startsWith('zh-hant')
+  ) {
+    return 'zh-TW'
+  }
+  if (normalized === 'en' || normalized === 'en-us' || normalized === 'en_us') {
+    return 'en'
+  }
+
+  return null
+}
+
+function resolveBrowserLanguage(): UILanguage {
+  if (typeof window === 'undefined') {
+    return DEFAULT_LANGUAGE
+  }
+
+  const candidates = Array.isArray(window.navigator.languages) && window.navigator.languages.length > 0
+    ? window.navigator.languages
+    : [window.navigator.language]
+
+  for (const candidate of candidates) {
+    const language = normalizeExplicitLanguage(candidate)
+    if (language) {
+      return language
+    }
+  }
+
+  return DEFAULT_LANGUAGE
+}
+
+export function resolveLocale(language: UILanguage): string {
+  return LANGUAGE_LOCALE[language] ?? LANGUAGE_LOCALE.en
+}
+
+function resolveLanguageFromMode(languageMode: UILanguageMode, browserLanguage: UILanguage): UILanguage {
+  return languageMode === AUTO_LANGUAGE ? browserLanguage : languageMode
+}
+
+function resolveAppearanceFromMedia(): UIAppearance {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return DEFAULT_APPEARANCE
+  }
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function resolveAppearance(mode: UIAppearanceMode, systemAppearance: UIAppearance): UIAppearance {
+  return mode === SYSTEM_APPEARANCE ? systemAppearance : mode
+}
+
+function resolveBrowserTimeZone(): string | undefined {
+  if (typeof Intl === 'undefined') {
+    return undefined
+  }
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  if (typeof timeZone !== 'string' || timeZone.trim().length === 0) {
+    return undefined
+  }
+  return timeZone
+}
+
+export function resolveDisplayTimeZone(timezone: UITimezone): string | undefined {
+  if (!timezone || timezone === AUTO_TIMEZONE) {
+    return resolveBrowserTimeZone()
+  }
+  return timezone
+}
+
+type UIPreferences = {
+  languageMode: UILanguageMode
+  fontSize: UIFontSize
+  appearanceMode: UIAppearanceMode
+  timezone: UITimezone
+}
+
+function buildDefaultPreferences(): UIPreferences {
+  return {
+    languageMode: DEFAULT_LANGUAGE_MODE,
+    fontSize: DEFAULT_FONT_SIZE,
+    appearanceMode: DEFAULT_APPEARANCE_MODE,
+    timezone: AUTO_TIMEZONE,
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function normalizeLanguageMode(value: unknown): UILanguageMode {
+  if (value === AUTO_LANGUAGE) {
+    return AUTO_LANGUAGE
+  }
+
+  return normalizeExplicitLanguage(value) ?? DEFAULT_LANGUAGE_MODE
+}
+
+function normalizeAppearanceMode(value: unknown): UIAppearanceMode {
+  if (value === 'system' || value === 'dark' || value === 'light') {
+    return value
+  }
+  return DEFAULT_APPEARANCE_MODE
+}
+
+function normalizeFontSize(value: unknown): UIFontSize {
+  if (value === 'compact' || value === 'default' || value === 'large') {
+    return value
+  }
+  return DEFAULT_FONT_SIZE
+}
+
+function normalizeTimezone(value: unknown): UITimezone {
+  if (typeof value !== 'string') {
+    return AUTO_TIMEZONE
+  }
+  const next = value.trim()
+  return next.length > 0 ? next : AUTO_TIMEZONE
+}
+
+function parseStoredPreferences(raw: string | null): UIPreferences {
+  const defaults = buildDefaultPreferences()
+  if (!raw) {
+    return defaults
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return defaults
+  }
+
+  // Backward compatibility: early payload could be a plain language string.
+  if (typeof parsed === 'string') {
+    const explicitLanguage = normalizeExplicitLanguage(parsed)
+    if (!explicitLanguage) {
+      return defaults
+    }
+
+    return {
+      ...defaults,
+      languageMode: explicitLanguage,
+    }
+  }
+
+  if (!isRecord(parsed)) {
+    return defaults
+  }
+
+  return {
+    languageMode: normalizeLanguageMode(
+      parsed.languageMode
+      ?? parsed.language_mode
+      ?? parsed.language
+      ?? parsed.lang
+      ?? parsed.locale
+    ),
+    fontSize: normalizeFontSize(parsed.fontSize ?? parsed.font_size ?? parsed.font),
+    appearanceMode: normalizeAppearanceMode(
+      parsed.appearanceMode
+      ?? parsed.appearance_mode
+      ?? parsed.appearance
+      ?? parsed.theme
+      ?? parsed.colorScheme
+    ),
+    timezone: normalizeTimezone(parsed.timezone ?? parsed.time_zone ?? parsed.tz),
+  }
+}
+
+function readStoredPreferences(): UIPreferences {
+  if (typeof window === 'undefined') {
+    return buildDefaultPreferences()
+  }
+
+  try {
+    return parseStoredPreferences(window.localStorage.getItem(STORAGE_KEY))
+  } catch {
+    return buildDefaultPreferences()
+  }
+}
+
+function persistPreferences(preferences: UIPreferences) {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  try {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        languageMode: preferences.languageMode,
+        fontSize: preferences.fontSize,
+        appearanceMode: preferences.appearanceMode,
+        timezone: preferences.timezone,
+      })
+    )
+  } catch {
+    // Ignore storage write failures (e.g. private mode / quota).
+  }
+}
+
+function arePreferencesEqual(left: UIPreferences, right: UIPreferences): boolean {
+  return (
+    left.languageMode === right.languageMode
+    && left.fontSize === right.fontSize
+    && left.appearanceMode === right.appearanceMode
+    && left.timezone === right.timezone
+  )
+}
+
+function updateThemeColor(appearance: UIAppearance) {
+  if (typeof document === 'undefined') {
+    return
+  }
+
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute('content', THEME_COLOR_BY_APPEARANCE[appearance])
+}
+
+function applyDocumentPreferences(language: UILanguage, fontSize: UIFontSize, appearance: UIAppearance) {
+  if (typeof document === 'undefined') {
+    return
+  }
+  document.documentElement.lang = language
+  document.documentElement.dataset.fontSize = fontSize
+  document.documentElement.dataset.theme = appearance
+  document.documentElement.style.colorScheme = appearance
+  updateThemeColor(appearance)
+}
+
+const I18nContext = React.createContext<I18nContextValue | null>(null)
+const useIsomorphicLayoutEffect =
+  typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
+
+export function I18nProvider({ children }: { children: React.ReactNode }) {
+  const [preferences, setPreferences] = React.useState<UIPreferences>(
+    () => buildDefaultPreferences()
+  )
+  const [browserLanguage, setBrowserLanguage] = React.useState<UILanguage>(DEFAULT_LANGUAGE)
+  const [systemAppearance, setSystemAppearance] = React.useState<UIAppearance>(DEFAULT_APPEARANCE)
+  const [initialized, setInitialized] = React.useState(false)
+  const { languageMode, fontSize, appearanceMode, timezone } = preferences
+  const language = React.useMemo(
+    () => resolveLanguageFromMode(languageMode, browserLanguage),
+    [browserLanguage, languageMode]
+  )
+  const appearance = React.useMemo(
+    () => resolveAppearance(appearanceMode, systemAppearance),
+    [appearanceMode, systemAppearance]
+  )
+
+  useIsomorphicLayoutEffect(() => {
+    const nextBrowserLanguage = resolveBrowserLanguage()
+    const nextSystemAppearance = resolveAppearanceFromMedia()
+    const nextPreferences = readStoredPreferences()
+    const nextLanguage = resolveLanguageFromMode(nextPreferences.languageMode, nextBrowserLanguage)
+    const nextAppearance = resolveAppearance(nextPreferences.appearanceMode, nextSystemAppearance)
+
+    setBrowserLanguage(nextBrowserLanguage)
+    setSystemAppearance(nextSystemAppearance)
+    setPreferences(nextPreferences)
+    applyDocumentPreferences(nextLanguage, nextPreferences.fontSize, nextAppearance)
+    setInitialized(true)
+  }, [])
+
+  React.useEffect(() => {
+    if (!initialized) {
+      return
+    }
+    applyDocumentPreferences(language, fontSize, appearance)
+    persistPreferences(preferences)
+  }, [appearance, fontSize, initialized, language, preferences, timezone])
+
+  React.useEffect(() => {
+    if (!initialized || appearanceMode !== 'system' || typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return
+    }
+
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSystemAppearance(event.matches ? 'dark' : 'light')
+    }
+
+    mediaQuery.addEventListener('change', handleChange)
+    return () => {
+      mediaQuery.removeEventListener('change', handleChange)
+    }
+  }, [appearanceMode, fontSize, initialized, language])
+
+  React.useEffect(() => {
+    if (!initialized || typeof window === 'undefined') {
+      return
+    }
+
+    const handleLanguageChange = () => {
+      setBrowserLanguage(resolveBrowserLanguage())
+    }
+
+    window.addEventListener('languagechange', handleLanguageChange)
+    return () => {
+      window.removeEventListener('languagechange', handleLanguageChange)
+    }
+  }, [initialized])
+
+  React.useEffect(() => {
+    if (!initialized || typeof window === 'undefined') {
+      return
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage || event.key !== STORAGE_KEY) {
+        return
+      }
+      const nextPreferences = parseStoredPreferences(event.newValue)
+      const nextLanguage = resolveLanguageFromMode(nextPreferences.languageMode, browserLanguage)
+      const nextAppearance = resolveAppearance(nextPreferences.appearanceMode, systemAppearance)
+      setPreferences((previous) => (
+        arePreferencesEqual(previous, nextPreferences) ? previous : nextPreferences
+      ))
+      applyDocumentPreferences(nextLanguage, nextPreferences.fontSize, nextAppearance)
+    }
+
+    window.addEventListener('storage', handleStorage)
+    return () => {
+      window.removeEventListener('storage', handleStorage)
+    }
+  }, [browserLanguage, initialized, systemAppearance])
+
+  const setLanguageMode = React.useCallback(
+    (nextMode: UILanguageMode) => {
+      const normalizedMode = normalizeLanguageMode(nextMode)
+      setPreferences((previous) => (
+        previous.languageMode === normalizedMode
+          ? previous
+          : { ...previous, languageMode: normalizedMode }
+      ))
+    },
+    []
+  )
+
+  const setLanguage = React.useCallback(
+    (nextLanguage: UILanguage) => {
+      setLanguageMode(nextLanguage)
+    },
+    [setLanguageMode]
+  )
+
+  const setFontSize = React.useCallback(
+    (nextFontSize: UIFontSize) => {
+      setPreferences((previous) => (
+        previous.fontSize === nextFontSize
+          ? previous
+          : { ...previous, fontSize: nextFontSize }
+      ))
+    },
+    []
+  )
+
+  const setAppearanceMode = React.useCallback(
+    (nextMode: UIAppearanceMode) => {
+      const normalizedMode = normalizeAppearanceMode(nextMode)
+      setPreferences((previous) => (
+        previous.appearanceMode === normalizedMode
+          ? previous
+          : { ...previous, appearanceMode: normalizedMode }
+      ))
+    },
+    []
+  )
+
+  const setTimezone = React.useCallback(
+    (nextTimezone: UITimezone) => {
+      const normalizedTimezone = normalizeTimezone(nextTimezone)
+      setPreferences((previous) => (
+        previous.timezone === normalizedTimezone
+          ? previous
+          : { ...previous, timezone: normalizedTimezone }
+      ))
+    },
+    []
+  )
+
+  const t = React.useCallback(
+    (key: TranslationKey, values?: TranslationValues): string => {
+      return interpolate(messages[language][key] ?? messages.en[key] ?? key, values)
+    },
+    [language]
+  )
+
+  const locale = React.useMemo(() => resolveLocale(language), [language])
+  const resolvedTimeZone = React.useMemo(
+    () => resolveDisplayTimeZone(timezone),
+    [timezone]
+  )
+
+  const value = React.useMemo<I18nContextValue>(
+    () => ({
+      languageMode,
+      setLanguageMode,
+      language,
+      setLanguage,
+      locale,
+      fontSize,
+      setFontSize,
+      appearanceMode,
+      setAppearanceMode,
+      appearance,
+      timezone,
+      setTimezone,
+      resolvedTimeZone,
+      t,
+    }),
+    [appearance, appearanceMode, fontSize, language, languageMode, locale, resolvedTimeZone, setAppearanceMode, setFontSize, setLanguage, setLanguageMode, setTimezone, t, timezone]
+  )
+
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>
+}
+
+export function useI18n() {
+  const context = React.useContext(I18nContext)
+  if (!context) {
+    throw new Error('useI18n must be used within I18nProvider')
+  }
+  return context
+}

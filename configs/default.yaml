@@ -1,0 +1,157 @@
+# Mochi 預設設定檔
+# 複製此檔案到 ~/.mochi/config.yaml 並依需求修改
+
+# 預設模型規格
+# 格式：
+#   ollama:<model>         - 使用本地 Ollama
+#   /path/to/model.gguf   - 使用 GGUF 本地模型（Phase 3）
+#   http://host/v1        - 使用 OpenAI-compatible API（Phase 3）
+model: "ollama:llama3.2"
+
+# 模型首次啟動 metadata。保留上方 model 以相容既有 CLI/API；
+# WebGUI 或部署腳本應檢查模型可用性，不可用時進入 provider setup。
+model_setup:
+  mode: "configured_or_setup"
+  default_provider: "ollama"
+  default_model: "llama3.2"
+  default_model_spec: "ollama:llama3.2"
+  setup_required: true
+  fallback_chain:
+    - "user_config"
+    - "ollama_tags"
+    - "openai_compatible_provider"
+
+# 語言、地區與顯示層預設
+locale_defaults:
+  region_profile: "global"        # global = 不偏特定地區；可由 MOCHI_REGION_PROFILE 覆蓋
+  ui_locale: "auto"               # auto = 由瀏覽器/客戶端偵測
+  ui_locale_fallback: "en-US"     # 無法偵測時的 UI fallback
+  response_language: "same_as_user" # 預設跟隨使用者輸入語言
+  default_tts_voice: "en-US-AriaNeural"
+  timezone: "auto"                # 儲存層仍保留 UTC；顯示層再轉換
+
+# Agent 核心設定
+agent:
+  system_prompt: |
+    You are Mochi, an efficient and honest AI assistant.
+    Reply in the same language as the user unless they request otherwise.
+  max_react_iterations: 10
+  max_context_tokens: 3000
+
+# Ollama 後端設定
+ollama:
+  base_url: "http://localhost:11434"
+  timeout: 120.0
+
+# GGUF 後端設定（Phase 3）
+gguf:
+  n_ctx: 4096
+  n_gpu_layers: -1    # -1 = 全部 GPU，0 = 純 CPU
+  n_threads: null     # null = 自動
+
+# HuggingFace 後端設定（Phase 3）
+huggingface:
+  device: "auto"
+  torch_dtype: "auto"
+  trust_remote_code: false
+
+# 語音管線設定（Phase 4，預設關閉）
+voice:
+  enabled: false
+  stt_backend: "faster-whisper"   # 可選：auto/faster-whisper/openai-api/openai-whisper/qwen-asr/vosk/whisper-cpp/whisperlivekit
+  stt_model: "medium"             # backend-specific model name / repo id / local path alias
+  stt_language: "auto"
+  stt_device: "auto"
+  stt_openai_base_url: null       # 只在 stt_backend=openai-api 時使用，可填 http://host/v1
+  stt_openai_api_key: null        # 只在 stt_backend=openai-api 時使用
+  stt_openai_timeout: 60.0        # openai-api transcription HTTP timeout（秒）
+  tts_backend: "edge-tts"         # 可選：auto/coqui-tts/edge-tts/kokoro-tts/openai-tts/piper
+  tts_model: null                 # 只在 coqui-tts/openai-tts 等需要模型名的後端使用
+  tts_voice: "en-US-AriaNeural"
+  tts_language: null              # 只在特定 TTS 後端使用（例如 coqui-tts）
+  tts_speed: 1.0
+  tts_use_gpu: false              # 只在支援 GPU 的本地 TTS 後端使用
+  tts_kokoro_lang_code: "a"       # 只在 tts_backend=kokoro-tts 時使用
+  tts_split_pattern: "\\n+"       # 只在 tts_backend=kokoro-tts 時使用
+  tts_openai_base_url: null       # 只在 tts_backend=openai-tts 時使用，可填 http://host/v1
+  tts_openai_api_key: null        # 只在 tts_backend=openai-tts 時使用
+  tts_openai_timeout: 60.0        # openai-tts HTTP timeout（秒）
+  tts_openai_response_format: "pcm" # 只在 tts_backend=openai-tts 時使用；可選 pcm/wav
+  vad_threshold: 0.5
+  vad_min_speech_ms: 250
+  vad_max_silence_ms: 700
+  sample_rate: 16000
+  channels: 1
+
+# 工具系統設定
+tools:
+  extra_tools_dirs: []
+  web_search_engine: "duckduckgo"
+
+# 記憶系統設定
+memory:
+  max_short_term_messages: 50
+  fts_top_k: 5
+
+# 持續學習設定
+learning:
+  enabled: true
+  auto_extract_skills: true
+  min_steps_for_extraction: 3
+  trajectory_retention_days: 30
+  skill_improvement_threshold: 0.7
+  max_skills: 500
+
+# 頻道適配設定（Phase 4.5，預設關閉）
+channels:
+  discord:
+    enabled: false
+    text_enabled: true
+    voice_enabled: false
+    bot_token: null             # 請設為環境變數 DISCORD_BOT_TOKEN
+    allowed_guild_ids: []      # 空列表 = 全部允許
+    allowed_channel_ids: []    # 空列表 = 全部允許
+    allowed_voice_channel_ids: []
+    allowed_user_ids: []
+    rate_limit_per_user: 10
+    message_mode: "mentions_only" # guild 文字收訊策略：all_messages / mentions_only / slash_only
+    auto_join_policy: "manual_only"
+    voice_auto_reply: true
+    voice_stt_enabled: true
+    voice_tts_enabled: true
+  telegram:
+    enabled: false
+    bot_token: null             # 請設為環境變數 TELEGRAM_BOT_TOKEN
+    allowed_chat_ids: []
+    allowed_user_ids: []
+    rate_limit_per_user: 10
+
+# 安全設定
+security:
+  require_approval_for_shell: true
+  require_approval_for_file_write: true
+  shell_command_allowlist:
+    - "ls"
+    - "cat"
+    - "pwd"
+    - "echo"
+    - "date"
+    - "which"
+  max_file_write_size_mb: 10.0
+
+# Web API 伺服器設定
+web:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000" # development default; override in production config/env
+  reload: false
+
+# 路徑設定
+workspace_dir: "~/.mochi"
+sessions_dir: "~/.mochi/sessions"
+skills_dir: "~/.mochi/skills"
+plugins_dir: "~/.mochi/plugins"
+
+# 日誌等級：DEBUG / INFO / WARNING / ERROR
+log_level: "INFO"

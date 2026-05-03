@@ -1,0 +1,179 @@
+"""Ollama LLM 後端實作。"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+import httpx
+from loguru import logger
+
+from mochi.backends.base import BaseLLMBackend
+from mochi.backends.types import (
+    GenerationResult,
+    Message,
+    ModelInfo,
+    StreamChunk,
+    ToolCall,
+    ToolSchema,
+)
+
+
+class OllamaBackend(BaseLLMBackend):
+    """Ollama HTTP API 後端。
+
+    使用 httpx async client 呼叫 Ollama /api/chat 端點，
+    支援 stream / non-stream 與原生 tool calling。
+    """
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str = "http://localhost:11434",
+        timeout: float = 120.0,
+    ) -> None:
+        """初始化 Ollama 後端。
+
+        Args:
+            model: 模型名稱（如 "llama3.2"、"qwen2.5"）。
+            base_url: Ollama 服務地址。
+            timeout: HTTP 請求逾時秒數。
+        """
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+
+    def supports_tool_calling(self) -> bool:
+        """Ollama 支援原生 tool calling。"""
+        return True
+
+    def get_model_info(self) -> ModelInfo:
+        """回傳 Ollama 後端的模型資訊。"""
+        return ModelInfo(
+            name=self.model,
+            backend_type="ollama",
+            context_length=4096,
+            supports_tool_calling=True,
+        )
+
+    async def health_check(self) -> bool:
+        """嘗試連線 Ollama /api/tags 端點，確認服務可用。"""
+        try:
+            resp = await self._client.get("/api/tags", timeout=5.0)
+            return resp.status_code == 200
+        except Exception as exc:
+            logger.debug(f"Ollama health check failed: {exc}")
+            return False
+
+    async def generate(
+        self,
+        messages: list[Message],
+        tools: list[ToolSchema] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        stream: bool = False,
+    ) -> GenerationResult | AsyncIterator[StreamChunk]:
+        """呼叫 Ollama /api/chat 進行推理。
+
+        Args:
+            messages: 對話訊息列表。
+            tools: 可用工具定義列表。
+            temperature: 採樣溫度。
+            max_tokens: 最大輸出 token 數。
+            stream: 是否啟用串流。
+
+        Returns:
+            非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [m.to_dict() for m in messages],
+            "stream": stream,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+            },
+        }
+        if tools:
+            payload["tools"] = [t.to_dict() for t in tools]
+
+        if stream:
+            return self._stream_generate(payload)
+        return await self._blocking_generate(payload)
+
+    async def _blocking_generate(self, payload: dict[str, Any]) -> GenerationResult:
+        """執行非串流推理並回傳完整結果。"""
+        try:
+            resp = await self._client.post("/api/chat", json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"Ollama API error {exc.response.status_code}: {exc.response.text}")
+            raise
+        except httpx.RequestError as exc:
+            logger.error(f"Ollama connection error: {exc}")
+            raise
+
+        data = resp.json()
+        msg = data.get("message", {})
+        content: str = msg.get("content", "")
+
+        tool_calls: list[ToolCall] = []
+        for tc in msg.get("tool_calls", []):
+            fn = tc.get("function", {})
+            raw_args = fn.get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    raw_args = {}
+            tool_calls.append(
+                ToolCall(
+                    id=tc.get("id", str(uuid.uuid4())),
+                    name=fn.get("name", ""),
+                    arguments=raw_args,
+                )
+            )
+
+        usage = data.get("prompt_eval_count", 0), data.get("eval_count", 0)
+        return GenerationResult(
+            content=content,
+            tool_calls=tool_calls,
+            input_tokens=usage[0],
+            output_tokens=usage[1],
+            model=data.get("model", self.model),
+            finish_reason="tool_calls" if tool_calls else data.get("done_reason", "stop"),
+        )
+
+    async def _stream_generate(self, payload: dict[str, Any]) -> AsyncIterator[StreamChunk]:
+        """執行串流推理，逐 chunk 回傳 StreamChunk。"""
+        try:
+            async with self._client.stream("POST", "/api/chat", json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    done: bool = data.get("done", False)
+                    msg = data.get("message", {})
+                    delta: str = msg.get("content", "")
+
+                    yield StreamChunk(
+                        delta=delta,
+                        is_final=done,
+                        finish_reason=data.get("done_reason") if done else None,
+                    )
+                    if done:
+                        break
+        except httpx.RequestError as exc:
+            logger.error(f"Ollama stream error: {exc}")
+            raise
+
+    async def close(self) -> None:
+        """關閉 HTTP client 連線。"""
+        await self._client.aclose()

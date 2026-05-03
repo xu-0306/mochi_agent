@@ -1,0 +1,20 @@
+"""API 路由集合。"""
+
+from __future__ import annotations
+
+from mochi.api.routes.chat import router as chat_router
+from mochi.api.routes.filesystem import router as filesystem_router
+from mochi.api.routes.models import router as models_router
+from mochi.api.routes.skills import router as skills_router
+
+from .sessions import router as sessions_router
+from .settings import router as settings_router
+
+__all__ = [
+    "chat_router",
+    "filesystem_router",
+    "models_router",
+    "sessions_router",
+    "settings_router",
+    "skills_router",
+]

@@ -1,0 +1,104 @@
+[project]
+name = "mochi"
+version = "0.1.0"
+description = "輕量級語音自學習 AI Agent 框架"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6",
+    "httpx>=0.27",
+    "loguru>=0.7",
+    "mcp>=1.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+gguf = [
+    "llama-cpp-python>=0.3",
+]
+
+hf = [
+    "transformers>=4.44",
+    "accelerate>=0.33",
+    "torch>=2.4",
+    "safetensors>=0.4",
+]
+
+voice = [
+    "silero-vad>=5",
+    "sounddevice>=0.5",
+    "numpy>=1.26",
+    "faster-whisper>=1.0",
+    "edge-tts>=6.1",
+]
+
+voice-extras = [
+    "openai-whisper>=20240930",
+    "whisper-cpp-python>=0.2",
+    "whisperlivekit>=0.2",
+    "vosk>=0.3.45",
+]
+
+tts-extras = [
+    # coqui-tts 已停止維護，需手動安裝或用 TTS>=0.22：
+    # pip install TTS
+    # kokoro-tts 需手動安裝（PyPI 套件名稱與版本變動頻繁）
+]
+
+channels = [
+    "discord.py[voice]>=2.3",
+    "python-telegram-bot>=21",
+]
+
+all = [
+    "mochi[gguf,hf,voice,channels]",
+    # voice-extras / tts-extras 不放進 all，因為版本波動快，
+    # 使用者按需 `uv sync --extra voice-extras` 手動啟用
+]
+
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "pyright>=1.1",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+mochi = "mochi.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["mochi", "tests"]
+exclude = ["openclaw", "zeroclaw", "hermes-agent"]

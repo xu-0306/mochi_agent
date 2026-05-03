@@ -1,0 +1,42 @@
+{
+  "id": "/",
+  "name": "Mochi",
+  "short_name": "Mochi",
+  "description": "Mochi WebGUI for chat, skills, and settings.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0B0B0F",
+  "theme_color": "#0B0B0F",
+  "icons": [
+    {
+      "src": "/icons/icon-any.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "New Chat",
+      "short_name": "New",
+      "url": "/"
+    },
+    {
+      "name": "Settings",
+      "short_name": "Settings",
+      "url": "/settings"
+    },
+    {
+      "name": "Skills",
+      "short_name": "Skills",
+      "url": "/skills"
+    }
+  ]
+}

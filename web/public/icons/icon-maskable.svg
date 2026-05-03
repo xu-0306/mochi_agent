@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mochi maskable icon">
+  <rect width="512" height="512" fill="#0B0B0F"/>
+  <circle cx="256" cy="256" r="176" fill="#171821"/>
+  <path d="M148 332V180h66l42 88 42-88h66v152h-40v-96l-38 78h-40l-38-78v96h-40z" fill="#6AA7FF"/>
+</svg>
