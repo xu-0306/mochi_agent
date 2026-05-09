@@ -74,6 +74,7 @@ logs/
 mochi/config.yaml
 mochi/workspace/
 mochi/sessions/
+mochi/skills/
 mochi/plugins/
 mochi/memory/
 
