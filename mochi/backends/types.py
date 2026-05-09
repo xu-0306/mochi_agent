@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal
 
 # 角色類型
@@ -33,7 +35,7 @@ class Message:
     content: str
     """訊息內容。"""
 
-    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=partial(list[ToolCall]))
     """若 role=assistant 且含工具呼叫則填入此欄。"""
 
     tool_call_id: str | None = None
@@ -50,7 +52,10 @@ class Message:
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {"name": tc.name, "arguments": str(tc.arguments)},
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                    },
                 }
                 for tc in self.tool_calls
             ]
@@ -93,7 +98,7 @@ class GenerationResult:
     content: str
     """生成的文字內容。"""
 
-    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=partial(list[ToolCall]))
     """工具呼叫請求列表。"""
 
     input_tokens: int = 0
@@ -142,5 +147,5 @@ class ModelInfo:
     supports_tool_calling: bool = False
     """是否原生支援 function calling。"""
 
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=partial(dict[str, Any]))
     """後端自訂元資料。"""

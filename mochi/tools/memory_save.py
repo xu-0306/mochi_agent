@@ -116,7 +116,11 @@ class MemorySaveTool(BaseTool):
     @property
     def description(self) -> str:
         """工具用途描述。"""
-        return "Save an item to long-term memory (local JSONL by default)."
+        return (
+            "Save an item to long-term memory via the configured memory store. "
+            "AgentEngine uses the shared SQLite memory store; standalone tool usage "
+            "falls back to local JSONL."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:

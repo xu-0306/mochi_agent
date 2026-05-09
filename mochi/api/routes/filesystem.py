@@ -11,7 +11,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 
-from mochi.api.server import _get_config
+from mochi.api.server import _get_config  # pyright: ignore[reportPrivateUsage]
 
 router = APIRouter(prefix="/v1/filesystem", tags=["filesystem"])
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
@@ -135,16 +135,21 @@ async def list_filesystem_roots(request: Request) -> dict[str, Any]:
         config = None
 
     if config is not None:
-        _add_root(roots, seen_paths, name="workspace", path=Path(config.workspace_dir))
-        _add_root(roots, seen_paths, name="sessions", path=Path(config.sessions_dir))
-        _add_root(roots, seen_paths, name="skills", path=Path(config.skills_dir))
-        _add_root(roots, seen_paths, name="plugins", path=Path(config.plugins_dir))
-        _add_root(roots, seen_paths, name="memory-parent", path=Path(config.memory.db_path).parent)
+        _add_root(roots, seen_paths, name="workspace", path=Path(config.workspace_dir).expanduser())
+        _add_root(roots, seen_paths, name="sessions", path=Path(config.sessions_dir).expanduser())
+        _add_root(roots, seen_paths, name="skills", path=Path(config.skills_dir).expanduser())
+        _add_root(roots, seen_paths, name="plugins", path=Path(config.plugins_dir).expanduser())
+        _add_root(
+            roots,
+            seen_paths,
+            name="memory-parent",
+            path=Path(config.memory.db_path).expanduser().parent,
+        )
         _add_root(
             roots,
             seen_paths,
             name="stt-cache-parent",
-            path=Path(config.voice.stt_model_cache_dir).parent,
+            path=Path(config.voice.stt_model_cache_dir).expanduser().parent,
         )
 
     return {"type": "filesystem_roots", "items": roots}

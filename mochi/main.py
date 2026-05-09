@@ -149,11 +149,82 @@ def _default_skills_db_path() -> Path:
     return Path(os.path.expanduser(cfg.skills_dir)) / "skills.db"
 
 
+def _default_skills_dir() -> Path:
+    """依目前設定推導預設技能目錄。"""
+    from mochi.config.manager import load_config
+
+    cfg = load_config()
+    return Path(os.path.expanduser(cfg.skills_dir))
+
+
+def _auto_sync_filesystem_skills_enabled() -> bool:
+    """依目前設定判斷 CLI 是否自動同步 filesystem skills。"""
+    from mochi.config.manager import load_config
+
+    cfg = load_config()
+    return cfg.learning.auto_sync_filesystem_skills
+
+
 def _resolve_skills_db_path(db_path: str | None) -> Path:
     """解析 CLI 指定或設定推導的技能庫路徑。"""
     if db_path:
         return Path(os.path.expanduser(db_path))
     return _default_skills_db_path()
+
+
+def _print_channels_setup_guide(platform: str) -> None:
+    """輸出頻道平台的 setup guide。"""
+    normalized = platform.strip().lower()
+    if normalized != "discord":
+        console.print(f"[yellow]Unsupported channel guide: {platform}[/yellow]")
+        console.print("[dim]Currently available: discord[/dim]")
+        raise typer.Exit(code=1)
+
+    lines = [
+        "[bold]Discord Setup Guide[/bold]",
+        "",
+        "1. Create a Discord application and bot in the Discord Developer Portal.",
+        "2. Enable the Message Content Intent in the Bot settings.",
+        "3. Invite the bot with scopes: bot, applications.commands.",
+        "4. Grant permissions: View Channels, Send Messages, Read Message History, Use Application Commands, Connect, Speak.",
+        "5. Install channels dependencies:",
+        "   uv sync --extra channels --active",
+        "6. Set your bot token in the environment:",
+        "   PowerShell: $env:DISCORD_BOT_TOKEN=\"your-token\"",
+        "7. Create a Mochi user config or a local config file with Discord enabled.",
+        "8. Start the bot:",
+        "   uv run mochi channels run",
+        "",
+        "[bold]Minimal config example[/bold]",
+        "channels:",
+        "  discord:",
+        "    enabled: true",
+        "    text_enabled: true",
+        "    voice_enabled: true",
+        "    bot_token: null",
+        "    allowed_guild_ids: []",
+        "    allowed_channel_ids: []",
+        "    allowed_voice_channel_ids: []",
+        "    allowed_user_ids: []",
+        "    rate_limit_per_user: 10",
+        "    message_mode: \"mentions_only\"",
+        "    auto_join_policy: \"manual_only\"",
+        "    voice_auto_reply: true",
+        "    voice_stt_enabled: true",
+        "    voice_tts_enabled: true",
+        "voice:",
+        "  enabled: true",
+        "  stt_backend: \"faster-whisper\"",
+        "  tts_backend: \"edge-tts\"",
+        "  sample_rate: 16000",
+        "  channels: 1",
+        "",
+        "[bold]Notes[/bold]",
+        "- WebGUI can currently show Discord status and guidance, but it does not yet accept bot tokens directly.",
+        "- For safety, prefer keeping the token in DISCORD_BOT_TOKEN instead of writing it into a tracked config file.",
+    ]
+    for line in lines:
+        console.print(line)
 
 
 def _skill_value(skill: object, key: str, default: object = "") -> object:
@@ -346,6 +417,14 @@ def channels_run(
     asyncio.run(_channels_run_async(config_path or None))
 
 
+@channels_app.command("guide")
+def channels_guide(
+    platform: Annotated[str, typer.Argument(help="Platform name: discord or telegram")] = "discord",
+) -> None:
+    """Show setup guide for a channel platform."""
+    _print_channels_setup_guide(platform)
+
+
 @skills_app.command("list")
 def skills_list(
     db_path: Annotated[str, typer.Option("--db", help="Skill library SQLite path")] = "",
@@ -435,6 +514,7 @@ def _print_tui_help() -> None:
     console.print("  /model <spec>        Switch model for this session")
     console.print("  /session             Show current session id")
     console.print("  /session <id>        Switch session id")
+    console.print("  channels guide       Run `mochi channels guide discord` for Discord setup help")
     console.print()
 
 
@@ -592,8 +672,14 @@ async def _chat_tui_async(
 async def _skills_list_async(db_path: str | None) -> None:
     """列出技能庫內容。"""
     from mochi.learning.skill_library import SkillLibrary
+    from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
 
     library = SkillLibrary(db_path=_resolve_skills_db_path(db_path))
+    if db_path is None and _auto_sync_filesystem_skills_enabled():
+        await SkillLoader.from_paths(
+            _default_skills_dir(),
+            system_skills_dir=default_system_skills_dir(),
+        ).sync(library)
     skills = await library.list()
 
     table = Table(title="Learned Skills")
@@ -623,8 +709,14 @@ async def _skills_list_async(db_path: str | None) -> None:
 async def _skills_show_async(skill_id: str, db_path: str | None) -> None:
     """顯示單一技能詳情。"""
     from mochi.learning.skill_library import SkillLibrary
+    from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
 
     library = SkillLibrary(db_path=_resolve_skills_db_path(db_path))
+    if db_path is None and _auto_sync_filesystem_skills_enabled():
+        await SkillLoader.from_paths(
+            _default_skills_dir(),
+            system_skills_dir=default_system_skills_dir(),
+        ).sync(library)
     skill = await library.get(skill_id)
     if skill is None:
         console.print(f"[red]Skill not found: {skill_id}[/red]")
@@ -667,8 +759,14 @@ async def _skills_delete_async(skill_id: str, db_path: str | None) -> None:
 async def _skills_export_async(db_path: str | None, output_path: str | None) -> None:
     """匯出技能庫。"""
     from mochi.learning.skill_library import SkillLibrary
+    from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
 
     library = SkillLibrary(db_path=_resolve_skills_db_path(db_path))
+    if db_path is None and _auto_sync_filesystem_skills_enabled():
+        await SkillLoader.from_paths(
+            _default_skills_dir(),
+            system_skills_dir=default_system_skills_dir(),
+        ).sync(library)
     payload = await library.export()
     output = _format_json_payload(payload)
 
@@ -782,8 +880,10 @@ async def _doctor_async() -> None:
                         console.print(f"    diagnostics ({helper_name}): {details}")
 
     # Config file
-    cfg_path = os.path.expanduser("~/.mochi/config.yaml")
-    exists = os.path.exists(cfg_path)
+    from mochi.config.manager import user_config_path
+
+    cfg_path = user_config_path()
+    exists = cfg_path.exists()
     status = "[green]exists[/green]" if exists else "[yellow]not created (using defaults)[/yellow]"
     console.print(f"  Config file {cfg_path}  {status}")
 

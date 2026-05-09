@@ -18,7 +18,6 @@ from mochi.voice.events import (
     VoiceStageEvent,
 )
 
-
 DiscordVoiceConnector = Callable[[int, int], Awaitable[object]]
 DiscordVoiceDisconnect = Callable[[object], Awaitable[None]]
 DiscordVoiceStopPlayback = Callable[[object], Awaitable[bool]]

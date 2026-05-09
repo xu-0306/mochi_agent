@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, MoreHorizontal, Settings } from 'lucide-react'
+import { AlertCircle, Loader2, MoreHorizontal, Settings } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ChatInput, type ChatInputModelOption } from '@/components/chat/ChatInput'
 import { ChatMessage, type Message } from '@/components/chat/ChatMessage'
@@ -15,6 +15,8 @@ import {
   type VoiceRuntimePhase,
   type VoiceTurnResult,
 } from '@/lib/voice-ws'
+
+const MODELS_UPDATED_EVENT = 'mochi:models-updated'
 
 interface BackendChatResponse {
   session_id?: string
@@ -65,20 +67,62 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
 }
 
-function resolveModelName(model: Record<string, unknown> | null | undefined): string | null {
+function resolveModelId(model: Record<string, unknown> | null | undefined): string | null {
   if (!model) {
     return null
   }
   return (
+    getString(model.id) ??
+    getString(model.model_spec) ??
     getString(model.name) ??
     getString(model.model) ??
-    getString(model.id) ??
     getString(model.label)
   )
 }
 
+function normalizeResolvedModelId(
+  model: Record<string, unknown> | null | undefined,
+  modelId: string | null
+): string | null {
+  if (!modelId) {
+    return null
+  }
+
+  const provider = getString(model?.provider)
+  const backendType = getString(model?.backend_type)
+  if ((provider === 'ollama' || backendType === 'ollama') && !modelId.startsWith('ollama:')) {
+    return `ollama:${modelId}`
+  }
+
+  return modelId
+}
+
+function resolveModelOptionId(model: Record<string, unknown> | null | undefined): string | null {
+  return normalizeResolvedModelId(model, resolveModelId(model))
+}
+
+function resolveModelLabel(model: Record<string, unknown>, modelId: string): string {
+  return (
+    getString(model.model) ??
+    getString(model.name) ??
+    getString(model.label) ??
+    formatModelLabel(modelId)
+  )
+}
+
 function formatModelLabel(modelId: string): string {
-  return modelId.replace(/^ollama:/, '').replace(/^openai:/, '')
+  const [provider, ...rest] = modelId.split(':')
+  if (provider === 'ollama') {
+    return rest.join(':') || modelId
+  }
+  if (
+    provider === 'openai_compat' ||
+    provider === 'gemini' ||
+    provider === 'anthropic'
+  ) {
+    return rest[rest.length - 1] ?? modelId
+  }
+  return modelId
 }
 
 function displaySessionTitle(title: string | undefined, fallback: string): string {
@@ -94,7 +138,8 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
 
   const pushModel = (
     modelId: string | null,
-    status: ChatInputModelOption['status']
+    status: ChatInputModelOption['status'],
+    label?: string | null
   ) => {
     if (!modelId || seen.has(modelId)) {
       return
@@ -102,18 +147,9 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
     seen.add(modelId)
     candidates.push({
       id: modelId,
-      label: formatModelLabel(modelId),
+      label: label ?? formatModelLabel(modelId),
       status,
     })
-  }
-
-  if (Array.isArray(payload.models)) {
-    for (const entry of payload.models) {
-      if (!isRecord(entry)) {
-        continue
-      }
-      pushModel(resolveModelName(entry), 'connected')
-    }
   }
 
   if (Array.isArray(payload.available_models)) {
@@ -121,14 +157,50 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
       if (!isRecord(entry)) {
         continue
       }
-      pushModel(resolveModelName(entry), 'connected')
+      const modelId = resolveModelOptionId(entry)
+      pushModel(modelId, 'connected', modelId ? resolveModelLabel(entry, modelId) : null)
     }
   }
 
-  pushModel(resolveModelName(payload.active_model ?? undefined), 'connected')
-  pushModel(getString(payload.configured_model), 'configured')
+  if (candidates.length === 0 && Array.isArray(payload.models)) {
+    for (const entry of payload.models) {
+      if (!isRecord(entry)) {
+        continue
+      }
+      const modelId = resolveModelOptionId(entry)
+      pushModel(modelId, 'connected', modelId ? resolveModelLabel(entry, modelId) : null)
+    }
+  }
+
+  if (candidates.length === 0) {
+    pushModel(resolveModelOptionId(payload.active_model ?? undefined), 'connected')
+    pushModel(getString(payload.configured_model), 'configured')
+  }
 
   return candidates
+}
+
+function resolveActiveModelId(
+  payload: ModelsResponse,
+  options: ChatInputModelOption[]
+): string | null {
+  const configuredModel = getString(payload.configured_model)
+  if (configuredModel) {
+    const configuredOption = options.find((option) => option.id === configuredModel)
+    if (configuredOption) {
+      return configuredOption.id
+    }
+  }
+
+  const activeName = resolveModelOptionId(payload.active_model ?? undefined)
+  if (activeName) {
+    const activeOption = options.find(
+      (option) => option.id === activeName || option.id.endsWith(`:${activeName}`)
+    )
+    return activeOption?.id ?? activeName
+  }
+
+  return configuredModel ?? options[0]?.id ?? null
 }
 
 async function requestChat(
@@ -166,6 +238,7 @@ export default function ChatPage() {
   const [isStreaming, setIsStreaming] = React.useState(false)
   const [modelOptions, setModelOptions] = React.useState<ChatInputModelOption[]>([])
   const [currentModel, setCurrentModel] = React.useState<string | null>(null)
+  const [modelSwitchError, setModelSwitchError] = React.useState<string | null>(null)
   const [voiceOpen, setVoiceOpen] = React.useState(false)
   const [voicePhase, setVoicePhase] = React.useState<VoiceRuntimePhase>('idle')
   const [voiceRecording, setVoiceRecording] = React.useState(false)
@@ -316,75 +389,104 @@ export default function ChatPage() {
     }
   }, [])
 
+  const loadModels = React.useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch('/v1/models', {
+      cache: 'no-store',
+      signal,
+    })
+    if (!response.ok) {
+      throw new Error(`GET /v1/models failed: ${response.status}`)
+    }
+
+    const payload = (await response.json()) as ModelsResponse
+    const nextOptions = deriveModelOptions(payload)
+    const activeModel = resolveActiveModelId(payload, nextOptions)
+
+    setModelOptions(nextOptions)
+    setCurrentModel(activeModel)
+  }, [])
+
   React.useEffect(() => {
     let cancelled = false
+    const controller = new AbortController()
 
-    const loadModels = async () => {
+    const refreshModels = async () => {
       try {
-        const response = await fetch('/v1/models', { cache: 'no-store' })
-        if (!response.ok) {
-          throw new Error(`GET /v1/models failed: ${response.status}`)
-        }
-        const payload = (await response.json()) as ModelsResponse
-        if (cancelled) {
-          return
-        }
-
-        const nextOptions = deriveModelOptions(payload)
-        const activeModel =
-          resolveModelName(payload.active_model ?? undefined) ??
-          getString(payload.configured_model)
-
-        setModelOptions(nextOptions)
-        setCurrentModel(activeModel)
-      } catch {
-        if (cancelled) {
+        await loadModels(controller.signal)
+      } catch (error) {
+        if (cancelled || (error instanceof DOMException && error.name === 'AbortError')) {
           return
         }
         setModelOptions((prev) => prev)
       }
     }
 
-    void loadModels()
+    const handleModelsUpdated = () => {
+      void refreshModels()
+    }
+    const handleFocus = () => {
+      void refreshModels()
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshModels()
+      }
+    }
+
+    void refreshModels()
+    window.addEventListener(MODELS_UPDATED_EVENT, handleModelsUpdated)
+    window.addEventListener('focus', handleFocus)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
 
     return () => {
       cancelled = true
+      controller.abort()
+      window.removeEventListener(MODELS_UPDATED_EVENT, handleModelsUpdated)
+      window.removeEventListener('focus', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [])
+  }, [loadModels])
 
   const handleSwitchModel = React.useCallback(async (modelId: string) => {
-    const response = await fetch('/v1/models/switch', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ model: modelId }),
-    })
+    setModelSwitchError(null)
 
-    if (!response.ok) {
-      throw new Error(`POST /v1/models/switch failed: ${response.status}`)
-    }
-
-    const payload = (await response.json()) as { active_model?: Record<string, unknown> }
-    const nextModel = resolveModelName(payload.active_model ?? undefined) ?? modelId
-
-    setCurrentModel(nextModel)
-    setModelOptions((prev) => {
-      if (prev.some((option) => option.id === nextModel)) {
-        return prev.map((option) =>
-          option.id === nextModel ? { ...option, status: 'connected' } : option
-        )
-      }
-      return [
-        ...prev,
-        {
-          id: nextModel,
-          label: formatModelLabel(nextModel),
-          status: 'connected',
+    try {
+      const response = await fetch('/v1/models/switch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-      ]
-    })
-  }, [])
+        body: JSON.stringify({ model: modelId }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`POST /v1/models/switch failed: ${response.status}`)
+      }
+
+      await response.json()
+      const nextModel = modelId
+
+      setCurrentModel(nextModel)
+      setModelOptions((prev) => {
+        if (prev.some((option) => option.id === nextModel)) {
+          return prev.map((option) =>
+            option.id === nextModel ? { ...option, status: 'connected' } : option
+          )
+        }
+        return [
+          ...prev,
+          {
+            id: nextModel,
+            label: formatModelLabel(nextModel),
+            status: 'connected',
+          },
+        ]
+      })
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : t('chat.modelSwitchFailed')
+      setModelSwitchError(`${t('chat.modelSwitchFailed')}: ${detail}`)
+    }
+  }, [t])
 
   const handleSend = React.useCallback(
     async (text: string) => {
@@ -581,6 +683,15 @@ export default function ChatPage() {
           <ChatMessage key={message.id} message={message} />
         ))}
       </div>
+
+      {modelSwitchError ? (
+        <div className="border-t border-border bg-canvas px-4 py-2">
+          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 break-words">{modelSwitchError}</span>
+          </div>
+        </div>
+      ) : null}
 
       <ChatInput
         onSend={handleSend}

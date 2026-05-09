@@ -8,6 +8,7 @@ import {
   Plus,
   Search,
   Pin,
+  Trash2,
   Zap,
   Settings,
   Library,
@@ -15,6 +16,14 @@ import {
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { useI18n } from '@/lib/i18n'
 import { useUIStore } from '@/lib/stores/ui-store'
 import { SessionItem } from './SessionItem'
@@ -61,6 +70,7 @@ export function Sidebar() {
   const collapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed)
   const [search, setSearch] = React.useState('')
+  const [pendingDeleteSession, setPendingDeleteSession] = React.useState<Session | null>(null)
 
   const {
     sessions,
@@ -103,6 +113,15 @@ export function Sidebar() {
     router.push('/')
   }
 
+  const handleConfirmDelete = () => {
+    if (!pendingDeleteSession) {
+      return
+    }
+    const sessionId = pendingDeleteSession.id
+    setPendingDeleteSession(null)
+    void deleteSession(sessionId)
+  }
+
   const renderSession = (s: (typeof sessions)[number]) => (
     <SessionItem
       key={s.id}
@@ -111,133 +130,176 @@ export function Sidebar() {
       isCollapsed={collapsed}
       onClick={() => handleSelectSession(s.id)}
       onRename={(title) => void renameSession(s.id, title)}
-      onDelete={() => void deleteSession(s.id)}
+      onDelete={() => setPendingDeleteSession(s)}
     />
   )
 
   return (
-    <aside
-      className={cn(
-        'flex flex-col h-full bg-sidebar-layer border-r border-border',
-        'transition-[width] duration-300 ease-out-smooth overflow-hidden shrink-0',
-        collapsed ? 'w-16' : 'w-[260px]'
-      )}
-    >
-      {/* Header */}
-      <div className={cn('flex items-center h-12 border-b border-border px-3 shrink-0', collapsed && 'justify-center px-0')}>
-        {!collapsed && (
-          <div className="flex items-center gap-2 flex-1 min-w-0">
-            <Zap className="h-5 w-5 text-primary-500 shrink-0" />
-            <span className="font-semibold text-sm text-foreground truncate">Mochi</span>
-          </div>
+    <>
+      <aside
+        className={cn(
+          'flex flex-col h-full bg-sidebar-layer border-r border-border',
+          'transition-[width] duration-300 ease-out-smooth overflow-hidden shrink-0',
+          collapsed ? 'w-16' : 'w-[260px]'
         )}
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={() => setSidebarCollapsed(!collapsed)}
-          aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
-          className="shrink-0"
-        >
-          {collapsed ? (
-            <PanelLeftOpen className="h-4 w-4" />
-          ) : (
-            <PanelLeftClose className="h-4 w-4" />
+      >
+        {/* Header */}
+        <div className={cn('flex items-center h-12 border-b border-border px-3 shrink-0', collapsed && 'justify-center px-0')}>
+          {!collapsed && (
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <Zap className="h-5 w-5 text-primary-500 shrink-0" />
+              <span className="font-semibold text-sm text-foreground truncate">Mochi</span>
+            </div>
           )}
-        </Button>
-      </div>
-
-      {/* Actions */}
-      <div className={cn('px-3 pt-3 pb-2 flex flex-col gap-2', collapsed && 'items-center px-2')}>
-        <Button
-          variant="primary"
-          size={collapsed ? 'icon' : 'md'}
-          className={cn('w-full', collapsed && 'w-9')}
-          onClick={handleNewSession}
-          title={t('sidebar.newChatShortcut')}
-        >
-          <Plus className="h-4 w-4" />
-          {!collapsed && <span>{t('sidebar.newChat')}</span>}
-        </Button>
-
-        {!collapsed && (
-          <div className="relative">
-            <Input
-              id="sidebar-search-input"
-              placeholder={t('sidebar.searchPlaceholder')}
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              leftIcon={<Search className="h-3.5 w-3.5" />}
-              size="sm"
-              className="pl-8"
-            />
-          </div>
-        )}
-
-        <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-2')}>
           <Button
             variant="ghost"
-            size={collapsed ? 'icon' : 'sm'}
-            onClick={() => router.push('/skills')}
-            title={t('sidebar.skills')}
-            className={collapsed ? 'w-9' : 'justify-start'}
+            size="icon-sm"
+            onClick={() => setSidebarCollapsed(!collapsed)}
+            aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
+            className="shrink-0"
           >
-            <Library className="h-4 w-4" />
-            {!collapsed && <span>Skills</span>}
-          </Button>
-          <Button
-            variant="ghost"
-            size={collapsed ? 'icon' : 'sm'}
-            onClick={() => router.push('/settings')}
-            title={t('sidebar.settings')}
-            className={collapsed ? 'w-9' : 'justify-start'}
-          >
-            <Settings className="h-4 w-4" />
-            {!collapsed && <span>{t('sidebar.settings')}</span>}
+            {collapsed ? (
+              <PanelLeftOpen className="h-4 w-4" />
+            ) : (
+              <PanelLeftClose className="h-4 w-4" />
+            )}
           </Button>
         </div>
-      </div>
 
-      {/* Session list */}
-      <nav className="flex-1 overflow-y-auto px-2 py-1 space-y-0.5">
-        {/* Pinned */}
-        {pinned.length > 0 && (
-          <SessionGroup
-            label={t('sidebar.pinned')}
-            icon={<Pin className="h-3 w-3" />}
-            collapsed={collapsed}
+        {/* Actions */}
+        <div className={cn('px-3 pt-3 pb-2 flex flex-col gap-2', collapsed && 'items-center px-2')}>
+          <Button
+            variant="primary"
+            size={collapsed ? 'icon' : 'md'}
+            className={cn('w-full', collapsed && 'w-9')}
+            onClick={handleNewSession}
+            title={t('sidebar.newChatShortcut')}
           >
-            {pinned.map(renderSession)}
-          </SessionGroup>
-        )}
+            <Plus className="h-4 w-4" />
+            {!collapsed && <span>{t('sidebar.newChat')}</span>}
+          </Button>
 
-        {/* Today */}
-        {today.length > 0 && (
-          <SessionGroup label={t('sidebar.today')} collapsed={collapsed}>
-            {today.map(renderSession)}
-          </SessionGroup>
-        )}
+          {!collapsed && (
+            <div className="relative">
+              <Input
+                id="sidebar-search-input"
+                placeholder={t('sidebar.searchPlaceholder')}
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                leftIcon={<Search className="h-3.5 w-3.5" />}
+                size="sm"
+                className="pl-8"
+              />
+            </div>
+          )}
 
-        {/* This week */}
-        {thisWeek.length > 0 && (
-          <SessionGroup label={t('sidebar.thisWeek')} collapsed={collapsed}>
-            {thisWeek.map(renderSession)}
-          </SessionGroup>
-        )}
+          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-2')}>
+            <Button
+              variant="ghost"
+              size={collapsed ? 'icon' : 'sm'}
+              onClick={() => router.push('/skills')}
+              title={t('sidebar.skills')}
+              className={collapsed ? 'w-9' : 'justify-start'}
+            >
+              <Library className="h-4 w-4" />
+              {!collapsed && <span>Skills</span>}
+            </Button>
+            <Button
+              variant="ghost"
+              size={collapsed ? 'icon' : 'sm'}
+              onClick={() => router.push('/settings')}
+              title={t('sidebar.settings')}
+              className={collapsed ? 'w-9' : 'justify-start'}
+            >
+              <Settings className="h-4 w-4" />
+              {!collapsed && <span>{t('sidebar.settings')}</span>}
+            </Button>
+          </div>
+        </div>
 
-        {/* Older */}
-        {older.length > 0 && (
-          <SessionGroup label={t('sidebar.older')} collapsed={collapsed}>
-            {older.map(renderSession)}
-          </SessionGroup>
-        )}
+        {/* Session list */}
+        <nav className="flex-1 overflow-y-auto px-2 py-1 space-y-0.5">
+          {/* Pinned */}
+          {pinned.length > 0 && (
+            <SessionGroup
+              label={t('sidebar.pinned')}
+              icon={<Pin className="h-3 w-3" />}
+              collapsed={collapsed}
+            >
+              {pinned.map(renderSession)}
+            </SessionGroup>
+          )}
 
-        {filtered.length === 0 && (
-          <p className="text-xs text-muted-foreground text-center py-6">
-            {search ? t('sidebar.noResults') : t('sidebar.noSessions')}
-          </p>
-        )}
-      </nav>
-    </aside>
+          {/* Today */}
+          {today.length > 0 && (
+            <SessionGroup label={t('sidebar.today')} collapsed={collapsed}>
+              {today.map(renderSession)}
+            </SessionGroup>
+          )}
+
+          {/* This week */}
+          {thisWeek.length > 0 && (
+            <SessionGroup label={t('sidebar.thisWeek')} collapsed={collapsed}>
+              {thisWeek.map(renderSession)}
+            </SessionGroup>
+          )}
+
+          {/* Older */}
+          {older.length > 0 && (
+            <SessionGroup label={t('sidebar.older')} collapsed={collapsed}>
+              {older.map(renderSession)}
+            </SessionGroup>
+          )}
+
+          {filtered.length === 0 && (
+            <p className="text-xs text-muted-foreground text-center py-6">
+              {search ? t('sidebar.noResults') : t('sidebar.noSessions')}
+            </p>
+          )}
+        </nav>
+      </aside>
+
+      <Dialog
+        open={pendingDeleteSession !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingDeleteSession(null)
+          }
+        }}
+      >
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[430px] rounded-xl border-border/80 p-0 shadow-2xl">
+          <DialogHeader className="mb-0 px-5 pt-5 pb-3">
+            <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-error/12 text-error">
+              <Trash2 className="h-4 w-4" />
+            </div>
+            <DialogTitle className="text-lg">{t('sidebar.deleteDialogTitle')}</DialogTitle>
+            <DialogDescription className="leading-6">
+              {t('sidebar.deleteDialogDescription', {
+                title: pendingDeleteSession?.title ?? t('sidebar.newChat'),
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-0 gap-2 border-t border-border/70 px-5 py-4 sm:flex-row sm:justify-end">
+            <Button
+              type="button"
+              variant="ghost"
+              size="md"
+              onClick={() => setPendingDeleteSession(null)}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              size="md"
+              onClick={handleConfirmDelete}
+            >
+              {t('sidebar.deleteDialogAction')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 

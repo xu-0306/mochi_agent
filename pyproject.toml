@@ -55,11 +55,16 @@ tts-extras = [
 
 channels = [
     "discord.py[voice]>=2.3",
+    "discord-ext-voice-recv>=0.5.2a179",
     "python-telegram-bot>=21",
 ]
 
+tools = [
+    "trafilatura>=1.12",
+]
+
 all = [
-    "mochi[gguf,hf,voice,channels]",
+    "mochi[gguf,hf,voice,channels,tools]",
     # voice-extras / tts-extras 不放進 all，因為版本波動快，
     # 使用者按需 `uv sync --extra voice-extras` 手動啟用
 ]

@@ -9,9 +9,9 @@ from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, WebSocket
-from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from mochi.voice.capabilities import get_voice_capabilities
 from mochi.voice.ws_bridge import VoiceWebSocketBridge
@@ -173,7 +173,10 @@ def create_app() -> FastAPI:
     @app.post("/v1/channels/{channel_name}/start")
     async def start_channel(channel_name: str) -> dict[str, Any]:
         """啟動單一已註冊頻道。"""
-        manager = _require_channel_manager(app)
+        try:
+            manager = await _ensure_channel_manager(app)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if channel_name not in set(_safe_registered_channels(manager)):
             raise HTTPException(status_code=404, detail="Channel not registered")
         start_one = getattr(manager, "start_channel", None)
@@ -377,6 +380,49 @@ async def _get_or_create_engine(app: FastAPI) -> Any:
     return engine
 
 
+async def _build_channel_manager_for_app(app: FastAPI) -> Any:
+    """依目前 app config/engine 建立新的 channel manager。"""
+    from mochi.channels.manager import build_channel_manager
+
+    config = await _get_config(app)
+    engine = await _get_or_create_engine(app)
+    return build_channel_manager(config, engine)
+
+
+async def _ensure_channel_manager(app: FastAPI) -> Any:
+    """確保 app 擁有可用的 channel manager，但不自動啟動頻道。"""
+    existing = cast(Any | None, getattr(app.state, "channel_manager", None))
+    if existing is not None:
+        return existing
+
+    manager = await _build_channel_manager_for_app(app)
+    app.state.channel_manager = manager
+    return manager
+
+
+async def _rebuild_channel_manager(app: FastAPI) -> Any:
+    """以最新 config/engine 重建 channel manager，保留先前 running set。"""
+    previous = cast(Any | None, getattr(app.state, "channel_manager", None))
+    previously_running = set(_safe_running_channels(previous)) if previous is not None else set()
+
+    if previous is not None:
+        stop_all = getattr(previous, "stop_all", None)
+        if callable(stop_all):
+            await _maybe_await(stop_all())
+
+    manager = await _build_channel_manager_for_app(app)
+    app.state.channel_manager = manager
+
+    for name in sorted(previously_running):
+        if name not in set(_safe_registered_channels(manager)):
+            continue
+        start_one = getattr(manager, "start_channel", None)
+        if callable(start_one):
+            await _maybe_await(start_one(name))
+
+    return manager
+
+
 async def _get_config(app: FastAPI) -> Any:
     """取得 API status endpoint 使用的設定物件。"""
     existing = cast(Any | None, getattr(app.state, "config", None))
@@ -507,6 +553,13 @@ def _safe_running_channels(manager: Any) -> list[str]:
 
 async def _shutdown_engine(app: FastAPI) -> None:
     """關閉時釋放 engine 資源。"""
+    manager = cast(Any | None, getattr(app.state, "channel_manager", None))
+    if manager is not None:
+        stop_all = getattr(manager, "stop_all", None)
+        if callable(stop_all):
+            await _maybe_await(stop_all())
+        app.state.channel_manager = None
+
     engine = cast(Any, app.state.engine)
     if engine is None:
         return

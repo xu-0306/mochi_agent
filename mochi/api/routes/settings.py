@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field, SecretStr
 
-from mochi.api.server import _get_config, _maybe_await
+from mochi.api.server import _get_config, _maybe_await, _rebuild_channel_manager
 from mochi.config.defaults import DEFAULT_EDGE_TTS_VOICE_PRESETS
 from mochi.config.manager import save_config
 from mochi.config.schema import (
@@ -146,6 +146,7 @@ class LearningSettingsPatch(BaseModel):
 
     enabled: bool | None = None
     auto_extract_skills: bool | None = None
+    auto_sync_filesystem_skills: bool | None = None
     min_steps_for_extraction: int | None = Field(default=None, ge=1, le=100)
     trajectory_retention_days: int | None = Field(default=None, ge=1, le=3650)
     skill_improvement_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -220,6 +221,27 @@ class UpdateSettingsRequest(BaseModel):
     persist: bool = True
 
 
+class DiscordSetupRequest(BaseModel):
+    """Discord 安全 onboarding request。"""
+
+    bot_token: str | None = None
+    enabled: bool = True
+    text_enabled: bool = True
+    voice_enabled: bool = True
+    allowed_guild_ids: list[int] | None = None
+    allowed_channel_ids: list[int] | None = None
+    allowed_voice_channel_ids: list[int] | None = None
+    allowed_user_ids: list[int] | None = None
+    rate_limit_per_user: int | None = Field(default=None, ge=1, le=10_000)
+    message_mode: Literal["all_messages", "mentions_only", "slash_only"] | None = None
+    auto_join_policy: Literal["manual_only"] | None = None
+    voice_auto_reply: bool | None = None
+    voice_stt_enabled: bool | None = None
+    voice_tts_enabled: bool | None = None
+    persist: bool = True
+    reload_voice: bool = False
+
+
 def _stringify_path(value: Any) -> str | None:
     """將 Path-like 值轉為字串。"""
     if value is None:
@@ -249,6 +271,8 @@ async def update_settings(request: Request, payload: UpdateSettingsRequest) -> d
         apply_config = getattr(engine, "apply_config", None)
         if callable(apply_config):
             await _maybe_await(apply_config(updated, reload_voice=payload.reload_voice))
+    if payload.channels is not None and getattr(request.app.state, "channel_manager", None) is not None:
+        await _rebuild_channel_manager(request.app)
 
     persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
 
@@ -258,6 +282,44 @@ async def update_settings(request: Request, payload: UpdateSettingsRequest) -> d
         "download": download_result,
         "persisted": persisted_path is not None,
         "config_path": str(persisted_path) if persisted_path is not None else None,
+    }
+    return response
+
+
+@router.post("/setup/discord")
+async def setup_discord(request: Request, payload: DiscordSetupRequest) -> dict[str, Any]:
+    """以專用安全路徑設定 Discord token 與頻道選項。"""
+    config = await _get_config(request.app)
+    try:
+        updated = _apply_discord_setup(config, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _ensure_config_directories(updated)
+
+    request.app.state.config = updated
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        apply_config = getattr(engine, "apply_config", None)
+        if callable(apply_config):
+            await _maybe_await(apply_config(updated, reload_voice=payload.reload_voice))
+    if (
+        getattr(request.app.state, "channel_manager", None) is not None
+        or updated.channels.discord.enabled
+    ):
+        await _rebuild_channel_manager(request.app)
+
+    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
+    response = _settings_payload(updated)
+    response["update"] = {
+        "type": "discord_setup",
+        "persisted": persisted_path is not None,
+        "config_path": str(persisted_path) if persisted_path is not None else None,
+        "discord": {
+            "configured": True,
+            "enabled": updated.channels.discord.enabled,
+            "text_enabled": updated.channels.discord.text_enabled,
+            "voice_enabled": updated.channels.discord.voice_enabled,
+        },
     }
     return response
 
@@ -287,6 +349,10 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "default_model_spec": config.model_setup.default_model_spec,
             "setup_required": config.model_setup.setup_required,
             "fallback_chain": list(config.model_setup.fallback_chain),
+            "configured_models": [
+                model.model_dump()
+                for model in config.model_setup.configured_models
+            ],
         },
         "locale_defaults": {
             "region_profile": config.locale_defaults.region_profile,
@@ -333,9 +399,16 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "max_short_term_messages": config.memory.max_short_term_messages,
             "fts_top_k": config.memory.fts_top_k,
         },
+        "tools": {
+            "web_search_engine": config.tools.web_search_engine,
+            "web_search_searxng_base_url": config.tools.web_search_searxng_base_url,
+            "web_search_brave_api_key_configured": config.tools.web_search_brave_api_key
+            is not None,
+        },
         "learning": {
             "enabled": config.learning.enabled,
             "auto_extract_skills": config.learning.auto_extract_skills,
+            "auto_sync_filesystem_skills": config.learning.auto_sync_filesystem_skills,
             "min_steps_for_extraction": config.learning.min_steps_for_extraction,
             "trajectory_retention_days": config.learning.trajectory_retention_days,
             "skill_improvement_threshold": config.learning.skill_improvement_threshold,
@@ -444,6 +517,32 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
         updates.update(_normalize_empty_paths(payload.paths.model_dump(exclude_unset=True), set()))
 
     return config.model_copy(update=updates)
+
+
+def _apply_discord_setup(config: MochiConfig, payload: DiscordSetupRequest) -> MochiConfig:
+    """套用 Discord 專用 onboarding 設定。"""
+    discord_updates = payload.model_dump(exclude={"bot_token", "persist", "reload_voice"}, exclude_unset=True)
+    existing_token = config.channels.discord.bot_token
+    normalized_token = payload.bot_token.strip() if isinstance(payload.bot_token, str) else ""
+    if normalized_token:
+        secret_token = SecretStr(normalized_token)
+    elif existing_token is not None:
+        secret_token = existing_token
+    else:
+        raise ValueError("Discord bot token is required for initial setup.")
+    merged_discord = {
+        **config.channels.discord.model_dump(),
+        **discord_updates,
+        "bot_token": secret_token,
+    }
+    updated_discord = DiscordPlatformConfig.model_validate(merged_discord)
+    updated_channels = ChannelsConfig.model_validate(
+        {
+            **config.channels.model_dump(),
+            "discord": updated_discord,
+        }
+    )
+    return config.model_copy(update={"channels": updated_channels})
 
 
 def _configured_provider(config: MochiConfig) -> str:

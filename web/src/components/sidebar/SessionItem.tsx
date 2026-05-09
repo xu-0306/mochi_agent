@@ -175,9 +175,7 @@ export function SessionItem({
             aria-label={t('sidebar.deleteConversation')}
             onClick={(event) => {
               event.stopPropagation()
-              if (window.confirm(t('sidebar.deleteConfirm', { title: visibleTitle }))) {
-                onDelete?.()
-              }
+              onDelete?.()
             }}
           >
             <Trash2 className="h-3.5 w-3.5 text-error" />

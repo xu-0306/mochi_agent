@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from loguru import logger
 from pydantic import SecretStr
 
+from mochi.config import defaults
 from mochi.config.schema import MochiConfig
 
 PROJECT_DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
@@ -17,13 +18,13 @@ PROJECT_DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 
 def user_config_path() -> Path:
     """回傳目前使用者的 Mochi YAML 設定檔路徑。"""
-    return Path.home() / ".mochi" / "config.yaml"
+    return defaults.default_config_path()
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
     """將任意值安全轉為 dict。"""
     if isinstance(value, dict):
-        return dict(value)
+        return dict(cast(dict[str, Any], value))
     return {}
 
 
@@ -106,6 +107,55 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         ollama_section["base_url"] = ollama_base_url
         merged["ollama"] = ollama_section
 
+    tools_section = _coerce_mapping(merged.get("tools"))
+    for env_name, config_key in {
+        "MOCHI_WEB_SEARCH_ENGINE": "web_search_engine",
+        "MOCHI_WEB_SEARCH_SEARXNG_BASE_URL": "web_search_searxng_base_url",
+        "MOCHI_BRAVE_API_KEY": "web_search_brave_api_key",
+        "MOCHI_TAVILY_API_KEY": "web_search_tavily_api_key",
+        "MOCHI_SERPER_API_KEY": "web_search_serper_api_key",
+        "MOCHI_JINA_API_KEY": "web_search_jina_api_key",
+        "MOCHI_EXA_API_KEY": "web_search_exa_api_key",
+        "MOCHI_S2_API_KEY": "semantic_scholar_api_key",
+        "MOCHI_PUBMED_API_KEY": "pubmed_api_key",
+        "MOCHI_PUBMED_EMAIL": "pubmed_email",
+        "MOCHI_CROSSREF_MAILTO": "crossref_mailto",
+    }.items():
+        value = _read_env(env_name)
+        if value is not None:
+            tools_section[config_key] = value
+    if tools_section:
+        merged["tools"] = tools_section
+
+    for env_name, config_key in {
+        "MOCHI_WORKSPACE_DIR": "workspace_dir",
+        "MOCHI_SESSIONS_DIR": "sessions_dir",
+        "MOCHI_SKILLS_DIR": "skills_dir",
+        "MOCHI_PLUGINS_DIR": "plugins_dir",
+    }.items():
+        value = _read_env(env_name)
+        if value is not None:
+            merged[config_key] = value
+
+    return merged
+
+
+def _apply_platform_path_defaults(raw: dict[str, Any]) -> dict[str, Any]:
+    """未明確設定路徑時套用平台感知預設。"""
+    merged = dict(raw)
+    path_defaults = {
+        "workspace_dir": defaults.default_workspace_dir(),
+        "sessions_dir": defaults.default_sessions_dir(),
+        "skills_dir": defaults.default_skills_dir(),
+        "plugins_dir": defaults.default_plugins_dir(),
+    }
+    for key, value in path_defaults.items():
+        if key not in merged or merged[key] in (None, ""):
+            merged[key] = value
+    memory_section = _coerce_mapping(merged.get("memory"))
+    if "db_path" not in memory_section or memory_section.get("db_path") in (None, ""):
+        memory_section["db_path"] = defaults.default_memory_db_path()
+    merged["memory"] = memory_section
     return merged
 
 
@@ -114,7 +164,7 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
 
     Args:
         config_path: YAML 設定檔路徑；None 時依序嘗試
-                     ~/.mochi/config.yaml → ./configs/default.yaml。
+                     platform user config → ./configs/default.yaml。
 
     Returns:
         解析後的 MochiConfig 實例。
@@ -133,10 +183,14 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
         if path.exists():
             logger.debug(f"Loading config from {path}")
             raw = _coerce_mapping(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-            return MochiConfig.model_validate(_apply_env_overrides(raw))
+            return MochiConfig.model_validate(
+                _apply_env_overrides(_apply_platform_path_defaults(raw))
+            )
 
     logger.debug("No config file found, using defaults.")
-    return MochiConfig.model_validate(_apply_env_overrides({}))
+    return MochiConfig.model_validate(
+        _apply_env_overrides(_apply_platform_path_defaults({}))
+    )
 
 
 def save_config(config: MochiConfig, config_path: str | Path | None = None) -> Path:
@@ -163,7 +217,9 @@ def _serialize_for_yaml(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
-        return {key: _serialize_for_yaml(item) for key, item in value.items()}
+        mapping = cast(dict[Any, Any], value)
+        return {key: _serialize_for_yaml(item) for key, item in mapping.items()}
     if isinstance(value, list):
-        return [_serialize_for_yaml(item) for item in value]
+        items = cast(list[Any], value)
+        return [_serialize_for_yaml(item) for item in items]
     return value

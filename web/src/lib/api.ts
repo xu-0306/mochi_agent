@@ -426,6 +426,17 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
     .filter(isRecord)
     .map(normalizeTimelineEvent)
     .filter((event): event is NormalizedTimelineEvent => event !== null)
+  const toolResultsByCallId = new Map<string, NormalizedTurnEvent>()
+
+  for (const event of normalized) {
+    if (
+      event.kind === 'turn_event' &&
+      event.phase === 'tool_call_result' &&
+      event.toolCallId
+    ) {
+      toolResultsByCallId.set(event.toolCallId, event)
+    }
+  }
 
   const turnsWithFinalAnswer = new Set(
     normalized
@@ -470,6 +481,24 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
             timestamp,
           }
         case 'tool_call_request':
+          if (event.toolCallId) {
+            const resultEvent = toolResultsByCallId.get(event.toolCallId)
+            if (resultEvent) {
+              return {
+                id,
+                type: 'tool_result',
+                eventType: 'tool_call_result',
+                content: resultEvent.toolError ?? resultEvent.content,
+                toolCallId: event.toolCallId,
+                toolName: event.toolName ?? resultEvent.toolName,
+                toolArgs: event.toolArgs,
+                toolResult: resultEvent.toolResult,
+                toolError: resultEvent.toolError,
+                timestamp: toMessageTimestamp(resultEvent.timestamp ?? event.timestamp),
+              }
+            }
+          }
+
           return {
             id,
             type: 'tool_call',
@@ -481,6 +510,19 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
             timestamp,
           }
         case 'tool_call_result':
+          if (event.toolCallId && toolResultsByCallId.get(event.toolCallId) === event) {
+            const hasRequest = normalized.some(
+              (candidate) =>
+                candidate.kind === 'turn_event' &&
+                candidate.phase === 'tool_call_request' &&
+                candidate.toolCallId === event.toolCallId
+            )
+
+            if (hasRequest) {
+              return null
+            }
+          }
+
           return {
             id,
             type: 'tool_result',
@@ -533,6 +575,7 @@ export async function sendMessage(
     body: JSON.stringify({
       message: text,
       session_id: options.sessionId,
+      model: options.model,
     }),
   })
 
@@ -553,6 +596,7 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
     body: JSON.stringify({
       message: payload.message,
       session_id: payload.session_id ?? payload.sessionId,
+      model: payload.model,
     }),
   })
 }
@@ -838,7 +882,13 @@ export async function deleteSession(sessionId: string): Promise<void> {
 }
 
 interface BackendModelInfo extends Record<string, ApiValue | undefined> {
+  id?: string
   name?: string
+  label?: string
+  model?: string
+  model_spec?: string
+  provider?: string
+  base_url?: string | null
   backend_type?: string
   context_length?: number
   supports_tool_calling?: boolean
@@ -854,11 +904,17 @@ interface BackendModelsStatus {
     description: string
   }>
   active_model: BackendModelInfo | null
+  available_models?: BackendModelInfo[]
   configured_remote_provider?: string | null
 }
 
 export interface ModelInfo {
+  id: string
   name: string
+  label: string
+  provider: string | null
+  modelSpec: string | null
+  baseUrl: string | null
   backendType: string
   contextLength: number | null
   supportsToolCalling: boolean | null
@@ -879,6 +935,7 @@ interface BackendConfigureModelResponse {
   type: 'model_configure'
   provider: ModelProvider
   active_model: BackendModelInfo
+  available_models?: BackendModelInfo[]
   api_key_configured: boolean
   persisted?: boolean
   config_path?: string | null
@@ -888,6 +945,7 @@ export interface ConfigureModelResult {
   type: 'model_configure'
   provider: ModelProvider
   activeModel: ModelInfo
+  availableModels: ModelInfo[]
   apiKeyConfigured: boolean
   persisted: boolean
   configPath: string | null
@@ -902,10 +960,11 @@ export interface ModelsStatus {
     description: string
   }>
   activeModel: ModelInfo | null
+  availableModels: ModelInfo[]
   configuredRemoteProvider: string | null
 }
 
-function normalizeModelInfo(model: BackendModelInfo | null): ModelInfo | null {
+function normalizeModelInfo(model: BackendModelInfo | Record<string, unknown> | null): ModelInfo | null {
   if (!model) {
     return null
   }
@@ -920,7 +979,12 @@ function normalizeModelInfo(model: BackendModelInfo | null): ModelInfo | null {
   }
 
   return {
-    name: getString(model.name) ?? '',
+    id: getString(model.id) ?? getString(model.model_spec) ?? getString(model.name) ?? getString(model.model) ?? '',
+    name: getString(model.name) ?? getString(model.model) ?? getString(model.model_spec) ?? '',
+    label: getString(model.label) ?? getString(model.name) ?? getString(model.model) ?? '',
+    provider: getString(model.provider),
+    modelSpec: getString(model.model_spec),
+    baseUrl: getString(model.base_url),
     backendType: getString(model.backend_type) ?? '',
     contextLength: getNumber(model.context_length) ?? null,
     supportsToolCalling: getBoolean(model.supports_tool_calling) ?? null,
@@ -935,12 +999,18 @@ export async function fetchModelsStatus(): Promise<ModelsStatus> {
     configuredModel: payload.configured_model,
     supportedModelSpecFormats: payload.supported_model_spec_formats,
     activeModel: normalizeModelInfo(payload.active_model),
+    availableModels: getRecordArray(payload.available_models).map((model) =>
+      normalizeModelInfo(model)
+    ).filter((model): model is ModelInfo => model !== null),
     configuredRemoteProvider: payload.configured_remote_provider ?? null,
   }
 }
 
 export async function fetchModels(): Promise<ModelInfo[]> {
   const status = await fetchModelsStatus()
+  if (status.availableModels.length > 0) {
+    return status.availableModels
+  }
   return status.activeModel ? [status.activeModel] : []
 }
 
@@ -983,6 +1053,9 @@ export async function configureModel(input: ConfigureModelInput): Promise<Config
     type: payload.type,
     provider: payload.provider,
     activeModel,
+    availableModels: getRecordArray(payload.available_models).map((model) =>
+      normalizeModelInfo(model)
+    ).filter((model): model is ModelInfo => model !== null),
     apiKeyConfigured: payload.api_key_configured,
     persisted: Boolean(payload.persisted),
     configPath: payload.config_path ?? null,
@@ -1147,6 +1220,7 @@ interface BackendSettings {
   type: 'settings'
   model: string
   model_config?: Record<string, ApiValue>
+  model_setup?: Record<string, ApiValue>
   voice: Record<string, ApiValue>
   memory: Record<string, ApiValue>
   learning: Record<string, ApiValue>
@@ -1160,6 +1234,7 @@ export interface Settings {
   type: 'settings'
   model: string
   model_config?: Record<string, ApiValue>
+  model_setup?: Record<string, ApiValue>
   voice: Record<string, ApiValue>
   memory: Record<string, ApiValue>
   learning: Record<string, ApiValue>
@@ -1198,6 +1273,8 @@ export interface DiscordChannelStatus extends ChannelRuntimeStatus {
   messageMode?: string
   auto_join_policy?: string
   autoJoinPolicy?: string
+  voice_ingress?: Record<string, unknown>
+  voiceIngress?: Record<string, unknown>
   voice_runtime?: Record<string, unknown>
   voiceRuntime?: Record<string, unknown>
 }
@@ -1228,6 +1305,10 @@ export interface DiscordChannelSummary {
   autoJoinPolicy: string | null
   activeVoiceRoomCount: number | null
   reconnectCount: number | null
+  voiceIngressEnabled: boolean | null
+  voiceIngressAvailable: boolean | null
+  voiceIngressGuildIds: string[]
+  voiceIngressError: string | null
   voiceRuntimePhase: string | null
   voiceRuntimeError: string | null
   playbackState: string | null
@@ -1242,11 +1323,29 @@ interface BackendChannelsStatus {
   channels?: unknown
 }
 
+interface BackendChannelsControlResponse {
+  type?: unknown
+  action?: unknown
+  scope?: unknown
+  channel?: unknown
+  running?: unknown
+  running_channels?: unknown
+}
+
 export interface ChannelsStatus {
   type: string
   phase: string | null
   supportedChannels: string[]
   channels: Record<string, ChannelRuntimeStatus>
+}
+
+export interface ChannelsControlResult {
+  type: string
+  action: string | null
+  scope: string | null
+  channel: string | null
+  running: boolean | null
+  runningChannels: string[]
 }
 
 function getRecordMap(value: unknown): Record<string, ChannelRuntimeStatus> {
@@ -1356,6 +1455,9 @@ export function normalizeDiscordChannelStatus(
 ): DiscordChannelSummary {
   const configuredRecord = isRecord(configured) ? configured : {}
   const runtimeRecord = isRecord(runtime) ? runtime : {}
+  const voiceIngress =
+    (isRecord(runtimeRecord.voice_ingress) ? runtimeRecord.voice_ingress : null) ??
+    (isRecord(runtimeRecord.voiceIngress) ? runtimeRecord.voiceIngress : null)
   const voiceRuntime =
     (isRecord(runtimeRecord.voice_runtime) ? runtimeRecord.voice_runtime : null) ??
     (isRecord(runtimeRecord.voiceRuntime) ? runtimeRecord.voiceRuntime : null)
@@ -1438,6 +1540,13 @@ export function normalizeDiscordChannelStatus(
       getNumberField(voiceRuntime ?? {}, ['active_voice_room_count', 'activeVoiceRoomCount']) ??
       activeRooms.length,
     reconnectCount: getNumberField(voiceRuntime ?? {}, ['reconnect_count', 'reconnectCount']),
+    voiceIngressEnabled: getBooleanField(voiceIngress ?? {}, ['enabled']),
+    voiceIngressAvailable: getBooleanField(voiceIngress ?? {}, ['extension_available', 'extensionAvailable']),
+    voiceIngressGuildIds: mergeIdLists(
+      voiceIngress?.active_guild_ids,
+      voiceIngress?.activeGuildIds
+    ),
+    voiceIngressError: getStringField(voiceIngress ?? {}, ['last_error', 'lastError', 'error']),
     voiceRuntimePhase: getStringField(voiceRuntime ?? {}, ['phase']),
     voiceRuntimeError: getStringField(voiceRuntime ?? {}, ['last_error', 'lastError', 'error']),
     playbackState:
@@ -1458,6 +1567,9 @@ export async function fetchSettings(): Promise<Settings> {
     model_config: isRecord(payload.model_config)
       ? payload.model_config as Record<string, ApiValue>
       : undefined,
+    model_setup: isRecord(payload.model_setup)
+      ? payload.model_setup as Record<string, ApiValue>
+      : undefined,
     voice: payload.voice,
     memory: payload.memory,
     learning: payload.learning,
@@ -1475,6 +1587,34 @@ export async function fetchChannelsStatus(): Promise<ChannelsStatus> {
     phase: getString(payload.phase),
     supportedChannels: getStringArray(payload.supported_channels),
     channels: getRecordMap(payload.channels),
+  }
+}
+
+export async function startChannel(name: string): Promise<ChannelsControlResult> {
+  const payload = await requestJson<BackendChannelsControlResponse>(`/channels/${name}/start`, {
+    method: 'POST',
+  })
+  return {
+    type: getString(payload.type) ?? 'channels_control',
+    action: getString(payload.action),
+    scope: getString(payload.scope),
+    channel: getString(payload.channel),
+    running: getBoolean(payload.running),
+    runningChannels: getStringArray(payload.running_channels),
+  }
+}
+
+export async function stopChannel(name: string): Promise<ChannelsControlResult> {
+  const payload = await requestJson<BackendChannelsControlResponse>(`/channels/${name}/stop`, {
+    method: 'POST',
+  })
+  return {
+    type: getString(payload.type) ?? 'channels_control',
+    action: getString(payload.action),
+    scope: getString(payload.scope),
+    channel: getString(payload.channel),
+    running: getBoolean(payload.running),
+    runningChannels: getStringArray(payload.running_channels),
   }
 }
 
@@ -1506,6 +1646,7 @@ export interface MemorySettingsUpdate {
 export interface LearningSettingsUpdate {
   enabled?: boolean
   auto_extract_skills?: boolean
+  auto_sync_filesystem_skills?: boolean
   min_steps_for_extraction?: number
   trajectory_retention_days?: number
   skill_improvement_threshold?: number
@@ -1529,9 +1670,50 @@ export interface UpdateSettingsInput {
   persist?: boolean
 }
 
+export interface DiscordSetupInput {
+  bot_token: string
+  enabled?: boolean
+  text_enabled?: boolean
+  voice_enabled?: boolean
+  allowed_guild_ids?: number[]
+  allowed_channel_ids?: number[]
+  allowed_voice_channel_ids?: number[]
+  allowed_user_ids?: number[]
+  rate_limit_per_user?: number
+  message_mode?: 'all_messages' | 'mentions_only' | 'slash_only'
+  auto_join_policy?: 'manual_only'
+  voice_auto_reply?: boolean
+  voice_stt_enabled?: boolean
+  voice_tts_enabled?: boolean
+  persist?: boolean
+  reload_voice?: boolean
+}
+
 export async function updateSettings(input: UpdateSettingsInput): Promise<Settings> {
   const payload = await requestJson<BackendSettings>('/settings', {
     method: 'PATCH',
+    body: JSON.stringify(input),
+  })
+
+  return {
+    type: payload.type,
+    model: payload.model,
+    model_config: isRecord(payload.model_config)
+      ? payload.model_config as Record<string, ApiValue>
+      : undefined,
+    voice: payload.voice,
+    memory: payload.memory,
+    learning: payload.learning,
+    channels: payload.channels,
+    web: payload.web,
+    paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
+    update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
+  }
+}
+
+export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> {
+  const payload = await requestJson<BackendSettings>('/setup/discord', {
+    method: 'POST',
     body: JSON.stringify(input),
   })
 

@@ -1,7 +1,14 @@
-const CACHE_NAME = 'mochi-web-v1'
+const CACHE_NAME = 'mochi-web-v2'
 const APP_SHELL_URLS = ['/', '/settings', '/skills', '/manifest.webmanifest']
+const LOCAL_DEV_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+const IS_LOCAL_DEV = LOCAL_DEV_HOSTS.has(self.location.hostname)
 
 self.addEventListener('install', (event) => {
+  if (IS_LOCAL_DEV) {
+    self.skipWaiting()
+    return
+  }
+
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL_URLS))
   )
@@ -9,6 +16,20 @@ self.addEventListener('install', (event) => {
 })
 
 self.addEventListener('activate', (event) => {
+  if (IS_LOCAL_DEV) {
+    event.waitUntil(
+      caches.keys().then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key.startsWith('mochi-web-'))
+            .map((key) => caches.delete(key))
+        )
+      ).then(() => self.registration.unregister())
+    )
+    self.clients.claim()
+    return
+  }
+
   event.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(
@@ -22,6 +43,10 @@ self.addEventListener('activate', (event) => {
 })
 
 self.addEventListener('fetch', (event) => {
+  if (IS_LOCAL_DEV) {
+    return
+  }
+
   const request = event.request
 
   if (request.method !== 'GET') {

@@ -45,7 +45,11 @@ class MCPCallTool(BaseTool):
     @property
     def description(self) -> str:
         """工具用途描述。"""
-        return "Call an MCP server tool. Requires an injected caller or adapter to execute."
+        return (
+            "Call a tool exposed by a configured MCP server through an injected caller "
+            "or adapter. Use when the runtime has already wired MCP connectivity. "
+            "This tool does not establish server connections by itself."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:

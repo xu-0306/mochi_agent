@@ -1,5 +1,6 @@
 # Mochi 預設設定檔
-# 複製此檔案到 ~/.mochi/config.yaml 並依需求修改
+# Windows 預設使用 mochi/config.yaml；Linux/macOS 預設使用 ~/.mochi/config.yaml。
+# 可複製此檔案到對應位置後依需求修改。
 
 # 預設模型規格
 # 格式：
@@ -86,8 +87,31 @@ voice:
 # 工具系統設定
 tools:
   extra_tools_dirs: []
-  web_search_engine: "duckduckgo"
-
+  # 搜尋引擎
+  web_search_engine: "tavily"             # 可選: tavily/serper/jina/exa/brave/searxng/duckduckgo
+  web_search_fallback_engines:            # 主引擎失敗時依序嘗試
+    - "brave"
+    - "duckduckgo_html"
+  web_search_tavily_api_key:              # env: MOCHI_TAVILY_API_KEY
+  web_search_serper_api_key:              # env: MOCHI_SERPER_API_KEY
+  web_search_jina_api_key:                # env: MOCHI_JINA_API_KEY
+  web_search_exa_api_key:                 # env: MOCHI_EXA_API_KEY
+  web_search_brave_api_key:               # env: MOCHI_BRAVE_API_KEY
+  web_search_searxng_base_url:            # SearXNG 實例 URL
+  web_search_language:                    # 搜尋語言偏好 (e.g. zh-TW)
+  web_search_region:                      # 搜尋地區偏好 (e.g. tw)
+  # 網頁擷取
+  web_fetch_extractor: "trafilatura"      # 可選: trafilatura/jina_reader/htmlparser
+  web_fetch_jina_api_key:                 # env: 可與 web_search_jina_api_key 共用
+  # 文獻搜尋
+  semantic_scholar_api_key:               # env: MOCHI_S2_API_KEY
+  pubmed_api_key:                         # env: MOCHI_PUBMED_API_KEY
+  pubmed_email:                           # NCBI E-utilities 聯繫 email
+  crossref_mailto:                        # Crossref polite pool email
+  # HTTP 共用
+  http_timeout: 20.0
+  http_max_retries: 3
+  http_backoff_base: 1.0
 # 記憶系統設定
 memory:
   max_short_term_messages: 50
@@ -97,6 +121,7 @@ memory:
 learning:
   enabled: true
   auto_extract_skills: true
+  auto_sync_filesystem_skills: true
   min_steps_for_extraction: 3
   trajectory_retention_days: 30
   skill_improvement_threshold: 0.7
@@ -148,10 +173,13 @@ web:
   reload: false
 
 # 路徑設定
-workspace_dir: "~/.mochi"
-sessions_dir: "~/.mochi/sessions"
-skills_dir: "~/.mochi/skills"
-plugins_dir: "~/.mochi/plugins"
+# 未設定時會依平台選擇：
+#   Windows: mochi/config.yaml, mochi/workspace, mochi/sessions,
+#            mochi/skills, mochi/plugins, mochi/memory/memory.db
+#   Linux/macOS: ~/.mochi/config.yaml, ~/.mochi, ~/.mochi/sessions,
+#                ~/.mochi/skills, ~/.mochi/plugins, ~/.mochi/memory.db
+# 可用 MOCHI_WORKSPACE_DIR / MOCHI_SESSIONS_DIR / MOCHI_SKILLS_DIR /
+# MOCHI_PLUGINS_DIR 或本檔明確覆蓋。
 
 # 日誌等級：DEBUG / INFO / WARNING / ERROR
 log_level: "INFO"

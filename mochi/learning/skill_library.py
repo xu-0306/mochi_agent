@@ -17,7 +17,7 @@ from mochi.learning.types import Skill, Trajectory
 class SkillLibrary:
     """階層式技能庫，使用 SQLite 儲存並以 FTS5 搜尋。"""
 
-    _JSON_FIELDS = {"trigger_keywords", "steps", "tools_used"}
+    _JSON_FIELDS = {"trigger_keywords", "steps", "tools_used", "metadata"}
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         """建立技能庫連線；未指定路徑時使用 in-memory DB。"""
@@ -45,9 +45,10 @@ class SkillLibrary:
                 INSERT INTO skills (
                     skill_id, name, description, trigger_keywords, preconditions,
                     steps, tools_used, source_trajectory_id, times_used,
-                    success_rate, created_at, updated_at, version
+                    success_rate, created_at, updated_at, version, source_type,
+                    source_path, content_hash, body, metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._skill_values(stored),
             )
@@ -118,6 +119,32 @@ class SkillLibrary:
             self._delete_fts(skill_id)
         return result.rowcount > 0
 
+    async def list_indexed_sources(self, *, source_type: str | None = None) -> list[Skill]:
+        """列出帶有 source_path 的索引技能，供檔案同步使用。"""
+        sql = "SELECT * FROM skills WHERE source_path != ''"
+        params: tuple[Any, ...] = ()
+        if source_type is not None:
+            sql += " AND source_type = ?"
+            params = (source_type,)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_skill(row) for row in rows]
+
+    async def upsert(self, skill: Skill) -> str:
+        """新增或替換技能，回傳 skill_id。"""
+        if await self.get(skill.skill_id) is None:
+            return await self.add(skill)
+
+        updates = skill.to_dict()
+        updates.pop("skill_id", None)
+        created_at = updates.pop("created_at", 0)
+        current = await self.get(skill.skill_id)
+        if current is not None and not created_at:
+            updates["created_at"] = current.created_at
+        elif created_at:
+            updates["created_at"] = created_at
+        await self.update(skill.skill_id, updates)
+        return skill.skill_id
+
     async def get_stats(self) -> dict:
         """取得技能庫統計。"""
         row = self._conn.execute(
@@ -187,6 +214,20 @@ class SkillLibrary:
             )
             """,
         )
+        self._ensure_schema_columns()
+        self._ensure_fts_schema()
+        self._sync_missing_fts_rows()
+        self._conn.commit()
+
+    def _ensure_fts_schema(self) -> None:
+        try:
+            rows = self._conn.execute("PRAGMA table_info(skills_fts)").fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        columns = {row["name"] for row in rows}
+        if rows and "body" not in columns:
+            self._conn.execute("DROP TABLE skills_fts")
+
         try:
             self._conn.execute(
                 """
@@ -196,7 +237,8 @@ class SkillLibrary:
                     description,
                     trigger_keywords,
                     steps,
-                    tools_used
+                    tools_used,
+                    body
                 )
                 """,
             )
@@ -204,7 +246,29 @@ class SkillLibrary:
             self._fts_enabled = False
         else:
             self._fts_enabled = True
-        self._conn.commit()
+
+    def _sync_missing_fts_rows(self) -> None:
+        if not self._fts_enabled:
+            return
+        rows = self._conn.execute("SELECT * FROM skills").fetchall()
+        for row in rows:
+            self._sync_fts(self._row_to_skill(row))
+
+    def _ensure_schema_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(skills)").fetchall()
+        }
+        migrations = {
+            "source_type": "ALTER TABLE skills ADD COLUMN source_type TEXT NOT NULL DEFAULT 'learned'",
+            "source_path": "ALTER TABLE skills ADD COLUMN source_path TEXT NOT NULL DEFAULT ''",
+            "content_hash": "ALTER TABLE skills ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+            "body": "ALTER TABLE skills ADD COLUMN body TEXT NOT NULL DEFAULT ''",
+            "metadata": "ALTER TABLE skills ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column_name, statement in migrations.items():
+            if column_name not in columns:
+                self._conn.execute(statement)
 
     def _skill_values(self, skill: Skill) -> tuple[Any, ...]:
         return (
@@ -221,6 +285,11 @@ class SkillLibrary:
             skill.created_at,
             skill.updated_at,
             skill.version,
+            skill.source_type,
+            skill.source_path,
+            skill.content_hash,
+            skill.body,
+            self._to_storage("metadata", skill.metadata),
         )
 
     def _row_to_skill(self, row: sqlite3.Row) -> Skill:
@@ -238,6 +307,11 @@ class SkillLibrary:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             version=row["version"],
+            source_type=row["source_type"],
+            source_path=row["source_path"],
+            content_hash=row["content_hash"],
+            body=row["body"],
+            metadata=json.loads(row["metadata"]),
         )
 
     def _skill_to_dict(self, skill: Skill) -> dict:
@@ -255,9 +329,9 @@ class SkillLibrary:
         self._conn.execute(
             """
             INSERT INTO skills_fts (
-                skill_id, name, description, trigger_keywords, steps, tools_used
+                skill_id, name, description, trigger_keywords, steps, tools_used, body
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 skill.skill_id,
@@ -266,6 +340,7 @@ class SkillLibrary:
                 " ".join(skill.trigger_keywords),
                 " ".join(skill.steps),
                 " ".join(skill.tools_used),
+                skill.body,
             ),
         )
 
@@ -301,10 +376,11 @@ class SkillLibrary:
                OR trigger_keywords LIKE ?
                OR steps LIKE ?
                OR tools_used LIKE ?
+               OR body LIKE ?
             ORDER BY updated_at DESC
             LIMIT ?
             """,
-            (pattern, pattern, pattern, pattern, pattern, top_k),
+            (pattern, pattern, pattern, pattern, pattern, pattern, top_k),
         ).fetchall()
         return [self._row_to_skill(row) for row in rows]
 

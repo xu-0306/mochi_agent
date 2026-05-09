@@ -29,15 +29,18 @@ class BackendRouter:
         self,
         ollama_base_url: str = "http://localhost:11434",
         openai_default_model: str = "auto",
+        openai_api_key: str = "",
     ) -> None:
         """初始化路由器。
 
         Args:
             ollama_base_url: Ollama 服務地址。
             openai_default_model: OpenAI-compatible API 預設模型名稱。
+            openai_api_key: OpenAI-compatible API 預設金鑰。
         """
         self._ollama_base_url = ollama_base_url
         self._openai_default_model = openai_default_model
+        self._openai_api_key = openai_api_key
         self._active: BaseLLMBackend | None = None
 
     async def load(self, model_spec: str) -> BaseLLMBackend:
@@ -106,6 +109,7 @@ class BackendRouter:
             api_key=api_key,
         )
         self._openai_default_model = normalized_model
+        self._openai_api_key = api_key
         return await self._switch_to_backend(backend, normalized_base_url)
 
     async def _switch_to_backend(
@@ -170,6 +174,7 @@ class BackendRouter:
             return OpenAICompatBackend(
                 base_url=model_spec.rstrip("/"),
                 model=self._openai_default_model,
+                api_key=self._openai_api_key,
             )
 
         if model_spec.lower().endswith(".gguf"):

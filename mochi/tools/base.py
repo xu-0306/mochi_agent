@@ -20,6 +20,12 @@ class ToolResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     """附加元資料（如執行時間、資源用量）。"""
 
+    retryable: bool = False
+    """提示 ReAct loop 此錯誤是否可透過重試解決（如 429/5xx/timeout）。"""
+
+    suggestion: str | None = None
+    """給 agent 的修正建議（例如「換用更精確的關鍵字」）。"""
+
 
 class BaseTool(ABC):
     """工具抽象基類。

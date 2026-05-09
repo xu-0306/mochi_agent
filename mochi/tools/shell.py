@@ -52,7 +52,12 @@ class ShellTool(BaseTool):
     @property
     def description(self) -> str:
         """工具用途描述。"""
-        return "Run a shell command under policy constraints (allowlist plus workspace)."
+        return (
+            "Run an allowlisted shell command in the workspace under approval and path "
+            "constraints. Use for simple command-line inspection or automation when file "
+            "tools are not enough. Commands outside the allowlist or workspace policy "
+            "are rejected."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:

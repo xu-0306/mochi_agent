@@ -53,8 +53,8 @@ class PromptBuilder:
         if skills_context:
             parts.append(
                 "\n\n## Reusable Skill Guidance\n"
-                "The following skills were extracted from previously successful tasks. "
-                "Use them as optional strategy guidance:\n"
+                "The following skills were loaded from Mochi's skill library. "
+                "Use them as optional task-specific operating guidance:\n"
                 f"{skills_context}"
             )
 
@@ -85,13 +85,23 @@ class PromptBuilder:
             steps = self._skill_value(skill, "steps", [])
             tools_used = self._skill_value(skill, "tools_used", [])
             version = self._skill_value(skill, "version", 1)
+            source_type = self._skill_value(skill, "source_type", "learned")
+            source_path = self._skill_value(skill, "source_path", "")
+            body = self._skill_value(skill, "body", "")
 
             lines.append(f"### {index}. {name}")
             lines.append(f"- **version**: {version}")
+            lines.append(f"- **source_type**: {source_type}")
+            if source_path:
+                lines.append(f"- **source_path**: {source_path}")
             lines.append(f"- **description**: {description or '(none)'}")
-            lines.append(f"- **preconditions**: {self._format_skill_field(preconditions)}")
-            lines.append("- **steps**:")
-            lines.extend(f"  {line}" for line in self._format_numbered_list(steps))
+            if body:
+                lines.append("- **instructions**:")
+                lines.append(str(body).strip())
+            else:
+                lines.append(f"- **preconditions**: {self._format_skill_field(preconditions)}")
+                lines.append("- **steps**:")
+                lines.extend(f"  {line}" for line in self._format_numbered_list(steps))
             lines.append(f"- **tools_used**: {self._format_skill_field(tools_used)}")
             lines.append("")
 

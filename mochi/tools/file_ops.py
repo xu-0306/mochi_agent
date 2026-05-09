@@ -52,7 +52,11 @@ class FileReadTool(BaseTool):
     @property
     def description(self) -> str:
         """工具用途描述。"""
-        return "Read text file contents from inside the workspace."
+        return (
+            "Read the contents of a text file from the workspace. Returns full text "
+            "content. Use when you need to inspect code, configuration, or notes. "
+            "Cannot read binary files, and the path must stay inside the workspace."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -154,7 +158,11 @@ class FileWriteTool(BaseTool):
     @property
     def description(self) -> str:
         """工具用途描述。"""
-        return "Write text to a file inside the workspace, either replacing or appending."
+        return (
+            "Write text to a file inside the workspace, either replacing or appending. "
+            "Use for controlled text or code updates after deciding on the content. "
+            "Cannot write outside the workspace and may require approval."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:

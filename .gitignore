@@ -71,6 +71,11 @@ logs/
 .codex/
 .codex
 .gemini/
+mochi/config.yaml
+mochi/workspace/
+mochi/sessions/
+mochi/plugins/
+mochi/memory/
 
 # Local scratch files
 1.txt

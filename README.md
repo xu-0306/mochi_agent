@@ -51,6 +51,7 @@ uv sync --extra gguf
 uv sync --extra hf
 uv sync --extra voice
 uv sync --extra channels
+uv sync --extra tools
 ```
 
 Voice backends with more volatile dependencies are separate:
@@ -59,14 +60,21 @@ Voice backends with more volatile dependencies are separate:
 uv sync --extra voice-extras
 ```
 
+`tools` currently installs higher-quality web content extraction support for `web_fetch`
+via `trafilatura`.
+
 The default config lookup order is:
 
-1. `~/.mochi/config.yaml`
+1. Platform user config: `mochi/config.yaml` on Windows, `~/.mochi/config.yaml` on Linux/macOS
 2. `configs/default.yaml`
 
 To create a user config:
 
 ```bash
+# Windows
+copy configs\default.yaml mochi\config.yaml
+
+# Linux/macOS
 mkdir -p ~/.mochi
 cp configs/default.yaml ~/.mochi/config.yaml
 ```
@@ -173,6 +181,26 @@ uv run mochi skills list
 uv run mochi skills show <skill-id>
 uv run mochi skills export --output skills.json
 ```
+
+Filesystem skills can be added by placing a Codex/Claude-style skill directory under
+`skills_dir`:
+
+```text
+mochi/skills/                 # Windows default
+  my-skill/
+    SKILL.md
+    scripts/
+      helper.py
+```
+
+On Windows the runtime defaults live under `mochi/` (`mochi/workspace`,
+`mochi/sessions`, `mochi/skills`, `mochi/plugins`, `mochi/memory/memory.db`).
+On Linux/macOS they remain under `~/.mochi`. You can override paths in config or
+with `MOCHI_WORKSPACE_DIR`, `MOCHI_SESSIONS_DIR`, `MOCHI_SKILLS_DIR`, and
+`MOCHI_PLUGINS_DIR`.
+
+Mochi automatically scans `skills_dir/**/SKILL.md` when listing/searching skills or
+building chat context. The SQLite `skills.db` file is only a searchable cache.
 
 ## Run the FastAPI backend
 
@@ -299,7 +327,7 @@ Mochi persists:
 
 - sessions under `sessions_dir`
 - memory in SQLite
-- learned skills under `skills_dir`
+- learned skill index and filesystem skills under `skills_dir`
 - trajectories in the workspace
 
 By default, successful tasks can feed the skill learning loop. The exact behavior is controlled by `learning.*` settings such as:

@@ -44,6 +44,30 @@ export default function RootLayout({
       }
     } catch {}
   `
+  const serviceWorkerCleanupScript = process.env.NODE_ENV !== 'production'
+    ? `
+      try {
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistrations()
+            .then(function (registrations) {
+              return Promise.all(registrations.map(function (registration) {
+                return registration.unregister();
+              }));
+            })
+            .catch(function () {});
+        }
+        if ('caches' in window) {
+          window.caches.keys()
+            .then(function (keys) {
+              return Promise.all(keys
+                .filter(function (key) { return key.indexOf('mochi-web-') === 0; })
+                .map(function (key) { return window.caches.delete(key); }));
+            })
+            .catch(function () {});
+        }
+      } catch {}
+    `
+    : null
 
   return (
     <html
@@ -58,6 +82,11 @@ export default function RootLayout({
         <Script id="mochi-theme-bootstrap" strategy="beforeInteractive">
           {themeBootstrapScript}
         </Script>
+        {serviceWorkerCleanupScript ? (
+          <Script id="mochi-dev-service-worker-cleanup" strategy="beforeInteractive">
+            {serviceWorkerCleanupScript}
+          </Script>
+        ) : null}
         <I18nProvider>
           <AppClientBootstrap />
           <div className="flex h-full">

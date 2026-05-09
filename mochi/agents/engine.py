@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 from loguru import logger
+from pydantic import SecretStr
 
 from mochi.agents.compaction import ConversationCompactor
 from mochi.agents.context import ContextManager
@@ -31,6 +32,7 @@ from mochi.learning.evaluator import OutcomeEvaluator
 from mochi.learning.extractor import SkillExtractor
 from mochi.learning.improver import SkillImprover
 from mochi.learning.skill_library import SkillLibrary
+from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
 from mochi.learning.trajectory import TrajectoryLogger
 from mochi.learning.types import Trajectory, TrajectoryStep
 from mochi.memory.conversation import ConversationMemory
@@ -38,11 +40,18 @@ from mochi.memory.store import MemoryStore
 from mochi.sessions.store import SessionStore
 from mochi.tools.execute_code import ExecuteCodeTool
 from mochi.tools.file_ops import FileReadTool, FileWriteTool
+from mochi.tools.literature_search import (
+    ArxivSearchTool,
+    CrossrefSearchTool,
+    PubMedSearchTool,
+    SemanticScholarSearchTool,
+)
 from mochi.tools.mcp_client import MCPCallTool
 from mochi.tools.memory_save import MemorySaveTool
 from mochi.tools.memory_search import MemorySearchTool
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.shell import ShellTool
+from mochi.tools.web_fetch import WebFetchTool
 from mochi.tools.web_search import WebSearchTool
 from mochi.voice.events import VoiceEvent
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS, VoiceRouter
@@ -74,6 +83,11 @@ class AgentEngine:
         self._router = BackendRouter(
             ollama_base_url=config.ollama.base_url,
             openai_default_model=config.openai_compat.model,
+            openai_api_key=(
+                config.openai_compat.api_key.get_secret_value()
+                if config.openai_compat.api_key is not None
+                else ""
+            ),
         )
         self._tool_registry = ToolRegistry(
             extra_dirs=config.tools.extra_tools_dirs or None,
@@ -84,6 +98,7 @@ class AgentEngine:
         self._session_store = SessionStore(sessions_dir=config.sessions_dir)
         self._contexts: dict[str, ContextManager] = {}
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
+        self._skill_loader = self._make_skill_loader()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
         self._outcome_evaluator = OutcomeEvaluator()
         self._skill_extractor = SkillExtractor()
@@ -249,10 +264,12 @@ class AgentEngine:
 
     async def list_skills(self) -> list:
         """列出目前技能庫中的技能。"""
+        await self._sync_filesystem_skills()
         return await self._skill_library.list()
 
     async def search_skills(self, query: str, top_k: int = 3) -> list:
         """搜尋目前技能庫中的相關技能。"""
+        await self._sync_filesystem_skills()
         return await self._skill_library.search(query, top_k=top_k)
 
     async def provide_feedback(self, trajectory_id: str, feedback: str) -> None:
@@ -267,6 +284,7 @@ class AgentEngine:
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
         self._session_store = SessionStore(sessions_dir=config.sessions_dir)
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
+        self._skill_loader = self._make_skill_loader()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
         self._contexts.clear()
         self._register_builtin_tools()
@@ -396,11 +414,25 @@ class AgentEngine:
         if not self._config.learning.enabled:
             return ""
         try:
+            await self._sync_filesystem_skills()
             skills = await self._skill_library.search(message, top_k=3)
         except Exception as exc:  # pragma: no cover - 防禦性收斂
             logger.warning(f"Skill search failed: {exc}")
             return ""
         return self._prompt_builder.format_skills_context(skills)
+
+    def _make_skill_loader(self) -> SkillLoader:
+        return SkillLoader.from_paths(
+            self._config.skills_dir,
+            system_skills_dir=default_system_skills_dir(),
+        )
+
+    async def _sync_filesystem_skills(self) -> None:
+        if not self._config.learning.auto_sync_filesystem_skills:
+            return
+        result = await self._skill_loader.sync(self._skill_library)
+        if result.errors:
+            logger.warning(f"Filesystem skill sync completed with errors: {result.errors}")
 
     def _start_trajectory(self, message: str) -> str | None:
         """依設定啟動本輪 trajectory 記錄。"""
@@ -503,10 +535,17 @@ class AgentEngine:
             extracted = await self._skill_extractor.extract(trajectory, self._router.active)
             matches = await self._skill_library.search(
                 " ".join([extracted.name, extracted.description, *extracted.trigger_keywords]),
-                top_k=1,
+                top_k=3,
             )
-            if matches and matches[0].success_rate >= self._config.learning.skill_improvement_threshold:
-                improved = await self._skill_improver.improve(matches[0], trajectory, self._router.active)
+            learned_match = next(
+                (match for match in matches if getattr(match, "source_type", "learned") == "learned"),
+                None,
+            )
+            if (
+                learned_match
+                and learned_match.success_rate >= self._config.learning.skill_improvement_threshold
+            ):
+                improved = await self._skill_improver.improve(learned_match, trajectory, self._router.active)
                 await self._skill_library.update(improved.skill_id, improved.to_dict())
             else:
                 await self._skill_library.add(extracted)
@@ -515,6 +554,11 @@ class AgentEngine:
 
     def _register_builtin_tools(self) -> None:
         """以共享 runtime 物件覆蓋內建工具預設實例。"""
+        from mochi.tools.calculator import CalculatorTool
+        from mochi.tools.datetime_tool import DateTimeTool
+
+        tc = self._config.tools  # shortcut
+
         self._tool_registry.register(
             ShellTool(
                 allowlist=self._config.security.shell_command_allowlist,
@@ -532,16 +576,71 @@ class AgentEngine:
                 max_write_size_mb=self._config.security.max_file_write_size_mb,
             )
         )
+
+        # --- 搜尋工具 ---
+        def _secret(s: SecretStr | None) -> str | None:
+            return s.get_secret_value() if s is not None else None
+
         self._tool_registry.register(
-            WebSearchTool(engine=self._config.tools.web_search_engine)
+            WebSearchTool(
+                engine=tc.web_search_engine,
+                timeout=tc.http_timeout,
+                fallback_engines=tc.web_search_fallback_engines,
+                searxng_base_url=tc.web_search_searxng_base_url,
+                brave_api_key=_secret(tc.web_search_brave_api_key),
+                tavily_api_key=_secret(tc.web_search_tavily_api_key),
+                serper_api_key=_secret(tc.web_search_serper_api_key),
+                jina_api_key=_secret(tc.web_search_jina_api_key),
+                exa_api_key=_secret(tc.web_search_exa_api_key),
+                language=tc.web_search_language,
+                region=tc.web_search_region,
+            )
         )
+
+        # --- 網頁擷取 ---
+        jina_key = _secret(tc.web_fetch_jina_api_key) or _secret(tc.web_search_jina_api_key)
+        self._tool_registry.register(
+            WebFetchTool(
+                timeout=tc.http_timeout,
+                jina_api_key=jina_key,
+                extractor=tc.web_fetch_extractor,
+            )
+        )
+
+        # --- 文獻工具 ---
+        self._tool_registry.register(ArxivSearchTool(timeout=tc.http_timeout))
+        self._tool_registry.register(
+            SemanticScholarSearchTool(
+                timeout=tc.http_timeout,
+                api_key=_secret(tc.semantic_scholar_api_key),
+            )
+        )
+        self._tool_registry.register(
+            CrossrefSearchTool(
+                timeout=tc.http_timeout,
+                mailto=tc.crossref_mailto,
+            )
+        )
+        self._tool_registry.register(
+            PubMedSearchTool(
+                timeout=tc.http_timeout,
+                email=tc.pubmed_email,
+                api_key=_secret(tc.pubmed_api_key),
+            )
+        )
+
+        # --- 程式碼執行 ---
         self._tool_registry.register(
             ExecuteCodeTool(
                 workspace_dir=self._config.workspace_dir,
                 require_approval=self._config.security.require_approval_for_shell,
             )
         )
+
+        # --- MCP ---
         self._tool_registry.register(MCPCallTool())
+
+        # --- 記憶 ---
         self._tool_registry.register(
             MemorySearchTool(
                 memory_store=self._memory_store,
@@ -555,6 +654,10 @@ class AgentEngine:
                 workspace_dir=self._config.workspace_dir,
             )
         )
+
+        # --- 實用工具 ---
+        self._tool_registry.register(CalculatorTool())
+        self._tool_registry.register(DateTimeTool())
 
     async def _get_context(self, session_id: str) -> ContextManager:
         """取得或建立指定 session 的上下文管理器。"""

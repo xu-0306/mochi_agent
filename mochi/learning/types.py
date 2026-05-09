@@ -105,6 +105,11 @@ class Skill:
     created_at: float = 0
     updated_at: float = 0
     version: int = 1
+    source_type: str = "learned"
+    source_path: str = ""
+    content_hash: str = ""
+    body: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """轉換為可 JSON 序列化的 dict。"""
@@ -122,6 +127,11 @@ class Skill:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "version": self.version,
+            "source_type": self.source_type,
+            "source_path": self.source_path,
+            "content_hash": self.content_hash,
+            "body": self.body,
+            "metadata": self.metadata,
         }
 
     @classmethod
@@ -141,4 +151,9 @@ class Skill:
             created_at=float(data.get("created_at", 0)),
             updated_at=float(data.get("updated_at", 0)),
             version=int(data.get("version", 1)),
+            source_type=str(data.get("source_type", "learned")),
+            source_path=str(data.get("source_path", "")),
+            content_hash=str(data.get("content_hash", "")),
+            body=str(data.get("body", "")),
+            metadata=dict(data.get("metadata", {})),
         )

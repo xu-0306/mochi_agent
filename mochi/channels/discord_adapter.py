@@ -11,9 +11,9 @@ from collections.abc import Sequence
 from contextlib import suppress
 from typing import Any, Literal
 
-from mochi.channels.discord_voice_runtime import DiscordVoiceRuntime
-
 from mochi.channels.base import BaseChannel, SendResult
+from mochi.channels.discord_voice_ingress import DiscordVoiceIngress
+from mochi.channels.discord_voice_runtime import DiscordVoiceRuntime
 from mochi.channels.events import Attachment, AttachmentEvent, CommandEvent, MessageEvent
 
 try:  # pragma: no cover - optional dependency is covered by adapter tests via injection.
@@ -73,6 +73,13 @@ class DiscordAdapter(BaseChannel):
             connect_voice_channel=self._connect_voice_channel,
             play_audio=self._play_audio_to_voice_client,
         )
+        self._voice_ingress = DiscordVoiceIngress(
+            enabled=voice_enabled and voice_stt_enabled,
+            sample_rate=voice_sample_rate,
+            on_audio_chunk=self._ingest_voice_chunk_from_transport,
+            on_end_turn=self.end_voice_turn,
+            on_interrupt_input=self.interrupt_voice_input,
+        )
 
     async def start(self) -> None:
         """啟動 discord.py client。"""
@@ -111,6 +118,7 @@ class DiscordAdapter(BaseChannel):
     async def stop(self) -> None:
         """停止 discord.py client。"""
         client = self._client
+        await self._voice_ingress.detach_all(flush=False)
         if client is not None:
             await client.close()
         if self._task is not None:
@@ -423,6 +431,7 @@ class DiscordAdapter(BaseChannel):
             "application_commands_synced": self._application_commands_synced,
             "pending_interaction_count": len(self._pending_slash_interactions),
             "bot_token_configured": bool(self._bot_token),
+            "voice_ingress": self._voice_ingress.get_status(),
             "voice_runtime": self._voice_runtime.get_status(),
         }
 
@@ -445,6 +454,7 @@ class DiscordAdapter(BaseChannel):
         """要求 bot 離開指定 guild 的 active room。"""
         if guild_id <= 0:
             raise RuntimeError("Discord guild_id is required for voice leave.")
+        await self._voice_ingress.detach(guild_id, flush=False)
         return await self._voice_runtime.leave_voice_channel(guild_id)
 
     async def interrupt_voice_playback(self, guild_id: int | None = None) -> bool:
@@ -507,6 +517,21 @@ class DiscordAdapter(BaseChannel):
             reply_synthesizer=reply_synthesizer,
         )
 
+    async def _ingest_voice_chunk_from_transport(
+        self,
+        guild_id: int,
+        chunk: bytes,
+        speaker_id: str | None,
+    ) -> dict[str, Any]:
+        if self._voice_tts_enabled:
+            await self.interrupt_voice_playback(guild_id)
+        return await self.ingest_voice_audio_chunk(
+            guild_id,
+            chunk=chunk,
+            speaker_id=speaker_id,
+            auto_end=False,
+        )
+
     async def _connect_voice_channel(self, guild_id: int, channel_id: int) -> object:
         client = self._client
         if client is None:
@@ -526,10 +551,12 @@ class DiscordAdapter(BaseChannel):
             current_channel = getattr(existing_voice_client, "channel", None)
             current_channel_id = int(getattr(current_channel, "id", 0) or 0)
             if current_channel_id == channel_id:
+                await self._try_attach_voice_ingress(guild_id, existing_voice_client)
                 return existing_voice_client
             move_to = getattr(existing_voice_client, "move_to", None)
             if callable(move_to):
                 await move_to(channel)
+                await self._try_attach_voice_ingress(guild_id, existing_voice_client)
                 return existing_voice_client
 
         connect = getattr(channel, "connect", None)
@@ -537,13 +564,28 @@ class DiscordAdapter(BaseChannel):
             raise RuntimeError(
                 f"Discord channel {channel_id} does not support voice connect()."
             )
-        voice_client = await connect()
+        connect_kwargs: dict[str, Any] = {}
+        voice_client_cls = self._voice_ingress.preferred_voice_client_cls()
+        if voice_client_cls is not None:
+            connect_kwargs["cls"] = voice_client_cls
+        voice_client = await connect(**connect_kwargs)
         resolved_guild_id = int(getattr(guild, "id", 0) or 0)
         if resolved_guild_id and resolved_guild_id != guild_id:
             raise RuntimeError(
                 f"Resolved voice channel guild mismatch: expected {guild_id}, got {resolved_guild_id}."
             )
+        await self._try_attach_voice_ingress(guild_id, voice_client)
         return voice_client
+
+    async def _try_attach_voice_ingress(self, guild_id: int, voice_client: object) -> None:
+        if not self._voice_ingress.enabled:
+            return
+        try:
+            await self._voice_ingress.attach(guild_id, voice_client)
+        except Exception as exc:
+            set_last_error = getattr(self._voice_runtime, "set_last_error", None)
+            if callable(set_last_error):
+                set_last_error(str(exc))
 
     async def _play_audio_to_voice_client(self, voice_client: object, audio: bytes) -> None:
         if discord is None:

@@ -1,9 +1,12 @@
 'use client'
 
 import * as React from 'react'
+import Link from 'next/link'
+import { useRouter, useSearchParams } from 'next/navigation'
 import {
   AlertCircle,
   Bot,
+  BookOpen,
   BrainCircuit,
   CheckCircle2,
   Cpu,
@@ -21,11 +24,18 @@ import {
   Terminal,
   Upload,
 } from 'lucide-react'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs, TabsContent } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  DEFAULT_SETTINGS_TAB,
+  SettingsNav,
+  isSettingsTab,
+  settingsTabHref,
+  type SettingsTab,
+} from '@/components/settings/SettingsNav'
 import { Switch } from '@/components/ui/switch'
 import * as api from '@/lib/api'
 import {
@@ -53,10 +63,19 @@ type ApiModule = typeof api & {
   fetchOllamaModels?: (baseUrl: string) => Promise<api.OllamaModelsResult>
   importFilesystemFiles?: (input: api.FilesystemImportInput) => Promise<api.FilesystemImportResult>
   updateSettings?: (input: api.UpdateSettingsInput) => Promise<api.Settings>
+  setupDiscord?: (input: api.DiscordSetupInput) => Promise<api.Settings>
+  startChannel?: (name: string) => Promise<api.ChannelsControlResult>
+  stopChannel?: (name: string) => Promise<api.ChannelsControlResult>
 }
 
 const settingsApi = api as ApiModule
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|api[_-]?key|credential|authorization)/i
+const MODELS_UPDATED_EVENT = 'mochi:models-updated'
+
+function getSettingsTabFromSearch(searchParams: { get: (name: string) => string | null }): SettingsTab {
+  const requestedTab = searchParams.get('tab')
+  return isSettingsTab(requestedTab) ? requestedTab : DEFAULT_SETTINGS_TAB
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -108,6 +127,24 @@ function getBooleanSetting(section: Record<string, unknown>, key: string, fallba
 function getStringOptions(section: Record<string, unknown>, key: string, fallback: string[]): string[] {
   const value = section[key]
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : fallback
+}
+
+function getIdSetting(section: Record<string, unknown>, key: string): string[] {
+  const value = section[key]
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((item) => {
+      if (typeof item === 'string') {
+        return item.trim()
+      }
+      if (typeof item === 'number' && Number.isFinite(item)) {
+        return String(item)
+      }
+      return ''
+    })
+    .filter((item) => item.length > 0)
 }
 
 function getOptionsByBackend(
@@ -284,42 +321,55 @@ function resolveChannelPanelState(
     const summary = api.normalizeDiscordChannelStatus(configured, runtime)
     const primaryRoom = summary.activeRooms[0] ?? null
     const voiceRuntimeDetails: SummaryItem[] = [
-      { label: 'Text Enabled', value: boolText(summary.textEnabled, t('common.yes'), t('common.no'), t('common.notReported')) },
-      { label: 'Voice Enabled', value: boolText(summary.voiceEnabled, t('common.yes'), t('common.no'), t('common.notReported')) },
-      { label: 'Allowed Guild IDs', value: summarizeIds(summary.allowedGuildIds, t) },
-      { label: 'Allowed Voice Channel IDs', value: summarizeIds(summary.allowedVoiceChannelIds, t) },
-      { label: 'Message Mode', value: summary.messageMode ?? t('common.notReported') },
-      { label: 'Auto Join Policy', value: summary.autoJoinPolicy ?? t('common.notReported') },
+      { label: t('settings.channel.discord.textEnabled'), value: boolText(summary.textEnabled, t('common.yes'), t('common.no'), t('common.notReported')) },
+      { label: t('settings.channel.discord.voiceEnabled'), value: boolText(summary.voiceEnabled, t('common.yes'), t('common.no'), t('common.notReported')) },
       {
-        label: 'Active Voice Rooms',
+        label: t('settings.channel.discord.voiceIngressEnabled'),
+        value: boolText(summary.voiceIngressEnabled, t('common.yes'), t('common.no'), t('common.notReported')),
+      },
+      {
+        label: t('settings.channel.discord.voiceReceiveExtension'),
+        value: boolText(summary.voiceIngressAvailable, t('common.available'), t('common.unavailable'), t('common.notReported')),
+      },
+      { label: t('settings.channel.discord.allowedGuildIds'), value: summarizeIds(summary.allowedGuildIds, t) },
+      { label: t('settings.channel.discord.allowedVoiceChannelIds'), value: summarizeIds(summary.allowedVoiceChannelIds, t) },
+      { label: t('settings.channel.discord.messageMode'), value: localizeDiscordValue(summary.messageMode, 'discordSetup.messageMode', t) },
+      { label: t('settings.channel.discord.autoJoinPolicy'), value: localizeDiscordValue(summary.autoJoinPolicy, 'discordSetup.autoJoinPolicy', t) },
+      { label: t('settings.channel.discord.ingressGuildIds'), value: summarizeIds(summary.voiceIngressGuildIds, t) },
+      {
+        label: t('settings.channel.discord.activeVoiceRooms'),
         value: summary.activeVoiceRoomCount !== null ? String(summary.activeVoiceRoomCount) : t('common.notReported'),
       },
       {
-        label: 'Voice Runtime Phase',
-        value: summary.voiceRuntimePhase ?? t('common.notReported'),
+        label: t('settings.channel.discord.voiceRuntimePhase'),
+        value: localizeDiscordValue(summary.voiceRuntimePhase, 'settings.channel.discord.phase', t),
       },
       {
-        label: 'Playback',
-        value: summary.playbackState ?? primaryRoom?.playbackState ?? t('common.notReported'),
+        label: t('settings.channel.discord.playback'),
+        value: localizeDiscordValue(summary.playbackState ?? primaryRoom?.playbackState, 'settings.channel.discord.playbackState', t),
       },
       {
-        label: 'Speaking',
-        value: summary.speakingState ?? primaryRoom?.speakingState ?? t('common.notReported'),
+        label: t('settings.channel.discord.speaking'),
+        value: localizeDiscordValue(summary.speakingState ?? primaryRoom?.speakingState, 'settings.channel.discord.speakingState', t),
       },
       {
-        label: 'Voice Error',
+        label: t('settings.channel.discord.voiceError'),
         value: summary.voiceRuntimeError ?? primaryRoom?.error ?? t('common.notReported'),
+      },
+      {
+        label: t('settings.channel.discord.voiceIngressError'),
+        value: summary.voiceIngressError ?? t('common.notReported'),
       },
     ]
 
     if (primaryRoom) {
       voiceRuntimeDetails.push(
-        { label: 'Active Guild ID', value: primaryRoom.guildId ?? t('common.notReported') },
-        { label: 'Active Voice Channel ID', value: primaryRoom.channelId ?? t('common.notReported') },
-        { label: 'Active Session ID', value: primaryRoom.sessionId ?? t('common.notReported') },
-        { label: 'Joined At', value: primaryRoom.joinedAt ?? t('common.notReported') },
+        { label: t('settings.channel.discord.activeGuildId'), value: primaryRoom.guildId ?? t('common.notReported') },
+        { label: t('settings.channel.discord.activeVoiceChannelId'), value: primaryRoom.channelId ?? t('common.notReported') },
+        { label: t('settings.channel.discord.activeSessionId'), value: primaryRoom.sessionId ?? t('common.notReported') },
+        { label: t('settings.channel.discord.joinedAt'), value: primaryRoom.joinedAt ?? t('common.notReported') },
         {
-          label: 'Participants',
+          label: t('settings.channel.discord.participants'),
           value: primaryRoom.participantCount !== null ? String(primaryRoom.participantCount) : t('common.notReported'),
         },
       )
@@ -379,6 +429,17 @@ function boolText(value: boolean | null, trueText: string, falseText: string, un
   return unknownText
 }
 
+function localizeDiscordValue(value: string | null, namespace: string, t: Translator): string {
+  if (!value) {
+    return t('common.notReported')
+  }
+
+  const normalized = value.trim()
+  const key = `${namespace}.${normalized.replace(/[^a-zA-Z0-9]+/g, '_')}`
+  const translated = t(key)
+  return translated === key ? normalized : translated
+}
+
 function messageWithDetail(label: string, error: unknown): string {
   if (error instanceof Error && error.message.trim()) {
     return `${label}: ${error.message}`
@@ -402,7 +463,79 @@ function getConnectedModelCount(models: unknown[]): number {
   }).length
 }
 
+function isUrlLike(value: string): boolean {
+  return /^https?:\/\//i.test(value)
+}
+
+function providerLabel(provider: string | null | undefined): string | null {
+  if (!provider) {
+    return null
+  }
+  return provider
+}
+
+function modelInfoId(modelInfo: api.ModelInfo): string {
+  return modelInfo.id || modelInfo.modelSpec || modelInfo.name
+}
+
+function modelInfoLabel(modelInfo: api.ModelInfo): string {
+  const provider = providerLabel(modelInfo.provider)
+  if (modelInfo.label && !isUrlLike(modelInfo.label)) {
+    return modelInfo.label
+  }
+  if (modelInfo.name && !isUrlLike(modelInfo.name)) {
+    return provider ? `${modelInfo.name} (${provider})` : modelInfo.name
+  }
+  return modelInfo.label || modelInfo.name || modelInfoId(modelInfo)
+}
+
+function activeConfiguredModel(settings: unknown, models: api.ModelInfo[]): api.ModelInfo | null {
+  const root = asRecord(settings)
+  const rootModel = typeof root?.model === 'string' ? root.model : ''
+  const modelConfig = extractSection(settings, 'model_config')
+  const provider = stringField(modelConfig, 'openai_compat_provider') ?? stringField(modelConfig, 'provider')
+  const remoteModel = stringField(modelConfig, 'openai_compat_model')
+  const remoteBaseUrl = stringField(modelConfig, 'openai_compat_base_url')
+  const ollamaModel = stringField(modelConfig, 'ollama_model')
+
+  for (const modelInfo of models) {
+    const id = modelInfoId(modelInfo)
+    if (
+      id === rootModel ||
+      modelInfo.modelSpec === rootModel ||
+      modelInfo.baseUrl === rootModel ||
+      (remoteModel && modelInfo.name === remoteModel && (!remoteBaseUrl || modelInfo.baseUrl === remoteBaseUrl)) ||
+      (ollamaModel && modelInfo.name === ollamaModel)
+    ) {
+      return modelInfo
+    }
+  }
+
+  if (remoteModel) {
+    return {
+      id: `${provider ?? 'openai_compat'}:${remoteBaseUrl ?? rootModel}:${remoteModel}`,
+      name: remoteModel,
+      label: provider ? `${remoteModel} (${provider})` : remoteModel,
+      provider,
+      modelSpec: rootModel || remoteBaseUrl,
+      baseUrl: remoteBaseUrl ?? (isUrlLike(rootModel) ? rootModel : null),
+      backendType: 'openai_compat',
+      contextLength: null,
+      supportsToolCalling: null,
+      metadata: {},
+    }
+  }
+
+  return null
+}
+
 function getPrimaryModel(settings: unknown, models: unknown[], t?: Translator): string {
+  const typedModels = models.filter((entry): entry is api.ModelInfo => Boolean(asRecord(entry)))
+  const activeModel = activeConfiguredModel(settings, typedModels)
+  if (activeModel) {
+    return modelInfoLabel(activeModel)
+  }
+
   const root = asRecord(settings)
   const rootModel = root ? formatScalar(root.model, t) : null
   if (rootModel !== null) {
@@ -434,7 +567,96 @@ function getPrimaryModel(settings: unknown, models: unknown[], t?: Translator): 
   return t ? t('common.unknown') : 'Unknown'
 }
 
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key]
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function modelInfoFromRecord(record: Record<string, unknown>): api.ModelInfo | null {
+  const id =
+    stringField(record, 'id') ??
+    stringField(record, 'model_spec') ??
+    stringField(record, 'name') ??
+    stringField(record, 'model')
+  if (!id) {
+    return null
+  }
+
+  const name =
+    stringField(record, 'name') ??
+    stringField(record, 'model') ??
+    stringField(record, 'model_spec') ??
+    id
+
+  return {
+    id,
+    name,
+    label: stringField(record, 'label') ?? name,
+    provider: stringField(record, 'provider'),
+    modelSpec: stringField(record, 'model_spec'),
+    baseUrl: stringField(record, 'base_url'),
+    backendType: stringField(record, 'backend_type') ?? '',
+    contextLength: typeof record.context_length === 'number' ? record.context_length : null,
+    supportsToolCalling: typeof record.supports_tool_calling === 'boolean' ? record.supports_tool_calling : null,
+    metadata: {},
+  }
+}
+
+function configuredModelsFromSettings(settings: unknown): api.ModelInfo[] {
+  const modelSetup = extractSection(settings, 'model_setup')
+  const configuredModels = modelSetup.configured_models
+  if (!Array.isArray(configuredModels)) {
+    return []
+  }
+
+  return configuredModels
+    .map((entry) => {
+      const record = asRecord(entry)
+      return record ? modelInfoFromRecord(record) : null
+    })
+    .filter((entry): entry is api.ModelInfo => entry !== null)
+}
+
+function mergeModelInfos(primary: api.ModelInfo[], secondary: api.ModelInfo[]): api.ModelInfo[] {
+  const seen = new Set<string>()
+  const merged: api.ModelInfo[] = []
+  for (const modelInfo of [...primary, ...secondary]) {
+    const id = modelInfoId(modelInfo)
+    if (!id || seen.has(id)) {
+      continue
+    }
+    seen.add(id)
+    merged.push(modelInfo)
+  }
+  return merged
+}
+
+function configuredModelRecordFromModelInfo(modelInfo: api.ModelInfo): Record<string, unknown> {
+  return {
+    id: modelInfoId(modelInfo),
+    label: modelInfoLabel(modelInfo),
+    provider: modelInfo.provider,
+    model: modelInfo.name,
+    model_spec: modelInfo.modelSpec,
+    base_url: modelInfo.baseUrl,
+    backend_type: modelInfo.backendType,
+  }
+}
+
+function omitConfiguredModels(section: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...section }
+  delete next.configured_models
+  return next
+}
+
+function notifyModelsUpdated() {
+  window.dispatchEvent(new Event(MODELS_UPDATED_EVENT))
+}
+
 function baseUrlFromModelInfo(modelInfo: api.ModelInfo): string | null {
+  if (modelInfo.baseUrl) {
+    return modelInfo.baseUrl
+  }
   const baseUrl = modelInfo.metadata.base_url
   return typeof baseUrl === 'string' && baseUrl.length > 0 ? baseUrl : null
 }
@@ -509,22 +731,71 @@ function OverviewBadge({ ok }: { ok: boolean }) {
 }
 
 function ChannelPanel({
+  channelName,
   title,
   icon: Icon,
   state,
   targetLabel,
   loading,
   onRefresh,
+  onControlSuccess,
 }: {
+  channelName: 'discord' | 'telegram'
   title: string
   icon: React.ComponentType<{ className?: string }>
   state: ChannelPanelState
   targetLabel: string
   loading: boolean
   onRefresh: () => void
+  onControlSuccess?: () => void
 }) {
   const { t } = useI18n()
   const hasDetails = (state.details?.length ?? 0) > 0
+  const [controlLoading, setControlLoading] = React.useState(false)
+  const [controlMessage, setControlMessage] = React.useState<FormMessage>(null)
+
+  const canStart = state.enabled === true && state.tokenConfigured === true && state.running !== true
+  const canStop = state.running === true
+
+  const handleStart = async () => {
+    setControlLoading(true)
+    setControlMessage(null)
+    try {
+      if (typeof settingsApi.startChannel !== 'function') {
+        throw new Error(t('channelControl.startApiUnavailable'))
+      }
+      await settingsApi.startChannel(channelName)
+      onControlSuccess?.()
+      setControlMessage({ type: 'success', text: t('channelControl.started', { name: title }) })
+    } catch (controlError) {
+      setControlMessage({
+        type: 'error',
+        text: messageWithDetail(t('channelControl.errorStart', { name: title }), controlError),
+      })
+    } finally {
+      setControlLoading(false)
+    }
+  }
+
+  const handleStop = async () => {
+    setControlLoading(true)
+    setControlMessage(null)
+    try {
+      if (typeof settingsApi.stopChannel !== 'function') {
+        throw new Error(t('channelControl.stopApiUnavailable'))
+      }
+      await settingsApi.stopChannel(channelName)
+      onControlSuccess?.()
+      setControlMessage({ type: 'success', text: t('channelControl.stopped', { name: title }) })
+    } catch (controlError) {
+      setControlMessage({
+        type: 'error',
+        text: messageWithDetail(t('channelControl.errorStop', { name: title }), controlError),
+      })
+    } finally {
+      setControlLoading(false)
+    }
+  }
 
   return (
     <section className="rounded-lg border border-border bg-surface-layer">
@@ -538,11 +809,25 @@ function ChannelPanel({
             <RefreshCw className="h-3.5 w-3.5" />
             {t('common.refresh')}
           </Button>
-          <Button type="button" variant="secondary" size="sm" disabled title={t('settings.disabled.connectUnavailable')}>
-            {t('settings.action.connect')}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={!canStart || controlLoading}
+            loading={controlLoading && canStart}
+            onClick={() => void handleStart()}
+          >
+            {t('channelControl.start')}
           </Button>
-          <Button type="button" variant="secondary" size="sm" disabled title={t('settings.disabled.testUnavailable')}>
-            {t('settings.action.test')}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={!canStop || controlLoading}
+            loading={controlLoading && canStop}
+            onClick={() => void handleStop()}
+          >
+            {t('channelControl.stop')}
           </Button>
         </div>
       </div>
@@ -578,6 +863,10 @@ function ChannelPanel({
         </div>
       </div>
 
+      <div className="px-4 pb-4">
+        <SettingMessage message={controlMessage} />
+      </div>
+
       {hasDetails ? (
         <div className="border-t border-border px-4 py-4">
           <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm md:grid-cols-2">
@@ -590,6 +879,250 @@ function ChannelPanel({
           </div>
         </div>
       ) : null}
+    </section>
+  )
+}
+
+function parseIdCsv(input: string): number[] {
+  return input
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .map((item) => Number.parseInt(item, 10))
+    .filter((item) => Number.isFinite(item) && item > 0)
+}
+
+function DiscordSetupForm({
+  channels,
+  onUpdated,
+}: {
+  channels: Record<string, unknown>
+  onUpdated: (settings: api.Settings) => void
+}) {
+  const { t } = useI18n()
+  const discord = asRecord(channels.discord) ?? {}
+  const [botToken, setBotToken] = React.useState('')
+  const [enabled, setEnabled] = React.useState(getBooleanSetting(discord, 'enabled', false))
+  const [textEnabled, setTextEnabled] = React.useState(getBooleanSetting(discord, 'text_enabled', true))
+  const [voiceEnabled, setVoiceEnabled] = React.useState(getBooleanSetting(discord, 'voice_enabled', true))
+  const [voiceAutoReply, setVoiceAutoReply] = React.useState(getBooleanSetting(discord, 'voice_auto_reply', true))
+  const [voiceSttEnabled, setVoiceSttEnabled] = React.useState(getBooleanSetting(discord, 'voice_stt_enabled', true))
+  const [voiceTtsEnabled, setVoiceTtsEnabled] = React.useState(getBooleanSetting(discord, 'voice_tts_enabled', true))
+  const [messageMode, setMessageMode] = React.useState(getStringSetting(discord, 'message_mode', 'mentions_only'))
+  const [allowedGuildIds, setAllowedGuildIds] = React.useState(
+    getIdSetting(discord, 'allowed_guild_ids').join(', ')
+  )
+  const [allowedChannelIds, setAllowedChannelIds] = React.useState(
+    getIdSetting(discord, 'allowed_channel_ids').join(', ')
+  )
+  const [allowedVoiceChannelIds, setAllowedVoiceChannelIds] = React.useState(
+    getIdSetting(discord, 'allowed_voice_channel_ids').join(', ')
+  )
+  const [allowedUserIds, setAllowedUserIds] = React.useState(
+    getIdSetting(discord, 'allowed_user_ids').join(', ')
+  )
+  const [submitting, setSubmitting] = React.useState(false)
+  const [message, setMessage] = React.useState<FormMessage>(null)
+
+  React.useEffect(() => {
+    const latestDiscord = asRecord(channels.discord) ?? {}
+    setEnabled(getBooleanSetting(latestDiscord, 'enabled', false))
+    setTextEnabled(getBooleanSetting(latestDiscord, 'text_enabled', true))
+    setVoiceEnabled(getBooleanSetting(latestDiscord, 'voice_enabled', true))
+    setVoiceAutoReply(getBooleanSetting(latestDiscord, 'voice_auto_reply', true))
+    setVoiceSttEnabled(getBooleanSetting(latestDiscord, 'voice_stt_enabled', true))
+    setVoiceTtsEnabled(getBooleanSetting(latestDiscord, 'voice_tts_enabled', true))
+    setMessageMode(getStringSetting(latestDiscord, 'message_mode', 'mentions_only'))
+    setAllowedGuildIds(getIdSetting(latestDiscord, 'allowed_guild_ids').join(', '))
+    setAllowedChannelIds(getIdSetting(latestDiscord, 'allowed_channel_ids').join(', '))
+    setAllowedVoiceChannelIds(getIdSetting(latestDiscord, 'allowed_voice_channel_ids').join(', '))
+    setAllowedUserIds(getIdSetting(latestDiscord, 'allowed_user_ids').join(', '))
+  }, [channels])
+
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setSubmitting(true)
+    setMessage(null)
+
+    try {
+      if (typeof settingsApi.setupDiscord !== 'function') {
+        throw new Error(t('discordSetup.errorApiUnavailable'))
+      }
+      if (botToken.trim().length === 0) {
+        throw new Error(t('discordSetup.errorTokenRequired'))
+      }
+
+      const settings = await settingsApi.setupDiscord({
+        bot_token: botToken.trim(),
+        enabled,
+        text_enabled: textEnabled,
+        voice_enabled: voiceEnabled,
+        allowed_guild_ids: parseIdCsv(allowedGuildIds),
+        allowed_channel_ids: parseIdCsv(allowedChannelIds),
+        allowed_voice_channel_ids: parseIdCsv(allowedVoiceChannelIds),
+        allowed_user_ids: parseIdCsv(allowedUserIds),
+        message_mode:
+          messageMode === 'all_messages' || messageMode === 'slash_only'
+            ? messageMode
+            : 'mentions_only',
+        auto_join_policy: 'manual_only',
+        voice_auto_reply: voiceAutoReply,
+        voice_stt_enabled: voiceSttEnabled,
+        voice_tts_enabled: voiceTtsEnabled,
+      })
+      setBotToken('')
+      onUpdated(settings)
+      setMessage({
+        type: 'success',
+        text: t('discordSetup.successSaved'),
+      })
+    } catch (setupError) {
+      setMessage({
+        type: 'error',
+        text: messageWithDetail(t('discordSetup.errorSave'), setupError),
+      })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-border bg-surface-layer">
+      <div className="border-b border-border px-4 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">{t('discordSetup.title')}</h3>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {t('discordSetup.description')}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button asChild type="button" variant="secondary" size="sm">
+              <Link href="/settings/discord-guide">
+                <BookOpen className="h-3.5 w-3.5" />
+                {t('discordGuide.openPage')}
+              </Link>
+            </Button>
+            <KeyRound className="h-4 w-4 text-muted-foreground" />
+          </div>
+        </div>
+      </div>
+
+      <form onSubmit={handleSubmit} className="space-y-4 px-4 py-4">
+        <label className="space-y-1.5">
+          <SettingLabel>{t('discordSetup.botToken')}</SettingLabel>
+          <p className="text-xs text-muted-foreground">
+            {t('discordSetup.botTokenHelp')}
+          </p>
+          <Input
+            type="password"
+            value={botToken}
+            onChange={(event) => setBotToken(event.target.value)}
+            placeholder={t('discordSetup.botTokenPlaceholder')}
+            autoComplete="off"
+            className="min-w-0 font-mono text-xs"
+          />
+        </label>
+
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('discordSetup.enableChannel')}</span>
+            <Switch checked={enabled} onCheckedChange={setEnabled} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('discordSetup.enableText')}</span>
+            <Switch checked={textEnabled} onCheckedChange={setTextEnabled} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('discordSetup.enableVoice')}</span>
+            <Switch checked={voiceEnabled} onCheckedChange={setVoiceEnabled} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('discordSetup.autoReply')}</span>
+            <Switch checked={voiceAutoReply} onCheckedChange={setVoiceAutoReply} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('discordSetup.voiceStt')}</span>
+            <Switch checked={voiceSttEnabled} onCheckedChange={setVoiceSttEnabled} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('discordSetup.voiceTts')}</span>
+            <Switch checked={voiceTtsEnabled} onCheckedChange={setVoiceTtsEnabled} />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>{t('discordSetup.messageMode')}</SettingLabel>
+            <SelectSetting
+              value={messageMode}
+              onValueChange={setMessageMode}
+              options={['mentions_only', 'all_messages', 'slash_only']}
+              getOptionLabel={(option) => {
+                if (option === 'all_messages') {
+                  return t('discordSetup.messageMode.allMessages')
+                }
+                if (option === 'slash_only') {
+                  return t('discordSetup.messageMode.slashOnly')
+                }
+                return t('discordSetup.messageMode.mentionsOnly')
+              }}
+            />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('discordSetup.autoJoinPolicy')}</SettingLabel>
+            <Input value={t('discordSetup.autoJoinPolicy.manualOnly')} disabled className="text-xs" />
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>{t('discordSetup.allowedGuildIds')}</SettingLabel>
+            <Input
+              value={allowedGuildIds}
+              onChange={(event) => setAllowedGuildIds(event.target.value)}
+              placeholder={t('discordSetup.idsPlaceholder')}
+              className="font-mono text-xs"
+            />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('discordSetup.allowedTextChannelIds')}</SettingLabel>
+            <Input
+              value={allowedChannelIds}
+              onChange={(event) => setAllowedChannelIds(event.target.value)}
+              placeholder={t('discordSetup.idsPlaceholder')}
+              className="font-mono text-xs"
+            />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('discordSetup.allowedVoiceChannelIds')}</SettingLabel>
+            <Input
+              value={allowedVoiceChannelIds}
+              onChange={(event) => setAllowedVoiceChannelIds(event.target.value)}
+              placeholder={t('discordSetup.idsPlaceholder')}
+              className="font-mono text-xs"
+            />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('discordSetup.allowedUserIds')}</SettingLabel>
+            <Input
+              value={allowedUserIds}
+              onChange={(event) => setAllowedUserIds(event.target.value)}
+              placeholder={t('discordSetup.idsPlaceholder')}
+              className="font-mono text-xs"
+            />
+          </label>
+        </div>
+
+        <SettingMessage message={message} />
+
+        <div className="flex justify-end">
+          <Button type="submit" variant="primary" size="sm" loading={submitting}>
+            <Save className="h-3.5 w-3.5" />
+            {t('discordSetup.save')}
+          </Button>
+        </div>
+      </form>
     </section>
   )
 }
@@ -841,11 +1374,13 @@ function SelectSetting({
   value,
   onValueChange,
   options,
+  getOptionLabel,
   className,
 }: {
   value: string
   onValueChange: (value: string) => void
   options: string[]
+  getOptionLabel?: (value: string) => string
   className?: string
 }) {
   return (
@@ -856,7 +1391,7 @@ function SelectSetting({
       <SelectContent>
         {options.map((option) => (
           <SelectItem key={option} value={option}>
-            {option}
+            {getOptionLabel ? getOptionLabel(option) : option}
           </SelectItem>
         ))}
       </SelectContent>
@@ -885,14 +1420,20 @@ function ModelConnectionForm({
   const [discoverMessage, setDiscoverMessage] = React.useState<FormMessage>(null)
   const [submitting, setSubmitting] = React.useState(false)
   const [message, setMessage] = React.useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const discoveryKeyRef = React.useRef(`${initialProvider}:${baseUrl}`)
 
   React.useEffect(() => {
     const nextProvider = configuredProvider(modelConfig, configuredModel)
+    const nextBaseUrl = configuredBaseUrl(nextProvider, modelConfig)
+    const nextDiscoveryKey = `${nextProvider}:${nextBaseUrl}`
     setProvider(nextProvider)
-    setBaseUrl(configuredBaseUrl(nextProvider, modelConfig))
+    setBaseUrl(nextBaseUrl)
     setModel(configuredModelName(nextProvider, configuredModel, modelConfig))
-    setOllamaModels([])
-    setDiscoverMessage(null)
+    if (discoveryKeyRef.current !== nextDiscoveryKey) {
+      discoveryKeyRef.current = nextDiscoveryKey
+      setOllamaModels([])
+      setDiscoverMessage(null)
+    }
   }, [configuredModel, modelConfig])
 
   const handleProviderChange = (nextProvider: ProviderChoice) => {
@@ -972,8 +1513,8 @@ function ModelConnectionForm({
       setMessage({
         type: 'success',
         text: result.persisted
-          ? t('settings.modelConnection.successSwitchedPersisted', { model: result.activeModel.name || model })
-          : t('settings.modelConnection.successSwitched', { model: result.activeModel.name || model }),
+          ? t('settings.modelConnection.successSwitchedPersisted', { model: modelInfoLabel(result.activeModel) || model })
+          : t('settings.modelConnection.successSwitched', { model: modelInfoLabel(result.activeModel) || model }),
       })
     } catch (configureError) {
       setMessage({
@@ -1106,7 +1647,7 @@ function ModelConnectionForm({
 
         <div className="flex items-center justify-end gap-2">
           <Button type="submit" variant="primary" size="sm" loading={submitting}>
-            {t('settings.action.applyTest')}
+            {t('settings.action.addApplyTest')}
           </Button>
         </div>
       </form>
@@ -1536,6 +2077,7 @@ function LearningStorageForm({
   const { t } = useI18n()
   const [enabled, setEnabled] = React.useState(getBooleanSetting(learning, 'enabled', true))
   const [autoExtract, setAutoExtract] = React.useState(getBooleanSetting(learning, 'auto_extract_skills', true))
+  const [autoSyncFilesystem, setAutoSyncFilesystem] = React.useState(getBooleanSetting(learning, 'auto_sync_filesystem_skills', true))
   const [minSteps, setMinSteps] = React.useState(String(getNumberSetting(learning, 'min_steps_for_extraction', 3)))
   const [retentionDays, setRetentionDays] = React.useState(String(getNumberSetting(learning, 'trajectory_retention_days', 30)))
   const [threshold, setThreshold] = React.useState(String(getNumberSetting(learning, 'skill_improvement_threshold', 0.7)))
@@ -1550,6 +2092,7 @@ function LearningStorageForm({
   React.useEffect(() => {
     setEnabled(getBooleanSetting(learning, 'enabled', true))
     setAutoExtract(getBooleanSetting(learning, 'auto_extract_skills', true))
+    setAutoSyncFilesystem(getBooleanSetting(learning, 'auto_sync_filesystem_skills', true))
     setMinSteps(String(getNumberSetting(learning, 'min_steps_for_extraction', 3)))
     setRetentionDays(String(getNumberSetting(learning, 'trajectory_retention_days', 30)))
     setThreshold(String(getNumberSetting(learning, 'skill_improvement_threshold', 0.7)))
@@ -1573,6 +2116,7 @@ function LearningStorageForm({
         learning: {
           enabled,
           auto_extract_skills: autoExtract,
+          auto_sync_filesystem_skills: autoSyncFilesystem,
           min_steps_for_extraction: Number.parseInt(minSteps, 10) || 3,
           trajectory_retention_days: Number.parseInt(retentionDays, 10) || 30,
           skill_improvement_threshold: Number.parseFloat(threshold) || 0.7,
@@ -1617,6 +2161,10 @@ function LearningStorageForm({
           <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
             <span className="text-sm text-foreground">{t('settings.learning.autoExtract')}</span>
             <Switch checked={autoExtract} onCheckedChange={setAutoExtract} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('settings.learning.autoSyncFilesystem')}</span>
+            <Switch checked={autoSyncFilesystem} onCheckedChange={setAutoSyncFilesystem} />
           </div>
         </div>
 
@@ -1826,6 +2374,9 @@ function PreferencesPanel() {
 
 export default function SettingsPage() {
   const { t } = useI18n()
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const activeTab = getSettingsTabFromSearch(searchParams)
   const [settings, setSettings] = React.useState<unknown>(null)
   const [models, setModels] = React.useState<api.ModelInfo[]>([])
   const [channelsStatus, setChannelsStatus] = React.useState<api.ChannelsStatus | null>(null)
@@ -1833,6 +2384,13 @@ export default function SettingsPage() {
   const [channelsRefreshing, setChannelsRefreshing] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+
+  const handleTabChange = React.useCallback((nextValue: string) => {
+    if (!isSettingsTab(nextValue)) {
+      return
+    }
+    router.push(settingsTabHref(nextValue))
+  }, [router])
 
   const refreshChannelsStatus = React.useCallback(async (showLoading = true) => {
     if (typeof settingsApi.fetchChannelsStatus !== 'function') {
@@ -1894,8 +2452,9 @@ export default function SettingsPage() {
           return
         }
 
+        const fetchedModels = Array.isArray(modelsResult) ? modelsResult as api.ModelInfo[] : []
         setSettings(settingsResult)
-        setModels(Array.isArray(modelsResult) ? modelsResult as api.ModelInfo[] : [])
+        setModels(mergeModelInfos(fetchedModels, configuredModelsFromSettings(settingsResult)))
         setChannelsStatus(channelsResult.result)
         setChannelsError(channelsResult.error)
       } catch (loadError) {
@@ -1920,7 +2479,8 @@ export default function SettingsPage() {
 
   const modelSection = React.useMemo(() => extractSection(settings, 'model'), [settings])
   const modelConfigSection = React.useMemo(() => extractSection(settings, 'model_config'), [settings])
-  const rootModel = React.useMemo(() => {
+  const rootModel = React.useMemo(() => getPrimaryModel(settings, models, t), [settings, models, t])
+  const rawRootModel = React.useMemo(() => {
     const root = asRecord(settings)
     return root ? formatScalar(root.model, t) : null
   }, [settings, t])
@@ -1938,7 +2498,7 @@ export default function SettingsPage() {
   ]
   const voiceSummary = collectSummary(voiceSection, ['enabled', 'stt_backend', 'stt_model', 'stt_model_cache_dir', 'tts_backend', 'tts_voice'], 6, t)
   const memorySummary = collectSummary(memorySection, ['db_path', 'max_short_term_messages', 'fts_top_k'], 6, t)
-  const learningSummary = collectSummary(learningSection, ['enabled', 'auto_extract_skills', 'trajectory_path', 'skills_db_path', 'trajectory_retention_days', 'max_skills'], 6, t)
+  const learningSummary = collectSummary(learningSection, ['enabled', 'auto_extract_skills', 'auto_sync_filesystem_skills', 'trajectory_path', 'skills_db_path', 'trajectory_retention_days', 'max_skills'], 7, t)
   const discordState = resolveChannelPanelState('discord', channelsSection, channelsStatus, t)
   const telegramState = resolveChannelPanelState('telegram', channelsSection, channelsStatus, t)
   const enabledChannels = [
@@ -2000,43 +2560,48 @@ export default function SettingsPage() {
           />
         </div>
 
-        <Tabs defaultValue="model" className="mt-5 flex gap-6">
+        <Tabs value={activeTab} onValueChange={handleTabChange} className="mt-5 flex gap-6">
           <div className="w-40 shrink-0">
-            <TabsList className="flex h-auto w-full flex-col gap-0.5 p-1">
-              <TabsTrigger value="model" className="w-full justify-start">{t('settings.tabs.model')}</TabsTrigger>
-              <TabsTrigger value="voice" className="w-full justify-start">{t('settings.tabs.voice')}</TabsTrigger>
-              <TabsTrigger value="memory" className="w-full justify-start">{t('settings.tabs.memory')}</TabsTrigger>
-              <TabsTrigger value="learning" className="w-full justify-start">{t('settings.tabs.learning')}</TabsTrigger>
-              <TabsTrigger value="channels" className="w-full justify-start">{t('settings.tabs.channels')}</TabsTrigger>
-              <TabsTrigger value="web" className="w-full justify-start">{t('settings.tabs.web')}</TabsTrigger>
-            </TabsList>
+            <SettingsNav active={activeTab} />
           </div>
 
           <div className="min-w-0 flex-1">
             <TabsContent value="model" className="mt-0">
               <div className="space-y-4">
                 <ModelConnectionForm
-                  configuredModel={rootModel}
+                  configuredModel={rawRootModel}
                   modelConfig={modelConfigSection}
                   onConfigured={(result) => {
                     const modelInfo = result.activeModel
-                    const remoteBaseUrl = baseUrlFromModelInfo(modelInfo)
-                    setModels([modelInfo])
+                    const availableModels = result.availableModels.length > 0
+                      ? result.availableModels
+                      : [modelInfo]
+                    const savedModelInfo = result.availableModels[0] ?? modelInfo
+                    const remoteBaseUrl = baseUrlFromModelInfo(savedModelInfo)
+                    const savedModelName = savedModelInfo.name || modelInfo.name
+                    const savedBackendType = savedModelInfo.backendType || modelInfo.backendType
+                    setModels(availableModels)
                     setSettings((current: unknown) => ({
                       ...(asRecord(current) ?? {}),
-                      model: modelInfo.backendType === 'ollama'
-                        ? `ollama:${modelInfo.name}`
-                        : remoteBaseUrl ?? rootModel ?? modelInfo.name,
+                      model: savedModelInfo.modelSpec ??
+                        (savedBackendType === 'ollama'
+                          ? `ollama:${savedModelName}`
+                          : remoteBaseUrl ?? rawRootModel ?? savedModelName),
                       model_config: {
-                        ...(asRecord(asRecord(current)?.model_config) ?? {}),
+                        ...omitConfiguredModels(asRecord(asRecord(current)?.model_config) ?? {}),
                         provider: result.provider,
-                        ollama_model: modelInfo.backendType === 'ollama' ? modelInfo.name : '',
-                        ollama_base_url: modelInfo.backendType === 'ollama' ? remoteBaseUrl : undefined,
+                        ollama_model: savedBackendType === 'ollama' ? savedModelName : '',
+                        ollama_base_url: savedBackendType === 'ollama' ? remoteBaseUrl : undefined,
                         openai_compat_provider: result.provider === 'ollama' ? undefined : result.provider,
                         openai_compat_base_url: result.provider === 'ollama' ? undefined : remoteBaseUrl,
-                        openai_compat_model: modelInfo.backendType === 'openai_compat' ? modelInfo.name : '',
+                        openai_compat_model: savedBackendType === 'openai_compat' ? savedModelName : '',
+                      },
+                      model_setup: {
+                        ...(asRecord(asRecord(current)?.model_setup) ?? {}),
+                        configured_models: availableModels.map(configuredModelRecordFromModelInfo),
                       },
                     }))
+                    notifyModelsUpdated()
                   }}
                 />
               <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
@@ -2052,9 +2617,11 @@ export default function SettingsPage() {
                     models.slice(0, 6).map((entry, index) => {
                       const record = asRecord(entry)
                       const label =
+                        modelInfoLabel(entry) ||
                         (record && (formatScalar(record.name, t) ?? formatScalar(record.id, t) ?? formatScalar(record.model, t))) ||
                         `${t('settings.modelFallback')} ${index + 1}`
                       const value =
+                        entry.backendType ||
                         (record && (formatScalar(record.status, t) ?? summarizeValue(record.provider, t) ?? summarizeValue(record.backend, t))) ||
                         t('common.reported')
                       return { label, value }
@@ -2137,21 +2704,29 @@ export default function SettingsPage() {
                     {channelsError}
                   </div>
                 ) : null}
+                <DiscordSetupForm
+                  channels={channelsSection}
+                  onUpdated={(updatedSettings) => setSettings(updatedSettings)}
+                />
                 <ChannelPanel
+                  channelName="discord"
                   title="Discord"
                   icon={Bot}
                   state={discordState}
                   targetLabel={t('settings.channel.allowedChannelIds')}
                   loading={channelsRefreshing}
                   onRefresh={() => void refreshChannelsStatus()}
+                  onControlSuccess={() => void refreshChannelsStatus(false)}
                 />
                 <ChannelPanel
+                  channelName="telegram"
                   title="Telegram"
                   icon={Send}
                   state={telegramState}
                   targetLabel={t('settings.channel.allowedChatIds')}
                   loading={channelsRefreshing}
                   onRefresh={() => void refreshChannelsStatus()}
+                  onControlSuccess={() => void refreshChannelsStatus(false)}
                 />
                 <TerminalLocalPanel
                   channelsRunning={channelsRunning}

@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -143,17 +144,22 @@ class AsyncReActLoop:
                             arguments=tc.arguments,
                         )
 
-                        tool_output = ""
+                        tool_output: Any = None
                         tool_error: str | None = None
                         if self._tool_registry is not None:
                             try:
                                 tr = await self._tool_registry.execute(tc.name, tc.arguments)
-                                tool_output = str(tr.output) if tr.output is not None else ""
+                                tool_output = tr.output
                                 tool_error = tr.error
                             except Exception as exc:
                                 tool_error = str(exc)
                         else:
                             tool_error = "No tool registry configured."
+
+                        tool_content = self._format_tool_message_content(
+                            output=tool_output,
+                            error=tool_error,
+                        )
 
                         yield ToolCallResultEvent(
                             call_id=tc.id,
@@ -165,7 +171,7 @@ class AsyncReActLoop:
                         messages.append(
                             Message(
                                 role="tool",
-                                content=tool_output if not tool_error else f"Error: {tool_error}",
+                                content=tool_content,
                                 tool_call_id=tc.id,
                                 name=tc.name,
                             )
@@ -185,3 +191,12 @@ class AsyncReActLoop:
             return
 
         yield FinalAnswerEvent(content=final_text)
+
+    def _format_tool_message_content(self, *, output: Any, error: str | None) -> str:
+        """將工具結果轉成可回灌給模型的穩定 JSON 文字。"""
+        if error:
+            payload: dict[str, Any] = {"ok": False, "error": error}
+        else:
+            payload = {"ok": True, "output": output}
+
+        return json.dumps(payload, ensure_ascii=False, default=str)

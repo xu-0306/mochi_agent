@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
+from mochi.config import defaults
 from mochi.config.defaults import (
     DEFAULT_MODEL,
     DEFAULT_MODEL_FALLBACK_CHAIN,
@@ -26,6 +27,13 @@ from mochi.config.defaults import (
 # ---------------------------------------------------------------------------
 # 子設定段
 # ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+def _empty_list_typed(item_type: type[T]) -> list[T]:
+    _ = item_type
+    return []
 
 
 class OllamaConfig(BaseModel):
@@ -105,6 +113,31 @@ class LocaleDefaultsConfig(BaseModel):
     """顯示層時區偏好；`auto` 表示由客戶端或系統偵測。"""
 
 
+class ConfiguredModelConfig(BaseModel):
+    """WebGUI 可選模型清單中的非敏感模型設定。"""
+
+    id: str = Field(min_length=1)
+    """模型清單項目的穩定識別碼；可由 `/v1/models/switch` 使用。"""
+
+    provider: Literal["ollama", "openai_compat", "gemini", "anthropic", "local"]
+    """模型供應商 preset。"""
+
+    model: str = Field(min_length=1)
+    """供應商內部模型名稱。"""
+
+    model_spec: str = Field(min_length=1)
+    """後端模型規格；Ollama 為 `ollama:<model>`，遠端相容 API 為 base URL。"""
+
+    base_url: str | None = None
+    """模型服務 base URL；不包含任何 API key。"""
+
+    label: str | None = None
+    """UI 顯示名稱。"""
+
+    backend_type: str | None = None
+    """底層 backend family。"""
+
+
 class ModelSetupConfig(BaseModel):
     """模型首次啟動與 provider-aware setup metadata。"""
 
@@ -125,6 +158,11 @@ class ModelSetupConfig(BaseModel):
 
     fallback_chain: list[str] = Field(default_factory=lambda: list(DEFAULT_MODEL_FALLBACK_CHAIN))
     """建議 setup 順序：使用者設定 → 本機探測 → 遠端 OpenAI-compatible provider。"""
+
+    configured_models: list[ConfiguredModelConfig] = Field(
+        default_factory=lambda: _empty_list_typed(ConfiguredModelConfig)
+    )
+    """WebGUI 已成功設定過、可在對話下拉選擇的非敏感模型清單。"""
 
 
 class VoiceConfig(BaseModel):
@@ -288,16 +326,16 @@ class DiscordPlatformConfig(BaseModel):
     bot_token: SecretStr | None = None
     """Discord Bot Token（敏感資料）。"""
 
-    allowed_guild_ids: list[int] = Field(default_factory=list)
+    allowed_guild_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許回應的 guild ID 白名單，空列表表示全部允許。"""
 
-    allowed_channel_ids: list[int] = Field(default_factory=list)
+    allowed_channel_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許回應的頻道 ID 白名單，空列表表示全部允許。"""
 
-    allowed_voice_channel_ids: list[int] = Field(default_factory=list)
+    allowed_voice_channel_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許加入的語音頻道 ID 白名單，空列表表示全部允許。"""
 
-    allowed_user_ids: list[int] = Field(default_factory=list)
+    allowed_user_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許使用的使用者 ID 白名單，空列表表示全部允許。"""
 
     rate_limit_per_user: int = 10
@@ -328,10 +366,10 @@ class TelegramPlatformConfig(BaseModel):
     bot_token: SecretStr | None = None
     """Telegram Bot Token（敏感資料）。"""
 
-    allowed_chat_ids: list[int] = Field(default_factory=list)
+    allowed_chat_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許回應的聊天室 ID 白名單，空列表表示全部允許。"""
 
-    allowed_user_ids: list[int] = Field(default_factory=list)
+    allowed_user_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許使用的使用者 ID 白名單，空列表表示全部允許。"""
 
     rate_limit_per_user: int = 10
@@ -357,6 +395,9 @@ class LearningConfig(BaseModel):
     auto_extract_skills: bool = True
     """成功任務完成後是否自動萃取技能。"""
 
+    auto_sync_filesystem_skills: bool = True
+    """是否自動同步 skills_dir 底下的 SKILL.md 檔案。"""
+
     min_steps_for_extraction: int = 3
     """少於此步驟數的任務不進行技能萃取。"""
 
@@ -373,7 +414,7 @@ class LearningConfig(BaseModel):
 class MemoryConfig(BaseModel):
     """記憶系統設定。"""
 
-    db_path: Path = Path.home() / ".mochi" / "memory.db"
+    db_path: Path = Field(default_factory=defaults.default_memory_db_path)
     """SQLite 資料庫路徑。"""
 
     max_short_term_messages: int = 50
@@ -420,11 +461,78 @@ class WebConfig(BaseModel):
 class ToolsConfig(BaseModel):
     """工具系統設定。"""
 
-    extra_tools_dirs: list[str] = Field(default_factory=list)
+    extra_tools_dirs: list[str] = Field(default_factory=lambda: _empty_list_typed(str))
     """額外工具目錄，自動掃描 BaseTool 子類。"""
 
-    web_search_engine: Literal["duckduckgo", "google", "bing"] = "duckduckgo"
-    """網頁搜尋引擎選擇。"""
+    # --- 搜尋引擎 ---
+
+    web_search_engine: Literal[
+        "tavily", "serper", "jina", "exa",
+        "brave", "searxng", "duckduckgo", "duckduckgo_html",
+    ] = "tavily"
+    """網頁搜尋 provider 選擇（預設 Tavily，agent-native）。"""
+
+    web_search_fallback_engines: list[str] = Field(
+        default_factory=lambda: ["brave", "duckduckgo_html"],
+    )
+    """搜尋引擎 fallback chain，主引擎失敗時依序嘗試。"""
+
+    web_search_tavily_api_key: SecretStr | None = None
+    """Tavily Search API key (env: MOCHI_TAVILY_API_KEY)。"""
+
+    web_search_serper_api_key: SecretStr | None = None
+    """Serper.dev API key (env: MOCHI_SERPER_API_KEY)。"""
+
+    web_search_jina_api_key: SecretStr | None = None
+    """Jina AI API key (env: MOCHI_JINA_API_KEY)。"""
+
+    web_search_exa_api_key: SecretStr | None = None
+    """Exa (Metaphor) API key (env: MOCHI_EXA_API_KEY)。"""
+
+    web_search_brave_api_key: SecretStr | None = None
+    """Brave Search API key (env: MOCHI_BRAVE_API_KEY)。"""
+
+    web_search_searxng_base_url: str | None = None
+    """SearXNG 實例 base URL，例如 `https://search.example.com`。"""
+
+    web_search_language: str | None = None
+    """搜尋語言偏好 (e.g. 'zh-TW', 'en')。"""
+
+    web_search_region: str | None = None
+    """搜尋地區偏好 (e.g. 'tw', 'us')。"""
+
+    # --- 網頁擷取 ---
+
+    web_fetch_extractor: Literal["trafilatura", "jina_reader", "htmlparser"] = "trafilatura"
+    """網頁內容擷取器選擇。"""
+
+    web_fetch_jina_api_key: SecretStr | None = None
+    """Jina Reader API key（可與 web_search_jina_api_key 共用）。"""
+
+    # --- 文獻搜尋 ---
+
+    semantic_scholar_api_key: SecretStr | None = None
+    """Semantic Scholar API key (env: MOCHI_S2_API_KEY)。"""
+
+    pubmed_api_key: SecretStr | None = None
+    """PubMed/NCBI API key (env: MOCHI_PUBMED_API_KEY)。"""
+
+    pubmed_email: str | None = None
+    """PubMed E-utilities 用的聯繫 email。"""
+
+    crossref_mailto: str | None = None
+    """Crossref polite pool 用的 email。"""
+
+    # --- HTTP 共用 ---
+
+    http_timeout: float = 20.0
+    """HTTP 工具共用逾時秒數。"""
+
+    http_max_retries: int = 3
+    """HTTP 工具共用最大重試次數。"""
+
+    http_backoff_base: float = 1.0
+    """HTTP 工具指數退避基數（秒）。"""
 
 
 class AgentConfig(BaseModel):
@@ -491,10 +599,10 @@ class MochiConfig(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
 
     # 路徑
-    workspace_dir: str = "~/.mochi"
-    sessions_dir: str = "~/.mochi/sessions"
-    skills_dir: str = "~/.mochi/skills"
-    plugins_dir: str = "~/.mochi/plugins"
+    workspace_dir: str = Field(default_factory=defaults.default_workspace_dir)
+    sessions_dir: str = Field(default_factory=defaults.default_sessions_dir)
+    skills_dir: str = Field(default_factory=defaults.default_skills_dir)
+    plugins_dir: str = Field(default_factory=defaults.default_plugins_dir)
 
     # 日誌
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

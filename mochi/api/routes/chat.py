@@ -30,6 +30,7 @@ class ChatRequest(BaseModel):
 
     message: str = Field(min_length=1)
     session_id: str | None = None
+    model: str | None = Field(default=None, min_length=1)
 
 
 class ChatResponse(BaseModel):
@@ -46,6 +47,10 @@ class ChatResponse(BaseModel):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     """執行 bounded 單輪文字對話並回傳完整事件列表。"""
+    if payload.model:
+        from mochi.api.routes.models import switch_model_runtime
+
+        await switch_model_runtime(request, payload.model)
     engine = await _get_or_create_engine(request.app)
     session_id = payload.session_id or str(uuid4())
 

@@ -53,7 +53,11 @@ class MemorySearchTool(BaseTool):
     @property
     def description(self) -> str:
         """工具用途描述。"""
-        return "Search long-term memory (local JSONL by default)."
+        return (
+            "Search long-term memory via the configured memory store. AgentEngine uses "
+            "the shared SQLite memory store with FTS5 or LIKE fallback; standalone tool "
+            "usage falls back to local JSONL."
+        )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
