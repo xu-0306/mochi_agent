@@ -38,6 +38,8 @@ class RuntimeStore:
                     session_id TEXT,
                     project_id TEXT,
                     workspace_dir TEXT,
+                    project_workspace_dir TEXT,
+                    task_workspace_dir TEXT,
                     inference_overrides_json TEXT NOT NULL,
                     permission_override_json TEXT,
                     final_answer TEXT,
@@ -87,6 +89,8 @@ class RuntimeStore:
             _ensure_column(conn, "task_runs", "final_answer", "TEXT")
             _ensure_column(conn, "task_runs", "started_at", "TEXT")
             _ensure_column(conn, "task_runs", "finished_at", "TEXT")
+            _ensure_column(conn, "task_runs", "project_workspace_dir", "TEXT")
+            _ensure_column(conn, "task_runs", "task_workspace_dir", "TEXT")
             conn.commit()
 
     async def create_task_run(
@@ -97,6 +101,8 @@ class RuntimeStore:
         session_id: str | None,
         project_id: str | None,
         workspace_dir: str | None,
+        project_workspace_dir: str | None,
+        task_workspace_dir: str | None,
         inference_overrides: dict[str, Any] | None = None,
         permission_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -109,9 +115,10 @@ class RuntimeStore:
                     """
                     INSERT INTO task_runs (
                         id, status, input, session_id, project_id, workspace_dir,
+                        project_workspace_dir, task_workspace_dir,
                         inference_overrides_json, permission_override_json, final_answer,
                         error, started_at, finished_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -120,6 +127,8 @@ class RuntimeStore:
                         session_id,
                         project_id,
                         workspace_dir,
+                        project_workspace_dir,
+                        task_workspace_dir,
                         json.dumps(inference_overrides or {}, ensure_ascii=False),
                         json.dumps(permission_override or {}, ensure_ascii=False),
                         None,

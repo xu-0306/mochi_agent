@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -21,20 +22,29 @@ class RuntimeService:
     def __init__(self, *, engine: Any, store: RuntimeStore) -> None:
         self._engine = engine
         self._store = store
+        self._runtime_tasks_root = Path("sessions") / "runtime-tasks"
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._security_config = SecurityConfig()
+
+    def set_runtime_tasks_root(self, root_dir: Path) -> None:
+        self._runtime_tasks_root = Path(root_dir)
 
     def update_security_config(self, security: SecurityConfig) -> None:
         self._security_config = security
 
     async def create_task(self, payload: TaskCreateRequest) -> dict[str, Any]:
         task_id = str(uuid4())
+        project_workspace_dir = payload.project_workspace_dir or payload.workspace_dir
+        task_workspace_dir = (self._runtime_tasks_root / task_id / "workspace").resolve()
+        task_workspace_dir.mkdir(parents=True, exist_ok=True)
         summary = await self._store.create_task_run(
             task_id=task_id,
             input_text=payload.input,
             session_id=payload.session_id,
             project_id=payload.project_id,
-            workspace_dir=payload.workspace_dir,
+            workspace_dir=project_workspace_dir,
+            project_workspace_dir=project_workspace_dir,
+            task_workspace_dir=str(task_workspace_dir),
             inference_overrides=payload.inference_overrides,
         )
         self._active_jobs[task_id] = asyncio.create_task(
@@ -181,7 +191,8 @@ class RuntimeService:
                 session_id=task.get("session_id"),
                 inference_overrides=task.get("inference_overrides") or {},
                 project_id=task.get("project_id"),
-                workspace_dir=task.get("workspace_dir"),
+                workspace_dir=task.get("project_workspace_dir") or task.get("workspace_dir"),
+                task_workspace_dir=task.get("task_workspace_dir"),
                 permission_policy=effective_permission_policy,
             )
             async for event in stream:
@@ -242,6 +253,8 @@ def _task_summary(task: dict[str, Any]) -> dict[str, Any]:
         "input_message": task["input"],
         "session_id": task.get("session_id"),
         "project_id": task.get("project_id"),
+        "project_workspace_dir": task.get("project_workspace_dir") or task.get("workspace_dir"),
+        "task_workspace_dir": task.get("task_workspace_dir"),
         "final_answer": task.get("final_answer"),
         "error": task.get("error"),
         "started_at": task.get("started_at"),

@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from mochi.tools.base import ToolExecutionContext
 from mochi.tools.execute_code import ExecuteCodeTool
 from mochi.tools.mcp_client import MCPCallTool
 from mochi.tools.process_service import ProcessService
@@ -70,6 +71,39 @@ def test_execute_code_rejects_path_outside_workspace(tmp_path: Path) -> None:
 
     assert result.error is not None
     assert "outside workspace" in result.error.lower()
+
+
+def test_execute_code_prefers_task_sandbox_from_context(tmp_path: Path) -> None:
+    """execute_code should default cwd to context task sandbox when present."""
+    captured: dict[str, Any] = {}
+    sandbox_dir = tmp_path / "sandbox"
+    sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_runner(
+        code: str,
+        cwd: Path,
+        timeout_sec: int,
+        python_executable: str,
+    ) -> tuple[int, str, str]:
+        captured["cwd"] = cwd
+        return 0, "ok", ""
+
+    tool = ExecuteCodeTool(
+        workspace_dir=tmp_path,
+        require_approval=False,
+        runner=fake_runner,
+    )
+    result = asyncio.run(
+        tool.execute(
+            code="print('x')",
+            context=ToolExecutionContext(
+                workspace_dir=str(tmp_path),
+                task_sandbox_dir=str(sandbox_dir),
+            ),
+        )
+    )
+    assert result.error is None
+    assert captured["cwd"] == sandbox_dir.resolve(strict=False)
 
 
 def test_execute_code_default_runner_executes_python(tmp_path: Path) -> None:

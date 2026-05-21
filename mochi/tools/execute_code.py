@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.tools.process_service import ProcessService
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
 
@@ -106,6 +106,7 @@ class ExecuteCodeTool(BaseTool):
         approved: bool = False,
         background: bool = False,
         process_label: str | None = None,
+        context: ToolExecutionContext | None = None,
     ) -> ToolResult:
         """執行 Python 程式碼。"""
         if not code.strip():
@@ -117,11 +118,12 @@ class ExecuteCodeTool(BaseTool):
                 metadata={"requires_approval": True},
             )
 
+        workspace_root = self._resolve_workspace_root(context)
         try:
             working_dir = (
-                resolve_path_in_workspace(cwd, self._workspace_dir)
+                resolve_path_in_workspace(cwd, workspace_root)
                 if cwd is not None
-                else self._workspace_dir
+                else workspace_root
             )
         except ValueError as exc:
             return ToolResult(error=str(exc))
@@ -178,6 +180,17 @@ class ExecuteCodeTool(BaseTool):
             )
 
         return ToolResult(output=stdout, metadata=metadata)
+
+    def _resolve_workspace_root(self, context: ToolExecutionContext | None) -> Path:
+        if context is not None:
+            for candidate in (
+                context.task_sandbox_dir,
+                context.project_workspace,
+                context.workspace_dir,
+            ):
+                if candidate:
+                    return normalize_workspace_dir(candidate)
+        return self._workspace_dir
 
     @staticmethod
     async def _default_runner(

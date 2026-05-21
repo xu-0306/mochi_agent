@@ -122,6 +122,36 @@ async def test_shell_tool_supports_injected_runner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_shell_tool_prefers_task_sandbox_from_context(tmp_path: Path) -> None:
+    """Shell tool should default cwd to context task sandbox when provided."""
+    captured: dict[str, Any] = {}
+    sandbox_dir = tmp_path / "task-sandbox"
+    sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_runner(command: str, cwd: Path, timeout_sec: int) -> tuple[int, str, str]:
+        captured["command"] = command
+        captured["cwd"] = cwd
+        captured["timeout_sec"] = timeout_sec
+        return 0, "ok", ""
+
+    tool = ShellTool(
+        allowlist=["echo"],
+        workspace_dir=tmp_path,
+        require_approval=False,
+        runner=fake_runner,
+    )
+    result = await tool.execute(
+        command="echo sandbox",
+        context=ToolExecutionContext(
+            workspace_dir=str(tmp_path),
+            task_sandbox_dir=str(sandbox_dir),
+        ),
+    )
+    assert result.error is None
+    assert captured["cwd"] == sandbox_dir.resolve(strict=False)
+
+
+@pytest.mark.asyncio
 async def test_file_tools_security_and_write_size(tmp_path: Path) -> None:
     """file_read/file_write 應限制 workspace、檢查大小與審批。"""
     writer = FileWriteTool(

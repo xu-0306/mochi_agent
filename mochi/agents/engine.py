@@ -160,6 +160,7 @@ class AgentEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        task_workspace_dir: str | None = None,
         permission_policy: dict[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         async for event in self._run_chat(
@@ -168,6 +169,7 @@ class AgentEngine:
             inference_overrides=inference_overrides,
             project_id=project_id,
             workspace_dir=workspace_dir,
+            task_workspace_dir=task_workspace_dir,
             permission_policy=permission_policy,
             backend_override=None,
         ):
@@ -181,6 +183,7 @@ class AgentEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        task_workspace_dir: str | None = None,
         permission_policy: dict[str, Any] | None = None,
         backend_override: BaseLLMBackend | None = None,
     ) -> AsyncIterator[AgentEvent]:
@@ -237,6 +240,7 @@ class AgentEngine:
         tool_execution_context = self._get_tool_execution_context(
             session_id=session_key,
             workspace_dir=effective_workspace_dir,
+            task_workspace_dir=task_workspace_dir,
             permission_policy_override=permission_policy,
         )
         active_backend = backend_override or self._router.active
@@ -245,6 +249,11 @@ class AgentEngine:
             available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
             backend=active_backend,
             session_bound_workspace=session_bound_workspace,
+            autonomy_mode=(
+                permission_policy.get("autonomy_mode")
+                if isinstance(permission_policy, dict)
+                else self._config.security.autonomy_mode
+            ),
         )
         tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
 
@@ -963,9 +972,10 @@ class AgentEngine:
         *,
         session_id: str,
         workspace_dir: str,
+        task_workspace_dir: str | None = None,
         permission_policy_override: dict[str, Any] | None = None,
     ) -> ToolExecutionContext:
-        key = (session_id, str(workspace_dir))
+        key = (session_id, str(workspace_dir), str(task_workspace_dir or ""))
         existing = self._tool_execution_contexts.get(key)
         if existing is not None and permission_policy_override is None:
             return existing
@@ -976,6 +986,7 @@ class AgentEngine:
                 workspace_dir=str(workspace_dir),
                 session_id=session_id,
                 project_workspace=str(workspace_dir),
+                task_sandbox_dir=task_workspace_dir,
                 tool_result_store_dir=str(
                     Path(tempfile.gettempdir()) / "mochi-tool-results" / session_id
                 ),
@@ -993,6 +1004,7 @@ class AgentEngine:
             workspace_dir=existing.workspace_dir,
             session_id=existing.session_id,
             project_workspace=existing.project_workspace,
+            task_sandbox_dir=existing.task_sandbox_dir,
             permission_policy=merged_policy,
             tool_result_store_dir=existing.tool_result_store_dir,
             progress_callback=existing.progress_callback,

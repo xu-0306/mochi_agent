@@ -51,5 +51,6 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     await store.initialize()
     service = RuntimeService(engine=engine, store=store)
     service.update_security_config(config.security)
+    service.set_runtime_tasks_root(Path(config.sessions_dir) / "runtime-tasks")
     app.state.runtime_service = service
     return service

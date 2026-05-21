@@ -17,6 +17,7 @@ from mochi.config.schema import MochiConfig
 class _RuntimeFakeEngine:
     def __init__(self) -> None:
         self.permission_policy_calls: list[dict[str, Any] | None] = []
+        self.task_workspace_calls: list[str | None] = []
         self._run_count = 0
 
     async def chat(
@@ -26,10 +27,18 @@ class _RuntimeFakeEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        task_workspace_dir: str | None = None,
         permission_policy: dict[str, Any] | None = None,
     ) -> AsyncIterator[object]:
-        _ = (message, session_id, inference_overrides, project_id, workspace_dir)
+        _ = (
+            message,
+            session_id,
+            inference_overrides,
+            project_id,
+            workspace_dir,
+        )
         self.permission_policy_calls.append(permission_policy)
+        self.task_workspace_calls.append(task_workspace_dir)
         self._run_count += 1
         if self._run_count == 1:
             yield ThinkingEvent(content="thinking")
@@ -74,16 +83,36 @@ def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
     with TestClient(app) as client:
         create_response = client.post(
             "/v1/tasks",
-            json={"input_message": "run something", "session_id": "runtime-s1"},
+            json={
+                "input_message": "run something",
+                "session_id": "runtime-s1",
+                "workspace_dir": str(tmp_path / "project-workspace"),
+            },
         )
         assert create_response.status_code == 200
-        task_id = create_response.json()["task_id"]
+        created = create_response.json()
+        task_id = created["task_id"]
+        assert created["project_workspace_dir"] == str(tmp_path / "project-workspace")
+        expected_task_workspace = (
+            tmp_path / "sessions" / "runtime-tasks" / task_id / "workspace"
+        ).resolve()
+        assert created["task_workspace_dir"] == str(expected_task_workspace)
+        assert expected_task_workspace.is_dir()
 
         task_payload = _wait_until(client, task_id, {"awaiting_approval"})
+        assert task_payload["project_workspace_dir"] == str(tmp_path / "project-workspace")
+        assert task_payload["task_workspace_dir"] == str(expected_task_workspace)
         assert task_payload["pending_approval"] is not None
         assert task_payload["events"][0]["type"] == "thinking"
         assert task_payload["events"][1]["type"] == "tool_call_request"
         assert task_payload["events"][2]["type"] == "tool_call_result"
+
+        list_response = client.get("/v1/tasks")
+        assert list_response.status_code == 200
+        listed = list_response.json()
+        assert len(listed) == 1
+        assert listed[0]["project_workspace_dir"] == str(tmp_path / "project-workspace")
+        assert listed[0]["task_workspace_dir"] == str(expected_task_workspace)
 
         approvals_response = client.get("/v1/approvals?status=pending")
         assert approvals_response.status_code == 200
@@ -118,3 +147,7 @@ def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
             }
         ]
     }
+    assert engine.task_workspace_calls == [
+        str(expected_task_workspace),
+        str(expected_task_workspace),
+    ]

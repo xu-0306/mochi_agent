@@ -17,6 +17,8 @@ def test_runtime_store_persists_tasks_events_and_approvals(tmp_path: Path) -> No
             session_id="s1",
             project_id=None,
             workspace_dir=None,
+            project_workspace_dir=str(tmp_path / "project-workspace"),
+            task_workspace_dir=str(tmp_path / "sessions" / "runtime-tasks" / "task-1" / "workspace"),
             inference_overrides={"temperature": 0.1},
         )
     )
@@ -54,3 +56,7 @@ def test_runtime_store_persists_tasks_events_and_approvals(tmp_path: Path) -> No
     saved_task = asyncio.run(store.get_task_run("task-1"))
     assert saved_task is not None
     assert saved_task["status"] == "succeeded"
+    assert saved_task["project_workspace_dir"] == str(tmp_path / "project-workspace")
+    assert saved_task["task_workspace_dir"] == str(
+        tmp_path / "sessions" / "runtime-tasks" / "task-1" / "workspace"
+    )

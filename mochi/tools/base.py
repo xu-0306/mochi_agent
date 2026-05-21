@@ -38,6 +38,7 @@ class ToolExecutionContext:
     workspace_dir: str | None = None
     session_id: str | None = None
     project_workspace: str | None = None
+    task_sandbox_dir: str | None = None
     permission_policy: dict[str, Any] = field(default_factory=dict)
     read_state_cache: dict[str, FileReadState] = field(default_factory=dict)
     tool_result_store_dir: str | None = None

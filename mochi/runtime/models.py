@@ -15,6 +15,7 @@ class TaskCreateRequest(BaseModel):
     input: str = Field(min_length=1, alias="input_message")
     session_id: str | None = None
     project_id: str | None = None
+    project_workspace_dir: str | None = None
     workspace_dir: str | None = None
     inference_overrides: dict[str, Any] = Field(default_factory=dict)
 
