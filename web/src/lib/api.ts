@@ -3927,3 +3927,144 @@ export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> 
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }
 }
+
+export interface TaskSummary {
+  task_id: string
+  session_id: string | null
+  project_id: string | null
+  status: string
+  input_message: string
+  final_answer: string | null
+  error: string | null
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+  pending_approval_id: string | null
+}
+
+export interface TaskDetail extends TaskSummary {
+  events: Array<Record<string, unknown>>
+}
+
+export interface ApprovalSummary {
+  approval_id: string
+  task_id: string
+  status: string
+  tool_name: string
+  arguments: Record<string, unknown>
+  created_at: string
+  resolved_at: string | null
+  decision: string | null
+}
+
+export interface CreateTaskInput {
+  session_id?: string | null
+  project_id?: string | null
+  input_message: string
+}
+
+export interface ResolveApprovalInput {
+  decision: 'approve' | 'reject'
+}
+
+function getNullableString(value: unknown): string | null {
+  const next = getString(value)
+  return next ?? null
+}
+
+function normalizeTaskSummary(payload: unknown): TaskSummary {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    task_id: getString(record.task_id) ?? '',
+    session_id: getNullableString(record.session_id),
+    project_id: getNullableString(record.project_id),
+    status: getString(record.status) ?? 'unknown',
+    input_message: getString(record.input_message) ?? '',
+    final_answer: getNullableString(record.final_answer),
+    error: getNullableString(record.error),
+    created_at: getString(record.created_at) ?? new Date(0).toISOString(),
+    updated_at: getString(record.updated_at) ?? new Date(0).toISOString(),
+    started_at: getNullableString(record.started_at),
+    finished_at: getNullableString(record.finished_at),
+    pending_approval_id: getNullableString(record.pending_approval_id),
+  }
+}
+
+function normalizeTaskDetail(payload: unknown): TaskDetail {
+  const summary = normalizeTaskSummary(payload)
+  const record = isRecord(payload) ? payload : {}
+  return {
+    ...summary,
+    events: getRecordArray(record.events),
+  }
+}
+
+function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    approval_id: getString(record.approval_id) ?? '',
+    task_id: getString(record.task_id) ?? '',
+    status: getString(record.status) ?? 'pending',
+    tool_name: getString(record.tool_name) ?? '',
+    arguments: isRecord(record.arguments) ? record.arguments : {},
+    created_at: getString(record.created_at) ?? new Date(0).toISOString(),
+    resolved_at: getNullableString(record.resolved_at),
+    decision: getNullableString(record.decision),
+  }
+}
+
+export async function createTask(input: CreateTaskInput): Promise<TaskSummary> {
+  const payload = await requestJson<unknown>('/tasks', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return normalizeTaskSummary(payload)
+}
+
+export async function fetchTasks(): Promise<TaskSummary[]> {
+  const payload = await requestJson<unknown>('/tasks')
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload.map((item) => normalizeTaskSummary(item))
+}
+
+export async function fetchTask(taskId: string): Promise<TaskDetail> {
+  const payload = await requestJson<unknown>(`/tasks/${encodeURIComponent(taskId)}`)
+  return normalizeTaskDetail(payload)
+}
+
+export async function resumeTask(taskId: string): Promise<TaskSummary> {
+  const payload = await requestJson<unknown>(`/tasks/${encodeURIComponent(taskId)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ approved: true }),
+  })
+  return normalizeTaskSummary(payload)
+}
+
+export async function cancelTask(taskId: string): Promise<TaskSummary> {
+  const payload = await requestJson<unknown>(`/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: 'POST',
+  })
+  return normalizeTaskSummary(payload)
+}
+
+export async function fetchApprovals(): Promise<ApprovalSummary[]> {
+  const payload = await requestJson<unknown>('/approvals')
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload.map((item) => normalizeApprovalSummary(item))
+}
+
+export async function resolveApproval(
+  approvalId: string,
+  input: ResolveApprovalInput
+): Promise<ApprovalSummary> {
+  const payload = await requestJson<unknown>(`/approvals/${encodeURIComponent(approvalId)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return normalizeApprovalSummary(payload)
+}

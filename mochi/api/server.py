@@ -69,6 +69,7 @@ def create_app() -> FastAPI:
     app.state.skill_library = None
     app.state.vllm_runtime_manager = None
     app.state.voice_bridge_diagnostics = _create_voice_bridge_diagnostics_state()
+    app.state.runtime_service = None
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_resolve_initial_cors_origins(),
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
     )
 
     from mochi.api.routes import (
+        approvals_router,
         chat_router,
         file_ops_router,
         filesystem_router,
@@ -86,10 +88,13 @@ def create_app() -> FastAPI:
         sessions_router,
         settings_router,
         skills_router,
+        tasks_router,
         voice_router,
     )
 
     app.include_router(chat_router)
+    app.include_router(tasks_router)
+    app.include_router(approvals_router)
     app.include_router(models_router)
     app.include_router(skills_router)
     app.include_router(projects_router)
@@ -610,6 +615,7 @@ async def _shutdown_engine(app: FastAPI) -> None:
         if callable(stop):
             await _maybe_await(stop())
     app.state.vllm_runtime_manager = None
+    app.state.runtime_service = None
 
 
 def _create_voice_bridge_diagnostics_state() -> dict[str, Any]:

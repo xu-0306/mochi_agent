@@ -10,6 +10,7 @@ import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
 import { InferencePanel } from '@/components/chat/InferencePanel'
 import { ScrollToBottom } from '@/components/chat/ScrollToBottom'
+import { TaskPanel } from '@/components/chat/TaskPanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import * as api from '@/lib/api'
 import type { Message, ReasoningStep } from '@/lib/chat'
@@ -1366,6 +1367,7 @@ export default function ChatPage() {
           settings={settings}
           onSettingsUpdated={setSettings}
         />
+        <TaskPanel />
       </div>
 
       {modelSwitchError ? (

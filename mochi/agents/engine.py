@@ -159,6 +159,7 @@ class AgentEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        permission_policy: dict[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         async for event in self._run_chat(
             message,
@@ -166,6 +167,7 @@ class AgentEngine:
             inference_overrides=inference_overrides,
             project_id=project_id,
             workspace_dir=workspace_dir,
+            permission_policy=permission_policy,
             backend_override=None,
         ):
             yield event
@@ -178,6 +180,7 @@ class AgentEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        permission_policy: dict[str, Any] | None = None,
         backend_override: BaseLLMBackend | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """執行單輪對話，回傳事件串流。
@@ -233,6 +236,7 @@ class AgentEngine:
         tool_execution_context = self._get_tool_execution_context(
             session_id=session_key,
             workspace_dir=effective_workspace_dir,
+            permission_policy_override=permission_policy,
         )
         active_backend = backend_override or self._router.active
         exposure_plan = self._tool_exposure_planner.plan(
@@ -956,27 +960,44 @@ class AgentEngine:
         *,
         session_id: str,
         workspace_dir: str,
+        permission_policy_override: dict[str, Any] | None = None,
     ) -> ToolExecutionContext:
         key = (session_id, str(workspace_dir))
         existing = self._tool_execution_contexts.get(key)
-        if existing is not None:
+        if existing is not None and permission_policy_override is None:
             return existing
 
-        context = ToolExecutionContext(
-            workspace_dir=str(workspace_dir),
-            session_id=session_id,
-            project_workspace=str(workspace_dir),
-            tool_result_store_dir=str(
-                Path(tempfile.gettempdir()) / "mochi-tool-results" / session_id
-            ),
-            permission_policy={
-                "require_approval_for_file_write": self._config.security.require_approval_for_file_write,
-                "require_approval_for_shell": self._config.security.require_approval_for_shell,
-                "file_ops_scope": self._config.security.file_ops_scope,
-            },
+        base_permission_policy = {
+            "require_approval_for_file_write": self._config.security.require_approval_for_file_write,
+            "require_approval_for_shell": self._config.security.require_approval_for_shell,
+            "file_ops_scope": self._config.security.file_ops_scope,
+        }
+        if existing is None:
+            context = ToolExecutionContext(
+                workspace_dir=str(workspace_dir),
+                session_id=session_id,
+                project_workspace=str(workspace_dir),
+                tool_result_store_dir=str(
+                    Path(tempfile.gettempdir()) / "mochi-tool-results" / session_id
+                ),
+                permission_policy=base_permission_policy,
+            )
+            self._tool_execution_contexts[key] = context
+            existing = context
+
+        if permission_policy_override is None:
+            return existing
+
+        merged_policy = dict(existing.permission_policy or base_permission_policy)
+        merged_policy.update(permission_policy_override)
+        return ToolExecutionContext(
+            workspace_dir=existing.workspace_dir,
+            session_id=existing.session_id,
+            project_workspace=existing.project_workspace,
+            permission_policy=merged_policy,
+            tool_result_store_dir=existing.tool_result_store_dir,
+            progress_callback=existing.progress_callback,
         )
-        self._tool_execution_contexts[key] = context
-        return context
 
     async def _get_context(self, session_id: str) -> ContextManager:
         """取得或建立指定 session 的上下文管理器。"""

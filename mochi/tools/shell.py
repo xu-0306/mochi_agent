@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.process_service import ProcessService
 from mochi.utils.security import (
     is_safe_command,
     normalize_workspace_dir,
@@ -28,6 +29,7 @@ class ShellTool(BaseTool):
         require_approval: bool = True,
         default_timeout_sec: int = 30,
         runner: ShellRunner | None = None,
+        process_service: ProcessService | None = None,
     ) -> None:
         """初始化 Shell 工具。
 
@@ -43,6 +45,7 @@ class ShellTool(BaseTool):
         self._require_approval = require_approval
         self._default_timeout_sec = default_timeout_sec
         self._runner = runner or self._default_runner
+        self._process_service = process_service
 
     @property
     def name(self) -> str:
@@ -85,6 +88,15 @@ class ShellTool(BaseTool):
                     "default": False,
                     "description": "Whether user approval has been granted. Required when require_approval is true.",
                 },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run command in background and return process metadata immediately.",
+                },
+                "process_label": {
+                    "type": "string",
+                    "description": "Optional label for background process tracking.",
+                },
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -102,6 +114,8 @@ class ShellTool(BaseTool):
         cwd: str | None = None,
         timeout_sec: int | None = None,
         approved: bool = False,
+        background: bool = False,
+        process_label: str | None = None,
     ) -> ToolResult:
         """執行受控 shell 命令。"""
         if not command.strip():
@@ -137,6 +151,22 @@ class ShellTool(BaseTool):
         effective_timeout = timeout_sec if timeout_sec is not None else self._default_timeout_sec
         if effective_timeout <= 0:
             return ToolResult(error="`timeout_sec` must be greater than 0.")
+
+        if background:
+            if self._process_service is None:
+                return ToolResult(error="Background process runtime is not configured.")
+            try:
+                payload = await self._process_service.start_shell(
+                    command=command,
+                    cwd=working_dir,
+                    label=process_label,
+                )
+            except Exception as exc:  # pragma: no cover
+                return ToolResult(
+                    error=f"Shell background launch failed: {exc}",
+                    metadata={"command": command, "cwd": str(working_dir)},
+                )
+            return ToolResult(output=payload, metadata=payload)
 
         try:
             returncode, stdout, stderr = await self._runner(command, working_dir, effective_timeout)

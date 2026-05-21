@@ -92,22 +92,49 @@ class ToolRegistry:
         if tool is None:
             raise KeyError(f"Tool '{name}' not found in registry.")
 
+        execution_args = dict(args)
         try:
-            validation_error = tool.validate_input(args, context)
+            validation_error = tool.validate_input(execution_args, context)
             if validation_error is not None:
                 return validation_error
 
-            permission_error = tool.check_permissions(args, context)
+            permission_error = tool.check_permissions(execution_args, context)
             if permission_error is not None:
                 return permission_error
 
             execute_signature = inspect.signature(tool.execute)
+            if (
+                context is not None
+                and "approved" in execute_signature.parameters
+                and self._is_auto_approved_call(name=name, args=execution_args, context=context)
+            ):
+                execution_args["approved"] = True
             if "context" in execute_signature.parameters:
-                return await tool.execute(**args, context=context)
-            return await tool.execute(**args)
+                return await tool.execute(**execution_args, context=context)
+            return await tool.execute(**execution_args)
         except Exception as exc:
             logger.warning("Tool '{}' execution error: {}", name, exc)
             return ToolResult(error=str(exc))
+
+    @staticmethod
+    def _is_auto_approved_call(
+        *,
+        name: str,
+        args: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> bool:
+        approved_calls = context.permission_policy.get("approved_tool_calls")
+        if not isinstance(approved_calls, list):
+            return False
+        for candidate in approved_calls:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("tool_name") != name:
+                continue
+            candidate_args = candidate.get("arguments")
+            if isinstance(candidate_args, dict) and candidate_args == args:
+                return True
+        return False
 
     def format_result_for_model(
         self,

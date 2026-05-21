@@ -19,6 +19,8 @@ from mochi.tools.literature_search import (
 from mochi.tools.mcp_client import MCPCallTool, McpListResourcesTool, McpReadResourceTool, McpRuntimeManager
 from mochi.tools.memory_save import MemorySaveTool
 from mochi.tools.memory_search import MemorySearchTool
+from mochi.tools.process_control import ProcessPollTool, ProcessStopTool
+from mochi.tools.process_service import ProcessService
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.shell import ShellTool
 from mochi.tools.web_fetch import WebFetchTool
@@ -55,6 +57,7 @@ class ToolRegistryFactory:
         self._config = config
         self._memory_store = memory_store
         self._mcp_runtime_manager = mcp_runtime_manager
+        self._process_service = ProcessService()
         self._builtins = self._build_specs()
 
     @property
@@ -89,6 +92,7 @@ class ToolRegistryFactory:
         return {
             "memory_store": self._memory_store,
             "mcp_runtime_manager": self._mcp_runtime_manager,
+            "process_service": self._process_service,
         }
 
     def _build_specs(self) -> list[BuiltInToolSpec]:
@@ -102,6 +106,8 @@ class ToolRegistryFactory:
             BuiltInToolSpec("file_write", "workspace", "workspace", self._build_file_write),
             BuiltInToolSpec("file_edit", "workspace", "workspace", self._build_file_edit),
             BuiltInToolSpec("execute_code", "workspace", "workspace", self._build_execute_code),
+            BuiltInToolSpec("process_poll", "workspace", "workspace", self._build_process_poll),
+            BuiltInToolSpec("process_stop", "workspace", "workspace", self._build_process_stop),
             BuiltInToolSpec("arxiv_search", "shared", "literature", self._build_arxiv),
             BuiltInToolSpec("semantic_scholar_search", "shared", "literature", self._build_semantic_scholar),
             BuiltInToolSpec("crossref_search", "shared", "literature", self._build_crossref),
@@ -150,6 +156,7 @@ class ToolRegistryFactory:
             allowlist=config.security.shell_command_allowlist,
             workspace_dir=workspace_dir,
             require_approval=config.security.require_approval_for_shell,
+            process_service=services.get("process_service"),
         )
 
     def _build_file_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -184,7 +191,16 @@ class ToolRegistryFactory:
         return ExecuteCodeTool(
             workspace_dir=workspace_dir,
             require_approval=config.security.require_approval_for_shell,
+            process_service=services.get("process_service"),
         )
+
+    def _build_process_poll(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
+        del config, workspace_dir
+        return ProcessPollTool(process_service=services["process_service"])
+
+    def _build_process_stop(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
+        del config, workspace_dir
+        return ProcessStopTool(process_service=services["process_service"])
 
     def _build_arxiv(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del workspace_dir, services

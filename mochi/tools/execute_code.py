@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.process_service import ProcessService
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
 
 CodeRunner = Callable[[str, Path, int, str], Awaitable[tuple[int, str, str]]]
@@ -26,6 +27,7 @@ class ExecuteCodeTool(BaseTool):
         default_timeout_sec: int = 10,
         python_executable: str | None = None,
         runner: CodeRunner | None = None,
+        process_service: ProcessService | None = None,
     ) -> None:
         """初始化 execute_code 工具。
 
@@ -41,6 +43,7 @@ class ExecuteCodeTool(BaseTool):
         self._default_timeout_sec = default_timeout_sec
         self._python_executable = python_executable or sys.executable
         self._runner = runner or self._default_runner
+        self._process_service = process_service
 
     @property
     def name(self) -> str:
@@ -75,6 +78,15 @@ class ExecuteCodeTool(BaseTool):
                     "default": False,
                     "description": "Whether user approval has been granted. Required when require_approval is true.",
                 },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run code in background and return process metadata immediately.",
+                },
+                "process_label": {
+                    "type": "string",
+                    "description": "Optional label for background process tracking.",
+                },
             },
             "required": ["code"],
             "additionalProperties": False,
@@ -92,6 +104,8 @@ class ExecuteCodeTool(BaseTool):
         cwd: str | None = None,
         timeout_sec: int | None = None,
         approved: bool = False,
+        background: bool = False,
+        process_label: str | None = None,
     ) -> ToolResult:
         """執行 Python 程式碼。"""
         if not code.strip():
@@ -118,6 +132,23 @@ class ExecuteCodeTool(BaseTool):
         effective_timeout = timeout_sec if timeout_sec is not None else self._default_timeout_sec
         if effective_timeout <= 0:
             return ToolResult(error="`timeout_sec` must be greater than 0.")
+
+        if background:
+            if self._process_service is None:
+                return ToolResult(error="Background process runtime is not configured.")
+            try:
+                payload = await self._process_service.start_python(
+                    code=code,
+                    cwd=working_dir,
+                    python_executable=self._python_executable,
+                    label=process_label,
+                )
+            except Exception as exc:  # pragma: no cover
+                return ToolResult(
+                    error=f"Code background launch failed: {exc}",
+                    metadata={"cwd": str(working_dir)},
+                )
+            return ToolResult(output=payload, metadata=payload)
 
         try:
             returncode, stdout, stderr = await self._runner(
