@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Save,
   Send,
+  Shield,
   Sparkles,
   Terminal,
   Trash2,
@@ -4575,6 +4576,160 @@ function LearningStorageForm({
   )
 }
 
+function SecuritySettingsForm({
+  security,
+  onUpdated,
+}: {
+  security: api.SecuritySettings | undefined
+  onUpdated: (settings: api.Settings) => void
+}) {
+  const { t } = useI18n()
+  const [autonomyMode, setAutonomyMode] = React.useState<api.SecuritySettings['autonomy_mode']>(
+    security?.autonomy_mode ?? 'trusted_workspace'
+  )
+  const [requireShellApproval, setRequireShellApproval] = React.useState(security?.require_approval_for_shell ?? true)
+  const [requireFileWriteApproval, setRequireFileWriteApproval] = React.useState(security?.require_approval_for_file_write ?? false)
+  const [fileOpsScope, setFileOpsScope] = React.useState<'workspace' | 'any'>(security?.file_ops_scope ?? 'workspace')
+  const [maxFileWriteSizeMb, setMaxFileWriteSizeMb] = React.useState(String(security?.max_file_write_size_mb ?? 10.0))
+  const [fileUndoMaxSizeMb, setFileUndoMaxSizeMb] = React.useState(String(security?.file_undo_max_size_mb ?? 2.0))
+  const [submitting, setSubmitting] = React.useState(false)
+  const [message, setMessage] = React.useState<FormMessage>(null)
+
+  React.useEffect(() => {
+    setAutonomyMode(security?.autonomy_mode ?? 'trusted_workspace')
+    setRequireShellApproval(security?.require_approval_for_shell ?? true)
+    setRequireFileWriteApproval(security?.require_approval_for_file_write ?? false)
+    setFileOpsScope(security?.file_ops_scope ?? 'workspace')
+    setMaxFileWriteSizeMb(String(security?.max_file_write_size_mb ?? 10.0))
+    setFileUndoMaxSizeMb(String(security?.file_undo_max_size_mb ?? 2.0))
+  }, [security])
+
+  const handleAutonomyModeChange = (value: api.SecuritySettings['autonomy_mode']) => {
+    setAutonomyMode(value)
+    if (value === 'strict') {
+      setRequireShellApproval(true)
+      setRequireFileWriteApproval(true)
+      setFileOpsScope('workspace')
+      return
+    }
+    if (value === 'trusted_workspace') {
+      setRequireShellApproval(true)
+      setRequireFileWriteApproval(false)
+      setFileOpsScope('workspace')
+      return
+    }
+    if (value === 'high_autonomy') {
+      setRequireShellApproval(false)
+      setRequireFileWriteApproval(false)
+      setFileOpsScope('any')
+      return
+    }
+    setRequireShellApproval(false)
+    setRequireFileWriteApproval(false)
+    setFileOpsScope('workspace')
+  }
+
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setSubmitting(true)
+    setMessage(null)
+
+    try {
+      if (typeof settingsApi.updateSettings !== 'function') {
+        throw new Error('Settings update API client is unavailable.')
+      }
+      const settings = await settingsApi.updateSettings({
+        security: {
+          autonomy_mode: autonomyMode,
+          require_approval_for_shell: requireShellApproval,
+          require_approval_for_file_write: requireFileWriteApproval,
+          file_ops_scope: fileOpsScope,
+          max_file_write_size_mb: Number.parseFloat(maxFileWriteSizeMb) || 10.0,
+          file_undo_max_size_mb: Number.parseFloat(fileUndoMaxSizeMb) || 2.0,
+        },
+      })
+      onUpdated(settings)
+      setMessage({ type: 'success', text: t('settings.security.successSaved') })
+    } catch (updateError) {
+      setMessage({
+        type: 'error',
+        text: messageWithDetail(t('settings.security.errorSave'), updateError),
+      })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <section className="rounded-lg border border-border bg-surface-layer">
+      <div className="border-b border-border px-4 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">{t('settings.security.title')}</h3>
+            <p className="mt-0.5 text-xs text-muted-foreground">{t('settings.security.description')}</p>
+          </div>
+          <Shield className="h-4 w-4 text-muted-foreground" />
+        </div>
+      </div>
+      <form onSubmit={handleSubmit} className="space-y-4 px-4 py-4">
+        <label className="space-y-1.5">
+          <SettingLabel>{t('settings.security.autonomyMode')}</SettingLabel>
+          <Select value={autonomyMode} onValueChange={(value) => handleAutonomyModeChange(value as api.SecuritySettings['autonomy_mode'])}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="strict">{t('settings.security.autonomyMode.strict')}</SelectItem>
+              <SelectItem value="trusted_workspace">{t('settings.security.autonomyMode.trusted_workspace')}</SelectItem>
+              <SelectItem value="auto_review">{t('settings.security.autonomyMode.auto_review')}</SelectItem>
+              <SelectItem value="high_autonomy">{t('settings.security.autonomyMode.high_autonomy')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </label>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('settings.security.requireShellApproval')}</span>
+            <Switch checked={requireShellApproval} onCheckedChange={setRequireShellApproval} />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
+            <span className="text-sm text-foreground">{t('settings.security.requireFileWriteApproval')}</span>
+            <Switch checked={requireFileWriteApproval} onCheckedChange={setRequireFileWriteApproval} />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <label className="space-y-1.5 md:col-span-1">
+            <SettingLabel>{t('settings.security.fileScope')}</SettingLabel>
+            <Select value={fileOpsScope} onValueChange={(value) => setFileOpsScope(value as 'workspace' | 'any')}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="workspace">{t('settings.security.fileScope.workspace')}</SelectItem>
+                <SelectItem value="any">{t('settings.security.fileScope.any')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.maxWriteSizeMb')}</SettingLabel>
+            <Input value={maxFileWriteSizeMb} onChange={(event) => setMaxFileWriteSizeMb(event.target.value)} className="font-mono text-xs" />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.undoMaxSizeMb')}</SettingLabel>
+            <Input value={fileUndoMaxSizeMb} onChange={(event) => setFileUndoMaxSizeMb(event.target.value)} className="font-mono text-xs" />
+          </label>
+        </div>
+        <SettingMessage message={message} />
+        <div className="flex justify-end">
+          <Button type="submit" variant="primary" size="sm" loading={submitting}>
+            <Save className="h-3.5 w-3.5" />
+            {t('settings.action.saveSecurity')}
+          </Button>
+        </div>
+      </form>
+    </section>
+  )
+}
+
 function ToolsSettingsForm({
   tools,
   onUpdated,
@@ -5204,6 +5359,7 @@ export default function SettingsPage() {
   const voiceSection = React.useMemo(() => settings?.voice ?? {}, [settings])
   const memorySection = React.useMemo(() => extractSection(settings, 'memory'), [settings])
   const learningSection = React.useMemo(() => extractSection(settings, 'learning'), [settings])
+  const securitySection = React.useMemo(() => settings?.security, [settings])
   const toolsSection = React.useMemo(() => settings?.tools ?? {}, [settings])
   const channelsSection = React.useMemo(() => extractSection(settings, 'channels'), [settings])
   const webSection = React.useMemo(() => extractSection(settings, 'web'), [settings])
@@ -5436,6 +5592,13 @@ export default function SettingsPage() {
                   items={learningSummary}
                 />
               </div>
+            </TabsContent>
+
+            <TabsContent value="security" className="mt-0">
+              <SecuritySettingsForm
+                security={securitySection}
+                onUpdated={(updatedSettings) => setSettings(updatedSettings)}
+              />
             </TabsContent>
 
             <TabsContent value="channels" className="mt-0">

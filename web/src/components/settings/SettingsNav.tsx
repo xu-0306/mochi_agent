@@ -5,7 +5,7 @@ import { BookOpen } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n'
 
-export type SettingsTab = 'model' | 'inference' | 'voice' | 'memory' | 'learning' | 'channels' | 'web'
+export type SettingsTab = 'model' | 'inference' | 'voice' | 'memory' | 'learning' | 'security' | 'channels' | 'web'
 export type SettingsNavActive = SettingsTab | 'discord-guide'
 
 export const DEFAULT_SETTINGS_TAB: SettingsTab = 'model'
@@ -19,6 +19,7 @@ export const SETTINGS_TABS: Array<{
   { value: 'voice', labelKey: 'settings.tabs.voice' },
   { value: 'memory', labelKey: 'settings.tabs.memory' },
   { value: 'learning', labelKey: 'settings.tabs.learning' },
+  { value: 'security', labelKey: 'settings.tabs.security' },
   { value: 'channels', labelKey: 'settings.tabs.channels' },
   { value: 'web', labelKey: 'settings.tabs.web' },
 ]

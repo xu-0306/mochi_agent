@@ -41,13 +41,15 @@ async def resolve_approval(
 
 async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     existing = cast(RuntimeService | None, getattr(app.state, "runtime_service", None))
+    config = await _get_config(app)
     if existing is not None:
+        existing.update_security_config(config.security)
         return existing
 
-    config = await _get_config(app)
     engine = await _get_or_create_engine(app)
     store = RuntimeStore(Path(config.sessions_dir) / "runtime.db")
     await store.initialize()
     service = RuntimeService(engine=engine, store=store)
+    service.update_security_config(config.security)
     app.state.runtime_service = service
     return service

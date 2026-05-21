@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import SecretStr
 
+from mochi.security.policy import resolve_runtime_permission_policy
 from mochi.tools.base import BaseTool
 from mochi.tools.execute_code import ExecuteCodeTool
 from mochi.tools.file_ops import FileEditTool, FileReadTool, FileWriteTool
@@ -151,46 +152,49 @@ class ToolRegistryFactory:
         )
 
     def _build_shell(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
-        del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         return ShellTool(
             allowlist=config.security.shell_command_allowlist,
             workspace_dir=workspace_dir,
-            require_approval=config.security.require_approval_for_shell,
+            require_approval=runtime_policy.require_approval_for_shell,
             process_service=services.get("process_service"),
         )
 
     def _build_file_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileReadTool(
             workspace_dir=workspace_dir,
-            path_scope=config.security.file_ops_scope,
+            path_scope=runtime_policy.file_ops_scope,
         )
 
     def _build_file_write(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileWriteTool(
             workspace_dir=workspace_dir,
-            path_scope=config.security.file_ops_scope,
-            require_approval=config.security.require_approval_for_file_write,
+            path_scope=runtime_policy.file_ops_scope,
+            require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
         )
 
     def _build_file_edit(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileEditTool(
             workspace_dir=workspace_dir,
-            path_scope=config.security.file_ops_scope,
-            require_approval=config.security.require_approval_for_file_write,
+            path_scope=runtime_policy.file_ops_scope,
+            require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
         )
 
     def _build_execute_code(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
-        del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         return ExecuteCodeTool(
             workspace_dir=workspace_dir,
-            require_approval=config.security.require_approval_for_shell,
+            require_approval=runtime_policy.require_approval_for_shell,
             process_service=services.get("process_service"),
         )
 

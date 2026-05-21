@@ -7,8 +7,10 @@ from typing import Any
 from uuid import uuid4
 
 from mochi.api.routes.chat import _serialize_event
+from mochi.config.schema import SecurityConfig
 from mochi.runtime.models import TaskCreateRequest
 from mochi.runtime.store import RuntimeStore
+from mochi.security.policy import build_runtime_permission_policy_dict
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 
@@ -20,6 +22,10 @@ class RuntimeService:
         self._engine = engine
         self._store = store
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
+        self._security_config = SecurityConfig()
+
+    def update_security_config(self, security: SecurityConfig) -> None:
+        self._security_config = security
 
     async def create_task(self, payload: TaskCreateRequest) -> dict[str, Any]:
         task_id = str(uuid4())
@@ -166,13 +172,17 @@ class RuntimeService:
         final_answer: str | None = None
 
         try:
+            effective_permission_policy = build_runtime_permission_policy_dict(
+                self._security_config,
+                overrides=permission_override,
+            )
             stream = self._engine.chat(
                 task["input"],
                 session_id=task.get("session_id"),
                 inference_overrides=task.get("inference_overrides") or {},
                 project_id=task.get("project_id"),
                 workspace_dir=task.get("workspace_dir"),
-                permission_policy=permission_override,
+                permission_policy=effective_permission_policy,
             )
             async for event in stream:
                 serialized = _serialize_event(event)

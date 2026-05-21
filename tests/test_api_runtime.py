@@ -100,8 +100,17 @@ def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
         done_payload = _wait_until(client, task_id, {"succeeded"})
         assert done_payload["events"][-1]["type"] == "final_answer"
 
-    assert engine.permission_policy_calls[0] is None
+    assert engine.permission_policy_calls[0] == {
+        "autonomy_mode": "trusted_workspace",
+        "require_approval_for_shell": True,
+        "require_approval_for_file_write": False,
+        "file_ops_scope": "workspace",
+    }
     assert engine.permission_policy_calls[1] == {
+        "autonomy_mode": "trusted_workspace",
+        "require_approval_for_shell": True,
+        "require_approval_for_file_write": False,
+        "file_ops_scope": "workspace",
         "approved_tool_calls": [
             {
                 "tool_name": "shell",

@@ -189,8 +189,9 @@ channels:
 
 # 安全設定
 security:
+  autonomy_mode: "trusted_workspace"
   require_approval_for_shell: true
-  require_approval_for_file_write: true
+  require_approval_for_file_write: false
   shell_command_allowlist:
     - "ls"
     - "cat"

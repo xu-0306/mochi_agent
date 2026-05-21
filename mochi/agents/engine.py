@@ -52,6 +52,7 @@ from mochi.memory.conversation import ConversationMemory
 from mochi.memory.store import MemoryStore
 from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.projects.store import ProjectStore
+from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
 from mochi.sessions.store import SessionStore
 from mochi.agents.tool_exposure import ToolExposurePlanner
 from mochi.tools.base import ToolExecutionContext
@@ -760,25 +761,26 @@ class AgentEngine:
         from mochi.tools.datetime_tool import DateTimeTool
 
         tc = self._config.tools  # shortcut
+        runtime_policy = resolve_runtime_permission_policy(self._config.security)
 
         self._tool_registry.register(
             ShellTool(
                 allowlist=self._config.security.shell_command_allowlist,
                 workspace_dir=self._config.workspace_dir,
-                require_approval=self._config.security.require_approval_for_shell,
+                require_approval=runtime_policy.require_approval_for_shell,
             )
         )
         self._tool_registry.register(
             FileReadTool(
                 workspace_dir=self._config.workspace_dir,
-                path_scope=self._config.security.file_ops_scope,
+                path_scope=runtime_policy.file_ops_scope,
             )
         )
         self._tool_registry.register(
             FileWriteTool(
                 workspace_dir=self._config.workspace_dir,
-                path_scope=self._config.security.file_ops_scope,
-                require_approval=self._config.security.require_approval_for_file_write,
+                path_scope=runtime_policy.file_ops_scope,
+                require_approval=runtime_policy.require_approval_for_file_write,
                 max_write_size_mb=self._config.security.max_file_write_size_mb,
                 undo_max_size_mb=self._config.security.file_undo_max_size_mb,
             )
@@ -786,8 +788,8 @@ class AgentEngine:
         self._tool_registry.register(
             FileEditTool(
                 workspace_dir=self._config.workspace_dir,
-                path_scope=self._config.security.file_ops_scope,
-                require_approval=self._config.security.require_approval_for_file_write,
+                path_scope=runtime_policy.file_ops_scope,
+                require_approval=runtime_policy.require_approval_for_file_write,
                 max_write_size_mb=self._config.security.max_file_write_size_mb,
                 undo_max_size_mb=self._config.security.file_undo_max_size_mb,
             )
@@ -849,7 +851,7 @@ class AgentEngine:
         self._tool_registry.register(
             ExecuteCodeTool(
                 workspace_dir=self._config.workspace_dir,
-                require_approval=self._config.security.require_approval_for_shell,
+                require_approval=runtime_policy.require_approval_for_shell,
             )
         )
 
@@ -884,6 +886,7 @@ class AgentEngine:
 
     def _build_tool_registry_for_workspace(self, workspace_dir: str) -> ToolRegistry:
         """Build a tool registry for one effective workspace."""
+        runtime_policy = resolve_runtime_permission_policy(self._config.security)
         registry = ToolRegistry(
             extra_dirs=self._config.tools.extra_tools_dirs or None,
             discover_builtin=False,
@@ -906,20 +909,20 @@ class AgentEngine:
             ShellTool(
                 allowlist=self._config.security.shell_command_allowlist,
                 workspace_dir=workspace_dir,
-                require_approval=self._config.security.require_approval_for_shell,
+                require_approval=runtime_policy.require_approval_for_shell,
             )
         )
         registry.register(
             FileReadTool(
                 workspace_dir=workspace_dir,
-                path_scope=self._config.security.file_ops_scope,
+                path_scope=runtime_policy.file_ops_scope,
             )
         )
         registry.register(
             FileWriteTool(
                 workspace_dir=workspace_dir,
-                path_scope=self._config.security.file_ops_scope,
-                require_approval=self._config.security.require_approval_for_file_write,
+                path_scope=runtime_policy.file_ops_scope,
+                require_approval=runtime_policy.require_approval_for_file_write,
                 max_write_size_mb=self._config.security.max_file_write_size_mb,
                 undo_max_size_mb=self._config.security.file_undo_max_size_mb,
             )
@@ -927,8 +930,8 @@ class AgentEngine:
         registry.register(
             FileEditTool(
                 workspace_dir=workspace_dir,
-                path_scope=self._config.security.file_ops_scope,
-                require_approval=self._config.security.require_approval_for_file_write,
+                path_scope=runtime_policy.file_ops_scope,
+                require_approval=runtime_policy.require_approval_for_file_write,
                 max_write_size_mb=self._config.security.max_file_write_size_mb,
                 undo_max_size_mb=self._config.security.file_undo_max_size_mb,
             )
@@ -936,7 +939,7 @@ class AgentEngine:
         registry.register(
             ExecuteCodeTool(
                 workspace_dir=workspace_dir,
-                require_approval=self._config.security.require_approval_for_shell,
+                require_approval=runtime_policy.require_approval_for_shell,
             )
         )
         registry.register(
@@ -967,11 +970,7 @@ class AgentEngine:
         if existing is not None and permission_policy_override is None:
             return existing
 
-        base_permission_policy = {
-            "require_approval_for_file_write": self._config.security.require_approval_for_file_write,
-            "require_approval_for_shell": self._config.security.require_approval_for_shell,
-            "file_ops_scope": self._config.security.file_ops_scope,
-        }
+        base_permission_policy = build_runtime_permission_policy_dict(self._config.security)
         if existing is None:
             context = ToolExecutionContext(
                 workspace_dir=str(workspace_dir),

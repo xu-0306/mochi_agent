@@ -2863,6 +2863,8 @@ export interface AgentSettings {
 }
 
 export interface SecuritySettings {
+  autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
+  require_approval_for_shell: boolean
   require_approval_for_file_write: boolean
   max_file_write_size_mb: number
   file_ops_scope: 'workspace' | 'any'
@@ -3716,6 +3718,8 @@ export interface AgentSettingsUpdate {
 }
 
 export interface SecuritySettingsUpdate {
+  autonomy_mode?: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
+  require_approval_for_shell?: boolean
   require_approval_for_file_write?: boolean
   max_file_write_size_mb?: number
   file_ops_scope?: 'workspace' | 'any'
@@ -3819,9 +3823,19 @@ function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined
     return undefined
   }
 
+  const autonomyMode = getString(value.autonomy_mode)
+  const normalizedAutonomyMode: SecuritySettings['autonomy_mode'] =
+    autonomyMode === 'strict' ||
+    autonomyMode === 'high_autonomy' ||
+    autonomyMode === 'auto_review'
+      ? autonomyMode
+      : 'trusted_workspace'
+
   return {
+    autonomy_mode: normalizedAutonomyMode,
+    require_approval_for_shell: getBoolean(value.require_approval_for_shell) ?? true,
     require_approval_for_file_write:
-      getBoolean(value.require_approval_for_file_write) ?? true,
+      getBoolean(value.require_approval_for_file_write) ?? false,
     max_file_write_size_mb: getNumber(value.max_file_write_size_mb) ?? 10.0,
     file_ops_scope: getString(value.file_ops_scope) === 'any' ? 'any' : 'workspace',
     file_undo_max_size_mb: getNumber(value.file_undo_max_size_mb) ?? 2.0,

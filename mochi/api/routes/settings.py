@@ -30,6 +30,7 @@ from mochi.config.schema import (
     VLLMConfig,
     VoiceConfig,
 )
+from mochi.security.policy import autonomy_mode_defaults
 from mochi.tools.web_search_providers import build_web_search_provider_status_payload
 from mochi.voice.model_manager import (
     ensure_model_available,
@@ -214,6 +215,8 @@ class AgentSettingsPatch(BaseModel):
 class SecuritySettingsPatch(BaseModel):
     """可由 WebGUI 更新的非敏感安全設定。"""
 
+    autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] | None = None
+    require_approval_for_shell: bool | None = None
     require_approval_for_file_write: bool | None = None
     max_file_write_size_mb: float | None = Field(default=None, ge=0.0)
     file_ops_scope: Literal["workspace", "any"] | None = None
@@ -609,6 +612,8 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "port": config.web.port,
         },
         "security": {
+            "autonomy_mode": config.security.autonomy_mode,
+            "require_approval_for_shell": config.security.require_approval_for_shell,
             "require_approval_for_file_write": config.security.require_approval_for_file_write,
             "max_file_write_size_mb": config.security.max_file_write_size_mb,
             "file_ops_scope": config.security.file_ops_scope,
@@ -718,10 +723,20 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
         updates.update(_normalize_empty_paths(payload.paths.model_dump(exclude_unset=True), set()))
 
     if payload.security is not None:
+        security_updates = payload.security.model_dump(exclude_unset=True)
+        requested_mode = security_updates.get("autonomy_mode")
+        if isinstance(requested_mode, str):
+            mode_defaults = autonomy_mode_defaults(requested_mode)
+            for key in (
+                "require_approval_for_shell",
+                "require_approval_for_file_write",
+                "file_ops_scope",
+            ):
+                security_updates.setdefault(key, mode_defaults[key])
         updates["security"] = SecurityConfig.model_validate(
             {
                 **config.security.model_dump(),
-                **payload.security.model_dump(exclude_unset=True),
+                **security_updates,
             }
         )
 

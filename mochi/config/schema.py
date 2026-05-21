@@ -23,6 +23,7 @@ from mochi.config.defaults import (
     DEFAULT_UI_LOCALE,
     DEFAULT_UI_LOCALE_FALLBACK,
 )
+from mochi.security.policy import autonomy_mode_defaults, infer_autonomy_mode
 from mochi.tools.web_search_providers import normalize_web_search_provider
 
 # ---------------------------------------------------------------------------
@@ -623,10 +624,13 @@ class InferencePreset(BaseModel):
 class SecurityConfig(BaseModel):
     """安全設定。"""
 
+    autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] = "trusted_workspace"
+    """Autonomy preset mapped to runtime approval behavior."""
+
     require_approval_for_shell: bool = True
     """執行 Shell 命令前是否需要使用者確認。"""
 
-    require_approval_for_file_write: bool = True
+    require_approval_for_file_write: bool = False
     """寫入檔案前是否需要使用者確認。"""
 
     shell_command_allowlist: list[str] = Field(
@@ -642,6 +646,58 @@ class SecurityConfig(BaseModel):
 
     file_undo_max_size_mb: float = 2.0
     """允許保存 undo 的最大檔案大小（MB）。"""
+
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_legacy_autonomy_mode(cls, value: Any) -> Any:
+        """??舐?蝚砍??怠?autonomy mode??"""
+        if not isinstance(value, dict):
+            return value
+        if "autonomy_mode" in value:
+            autonomy_mode = value.get("autonomy_mode")
+            if isinstance(autonomy_mode, str):
+                mode_defaults = autonomy_mode_defaults(autonomy_mode)
+                return {
+                    **{key: default for key, default in mode_defaults.items() if key != "autonomy_mode"},
+                    **value,
+                }
+            return value
+
+        relevant_keys = {
+            "require_approval_for_shell",
+            "require_approval_for_file_write",
+            "file_ops_scope",
+        }
+        if not any(key in value for key in relevant_keys):
+            return value
+
+        require_shell = bool(
+            value.get(
+                "require_approval_for_shell",
+                cls.model_fields["require_approval_for_shell"].default,
+            )
+        )
+        require_file_write = bool(
+            value.get(
+                "require_approval_for_file_write",
+                cls.model_fields["require_approval_for_file_write"].default,
+            )
+        )
+        file_ops_scope = str(
+            value.get(
+                "file_ops_scope",
+                cls.model_fields["file_ops_scope"].default,
+            )
+        )
+        return {
+            **value,
+            "autonomy_mode": infer_autonomy_mode(
+                require_approval_for_shell=require_shell,
+                require_approval_for_file_write=require_file_write,
+                file_ops_scope=file_ops_scope,
+            ),
+        }
 
 
 class WebConfig(BaseModel):
