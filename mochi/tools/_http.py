@@ -8,7 +8,12 @@ import time
 from typing import Any
 
 import httpx
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 from mochi.tools.base import ToolResult
 

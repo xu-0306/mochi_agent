@@ -208,6 +208,26 @@ building chat context. The SQLite `skills.db` file is only a searchable cache.
 uv run uvicorn mochi.api.server:app --host 127.0.0.1 --port 8000
 ```
 
+For WSL development, you can launch both backend and frontend together:
+
+```bash
+./scripts/start-mochi-wsl.sh start
+```
+
+Running `start` again acts like a safe restart for Mochi itself: it stops the
+existing Mochi backend/frontend first, then starts them again. If port `8000`
+or `3000` is occupied by a non-Mochi process, the script exits with an error
+instead of killing unrelated services.
+
+Useful subcommands:
+
+```bash
+./scripts/start-mochi-wsl.sh status
+./scripts/start-mochi-wsl.sh logs
+./scripts/start-mochi-wsl.sh restart
+./scripts/start-mochi-wsl.sh stop
+```
+
 Key routes:
 
 - `GET /health`

@@ -10,7 +10,12 @@ from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 
 from mochi.voice.capabilities import get_voice_capabilities
@@ -60,7 +65,9 @@ def create_app() -> FastAPI:
     app.state.config_factory = None
     app.state.channel_manager = None
     app.state.session_store = None
+    app.state.project_store = None
     app.state.skill_library = None
+    app.state.vllm_runtime_manager = None
     app.state.voice_bridge_diagnostics = _create_voice_bridge_diagnostics_state()
     app.add_middleware(
         CORSMiddleware,
@@ -72,19 +79,25 @@ def create_app() -> FastAPI:
 
     from mochi.api.routes import (
         chat_router,
+        file_ops_router,
         filesystem_router,
         models_router,
+        projects_router,
         sessions_router,
         settings_router,
         skills_router,
+        voice_router,
     )
 
     app.include_router(chat_router)
     app.include_router(models_router)
     app.include_router(skills_router)
+    app.include_router(projects_router)
     app.include_router(sessions_router)
     app.include_router(settings_router)
+    app.include_router(voice_router)
     app.include_router(filesystem_router)
+    app.include_router(file_ops_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -375,9 +388,24 @@ async def _get_or_create_engine(app: FastAPI) -> Any:
 
     from mochi.agents.engine import AgentEngine
 
-    engine = AgentEngine(await _get_config(app))
+    engine = AgentEngine(
+        await _get_config(app),
+        vllm_runtime_manager=_get_or_create_vllm_runtime_manager(app),
+    )
     app.state.engine = engine
     return engine
+
+
+def _get_or_create_vllm_runtime_manager(app: FastAPI) -> Any:
+    manager = getattr(app.state, "vllm_runtime_manager", None)
+    if manager is not None:
+        return manager
+
+    from mochi.backends.vllm_runtime import ManagedVLLMRuntimeManager
+
+    manager = ManagedVLLMRuntimeManager()
+    app.state.vllm_runtime_manager = manager
+    return manager
 
 
 async def _build_channel_manager_for_app(app: FastAPI) -> Any:
@@ -386,7 +414,16 @@ async def _build_channel_manager_for_app(app: FastAPI) -> Any:
 
     config = await _get_config(app)
     engine = await _get_or_create_engine(app)
-    return build_channel_manager(config, engine)
+    config_path = getattr(app.state, "config_path", None)
+    persist_config_updates = (
+        config_path is not None or getattr(app.state, "config_factory", None) is None
+    )
+    return build_channel_manager(
+        config,
+        engine,
+        config_path=config_path,
+        persist_config_updates=persist_config_updates,
+    )
 
 
 async def _ensure_channel_manager(app: FastAPI) -> Any:
@@ -561,12 +598,18 @@ async def _shutdown_engine(app: FastAPI) -> None:
         app.state.channel_manager = None
 
     engine = cast(Any, app.state.engine)
-    if engine is None:
-        return
-    close = getattr(engine, "close", None)
-    if callable(close):
-        await _maybe_await(close())
+    if engine is not None:
+        close = getattr(engine, "close", None)
+        if callable(close):
+            await _maybe_await(close())
     app.state.engine = None
+
+    vllm_manager = cast(Any | None, getattr(app.state, "vllm_runtime_manager", None))
+    if vllm_manager is not None:
+        stop = getattr(vllm_manager, "stop", None)
+        if callable(stop):
+            await _maybe_await(stop())
+    app.state.vllm_runtime_manager = None
 
 
 def _create_voice_bridge_diagnostics_state() -> dict[str, Any]:
@@ -676,9 +719,13 @@ def _resolve_initial_cors_origins() -> list[str]:
         for origin in config.web.cors_origins
         if isinstance(origin, str) and origin.strip()
     ]
+    if "http://localhost:3000" in origins and "http://127.0.0.1:3000" not in origins:
+        origins.append("http://127.0.0.1:3000")
+    if "http://127.0.0.1:3000" in origins and "http://localhost:3000" not in origins:
+        origins.append("http://localhost:3000")
     if origins:
         return origins
-    return ["http://localhost:3000"]
+    return ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
 app = create_app()

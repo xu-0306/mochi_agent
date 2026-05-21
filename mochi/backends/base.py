@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any
 
 from mochi.backends.types import (
     GenerationResult,
@@ -13,6 +15,17 @@ from mochi.backends.types import (
     StreamChunk,
     ToolSchema,
 )
+
+
+@dataclass
+class BackendRequestError(RuntimeError):
+    """Normalized backend request failure with structured diagnostics."""
+
+    message: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
 
 
 class BaseLLMBackend(ABC):
@@ -29,6 +42,12 @@ class BaseLLMBackend(ABC):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """執行生成推理。
@@ -38,6 +57,12 @@ class BaseLLMBackend(ABC):
             tools: 可用工具定義列表，None 表示不使用工具。
             temperature: 採樣溫度（0.0–2.0）。
             max_tokens: 最大輸出 token 數。
+            top_p: Top-p 取樣。
+            min_p: Min-p 取樣。
+            top_k: Top-k 取樣。
+            frequency_penalty: Frequency penalty。
+            presence_penalty: Presence penalty。
+            repeat_penalty: Repeat penalty。
             stream: 是否啟用串流輸出。
 
         Returns:

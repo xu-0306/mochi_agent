@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.tool_call_simulator import ToolCallSimulator
@@ -20,6 +21,15 @@ from mochi.backends.types import (
 
 GGUFModelLoader = Callable[[], Any]
 _STREAM_END = object()
+_ToolCallMode = Literal["plain_chat", "structured_native", "flattened_text"]
+_TOOL_AWARE_CHAT_FORMAT_ALLOWLIST = frozenset(
+    {
+        "functionary",
+        "functionary-v1",
+        "functionary-v2",
+        "chatml-function-calling",
+    }
+)
 
 
 class GGUFBackend(BaseLLMBackend):
@@ -31,6 +41,14 @@ class GGUFBackend(BaseLLMBackend):
         n_ctx: int = 4096,
         n_gpu_layers: int = -1,
         n_threads: int | None = None,
+        n_batch: int = 512,
+        n_ubatch: int = 512,
+        n_threads_batch: int | None = None,
+        flash_attn: bool = False,
+        offload_kqv: bool = True,
+        use_mmap: bool = True,
+        use_mlock: bool = False,
+        llama_cpp_lib_path: str | None = None,
         *,
         model_loader: GGUFModelLoader | None = None,
         tool_call_simulator: ToolCallSimulator | None = None,
@@ -49,10 +67,21 @@ class GGUFBackend(BaseLLMBackend):
         self.n_ctx = n_ctx
         self.n_gpu_layers = n_gpu_layers
         self.n_threads = n_threads
+        self.n_batch = n_batch
+        self.n_ubatch = n_ubatch
+        self.n_threads_batch = n_threads_batch
+        self.flash_attn = flash_attn
+        self.offload_kqv = offload_kqv
+        self.use_mmap = use_mmap
+        self.use_mlock = use_mlock
+        self.llama_cpp_lib_path = llama_cpp_lib_path
         self._model_loader = model_loader
         self._tool_call_simulator = tool_call_simulator or ToolCallSimulator()
         self._model: Any | None = None
         self._dependency_error: str | None = self._probe_dependency_error()
+        self._tool_call_strategy = "flattened_text"
+        self._tool_call_strategy_reason = "conservative default: tools not requested yet"
+        self._detected_chat_format = "unknown"
 
     async def generate(
         self,
@@ -60,13 +89,41 @@ class GGUFBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """執行生成。"""
         if stream:
-            return self._stream_generate(messages, tools, temperature, max_tokens)
+            return self._stream_generate(
+                messages,
+                tools,
+                temperature,
+                max_tokens,
+                top_p,
+                min_p,
+                top_k,
+                frequency_penalty,
+                presence_penalty,
+                repeat_penalty,
+            )
 
-        return await self._generate_nonstream(messages, tools, temperature, max_tokens)
+        return await self._generate_nonstream(
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+            top_p,
+            min_p,
+            top_k,
+            frequency_penalty,
+            presence_penalty,
+            repeat_penalty,
+        )
 
     async def _generate_nonstream(
         self,
@@ -74,20 +131,38 @@ class GGUFBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         temperature: float,
         max_tokens: int,
+        top_p: float,
+        min_p: float,
+        top_k: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        repeat_penalty: float,
     ) -> GenerationResult:
         """執行 non-stream 生成。"""
         model = await self._ensure_model_loaded()
-        prepared_messages = self._prepare_messages(messages, tools)
-        raw_result = await asyncio.to_thread(
-            model.create_chat_completion,
-            messages=[message.to_dict() for message in prepared_messages],
+        tool_call_mode = self._resolve_tool_call_mode(tools, model)
+        prepared_messages = self._prepare_messages(messages, tools, strategy=tool_call_mode)
+        request_payload = self._build_request_payload(
+            messages=prepared_messages,
+            tools=tools,
+            strategy=tool_call_mode,
             temperature=temperature,
             max_tokens=max_tokens,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            repeat_penalty=repeat_penalty,
             stream=False,
+        )
+        raw_result = await asyncio.to_thread(
+            model.create_chat_completion,
+            **request_payload,
         )
         return self._parse_generation_result(
             raw_result=raw_result,
-            tools=tools,
+            strategy=tool_call_mode,
             prepared_messages=prepared_messages,
             model=model,
             max_tokens=max_tokens,
@@ -99,16 +174,34 @@ class GGUFBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         temperature: float,
         max_tokens: int,
+        top_p: float,
+        min_p: float,
+        top_k: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        repeat_penalty: float,
     ) -> AsyncIterator[StreamChunk]:
         """執行最小可用 stream 生成。"""
         model = await self._ensure_model_loaded()
-        prepared_messages = self._prepare_messages(messages, tools)
-        iterator = await asyncio.to_thread(
-            model.create_chat_completion,
-            messages=[message.to_dict() for message in prepared_messages],
+        tool_call_mode = self._resolve_tool_call_mode(tools, model)
+        prepared_messages = self._prepare_messages(messages, tools, strategy=tool_call_mode)
+        request_payload = self._build_request_payload(
+            messages=prepared_messages,
+            tools=tools,
+            strategy=tool_call_mode,
             temperature=temperature,
             max_tokens=max_tokens,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            repeat_penalty=repeat_penalty,
             stream=True,
+        )
+        iterator = await asyncio.to_thread(
+            model.create_chat_completion,
+            **request_payload,
         )
 
         emitted_final = False
@@ -143,9 +236,21 @@ class GGUFBackend(BaseLLMBackend):
             metadata={
                 "model_path": self.model_path,
                 "dependency_ready": self._dependency_error is None,
+                "dependency_error": self._dependency_error,
                 "loaded": self._model is not None,
                 "n_gpu_layers": self.n_gpu_layers,
                 "n_threads": self.n_threads,
+                "n_batch": self.n_batch,
+                "n_ubatch": self.n_ubatch,
+                "n_threads_batch": self.n_threads_batch,
+                "flash_attn": self.flash_attn,
+                "offload_kqv": self.offload_kqv,
+                "use_mmap": self.use_mmap,
+                "use_mlock": self.use_mlock,
+                "llama_cpp_lib_path": self.llama_cpp_lib_path,
+                "tool_call_strategy": self._tool_call_strategy,
+                "tool_call_strategy_reason": self._tool_call_strategy_reason,
+                "detected_chat_format": self._detected_chat_format,
             },
         )
 
@@ -184,28 +289,59 @@ class GGUFBackend(BaseLLMBackend):
 
     def _default_model_loader(self) -> Any:
         """使用 llama-cpp-python 載入模型。"""
-        from llama_cpp import Llama  # type: ignore[import-not-found]
+        Llama = self._load_llama_class()
 
         kwargs: dict[str, Any] = {
             "model_path": self.model_path,
             "n_ctx": self.n_ctx,
             "n_gpu_layers": self.n_gpu_layers,
+            "n_batch": self.n_batch,
+            "n_ubatch": self.n_ubatch,
+            "flash_attn": self.flash_attn,
+            "offload_kqv": self.offload_kqv,
+            "use_mmap": self.use_mmap,
+            "use_mlock": self.use_mlock,
             "verbose": False,
         }
         if self.n_threads is not None:
             kwargs["n_threads"] = self.n_threads
+        if self.n_threads_batch is not None:
+            kwargs["n_threads_batch"] = self.n_threads_batch
         return Llama(**kwargs)
+
+    def _load_llama_class(self) -> Any:
+        """Load the installed llama-cpp-python runtime for GGUF inference."""
+        from llama_cpp import Llama  # type: ignore[import-not-found]
+        from llama_cpp import llama_cpp as lib  # type: ignore[import-not-found]
+
+        supports_gpu_offload = getattr(lib, "llama_supports_gpu_offload", None)
+        if (
+            self.n_gpu_layers != 0
+            and callable(supports_gpu_offload)
+            and supports_gpu_offload() is False
+        ):
+            loaded_base = getattr(lib, "_base_path", None)
+            configured_path = str(loaded_base) if loaded_base is not None else "unknown"
+            raise RuntimeError(
+                "Installed llama-cpp-python runtime does not support GPU offload. "
+                "GGUF inference must use a CUDA/HIP-capable llama-cpp-python build that matches "
+                f"its bundled llama runtime. Loaded library path: {configured_path}"
+            )
+        return Llama
 
     def _prepare_messages(
         self,
         messages: list[Message],
         tools: list[ToolSchema] | None,
+        *,
+        strategy: _ToolCallMode,
     ) -> list[Message]:
         """必要時將工具說明注入 system prompt。"""
-        if not tools:
-            return list(messages)
-
         prepared = [Message(**message.__dict__) for message in messages]
+        if strategy in {"plain_chat", "structured_native"} or not tools:
+            return prepared
+
+        prepared = self._flatten_simulated_tool_messages(prepared)
         injected = False
         for message in prepared:
             if message.role == "system":
@@ -226,10 +362,141 @@ class GGUFBackend(BaseLLMBackend):
             )
         return prepared
 
+    def _build_request_payload(
+        self,
+        *,
+        messages: list[Message],
+        tools: list[ToolSchema] | None,
+        strategy: _ToolCallMode,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        min_p: float,
+        top_k: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        repeat_penalty: float,
+        stream: bool,
+    ) -> dict[str, Any]:
+        """Build llama-cpp chat-completion payload for the selected tool-call mode."""
+        payload: dict[str, Any] = {
+            "messages": [message.to_dict() for message in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "min_p": min_p,
+            "top_k": top_k,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "repeat_penalty": repeat_penalty,
+            "stream": stream,
+        }
+        if strategy == "structured_native" and tools:
+            payload["tools"] = [tool.to_dict() for tool in tools]
+        return payload
+
+    def _resolve_tool_call_mode(self, tools: list[ToolSchema] | None, model: Any | None) -> _ToolCallMode:
+        """Resolve one tool-call mode per request and keep metadata consistent."""
+        if not tools:
+            self._tool_call_strategy = "plain_chat"
+            self._tool_call_strategy_reason = "tools not requested"
+            self._detected_chat_format = "unknown"
+            return "plain_chat"
+        return cast(_ToolCallMode, self._resolve_tool_call_strategy(model))
+
+    def _flatten_simulated_tool_messages(self, messages: list[Message]) -> list[Message]:
+        """將 OpenAI-style tool message 壓平成一般聊天內容，避免 llama.cpp template 失敗。"""
+        flattened: list[Message] = []
+        for message in messages:
+            if message.role == "assistant" and message.tool_calls:
+                if message.content:
+                    flattened.append(Message(role="assistant", content=message.content))
+                for tool_call in message.tool_calls:
+                    flattened.append(
+                        Message(
+                            role="assistant",
+                            content=(
+                                f"Tool request: {tool_call.name}\n"
+                                f"Arguments: {tool_call.arguments}"
+                            ),
+                        )
+                    )
+                continue
+
+            if message.role == "tool":
+                tool_name = message.name or "tool"
+                tool_text = message.content
+                if not tool_text.startswith(f"Tool {tool_name} result:") and not tool_text.startswith(
+                    f"Tool {tool_name} error:"
+                ):
+                    tool_text = f"Tool {tool_name} result:\n{tool_text}"
+                flattened.append(
+                    Message(
+                        role="user",
+                        content=tool_text,
+                    )
+                )
+                continue
+
+            flattened.append(Message(**message.__dict__))
+        return flattened
+
+    def _resolve_tool_call_strategy(self, model: Any | None) -> str:
+        """Conservatively choose GGUF tool message strategy from runtime chat format."""
+        detected_chat_format, detect_reason = self._detect_chat_format(model)
+        self._detected_chat_format = detected_chat_format or "unknown"
+
+        if detected_chat_format and detected_chat_format in _TOOL_AWARE_CHAT_FORMAT_ALLOWLIST:
+            self._tool_call_strategy = "structured_native"
+            self._tool_call_strategy_reason = (
+                f"detected chat format '{detected_chat_format}' is in allowlist"
+            )
+            return self._tool_call_strategy
+
+        self._tool_call_strategy = "flattened_text"
+        if detected_chat_format:
+            self._tool_call_strategy_reason = (
+                f"detected chat format '{detected_chat_format}' not in allowlist"
+            )
+        else:
+            self._tool_call_strategy_reason = detect_reason
+        return self._tool_call_strategy
+
+    def _detect_chat_format(self, model: Any | None) -> tuple[str | None, str]:
+        """Best-effort chat format inspection with safe fallback."""
+        if model is None:
+            return None, "unable to inspect chat format (model unavailable)"
+
+        candidate_sources: list[tuple[Any, str]] = [(model, "chat_format"), (model, "_chat_format")]
+        try:
+            chat_handler = getattr(model, "chat_handler", None)
+        except Exception as exc:
+            return None, f"unable to inspect chat format ({exc.__class__.__name__})"
+
+        if chat_handler is not None:
+            candidate_sources.extend(
+                [
+                    (chat_handler, "chat_format"),
+                    (chat_handler, "name"),
+                ]
+            )
+
+        for source, attr_name in candidate_sources:
+            try:
+                value = getattr(source, attr_name, None)
+            except Exception as exc:
+                return None, f"unable to inspect chat format ({exc.__class__.__name__})"
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized:
+                    return normalized, f"detected via {attr_name}"
+
+        return None, "unable to inspect chat format"
+
     def _parse_generation_result(
         self,
         raw_result: Any,
-        tools: list[ToolSchema] | None,
+        strategy: _ToolCallMode,
         prepared_messages: list[Message],
         model: Any,
         max_tokens: int,
@@ -250,7 +517,12 @@ class GGUFBackend(BaseLLMBackend):
         tool_calls: list[ToolCall] = []
         input_text = "\n".join(message.content for message in prepared_messages)
 
-        if tools:
+        if strategy == "structured_native":
+            raw_tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
+            tool_calls = self._parse_native_tool_calls(raw_tool_calls)
+            if tool_calls:
+                finish_reason = "tool_calls"
+        elif strategy == "flattened_text":
             tool_calls = self._tool_call_simulator.parse_tool_calls(content)
             content = self._tool_call_simulator.extract_text_response(content)
             if tool_calls:
@@ -277,6 +549,47 @@ class GGUFBackend(BaseLLMBackend):
             model=raw_result.get("model", self.model_path) if isinstance(raw_result, dict) else self.model_path,
             finish_reason=finish_reason,
         )
+
+    def _parse_native_tool_calls(self, raw_tool_calls: Any) -> list[ToolCall]:
+        """Parse OpenAI-style assistant tool_calls from llama-cpp chat completion output."""
+        if not isinstance(raw_tool_calls, list):
+            return []
+
+        parsed: list[ToolCall] = []
+        raw_items = cast(list[Any], raw_tool_calls)
+        for index, raw_item in enumerate(raw_items):
+            if not isinstance(raw_item, dict):
+                continue
+            item = cast(dict[str, Any], raw_item)
+            fn = item.get("function", {})
+            if not isinstance(fn, dict):
+                fn = {}
+            fn = cast(dict[str, Any], fn)
+
+            name = fn.get("name", "")
+            if not isinstance(name, str):
+                name = ""
+
+            raw_args = fn.get("arguments", {})
+            arguments: dict[str, Any]
+            if isinstance(raw_args, str):
+                try:
+                    decoded = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    decoded = {}
+                arguments = cast(dict[str, Any], decoded) if isinstance(decoded, dict) else {}
+            elif isinstance(raw_args, dict):
+                arguments = cast(dict[str, Any], raw_args)
+            else:
+                arguments = {}
+
+            call_id = item.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                call_id = f"gguf-tool-call-{index + 1}"
+
+            parsed.append(ToolCall(id=call_id, name=name, arguments=arguments))
+
+        return parsed
 
     def _parse_stream_item(self, item: Any) -> tuple[str, str | None]:
         """解析單個 stream chunk。"""

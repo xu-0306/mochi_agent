@@ -104,6 +104,9 @@ class CoquiTTS(BaseTTS):
             for candidate in (self._runtime, self._synthesize_callable, self._model_factory)
         )
 
+    async def ensure_ready(self) -> None:
+        await asyncio.to_thread(self._ensure_runtime)
+
     async def close(self) -> None:
         runtime = self._runtime
         self._runtime = None

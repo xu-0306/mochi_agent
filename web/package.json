@@ -7,7 +7,14 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test:chat-stream-target": "node ./scripts/test-chat-stream-target.mjs",
+    "test:chat-inference-context-settings": "node ./scripts/test-chat-inference-context-settings.mjs",
+    "test:model-context-settings": "node --experimental-strip-types ./scripts/test-model-context-settings.mjs",
+    "test:settings-inference-tab": "node ./scripts/test-settings-inference-tab.mjs",
+    "test:inline-reasoning": "node --experimental-strip-types ./scripts/test-inline-reasoning.mjs",
+    "test:voice-settings-modes": "node --experimental-strip-types ./scripts/test-voice-settings-modes.mjs",
+    "test:dialog-animation": "node ./scripts/test-dialog-animation.mjs"
   },
   "dependencies": {
     "@radix-ui/react-collapsible": "^1.0.3",
@@ -16,6 +23,7 @@
     "@radix-ui/react-dropdown-menu": "^2.0.6",
     "@radix-ui/react-scroll-area": "^1.0.5",
     "@radix-ui/react-select": "^2.0.0",
+    "@radix-ui/react-slider": "^1.2.2",
     "@radix-ui/react-separator": "^1.0.3",
     "@radix-ui/react-slot": "^1.0.2",
     "@radix-ui/react-switch": "^1.0.3",
@@ -28,6 +36,9 @@
     "next": "^16.2.4",
     "react": "18.3.1",
     "react-dom": "18.3.1",
+    "react-markdown": "^9.0.1",
+    "rehype-highlight": "^7.0.0",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "^2.3.0",
     "zustand": "^4.5.2"
   },

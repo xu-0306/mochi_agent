@@ -31,17 +31,19 @@ class PromptBuilder:
         self,
         skills_context: str | None = None,
         memory_context: str | None = None,
+        base_prompt: str | None = None,
     ) -> str:
         """建構完整的系統提示詞。
 
         Args:
             skills_context: 從技能庫檢索到的相關技能描述（Markdown 格式）。
             memory_context: 從長期記憶檢索到的相關內容。
+            base_prompt: 覆蓋基礎 system prompt。
 
         Returns:
             完整系統提示詞字串。
         """
-        parts: list[str] = [self._base_prompt]
+        parts: list[str] = [base_prompt if base_prompt is not None else self._base_prompt]
 
         if memory_context:
             parts.append(

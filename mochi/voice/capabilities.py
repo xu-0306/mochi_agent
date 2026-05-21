@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, get_args
 
 from mochi.config.schema import VoiceConfig
+from mochi.voice.presets import get_voice_recommendations_payload
 from mochi.voice.events import VoiceStage
 from mochi.voice.ws_bridge import VoiceWebSocketBridge
 
@@ -36,6 +37,7 @@ def get_voice_capabilities() -> dict[str, Any]:
     voice_config = VoiceConfig()
     audio_contract = voice_config.voice_input_contract
     channel_policy = voice_config.voice_input_channel_policy
+    voice_recommendations = get_voice_recommendations_payload()
     return {
         "transport": "websocket",
         "path": "/v1/voice",
@@ -79,4 +81,6 @@ def get_voice_capabilities() -> dict[str, Any]:
             "mono_only_input": True,
             "whisperlivekit_pcm_input_default": True,
         },
+        "recommended_local_tts_backends": voice_recommendations["recommended_local_tts_backends"],
+        "external_api_tts_presets": voice_recommendations["external_api_tts_presets"],
     }

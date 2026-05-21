@@ -6,7 +6,9 @@ import {
   deleteSession as deleteSessionApi,
   fetchSession,
   fetchSessions,
+  forkSession as forkSessionApi,
   renameSession as renameSessionApi,
+  updateSessionProject as updateSessionProjectApi,
   type SessionDetail,
   type SessionSummary,
 } from '@/lib/api'
@@ -23,6 +25,8 @@ export interface Session {
   source: ChannelSource
   isPinned: boolean
   messageCount: number
+  projectId: string | null
+  isDraft: boolean
 }
 
 interface SessionStore {
@@ -37,11 +41,19 @@ interface SessionStore {
   loadSessions: () => Promise<void>
   selectSession: (id: string) => Promise<void>
   setCurrentSession: (id: string) => void
-  createSession: () => string
+  createDraftSession: (projectId: string | null) => string
+  createSession: (projectId?: string | null) => string
+  materializeDraftSession: (draftId: string) => Promise<string>
+  forkSessionFromTurn: (
+    sessionId: string,
+    turnId: string,
+    projectId?: string | null
+  ) => Promise<string>
   pinSession: (id: string) => void
   deleteSession: (id: string) => Promise<void>
   renameSession: (id: string, title: string) => Promise<void>
   updateLastMessage: (id: string, message: string) => void
+  moveSessionToProject: (id: string, projectId: string | null) => Promise<void>
 }
 
 function extractLastMessage(detail: SessionDetail): string {
@@ -92,6 +104,8 @@ function normalizeSummary(summary: SessionSummary): Session {
     source: inferSource(summary.id),
     isPinned: false,
     messageCount: summary.eventCount,
+    projectId: summary.projectId,
+    isDraft: false,
   }
 }
 
@@ -103,6 +117,23 @@ function mergeSession(target: Session, detail: SessionDetail): Session {
     lastMessageAt: extractLastMessageAt(detail, detail.updatedAt),
     source: inferSource(detail.id),
     messageCount: detail.eventCount,
+    projectId: detail.projectId,
+    isDraft: false,
+  }
+}
+
+function buildDraftSession(projectId: string | null): Session {
+  const now = new Date()
+  return {
+    id: `draft-${Date.now()}`,
+    title: DEFAULT_SESSION_TITLE,
+    lastMessage: '',
+    lastMessageAt: now,
+    source: 'web',
+    isPinned: false,
+    messageCount: 0,
+    projectId,
+    isDraft: true,
   }
 }
 
@@ -124,43 +155,71 @@ const sessionStore = create<SessionStore>((set, get) => ({
 
     try {
       const summaries = await fetchSessions()
-      const sessions = summaries.map(normalizeSummary)
+      const persistedSessions = summaries.map(normalizeSummary)
 
-      set((state) => ({
-        sessions,
-        currentSessionId:
+      set((state) => {
+        const draftSessions = state.sessions.filter((session) => session.isDraft)
+        const sessions = [...draftSessions, ...persistedSessions]
+        const currentSessionId =
           state.currentSessionId && sessions.some((session) => session.id === state.currentSessionId)
             ? state.currentSessionId
-            : (sessions[0]?.id ?? null),
-        currentSessionDetail:
-          state.currentSessionDetail &&
-          sessions.some((session) => session.id === state.currentSessionDetail?.id)
-            ? state.currentSessionDetail
-            : null,
-        isLoading: false,
-        hasLoaded: true,
-        error: null,
-      }))
+            : (sessions[0]?.id ?? null)
+
+        return {
+          sessions,
+          currentSessionId,
+          currentSessionDetail:
+            state.currentSessionDetail &&
+            sessions.some((session) => session.id === state.currentSessionDetail?.id)
+              ? state.currentSessionDetail
+              : null,
+          isLoading: false,
+          hasLoaded: true,
+          error: null,
+        }
+      })
 
       const currentSessionId = get().currentSessionId
-      if (currentSessionId) {
+      const currentSession = get().sessions.find((session) => session.id === currentSessionId)
+      if (currentSessionId && currentSession && !currentSession.isDraft) {
         void get().selectSession(currentSessionId)
       }
     } catch (error: unknown) {
-      set({
-        sessions: [],
-        currentSessionId: null,
-        currentSessionDetail: null,
+      set((state) => ({
+        sessions: state.sessions.filter((session) => session.isDraft),
+        currentSessionId: state.currentSessionId,
+        currentSessionDetail: state.currentSessionDetail,
         isLoading: false,
         isLoadingDetail: false,
         hasLoaded: true,
         error: error instanceof Error ? error.message : 'Failed to load sessions',
-      })
+      }))
     }
   },
 
   selectSession: async (id) => {
-    set({ currentSessionId: id, isLoadingDetail: true, error: null })
+    const target = get().sessions.find((session) => session.id === id)
+    set({
+      currentSessionId: id,
+      isLoadingDetail: target?.isDraft ? false : true,
+      error: null,
+      currentSessionDetail:
+        target?.isDraft
+          ? {
+              id: target.id,
+              title: target.title,
+              createdAt: target.lastMessageAt.toISOString(),
+              updatedAt: target.lastMessageAt.toISOString(),
+              eventCount: 0,
+              projectId: target.projectId,
+              events: [],
+            }
+          : get().currentSessionDetail,
+    })
+
+    if (target?.isDraft) {
+      return
+    }
 
     try {
       const detail = await fetchSession(id)
@@ -192,77 +251,93 @@ const sessionStore = create<SessionStore>((set, get) => ({
     void get().selectSession(id)
   },
 
-  createSession: () => {
-    const optimisticId = `pending-${Date.now()}`
-    const optimisticSession: Session = {
-      id: optimisticId,
-      title: DEFAULT_SESSION_TITLE,
-      lastMessage: '',
-      lastMessageAt: new Date(),
-      source: 'web',
-      isPinned: false,
-      messageCount: 0,
-    }
-
+  createDraftSession: (projectId) => {
+    const draft = buildDraftSession(projectId)
     set((state) => ({
-      sessions: [optimisticSession, ...state.sessions],
-      currentSessionId: optimisticId,
+      sessions: [draft, ...state.sessions.filter((session) => !session.isDraft)],
+      currentSessionId: draft.id,
       currentSessionDetail: {
-        id: optimisticId,
-        title: DEFAULT_SESSION_TITLE,
-        createdAt: optimisticSession.lastMessageAt.toISOString(),
-        updatedAt: optimisticSession.lastMessageAt.toISOString(),
+        id: draft.id,
+        title: draft.title,
+        createdAt: draft.lastMessageAt.toISOString(),
+        updatedAt: draft.lastMessageAt.toISOString(),
         eventCount: 0,
+        projectId: draft.projectId,
         events: [],
       },
       error: null,
     }))
+    return draft.id
+  },
 
-    void (async () => {
-      try {
-        const created = await createSessionApi(optimisticId)
-        const createdSession = normalizeSummary(created)
+  createSession: (projectId = null) => get().createDraftSession(projectId),
 
-        set((state) => ({
-          sessions: state.sessions.map((session) =>
-            session.id === optimisticId
-              ? {
-                  ...createdSession,
-                  title: DEFAULT_SESSION_TITLE,
-                  isPinned: session.isPinned,
+  materializeDraftSession: async (draftId) => {
+    const draft = get().sessions.find((session) => session.id === draftId)
+    if (!draft) {
+      return draftId
+    }
+    if (!draft.isDraft) {
+      return draft.id
+    }
+
+    const created = await createSessionApi(undefined, draft.projectId)
+    const detail = await fetchSession(created.id)
+
+    set((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === draftId
+          ? {
+              ...mergeSession(
+                {
+                  ...normalizeSummary(created),
+                  id: created.id,
                   lastMessage: session.lastMessage,
                   lastMessageAt: session.lastMessageAt,
-                }
-              : session
-          ),
-          currentSessionId:
-            state.currentSessionId === optimisticId ? createdSession.id : state.currentSessionId,
-          currentSessionDetail:
-            state.currentSessionId === optimisticId
-              ? {
-                  id: created.id,
-                  title: DEFAULT_SESSION_TITLE,
-                  createdAt: created.createdAt,
-                  updatedAt: created.updatedAt,
-                  eventCount: 0,
-                  events: [],
-                }
-              : state.currentSessionDetail,
-          error: null,
-        }))
-      } catch (error: unknown) {
-        set((state) => ({
-          sessions: state.sessions.filter((session) => session.id !== optimisticId),
-          currentSessionId:
-            state.currentSessionId === optimisticId ? (state.sessions[1]?.id ?? null) : state.currentSessionId,
-          currentSessionDetail:
-            state.currentSessionId === optimisticId ? null : state.currentSessionDetail,
-          error: error instanceof Error ? error.message : 'Failed to create session',
-        }))
-      }
-    })()
+                  isPinned: session.isPinned,
+                  projectId: draft.projectId,
+                  isDraft: false,
+                },
+                detail
+              ),
+              id: created.id,
+              lastMessage: session.lastMessage,
+              lastMessageAt: session.lastMessageAt,
+            }
+          : session
+      ),
+      currentSessionId: state.currentSessionId === draftId ? created.id : state.currentSessionId,
+      currentSessionDetail:
+        state.currentSessionId === draftId
+          ? {
+              ...detail,
+              title: sessionTitleForMaterialized(detail.title, draft.title),
+            }
+          : state.currentSessionDetail,
+      error: null,
+    }))
 
-    return optimisticId
+    return created.id
+  },
+
+  forkSessionFromTurn: async (sessionId, turnId, projectId) => {
+    const created = await forkSessionApi({ sessionId, turnId, projectId })
+    const detail = await fetchSession(created.id)
+    const normalized = normalizeSummary(created)
+    const merged = mergeSession(normalized, detail)
+
+    set((state) => ({
+      sessions: [
+        merged,
+        ...state.sessions.filter((session) => session.id !== created.id && !session.isDraft),
+        ...state.sessions.filter((session) => session.isDraft),
+      ],
+      currentSessionId: created.id,
+      currentSessionDetail: detail,
+      error: null,
+    }))
+
+    return created.id
   },
 
   pinSession: (id) =>
@@ -273,6 +348,11 @@ const sessionStore = create<SessionStore>((set, get) => ({
     })),
 
   deleteSession: async (id) => {
+    const target = get().sessions.find((session) => session.id === id)
+    if (!target) {
+      return
+    }
+
     const previous = get()
     let nextCurrentSessionId: string | null = null
     set((state) => {
@@ -288,7 +368,9 @@ const sessionStore = create<SessionStore>((set, get) => ({
     })
 
     try {
-      await deleteSessionApi(id)
+      if (!target.isDraft) {
+        await deleteSessionApi(id)
+      }
     } catch (error: unknown) {
       set({
         sessions: previous.sessions,
@@ -311,6 +393,11 @@ const sessionStore = create<SessionStore>((set, get) => ({
     }
 
     const previous = get()
+    const target = previous.sessions.find((session) => session.id === id)
+    if (!target) {
+      return
+    }
+
     set((state) => ({
       sessions: state.sessions.map((session) =>
         session.id === id ? { ...session, title: trimmedTitle } : session
@@ -322,18 +409,21 @@ const sessionStore = create<SessionStore>((set, get) => ({
       error: null,
     }))
 
+    if (target.isDraft) {
+      return
+    }
+
     try {
       await renameSessionApi(id, trimmedTitle)
       const detail = await fetchSession(id)
-      if (get().currentSessionId === id) {
-        set((state) => ({
-          sessions: state.sessions.map((session) =>
-            session.id === id ? mergeSession(session, detail) : session
-          ),
-          currentSessionDetail: detail,
-          error: null,
-        }))
-      }
+      set((state) => ({
+        sessions: state.sessions.map((session) =>
+          session.id === id ? mergeSession(session, detail) : session
+        ),
+        currentSessionDetail:
+          state.currentSessionDetail?.id === id ? detail : state.currentSessionDetail,
+        error: null,
+      }))
     } catch (error: unknown) {
       set({
         sessions: previous.sessions,
@@ -352,42 +442,52 @@ const sessionStore = create<SessionStore>((set, get) => ({
               ...session,
               lastMessage: message,
               lastMessageAt: new Date(),
-              title: session.messageCount === 0 && !session.lastMessage
-                ? message.slice(0, 80)
-                : session.title,
+              title:
+                session.messageCount === 0 && !session.lastMessage
+                  ? message.slice(0, 80)
+                  : session.title,
             }
           : session
       ),
     })),
+
+  moveSessionToProject: async (id, projectId) => {
+    const previous = get()
+    const target = previous.sessions.find((session) => session.id === id)
+    if (!target) {
+      return
+    }
+
+    set((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === id ? { ...session, projectId } : session
+      ),
+      currentSessionDetail:
+        state.currentSessionDetail?.id === id
+          ? { ...state.currentSessionDetail, projectId }
+          : state.currentSessionDetail,
+      error: null,
+    }))
+
+    if (target.isDraft) {
+      return
+    }
+
+    try {
+      await updateSessionProjectApi(id, projectId)
+    } catch (error: unknown) {
+      set({
+        sessions: previous.sessions,
+        currentSessionId: previous.currentSessionId,
+        currentSessionDetail: previous.currentSessionDetail,
+        error: error instanceof Error ? error.message : 'Failed to move session',
+      })
+    }
+  },
 }))
 
+function sessionTitleForMaterialized(nextTitle: string, draftTitle: string): string {
+  return nextTitle && nextTitle !== DEFAULT_SESSION_TITLE ? nextTitle : draftTitle
+}
+
 export const useSessionStore = sessionStore
-
-export function getPinnedSessions(sessions: Session[]): Session[] {
-  return sessions.filter((session) => session.isPinned)
-}
-
-export function getTodaySessions(sessions: Session[]): Session[] {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  return sessions.filter((session) => !session.isPinned && session.lastMessageAt >= today)
-}
-
-export function getThisWeekSessions(sessions: Session[]): Session[] {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000)
-  return sessions.filter(
-    (session) =>
-      !session.isPinned &&
-      session.lastMessageAt < today &&
-      session.lastMessageAt >= weekAgo
-  )
-}
-
-export function getOlderSessions(sessions: Session[]): Session[] {
-  const weekAgo = new Date()
-  weekAgo.setHours(0, 0, 0, 0)
-  weekAgo.setDate(weekAgo.getDate() - 7)
-  return sessions.filter((session) => !session.isPinned && session.lastMessageAt < weekAgo)
-}

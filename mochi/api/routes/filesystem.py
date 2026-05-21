@@ -58,8 +58,11 @@ def _windows_drive_roots() -> list[Path]:
     roots: list[Path] = []
     for drive in ascii_uppercase:
         candidate = Path(f"{drive}:\\")
-        if candidate.exists():
-            roots.append(candidate)
+        try:
+            if candidate.exists():
+                roots.append(candidate)
+        except OSError:
+            continue
     return roots
 
 

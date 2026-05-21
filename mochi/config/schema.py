@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from mochi.config import defaults
 from mochi.config.defaults import (
@@ -23,6 +23,7 @@ from mochi.config.defaults import (
     DEFAULT_UI_LOCALE,
     DEFAULT_UI_LOCALE_FALLBACK,
 )
+from mochi.tools.web_search_providers import normalize_web_search_provider
 
 # ---------------------------------------------------------------------------
 # 子設定段
@@ -59,6 +60,28 @@ class GGUFConfig(BaseModel):
     """CPU 執行緒數，None 表示自動。"""
 
 
+    n_batch: int = 512
+    """Prompt/eval batch size，較大通常更能吃滿 GPU。"""
+
+    n_ubatch: int = 512
+    """Micro-batch size，控制單次提交給後端的批次大小。"""
+
+    n_threads_batch: int | None = None
+    """Batch 評估階段使用的 CPU 執行緒數。"""
+
+    flash_attn: bool = False
+    """是否啟用 flash attention。"""
+
+    offload_kqv: bool = True
+    """是否將 K/Q/V 與 KV cache 相關計算盡量卸載到 GPU。"""
+
+    use_mmap: bool = True
+    """是否使用 mmap 載入模型。"""
+
+    use_mlock: bool = False
+    """是否鎖定模型頁面避免被換出。"""
+
+
 class HuggingFaceConfig(BaseModel):
     """HuggingFace Safetensors 後端設定。"""
 
@@ -70,6 +93,67 @@ class HuggingFaceConfig(BaseModel):
 
     trust_remote_code: bool = False
     """是否信任遠端程式碼。"""
+
+
+class LocalModelConfig(BaseModel):
+    """本地模型掃描與 runtime 設定。"""
+
+    roots: list[Path] = Field(default_factory=lambda: _empty_list_typed(Path))
+    """允許 WebGUI 掃描的根目錄；空列表表示不限制。"""
+
+    scan_max_depth: int = Field(default=3, ge=0, le=32)
+    """單次掃描允許的最大目錄深度。"""
+
+    scan_max_entries: int = Field(default=500, ge=1, le=100_000)
+    """單次掃描最多檢查的 filesystem entry 數。"""
+
+    runtime: Literal["inprocess", "worker"] = "inprocess"
+    """本地模型 runtime 模式。"""
+
+    idle_unload_enabled: bool = False
+    """是否啟用本地模型閒置超時卸載。"""
+
+    idle_unload_seconds: int | None = Field(default=300, ge=0, le=86_400)
+    """本地模型閒置多久後自動卸載；`0` 或 `None` 表示停用。"""
+
+    llama_cpp: "LlamaCppRuntimeConfig" = Field(default_factory=lambda: LlamaCppRuntimeConfig())
+    """llama.cpp 轉換 runtime 的保守 managed/registered metadata。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_legacy_idle_unload_defaults(cls, value: Any) -> Any:
+        """相容舊設定：若缺少新布林欄位，依 idle_unload_seconds 推導。"""
+        if not isinstance(value, dict):
+            return value
+
+        if "idle_unload_enabled" in value:
+            return value
+
+        raw_seconds = value.get("idle_unload_seconds")
+        if isinstance(raw_seconds, int):
+            value = dict(value)
+            value["idle_unload_enabled"] = raw_seconds > 0
+            return value
+        if raw_seconds is None:
+            value = dict(value)
+            value["idle_unload_enabled"] = False
+        return value
+
+
+class LlamaCppRuntimeConfig(BaseModel):
+    """llama.cpp 轉換工具鏈設定。"""
+
+    source: Literal["managed", "existing_path"] | None = None
+    """若有保存 runtime 來源，僅限 managed install 或既有路徑註冊。"""
+
+    root_dir: Path | None = None
+    """已保存的 llama.cpp 根目錄；可指向 managed install 或既有路徑。"""
+
+    python_executable: str | None = None
+    """可選覆蓋 llama.cpp convert script 使用的 Python。"""
+
+    version: str | None = None
+    """可選保存的 llama.cpp 版本/來源 tag。"""
 
 
 class OpenAICompatConfig(BaseModel):
@@ -84,11 +168,51 @@ class OpenAICompatConfig(BaseModel):
     api_key: SecretStr | None = None
     """遠端 API key（敏感資料）。"""
 
-    provider: Literal["openai_compat", "gemini", "anthropic"] = "openai_compat"
+    provider: Literal["openai_compat", "gemini", "anthropic", "vllm"] = "openai_compat"
     """UI/provider preset；底層目前皆走 OpenAI-compatible protocol。"""
 
     timeout: float = 120.0
     """HTTP 請求逾時秒數。"""
+
+
+class VLLMConfig(BaseModel):
+    """Managed vLLM runtime 閮剖?"""
+
+    enabled: bool = False
+    """?臬? managed vLLM runtime。"""
+
+    host: str = "127.0.0.1"
+    """vLLM API host。"""
+
+    port: int | None = None
+    """vLLM API port；`None` 甇?? route/runtime 層分配。"""
+
+    api_key: SecretStr | None = None
+    """vLLM API key。"""
+
+    tensor_parallel_size: int = 1
+    """vLLM tensor parallel size。"""
+
+    dtype: str = "auto"
+    """vLLM dtype。"""
+
+    gpu_memory_utilization: float = Field(default=0.9, ge=0.0, le=1.0)
+    """GPU 憭扳? ratio嚗?.0~1.0嚗?"""
+
+    max_model_len: int | None = None
+    """vLLM max model length。"""
+
+    trust_remote_code: bool = False
+    """?臬 trust remote code。"""
+
+    quantization: str | None = None
+    """vLLM quantization preset。"""
+
+    startup_timeout_seconds: int = 180
+    """managed vLLM ?臭?逾時秒數。"""
+
+    cuda_visible_devices: str | None = None
+    """?阡? runtime ??`CUDA_VISIBLE_DEVICES`。"""
 
 
 class LocaleDefaultsConfig(BaseModel):
@@ -119,7 +243,7 @@ class ConfiguredModelConfig(BaseModel):
     id: str = Field(min_length=1)
     """模型清單項目的穩定識別碼；可由 `/v1/models/switch` 使用。"""
 
-    provider: Literal["ollama", "openai_compat", "gemini", "anthropic", "local"]
+    provider: Literal["ollama", "openai_compat", "gemini", "anthropic", "vllm", "local"]
     """模型供應商 preset。"""
 
     model: str = Field(min_length=1)
@@ -135,6 +259,9 @@ class ConfiguredModelConfig(BaseModel):
     """UI 顯示名稱。"""
 
     backend_type: str | None = None
+    """摨惜 backend family??"""
+
+    launch_mode: Literal["external", "managed"] | None = None
     """底層 backend family。"""
 
 
@@ -165,6 +292,16 @@ class ModelSetupConfig(BaseModel):
     """WebGUI 已成功設定過、可在對話下拉選擇的非敏感模型清單。"""
 
 
+class RegisteredTTSVoiceConfig(BaseModel):
+    """已註冊的自訂 TTS 聲音包設定。"""
+
+    id: str = Field(min_length=1)
+    backend: Literal["coqui-tts", "kokoro-tts", "openai-tts", "piper"] | None = None
+    path: Path
+    label: str | None = None
+    source: Literal["registered_path", "upload"] = "registered_path"
+
+
 class VoiceConfig(BaseModel):
     """語音管線設定（STT + TTS + VAD + Audio）。"""
 
@@ -176,6 +313,7 @@ class VoiceConfig(BaseModel):
         "auto",
         "faster-whisper",
         "openai-api",
+        "external-api",
         "openai-whisper",
         "qwen-asr",
         "vosk",
@@ -213,10 +351,11 @@ class VoiceConfig(BaseModel):
         "auto",
         "coqui-tts",
         "edge-tts",
+        "external-api",
         "kokoro-tts",
         "openai-tts",
         "piper",
-    ] = "edge-tts"
+    ] = "kokoro-tts"
     """TTS 後端選擇。"""
 
     tts_model: str | None = None
@@ -251,6 +390,23 @@ class VoiceConfig(BaseModel):
 
     tts_openai_response_format: Literal["pcm", "wav"] = "pcm"
     """`openai-tts` 回應音訊格式。"""
+
+    reply_model_mode: Literal["inherit_active", "configured_model"] = "inherit_active"
+    """語音回覆使用中的回答模型模式。"""
+
+    reply_model_id: str | None = None
+    """當 `reply_model_mode=configured_model` 時使用的 configured model id。"""
+
+    session_mode: Literal["append_current", "isolated_voice"] = "append_current"
+    """語音對話是附加到目前 chat session，或使用隔離的 voice session。"""
+
+    voice_pack_dir: Path = Path.home() / ".cache" / "mochi" / "voice-packs"
+    """瀏覽器上傳的自訂語音包儲存目錄。"""
+
+    registered_tts_voices: list[RegisteredTTSVoiceConfig] = Field(
+        default_factory=lambda: _empty_list_typed(RegisteredTTSVoiceConfig)
+    )
+    """共用的自訂 TTS 聲音包註冊表。"""
 
     # VAD 設定
     vad_threshold: float = 0.5
@@ -338,6 +494,9 @@ class DiscordPlatformConfig(BaseModel):
     allowed_user_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
     """允許使用的使用者 ID 白名單，空列表表示全部允許。"""
 
+    admin_user_ids: list[int] = Field(default_factory=lambda: _empty_list_typed(int))
+    """允許變更 Discord 共用設定的管理者 user id 清單。"""
+
     rate_limit_per_user: int = 10
     """每使用者 60 秒內最多幾則訊息。"""
 
@@ -401,6 +560,9 @@ class LearningConfig(BaseModel):
     min_steps_for_extraction: int = 3
     """少於此步驟數的任務不進行技能萃取。"""
 
+    min_tool_calls_for_extraction: int = 2
+    """少於此工具呼叫次數的任務不進行技能萃取。"""
+
     trajectory_retention_days: int = 30
     """軌跡記錄保留天數。"""
 
@@ -424,6 +586,40 @@ class MemoryConfig(BaseModel):
     """FTS5 搜尋返回最大結果數。"""
 
 
+class InferencePreset(BaseModel):
+    """推理參數 preset。"""
+
+    name: str = Field(min_length=1, max_length=64)
+    """Preset 名稱。"""
+
+    system_prompt: str = ""
+    """Preset 的系統提示詞。"""
+
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    """採樣溫度（0.0–2.0）。"""
+
+    max_tokens: int = Field(default=4096, ge=1, le=131072)
+    """最大輸出 token 數。"""
+
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Top-p 取樣機率。"""
+
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Min-p 取樣機率。"""
+
+    top_k: int = Field(default=0, ge=0)
+    """Top-k 取樣數量；0 代表停用。"""
+
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    """Frequency penalty。"""
+
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    """Presence penalty。"""
+
+    repeat_penalty: float = Field(default=1.0, ge=0.0, le=2.0)
+    """Repeat penalty。"""
+
+
 class SecurityConfig(BaseModel):
     """安全設定。"""
 
@@ -441,6 +637,12 @@ class SecurityConfig(BaseModel):
     max_file_write_size_mb: float = 10.0
     """允許寫入的最大檔案大小（MB）。"""
 
+    file_ops_scope: Literal["workspace", "any"] = "workspace"
+    """檔案操作範圍（workspace / any）。"""
+
+    file_undo_max_size_mb: float = 2.0
+    """允許保存 undo 的最大檔案大小（MB）。"""
+
 
 class WebConfig(BaseModel):
     """WebAPI 伺服器設定。"""
@@ -451,7 +653,9 @@ class WebConfig(BaseModel):
     port: int = 8000
     """監聽埠號。"""
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    )
     """允許的 CORS 來源列表（開發預設值，可由設定檔或環境變數覆蓋）。"""
 
     reload: bool = False
@@ -535,6 +739,28 @@ class ToolsConfig(BaseModel):
     """HTTP 工具指數退避基數（秒）。"""
 
 
+    @field_validator("web_search_engine", mode="before")
+    @classmethod
+    def _normalize_web_search_engine(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return normalize_web_search_provider(value)
+        return value
+
+    @field_validator("web_search_fallback_engines", mode="before")
+    @classmethod
+    def _normalize_web_search_fallback_engines(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            candidate = normalize_web_search_provider(item)
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+
 class AgentConfig(BaseModel):
     """Agent 核心設定。"""
 
@@ -549,6 +775,39 @@ class AgentConfig(BaseModel):
 
     max_context_tokens: int = 3000
     """傳入 LLM 的最大 context token 數（不含輸出）。"""
+
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    """採樣溫度（0.0–2.0）。"""
+
+    max_tokens: int = Field(default=4096, ge=1, le=131072)
+    """最大輸出 token 數。"""
+
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Top-p 取樣機率。"""
+
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Min-p 取樣機率。"""
+
+    top_k: int = Field(default=0, ge=0)
+    """Top-k 取樣數量；0 代表停用。"""
+
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    """Frequency penalty。"""
+
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    """Presence penalty。"""
+
+    repeat_penalty: float = Field(default=1.0, ge=0.0, le=2.0)
+    """Repeat penalty。"""
+
+    show_token_stats: bool = False
+    """是否顯示 token 統計資訊。"""
+
+    presets: list[InferencePreset] = Field(default_factory=lambda: [InferencePreset(name="default")])
+    """推理參數 preset 列表。"""
+
+    active_preset: str = "default"
+    """目前啟用的 preset 名稱。"""
 
 
 # ---------------------------------------------------------------------------
@@ -574,8 +833,10 @@ class MochiConfig(BaseModel):
 
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     openai_compat: OpenAICompatConfig = Field(default_factory=OpenAICompatConfig)
+    vllm: VLLMConfig = Field(default_factory=VLLMConfig)
     gguf: GGUFConfig = Field(default_factory=GGUFConfig)
     huggingface: HuggingFaceConfig = Field(default_factory=HuggingFaceConfig)
+    local_models: LocalModelConfig = Field(default_factory=LocalModelConfig)
 
     # 語音
     voice: VoiceConfig = Field(default_factory=VoiceConfig)

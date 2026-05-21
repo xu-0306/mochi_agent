@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mochi.config.schema import VoiceConfig
+
 # Attribution:
 # Adapted from /mnt/g/_python/STT&TTS/backend/model_manager.py
 # Scope intentionally bounded for Mochi: path resolution, model target selection,
@@ -30,6 +32,7 @@ QWEN_ASR_MODEL_REPOS: dict[str, str] = {
 NotifyCallback = Callable[[str], object]
 WhisperDownloadFn = Callable[[str, str, Path], object]
 QwenSnapshotFn = Callable[[str, Path], object]
+TTSFactory = Callable[[VoiceConfig], object]
 
 
 @dataclass(slots=True, frozen=True)
@@ -144,7 +147,7 @@ def resolve_bounded_stt_runtime_spec(
             model_source=requested_model,
             uses_local_model_source=False,
         )
-    if backend == "openai-api":
+    if backend in {"openai-api", "external-api"}:
         return STTRuntimeSpec(
             backend=backend,
             requested_model=requested_model,
@@ -331,6 +334,59 @@ async def ensure_qwen_model_available(
     return updated
 
 
+async def ensure_tts_runtime_available(
+    voice: VoiceConfig,
+    *,
+    tts_factory: TTSFactory | None = None,
+) -> dict[str, Any]:
+    """Best-effort local TTS runtime preparation with failure surfaced as status."""
+    backend = _normalize_backend_name(voice.tts_backend)
+    if backend not in {"kokoro-tts", "coqui-tts", "piper"}:
+        return {
+            "requested": False,
+            "backend": backend,
+            "status": "skipped",
+        }
+
+    factory = tts_factory or _default_tts_prepare_factory
+    tts = factory(voice)
+    try:
+        ensure_ready = getattr(tts, "ensure_ready", None)
+        if callable(ensure_ready):
+            await _maybe_call_noargs(ensure_ready)
+            return {
+                "requested": True,
+                "backend": backend,
+                "status": "ready",
+            }
+
+        health_check = getattr(tts, "health_check", None)
+        if callable(health_check):
+            healthy_result = health_check()
+            if inspect.isawaitable(healthy_result):
+                healthy_result = await healthy_result
+            if healthy_result:
+                return {
+                    "requested": True,
+                    "backend": backend,
+                    "status": "ready",
+                }
+        return {
+            "requested": True,
+            "backend": backend,
+            "status": "ready",
+        }
+    except Exception as exc:
+        return {
+            "requested": True,
+            "backend": backend,
+            "status": "prepare_failed",
+            "error": str(exc),
+        }
+    finally:
+        await _close_if_possible(tts)
+
+
 def _with_qwen_model_dir(stt_cfg: dict[str, Any], target: Path) -> dict[str, Any]:
     qwen_cfg_raw = stt_cfg.get("qwen_asr", {})
     qwen_cfg = dict(qwen_cfg_raw) if isinstance(qwen_cfg_raw, Mapping) else {}
@@ -355,6 +411,21 @@ async def _maybe_call(callback: NotifyCallback | None, message: str) -> None:
     if callback is None:
         return
     result = callback(message)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _maybe_call_noargs(callback: Callable[[], object]) -> None:
+    result = callback()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _close_if_possible(value: object) -> None:
+    closer = getattr(value, "close", None)
+    if not callable(closer):
+        return
+    result = closer()
     if inspect.isawaitable(result):
         await result
 
@@ -384,6 +455,16 @@ async def _maybe_call_snapshot(
 
 def _normalize_backend_name(name: str) -> str:
     return name.strip().lower().replace("_", "-")
+
+
+def _default_tts_prepare_factory(voice: VoiceConfig) -> object:
+    from mochi.voice.router import VoiceRouter, _resolve_registered_tts_voice_path
+
+    effective_voice = voice
+    resolved_tts_voice = _resolve_registered_tts_voice_path(voice)
+    if resolved_tts_voice != voice.tts_voice:
+        effective_voice = voice.model_copy(update={"tts_voice": resolved_tts_voice})
+    return VoiceRouter._default_tts_factory(effective_voice)  # noqa: SLF001
 
 
 def _resolve_existing_model_source(

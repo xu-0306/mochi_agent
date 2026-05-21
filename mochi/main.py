@@ -215,7 +215,7 @@ def _print_channels_setup_guide(platform: str) -> None:
         "voice:",
         "  enabled: true",
         "  stt_backend: \"faster-whisper\"",
-        "  tts_backend: \"edge-tts\"",
+        "  tts_backend: \"kokoro-tts\"",
         "  sample_rate: 16000",
         "  channels: 1",
         "",
@@ -425,6 +425,41 @@ def channels_guide(
     _print_channels_setup_guide(platform)
 
 
+@channels_app.command("voice-settings")
+def channels_voice_settings(
+    config_path: Annotated[str, typer.Option("--config", "-c", help="Config file path")] = "",
+    tts_voice: Annotated[
+        str,
+        typer.Option("--tts-voice", help="Discord voice reply TTS voice id"),
+    ] = "",
+    session_mode: Annotated[
+        str,
+        typer.Option(
+            "--session-mode",
+            help="Discord voice session mode: voice_room/shared/per_guild/per_channel",
+        ),
+    ] = "",
+    reply_model_mode: Annotated[
+        str,
+        typer.Option("--reply-model-mode", help="Discord voice reply model mode: agent-default/fixed"),
+    ] = "",
+    reply_model: Annotated[
+        str,
+        typer.Option("--reply-model", help="Discord voice fixed reply model id"),
+    ] = "",
+) -> None:
+    """Update shared Discord voice conversation settings."""
+    asyncio.run(
+        _channels_voice_settings_async(
+            config_path=config_path or None,
+            tts_voice=tts_voice or None,
+            session_mode=session_mode or None,
+            reply_model_mode=reply_model_mode or None,
+            reply_model=reply_model or None,
+        )
+    )
+
+
 @skills_app.command("list")
 def skills_list(
     db_path: Annotated[str, typer.Option("--db", help="Skill library SQLite path")] = "",
@@ -514,6 +549,18 @@ def _print_tui_help() -> None:
     console.print("  /model <spec>        Switch model for this session")
     console.print("  /session             Show current session id")
     console.print("  /session <id>        Switch session id")
+    console.print("  /tools               Show web search / fetch tool settings")
+    console.print("  /tools search-engine <engine>")
+    console.print("                       Set primary web search engine")
+    console.print("  /tools fallback <engine...>")
+    console.print("                       Set fallback web search engines")
+    console.print("  /tools fetch-extractor <extractor>")
+    console.print("                       Set web fetch extractor")
+    console.print("  /tools key-status    Show web search provider key status")
+    console.print("  /tools key <provider>")
+    console.print("                       Set one provider API key using a masked prompt")
+    console.print("  /tools key-clear <provider>")
+    console.print("                       Clear one provider API key")
     console.print("  channels guide       Run `mochi channels guide discord` for Discord setup help")
     console.print()
 
@@ -550,8 +597,14 @@ async def _chat_tui_async(
         TextChunkEvent,
         ToolCallResultEvent,
     )
-    from mochi.config.manager import load_config
+    from mochi.config.manager import load_config, save_config
     from mochi.sessions.store import SessionStore
+    from mochi.tools.web_search_providers import (
+        iter_web_search_provider_specs,
+        normalize_web_search_provider,
+        provider_key_config_field,
+        supported_web_search_provider_names,
+    )
 
     if max_turns <= 0:
         console.print("[red]max_turns must be greater than 0.[/red]")
@@ -564,11 +617,37 @@ async def _chat_tui_async(
     engine = AgentEngine(cfg)
     current_session = session_id.strip() or DEFAULT_TUI_SESSION_ID
     session_store = SessionStore(sessions_dir=getattr(cfg, "sessions_dir", "~/.mochi/sessions"))
+    supported_search_engines = set(supported_web_search_provider_names(include_aliases=True))
+    supported_fetch_extractors = {"trafilatura", "jina_reader", "htmlparser"}
+    provider_specs = [
+        spec
+        for spec in iter_web_search_provider_specs()
+        if spec.key_config_field is not None
+    ]
 
     async def _reset_engine() -> None:
         nonlocal engine
         await engine.close()
         engine = AgentEngine(cfg)
+        await engine.initialize()
+
+    def _show_tool_settings() -> None:
+        fallback = ", ".join(cfg.tools.web_search_fallback_engines) or "(none)"
+        console.print(f"[dim]Web search engine: {cfg.tools.web_search_engine}[/dim]")
+        console.print(f"[dim]Web search fallback: {fallback}[/dim]")
+        console.print(f"[dim]Web fetch extractor: {cfg.tools.web_fetch_extractor}[/dim]")
+        _show_tool_key_status()
+
+    def _show_tool_key_status() -> None:
+        for spec in provider_specs:
+            configured = getattr(cfg.tools, spec.key_config_field, None) is not None
+            status = "configured" if configured else "not configured"
+            console.print(f"[dim]{spec.canonical_name}: {status}[/dim]")
+
+    async def _persist_tool_settings() -> None:
+        path = save_config(cfg, config_path)
+        await _reset_engine()
+        console.print(f"[dim]Saved config: {path}[/dim]")
 
     try:
         await engine.initialize()
@@ -652,6 +731,105 @@ async def _chat_tui_async(
                         continue
                     current_session = next_session
                     console.print(f"[green]Session switched:[/green] {current_session}")
+                    continue
+                if command == "tools":
+                    if not args:
+                        _show_tool_settings()
+                        continue
+                    subcommand = args[0].strip().lower()
+                    subargs = [arg.strip().lower() for arg in args[1:] if arg.strip()]
+                    if subcommand == "search-engine":
+                        if len(subargs) != 1:
+                            console.print("[red]Usage: /tools search-engine <engine>[/red]")
+                            continue
+                        next_engine = normalize_web_search_provider(subargs[0])
+                        if next_engine not in supported_search_engines:
+                            console.print(
+                                "[red]Unsupported search engine.[/red] "
+                                f"Choose from: {', '.join(sorted(supported_search_engines))}"
+                            )
+                            continue
+                        cfg.tools.web_search_engine = next_engine
+                        await _persist_tool_settings()
+                        console.print(
+                            f"[green]Web search engine updated:[/green] {cfg.tools.web_search_engine}"
+                        )
+                        continue
+                    if subcommand == "fallback":
+                        if not subargs:
+                            console.print("[red]Usage: /tools fallback <engine...>[/red]")
+                            continue
+                        normalized_fallback = [normalize_web_search_provider(engine_name) for engine_name in subargs]
+                        invalid = [engine_name for engine_name in normalized_fallback if engine_name not in supported_search_engines]
+                        if invalid:
+                            console.print(
+                                "[red]Unsupported fallback engine(s):[/red] "
+                                + ", ".join(invalid)
+                            )
+                            continue
+                        deduped_fallback = list(dict.fromkeys(normalized_fallback))
+                        cfg.tools.web_search_fallback_engines = deduped_fallback
+                        await _persist_tool_settings()
+                        console.print(
+                            "[green]Web search fallback updated:[/green] "
+                            + ", ".join(cfg.tools.web_search_fallback_engines)
+                        )
+                        continue
+                    if subcommand == "fetch-extractor":
+                        if len(subargs) != 1:
+                            console.print("[red]Usage: /tools fetch-extractor <extractor>[/red]")
+                            continue
+                        next_extractor = subargs[0]
+                        if next_extractor not in supported_fetch_extractors:
+                            console.print(
+                                "[red]Unsupported fetch extractor.[/red] "
+                                f"Choose from: {', '.join(sorted(supported_fetch_extractors))}"
+                            )
+                            continue
+                        cfg.tools.web_fetch_extractor = next_extractor
+                        await _persist_tool_settings()
+                        console.print(
+                            f"[green]Web fetch extractor updated:[/green] {cfg.tools.web_fetch_extractor}"
+                        )
+                        continue
+                    if subcommand == "key-status":
+                        _show_tool_key_status()
+                        continue
+                    if subcommand == "key":
+                        if len(subargs) != 1:
+                            console.print("[red]Usage: /tools key <provider>[/red]")
+                            continue
+                        provider_name = normalize_web_search_provider(subargs[0])
+                        field_name = provider_key_config_field(provider_name)
+                        if field_name is None:
+                            console.print(f"[red]Provider {provider_name} does not use a managed API key.[/red]")
+                            continue
+                        secret_value = console.input(
+                            f"[bold cyan]{provider_name} key[/bold cyan] > ",
+                            password=True,
+                        ).strip()
+                        if not secret_value:
+                            console.print(f"[yellow]No key entered for {provider_name}; existing value kept.[/yellow]")
+                            continue
+                        setattr(cfg.tools, field_name, secret_value)
+                        await _persist_tool_settings()
+                        console.print(f"[green]Saved key for {provider_name}.[/green]")
+                        continue
+                    if subcommand == "key-clear":
+                        if len(subargs) != 1:
+                            console.print("[red]Usage: /tools key-clear <provider>[/red]")
+                            continue
+                        provider_name = normalize_web_search_provider(subargs[0])
+                        field_name = provider_key_config_field(provider_name)
+                        if field_name is None:
+                            console.print(f"[red]Provider {provider_name} does not use a managed API key.[/red]")
+                            continue
+                        setattr(cfg.tools, field_name, None)
+                        await _persist_tool_settings()
+                        console.print(f"[green]Cleared key for {provider_name}.[/green]")
+                        continue
+
+                    console.print(f"[yellow]Unknown /tools command: {subcommand}[/yellow]")
                     continue
 
                 console.print(f"[yellow]Unknown command: /{command}[/yellow]")
@@ -1289,7 +1467,12 @@ async def _channels_run_async(config_path: str | None) -> None:
     manager = None
     try:
         await engine.initialize()
-        manager = build_channel_manager(cfg, engine)
+        manager = build_channel_manager(
+            cfg,
+            engine,
+            config_path=config_path,
+            persist_config_updates=True,
+        )
         channel_names = manager.list_channels()
         if not channel_names:
             console.print("[yellow]No channels are enabled. Enable discord or telegram in config.channels.[/yellow]")
@@ -1311,6 +1494,89 @@ async def _channels_run_async(config_path: str | None) -> None:
         if manager is not None:
             await manager.stop_all()
         await engine.close()
+
+
+async def _channels_voice_settings_async(
+    *,
+    config_path: str | None,
+    tts_voice: str | None,
+    session_mode: str | None,
+    reply_model_mode: str | None,
+    reply_model: str | None,
+) -> None:
+    from mochi.config.manager import load_config, save_config
+
+    cfg = load_config(config_path)
+    updates_requested = any(
+        value is not None
+        for value in (tts_voice, session_mode, reply_model_mode, reply_model)
+    )
+    if not updates_requested:
+        console.print("[bold]Discord voice settings[/bold]")
+        console.print(f"  tts_voice: {getattr(cfg.voice, 'tts_voice', '')}")
+        console.print(
+            "  session_mode: "
+            f"{getattr(cfg.voice, 'session_mode', 'append_current')}"
+        )
+        console.print(
+            "  reply_model_mode: "
+            f"{getattr(cfg.voice, 'reply_model_mode', 'inherit_active')}"
+        )
+        console.print(
+            "  reply_model_id: "
+            f"{getattr(cfg.voice, 'reply_model_id', '')}"
+        )
+        return
+
+    if tts_voice is not None:
+        cfg.voice.tts_voice = tts_voice.strip()
+
+    if session_mode is not None:
+        normalized_session_mode = session_mode.strip()
+        if normalized_session_mode not in {"append_current", "isolated_voice"}:
+            console.print(
+                "[red]Invalid session_mode. Use one of: "
+                "append_current, isolated_voice.[/red]"
+            )
+            sys.exit(1)
+        if hasattr(cfg.voice, "session_mode"):
+            setattr(cfg.voice, "session_mode", normalized_session_mode)
+        else:
+            console.print(
+                "[red]Config schema is missing voice.session_mode. "
+                "Please add this field in shared config/schema first.[/red]"
+            )
+            sys.exit(1)
+
+    if reply_model_mode is not None:
+        normalized_mode = reply_model_mode.strip().replace("-", "_")
+        if normalized_mode not in {"inherit_active", "configured_model"}:
+            console.print(
+                "[red]Invalid reply_model_mode. Use one of: "
+                "inherit_active, configured_model.[/red]"
+            )
+            sys.exit(1)
+        if hasattr(cfg.voice, "reply_model_mode"):
+            setattr(cfg.voice, "reply_model_mode", normalized_mode)
+        else:
+            console.print(
+                "[red]Config schema is missing voice.reply_model_mode. "
+                "Please add this field in shared config/schema first.[/red]"
+            )
+            sys.exit(1)
+
+    if reply_model is not None:
+        if hasattr(cfg.voice, "reply_model_id"):
+            setattr(cfg.voice, "reply_model_id", reply_model.strip())
+        else:
+            console.print(
+                "[red]Config schema is missing voice.reply_model_id. "
+                "Please add this field in shared config/schema first.[/red]"
+            )
+            sys.exit(1)
+
+    path = save_config(cfg, config_path)
+    console.print(f"[green]Saved Discord voice settings:[/green] {path}")
 
 
 if __name__ == "__main__":

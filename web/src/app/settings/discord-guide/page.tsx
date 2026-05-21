@@ -54,7 +54,7 @@ export default function DiscordGuidePage() {
     'voice:',
     '  enabled: true',
     '  stt_backend: "faster-whisper"',
-    '  tts_backend: "edge-tts"',
+    '  tts_backend: "kokoro-tts"',
     '  sample_rate: 16000',
     '  channels: 1',
   ]

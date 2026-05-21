@@ -88,6 +88,23 @@ def resolve_path_in_workspace(path: str | Path, workspace_dir: str | Path) -> Pa
     return resolved
 
 
+def resolve_path_with_scope(
+    path: str | Path,
+    workspace_dir: str | Path,
+    scope: str,
+) -> Path:
+    """依 scope 解析路徑。"""
+    workspace = normalize_workspace_dir(workspace_dir)
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    resolved = candidate.resolve(strict=False)
+
+    if scope == "workspace" and not is_path_within_workspace(resolved, workspace):
+        raise ValueError(f"Path '{path}' is outside workspace '{workspace}'.")
+    return resolved
+
+
 def content_size_bytes(content: str, encoding: str = "utf-8") -> int:
     """計算文字內容在指定編碼下的位元組大小。"""
     return len(content.encode(encoding))

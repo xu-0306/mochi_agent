@@ -30,6 +30,7 @@ class PiperTTS(BaseTTS):
         self.speed = speed
         self.speaker_id = speaker_id
         self._synthesize_callable = synthesize_callable
+        self._voice_loader: Callable[[str], Any] | None = None
         self._dependency_error: Exception | None = None
 
         if self._synthesize_callable is None:
@@ -92,6 +93,18 @@ class PiperTTS(BaseTTS):
     async def health_check(self) -> bool:
         return self._dependency_error is None
 
+    async def ensure_ready(self) -> None:
+        if self._dependency_error is not None:
+            raise RuntimeError(
+                "piper synthesize unavailable [dependency_missing]: "
+                f"{self._dependency_error}"
+            ) from self._dependency_error
+        if self._synthesize_callable is None:
+            raise RuntimeError("piper synthesize unavailable [factory_missing]")
+        if self._voice_loader is None:
+            return
+        await asyncio.to_thread(self._voice_loader, self.voice)
+
     def _build_default_synthesize_callable(self, piper_module: Any) -> PiperSynthesizeCallable:
         voice_cls = getattr(piper_module, "PiperVoice", None)
         if voice_cls is None or not hasattr(voice_cls, "load"):
@@ -99,12 +112,17 @@ class PiperTTS(BaseTTS):
 
         cache: dict[str, Any] = {}
 
-        def _synthesize(text: str, selected_voice: str, speed: float) -> bytes:
+        def _load_voice(selected_voice: str) -> Any:
             runtime = cache.get(selected_voice)
             if runtime is None:
                 runtime = voice_cls.load(selected_voice)
                 cache[selected_voice] = runtime
+            return runtime
 
+        self._voice_loader = _load_voice
+
+        def _synthesize(text: str, selected_voice: str, speed: float) -> bytes:
+            runtime = _load_voice(selected_voice)
             wav_bytes = io.BytesIO()
             with wave.open(wav_bytes, "wb") as wav_file:
                 _call_with_supported_kwargs(

@@ -1,4 +1,4 @@
-"""Voice runtime 狀態聚合工具。"""
+"""Voice runtime status helpers."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ async def build_voice_runtime_status(
     last_load_error: str | None = None,
     session_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """組裝共享 voice runtime status payload。"""
+    """Build a shared voice runtime status payload."""
     stt_status = await _describe_component(
         stt_component,
         configured_backend=config.stt_backend,
@@ -51,6 +51,12 @@ async def build_voice_runtime_status(
         "phase": "bounded",
         "enabled": config.enabled,
         "loaded": loaded,
+        "features": {
+            "transcription_preview": (
+                config.stt_backend == "whisperlivekit"
+                or _supports_transcription_preview(stt_component)
+            ),
+        },
         "supported_backends": {
             "stt": list(supported_stt_backends),
             "tts": list(supported_tts_backends),
@@ -72,6 +78,20 @@ async def build_voice_runtime_status(
             "tts_openai_api_key_configured": config.tts_openai_api_key is not None,
             "tts_openai_timeout": config.tts_openai_timeout,
             "tts_openai_response_format": config.tts_openai_response_format,
+            "reply_model_mode": config.reply_model_mode,
+            "reply_model_id": config.reply_model_id,
+            "session_mode": config.session_mode,
+            "voice_pack_dir": str(config.voice_pack_dir),
+            "registered_tts_voices": [
+                {
+                    "id": voice.id,
+                    "backend": voice.backend,
+                    "path": str(voice.path),
+                    "label": voice.label,
+                    "source": voice.source,
+                }
+                for voice in config.registered_tts_voices
+            ],
             "sample_rate": config.sample_rate,
             "channels": config.channels,
             "voice_input_contract": config.voice_input_contract,
@@ -145,5 +165,20 @@ async def _safe_health_check(component: object) -> tuple[bool | None, str | None
         if inspect.isawaitable(result):
             result = await cast(Awaitable[bool], result)
         return bool(result), None
-    except Exception as exc:  # pragma: no cover - 防禦性分支
+    except Exception as exc:  # pragma: no cover
         return False, str(exc)
+
+
+def _supports_transcription_preview(component: object | None) -> bool:
+    if component is None:
+        return False
+    checker = getattr(component, "supports_transcription_preview", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    info = _safe_get_info(component)
+    if info is None:
+        return False
+    return bool(info.metadata.get("supports_preview", False))

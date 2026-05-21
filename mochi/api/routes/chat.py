@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from mochi.agents.events import (
@@ -19,8 +20,11 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config, _get_or_create_engine, _maybe_await
+from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.sessions.store import SessionStore
+from mochi.utils.streaming import sse_stream
 
 router = APIRouter(prefix="/v1")
 
@@ -30,7 +34,17 @@ class ChatRequest(BaseModel):
 
     message: str = Field(min_length=1)
     session_id: str | None = None
+    project_id: str | None = None
     model: str | None = Field(default=None, min_length=1)
+    system_prompt: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    repeat_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
 class ChatResponse(BaseModel):
@@ -53,8 +67,21 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         await switch_model_runtime(request, payload.model)
     engine = await _get_or_create_engine(request.app)
     session_id = payload.session_id or str(uuid4())
+    resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
+        request,
+        payload,
+        session_id,
+    )
 
-    stream = await _maybe_await(engine.chat(payload.message, session_id=session_id))
+    stream = await _maybe_await(
+        engine.chat(
+            payload.message,
+            session_id=session_id,
+            inference_overrides=_build_inference_overrides(payload),
+            project_id=resolved_project_id,
+            workspace_dir=resolved_workspace_dir,
+        )
+    )
     events, final_answer, trajectory_id = await _collect_chat_result(stream)
     turn_id = _response_turn_id(events)
     if turn_id is None:
@@ -66,6 +93,42 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         final_answer=final_answer,
         trajectory_id=trajectory_id,
         events=events,
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
+    """以 SSE 串流回傳 chat event stream。"""
+    if payload.model:
+        from mochi.api.routes.models import switch_model_runtime
+
+        await switch_model_runtime(request, payload.model)
+    engine = await _get_or_create_engine(request.app)
+    session_id = payload.session_id or str(uuid4())
+    resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
+        request,
+        payload,
+        session_id,
+    )
+
+    stream = await _maybe_await(
+        engine.chat(
+            payload.message,
+            session_id=session_id,
+            inference_overrides=_build_inference_overrides(payload),
+            project_id=resolved_project_id,
+            workspace_dir=resolved_workspace_dir,
+        )
+    )
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Session-ID": session_id,
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        sse_stream(_stream_chat_events(request, session_id, stream)),
+        media_type="text/event-stream",
+        headers=headers,
     )
 
 
@@ -88,51 +151,146 @@ async def _collect_chat_result(
     return events, final_answer, trajectory_id
 
 
-def _serialize_event(event: Any) -> dict[str, Any]:
+async def _stream_chat_events(
+    request: Request,
+    session_id: str,
+    stream: AsyncIterator[Any],
+) -> AsyncIterator[dict[str, Any]]:
+    """串流 serialized chat events，必要時補做 session replay 持久化。"""
+    fallback_turn_id = str(uuid4())
+    events: list[dict[str, Any]] = []
+
+    try:
+        async for event in stream:
+            serialized = _serialize_event(event, fallback_turn_id=fallback_turn_id)
+            events.append(serialized)
+            yield serialized
+    except Exception as exc:
+        error_event = _attach_turn_id(
+            None,
+            {
+                "type": "error",
+                "error": str(exc),
+                "code": "CHAT_STREAM_ERROR",
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
+        events.append(error_event)
+        yield error_event
+    finally:
+        if _should_persist_fallback_events(events, fallback_turn_id):
+            await _persist_turn_events(request, session_id, events, turn_id=fallback_turn_id)
+
+
+def _serialize_event(
+    event: Any,
+    *,
+    fallback_turn_id: str | None = None,
+) -> dict[str, Any]:
     """將 AgentEvent 轉成 JSON-safe dict。"""
     if isinstance(event, ThinkingEvent):
-        return _attach_turn_id(event, {"type": event.type, "content": event.content})
+        return _attach_turn_id(
+            event,
+            {"type": event.type, "content": event.content},
+            fallback_turn_id=fallback_turn_id,
+        )
     if isinstance(event, ToolCallRequestEvent):
-        return _attach_turn_id(event, {
-            "type": event.type,
-            "call_id": event.call_id,
-            "tool_name": event.tool_name,
-            "arguments": jsonable_encoder(event.arguments),
-        })
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "arguments": jsonable_encoder(event.arguments),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
     if isinstance(event, ToolCallResultEvent):
-        return _attach_turn_id(event, {
-            "type": event.type,
-            "call_id": event.call_id,
-            "tool_name": event.tool_name,
-            "result": _json_safe(event.result),
-            "error": event.error,
-        })
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "result": _json_safe(event.result),
+                "error": event.error,
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
     if isinstance(event, FinalAnswerEvent):
-        return _attach_turn_id(event, {
-            "type": event.type,
-            "content": event.content,
-            "trajectory_id": event.trajectory_id,
-        })
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "content": event.content,
+                "trajectory_id": event.trajectory_id,
+                "input_tokens": event.input_tokens,
+                "output_tokens": event.output_tokens,
+                "generation_time_ms": event.generation_time_ms,
+                "finish_reason": event.finish_reason,
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
     if isinstance(event, ErrorEvent):
-        return _attach_turn_id(event, {"type": event.type, "error": event.message, "code": event.code})
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "error": event.message,
+                "code": event.code,
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
     if is_dataclass(event):
-        return jsonable_encoder(asdict(event))
+        return _attach_turn_id(
+            event,
+            jsonable_encoder(asdict(event)),
+            fallback_turn_id=fallback_turn_id,
+        )
     if isinstance(event, dict):
-        return jsonable_encoder(event)
-    return {"type": "unknown", "content": _json_safe(event)}
+        return _attach_turn_id(
+            None,
+            jsonable_encoder(event),
+            fallback_turn_id=fallback_turn_id,
+        )
+    return _attach_turn_id(
+        None,
+        {"type": "unknown", "content": _json_safe(event)},
+        fallback_turn_id=fallback_turn_id,
+    )
+
+
+def _build_inference_overrides(payload: ChatRequest) -> dict[str, Any]:
+    """從 chat payload 擷取推理參數覆蓋。"""
+    overrides = {
+        "system_prompt": payload.system_prompt,
+        "temperature": payload.temperature,
+        "max_tokens": payload.max_tokens,
+        "top_p": payload.top_p,
+        "min_p": payload.min_p,
+        "top_k": payload.top_k,
+        "frequency_penalty": payload.frequency_penalty,
+        "presence_penalty": payload.presence_penalty,
+        "repeat_penalty": payload.repeat_penalty,
+    }
+    return {key: value for key, value in overrides.items() if value is not None}
 
 
 async def _persist_turn_events(
     request: Request,
     session_id: str,
     events: list[dict[str, Any]],
+    *,
+    turn_id: str | None = None,
 ) -> str | None:
     """將本輪 replay event 以 `turn_event` schema 追加到 session JSONL。"""
     if not events:
         return None
 
     store = await _get_session_store(request)
-    turn_id = str(uuid4())
+    resolved_turn_id = turn_id or str(uuid4())
 
     for index, event in enumerate(events, start=1):
         phase = _event_phase(event)
@@ -144,7 +302,7 @@ async def _persist_turn_events(
             {
                 "type": "turn_event",
                 "schema_version": 1,
-                "turn_id": turn_id,
+                "turn_id": resolved_turn_id,
                 "event_id": str(uuid4()),
                 "seq": index,
                 "phase": phase,
@@ -152,14 +310,24 @@ async def _persist_turn_events(
                 "payload": event,
             },
         )
-    return turn_id
+    return resolved_turn_id
 
 
-def _attach_turn_id(event: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def _attach_turn_id(
+    event: Any,
+    payload: dict[str, Any],
+    *,
+    fallback_turn_id: str | None = None,
+) -> dict[str, Any]:
     """若 AgentEvent 帶有 turn_id，附加到 API event。"""
     turn_id = getattr(event, "turn_id", None)
     if isinstance(turn_id, str) and turn_id:
         payload["turn_id"] = turn_id
+    elif (
+        fallback_turn_id is not None
+        and not isinstance(payload.get("turn_id"), str)
+    ):
+        payload["turn_id"] = fallback_turn_id
     return payload
 
 
@@ -172,6 +340,16 @@ def _response_turn_id(events: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _should_persist_fallback_events(
+    events: list[dict[str, Any]],
+    fallback_turn_id: str,
+) -> bool:
+    """判斷是否需要以 route fallback 寫入 turn replay events。"""
+    if not events:
+        return False
+    return _response_turn_id(events) == fallback_turn_id
+
+
 async def _get_session_store(request: Request) -> SessionStore:
     """取得 chat route 可共用的 SessionStore。"""
     existing = getattr(request.app.state, "session_store", None)
@@ -182,6 +360,30 @@ async def _get_session_store(request: Request) -> SessionStore:
     store = SessionStore(config.sessions_dir)
     request.app.state.session_store = store
     return store
+
+
+async def _resolve_chat_project_context(
+    request: Request,
+    payload: ChatRequest,
+    session_id: str,
+) -> tuple[str | None, str]:
+    """Resolve effective project assignment and workspace for one request."""
+    config = await _get_config(request.app)
+    resolver = ExecutionScopeResolver(
+        default_workspace_dir=str(getattr(config, "workspace_dir")),
+        session_store=await _get_session_store(request),
+        project_store=_get_project_store(request.app, config=config),
+    )
+    try:
+        scope = await resolver.resolve(
+            session_id=session_id,
+            project_id=payload.project_id,
+        )
+    except LookupError as exc:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return scope.project_id, scope.workspace_dir
 
 
 def _event_phase(event: dict[str, Any]) -> str | None:

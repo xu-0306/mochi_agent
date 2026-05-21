@@ -40,8 +40,7 @@ const DialogContent = React.forwardRef<
         'translate-x-[-50%] translate-y-[-50%]',
         'bg-elevated-layer border border-border rounded-xl shadow-xl p-6',
         'duration-200',
-        'data-[state=open]:animate-slide-up data-[state=open]:scale-100',
-        'data-[state=closed]:opacity-0 data-[state=closed]:scale-95',
+        'data-[state=open]:animate-dialog-in data-[state=closed]:animate-dialog-out',
         className
       )}
       {...props}

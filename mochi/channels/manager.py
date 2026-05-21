@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from mochi.agents.events import ErrorEvent, FinalAnswerEvent, TextChunkEvent
@@ -33,10 +34,16 @@ class ChannelManager:
         self,
         *,
         engine: Any | None = None,
+        config: MochiConfig | None = None,
         session_bridge: SessionBridge | None = None,
+        config_path: str | Path | None = None,
+        persist_config_updates: bool = False,
     ) -> None:
         self._engine = engine
+        self._config = config
         self._session_bridge = session_bridge or SessionBridge()
+        self._config_path = Path(config_path).expanduser() if config_path is not None else None
+        self._persist_config_updates = persist_config_updates
         self._channels: dict[str, BaseChannel] = {}
         self._running_channels: set[str] = set()
         self._running = False
@@ -186,6 +193,17 @@ class ChannelManager:
     async def _handle_command(self, channel: BaseChannel, event: CommandEvent) -> None:
         """處理平台 command。"""
         command = event.command.lower().strip()
+        if self._is_discord_mutation_command(command) and not self._is_discord_admin_command(
+            channel=channel,
+            event=event,
+        ):
+            await channel.send_message(
+                event.chat_id,
+                f"Discord command `/{command}` is admin-only.",
+                reply_to=event.message_id or None,
+            )
+            return
+
         if command in {"start", "help"}:
             await channel.send_message(
                 event.chat_id,
@@ -279,6 +297,69 @@ class ChannelManager:
             await channel.send_message(
                 event.chat_id,
                 status_text,
+                reply_to=event.message_id or None,
+            )
+            return
+
+        if command == "voice-config":
+            get_settings = getattr(channel, "get_voice_conversation_settings", None)
+            if not callable(get_settings):
+                await channel.send_message(
+                    event.chat_id,
+                    "Discord voice settings are unavailable on this channel adapter.",
+                    reply_to=event.message_id or None,
+                )
+                return
+            settings = get_settings()
+            if not isinstance(settings, dict):
+                await channel.send_message(
+                    event.chat_id,
+                    "Discord voice settings returned an invalid payload.",
+                    reply_to=event.message_id or None,
+                )
+                return
+            lines = ["Discord voice settings"]
+            for key in ("session_mode", "reply_model_mode", "reply_model_id", "tts_voice"):
+                if key in settings:
+                    lines.append(f"{key}: {settings.get(key)}")
+            await channel.send_message(
+                event.chat_id,
+                "\n".join(lines),
+                reply_to=event.message_id or None,
+            )
+            return
+
+        if command == "voice-set":
+            if len(event.args) < 2:
+                await channel.send_message(
+                    event.chat_id,
+                    "Usage: /voice-set <key> <value>",
+                    reply_to=event.message_id or None,
+                )
+                return
+            key = event.args[0]
+            value = " ".join(event.args[1:]).strip()
+            update_setting = getattr(channel, "update_voice_conversation_setting", None)
+            if not callable(update_setting):
+                await channel.send_message(
+                    event.chat_id,
+                    "Discord voice settings are unavailable on this channel adapter.",
+                    reply_to=event.message_id or None,
+                )
+                return
+            try:
+                updated_key, updated_value = update_setting(key, value)
+            except Exception as exc:
+                await channel.send_message(
+                    event.chat_id,
+                    f"Discord voice setting update failed: {exc}",
+                    reply_to=event.message_id or None,
+                )
+                return
+            await self._update_shared_voice_setting(updated_key, updated_value)
+            await channel.send_message(
+                event.chat_id,
+                f"Updated Discord voice setting: {updated_key}={updated_value}",
                 reply_to=event.message_id or None,
             )
             return
@@ -427,15 +508,79 @@ class ChannelManager:
             return int(raw.strip())
         return 0
 
+    def _is_discord_mutation_command(self, command: str) -> bool:
+        if not command:
+            return False
+        return command in {"join", "leave", "voice-set"}
 
-def build_channel_manager(config: MochiConfig, engine: Any) -> ChannelManager:
+    def _is_discord_admin_command(self, *, channel: BaseChannel, event: CommandEvent) -> bool:
+        if event.channel != "discord":
+            return True
+        checker = getattr(channel, "is_admin_user", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker(event.user_id))
+        except Exception:
+            return False
+
+    async def _update_shared_voice_setting(self, key: str, value: str) -> None:
+        if self._config is None:
+            return
+        if key == "session_mode":
+            self._config.voice.session_mode = (
+                "append_current"
+                if value in {"append_current", "shared"}
+                else "isolated_voice"
+            )
+        elif key == "reply_model_mode":
+            self._config.voice.reply_model_mode = (
+                "inherit_active"
+                if value in {"inherit_active", "agent-default"}
+                else "configured_model"
+            )
+        elif key == "reply_model_id":
+            self._config.voice.reply_model_id = value
+        elif key == "tts_voice":
+            self._config.voice.tts_voice = value
+        else:
+            return
+
+        if self._engine is not None:
+            apply_config = getattr(self._engine, "apply_config", None)
+            if callable(apply_config):
+                await apply_config(self._config, reload_voice=True)
+
+        self._persist_config_updates_if_needed()
+
+    def _persist_config_updates_if_needed(self) -> None:
+        if self._config is None or not self._persist_config_updates:
+            return
+
+        from mochi.config.manager import save_config
+
+        save_config(self._config, self._config_path)
+
+
+def build_channel_manager(
+    config: MochiConfig,
+    engine: Any,
+    *,
+    config_path: str | Path | None = None,
+    persist_config_updates: bool = False,
+) -> ChannelManager:
     """依設定建立並註冊啟用中的 Discord / Telegram adapter。"""
     import os
 
     from mochi.channels.discord_adapter import DiscordAdapter
     from mochi.channels.telegram_adapter import TelegramAdapter
 
-    manager = ChannelManager(engine=engine)
+    manager = ChannelManager(
+        engine=engine,
+        config=config,
+        config_path=config_path,
+        persist_config_updates=persist_config_updates,
+    )
 
     discord_cfg = config.channels.discord
     if discord_cfg.enabled:
@@ -456,12 +601,17 @@ def build_channel_manager(config: MochiConfig, engine: Any) -> ChannelManager:
                 allowed_channel_ids=discord_cfg.allowed_channel_ids,
                 allowed_voice_channel_ids=discord_cfg.allowed_voice_channel_ids,
                 allowed_user_ids=discord_cfg.allowed_user_ids,
+                admin_user_ids=getattr(discord_cfg, "admin_user_ids", []),
                 rate_limit_per_user=discord_cfg.rate_limit_per_user,
                 message_mode=discord_cfg.message_mode,
                 auto_join_policy=discord_cfg.auto_join_policy,
                 voice_auto_reply=discord_cfg.voice_auto_reply,
                 voice_stt_enabled=discord_cfg.voice_stt_enabled,
                 voice_tts_enabled=discord_cfg.voice_tts_enabled,
+                voice_session_mode=getattr(config.voice, "session_mode", "append_current"),
+                voice_reply_model_mode=getattr(config.voice, "reply_model_mode", "inherit_active"),
+                voice_reply_model_id=getattr(config.voice, "reply_model_id", "") or "",
+                voice_reply_tts_voice=getattr(config.voice, "tts_voice", ""),
                 voice_sample_rate=config.voice.sample_rate,
             )
         if callable(getattr(engine, "get_or_create_voice_session", None)) or callable(

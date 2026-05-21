@@ -28,6 +28,7 @@ SUPPORTED_STT_BACKENDS = frozenset(
         "auto",
         "faster-whisper",
         "openai-api",
+        "external-api",
         "openai-whisper",
         "qwen-asr",
         "vosk",
@@ -40,6 +41,7 @@ SUPPORTED_TTS_BACKENDS = frozenset(
         "auto",
         "coqui-tts",
         "edge-tts",
+        "external-api",
         "kokoro-tts",
         "openai-tts",
         "piper",
@@ -105,6 +107,9 @@ class VoiceRouter:
             and stt_runtime_spec.model_source != config.stt_model
         ):
             effective_config = config.model_copy(update={"stt_model": stt_runtime_spec.model_source})
+        resolved_tts_voice = _resolve_registered_tts_voice_path(effective_config)
+        if resolved_tts_voice != effective_config.tts_voice:
+            effective_config = effective_config.model_copy(update={"tts_voice": resolved_tts_voice})
 
         try:
             runtime = VoiceRuntime(
@@ -174,7 +179,7 @@ class VoiceRouter:
                 language=config.stt_language,
                 audio_input_contract=config.voice_input_contract,
             )
-        if backend == "openai-api":
+        if backend in {"openai-api", "external-api"}:
             return OpenAIApiSTT(
                 model=config.stt_model,
                 base_url=config.stt_openai_base_url,
@@ -215,7 +220,7 @@ class VoiceRouter:
                 speed=config.tts_speed,
                 split_pattern=config.tts_split_pattern,
             )
-        if backend == "openai-tts":
+        if backend in {"openai-tts", "external-api"}:
             kwargs: dict[str, Any] = {
                 "voice": config.tts_voice,
                 "speed": config.tts_speed,
@@ -277,3 +282,15 @@ class VoiceRouter:
 
 def _normalize_backend_name(name: str) -> str:
     return name.strip().lower().replace("_", "-")
+
+
+def _resolve_registered_tts_voice_path(config: VoiceConfig) -> str:
+    requested_voice = str(config.tts_voice)
+    backend = _normalize_backend_name(config.tts_backend)
+    for voice in config.registered_tts_voices:
+        if voice.id != requested_voice:
+            continue
+        if voice.backend is not None and backend not in {"auto", _normalize_backend_name(voice.backend)}:
+            continue
+        return str(voice.path)
+    return requested_voice

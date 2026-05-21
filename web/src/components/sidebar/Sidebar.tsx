@@ -3,19 +3,20 @@
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
 import {
+  ChevronDown,
+  ChevronRight,
+  FolderPlus,
+  Library,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
   Search,
-  Pin,
+  Settings,
   Trash2,
   Zap,
-  Settings,
-  Library,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
   Dialog,
   DialogContent,
@@ -24,53 +25,63 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { PathPicker } from '@/components/settings/PathPicker'
 import { useI18n } from '@/lib/i18n'
+import { useProjectStore } from '@/lib/stores/project-store'
+import {
+  type Session,
+  useSessionStore,
+} from '@/lib/stores/session-store'
 import { useUIStore } from '@/lib/stores/ui-store'
 import { SessionItem } from './SessionItem'
-import {
-  useSessionStore,
-  getPinnedSessions,
-  type Session,
-} from '@/lib/stores/session-store'
 
-function getDateKey(date: Date, timeZone: string | undefined): string {
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    ...(timeZone ? { timeZone } : {}),
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  })
-  const parts = formatter.formatToParts(date)
-  const year = parts.find((part) => part.type === 'year')?.value ?? '0000'
-  const month = parts.find((part) => part.type === 'month')?.value ?? '00'
-  const day = parts.find((part) => part.type === 'day')?.value ?? '00'
-  return `${year}-${month}-${day}`
+interface ProjectDialogState {
+  mode: 'create' | 'edit'
+  projectId: string | null
+  name: string
+  workspaceDir: string
 }
 
-function groupSessionsByDisplayDate(sessions: Session[], timeZone: string | undefined) {
-  const now = new Date()
-  const todayKey = getDateKey(now, timeZone)
-  const weekAgoKey = getDateKey(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), timeZone)
-  const unpinned = sessions.filter((session) => !session.isPinned)
+function basename(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, '')
+  if (!normalized) {
+    return path
+  }
+  const parts = normalized.split(/[\\/]/)
+  return parts[parts.length - 1] ?? path
+}
+
+function groupSessionsByProject(sessions: Session[]) {
+  const draftSessions = sessions.filter((session) => session.isDraft)
+  const persistedSessions = sessions.filter((session) => !session.isDraft)
 
   return {
-    pinned: getPinnedSessions(sessions),
-    today: unpinned.filter((session) => getDateKey(session.lastMessageAt, timeZone) >= todayKey),
-    thisWeek: unpinned.filter((session) => {
-      const key = getDateKey(session.lastMessageAt, timeZone)
-      return key < todayKey && key >= weekAgoKey
-    }),
-    older: unpinned.filter((session) => getDateKey(session.lastMessageAt, timeZone) < weekAgoKey),
+    drafts: draftSessions,
+    unassigned: persistedSessions.filter((session) => session.projectId === null),
+    byProject: persistedSessions.reduce<Record<string, Session[]>>((acc, session) => {
+      if (!session.projectId) {
+        return acc
+      }
+      acc[session.projectId] = [...(acc[session.projectId] ?? []), session]
+      return acc
+    }, {}),
   }
+}
+
+function sortSessions(sessions: Session[]): Session[] {
+  return [...sessions].sort((a, b) => b.lastMessageAt.getTime() - a.lastMessageAt.getTime())
 }
 
 export function Sidebar() {
   const router = useRouter()
-  const { resolvedTimeZone, t } = useI18n()
+  const { t } = useI18n()
   const collapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed)
   const [search, setSearch] = React.useState('')
   const [pendingDeleteSession, setPendingDeleteSession] = React.useState<Session | null>(null)
+  const [pendingDeleteProjectId, setPendingDeleteProjectId] = React.useState<string | null>(null)
+  const [projectDialog, setProjectDialog] = React.useState<ProjectDialogState | null>(null)
 
   const {
     sessions,
@@ -78,10 +89,24 @@ export function Sidebar() {
     hasLoaded,
     loadSessions,
     setCurrentSession,
-    createSession,
+    createDraftSession,
     renameSession,
     deleteSession,
+    moveSessionToProject,
   } = useSessionStore()
+  const {
+    projects,
+    activeProjectId,
+    expandedProjectIds,
+    hasLoadedProjects,
+    isLoadingProjects,
+    loadProjects,
+    setActiveProjectId,
+    toggleProjectExpanded,
+    createProject,
+    updateProject,
+    deleteProject,
+  } = useProjectStore()
 
   React.useEffect(() => {
     if (!hasLoaded) {
@@ -89,22 +114,28 @@ export function Sidebar() {
     }
   }, [hasLoaded, loadSessions])
 
-  const filtered = search.trim()
-    ? sessions.filter(
-        (s) =>
-          s.title.toLowerCase().includes(search.toLowerCase()) ||
-          s.lastMessage.toLowerCase().includes(search.toLowerCase())
-      )
+  React.useEffect(() => {
+    if (!hasLoadedProjects && !isLoadingProjects) {
+      void loadProjects()
+    }
+  }, [hasLoadedProjects, isLoadingProjects, loadProjects])
+
+  const normalizedSearch = search.trim().toLowerCase()
+  const visibleSessions = normalizedSearch
+    ? sessions.filter((session) => {
+        const haystacks = [session.title, session.lastMessage]
+        return haystacks.some((value) => value.toLowerCase().includes(normalizedSearch))
+      })
     : sessions
 
-  const { pinned, today, thisWeek, older } = React.useMemo(
-    () => groupSessionsByDisplayDate(filtered, resolvedTimeZone),
-    [filtered, resolvedTimeZone]
+  const { drafts, unassigned, byProject } = React.useMemo(
+    () => groupSessionsByProject(visibleSessions),
+    [visibleSessions]
   )
 
   const handleNewSession = () => {
-    const id = createSession()
-    void id
+    const draftId = createDraftSession(activeProjectId)
+    void draftId
     router.push('/')
   }
 
@@ -113,7 +144,7 @@ export function Sidebar() {
     router.push('/')
   }
 
-  const handleConfirmDelete = () => {
+  const handleConfirmDeleteSession = () => {
     if (!pendingDeleteSession) {
       return
     }
@@ -122,15 +153,67 @@ export function Sidebar() {
     void deleteSession(sessionId)
   }
 
-  const renderSession = (s: (typeof sessions)[number]) => (
+  const handleConfirmDeleteProject = () => {
+    if (!pendingDeleteProjectId) {
+      return
+    }
+    const projectId = pendingDeleteProjectId
+    setPendingDeleteProjectId(null)
+    void deleteProject(projectId)
+  }
+
+  const openCreateProject = () => {
+    setProjectDialog({
+      mode: 'create',
+      projectId: null,
+      name: '',
+      workspaceDir: '',
+    })
+  }
+
+  const openEditProject = (projectId: string) => {
+    const project = projects.find((item) => item.id === projectId)
+    if (!project) {
+      return
+    }
+    setProjectDialog({
+      mode: 'edit',
+      projectId,
+      name: project.name,
+      workspaceDir: project.workspaceDir,
+    })
+  }
+
+  const submitProjectDialog = async () => {
+    const dialog = projectDialog
+    if (!dialog) {
+      return
+    }
+    const name = dialog.name.trim()
+    const workspaceDir = dialog.workspaceDir.trim()
+    if (!name || !workspaceDir) {
+      return
+    }
+
+    if (dialog.mode === 'create') {
+      await createProject({ name, workspaceDir })
+    } else if (dialog.projectId) {
+      await updateProject(dialog.projectId, { name, workspaceDir })
+    }
+    setProjectDialog(null)
+  }
+
+  const renderSession = (session: Session) => (
     <SessionItem
-      key={s.id}
-      session={s}
-      isActive={s.id === currentSessionId}
+      key={session.id}
+      session={session}
+      isActive={session.id === currentSessionId}
       isCollapsed={collapsed}
-      onClick={() => handleSelectSession(s.id)}
-      onRename={(title) => void renameSession(s.id, title)}
-      onDelete={() => setPendingDeleteSession(s)}
+      projects={projects}
+      onClick={() => handleSelectSession(session.id)}
+      onRename={(title) => void renameSession(session.id, title)}
+      onMoveToProject={(projectId) => void moveSessionToProject(session.id, projectId)}
+      onDelete={() => setPendingDeleteSession(session)}
     />
   )
 
@@ -138,17 +221,16 @@ export function Sidebar() {
     <>
       <aside
         className={cn(
-          'flex flex-col h-full bg-sidebar-layer border-r border-border',
-          'transition-[width] duration-300 ease-out-smooth overflow-hidden shrink-0',
-          collapsed ? 'w-16' : 'w-[260px]'
+          'flex h-full shrink-0 flex-col overflow-hidden border-r border-border bg-sidebar-layer',
+          'transition-[width] duration-300 ease-out-smooth',
+          collapsed ? 'w-16' : 'w-[300px]'
         )}
       >
-        {/* Header */}
-        <div className={cn('flex items-center h-12 border-b border-border px-3 shrink-0', collapsed && 'justify-center px-0')}>
+        <div className={cn('flex h-12 items-center border-b border-border px-3 shrink-0', collapsed && 'justify-center px-0')}>
           {!collapsed && (
-            <div className="flex items-center gap-2 flex-1 min-w-0">
-              <Zap className="h-5 w-5 text-primary-500 shrink-0" />
-              <span className="font-semibold text-sm text-foreground truncate">Mochi</span>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <Zap className="h-5 w-5 shrink-0 text-primary-500" />
+              <span className="truncate text-sm font-semibold text-foreground">Mochi</span>
             </div>
           )}
           <Button
@@ -158,16 +240,11 @@ export function Sidebar() {
             aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
             className="shrink-0"
           >
-            {collapsed ? (
-              <PanelLeftOpen className="h-4 w-4" />
-            ) : (
-              <PanelLeftClose className="h-4 w-4" />
-            )}
+            {collapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
           </Button>
         </div>
 
-        {/* Actions */}
-        <div className={cn('px-3 pt-3 pb-2 flex flex-col gap-2', collapsed && 'items-center px-2')}>
+        <div className={cn('flex flex-col gap-2 px-3 pb-2 pt-3', collapsed && 'items-center px-2')}>
           <Button
             variant="primary"
             size={collapsed ? 'icon' : 'md'}
@@ -179,19 +256,25 @@ export function Sidebar() {
             {!collapsed && <span>{t('sidebar.newChat')}</span>}
           </Button>
 
-          {!collapsed && (
-            <div className="relative">
-              <Input
-                id="sidebar-search-input"
-                placeholder={t('sidebar.searchPlaceholder')}
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                leftIcon={<Search className="h-3.5 w-3.5" />}
-                size="sm"
-                className="pl-8"
-              />
-            </div>
-          )}
+          {!collapsed ? (
+            <>
+              <Button variant="secondary" size="md" className="w-full" onClick={openCreateProject}>
+                <FolderPlus className="h-4 w-4" />
+                <span>New Project</span>
+              </Button>
+              <div className="relative">
+                <Input
+                  id="sidebar-search-input"
+                  placeholder={t('sidebar.searchPlaceholder')}
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  leftIcon={<Search className="h-3.5 w-3.5" />}
+                  size="sm"
+                  className="pl-8"
+                />
+              </div>
+            </>
+          ) : null}
 
           <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-2')}>
             <Button
@@ -217,45 +300,85 @@ export function Sidebar() {
           </div>
         </div>
 
-        {/* Session list */}
-        <nav className="flex-1 overflow-y-auto px-2 py-1 space-y-0.5">
-          {/* Pinned */}
-          {pinned.length > 0 && (
-            <SessionGroup
-              label={t('sidebar.pinned')}
-              icon={<Pin className="h-3 w-3" />}
-              collapsed={collapsed}
-            >
-              {pinned.map(renderSession)}
-            </SessionGroup>
-          )}
+        <nav className="flex-1 space-y-3 overflow-y-auto px-2 py-2">
+          {drafts.length > 0 && !collapsed ? (
+            <SidebarSection title="Draft Chat">
+              {sortSessions(drafts).map(renderSession)}
+            </SidebarSection>
+          ) : null}
 
-          {/* Today */}
-          {today.length > 0 && (
-            <SessionGroup label={t('sidebar.today')} collapsed={collapsed}>
-              {today.map(renderSession)}
-            </SessionGroup>
-          )}
+          <SidebarSection title="Projects" collapsed={collapsed}>
+            {projects.map((project) => {
+              const expanded = expandedProjectIds.includes(project.id)
+              const projectSessions = sortSessions(byProject[project.id] ?? [])
+              const isActiveProject = project.id === activeProjectId
 
-          {/* This week */}
-          {thisWeek.length > 0 && (
-            <SessionGroup label={t('sidebar.thisWeek')} collapsed={collapsed}>
-              {thisWeek.map(renderSession)}
-            </SessionGroup>
-          )}
+              return (
+                <div
+                  key={project.id}
+                  className={cn(
+                    'rounded-lg border border-border/60 bg-surface-layer/50',
+                    isActiveProject && 'border-primary-500/40 bg-primary-500/8'
+                  )}
+                >
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 px-2 py-2 text-left"
+                    onClick={() => {
+                      setActiveProjectId(project.id)
+                      toggleProjectExpanded(project.id)
+                    }}
+                  >
+                    {expanded ? <ChevronDown className="h-4 w-4 shrink-0" /> : <ChevronRight className="h-4 w-4 shrink-0" />}
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium text-foreground">{project.name}</div>
+                      {!collapsed ? (
+                        <div className="truncate text-[11px] text-muted-foreground">
+                          {basename(project.workspaceDir)}
+                        </div>
+                      ) : null}
+                    </div>
+                  </button>
 
-          {/* Older */}
-          {older.length > 0 && (
-            <SessionGroup label={t('sidebar.older')} collapsed={collapsed}>
-              {older.map(renderSession)}
-            </SessionGroup>
-          )}
+                  {!collapsed ? (
+                    <div className="flex gap-1 px-2 pb-2">
+                      <Button variant="ghost" size="sm" onClick={() => setActiveProjectId(project.id)}>
+                        Use
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => openEditProject(project.id)}>
+                        Edit
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => setPendingDeleteProjectId(project.id)}>
+                        Delete
+                      </Button>
+                    </div>
+                  ) : null}
 
-          {filtered.length === 0 && (
-            <p className="text-xs text-muted-foreground text-center py-6">
-              {search ? t('sidebar.noResults') : t('sidebar.noSessions')}
-            </p>
-          )}
+                  {expanded && !collapsed ? (
+                    <div className="space-y-2 border-t border-border/50 px-2 py-2">
+                      {projectSessions.length > 0 ? (
+                        projectSessions.map(renderSession)
+                      ) : (
+                        <p className="px-2 py-2 text-xs text-muted-foreground">
+                          No chats yet.
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+              )
+            })}
+            {projects.length === 0 && !collapsed ? (
+              <p className="px-2 py-2 text-xs text-muted-foreground">No projects yet.</p>
+            ) : null}
+          </SidebarSection>
+
+          <SidebarSection title="Unassigned Chats" collapsed={collapsed}>
+            {sortSessions(unassigned).map(renderSession)}
+            {unassigned.length === 0 && !collapsed ? (
+              <p className="px-2 py-2 text-xs text-muted-foreground">No unassigned chats.</p>
+            ) : null}
+          </SidebarSection>
         </nav>
       </aside>
 
@@ -268,7 +391,7 @@ export function Sidebar() {
         }}
       >
         <DialogContent className="w-[calc(100vw-2rem)] max-w-[430px] rounded-xl border-border/80 p-0 shadow-2xl">
-          <DialogHeader className="mb-0 px-5 pt-5 pb-3">
+          <DialogHeader className="mb-0 px-5 pb-3 pt-5">
             <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-error/12 text-error">
               <Trash2 className="h-4 w-4" />
             </div>
@@ -280,21 +403,91 @@ export function Sidebar() {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="mt-0 gap-2 border-t border-border/70 px-5 py-4 sm:flex-row sm:justify-end">
-            <Button
-              type="button"
-              variant="ghost"
-              size="md"
-              onClick={() => setPendingDeleteSession(null)}
-            >
+            <Button type="button" variant="ghost" size="md" onClick={() => setPendingDeleteSession(null)}>
               {t('common.cancel')}
             </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              size="md"
-              onClick={handleConfirmDelete}
-            >
+            <Button type="button" variant="destructive" size="md" onClick={handleConfirmDeleteSession}>
               {t('sidebar.deleteDialogAction')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={pendingDeleteProjectId !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingDeleteProjectId(null)
+          }
+        }}
+      >
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[430px] rounded-xl border-border/80 p-0 shadow-2xl">
+          <DialogHeader className="mb-0 px-5 pb-3 pt-5">
+            <DialogTitle className="text-lg">Delete project</DialogTitle>
+            <DialogDescription className="leading-6">
+              Assigned chats will become unassigned.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-0 gap-2 border-t border-border/70 px-5 py-4 sm:flex-row sm:justify-end">
+            <Button type="button" variant="ghost" size="md" onClick={() => setPendingDeleteProjectId(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button type="button" variant="destructive" size="md" onClick={handleConfirmDeleteProject}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={projectDialog !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setProjectDialog(null)
+          }
+        }}
+      >
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[560px] rounded-xl border-border/80 p-0 shadow-2xl">
+          <DialogHeader className="mb-0 px-5 pb-3 pt-5">
+            <DialogTitle className="text-lg">
+              {projectDialog?.mode === 'edit' ? 'Edit Project' : 'New Project'}
+            </DialogTitle>
+            <DialogDescription>
+              Bind chats under one workspace directory.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-5 py-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground">Project name</label>
+              <Input
+                value={projectDialog?.name ?? ''}
+                onChange={(event) =>
+                  setProjectDialog((state) =>
+                    state ? { ...state, name: event.target.value } : state
+                  )
+                }
+                placeholder="My Project"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground">Workspace directory</label>
+              <PathPicker
+                value={projectDialog?.workspaceDir ?? ''}
+                onChange={(value) =>
+                  setProjectDialog((state) =>
+                    state ? { ...state, workspaceDir: value } : state
+                  )
+                }
+                mode="directory"
+              />
+            </div>
+          </div>
+          <DialogFooter className="mt-0 gap-2 border-t border-border/70 px-5 py-4 sm:flex-row sm:justify-end">
+            <Button type="button" variant="ghost" size="md" onClick={() => setProjectDialog(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button type="button" variant="primary" size="md" onClick={() => void submitProjectDialog()}>
+              Save
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -303,25 +496,23 @@ export function Sidebar() {
   )
 }
 
-interface SessionGroupProps {
-  label: string
-  icon?: React.ReactNode
-  collapsed: boolean
+function SidebarSection({
+  title,
+  collapsed = false,
+  children,
+}: {
+  title: string
+  collapsed?: boolean
   children: React.ReactNode
-}
-
-function SessionGroup({ label, icon, collapsed, children }: SessionGroupProps) {
+}) {
   return (
-    <div className="mb-2">
-      {!collapsed && (
-        <div className="flex items-center gap-1.5 px-2 py-1 mb-0.5">
-          {icon && <span className="text-muted-foreground">{icon}</span>}
-          <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
-            {label}
-          </span>
+    <div className="space-y-1">
+      {!collapsed ? (
+        <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+          {title}
         </div>
-      )}
-      <div className="space-y-0.5">{children}</div>
+      ) : null}
+      <div className="space-y-1">{children}</div>
     </div>
   )
 }

@@ -18,6 +18,10 @@ dependencies = [
     "loguru>=0.7",
     "mcp>=1.0",
     "python-multipart>=0.0.9",
+    "transformers>=4.44",
+    "accelerate>=0.33",
+    "torch>=2.4",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -26,10 +30,7 @@ gguf = [
 ]
 
 hf = [
-    "transformers>=4.44",
-    "accelerate>=0.33",
-    "torch>=2.4",
-    "safetensors>=0.4",
+    # Kept for backward compatibility with existing `uv sync --extra hf` commands.
 ]
 
 voice = [
@@ -69,6 +70,12 @@ all = [
     # 使用者按需 `uv sync --extra voice-extras` 手動啟用
 ]
 
+
+
+[project.scripts]
+mochi = "mochi.main:app"
+
+[dependency-groups]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -77,8 +84,8 @@ dev = [
     "httpx>=0.27",
 ]
 
-[project.scripts]
-mochi = "mochi.main:app"
+[tool.uv]
+default-groups = ["dev"]
 
 [build-system]
 requires = ["hatchling"]

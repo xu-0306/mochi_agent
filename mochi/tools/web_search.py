@@ -17,15 +17,21 @@ from mochi.tools._http import (
     make_default_client,
 )
 from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.web_search_providers import (
+    get_web_search_provider_spec,
+    iter_web_search_provider_specs,
+    normalize_web_search_provider,
+)
 
 # ---------------------------------------------------------------------------
 # \u5171\u7528\u5e38\u6578\u8207\u578b\u5225
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_ENGINES = frozenset({
-    "tavily", "serper", "jina", "exa",
-    "brave", "searxng", "duckduckgo_html",
-})
+_SUPPORTED_ENGINES = frozenset(
+    spec.canonical_name
+    for spec in iter_web_search_provider_specs()
+)
+_EMERGENCY_FALLBACK_ENGINES = ("jina", "duckduckgo_html")
 
 
 @dataclass
@@ -243,6 +249,18 @@ class WebSearchTool(BaseTool):
         )
 
     @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def is_open_world(self) -> bool:
+        return True
+
+    @property
+    def search_hint(self) -> str | None:
+        return "Use this tool for current information or to discover sources before fetching a page."
+
+    @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
@@ -275,6 +293,24 @@ class WebSearchTool(BaseTool):
                         "(when supported by the search engine)."
                     ),
                 },
+                "allowed_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional allowlist of result domains.",
+                },
+                "blocked_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional denylist of result domains.",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional search language override.",
+                },
+                "region": {
+                    "type": "string",
+                    "description": "Optional search region override.",
+                },
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -289,19 +325,35 @@ class WebSearchTool(BaseTool):
         top_k = top_k_result
         search_depth = str(kwargs.get("search_depth", "basic"))
         include_content = bool(kwargs.get("include_content", False))
+        allowed_domains = _coerce_domain_list(kwargs.get("allowed_domains"))
+        blocked_domains = _coerce_domain_list(kwargs.get("blocked_domains"))
+        language = str(kwargs.get("language", "")).strip() or self._language
+        region = str(kwargs.get("region", "")).strip() or self._region
 
         if not query:
             return ToolResult(error="`query` must not be empty.")
 
-        # \u5617\u8a66\u4e3b\u8981\u5f15\u64ce + fallback chain
-        engines_to_try = [self._engine, *self._fallback_engines]
+        # \u5617\u8a66\u4e3b\u8981\u5f15\u64ce + fallback chain + no-key emergency fallback
+        engines_to_try = self._provider_chain()
         last_error: ToolResult | None = None
+        attempted_providers: list[str] = []
+        provider_attempts: list[dict[str, Any]] = []
+        warnings: list[dict[str, str]] = []
 
         for engine in engines_to_try:
             if engine not in _SUPPORTED_ENGINES:
                 continue
-            if not self._engine_is_configured(engine):
+            provider_state = self._provider_state(engine)
+            if not provider_state["configured"]:
+                warning = {
+                    "provider": engine,
+                    "status": str(provider_state["status"]),
+                    "reason": str(provider_state["reason"]),
+                }
+                provider_attempts.append(dict(warning))
+                warnings.append(warning)
                 continue
+            attempted_providers.append(engine)
 
             result = await self._search_with_engine(
                 engine=engine,
@@ -309,40 +361,123 @@ class WebSearchTool(BaseTool):
                 top_k=top_k,
                 search_depth=search_depth,
                 include_content=include_content,
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+                language=language,
+                region=region,
             )
             if result.error is None:
-                return result
+                provider_attempts.append({
+                    "provider": engine,
+                    "status": "succeeded",
+                })
+                return _normalize_search_tool_result(
+                    result=result,
+                    query=query,
+                    provider=engine,
+                    attempted_providers=attempted_providers,
+                    warnings=warnings,
+                    provider_attempts=provider_attempts,
+                )
+            provider_attempts.append({
+                "provider": engine,
+                "status": "request_failed",
+                "reason": result.error or "request failed",
+            })
             last_error = result
             # \u82e5\u932f\u8aa4\u662f non-retryable \u4e14\u975e\u670d\u52d9\u5668\u7aef\u554f\u984c\uff0c\u4e0d fallback
             if not result.retryable and not result.metadata.get("blocked"):
+                result.metadata.setdefault("provider_attempts", provider_attempts)
+                result.metadata.setdefault("warnings", warnings)
+                result.metadata.setdefault("attempted_providers", attempted_providers)
                 return result
 
         if last_error is not None:
+            last_error.metadata.setdefault("provider_attempts", provider_attempts)
+            last_error.metadata.setdefault("warnings", warnings)
+            last_error.metadata.setdefault("attempted_providers", attempted_providers)
             return last_error
 
         return ToolResult(
             error="No configured search engine is available.",
+            metadata={
+                "attempted_providers": attempted_providers,
+                "provider_attempts": provider_attempts,
+                "warnings": warnings,
+            },
             suggestion=(
                 "Configure at least one search engine API key in settings. "
                 "Recommended: set MOCHI_TAVILY_API_KEY for reliable web search."
             ),
         )
 
-    def _engine_is_configured(self, engine: str) -> bool:
-        """\u6aa2\u67e5 engine \u662f\u5426\u5df2\u914d\u7f6e\u5fc5\u8981\u7684 API key \u6216 URL\u3002"""
+    def _provider_chain(self) -> list[str]:
+        primary_chain: list[str] = []
+        for engine in [self._engine, *self._fallback_engines]:
+            normalized = _normalize_engine(engine)
+            if normalized in _SUPPORTED_ENGINES and normalized not in primary_chain:
+                primary_chain.append(normalized)
+
+        if any(self._provider_state(engine)["configured"] for engine in primary_chain):
+            return primary_chain
+
+        ordered = list(primary_chain)
+        for engine in _EMERGENCY_FALLBACK_ENGINES:
+            normalized = _normalize_engine(engine)
+            if normalized in _SUPPORTED_ENGINES and normalized not in ordered:
+                ordered.append(normalized)
+        return ordered
+
+    def _provider_state(self, engine: str) -> dict[str, Any]:
+        """Describe whether one provider is usable or why it is skipped."""
+        spec = get_web_search_provider_spec(engine)
+        if spec is None:
+            return {
+                "configured": False,
+                "status": "skipped_unsupported",
+                "reason": "unsupported provider",
+            }
+        if spec.base_url_config_field:
+            if isinstance(self._searxng_base_url, str) and self._searxng_base_url.strip():
+                return {"configured": True, "status": "configured", "reason": ""}
+            return {
+                "configured": False,
+                "status": "skipped_missing_config",
+                "reason": f"{spec.base_url_config_field} is not configured",
+            }
+        secret = self._provider_secret_value(engine)
+        if secret:
+            return {"configured": True, "status": "configured", "reason": ""}
+        if spec.no_key_supported:
+            return {
+                "configured": True,
+                "status": "configured_no_key",
+                "reason": "provider supports no-key access",
+            }
+        if spec.key_config_field:
+            return {
+                "configured": False,
+                "status": "skipped_missing_key",
+                "reason": f"{spec.key_config_field} is not configured",
+            }
+        return {
+            "configured": False,
+            "status": "skipped_missing_config",
+            "reason": "provider is not configured",
+        }
+
+    def _provider_secret_value(self, engine: str) -> str | None:
         if engine == "tavily":
-            return bool(self._tavily_api_key)
+            return self._tavily_api_key
         if engine == "serper":
-            return bool(self._serper_api_key)
+            return self._serper_api_key
         if engine == "brave":
-            return bool(self._brave_api_key)
-        if engine == "searxng":
-            return bool(self._searxng_base_url)
+            return self._brave_api_key
         if engine == "jina":
-            return True  # Jina s.jina.ai \u6709\u514d\u8cbb\u5c64
+            return self._jina_api_key
         if engine == "exa":
-            return bool(self._exa_api_key)
-        return engine == "duckduckgo_html"  # \u4e0d\u9700 API key
+            return self._exa_api_key
+        return None
 
     async def _search_with_engine(
         self,
@@ -352,6 +487,10 @@ class WebSearchTool(BaseTool):
         top_k: int,
         search_depth: str,
         include_content: bool,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
+        language: str | None,
+        region: str | None,
     ) -> ToolResult:
         """\u4f7f\u7528\u6307\u5b9a engine \u57f7\u884c\u641c\u5c0b\u3002"""
         try:
@@ -360,23 +499,56 @@ class WebSearchTool(BaseTool):
                     query=query, top_k=top_k,
                     search_depth=search_depth,
                     include_content=include_content,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
                 )
             if engine == "serper":
-                return await self._search_serper(query=query, top_k=top_k)
+                return await self._search_serper(
+                    query=query,
+                    top_k=top_k,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                    language=language,
+                    region=region,
+                )
             if engine == "jina":
-                return await self._search_jina(query=query, top_k=top_k)
+                return await self._search_jina(
+                    query=query,
+                    top_k=top_k,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                )
             if engine == "exa":
                 return await self._search_exa(
                     query=query,
                     top_k=top_k,
                     include_content=include_content,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
                 )
             if engine == "brave":
-                return await self._search_brave(query=query, top_k=top_k)
+                return await self._search_brave(
+                    query=query,
+                    top_k=top_k,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                    language=language,
+                    region=region,
+                )
             if engine == "searxng":
-                return await self._search_searxng(query=query, top_k=top_k)
+                return await self._search_searxng(
+                    query=query,
+                    top_k=top_k,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                )
             if engine == "duckduckgo_html":
-                return await self._search_duckduckgo_html(query=query, top_k=top_k)
+                return await self._search_duckduckgo_html(
+                    query=query,
+                    top_k=top_k,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                )
             return ToolResult(error=f"Unsupported search engine: {engine}")
         except ToolHttpError as exc:
             return error_to_tool_result(
@@ -396,6 +568,8 @@ class WebSearchTool(BaseTool):
         top_k: int,
         search_depth: str,
         include_content: bool,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
     ) -> ToolResult:
         """\u4f7f\u7528 Tavily Search API\u3002"""
         body: dict[str, Any] = {
@@ -404,6 +578,10 @@ class WebSearchTool(BaseTool):
             "search_depth": search_depth if search_depth in {"basic", "advanced"} else "basic",
             "include_raw_content": include_content,
         }
+        if allowed_domains:
+            body["include_domains"] = allowed_domains
+        if blocked_domains:
+            body["exclude_domains"] = blocked_domains
 
         response = await http_request(
             self._client,
@@ -446,19 +624,30 @@ class WebSearchTool(BaseTool):
             engine="tavily",
             status_code=response.status_code,
             include_content=include_content,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     # -----------------------------------------------------------------------
     # Serper (Google SERP)
     # -----------------------------------------------------------------------
 
-    async def _search_serper(self, *, query: str, top_k: int) -> ToolResult:
+    async def _search_serper(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
+        language: str | None,
+        region: str | None,
+    ) -> ToolResult:
         """\u4f7f\u7528 Serper.dev Google Search API\u3002"""
         body: dict[str, Any] = {"q": query, "num": top_k}
-        if self._language:
-            body["hl"] = self._language
-        if self._region:
-            body["gl"] = self._region
+        if language:
+            body["hl"] = language
+        if region:
+            body["gl"] = region
 
         response = await http_request(
             self._client,
@@ -499,13 +688,22 @@ class WebSearchTool(BaseTool):
             query=query,
             engine="serper",
             status_code=response.status_code,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     # -----------------------------------------------------------------------
     # Jina s.jina.ai
     # -----------------------------------------------------------------------
 
-    async def _search_jina(self, *, query: str, top_k: int) -> ToolResult:
+    async def _search_jina(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
+    ) -> ToolResult:
         """\u4f7f\u7528 Jina AI s.jina.ai \u641c\u5c0b API\u3002"""
         headers: dict[str, str] = {"Accept": "application/json"}
         if self._jina_api_key:
@@ -546,6 +744,8 @@ class WebSearchTool(BaseTool):
             query=query,
             engine="jina",
             status_code=response.status_code,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     # -----------------------------------------------------------------------
@@ -558,6 +758,8 @@ class WebSearchTool(BaseTool):
         query: str,
         top_k: int,
         include_content: bool,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
     ) -> ToolResult:
         """使用 Exa Search API 搜尋。"""
         contents: dict[str, Any] = {
@@ -617,19 +819,30 @@ class WebSearchTool(BaseTool):
             engine="exa",
             status_code=response.status_code,
             include_content=include_content,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     # -----------------------------------------------------------------------
     # Brave Search API (\u7e7c\u627f\u820a\u5be6\u4f5c + retry)
     # -----------------------------------------------------------------------
 
-    async def _search_brave(self, *, query: str, top_k: int) -> ToolResult:
+    async def _search_brave(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
+        language: str | None,
+        region: str | None,
+    ) -> ToolResult:
         """\u4f7f\u7528 Brave Search API \u641c\u5c0b\u3002"""
         params: dict[str, Any] = {"q": query, "count": top_k}
-        if self._language:
-            params["search_lang"] = self._language
-        if self._region:
-            params["country"] = self._region
+        if language:
+            params["search_lang"] = language
+        if region:
+            params["country"] = region
 
         response = await http_request(
             self._client,
@@ -677,13 +890,22 @@ class WebSearchTool(BaseTool):
             query=query,
             engine="brave",
             status_code=response.status_code,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     # -----------------------------------------------------------------------
     # SearXNG JSON API (\u7e7c\u627f\u820a\u5be6\u4f5c + retry)
     # -----------------------------------------------------------------------
 
-    async def _search_searxng(self, *, query: str, top_k: int) -> ToolResult:
+    async def _search_searxng(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
+    ) -> ToolResult:
         """\u4f7f\u7528 SearXNG JSON API \u641c\u5c0b\u3002"""
         if not self._searxng_base_url:
             return ToolResult(
@@ -730,13 +952,22 @@ class WebSearchTool(BaseTool):
             query=query,
             engine="searxng",
             status_code=response.status_code,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     # -----------------------------------------------------------------------
     # DuckDuckGo HTML (\u7e7c\u627f\u820a\u5be6\u4f5c + retry)
     # -----------------------------------------------------------------------
 
-    async def _search_duckduckgo_html(self, *, query: str, top_k: int) -> ToolResult:
+    async def _search_duckduckgo_html(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        allowed_domains: list[str],
+        blocked_domains: list[str],
+    ) -> ToolResult:
         """\u4f7f\u7528 DuckDuckGo HTML \u9801\u9762\u505a best-effort \u641c\u5c0b\u3002"""
         try:
             response = await http_request(
@@ -781,12 +1012,48 @@ class WebSearchTool(BaseTool):
             query=query,
             engine="duckduckgo_html",
             status_code=status_code,
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
         )
 
     async def close(self) -> None:
         """\u95dc\u9589\u5167\u90e8 HTTP client\u3002"""
         if self._owns_client:
             await self._client.aclose()
+
+    def format_result_for_model(
+        self,
+        result: ToolResult,
+        *,
+        max_chars: int = 2000,
+    ) -> str:
+        if result.error is not None or not isinstance(result.output, dict):
+            return super().format_result_for_model(result, max_chars=max_chars)
+
+        results = result.output.get("results")
+        if not isinstance(results, list):
+            return super().format_result_for_model(result, max_chars=max_chars)
+
+        citations: list[str] = []
+        for index, item in enumerate(results, start=1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip() or f"Result {index}"
+            url = str(item.get("url") or "").strip()
+            snippet = str(item.get("snippet") or "").strip()
+            citations.append(f"[{index}] {title} - {url} - {snippet}")
+
+        payload = ToolResult(
+            output={
+                **result.output,
+                "citations": citations,
+            },
+            error=None,
+            metadata=result.metadata,
+            retryable=result.retryable,
+            suggestion=result.suggestion,
+        )
+        return super().format_result_for_model(payload, max_chars=max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -795,10 +1062,7 @@ class WebSearchTool(BaseTool):
 
 
 def _normalize_engine(engine: str) -> str:
-    normalized = engine.strip().lower().replace("-", "_")
-    if normalized in {"duckduckgo", "ddg", "duckduckgo_html"}:
-        return "duckduckgo_html"
-    return normalized
+    return normalize_web_search_provider(engine)
 
 
 def _coerce_top_k(value: Any) -> int | ToolResult:
@@ -809,6 +1073,30 @@ def _coerce_top_k(value: Any) -> int | ToolResult:
     return max(1, min(top_k, 10))
 
 
+def _coerce_domain_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    domains: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        domain = item.strip().lower()
+        if domain:
+            domains.append(domain)
+    return domains
+
+
+def _domain_allowed(url: str, allowed_domains: list[str], blocked_domains: list[str]) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return False
+    if allowed_domains and not any(host == domain or host.endswith(f".{domain}") for domain in allowed_domains):
+        return False
+    if any(host == domain or host.endswith(f".{domain}") for domain in blocked_domains):
+        return False
+    return True
+
+
 def _results_to_tool_result(
     *,
     results: list[SearchResult],
@@ -816,7 +1104,15 @@ def _results_to_tool_result(
     engine: str,
     status_code: int | None = None,
     include_content: bool = False,
+    allowed_domains: list[str] | None = None,
+    blocked_domains: list[str] | None = None,
 ) -> ToolResult:
+    allowed_domains = allowed_domains or []
+    blocked_domains = blocked_domains or []
+    results = [
+        item for item in results
+        if _domain_allowed(item.url, allowed_domains, blocked_domains)
+    ]
     if not results:
         return ToolResult(
             error="Search returned no parseable results.",
@@ -848,5 +1144,46 @@ def _results_to_tool_result(
             "engine": engine,
             "status_code": status_code,
             "count": len(results),
+            "allowed_domains": allowed_domains,
+            "blocked_domains": blocked_domains,
         },
     )
+
+
+def _normalize_search_tool_result(
+    *,
+    result: ToolResult,
+    query: str,
+    provider: str,
+    attempted_providers: list[str],
+    warnings: list[dict[str, str]],
+    provider_attempts: list[dict[str, Any]],
+) -> ToolResult:
+    raw_results = result.output if isinstance(result.output, list) else []
+    normalized_results: list[dict[str, Any]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        entry = {
+            "title": str(item.get("title") or "").strip(),
+            "url": str(item.get("url") or "").strip(),
+            "snippet": str(item.get("snippet") or "").strip(),
+        }
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            entry["content"] = content
+        if entry["title"] and entry["url"]:
+            normalized_results.append(entry)
+
+    result.output = {
+        "query": query,
+        "provider": provider,
+        "results": normalized_results,
+        "warnings": warnings,
+        "attempted_providers": attempted_providers,
+    }
+    result.metadata["provider"] = provider
+    result.metadata["attempted_providers"] = attempted_providers
+    result.metadata["provider_attempts"] = provider_attempts
+    result.metadata["warnings"] = warnings
+    return result

@@ -11,6 +11,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
 from mochi.sessions.store import SessionStore
 
@@ -21,12 +22,21 @@ class CreateSessionRequest(BaseModel):
     """建立 session request。"""
 
     session_id: str | None = None
+    project_id: str | None = None
+    fork_from_session_id: str | None = None
+    fork_until_turn_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
     """更新 session metadata request。"""
 
     title: str
+
+
+class UpdateSessionProjectRequest(BaseModel):
+    """Update session project assignment request."""
+
+    project_id: str | None = None
 
 
 def _get_session_store(app: object, *, config: object | None = None) -> SessionStore:
@@ -60,6 +70,7 @@ async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]
                 "title": title,
                 "event_count": len(events),
                 "updated_at": updated_at,
+                "project_id": _session_project_id(events),
             }
         )
 
@@ -90,6 +101,78 @@ def _session_title(session_id: str, events: list[dict]) -> str:
     return session_id
 
 
+def _session_project_id(events: list[dict]) -> str | None:
+    """Resolve latest project assignment from metadata events."""
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "project_assigned":
+            continue
+        project_id = event.get("project_id")
+        if project_id is None:
+            return None
+        if isinstance(project_id, str) and project_id.strip():
+            return project_id.strip()
+    return None
+
+
+async def _append_project_assignment_event(
+    store: SessionStore,
+    session_id: str,
+    project_id: str | None,
+) -> None:
+    await store.save_event(
+        session_id,
+        {
+            "type": "session_meta",
+            "event": "project_assigned",
+            "session_id": session_id,
+            "project_id": project_id,
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        },
+    )
+
+
+def _cloneable_session_events(
+    events: list[dict],
+    *,
+    until_turn_id: str,
+) -> list[dict]:
+    """Return replayable events through the selected assistant turn."""
+    cloned: list[dict] = []
+
+    for event in events:
+        if event.get("type") == "session_meta":
+            continue
+
+        cloned.append(dict(event))
+        if (
+            event.get("type") == "message"
+            and event.get("role") == "assistant"
+            and event.get("turn_id") == until_turn_id
+        ):
+            return cloned
+
+    raise HTTPException(status_code=404, detail="Fork turn not found")
+
+
+async def _clear_project_from_sessions(
+    app: object,
+    project_id: str,
+    *,
+    config: object | None = None,
+) -> None:
+    store = _get_session_store(app, config=config)
+    sessions_dir = Path(store._sessions_dir).expanduser()  # noqa: SLF001
+    if not sessions_dir.exists():
+        return
+
+    for path in await asyncio.to_thread(lambda: sorted(sessions_dir.glob("*.jsonl"))):
+        events = await store.load_session(path.stem)
+        if _session_project_id(events) == project_id:
+            await _append_project_assignment_event(store, path.stem, None)
+
+
 @router.post("/sessions")
 async def create_session(
     request: CreateSessionRequest | None = None,
@@ -103,6 +186,55 @@ async def create_session(
     session_id = (request.session_id if request is not None else None) or str(uuid4())
     now = datetime.now(tz=UTC).isoformat()
 
+    if request is not None and request.fork_from_session_id is not None:
+        source_session_id = request.fork_from_session_id.strip()
+        fork_until_turn_id = (request.fork_until_turn_id or "").strip()
+
+        if not source_session_id:
+            raise HTTPException(status_code=422, detail="fork_from_session_id must not be empty")
+        if not fork_until_turn_id:
+            raise HTTPException(
+                status_code=422,
+                detail="fork_until_turn_id is required when fork_from_session_id is provided",
+            )
+
+        source_events = await store.load_session(source_session_id)
+        if not source_events:
+            raise HTTPException(status_code=404, detail="Source session not found")
+
+        effective_project_id = request.project_id
+        if effective_project_id is None:
+            effective_project_id = _session_project_id(source_events)
+
+        if effective_project_id is not None:
+            project_store = _get_project_store(app, config=config)
+            project = await project_store.get_project(effective_project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+        await store.save_event(
+            session_id,
+            {
+                "type": "session_meta",
+                "event": "created",
+                "session_id": session_id,
+                "timestamp": now,
+            },
+        )
+        if effective_project_id is not None:
+            await _append_project_assignment_event(store, session_id, effective_project_id)
+
+        for event in _cloneable_session_events(source_events, until_turn_id=fork_until_turn_id):
+            await store.save_event(session_id, event)
+
+        return {"type": "session", "session_id": session_id}
+
+    if request is not None and request.project_id is not None:
+        project_store = _get_project_store(app, config=config)
+        project = await project_store.get_project(request.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
     await store.save_event(
         session_id,
         {
@@ -112,6 +244,8 @@ async def create_session(
             "timestamp": now,
         },
     )
+    if request is not None and request.project_id is not None:
+        await _append_project_assignment_event(store, session_id, request.project_id)
     return {"type": "session", "session_id": session_id}
 
 
@@ -135,6 +269,7 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "type": "session",
         "session_id": session_id,
         "title": _session_title(session_id, events),
+        "project_id": _session_project_id(events),
         "events": events,
     }
 
@@ -168,6 +303,33 @@ async def update_session(
         },
     )
     return {"type": "session", "session_id": session_id, "title": title}
+
+
+@router.patch("/sessions/{session_id}/project")
+async def update_session_project(
+    session_id: str,
+    payload: UpdateSessionProjectRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    """Update session project assignment."""
+    app = http_request.app
+    config = await _get_config(app)
+    store = _get_session_store(app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if payload.project_id is not None:
+        project_store = _get_project_store(app, config=config)
+        project = await project_store.get_project(payload.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    await _append_project_assignment_event(store, session_id, payload.project_id)
+    return {
+        "type": "session",
+        "session_id": session_id,
+        "project_id": payload.project_id,
+    }
 
 
 @router.delete("/sessions/{session_id}")

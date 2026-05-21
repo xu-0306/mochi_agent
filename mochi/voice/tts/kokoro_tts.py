@@ -98,6 +98,9 @@ class KokoroTTS(BaseTTS):
             for candidate in (self._runtime, self._pipeline_factory, self._synthesize_callable)
         )
 
+    async def ensure_ready(self) -> None:
+        await asyncio.to_thread(self._ensure_runtime)
+
     async def close(self) -> None:
         runtime = self._runtime
         self._runtime = None

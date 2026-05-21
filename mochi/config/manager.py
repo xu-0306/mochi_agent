@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    logger = logging.getLogger(__name__)
 from pydantic import SecretStr
 
 from mochi.config import defaults
@@ -16,9 +21,20 @@ from mochi.config.schema import MochiConfig
 PROJECT_DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
 
 
+def _safe_debug_log(message: str, *args: Any) -> None:
+    """Best-effort debug logging that never breaks config loading on Windows consoles."""
+    try:
+        logger.debug(message, *args)
+    except (OSError, UnicodeEncodeError):
+        return
+
+
 def user_config_path() -> Path:
     """回傳目前使用者的 Mochi YAML 設定檔路徑。"""
-    return defaults.default_config_path()
+    home = os.getenv("HOME")
+    if home:
+        return Path(home).expanduser() / ".mochi" / "config.yaml"
+    return Path.home() / ".mochi" / "config.yaml"
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
@@ -116,6 +132,7 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         "MOCHI_SERPER_API_KEY": "web_search_serper_api_key",
         "MOCHI_JINA_API_KEY": "web_search_jina_api_key",
         "MOCHI_EXA_API_KEY": "web_search_exa_api_key",
+        "MOCHI_WEB_FETCH_JINA_API_KEY": "web_fetch_jina_api_key",
         "MOCHI_S2_API_KEY": "semantic_scholar_api_key",
         "MOCHI_PUBMED_API_KEY": "pubmed_api_key",
         "MOCHI_PUBMED_EMAIL": "pubmed_email",
@@ -181,13 +198,13 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
 
     for path in search_paths:
         if path.exists():
-            logger.debug(f"Loading config from {path}")
+            _safe_debug_log("Loading config from {}", path)
             raw = _coerce_mapping(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
             return MochiConfig.model_validate(
                 _apply_env_overrides(_apply_platform_path_defaults(raw))
             )
 
-    logger.debug("No config file found, using defaults.")
+    _safe_debug_log("No config file found, using defaults.")
     return MochiConfig.model_validate(
         _apply_env_overrides(_apply_platform_path_defaults({}))
     )
@@ -206,7 +223,7 @@ def save_config(config: MochiConfig, config_path: str | Path | None = None) -> P
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
-    logger.debug(f"Saved config to {path}")
+    _safe_debug_log("Saved config to {}", path)
     return path
 
 

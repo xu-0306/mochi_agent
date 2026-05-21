@@ -6,15 +6,25 @@ import { cn, truncate, formatRelativeTime } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { useI18n } from '@/lib/i18n'
+import type { ProjectSummary } from '@/lib/api'
 import type { Session, ChannelSource } from '@/lib/stores/session-store'
 
 interface SessionItemProps {
   session: Session
   isActive: boolean
   isCollapsed?: boolean
+  projects?: ProjectSummary[]
   onClick: () => void
   onRename?: (title: string) => void
+  onMoveToProject?: (projectId: string | null) => void
   onDelete?: () => void
 }
 
@@ -40,8 +50,10 @@ export function SessionItem({
   session,
   isActive,
   isCollapsed = false,
+  projects = [],
   onClick,
   onRename,
+  onMoveToProject,
   onDelete,
 }: SessionItemProps) {
   const { locale, resolvedTimeZone, t } = useI18n()
@@ -68,36 +80,61 @@ export function SessionItem({
 
   if (!isCollapsed && isEditing) {
     return (
-      <form
+      <div
         className={cn(
-          'flex h-10 items-center gap-1 rounded-md px-1.5',
+          'rounded-md px-1.5 py-1.5',
           isActive ? 'bg-primary-500/12' : 'bg-muted'
         )}
-        onSubmit={(event) => {
-          event.preventDefault()
-          submitRename()
-        }}
       >
-        <Input
-          value={draftTitle}
-          onChange={(event) => setDraftTitle(event.target.value)}
-          autoFocus
-          size="sm"
-          className="h-7 min-w-0 flex-1 px-2 text-xs"
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') {
-              event.preventDefault()
-              cancelRename()
-            }
+        <form
+          className="flex h-10 items-center gap-1"
+          onSubmit={(event) => {
+            event.preventDefault()
+            submitRename()
           }}
-        />
-        <Button type="submit" variant="ghost" size="icon-sm" aria-label={t('sidebar.renameSave')}>
-          <Check className="h-3.5 w-3.5" />
-        </Button>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label={t('sidebar.renameCancel')} onClick={cancelRename}>
-          <X className="h-3.5 w-3.5" />
-        </Button>
-      </form>
+        >
+          <Input
+            value={draftTitle}
+            onChange={(event) => setDraftTitle(event.target.value)}
+            autoFocus
+            size="sm"
+            className="h-7 min-w-0 flex-1 px-2 text-xs"
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                cancelRename()
+              }
+            }}
+          />
+          <Button type="submit" variant="ghost" size="icon-sm" aria-label={t('sidebar.renameSave')}>
+            <Check className="h-3.5 w-3.5" />
+          </Button>
+          <Button type="button" variant="ghost" size="icon-sm" aria-label={t('sidebar.renameCancel')} onClick={cancelRename}>
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        </form>
+
+        <div className="mt-2">
+          <Select
+            value={session.projectId ?? '__unassigned__'}
+            onValueChange={(value) => {
+              onMoveToProject?.(value === '__unassigned__' ? null : value)
+            }}
+          >
+            <SelectTrigger className="h-8 text-xs">
+              <SelectValue placeholder="Move to..." />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__unassigned__">Unassigned</SelectItem>
+              {projects.map((project) => (
+                <SelectItem key={project.id} value={project.id}>
+                  {project.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
     )
   }
 

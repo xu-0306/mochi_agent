@@ -12,7 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from mochi.backends.base import BaseLLMBackend
+from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.types import (
     GenerationResult,
     Message,
@@ -71,6 +71,12 @@ class OpenAICompatBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """呼叫 Chat Completions API 進行生成。
@@ -86,9 +92,27 @@ class OpenAICompatBackend(BaseLLMBackend):
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
         payload = (
-            self._build_responses_payload(messages, tools, temperature, max_tokens, stream)
+            self._build_responses_payload(
+                messages,
+                tools,
+                temperature,
+                max_tokens,
+                top_p,
+                frequency_penalty,
+                presence_penalty,
+                stream,
+            )
             if self._api_mode == "responses"
-            else self._build_chat_completions_payload(messages, tools, temperature, max_tokens, stream)
+            else self._build_chat_completions_payload(
+                messages,
+                tools,
+                temperature,
+                max_tokens,
+                top_p,
+                frequency_penalty,
+                presence_penalty,
+                stream,
+            )
         )
 
         if stream:
@@ -140,10 +164,10 @@ class OpenAICompatBackend(BaseLLMBackend):
             logger.error(
                 f"OpenAI-compatible API error {exc.response.status_code}: {exc.response.text}"
             )
-            raise
+            raise self._wrap_request_error(exc, stage="generate") from exc
         except httpx.RequestError as exc:
             logger.error(f"OpenAI-compatible connection error: {exc}")
-            raise
+            raise self._wrap_request_error(exc, stage="generate") from exc
 
         data = resp.json()
         if self._api_mode == "responses":
@@ -157,13 +181,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         choice0 = choices[0] if choices else {}
         message = choice0.get("message", {})
 
-        content_raw = message.get("content", "")
-        if isinstance(content_raw, str):
-            content = content_raw
-        elif content_raw is None:
-            content = ""
-        else:
-            content = json.dumps(content_raw, ensure_ascii=False)
+        content = self._normalize_chat_message_content(message)
 
         tool_calls = self._parse_tool_calls(message.get("tool_calls", []))
         usage = data.get("usage", {})
@@ -198,6 +216,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                 headers=self._build_headers(),
             ) as resp:
                 resp.raise_for_status()
+                reasoning_stream_open = False
                 async for raw_line in resp.aiter_lines():
                     line = raw_line.strip()
                     if not line:
@@ -225,9 +244,10 @@ class OpenAICompatBackend(BaseLLMBackend):
                     choice0 = choices[0]
                     delta_obj = choice0.get("delta", {})
 
-                    text_delta = delta_obj.get("content", "")
-                    if not isinstance(text_delta, str):
-                        text_delta = ""
+                    text_delta, reasoning_stream_open = self._normalize_chat_delta(
+                        delta_obj,
+                        reasoning_stream_open=reasoning_stream_open,
+                    )
 
                     tool_call_delta = self._parse_tool_call_delta(
                         delta_obj.get("tool_calls"),
@@ -236,6 +256,9 @@ class OpenAICompatBackend(BaseLLMBackend):
 
                     finish_reason = choice0.get("finish_reason")
                     is_final = finish_reason is not None
+                    if is_final and reasoning_stream_open:
+                        text_delta += "</think>"
+                        reasoning_stream_open = False
                     if is_final:
                         emitted_final = True
 
@@ -250,10 +273,53 @@ class OpenAICompatBackend(BaseLLMBackend):
             logger.error(
                 f"OpenAI-compatible stream API error {exc.response.status_code}: {exc.response.text}"
             )
-            raise
+            raise self._wrap_request_error(exc, stage="stream_generate") from exc
         except httpx.RequestError as exc:
             logger.error(f"OpenAI-compatible stream connection error: {exc}")
-            raise
+            raise self._wrap_request_error(exc, stage="stream_generate") from exc
+
+    def _normalize_chat_message_content(self, message: dict[str, Any]) -> str:
+        content = self._stringify_chat_text_part(message.get("content"))
+        reasoning = self._stringify_chat_text_part(message.get("reasoning_content"))
+        return self._combine_reasoning_and_content(reasoning=reasoning, content=content)
+
+    def _normalize_chat_delta(
+        self,
+        delta_obj: dict[str, Any],
+        *,
+        reasoning_stream_open: bool,
+    ) -> tuple[str, bool]:
+        reasoning_delta = self._stringify_chat_text_part(delta_obj.get("reasoning_content"))
+        content_delta = self._stringify_chat_text_part(delta_obj.get("content"))
+        parts: list[str] = []
+
+        if reasoning_delta:
+            if not reasoning_stream_open:
+                parts.append("<think>")
+                reasoning_stream_open = True
+            parts.append(reasoning_delta)
+
+        if content_delta:
+            if reasoning_stream_open:
+                parts.append("</think>")
+                reasoning_stream_open = False
+            parts.append(content_delta)
+
+        return "".join(parts), reasoning_stream_open
+
+    def _stringify_chat_text_part(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        return json.dumps(value, ensure_ascii=False)
+
+    def _combine_reasoning_and_content(self, *, reasoning: str, content: str) -> str:
+        if reasoning and content:
+            return f"<think>{reasoning}</think>\n\n{content}"
+        if reasoning:
+            return f"<think>{reasoning}</think>"
+        return content
 
     async def _stream_responses_generate(self, payload: dict[str, Any]) -> AsyncIterator[StreamChunk]:
         """執行 Responses API 串流生成。"""
@@ -311,6 +377,9 @@ class OpenAICompatBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         temperature: float,
         max_tokens: int,
+        top_p: float,
+        frequency_penalty: float,
+        presence_penalty: float,
         stream: bool,
     ) -> dict[str, Any]:
         """建立 Chat Completions payload。"""
@@ -319,6 +388,9 @@ class OpenAICompatBackend(BaseLLMBackend):
             "messages": [m.to_dict() for m in messages],
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
             "stream": stream,
         }
         if tools:
@@ -331,6 +403,9 @@ class OpenAICompatBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         temperature: float,
         max_tokens: int,
+        top_p: float,
+        frequency_penalty: float,
+        presence_penalty: float,
         stream: bool,
     ) -> dict[str, Any]:
         """建立 Responses API payload。"""
@@ -340,6 +415,9 @@ class OpenAICompatBackend(BaseLLMBackend):
             "input": self._build_responses_input(messages),
             "temperature": temperature,
             "max_output_tokens": max_tokens,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
             "stream": stream,
         }
         if instructions:
@@ -439,6 +517,24 @@ class OpenAICompatBackend(BaseLLMBackend):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+
+    def _wrap_request_error(
+        self,
+        exc: httpx.HTTPError,
+        *,
+        stage: str,
+    ) -> BackendRequestError:
+        metadata: dict[str, Any] = {
+            "backend_name": "openai_compat",
+            "api_mode": self._api_mode,
+            "request_url": self._request_url,
+            "stage": stage,
+            "model": self.model,
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            metadata["status_code"] = exc.response.status_code
+            metadata["response_text"] = exc.response.text
+        return BackendRequestError(str(exc), metadata=metadata)
 
     def _parse_tool_calls(self, raw_tool_calls: Any) -> list[ToolCall]:
         """解析 non-stream 回覆中的 tool calls。"""

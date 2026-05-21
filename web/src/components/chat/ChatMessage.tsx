@@ -1,99 +1,100 @@
 'use client'
 
 import * as React from 'react'
-import { AlertCircle, Brain, Bot } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import { useI18n } from '@/lib/i18n'
-import { ToolCallCard } from './ToolCallCard'
-
-export type MessageType =
-  | 'user'
-  | 'assistant'
-  | 'system'
-  | 'thinking'
-  | 'tool_call'
-  | 'tool_result'
-  | 'error'
-
-export interface Message {
-  id: string
-  type: MessageType
-  content: string
-  eventType?:
-    | 'thinking'
-    | 'tool_call_request'
-    | 'tool_call_result'
-    | 'final_answer'
-    | 'error'
-  toolName?: string
-  toolArgs?: Record<string, unknown>
-  toolResult?: unknown
-  toolCallId?: string
-  toolError?: string
-  errorCode?: string
-  timestamp: Date
-  isStreaming?: boolean
-}
+import { AlertCircle, Bot, Check, Pencil, RefreshCcw, X } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import rehypeHighlight from 'rehype-highlight'
+import { cn, formatDate, formatRelativeTime } from '@/lib/utils'
+import type { Message } from '@/lib/chat'
+import { ReasoningPanel } from './ReasoningPanel'
+import { CopyButton } from './CopyButton'
+import type { FileChangeSummary } from '@/lib/chat-p2'
+import { Button } from '@/components/ui/button'
+import { Textarea } from '@/components/ui/textarea'
 
 interface ChatMessageProps {
   message: Message
+  onRegenerate?: (message: Message) => void
+  onEditAndResend?: (message: Message, nextContent: string) => Promise<void> | void
+  onUndoFileChange?: (change: FileChangeSummary) => Promise<void> | void
 }
 
-export function ChatMessage({ message }: ChatMessageProps) {
-  const { t } = useI18n()
-  const {
-    type,
-    content,
-    toolName,
-    toolArgs,
-    toolResult,
-    toolCallId,
-    toolError,
-    errorCode,
-    isStreaming,
-  } = message
-
-  if (type === 'tool_call' || type === 'tool_result') {
-    return (
-      <div className="flex justify-start animate-slide-up">
-        <ToolCallCard
-          toolName={toolName ?? 'unknown_tool'}
-          args={toolArgs}
-          result={toolResult}
-          type={type}
-          callId={toolCallId}
-          status={type === 'tool_call' ? 'calling' : toolError ? 'error' : 'success'}
-          errorMessage={toolError}
-        />
-      </div>
-    )
+function formatTokenStats(message: Message): string | null {
+  if (!message.tokenStats) {
+    return null
   }
+
+  const { inputTokens, outputTokens, generationTimeMs, finishReason } = message.tokenStats
+  const stats: string[] = []
+
+  if (generationTimeMs > 0) {
+    const tokensPerSecond = outputTokens / (generationTimeMs / 1000)
+    if (Number.isFinite(tokensPerSecond) && tokensPerSecond > 0) {
+      stats.push(`${tokensPerSecond.toFixed(2)} tok/sec`)
+    }
+  }
+
+  stats.push(`input tokens ${inputTokens}`)
+  stats.push(`output tokens ${outputTokens}`)
+  stats.push(`generation time ${(generationTimeMs / 1000).toFixed(2)}s`)
+
+  if (finishReason) {
+    stats.push(`finish reason ${finishReason}`)
+  }
+
+  return stats.join('  ')
+}
+
+export function ChatMessage({
+  message,
+  onRegenerate,
+  onEditAndResend,
+  onUndoFileChange,
+}: ChatMessageProps) {
+  const { type, content, errorCode, isStreaming, reasoningSteps } = message
+  const [isEditing, setIsEditing] = React.useState(false)
+  const [draftContent, setDraftContent] = React.useState(content)
+  const [isSubmittingEdit, setIsSubmittingEdit] = React.useState(false)
+  const tokenStatsLabel = type === 'assistant' ? formatTokenStats(message) : null
+  const timestampLabel = formatRelativeTime(message.timestamp)
+  const timestampTitle = formatDate(message.timestamp, {
+    format: {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    },
+  })
+
+  React.useEffect(() => {
+    setDraftContent(content)
+    setIsEditing(false)
+    setIsSubmittingEdit(false)
+  }, [content, message.id])
+
+  const handleSubmitEdit = React.useCallback(async () => {
+    const nextContent = draftContent.trim()
+    if (!nextContent || !onEditAndResend || isSubmittingEdit) {
+      return
+    }
+
+    setIsSubmittingEdit(true)
+    try {
+      await onEditAndResend(message, nextContent)
+      setIsEditing(false)
+    } finally {
+      setIsSubmittingEdit(false)
+    }
+  }, [draftContent, isSubmittingEdit, message, onEditAndResend])
 
   if (type === 'system') {
     return (
       <div className="flex justify-center animate-fade-in">
-        <div className="max-w-md bg-elevated-layer border border-dashed border-border rounded-lg px-4 py-2 text-xs text-muted-foreground text-center">
+        <div className="max-w-md rounded-lg border border-dashed border-border bg-elevated-layer px-4 py-2 text-center text-xs text-muted-foreground">
           {content}
-        </div>
-      </div>
-    )
-  }
-
-  if (type === 'thinking') {
-    return (
-      <div className="flex justify-start animate-slide-up">
-        <div className="flex max-w-[560px] items-start gap-3 rounded-lg border border-border bg-surface-layer px-3 py-2.5">
-          <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/10">
-            <Brain className="h-3.5 w-3.5 text-primary-400" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              {t('chat.thinking')}
-            </p>
-            <p className="text-sm leading-relaxed text-foreground whitespace-pre-wrap break-words">
-              {content}
-            </p>
-          </div>
         </div>
       </div>
     )
@@ -105,11 +106,11 @@ export function ChatMessage({ message }: ChatMessageProps) {
         <div className="flex max-w-[560px] items-start gap-3 rounded-lg border border-error/40 bg-error/10 px-3 py-2.5">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-error" />
           <div className="min-w-0 flex-1">
-            <p className="text-sm leading-relaxed text-foreground whitespace-pre-wrap break-words">
+            <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
               {content}
             </p>
             {errorCode ? (
-              <p className="mt-1 text-[11px] text-muted-foreground break-all">
+              <p className="mt-1 break-all text-[11px] text-muted-foreground">
                 {errorCode}
               </p>
             ) : null}
@@ -121,31 +122,187 @@ export function ChatMessage({ message }: ChatMessageProps) {
 
   if (type === 'user') {
     return (
-      <div className="flex justify-end animate-slide-up">
-        <div
-          className={cn(
-            'max-w-[480px] bg-primary-500 text-white px-4 py-2.5',
-            'rounded-[16px_16px_4px_16px]',
-            'text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words'
-          )}
-        >
-          {content}
+      <div className="group flex justify-end animate-slide-up">
+        <div className="flex max-w-[720px] flex-col items-end gap-1">
+          <div className="relative w-full">
+            {!isEditing ? (
+              <div className="pointer-events-none absolute top-2 right-2 z-10 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                <div className="pointer-events-auto flex items-center gap-1 rounded-full border border-white/15 bg-black/30 p-1 shadow-sm backdrop-blur-sm">
+                  {onEditAndResend ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      className="h-6 w-6 rounded-full text-white/75 hover:bg-white/12 hover:text-white"
+                      title="Edit and resend"
+                      aria-label="Edit and resend"
+                      onClick={() => setIsEditing(true)}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  ) : null}
+                  <CopyButton
+                    text={content}
+                    label="Copy message"
+                    className="h-6 w-6 rounded-full text-white/75 hover:bg-white/12 hover:text-white"
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            <div
+              className={cn(
+                'bg-primary-500 px-4 py-3 text-white',
+                'rounded-[18px_18px_6px_18px]',
+                'whitespace-pre-wrap break-words text-sm leading-relaxed shadow-sm',
+                !isEditing && onEditAndResend ? 'pr-16' : null
+              )}
+            >
+              {isEditing ? (
+                <div className="space-y-3">
+                  <Textarea
+                    value={draftContent}
+                    onChange={(event) => setDraftContent(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Escape') {
+                        event.preventDefault()
+                        setDraftContent(content)
+                        setIsEditing(false)
+                        return
+                      }
+
+                      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                        event.preventDefault()
+                        void handleSubmitEdit()
+                      }
+                    }}
+                    autoResize
+                    minRows={2}
+                    maxRows={10}
+                    className={cn(
+                      'min-h-[84px] border-white/20 bg-white/10 px-3 py-2 text-sm text-white',
+                      'placeholder:text-white/55 focus-visible:border-white/40 focus-visible:ring-white/20'
+                    )}
+                  />
+                  <div className="flex items-center justify-end gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 rounded-full px-3 text-white/80 hover:bg-white/12 hover:text-white"
+                      onClick={() => {
+                        setDraftContent(content)
+                        setIsEditing(false)
+                      }}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      className="h-7 rounded-full border-white/20 bg-white/14 px-3 text-white hover:bg-white/20"
+                      loading={isSubmittingEdit}
+                      onClick={() => void handleSubmitEdit()}
+                    >
+                      {!isSubmittingEdit ? <Check className="h-3.5 w-3.5" /> : null}
+                      Resend
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div>{content}</div>
+              )}
+            </div>
+          </div>
+          <span className="px-1 text-[11px] text-muted-foreground" title={timestampTitle}>
+            {timestampLabel}
+          </span>
         </div>
       </div>
     )
   }
 
-  // assistant
   return (
-    <div className="flex justify-start gap-3 animate-slide-up">
-      <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/20">
-        <Bot className="h-3.5 w-3.5 text-primary-400" />
-      </div>
-      <div className="max-w-[560px] min-w-0 flex-1">
-        <p className="text-sm leading-relaxed text-foreground whitespace-pre-wrap break-words">
-          {content}
-          {isStreaming && <span className="animate-blink text-primary-400 ml-0.5">▍</span>}
-        </p>
+    <div className="group animate-slide-up">
+      <div className="flex justify-start">
+        <div className="w-full max-w-[760px]">
+          <ReasoningPanel
+            steps={reasoningSteps ?? []}
+            isStreaming={isStreaming}
+            tokenStats={message.tokenStats}
+            onUndoFileChange={onUndoFileChange}
+          />
+          <div className="flex gap-3">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/15">
+              <Bot className="h-3.5 w-3.5 text-primary-400" />
+            </div>
+            <div className="min-w-0 flex-1 pt-0.5">
+              <div className="prose prose-invert max-w-none text-sm leading-7 text-foreground">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeHighlight]}
+                  components={{
+                    code(props: React.ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
+                      const { children, className, inline, ...rest } = props
+                      const codeText = String(children ?? '').replace(/\n$/, '')
+
+                      if (inline) {
+                        return (
+                          <code
+                            className="rounded bg-elevated-layer px-1.5 py-0.5 text-[0.9em]"
+                            {...rest}
+                          >
+                            {children}
+                          </code>
+                        )
+                      }
+
+                      return (
+                        <div className="relative my-4 overflow-hidden rounded-lg border border-border bg-canvas">
+                          <div className="flex items-center justify-end border-b border-border px-2 py-1">
+                            <CopyButton text={codeText} label="Copy code" />
+                          </div>
+                          <pre className="overflow-x-auto p-3">
+                            <code className={className} {...rest}>
+                              {children}
+                            </code>
+                          </pre>
+                        </div>
+                      )
+                    },
+                  }}
+                >
+                  {content}
+                </ReactMarkdown>
+                {isStreaming ? <span className="ml-0.5 animate-blink text-primary-400">|</span> : null}
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-2 opacity-0 transition-opacity group-hover:opacity-100">
+                <span className="text-[11px] text-muted-foreground" title={timestampTitle}>
+                  {timestampLabel}
+                </span>
+                <div className="flex items-center gap-1">
+                  {onRegenerate && !isStreaming ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => onRegenerate(message)}
+                    >
+                      <RefreshCcw className="h-3.5 w-3.5" />
+                      Regenerate
+                    </Button>
+                  ) : null}
+                  <CopyButton text={content} label="Copy message" />
+                </div>
+              </div>
+              {tokenStatsLabel ? (
+                <p className="mt-1 text-xs text-muted-foreground">{tokenStatsLabel}</p>
+              ) : null}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

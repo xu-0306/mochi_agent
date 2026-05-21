@@ -56,6 +56,9 @@ class ToolCallResultEvent:
     error: str | None = None
     """若執行失敗，此欄包含錯誤訊息。"""
 
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """工具附加元資料。"""
+
 
 @dataclass
 class FinalAnswerEvent:
@@ -68,6 +71,18 @@ class FinalAnswerEvent:
     trajectory_id: str | None = None
     """關聯的軌跡 ID（供學習系統使用）。"""
 
+    input_tokens: int = 0
+    """輸入 token 數量。"""
+
+    output_tokens: int = 0
+    """輸出 token 數量。"""
+
+    generation_time_ms: float = 0.0
+    """推理耗時（毫秒）。"""
+
+    finish_reason: str = "stop"
+    """停止原因。"""
+
 
 @dataclass
 class ErrorEvent:
@@ -78,6 +93,7 @@ class ErrorEvent:
     """錯誤描述。"""
 
     code: str = "AGENT_ERROR"
+    metadata: dict[str, Any] = field(default_factory=dict)
     """錯誤代碼。"""
 
 

@@ -8,9 +8,14 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
 
-from mochi.backends.base import BaseLLMBackend
+    logger = logging.getLogger(__name__)
+
+from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.types import (
     GenerationResult,
     Message,
@@ -73,6 +78,12 @@ class OllamaBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """呼叫 Ollama /api/chat 進行推理。
@@ -87,14 +98,21 @@ class OllamaBackend(BaseLLMBackend):
         Returns:
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
+        options: dict[str, Any] = {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repeat_penalty": repeat_penalty,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+        }
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [m.to_dict() for m in messages],
             "stream": stream,
-            "options": {
-                "temperature": temperature,
-                "num_predict": max_tokens,
-            },
+            "options": options,
         }
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
@@ -110,10 +128,10 @@ class OllamaBackend(BaseLLMBackend):
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             logger.error(f"Ollama API error {exc.response.status_code}: {exc.response.text}")
-            raise
+            raise self._wrap_request_error(exc, stage="generate") from exc
         except httpx.RequestError as exc:
             logger.error(f"Ollama connection error: {exc}")
-            raise
+            raise self._wrap_request_error(exc, stage="generate") from exc
 
         data = resp.json()
         msg = data.get("message", {})
@@ -172,8 +190,25 @@ class OllamaBackend(BaseLLMBackend):
                         break
         except httpx.RequestError as exc:
             logger.error(f"Ollama stream error: {exc}")
-            raise
+            raise self._wrap_request_error(exc, stage="stream_generate") from exc
 
     async def close(self) -> None:
         """關閉 HTTP client 連線。"""
         await self._client.aclose()
+
+    def _wrap_request_error(
+        self,
+        exc: httpx.HTTPError,
+        *,
+        stage: str,
+    ) -> BackendRequestError:
+        metadata: dict[str, Any] = {
+            "backend_name": "ollama",
+            "request_url": f"{self.base_url}/api/chat",
+            "stage": stage,
+            "model": self.model,
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            metadata["status_code"] = exc.response.status_code
+            metadata["response_text"] = exc.response.text
+        return BackendRequestError(str(exc), metadata=metadata)

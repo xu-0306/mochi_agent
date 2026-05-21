@@ -1,11 +1,25 @@
 /**
  * Mochi FastAPI client.
- * All requests use relative /v1/* paths and rely on Next.js rewrites in development.
+ * Most requests use relative /v1/* paths and rely on Next.js rewrites in development.
+ * Long-running local model operations can bypass the dev proxy and hit the backend directly.
  */
 
-import type { Message } from '@/components/chat/ChatMessage'
+import type {
+  Message,
+  MessageEventType,
+  ReasoningStep,
+  TokenStats,
+} from '@/lib/chat'
+import {
+  appendInlineReasoningChunk,
+  buildInlineReasoningStep,
+  createInlineReasoningBuffer,
+  extractInlineReasoning,
+  finalizeInlineReasoningBuffer,
+} from '@/lib/reasoning'
 
 const API_BASE = '/v1'
+const LOCAL_DEV_API_ORIGIN = 'http://127.0.0.1:8000'
 
 type ApiPrimitive = string | number | boolean | null
 type ApiValue = ApiPrimitive | ApiValue[] | { [key: string]: ApiValue }
@@ -103,12 +117,46 @@ async function parseResponseBody(response: Response): Promise<unknown> {
   return text.length > 0 ? text : null
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+type RequestTarget = 'proxy' | 'direct'
+
+function normalizeApiOrigin(origin: string): string {
+  return origin.replace(/\/+$/, '')
+}
+
+function resolveApiUrl(path: string, target: RequestTarget = 'proxy'): string {
+  if (target === 'direct' && typeof window !== 'undefined') {
+    const configuredOrigin = process.env.NEXT_PUBLIC_MOCHI_API_BASE_URL?.trim()
+    if (configuredOrigin) {
+      return `${normalizeApiOrigin(configuredOrigin)}${API_BASE}${path}`
+    }
+
+    const { hostname, port, protocol } = window.location
+    if ((hostname === 'localhost' || hostname === '127.0.0.1') && port === '3000') {
+      return `${protocol}//127.0.0.1:8000${API_BASE}${path}`
+    }
+    return `${LOCAL_DEV_API_ORIGIN}${API_BASE}${path}`
+  }
+
+  return `${API_BASE}${path}`
+}
+
+function isLocalModelSpec(model?: string | null): boolean {
+  if (!model) {
+    return false
+  }
+  return model.startsWith('/') || /^[A-Za-z]:[\\/]/.test(model)
+}
+
+export function resolveChatStreamTarget(options: SendMessageOptions = {}): RequestTarget {
+  return isLocalModelSpec(options.model) ? 'direct' : 'proxy'
+}
+
+async function requestJson<T>(path: string, init?: RequestInit, target: RequestTarget = 'proxy'): Promise<T> {
   let response: Response
   const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData
 
   try {
-    response = await fetch(`${API_BASE}${path}`, {
+    response = await fetch(resolveApiUrl(path, target), {
       ...init,
       headers: {
         Accept: 'application/json',
@@ -142,9 +190,18 @@ export interface ChatMessage {
 
 export interface SendMessageOptions {
   sessionId?: string
+  projectId?: string | null
   model?: string
   temperature?: number
   maxTokens?: number
+  systemPrompt?: string
+  topP?: number
+  minP?: number
+  topK?: number
+  frequencyPenalty?: number
+  presencePenalty?: number
+  repeatPenalty?: number
+  signal?: AbortSignal
 }
 
 export type TurnEventPhase =
@@ -183,6 +240,11 @@ export interface TurnEventPayload extends Record<string, unknown> {
   errorCode?: unknown
   trajectory_id?: unknown
   trajectoryId?: unknown
+  metadata?: unknown
+  input_tokens?: unknown
+  output_tokens?: unknown
+  generation_time_ms?: unknown
+  finish_reason?: unknown
 }
 
 export interface SessionMessageEvent {
@@ -213,9 +275,18 @@ export interface UnknownSessionEvent {
 
 export type BackendChatEvent = LegacyChatEvent | SessionTurnEvent
 
+export interface TextChunkChatEvent {
+  type: 'text_chunk'
+  content?: string
+  turn_id?: string | number
+  turnId?: string | number
+  timestamp?: string
+}
+
 export interface BackendChatResponse {
   type: 'chat_response'
   session_id: string
+  turn_id?: string | null
   final_answer: string
   trajectory_id: string | null
   events: BackendChatEvent[]
@@ -225,7 +296,18 @@ export interface PostChatPayload {
   message: string
   session_id?: string
   sessionId?: string
+  project_id?: string | null
+  projectId?: string | null
   model?: string
+  system_prompt?: string
+  temperature?: number
+  max_tokens?: number
+  top_p?: number
+  min_p?: number
+  top_k?: number
+  frequency_penalty?: number
+  presence_penalty?: number
+  repeat_penalty?: number
 }
 
 export interface SendMessageResult {
@@ -238,6 +320,31 @@ export interface SendMessageResult {
   events: BackendChatEvent[]
 }
 
+export type StreamChatEvent =
+  | BackendChatEvent
+  | TextChunkChatEvent
+  | BackendChatResponse
+  | {
+      type: 'done'
+      session_id?: string
+      sessionId?: string
+      model?: string
+      trajectory_id?: string | null
+      trajectoryId?: string | null
+    }
+
+export interface StreamChatOptions extends SendMessageOptions {
+  onSessionId?: (sessionId: string) => void
+}
+
+export interface StreamChatChunk {
+  event: Message | null
+  sessionId?: string
+  trajectoryId?: string | null
+  model?: string | null
+  done?: boolean
+}
+
 interface NormalizedMessageEvent {
   kind: 'message'
   role: 'user' | 'assistant' | 'system'
@@ -248,7 +355,7 @@ interface NormalizedMessageEvent {
 
 interface NormalizedTurnEvent {
   kind: 'turn_event'
-  phase: TurnEventPhase
+  phase: MessageEventType
   content: string
   timestamp?: string
   turnKey: string | null
@@ -256,12 +363,28 @@ interface NormalizedTurnEvent {
   toolName?: string
   toolArgs?: Record<string, unknown>
   toolResult?: unknown
+  toolMeta?: Record<string, unknown>
   toolError?: string
   errorCode?: string
   trajectoryId?: string | null
+  inputTokens?: number
+  outputTokens?: number
+  generationTimeMs?: number
+  finishReason?: string
 }
 
-type NormalizedTimelineEvent = NormalizedMessageEvent | NormalizedTurnEvent
+interface NormalizedTextChunkEvent {
+  kind: 'text_chunk'
+  phase: 'text_chunk'
+  content: string
+  timestamp?: string
+  turnKey: string | null
+}
+
+type NormalizedTimelineEvent =
+  | NormalizedMessageEvent
+  | NormalizedTurnEvent
+  | NormalizedTextChunkEvent
 
 function getNonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
@@ -318,6 +441,16 @@ function getPayloadRecord(
   return isRecord(camelCaseValue) ? camelCaseValue : undefined
 }
 
+function getPayloadNumber(
+  payload: Record<string, unknown>,
+  snakeCaseKey: string,
+  camelCaseKey: string
+): number | undefined {
+  const snakeCaseValue = payload[snakeCaseKey]
+  const camelCaseValue = payload[camelCaseKey]
+  return getNumber(snakeCaseValue) ?? getNumber(camelCaseValue) ?? undefined
+}
+
 function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimelineEvent | null {
   const type = getString(event.type)
   const timestamp = getString(event.timestamp) ?? undefined
@@ -347,6 +480,10 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
   if (type === 'turn_event') {
     const phase = getString(event.phase)
     const payload = isRecord(event.payload) ? event.payload : {}
+    const finishReason =
+      getNonEmptyString(payload.finish_reason) ??
+      getNonEmptyString(payload.finishReason) ??
+      undefined
 
     if (
       phase !== 'thinking' &&
@@ -368,12 +505,30 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       toolName: getString(payload.tool_name) ?? getString(payload.toolName) ?? undefined,
       toolArgs: getPayloadRecord(payload, 'arguments', 'toolArgs'),
       toolResult: payload.result ?? payload.toolResult,
+      toolMeta: getPayloadRecord(payload, 'metadata', 'metadata'),
       toolError:
         getNonEmptyString(payload.error) ??
         getNonEmptyString(payload.toolError) ??
         (phase === 'error' ? getNonEmptyString(payload.message) ?? undefined : undefined),
       errorCode: getString(payload.code) ?? getString(payload.errorCode) ?? undefined,
       trajectoryId: getString(payload.trajectory_id) ?? getString(payload.trajectoryId),
+      inputTokens: getPayloadNumber(payload, 'input_tokens', 'inputTokens'),
+      outputTokens: getPayloadNumber(payload, 'output_tokens', 'outputTokens'),
+      generationTimeMs: getPayloadNumber(payload, 'generation_time_ms', 'generationTimeMs'),
+      finishReason,
+    }
+  }
+
+  if (
+    type === 'text_chunk' &&
+    getNonEmptyString(event.content)
+  ) {
+    return {
+      kind: 'text_chunk',
+      phase: 'text_chunk',
+      content: getNonEmptyString(event.content) ?? '',
+      timestamp,
+      turnKey,
     }
   }
 
@@ -398,9 +553,14 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       toolName: getString(event.tool_name) ?? undefined,
       toolArgs: isRecord(event.arguments) ? event.arguments : undefined,
       toolResult: event.result,
+      toolMeta: isRecord(event.metadata) ? event.metadata : undefined,
       toolError: getNonEmptyString(event.error) ?? undefined,
       errorCode: getString(event.code) ?? undefined,
       trajectoryId: getString(event.trajectory_id),
+      inputTokens: getNumber(event.input_tokens) ?? undefined,
+      outputTokens: getNumber(event.output_tokens) ?? undefined,
+      generationTimeMs: getNumber(event.generation_time_ms) ?? undefined,
+      finishReason: getNonEmptyString(event.finish_reason) ?? undefined,
     }
   }
 
@@ -421,6 +581,237 @@ function buildMessageId(prefix: string, index: number, turnKey: string | null, t
   return [prefix, turnKey ?? 'na', timestamp ?? 'now', index.toString()].join('-')
 }
 
+function buildReasoningStep(
+  event: NormalizedTurnEvent,
+  index: number
+): ReasoningStep | null {
+  const id = buildMessageId(`reasoning-${event.phase}`, index, event.turnKey, event.timestamp)
+  const timestamp = toMessageTimestamp(event.timestamp)
+
+  switch (event.phase) {
+    case 'thinking':
+      return {
+        id,
+        type: 'thinking',
+        content: event.content,
+        timestamp,
+      }
+    case 'tool_call_request':
+      return {
+        id,
+        type: 'tool_call',
+        content: event.content,
+        timestamp,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        toolArgs: event.toolArgs,
+        status: 'running',
+      }
+    case 'tool_call_result':
+      return {
+        id,
+        type: 'tool_result',
+        content: event.toolError ?? event.content,
+        timestamp,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        toolResult: event.toolResult,
+        toolMeta: event.toolMeta,
+        toolError: event.toolError,
+        status: event.toolError ? 'error' : 'success',
+      }
+    case 'error':
+      return {
+        id,
+        type: 'error',
+        content: event.toolError ?? event.content ?? 'Unknown error.',
+        timestamp,
+        errorCode: event.errorCode,
+        status: 'error',
+      }
+    default:
+      return null
+  }
+}
+
+function buildTokenStats(event: NormalizedTurnEvent): TokenStats | undefined {
+  if (
+    typeof event.inputTokens !== 'number' ||
+    typeof event.outputTokens !== 'number' ||
+    typeof event.generationTimeMs !== 'number'
+  ) {
+    return undefined
+  }
+
+  return {
+    inputTokens: event.inputTokens,
+    outputTokens: event.outputTokens,
+    generationTimeMs: event.generationTimeMs,
+    finishReason: event.finishReason,
+  }
+}
+
+function normalizeReasoningText(value: string): string {
+  return value
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function appendInlineReasoning(
+  message: Message,
+  options: {
+    content: string
+    index: number
+    turnKey: string | null
+    timestamp?: string
+  },
+): Message {
+  const { content, index, turnKey, timestamp } = options
+  const extracted = extractInlineReasoning(content)
+  if (!extracted.reasoning) {
+    return {
+      ...message,
+      content: extracted.content,
+    }
+  }
+
+  return {
+    ...message,
+    content: extracted.content,
+    reasoningSteps: [
+      ...(message.reasoningSteps ?? []),
+      buildInlineReasoningStep(extracted.reasoning, {
+        index,
+        turnKey,
+        timestamp,
+      }),
+    ],
+  }
+}
+
+function appendStreamingInlineReasoning(
+  message: Message,
+  options: {
+    contentChunk: string
+    index: number
+    turnKey: string | null
+    timestamp?: string
+  },
+): Message {
+  const { contentChunk, index, turnKey, timestamp } = options
+  const result = appendInlineReasoningChunk(
+    message.reasoningBuffer ?? createInlineReasoningBuffer(),
+    contentChunk,
+  )
+
+  let reasoningSteps = message.reasoningSteps ?? []
+  if (result.reasoningDelta) {
+    const stepId =
+      message.inlineReasoningStepId ??
+      ['reasoning-inline-live', turnKey ?? 'na', timestamp ?? 'now', String(index)].join('-')
+    const nextContent = normalizeReasoningText(result.buffer.reasoning)
+    const existingIndex = reasoningSteps.findIndex((step) => step.id === stepId)
+    const nextStep: ReasoningStep = {
+      id: stepId,
+      type: 'thinking',
+      content: nextContent,
+      timestamp: timestamp ? toMessageTimestamp(timestamp) : new Date(),
+      status: 'running',
+    }
+
+    reasoningSteps =
+      existingIndex === -1
+        ? [...reasoningSteps, nextStep]
+        : reasoningSteps.map((step, stepIndex) => (stepIndex === existingIndex ? nextStep : step))
+
+    return {
+      ...message,
+      content: `${message.content}${result.contentDelta}`,
+      reasoningSteps,
+      reasoningBuffer: result.buffer,
+      inlineReasoningStepId: stepId,
+    }
+  }
+
+  return {
+    ...message,
+    content: `${message.content}${result.contentDelta}`,
+    reasoningSteps,
+    reasoningBuffer: result.buffer,
+  }
+}
+
+function finalizeStreamingInlineReasoning(
+  message: Message,
+  options: {
+    content: string
+    index: number
+    turnKey: string | null
+    timestamp?: string
+  },
+): Message {
+  const { content, index, turnKey, timestamp } = options
+  if (message.reasoningBuffer) {
+    const finalized = finalizeInlineReasoningBuffer(message.reasoningBuffer)
+    const extracted = extractInlineReasoning(content)
+    const visibleContent = extracted.content || finalized.content || message.content
+
+    let reasoningSteps = message.reasoningSteps ?? []
+    const completedReasoning = finalized.reasoning
+    if (completedReasoning) {
+      const stepId = message.inlineReasoningStepId
+      if (stepId) {
+        const existingIndex = reasoningSteps.findIndex((step) => step.id === stepId)
+        if (existingIndex !== -1) {
+          reasoningSteps = reasoningSteps.map((step, stepIndex) => (
+            stepIndex === existingIndex
+              ? {
+                  ...step,
+                  content: completedReasoning,
+                  status: 'success',
+                }
+              : step
+          ))
+        } else {
+          reasoningSteps = [
+            ...reasoningSteps,
+            buildInlineReasoningStep(completedReasoning, {
+              index,
+              turnKey,
+              timestamp,
+            }),
+          ]
+        }
+      } else if (!reasoningSteps.some((step) => step.type === 'thinking' && step.content === completedReasoning)) {
+        reasoningSteps = [
+          ...reasoningSteps,
+          buildInlineReasoningStep(completedReasoning, {
+            index,
+            turnKey,
+            timestamp,
+          }),
+        ]
+      }
+    }
+
+    return {
+      ...message,
+      content: visibleContent,
+      reasoningSteps,
+      reasoningBuffer: undefined,
+      inlineReasoningStepId: undefined,
+    }
+  }
+
+  return appendInlineReasoning(message, {
+    content,
+    index,
+    turnKey,
+    timestamp,
+  })
+}
+
 export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>): Message[] {
   const normalized = events
     .filter(isRecord)
@@ -438,122 +829,160 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
     }
   }
 
-  const turnsWithFinalAnswer = new Set(
-    normalized
-      .filter(
-        (event): event is NormalizedTurnEvent =>
-          event.kind === 'turn_event' &&
-          event.phase === 'final_answer' &&
-          event.turnKey !== null
-      )
-      .map((event) => event.turnKey)
-  )
+  const messages: Message[] = []
+  const assistantIndexByTurn = new Map<string, number>()
 
-  const messages = normalized
-    .map((event, index): Message | null => {
-      if (event.kind === 'message') {
-        if (
-          event.role === 'assistant' &&
-          event.turnKey !== null &&
-          turnsWithFinalAnswer.has(event.turnKey)
-        ) {
-          return null
+  normalized.forEach((event, index) => {
+    if (event.kind === 'message') {
+      if (event.role === 'assistant') {
+        const existingIndex = event.turnKey ? assistantIndexByTurn.get(event.turnKey) : undefined
+        if (existingIndex !== undefined) {
+          messages[existingIndex] = appendInlineReasoning({
+            ...messages[existingIndex],
+            content: event.content,
+            timestamp: toMessageTimestamp(event.timestamp),
+          }, {
+            content: event.content,
+            index,
+            turnKey: event.turnKey,
+            timestamp: event.timestamp,
+          })
+          return
         }
+      }
 
-        return {
-          id: buildMessageId(`timeline-${event.role}`, index, event.turnKey, event.timestamp),
-          type: event.role,
+      const message: Message = appendInlineReasoning({
+        id: buildMessageId(`timeline-${event.role}`, index, event.turnKey, event.timestamp),
+        type: event.role,
+        content: event.content,
+        timestamp: toMessageTimestamp(event.timestamp),
+        turnKey: event.turnKey,
+        turnId: event.turnKey,
+      }, {
+        content: event.content,
+        index,
+        turnKey: event.turnKey,
+        timestamp: event.timestamp,
+      })
+      messages.push(message)
+      if (event.role === 'assistant' && event.turnKey) {
+        assistantIndexByTurn.set(event.turnKey, messages.length - 1)
+      }
+      return
+    }
+
+    if (event.kind === 'text_chunk') {
+      const turnKey = event.turnKey ?? `stream-${index}`
+      const existingIndex = assistantIndexByTurn.get(turnKey)
+      if (existingIndex !== undefined) {
+        messages[existingIndex] = appendStreamingInlineReasoning(
+          {
+            ...messages[existingIndex],
+            isStreaming: true,
+            eventType: 'text_chunk',
+          },
+          {
+            contentChunk: event.content,
+            index,
+            turnKey,
+            timestamp: event.timestamp,
+          }
+        )
+      } else {
+        messages.push({
+          id: buildMessageId('timeline-assistant-stream', index, turnKey, event.timestamp),
+          type: 'assistant',
+          content: '',
+          timestamp: toMessageTimestamp(event.timestamp),
+          eventType: 'text_chunk',
+          turnKey,
+          turnId: turnKey,
+          isStreaming: true,
+          reasoningSteps: [],
+          reasoningBuffer: createInlineReasoningBuffer(),
+        })
+        messages[messages.length - 1] = appendStreamingInlineReasoning(messages[messages.length - 1], {
+          contentChunk: event.content,
+          index,
+          turnKey,
+          timestamp: event.timestamp,
+        })
+        assistantIndexByTurn.set(turnKey, messages.length - 1)
+      }
+      return
+    }
+
+    const turnKey = event.turnKey ?? `turn-${index}`
+    const existingIndex = assistantIndexByTurn.get(turnKey)
+
+    if (event.phase === 'final_answer') {
+      const tokenStats = buildTokenStats(event)
+      if (existingIndex !== undefined) {
+        messages[existingIndex] = finalizeStreamingInlineReasoning({
+          ...messages[existingIndex],
+          timestamp: toMessageTimestamp(event.timestamp),
+          eventType: 'final_answer',
+          isStreaming: false,
+          tokenStats: tokenStats ?? messages[existingIndex].tokenStats,
+        }, {
+          content: event.content,
+          index,
+          turnKey,
+          timestamp: event.timestamp,
+        })
+      } else {
+        messages.push(appendInlineReasoning({
+          id: buildMessageId('timeline-final', index, turnKey, event.timestamp),
+          type: 'assistant',
           content: event.content,
           timestamp: toMessageTimestamp(event.timestamp),
-        }
+          eventType: 'final_answer',
+          turnKey,
+          turnId: turnKey,
+          isStreaming: false,
+          reasoningSteps: [],
+          tokenStats: tokenStats,
+        }, {
+          content: event.content,
+          index,
+          turnKey,
+          timestamp: event.timestamp,
+        }))
+        assistantIndexByTurn.set(turnKey, messages.length - 1)
       }
+      return
+    }
 
-      const timestamp = toMessageTimestamp(event.timestamp)
-      const id = buildMessageId(`timeline-${event.phase}`, index, event.turnKey, event.timestamp)
+    const step = buildReasoningStep(event, index)
+    if (!step) {
+      return
+    }
 
-      switch (event.phase) {
-        case 'thinking':
-          return {
-            id,
-            type: 'thinking',
-            eventType: 'thinking',
-            content: event.content,
-            timestamp,
-          }
-        case 'tool_call_request':
-          if (event.toolCallId) {
-            const resultEvent = toolResultsByCallId.get(event.toolCallId)
-            if (resultEvent) {
-              return {
-                id,
-                type: 'tool_result',
-                eventType: 'tool_call_result',
-                content: resultEvent.toolError ?? resultEvent.content,
-                toolCallId: event.toolCallId,
-                toolName: event.toolName ?? resultEvent.toolName,
-                toolArgs: event.toolArgs,
-                toolResult: resultEvent.toolResult,
-                toolError: resultEvent.toolError,
-                timestamp: toMessageTimestamp(resultEvent.timestamp ?? event.timestamp),
-              }
-            }
-          }
-
-          return {
-            id,
-            type: 'tool_call',
-            eventType: 'tool_call_request',
-            content: '',
-            toolCallId: event.toolCallId,
-            toolName: event.toolName,
-            toolArgs: event.toolArgs,
-            timestamp,
-          }
-        case 'tool_call_result':
-          if (event.toolCallId && toolResultsByCallId.get(event.toolCallId) === event) {
-            const hasRequest = normalized.some(
-              (candidate) =>
-                candidate.kind === 'turn_event' &&
-                candidate.phase === 'tool_call_request' &&
-                candidate.toolCallId === event.toolCallId
-            )
-
-            if (hasRequest) {
-              return null
-            }
-          }
-
-          return {
-            id,
-            type: 'tool_result',
-            eventType: 'tool_call_result',
-            content: event.toolError ?? event.content,
-            toolCallId: event.toolCallId,
-            toolName: event.toolName,
-            toolResult: event.toolResult,
-            toolError: event.toolError,
-            timestamp,
-          }
-        case 'error':
-          return {
-            id,
-            type: 'error',
-            eventType: 'error',
-            content: event.toolError ?? event.content ?? 'Unknown error.',
-            errorCode: event.errorCode,
-            timestamp,
-          }
-        case 'final_answer':
-          return {
-            id,
-            type: 'assistant',
-            eventType: 'final_answer',
-            content: event.content,
-            timestamp,
-          }
+    if (existingIndex !== undefined) {
+      const target = messages[existingIndex]
+      messages[existingIndex] = {
+        ...target,
+        reasoningSteps: [...(target.reasoningSteps ?? []), step],
       }
+      return
+    }
+
+    messages.push({
+      id: buildMessageId('timeline-assistant-turn', index, turnKey, event.timestamp),
+      type: step.type === 'error' ? 'error' : 'assistant',
+      content: step.type === 'error' ? step.content : '',
+      timestamp: toMessageTimestamp(event.timestamp),
+      eventType: step.type === 'error' ? 'error' : undefined,
+      turnKey,
+      turnId: turnKey,
+      reasoningSteps: [step],
+      errorCode: step.errorCode,
+      isStreaming: step.type !== 'error',
+      reasoningBuffer: step.type === 'error' ? undefined : createInlineReasoningBuffer(),
+      inlineReasoningStepId: undefined,
     })
-    .filter((message): message is Message => message !== null)
+    assistantIndexByTurn.set(turnKey, messages.length - 1)
+  })
 
   return messages
 }
@@ -575,7 +1004,17 @@ export async function sendMessage(
     body: JSON.stringify({
       message: text,
       session_id: options.sessionId,
+      project_id: options.projectId,
       model: options.model,
+      system_prompt: options.systemPrompt,
+      temperature: options.temperature,
+      max_tokens: options.maxTokens,
+      top_p: options.topP,
+      min_p: options.minP,
+      top_k: options.topK,
+      frequency_penalty: options.frequencyPenalty,
+      presence_penalty: options.presencePenalty,
+      repeat_penalty: options.repeatPenalty,
     }),
   })
 
@@ -596,18 +1035,346 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
     body: JSON.stringify({
       message: payload.message,
       session_id: payload.session_id ?? payload.sessionId,
+      project_id: payload.project_id ?? payload.projectId,
       model: payload.model,
+      system_prompt: payload.system_prompt,
+      temperature: payload.temperature,
+      max_tokens: payload.max_tokens,
+      top_p: payload.top_p,
+      min_p: payload.min_p,
+      top_k: payload.top_k,
+      frequency_penalty: payload.frequency_penalty,
+      presence_penalty: payload.presence_penalty,
+      repeat_penalty: payload.repeat_penalty,
     }),
   })
+}
+
+function normalizeStreamEvent(value: unknown): StreamChatEvent | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  const type = getString(value.type)
+  if (!type) {
+    return null
+  }
+  return value as StreamChatEvent
+}
+
+function isBackendChatResponse(value: StreamChatEvent): value is BackendChatResponse {
+  return value.type === 'chat_response'
+}
+
+function resolveStreamSessionId(event: StreamChatEvent): string | undefined {
+  if (isBackendChatResponse(event)) {
+    return event.session_id
+  }
+
+  if ('session_id' in event && typeof event.session_id === 'string' && event.session_id.length > 0) {
+    return event.session_id
+  }
+
+  if ('sessionId' in event && typeof event.sessionId === 'string' && event.sessionId.length > 0) {
+    return event.sessionId
+  }
+
+  return undefined
+}
+
+function resolveStreamModel(event: StreamChatEvent): string | null {
+  if ('model' in event && typeof event.model === 'string' && event.model.length > 0) {
+    return event.model
+  }
+  return null
+}
+
+function resolveStreamTrajectoryId(event: StreamChatEvent): string | null {
+  if (isBackendChatResponse(event)) {
+    return event.trajectory_id
+  }
+
+  if (
+    'trajectory_id' in event &&
+    (typeof event.trajectory_id === 'string' || event.trajectory_id === null)
+  ) {
+    return event.trajectory_id
+  }
+
+  if (
+    'trajectoryId' in event &&
+    (typeof event.trajectoryId === 'string' || event.trajectoryId === null)
+  ) {
+    return event.trajectoryId
+  }
+
+  return null
+}
+
+function toStreamMessages(event: StreamChatEvent): Message[] {
+  if (isBackendChatResponse(event)) {
+    return buildMessagesFromChatEvents(event.events)
+  }
+
+  if (
+    event.type === 'thinking' ||
+    event.type === 'tool_call_request' ||
+    event.type === 'tool_call_result' ||
+    event.type === 'error' ||
+    event.type === 'final_answer' ||
+    event.type === 'text_chunk'
+  ) {
+    return buildMessagesFromTimelineEvents([event])
+  }
+
+  return []
+}
+
+async function* readNdjsonStream(
+  stream: ReadableStream<Uint8Array>
+): AsyncGenerator<StreamChatEvent, void, unknown> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) {
+      break
+    }
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const rawLine of lines) {
+      const line = rawLine.trim()
+      if (!line) {
+        continue
+      }
+      const parsed = normalizeStreamEvent(JSON.parse(line))
+      if (parsed) {
+        yield parsed
+      }
+    }
+  }
+
+  const finalLine = buffer.trim()
+  if (finalLine) {
+    const parsed = normalizeStreamEvent(JSON.parse(finalLine))
+    if (parsed) {
+      yield parsed
+    }
+  }
+}
+
+async function* readSseStream(
+  stream: ReadableStream<Uint8Array>
+): AsyncGenerator<StreamChatEvent, void, unknown> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) {
+      break
+    }
+    buffer += decoder.decode(value, { stream: true })
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() ?? ''
+
+    for (const frame of frames) {
+      const data = frame
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trim())
+        .join('\n')
+        .trim()
+
+      if (!data || data === '[DONE]') {
+        continue
+      }
+
+      const parsed = normalizeStreamEvent(JSON.parse(data))
+      if (parsed) {
+        yield parsed
+      }
+    }
+  }
+
+  const finalFrame = buffer.trim()
+  if (!finalFrame) {
+    return
+  }
+
+  const data = finalFrame
+    .split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+    .join('\n')
+    .trim()
+
+  if (!data || data === '[DONE]') {
+    return
+  }
+
+  const parsed = normalizeStreamEvent(JSON.parse(data))
+  if (parsed) {
+    yield parsed
+  }
+}
+
+async function requestStreamResponse(
+  text: string,
+  options: SendMessageOptions = {}
+): Promise<Response> {
+  let response: Response
+  const target = resolveChatStreamTarget(options)
+
+  try {
+    response = await fetch(resolveApiUrl('/chat/stream', target), {
+      method: 'POST',
+      headers: {
+        Accept: 'text/event-stream, application/x-ndjson, application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message: text,
+        session_id: options.sessionId,
+        project_id: options.projectId,
+        model: options.model,
+        system_prompt: options.systemPrompt,
+        temperature: options.temperature,
+        max_tokens: options.maxTokens,
+        top_p: options.topP,
+        min_p: options.minP,
+        top_k: options.topK,
+        frequency_penalty: options.frequencyPenalty,
+        presence_penalty: options.presencePenalty,
+        repeat_penalty: options.repeatPenalty,
+      }),
+      signal: options.signal,
+      cache: 'no-store',
+    })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Network request failed'
+    throw new ApiError(0, message, error)
+  }
+
+  if (!response.ok) {
+    const payload = await parseResponseBody(response)
+    throw new ApiError(
+      response.status,
+      getApiMessage(payload, response.statusText || 'Request failed'),
+      payload
+    )
+  }
+
+  if (!response.body) {
+    throw new ApiError(0, 'Streaming response body is unavailable.')
+  }
+
+  return response
 }
 
 export async function* streamChat(
   text: string,
   options: SendMessageOptions = {}
-): AsyncGenerator<string, void, unknown> {
-  const response = await sendMessage(text, options)
-  for (const char of response.content) {
-    yield char
+): AsyncGenerator<StreamChatEvent, void, unknown> {
+  const response = await requestStreamResponse(text, options)
+  const body = response.body
+  if (!body) {
+    throw new ApiError(0, 'Streaming response body is unavailable.')
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''
+  if (contentType.includes('text/event-stream')) {
+    yield* readSseStream(body)
+    return
+  }
+
+  if (contentType.includes('application/x-ndjson')) {
+    yield* readNdjsonStream(body)
+    return
+  }
+
+  const payload = normalizeStreamEvent(await parseResponseBody(response))
+  if (payload) {
+    yield payload
+  }
+}
+
+export async function* streamChatMessages(
+  text: string,
+  options: StreamChatOptions = {}
+): AsyncGenerator<StreamChatChunk, void, unknown> {
+  const response = await requestStreamResponse(text, options)
+  const body = response.body
+  if (!body) {
+    throw new ApiError(0, 'Streaming response body is unavailable.')
+  }
+  const responseSessionId = response.headers.get('X-Session-ID') ?? undefined
+  if (responseSessionId) {
+    options.onSessionId?.(responseSessionId)
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''
+  const stream =
+    contentType.includes('text/event-stream')
+      ? readSseStream(body)
+      : contentType.includes('application/x-ndjson')
+        ? readNdjsonStream(body)
+        : (async function* singlePayload() {
+            const payload = normalizeStreamEvent(await parseResponseBody(response))
+            if (payload) {
+              yield payload
+            }
+          })()
+
+  let seenSessionId = responseSessionId
+  let emittedDone = false
+
+  for await (const rawEvent of stream) {
+    const nextSessionId = resolveStreamSessionId(rawEvent) ?? seenSessionId
+    if (nextSessionId && nextSessionId !== seenSessionId) {
+      seenSessionId = nextSessionId
+      options.onSessionId?.(nextSessionId)
+    }
+
+    const model = resolveStreamModel(rawEvent)
+    const trajectoryId = resolveStreamTrajectoryId(rawEvent)
+
+    if (rawEvent.type === 'done') {
+      emittedDone = true
+      yield {
+        event: null,
+        sessionId: nextSessionId,
+        model,
+        trajectoryId,
+        done: true,
+      }
+      continue
+    }
+
+    const messages = toStreamMessages(rawEvent)
+    if (messages.length === 0) {
+      continue
+    }
+
+    for (const message of messages) {
+      yield {
+        event: message,
+        sessionId: nextSessionId,
+        model,
+        trajectoryId,
+      }
+    }
+  }
+
+  if (!emittedDone) {
+    yield {
+      event: null,
+      sessionId: seenSessionId,
+      done: true,
+    }
   }
 }
 
@@ -707,6 +1474,7 @@ interface BackendSessionListItem {
   title?: string
   event_count: number
   updated_at: string
+  project_id?: string | null
 }
 
 interface BackendSessionListResponse {
@@ -720,6 +1488,7 @@ export interface SessionSummary {
   createdAt: string
   updatedAt: string
   eventCount: number
+  projectId: string | null
 }
 
 export type SessionEvent = SessionMessageEvent | SessionTurnEvent | UnknownSessionEvent
@@ -728,6 +1497,7 @@ interface BackendSessionResponse {
   type: 'session'
   session_id: string
   title?: string
+  project_id?: string | null
   events: Record<string, unknown>[]
 }
 
@@ -742,6 +1512,7 @@ function normalizeSessionSummary(item: BackendSessionListItem): SessionSummary {
     createdAt: item.updated_at,
     updatedAt: item.updated_at,
     eventCount: item.event_count,
+    projectId: getString(item.project_id) ?? null,
   }
 }
 
@@ -825,6 +1596,7 @@ export async function fetchSession(sessionId: string): Promise<SessionDetail> {
     createdAt: updatedAt,
     updatedAt,
     eventCount: events.length,
+    projectId: getString(payload.project_id) ?? null,
     events,
   }
 }
@@ -834,10 +1606,22 @@ interface BackendCreateSessionResponse {
   session_id: string
 }
 
-export async function createSession(sessionId?: string): Promise<SessionSummary> {
+interface ForkSessionInput {
+  sessionId: string
+  turnId: string
+  projectId?: string | null
+}
+
+export async function createSession(
+  sessionId?: string,
+  projectId?: string | null
+): Promise<SessionSummary> {
   const payload = await requestJson<BackendCreateSessionResponse>('/sessions', {
     method: 'POST',
-    body: JSON.stringify(sessionId ? { session_id: sessionId } : {}),
+    body: JSON.stringify({
+      ...(sessionId ? { session_id: sessionId } : {}),
+      ...(projectId !== undefined ? { project_id: projectId } : {}),
+    }),
   })
 
   const now = new Date().toISOString()
@@ -847,6 +1631,28 @@ export async function createSession(sessionId?: string): Promise<SessionSummary>
     createdAt: now,
     updatedAt: now,
     eventCount: 1,
+    projectId: projectId ?? null,
+  }
+}
+
+export async function forkSession(input: ForkSessionInput): Promise<SessionSummary> {
+  const payload = await requestJson<BackendCreateSessionResponse>('/sessions', {
+    method: 'POST',
+    body: JSON.stringify({
+      fork_from_session_id: input.sessionId,
+      fork_until_turn_id: input.turnId,
+      ...(input.projectId !== undefined ? { project_id: input.projectId } : {}),
+    }),
+  })
+
+  const now = new Date().toISOString()
+  return {
+    id: payload.session_id,
+    title: payload.session_id,
+    createdAt: now,
+    updatedAt: now,
+    eventCount: 1,
+    projectId: input.projectId ?? null,
   }
 }
 
@@ -872,11 +1678,116 @@ export async function renameSession(sessionId: string, title: string): Promise<S
     createdAt: now,
     updatedAt: now,
     eventCount: 0,
+    projectId: null,
   }
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
   await requestJson<{ deleted: boolean }>(`/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  })
+}
+
+interface BackendUpdateSessionProjectResponse {
+  type: 'session'
+  session_id: string
+  project_id?: string | null
+}
+
+export async function updateSessionProject(
+  sessionId: string,
+  projectId: string | null
+): Promise<{ sessionId: string; projectId: string | null }> {
+  const payload = await requestJson<BackendUpdateSessionProjectResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}/project`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ project_id: projectId }),
+    }
+  )
+
+  return {
+    sessionId: payload.session_id,
+    projectId: getString(payload.project_id) ?? null,
+  }
+}
+
+interface BackendProject {
+  id: string
+  name: string
+  workspace_dir: string
+  created_at: string
+  updated_at: string
+}
+
+interface BackendProjectListResponse {
+  type: 'projects'
+  items: BackendProject[]
+}
+
+export interface ProjectSummary {
+  id: string
+  name: string
+  workspaceDir: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ProjectDetail extends ProjectSummary {}
+
+function normalizeProject(project: BackendProject): ProjectDetail {
+  return {
+    id: project.id,
+    name: project.name,
+    workspaceDir: project.workspace_dir,
+    createdAt: project.created_at,
+    updatedAt: project.updated_at,
+  }
+}
+
+export async function fetchProjects(): Promise<ProjectSummary[]> {
+  const payload = await requestJson<BackendProjectListResponse>('/projects')
+  return payload.items.map(normalizeProject)
+}
+
+export async function fetchProject(projectId: string): Promise<ProjectDetail> {
+  const payload = await requestJson<BackendProject>(`/projects/${encodeURIComponent(projectId)}`)
+  return normalizeProject(payload)
+}
+
+export async function createProject(input: {
+  name: string
+  workspaceDir: string
+}): Promise<ProjectDetail> {
+  const payload = await requestJson<BackendProject>('/projects', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: input.name,
+      workspace_dir: input.workspaceDir,
+    }),
+  })
+  return normalizeProject(payload)
+}
+
+export async function updateProject(
+  projectId: string,
+  input: {
+    name?: string
+    workspaceDir?: string
+  }
+): Promise<ProjectDetail> {
+  const payload = await requestJson<BackendProject>(`/projects/${encodeURIComponent(projectId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.workspaceDir !== undefined ? { workspace_dir: input.workspaceDir } : {}),
+    }),
+  })
+  return normalizeProject(payload)
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  await requestJson<{ deleted: boolean }>(`/projects/${encodeURIComponent(projectId)}`, {
     method: 'DELETE',
   })
 }
@@ -921,7 +1832,7 @@ export interface ModelInfo {
   metadata: Record<string, ApiValue>
 }
 
-export type ModelProvider = 'ollama' | 'openai_compat' | 'gemini' | 'anthropic'
+export type ModelProvider = 'ollama' | 'openai_compat' | 'gemini' | 'anthropic' | 'vllm' | 'local'
 
 export interface ConfigureModelInput {
   provider: ModelProvider
@@ -947,6 +1858,54 @@ export interface ConfigureModelResult {
   activeModel: ModelInfo
   availableModels: ModelInfo[]
   apiKeyConfigured: boolean
+  persisted: boolean
+  configPath: string | null
+}
+
+interface BackendModelEntryUpdateResponse {
+  type: 'model_entry_update'
+  updated_model: BackendModelInfo
+  available_models?: BackendModelInfo[]
+  configured_model: string
+  api_key_configured: boolean
+  persisted?: boolean
+  config_path?: string | null
+}
+
+interface BackendModelEntryDeleteResponse {
+  type: 'model_entry_delete'
+  deleted_model_id: string
+  available_models?: BackendModelInfo[]
+  configured_model: string
+  persisted?: boolean
+  config_path?: string | null
+}
+
+export interface UpdateModelEntryInput {
+  modelId: string
+  provider: ModelProvider
+  model: string
+  modelSpec: string
+  baseUrl?: string | null
+  apiKey?: string | null
+  persist?: boolean
+}
+
+export interface UpdateModelEntryResult {
+  type: 'model_entry_update'
+  updatedModel: ModelInfo
+  availableModels: ModelInfo[]
+  configuredModel: string
+  apiKeyConfigured: boolean
+  persisted: boolean
+  configPath: string | null
+}
+
+export interface DeleteModelEntryResult {
+  type: 'model_entry_delete'
+  deletedModelId: string
+  availableModels: ModelInfo[]
+  configuredModel: string
   persisted: boolean
   configPath: string | null
 }
@@ -1062,6 +2021,55 @@ export async function configureModel(input: ConfigureModelInput): Promise<Config
   }
 }
 
+export async function updateModelEntry(input: UpdateModelEntryInput): Promise<UpdateModelEntryResult> {
+  const payload = await requestJson<BackendModelEntryUpdateResponse>(`/models/configured/${encodeURIComponent(input.modelId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      provider: input.provider,
+      model: input.model,
+      model_spec: input.modelSpec,
+      base_url: input.baseUrl ?? null,
+      api_key: input.apiKey ?? null,
+      persist: input.persist,
+    }),
+  })
+
+  const updatedModel = normalizeModelInfo(payload.updated_model)
+  if (!updatedModel) {
+    throw new ApiError(500, 'Backend did not return an updated model entry')
+  }
+
+  return {
+    type: payload.type,
+    updatedModel,
+    availableModels: getRecordArray(payload.available_models).map((model) =>
+      normalizeModelInfo(model)
+    ).filter((model): model is ModelInfo => model !== null),
+    configuredModel: payload.configured_model,
+    apiKeyConfigured: payload.api_key_configured,
+    persisted: Boolean(payload.persisted),
+    configPath: payload.config_path ?? null,
+  }
+}
+
+export async function deleteModelEntry(modelId: string, persist = true): Promise<DeleteModelEntryResult> {
+  const payload = await requestJson<BackendModelEntryDeleteResponse>(`/models/configured/${encodeURIComponent(modelId)}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ persist }),
+  })
+
+  return {
+    type: payload.type,
+    deletedModelId: payload.deleted_model_id,
+    availableModels: getRecordArray(payload.available_models).map((model) =>
+      normalizeModelInfo(model)
+    ).filter((model): model is ModelInfo => model !== null),
+    configuredModel: payload.configured_model,
+    persisted: Boolean(payload.persisted),
+    configPath: payload.config_path ?? null,
+  }
+}
+
 interface BackendOllamaModelsResponse {
   type: 'ollama_models'
   base_url: string
@@ -1081,6 +2089,595 @@ export async function fetchOllamaModels(baseUrl: string): Promise<OllamaModelsRe
     type: payload.type,
     baseUrl: payload.base_url,
     models: getStringArray(payload.models),
+  }
+}
+
+interface BackendLocalModelsResponse {
+  type: 'local_models'
+  root: string
+  models?: BackendModelInfo[]
+  warnings?: string[]
+}
+
+export interface LocalModelsResult {
+  type: 'local_models'
+  root: string
+  models: ModelInfo[]
+  warnings: string[]
+}
+
+export async function fetchLocalModels(root: string): Promise<LocalModelsResult> {
+  const query = new URLSearchParams({ root })
+  const payload = await requestJson<BackendLocalModelsResponse>(`/models/local?${query}`)
+  return {
+    type: payload.type,
+    root: payload.root,
+    models: getRecordArray(payload.models).map((model) =>
+      normalizeModelInfo(model)
+    ).filter((model): model is ModelInfo => model !== null),
+    warnings: getStringArray(payload.warnings),
+  }
+}
+
+export type LocalModelCapabilityStatus = 'supported' | 'unsupported' | 'conditional' | 'unknown'
+export type LocalModelCapabilityFormat = 'gguf' | string
+
+interface BackendQuantizationOption {
+  id?: string
+  name?: string
+  bits?: string
+  description?: string
+}
+
+interface BackendLocalModelCapabilityFormat {
+  format_id?: string
+  format_name?: string
+  supported?: boolean
+  priority?: string
+  reason?: string
+  warnings?: string[]
+  quantization_options?: BackendQuantizationOption[]
+  suggested_default_quantization?: string | null
+}
+
+interface BackendHardwareSummary {
+  provider?: string
+  cuda_available?: boolean
+  gpu_count?: number
+  gpu_vendor?: string | null
+  primary_gpu_name?: string | null
+  total_vram_gb?: number | null
+  recommended_runtime_backend?: string | null
+  recommended_runtime_label?: string | null
+  warnings?: string[]
+}
+
+interface BackendLocalModelCapabilitiesResponse {
+  type?: string
+  model_spec?: string
+  model_dir?: string
+  model_family?: string | null
+  formats?: BackendLocalModelCapabilityFormat[]
+  warnings?: string[]
+  hardware?: BackendHardwareSummary | null
+}
+
+export interface LocalModelQuantizationOption {
+  id: string
+  name: string
+  bits: string | null
+  description: string | null
+}
+
+export interface LocalModelCapabilityFormatInfo {
+  formatId: LocalModelCapabilityFormat
+  formatName: string
+  status: LocalModelCapabilityStatus
+  supported: boolean
+  priority: string | null
+  reason: string | null
+  warnings: string[]
+  quantizationOptions: LocalModelQuantizationOption[]
+  suggestedDefaultQuantization: string | null
+}
+
+export interface LocalModelHardwareSummary {
+  provider: string | null
+  cudaAvailable: boolean | null
+  gpuCount: number | null
+  gpuVendor: string | null
+  primaryGpuName: string | null
+  totalVramGb: number | null
+  recommendedRuntimeBackend: string | null
+  recommendedRuntimeLabel: string | null
+  warnings: string[]
+}
+
+export interface LocalModelCapabilitiesResult {
+  type: string
+  modelSpec: string
+  modelDir: string
+  modelFamily: string | null
+  formats: LocalModelCapabilityFormatInfo[]
+  warnings: string[]
+  hardware: LocalModelHardwareSummary | null
+}
+
+export type LocalModelRuntimeReadiness =
+  | 'ready'
+  | 'degraded'
+  | 'missing'
+  | 'not_installed'
+  | 'manual_setup_required'
+  | 'incompatible'
+  | 'installing'
+  | 'unknown'
+
+export type LocalModelRuntimeSource =
+  | 'managed'
+  | 'existing_path'
+  | 'env'
+  | 'auto'
+  | 'unknown'
+  | string
+
+export type LocalModelRuntimeAction =
+  | 'register_existing_path'
+  | 'prepare_managed_runtime'
+  | 'ready_for_conversion'
+  | string
+
+interface BackendLocalModelRuntimeStatusResponse {
+  type?: string
+  runtime?: string
+  readiness?: string
+  installed?: boolean
+  source?: string
+  root_dir?: string | null
+  install_dir?: string | null
+  python_executable?: string
+  version?: string | null
+  platform?: string | null
+  binary_asset?: string | null
+  convert_script?: string | null
+  quantize_binary?: string | null
+  missing_components?: string[]
+  warnings?: string[]
+  actions?: string[]
+  hardware?: BackendHardwareSummary | null
+}
+
+export interface LocalModelRuntimeStatus {
+  type: string
+  runtime: string
+  readiness: LocalModelRuntimeReadiness
+  installed: boolean
+  source: LocalModelRuntimeSource
+  rootDir: string | null
+  installDir: string | null
+  pythonExecutable: string | null
+  version: string | null
+  platform: string | null
+  binaryAsset: string | null
+  convertScript: string | null
+  quantizeBinary: string | null
+  missingComponents: string[]
+  warnings: string[]
+  actions: LocalModelRuntimeAction[]
+  hardware: LocalModelHardwareSummary | null
+}
+
+export type LocalModelRuntimeInstallAction = 'prepare_managed' | 'register_existing_path'
+
+interface BackendLocalModelRuntimeInstallResponse {
+  type?: string
+  runtime?: string
+  action?: string
+  state?: string
+  source?: string
+  install_dir?: string | null
+  root_dir?: string | null
+  version?: string | null
+  platform?: string | null
+  binary_asset?: string | null
+  persisted?: boolean
+  config_path?: string | null
+  runtime_status?: BackendLocalModelRuntimeStatusResponse | null
+  warnings?: string[]
+  message?: string
+}
+
+export interface LocalModelRuntimeInstallInput {
+  action: LocalModelRuntimeInstallAction
+  existingPath?: string
+  persist?: boolean
+}
+
+export interface LocalModelRuntimeInstallResult {
+  type: string
+  runtime: string
+  action: string
+  state: LocalModelRuntimeReadiness
+  source: LocalModelRuntimeSource
+  installDir: string | null
+  rootDir: string | null
+  version: string | null
+  platform: string | null
+  binaryAsset: string | null
+  persisted: boolean
+  configPath: string | null
+  runtimeStatus: LocalModelRuntimeStatus | null
+  warnings: string[]
+  message: string | null
+}
+
+interface BackendLocalActiveModelRuntimeStatusResponse {
+  type?: string
+  has_active_local_model?: boolean
+  model_spec?: string | null
+  backend_type?: string | null
+  loaded?: boolean
+  idle_unloaded?: boolean
+  can_unload?: boolean
+}
+
+interface BackendLocalActiveModelRuntimeUnloadResponse {
+  type?: string
+  unloaded?: boolean
+  active_runtime?: BackendLocalActiveModelRuntimeStatusResponse | null
+}
+
+export interface LocalActiveModelRuntimeStatus {
+  type: string
+  hasActiveLocalModel: boolean
+  modelSpec: string | null
+  backendType: string | null
+  loaded: boolean
+  idleUnloaded: boolean
+  canUnload: boolean
+}
+
+export interface LocalActiveModelRuntimeUnloadResult {
+  type: string
+  unloaded: boolean
+  activeRuntime: LocalActiveModelRuntimeStatus
+}
+
+function normalizeRuntimeReadiness(value: unknown, installed: boolean): LocalModelRuntimeReadiness {
+  const readiness = getString(value)?.trim().toLowerCase()
+  if (readiness === 'ready' || readiness === 'degraded' || readiness === 'missing') {
+    return readiness
+  }
+  if (readiness === 'not_installed' || readiness === 'manual_setup_required' || readiness === 'incompatible') {
+    return readiness
+  }
+  if (!installed) {
+    return 'not_installed'
+  }
+  return 'unknown'
+}
+
+function normalizeLocalModelRuntimeStatus(
+  payload: BackendLocalModelRuntimeStatusResponse | null | undefined
+): LocalModelRuntimeStatus | null {
+  if (!payload || !isRecord(payload)) {
+    return null
+  }
+
+  const installed = getBoolean(payload.installed) ?? false
+  return {
+    type: getString(payload.type) ?? 'local_model_runtime_status',
+    runtime: getString(payload.runtime) ?? 'llama.cpp',
+    readiness: normalizeRuntimeReadiness(payload.readiness, installed),
+    installed,
+    source: getString(payload.source) ?? 'unknown',
+    rootDir: getString(payload.root_dir),
+    installDir: getString(payload.install_dir),
+    pythonExecutable: getString(payload.python_executable),
+    version: getString(payload.version),
+    platform: getString(payload.platform),
+    binaryAsset: getString(payload.binary_asset),
+    convertScript: getString(payload.convert_script),
+    quantizeBinary: getString(payload.quantize_binary),
+    missingComponents: getStringArray(payload.missing_components),
+    warnings: getStringArray(payload.warnings),
+    actions: getStringArray(payload.actions),
+    hardware: normalizeHardwareSummary(payload.hardware),
+  }
+}
+
+function normalizeLocalActiveModelRuntimeStatus(
+  payload: BackendLocalActiveModelRuntimeStatusResponse | null | undefined
+): LocalActiveModelRuntimeStatus | null {
+  if (!payload || !isRecord(payload)) {
+    return null
+  }
+
+  return {
+    type: getString(payload.type) ?? 'local_active_model_runtime_status',
+    hasActiveLocalModel: getBoolean(payload.has_active_local_model) ?? false,
+    modelSpec: getString(payload.model_spec),
+    backendType: getString(payload.backend_type),
+    loaded: getBoolean(payload.loaded) ?? false,
+    idleUnloaded: getBoolean(payload.idle_unloaded) ?? false,
+    canUnload: getBoolean(payload.can_unload) ?? false,
+  }
+}
+
+function normalizeCapabilityStatus(supported: boolean | null): LocalModelCapabilityStatus {
+  if (supported === true) {
+    return 'supported'
+  }
+  if (supported === false) {
+    return 'unsupported'
+  }
+  return 'unknown'
+}
+
+function normalizeQuantizationOptions(value: unknown): LocalModelQuantizationOption[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const options: LocalModelQuantizationOption[] = []
+  for (const entry of value) {
+    if (typeof entry === 'string') {
+      const text = entry.trim()
+      if (text.length === 0) {
+        continue
+      }
+      options.push({
+        id: text,
+        name: text,
+        bits: null,
+        description: null,
+      })
+      continue
+    }
+
+    if (!isRecord(entry)) {
+      continue
+    }
+
+    const id = (
+      getString(entry.id) ??
+      getString(entry.name) ??
+      getString(entry.value)
+    )?.trim()
+    const name = (
+      getString(entry.name) ??
+      getString(entry.id) ??
+      getString(entry.value)
+    )?.trim()
+
+    if (!id || !name) {
+      continue
+    }
+
+    options.push({
+      id,
+      name,
+      bits: getString(entry.bits),
+      description: getString(entry.description),
+    })
+  }
+
+  return options
+}
+
+function normalizeCapabilityFormat(
+  entry: Record<string, unknown>
+): LocalModelCapabilityFormatInfo {
+  const formatId = (getString(entry.format_id) ?? '').trim().toLowerCase() || 'unknown'
+  const formatName = (getString(entry.format_name) ?? formatId).trim()
+  const supported = getBoolean(entry.supported)
+  const warnings = getStringArray(entry.warnings)
+  const reason = getString(entry.reason)
+
+  let status = normalizeCapabilityStatus(supported)
+  if (status === 'unsupported' && warnings.length > 0) {
+    status = 'conditional'
+  }
+
+  return {
+    formatId,
+    formatName,
+    status,
+    supported: supported ?? false,
+    priority: getString(entry.priority),
+    reason,
+    warnings,
+    quantizationOptions: normalizeQuantizationOptions(entry.quantization_options),
+    suggestedDefaultQuantization: getString(entry.suggested_default_quantization),
+  }
+}
+
+function normalizeHardwareSummary(value: unknown): LocalModelHardwareSummary | null {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  return {
+    provider: getString(value.provider),
+    cudaAvailable: getBoolean(value.cuda_available),
+    gpuCount: getNumber(value.gpu_count),
+    gpuVendor: getString(value.gpu_vendor),
+    primaryGpuName: getString(value.primary_gpu_name),
+    totalVramGb: getNumber(value.total_vram_gb),
+    recommendedRuntimeBackend: getString(value.recommended_runtime_backend),
+    recommendedRuntimeLabel: getString(value.recommended_runtime_label),
+    warnings: getStringArray(value.warnings),
+  }
+}
+
+export async function fetchLocalModelCapabilities(model: string): Promise<LocalModelCapabilitiesResult> {
+  const normalizedModel = model.trim()
+  const query = new URLSearchParams({ model_spec: normalizedModel })
+  const payload = await requestJson<BackendLocalModelCapabilitiesResponse>(`/models/local/capabilities?${query}`)
+
+  return {
+    type: payload.type ?? 'local_model_quantization_capabilities',
+    modelSpec: getString(payload.model_spec) ?? normalizedModel,
+    modelDir: getString(payload.model_dir) ?? normalizedModel,
+    modelFamily: getString(payload.model_family),
+    formats: getRecordArray(payload.formats).map(normalizeCapabilityFormat),
+    warnings: getStringArray(payload.warnings),
+    hardware: normalizeHardwareSummary(payload.hardware),
+  }
+}
+
+export async function fetchLocalModelRuntimeStatus(): Promise<LocalModelRuntimeStatus> {
+  const payload = await requestJson<BackendLocalModelRuntimeStatusResponse>('/models/local/runtime')
+  const normalized = normalizeLocalModelRuntimeStatus(payload)
+  if (!normalized) {
+    throw new ApiError(500, 'Invalid local model runtime status response', payload)
+  }
+  return normalized
+}
+
+export async function installLocalModelRuntime(
+  input: LocalModelRuntimeInstallInput
+): Promise<LocalModelRuntimeInstallResult> {
+  const payload = await requestJson<BackendLocalModelRuntimeInstallResponse>('/models/local/runtime/install', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: input.action,
+      existing_path: input.existingPath?.trim() || undefined,
+      persist: input.persist,
+    }),
+  }, 'direct')
+
+  return {
+    type: payload.type ?? 'local_model_runtime_install',
+    runtime: getString(payload.runtime) ?? 'llama.cpp',
+    action: getString(payload.action) ?? input.action,
+    state: normalizeRuntimeReadiness(payload.state, true),
+    source: getString(payload.source) ?? 'unknown',
+    installDir: getString(payload.install_dir),
+    rootDir: getString(payload.root_dir),
+    version: getString(payload.version),
+    platform: getString(payload.platform),
+    binaryAsset: getString(payload.binary_asset),
+    persisted: Boolean(payload.persisted),
+    configPath: getString(payload.config_path),
+    runtimeStatus: normalizeLocalModelRuntimeStatus(payload.runtime_status),
+    warnings: getStringArray(payload.warnings),
+    message: getString(payload.message),
+  }
+}
+
+export async function fetchActiveLocalModelRuntimeStatus(): Promise<LocalActiveModelRuntimeStatus> {
+  const payload = await requestJson<BackendLocalActiveModelRuntimeStatusResponse>('/models/local/active-runtime')
+  const normalized = normalizeLocalActiveModelRuntimeStatus(payload)
+  if (!normalized) {
+    throw new ApiError(500, 'Invalid active local model runtime status response', payload)
+  }
+  return normalized
+}
+
+export async function unloadActiveLocalModelRuntime(): Promise<LocalActiveModelRuntimeUnloadResult> {
+  const payload = await requestJson<BackendLocalActiveModelRuntimeUnloadResponse>(
+    '/models/local/active-runtime/unload',
+    { method: 'POST' }
+  )
+  const activeRuntime = normalizeLocalActiveModelRuntimeStatus(payload.active_runtime)
+  if (!activeRuntime) {
+    throw new ApiError(500, 'Invalid active local model runtime unload response', payload)
+  }
+  return {
+    type: getString(payload.type) ?? 'local_active_model_runtime_unload',
+    unloaded: getBoolean(payload.unloaded) ?? false,
+    activeRuntime,
+  }
+}
+
+interface BackendLocalModelConvertResponse {
+  type?: string
+  provider?: string
+  source_model_dir?: string
+  model_dir?: string
+  model_spec?: string
+  target_format?: string
+  quantization?: string | null
+  output_model_path?: string
+  output_model_spec?: string
+  output_path?: string
+  gguf_path?: string
+  persisted?: boolean
+  config_path?: string | null
+  warnings?: string[]
+  available_models?: BackendModelInfo[]
+  active_model?: BackendModelInfo | null
+}
+
+export interface LocalModelConvertInput {
+  sourceModelDir: string
+  targetFormat: 'gguf'
+  quantization: string
+  persist?: boolean
+}
+
+export interface LocalModelConvertResult {
+  type: string
+  provider: ModelProvider | null
+  sourceModelDir: string
+  targetFormat: string
+  quantization: string | null
+  outputPath: string | null
+  persisted: boolean
+  configPath: string | null
+  warnings: string[]
+  availableModels: ModelInfo[]
+  activeModel: ModelInfo | null
+}
+
+function normalizeProvider(value: unknown): ModelProvider | null {
+  const provider = getString(value)
+  if (
+    provider === 'ollama' ||
+    provider === 'openai_compat' ||
+    provider === 'gemini' ||
+    provider === 'anthropic' ||
+    provider === 'local'
+  ) {
+    return provider
+  }
+  return null
+}
+
+export async function convertLocalModel(input: LocalModelConvertInput): Promise<LocalModelConvertResult> {
+  const normalizedSource = input.sourceModelDir.trim()
+  const normalizedQuantization = input.quantization.trim()
+  const payload = await requestJson<BackendLocalModelConvertResponse>('/models/local/convert', {
+    method: 'POST',
+    body: JSON.stringify({
+      model_spec: normalizedSource,
+      source_model_dir: normalizedSource,
+      target_format: input.targetFormat,
+      quantization: normalizedQuantization,
+      persist: input.persist,
+    }),
+  }, 'direct')
+
+  return {
+    type: payload.type ?? 'local_model_convert',
+    provider: normalizeProvider(payload.provider),
+    sourceModelDir: getString(payload.source_model_dir) ?? getString(payload.model_dir) ?? normalizedSource,
+    targetFormat: getString(payload.target_format) ?? input.targetFormat,
+    quantization: getString(payload.quantization) ?? normalizedQuantization,
+    outputPath: (
+      getString(payload.output_model_path) ??
+      getString(payload.output_model_spec) ??
+      getString(payload.output_path) ??
+      getString(payload.gguf_path)
+    ),
+    persisted: Boolean(payload.persisted),
+    configPath: getString(payload.config_path),
+    warnings: getStringArray(payload.warnings),
+    availableModels: getRecordArray(payload.available_models).map((model) =>
+      normalizeModelInfo(model)
+    ).filter((model): model is ModelInfo => model !== null),
+    activeModel: normalizeModelInfo(payload.active_model ?? null),
   }
 }
 
@@ -1221,13 +2818,141 @@ interface BackendSettings {
   model: string
   model_config?: Record<string, ApiValue>
   model_setup?: Record<string, ApiValue>
+  locale_defaults?: Record<string, ApiValue>
+  agent?: Record<string, ApiValue>
   voice: Record<string, ApiValue>
   memory: Record<string, ApiValue>
   learning: Record<string, ApiValue>
+  tools?: Record<string, ApiValue>
+  local_models?: Record<string, ApiValue>
+  gguf?: Record<string, ApiValue>
+  vllm?: Record<string, ApiValue>
   channels: Record<string, ApiValue>
   web: Record<string, ApiValue>
+  security?: Record<string, ApiValue>
   paths?: Record<string, ApiValue>
   update?: Record<string, ApiValue>
+}
+
+export interface InferencePreset {
+  name: string
+  system_prompt: string
+  temperature: number
+  max_tokens: number
+  top_p: number
+  min_p: number
+  top_k: number
+  frequency_penalty: number
+  presence_penalty: number
+  repeat_penalty: number
+}
+
+export interface AgentSettings {
+  system_prompt: string
+  temperature: number
+  max_tokens: number
+  top_p: number
+  min_p: number
+  top_k: number
+  frequency_penalty: number
+  presence_penalty: number
+  repeat_penalty: number
+  show_token_stats: boolean
+  presets: InferencePreset[]
+  active_preset: string
+}
+
+export interface SecuritySettings {
+  require_approval_for_file_write: boolean
+  max_file_write_size_mb: number
+  file_ops_scope: 'workspace' | 'any'
+  file_undo_max_size_mb: number
+}
+
+export interface LocalModelSettings {
+  idle_unload_enabled: boolean
+  idle_unload_seconds: number | null
+}
+
+export interface GGUFSettings {
+  n_ctx: number
+}
+
+export interface VLLMSettings {
+  max_model_len: number | null
+}
+
+export interface ToolsSettings extends Record<string, unknown> {
+  web_search_engine?: string
+  web_search_fallback_engines?: string[]
+  web_search_searxng_base_url?: string | null
+  web_search_language?: string | null
+  web_search_region?: string | null
+  web_search_tavily_api_key_configured?: boolean
+  web_search_serper_api_key_configured?: boolean
+  web_search_jina_configured?: boolean
+  web_search_brave_api_key_configured?: boolean
+  web_search_jina_api_key_configured?: boolean
+  web_search_exa_api_key_configured?: boolean
+  web_search_searxng_configured?: boolean
+  web_search_duckduckgo_html_configured?: boolean
+  web_fetch_extractor?: 'trafilatura' | 'jina_reader' | 'htmlparser'
+  web_fetch_jina_api_key_configured?: boolean
+}
+
+export interface VoiceLocalTtsRecommendation extends Record<string, unknown> {
+  id: string
+  backend: string
+  label: string
+  default_voice?: string | null
+  default_model?: string | null
+  local?: boolean
+  priority?: number
+  summary?: string
+  notes: string[]
+}
+
+export interface VoiceExternalApiTtsPreset extends Record<string, unknown> {
+  id: string
+  backend: string
+  label: string
+  compatibility?: string
+  model?: string | null
+  voice?: string | null
+  summary?: string
+  requires_base_url?: boolean
+  requires_api_key?: boolean
+  apply_supported?: boolean
+  notes: string[]
+}
+
+export interface VoiceSettings extends Record<string, unknown> {
+  enabled?: boolean
+  stt_backend?: string
+  stt_model?: string
+  stt_language?: string
+  stt_device?: string
+  stt_model_cache_dir?: string
+  stt_model_path?: string
+  stt_openai_base_url?: string | null
+  stt_openai_api_key_configured?: boolean
+  stt_openai_timeout?: number
+  tts_backend?: string
+  tts_model?: string | null
+  tts_voice?: string
+  tts_language?: string | null
+  tts_speed?: number
+  tts_use_gpu?: boolean
+  tts_kokoro_lang_code?: string
+  tts_openai_base_url?: string | null
+  tts_openai_api_key_configured?: boolean
+  tts_openai_timeout?: number
+  tts_openai_response_format?: 'pcm' | 'wav'
+  reply_model_mode?: string
+  reply_model_id?: string | null
+  session_mode?: string
+  recommended_local_tts_backends?: VoiceLocalTtsRecommendation[]
+  external_api_tts_presets?: VoiceExternalApiTtsPreset[]
 }
 
 export interface Settings {
@@ -1235,11 +2960,18 @@ export interface Settings {
   model: string
   model_config?: Record<string, ApiValue>
   model_setup?: Record<string, ApiValue>
-  voice: Record<string, ApiValue>
+  locale_defaults?: Record<string, ApiValue>
+  agent?: AgentSettings
+  voice: VoiceSettings
   memory: Record<string, ApiValue>
   learning: Record<string, ApiValue>
+  tools?: ToolsSettings
+  local_models?: LocalModelSettings
+  gguf?: GGUFSettings
+  vllm?: VLLMSettings
   channels: Record<string, ApiValue>
   web: Record<string, ApiValue>
+  security?: SecuritySettings
   paths?: Record<string, ApiValue>
   update?: Record<string, ApiValue>
 }
@@ -1316,6 +3048,34 @@ export interface DiscordChannelSummary {
   activeRooms: DiscordVoiceRoomSummary[]
 }
 
+export interface VoiceRuntimeStatus {
+  type: string
+  phase: string | null
+  enabled: boolean | null
+  loaded: boolean | null
+  ready: boolean
+  error: string | null
+  configured: Record<string, unknown>
+  sessionDiagnostics: Record<string, unknown>
+  raw: Record<string, unknown>
+}
+
+export interface VoiceCatalogVoice {
+  id: string
+  name: string
+  backend: string
+  locale: string | null
+  source: string | null
+  path: string | null
+  isBuiltin: boolean
+  metadata: Record<string, unknown>
+}
+
+export interface VoiceCatalog {
+  type: string
+  voices: VoiceCatalogVoice[]
+}
+
 interface BackendChannelsStatus {
   type?: unknown
   phase?: unknown
@@ -1330,6 +3090,27 @@ interface BackendChannelsControlResponse {
   channel?: unknown
   running?: unknown
   running_channels?: unknown
+}
+
+interface BackendVoiceRuntimeStatus {
+  type?: unknown
+  phase?: unknown
+  enabled?: unknown
+  loaded?: unknown
+  ready?: unknown
+  error?: unknown
+  last_error?: unknown
+  lastLoadError?: unknown
+  last_load_error?: unknown
+  configured?: unknown
+  session_diagnostics?: unknown
+  sessionDiagnostics?: unknown
+}
+
+interface BackendVoiceCatalog {
+  type?: unknown
+  voices?: unknown
+  items?: unknown
 }
 
 export interface ChannelsStatus {
@@ -1424,6 +3205,98 @@ function normalizeDiscordVoiceRoom(room: Record<string, unknown>): DiscordVoiceR
       getStringField(room, ['speaking_state', 'speakingState', 'speaking_status', 'speakingStatus']) ??
       (getBooleanField(room, ['is_speaking', 'speaking']) === true ? 'speaking' : null),
     error: getStringField(room, ['last_error', 'lastError', 'error']),
+  }
+}
+
+function normalizeVoiceSettings(value: unknown): VoiceSettings {
+  if (!isRecord(value)) {
+    return {}
+  }
+
+  const settings: VoiceSettings = {
+    ...value,
+  }
+
+  const replyModelMode = getString(value.reply_model_mode) ?? getString(value.replyModelMode)
+  if (replyModelMode !== null) {
+    settings.reply_model_mode = replyModelMode
+  }
+
+  const replyModelId =
+    getString(value.reply_model_id) ??
+    getString(value.replyModelId) ??
+    null
+  settings.reply_model_id = replyModelId
+
+  const sessionMode = getString(value.session_mode) ?? getString(value.sessionMode)
+  if (sessionMode !== null) {
+    settings.session_mode = sessionMode
+  }
+
+  settings.recommended_local_tts_backends = getRecordArray(
+    value.recommended_local_tts_backends ?? value.recommendedLocalTtsBackends
+  )
+    .map(normalizeVoiceLocalTtsRecommendation)
+    .filter((recommendation): recommendation is VoiceLocalTtsRecommendation => recommendation !== null)
+
+  settings.external_api_tts_presets = getRecordArray(
+    value.external_api_tts_presets ?? value.externalApiTtsPresets
+  )
+    .map(normalizeVoiceExternalApiTtsPreset)
+    .filter((preset): preset is VoiceExternalApiTtsPreset => preset !== null)
+
+  return settings
+}
+
+function normalizeVoiceRecommendationNotes(value: unknown): string[] {
+  return getStringArray(value)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+}
+
+function normalizeVoiceLocalTtsRecommendation(value: Record<string, unknown>): VoiceLocalTtsRecommendation | null {
+  const backend = getNonEmptyString(value.backend)
+  const id = getNonEmptyString(value.id) ?? backend
+  const label = getNonEmptyString(value.label) ?? backend
+  if (!id || !backend || !label) {
+    return null
+  }
+
+  return {
+    ...value,
+    id,
+    backend,
+    label,
+    default_voice: getString(value.default_voice),
+    default_model: getString(value.default_model),
+    local: getBoolean(value.local) ?? undefined,
+    priority: getNumber(value.priority) ?? undefined,
+    summary: getString(value.summary) ?? undefined,
+    notes: normalizeVoiceRecommendationNotes(value.notes),
+  }
+}
+
+function normalizeVoiceExternalApiTtsPreset(value: Record<string, unknown>): VoiceExternalApiTtsPreset | null {
+  const backend = getNonEmptyString(value.backend)
+  const id = getNonEmptyString(value.id) ?? backend
+  const label = getNonEmptyString(value.label) ?? backend
+  if (!id || !backend || !label) {
+    return null
+  }
+
+  return {
+    ...value,
+    id,
+    backend,
+    label,
+    compatibility: getString(value.compatibility) ?? undefined,
+    model: getString(value.model),
+    voice: getString(value.voice),
+    summary: getString(value.summary) ?? undefined,
+    requires_base_url: getBoolean(value.requires_base_url) ?? undefined,
+    requires_api_key: getBoolean(value.requires_api_key) ?? undefined,
+    apply_supported: getBoolean(value.apply_supported) ?? undefined,
+    notes: normalizeVoiceRecommendationNotes(value.notes),
   }
 }
 
@@ -1559,6 +3432,92 @@ export function normalizeDiscordChannelStatus(
   }
 }
 
+function normalizeVoiceRuntimeStatus(payload: unknown): VoiceRuntimeStatus {
+  const record = isRecord(payload) ? payload : {}
+  const configured = isRecord(record.configured) ? record.configured : {}
+  const sessionDiagnostics =
+    (isRecord(record.session_diagnostics) ? record.session_diagnostics : null) ??
+    (isRecord(record.sessionDiagnostics) ? record.sessionDiagnostics : null) ??
+    {}
+  const error =
+    getString(record.error) ??
+    getString(record.last_error) ??
+    getString(record.last_load_error) ??
+    getString(record.lastLoadError)
+  const phase = getString(record.phase)
+  const enabled = getBoolean(record.enabled)
+  const loaded = getBoolean(record.loaded)
+  const explicitReady = getBoolean(record.ready)
+  const ready = explicitReady ?? (loaded === true && !error && phase !== 'error')
+
+  return {
+    type: getString(record.type) ?? 'voice_runtime_status',
+    phase,
+    enabled,
+    loaded,
+    ready: Boolean(ready),
+    error,
+    configured,
+    sessionDiagnostics,
+    raw: record,
+  }
+}
+
+function normalizeVoiceCatalogVoice(payload: unknown): VoiceCatalogVoice | null {
+  if (!isRecord(payload)) {
+    return null
+  }
+
+  const id =
+    getNonEmptyString(payload.id) ??
+    getNonEmptyString(payload.voice_id) ??
+    getNonEmptyString(payload.voiceId) ??
+    getNonEmptyString(payload.name) ??
+    getNonEmptyString(payload.label)
+  if (!id) {
+    return null
+  }
+
+  return {
+    id,
+    name:
+      getNonEmptyString(payload.name) ??
+      getNonEmptyString(payload.label) ??
+      id,
+    backend:
+      getNonEmptyString(payload.backend) ??
+      getNonEmptyString(payload.provider) ??
+      'unknown',
+    locale:
+      getNonEmptyString(payload.locale) ??
+      getNonEmptyString(payload.language),
+    source:
+      getNonEmptyString(payload.source) ??
+      getNonEmptyString(payload.origin),
+    path:
+      getNonEmptyString(payload.path) ??
+      getNonEmptyString(payload.model_path) ??
+      getNonEmptyString(payload.modelPath),
+    isBuiltin:
+      getBoolean(payload.is_builtin) ??
+      getBoolean(payload.builtin) ??
+      false,
+    metadata: isRecord(payload.metadata) ? payload.metadata : {},
+  }
+}
+
+function normalizeVoiceCatalog(payload: unknown): VoiceCatalog {
+  const record = isRecord(payload) ? payload : {}
+  const voices = getRecordArray(record.voices ?? record.items)
+    .map(normalizeVoiceCatalogVoice)
+    .filter((voice): voice is VoiceCatalogVoice => voice !== null)
+
+  return {
+    type: getString(record.type) ?? 'voice_catalog',
+    voices,
+  }
+}
+
 export async function fetchSettings(): Promise<Settings> {
   const payload = await requestJson<BackendSettings>('/settings')
   return {
@@ -1570,11 +3529,20 @@ export async function fetchSettings(): Promise<Settings> {
     model_setup: isRecord(payload.model_setup)
       ? payload.model_setup as Record<string, ApiValue>
       : undefined,
-    voice: payload.voice,
+    locale_defaults: isRecord(payload.locale_defaults)
+      ? payload.locale_defaults as Record<string, ApiValue>
+      : undefined,
+    agent: normalizeAgentSettings(payload.agent),
+    voice: normalizeVoiceSettings(payload.voice),
     memory: payload.memory,
     learning: payload.learning,
+    tools: isRecord(payload.tools) ? payload.tools as ToolsSettings : undefined,
+    local_models: normalizeLocalModelSettings(payload.local_models),
+    gguf: normalizeGgufSettings(payload.gguf),
+    vllm: normalizeVllmSettings(payload.vllm),
     channels: payload.channels,
     web: payload.web,
+    security: normalizeSecuritySettings(payload.security),
     paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }
@@ -1618,6 +3586,41 @@ export async function stopChannel(name: string): Promise<ChannelsControlResult> 
   }
 }
 
+export async function fetchVoiceStatus(): Promise<VoiceRuntimeStatus> {
+  const payload = await requestJson<BackendVoiceRuntimeStatus>('/voice/status')
+  return normalizeVoiceRuntimeStatus(payload)
+}
+
+export async function fetchVoiceCatalog(): Promise<VoiceCatalog> {
+  const payload = await requestJson<BackendVoiceCatalog>('/voice/voices')
+  return normalizeVoiceCatalog(payload)
+}
+
+export async function uploadVoicePack(file: File): Promise<VoiceCatalog> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  const payload = await requestJson<BackendVoiceCatalog>('/voice/voices/upload', {
+    method: 'POST',
+    body: form,
+  })
+  return normalizeVoiceCatalog(payload)
+}
+
+export async function registerVoicePackPath(path: string): Promise<VoiceCatalog> {
+  const payload = await requestJson<BackendVoiceCatalog>('/voice/voices/register-path', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  })
+  return normalizeVoiceCatalog(payload)
+}
+
+export async function deleteVoice(voiceId: string): Promise<VoiceCatalog> {
+  const payload = await requestJson<BackendVoiceCatalog>(`/voice/voices/${encodeURIComponent(voiceId)}`, {
+    method: 'DELETE',
+  })
+  return normalizeVoiceCatalog(payload)
+}
+
 export interface VoiceSettingsUpdate {
   enabled?: boolean
   stt_backend?: string
@@ -1626,6 +3629,9 @@ export interface VoiceSettingsUpdate {
   stt_device?: string
   stt_model_cache_dir?: string
   stt_model_path?: string
+  stt_openai_base_url?: string | null
+  stt_openai_api_key?: string | null
+  stt_openai_timeout?: number
   tts_backend?: string
   tts_model?: string | null
   tts_voice?: string
@@ -1634,7 +3640,12 @@ export interface VoiceSettingsUpdate {
   tts_use_gpu?: boolean
   tts_kokoro_lang_code?: string
   tts_openai_base_url?: string | null
+  tts_openai_api_key?: string | null
+  tts_openai_timeout?: number
   tts_openai_response_format?: 'pcm' | 'wav'
+  reply_model_mode?: string
+  reply_model_id?: string | null
+  session_mode?: string
 }
 
 export interface MemorySettingsUpdate {
@@ -1648,9 +3659,25 @@ export interface LearningSettingsUpdate {
   auto_extract_skills?: boolean
   auto_sync_filesystem_skills?: boolean
   min_steps_for_extraction?: number
+  min_tool_calls_for_extraction?: number
   trajectory_retention_days?: number
   skill_improvement_threshold?: number
   max_skills?: number
+}
+
+export interface ToolsSettingsUpdate {
+  web_search_engine?: string
+  web_search_fallback_engines?: string[]
+  web_search_tavily_api_key?: string | null
+  web_search_serper_api_key?: string | null
+  web_search_jina_api_key?: string | null
+  web_search_exa_api_key?: string | null
+  web_search_brave_api_key?: string | null
+  web_search_searxng_base_url?: string | null
+  web_search_language?: string | null
+  web_search_region?: string | null
+  web_fetch_extractor?: 'trafilatura' | 'jina_reader' | 'htmlparser'
+  web_fetch_jina_api_key?: string | null
 }
 
 export interface PathSettingsUpdate {
@@ -1660,10 +3687,59 @@ export interface PathSettingsUpdate {
   plugins_dir?: string
 }
 
+export interface InferencePresetInput {
+  name: string
+  system_prompt: string
+  temperature: number
+  max_tokens: number
+  top_p: number
+  min_p: number
+  top_k: number
+  frequency_penalty: number
+  presence_penalty: number
+  repeat_penalty: number
+}
+
+export interface AgentSettingsUpdate {
+  system_prompt?: string
+  temperature?: number
+  max_tokens?: number
+  top_p?: number
+  min_p?: number
+  top_k?: number
+  frequency_penalty?: number
+  presence_penalty?: number
+  repeat_penalty?: number
+  show_token_stats?: boolean
+  presets?: InferencePresetInput[]
+  active_preset?: string
+}
+
+export interface SecuritySettingsUpdate {
+  require_approval_for_file_write?: boolean
+  max_file_write_size_mb?: number
+  file_ops_scope?: 'workspace' | 'any'
+  file_undo_max_size_mb?: number
+}
+
+export interface UndoFileWriteInput {
+  file_path: string
+  original_content: string | null
+  session_id?: string
+  action: 'restore' | 'delete'
+  encoding?: string
+}
+
 export interface UpdateSettingsInput {
+  agent?: AgentSettingsUpdate
   voice?: VoiceSettingsUpdate
   memory?: MemorySettingsUpdate
   learning?: LearningSettingsUpdate
+  tools?: ToolsSettingsUpdate
+  local_models?: Partial<LocalModelSettings>
+  gguf?: Partial<GGUFSettings>
+  vllm?: Partial<VLLMSettings>
+  security?: SecuritySettingsUpdate
   paths?: PathSettingsUpdate
   download_missing_models?: boolean
   reload_voice?: boolean
@@ -1689,6 +3765,100 @@ export interface DiscordSetupInput {
   reload_voice?: boolean
 }
 
+function normalizeInferencePreset(value: unknown): InferencePreset | null {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const name = getNonEmptyString(value.name)
+  if (!name) {
+    return null
+  }
+
+  return {
+    name,
+    system_prompt: getString(value.system_prompt) ?? '',
+    temperature: getNumber(value.temperature) ?? 0.7,
+    max_tokens: getNumber(value.max_tokens) ?? 4096,
+    top_p: getNumber(value.top_p) ?? 1.0,
+    min_p: getNumber(value.min_p) ?? 0.0,
+    top_k: getNumber(value.top_k) ?? 0,
+    frequency_penalty: getNumber(value.frequency_penalty) ?? 0.0,
+    presence_penalty: getNumber(value.presence_penalty) ?? 0.0,
+    repeat_penalty: getNumber(value.repeat_penalty) ?? 1.0,
+  }
+}
+
+function normalizeAgentSettings(value: unknown): AgentSettings | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  const presets = getRecordArray(value.presets)
+    .map(normalizeInferencePreset)
+    .filter((preset): preset is InferencePreset => preset !== null)
+
+  return {
+    system_prompt: getString(value.system_prompt) ?? '',
+    temperature: getNumber(value.temperature) ?? 0.7,
+    max_tokens: getNumber(value.max_tokens) ?? 4096,
+    top_p: getNumber(value.top_p) ?? 1.0,
+    min_p: getNumber(value.min_p) ?? 0.0,
+    top_k: getNumber(value.top_k) ?? 0,
+    frequency_penalty: getNumber(value.frequency_penalty) ?? 0.0,
+    presence_penalty: getNumber(value.presence_penalty) ?? 0.0,
+    repeat_penalty: getNumber(value.repeat_penalty) ?? 1.0,
+    show_token_stats: getBoolean(value.show_token_stats) ?? false,
+    presets,
+    active_preset: getString(value.active_preset) ?? (presets[0]?.name ?? 'default'),
+  }
+}
+
+function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  return {
+    require_approval_for_file_write:
+      getBoolean(value.require_approval_for_file_write) ?? true,
+    max_file_write_size_mb: getNumber(value.max_file_write_size_mb) ?? 10.0,
+    file_ops_scope: getString(value.file_ops_scope) === 'any' ? 'any' : 'workspace',
+    file_undo_max_size_mb: getNumber(value.file_undo_max_size_mb) ?? 2.0,
+  }
+}
+
+function normalizeLocalModelSettings(value: unknown): LocalModelSettings | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  return {
+    idle_unload_enabled: getBoolean(value.idle_unload_enabled) ?? false,
+    idle_unload_seconds: getNumber(value.idle_unload_seconds),
+  }
+}
+
+function normalizeGgufSettings(value: unknown): GGUFSettings | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  return {
+    n_ctx: getNumber(value.n_ctx) ?? 4096,
+  }
+}
+
+function normalizeVllmSettings(value: unknown): VLLMSettings | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  return {
+    max_model_len: getNumber(value.max_model_len),
+  }
+}
+
 export async function updateSettings(input: UpdateSettingsInput): Promise<Settings> {
   const payload = await requestJson<BackendSettings>('/settings', {
     method: 'PATCH',
@@ -1701,14 +3871,31 @@ export async function updateSettings(input: UpdateSettingsInput): Promise<Settin
     model_config: isRecord(payload.model_config)
       ? payload.model_config as Record<string, ApiValue>
       : undefined,
-    voice: payload.voice,
+    model_setup: isRecord(payload.model_setup)
+      ? payload.model_setup as Record<string, ApiValue>
+      : undefined,
+    locale_defaults: isRecord(payload.locale_defaults)
+      ? payload.locale_defaults as Record<string, ApiValue>
+      : undefined,
+    agent: normalizeAgentSettings(payload.agent),
+    voice: normalizeVoiceSettings(payload.voice),
     memory: payload.memory,
     learning: payload.learning,
+    tools: isRecord(payload.tools) ? payload.tools as ToolsSettings : undefined,
+    local_models: normalizeLocalModelSettings(payload.local_models),
     channels: payload.channels,
     web: payload.web,
+    security: normalizeSecuritySettings(payload.security),
     paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }
+}
+
+export async function undoFileWrite(input: UndoFileWriteInput): Promise<Record<string, unknown>> {
+  return requestJson<Record<string, unknown>>('/tools/file/undo', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
 }
 
 export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> {
@@ -1723,11 +3910,19 @@ export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> 
     model_config: isRecord(payload.model_config)
       ? payload.model_config as Record<string, ApiValue>
       : undefined,
-    voice: payload.voice,
+    model_setup: isRecord(payload.model_setup)
+      ? payload.model_setup as Record<string, ApiValue>
+      : undefined,
+    locale_defaults: isRecord(payload.locale_defaults)
+      ? payload.locale_defaults as Record<string, ApiValue>
+      : undefined,
+    agent: normalizeAgentSettings(payload.agent),
+    voice: normalizeVoiceSettings(payload.voice),
     memory: payload.memory,
     learning: payload.learning,
     channels: payload.channels,
     web: payload.web,
+    security: normalizeSecuritySettings(payload.security),
     paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }

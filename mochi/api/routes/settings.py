@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -12,23 +13,36 @@ from mochi.api.server import _get_config, _maybe_await, _rebuild_channel_manager
 from mochi.config.defaults import DEFAULT_EDGE_TTS_VOICE_PRESETS
 from mochi.config.manager import save_config
 from mochi.config.schema import (
+    AgentConfig,
     ChannelsConfig,
     DiscordPlatformConfig,
+    GGUFConfig,
+    InferencePreset,
     LearningConfig,
+    LocalModelConfig,
     LocaleDefaultsConfig,
     MemoryConfig,
     MochiConfig,
+    RegisteredTTSVoiceConfig,
+    SecurityConfig,
     TelegramPlatformConfig,
+    ToolsConfig,
+    VLLMConfig,
     VoiceConfig,
 )
+from mochi.tools.web_search_providers import build_web_search_provider_status_payload
 from mochi.voice.model_manager import (
     ensure_model_available,
     ensure_qwen_model_available,
+    ensure_tts_runtime_available,
     resolve_bounded_stt_runtime_spec,
 )
+from mochi.voice.presets import get_voice_recommendations_payload
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS
 
 router = APIRouter(prefix="/v1", tags=["settings"])
+
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 WHISPER_MODEL_PRESETS = [
     "tiny",
@@ -67,6 +81,7 @@ STT_MODEL_PRESETS_BY_BACKEND: dict[str, list[str]] = {
     "whisperlivekit": WHISPER_MODEL_PRESETS,
     "whisper-cpp": WHISPER_MODEL_PRESETS,
     "openai-api": ["whisper-1"],
+    "external-api": ["whisper-1"],
     "qwen-asr": ["qwen3-asr-0.6b", "qwen3-asr-1.7b"],
     "vosk": [
         "vosk-model-small-cn-0.22",
@@ -78,6 +93,7 @@ TTS_MODEL_PRESETS_BY_BACKEND: dict[str, list[str]] = {
     "auto": ["none"],
     "edge-tts": ["none"],
     "openai-tts": ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"],
+    "external-api": ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"],
     "piper": ["none"],
     "coqui-tts": [
         "tts_models/en/ljspeech/tacotron2-DDC",
@@ -90,6 +106,7 @@ TTS_VOICE_PRESETS_BY_BACKEND: dict[str, list[str]] = {
     "auto": DEFAULT_EDGE_TTS_VOICE_PRESETS,
     "edge-tts": DEFAULT_EDGE_TTS_VOICE_PRESETS,
     "openai-tts": ["alloy", "verse", "aria", "coral", "sage", "nova", "shimmer"],
+    "external-api": ["alloy", "verse", "aria", "coral", "sage", "nova", "shimmer"],
     "piper": ["zh_CN-huayan-medium", "en_US-lessac-medium"],
     "coqui-tts": ["default"],
     "kokoro-tts": ["af_heart", "af_bella", "bf_emma", "am_adam", "bm_george"],
@@ -104,6 +121,7 @@ class VoiceSettingsPatch(BaseModel):
         "auto",
         "faster-whisper",
         "openai-api",
+        "external-api",
         "openai-whisper",
         "qwen-asr",
         "vosk",
@@ -115,10 +133,14 @@ class VoiceSettingsPatch(BaseModel):
     stt_device: str | None = None
     stt_model_cache_dir: str | None = None
     stt_model_path: str | None = None
+    stt_openai_base_url: str | None = None
+    stt_openai_api_key: SecretStr | None = None
+    stt_openai_timeout: float | None = Field(default=None, ge=0.0)
     tts_backend: Literal[
         "auto",
         "coqui-tts",
         "edge-tts",
+        "external-api",
         "kokoro-tts",
         "openai-tts",
         "piper",
@@ -130,7 +152,14 @@ class VoiceSettingsPatch(BaseModel):
     tts_use_gpu: bool | None = None
     tts_kokoro_lang_code: str | None = None
     tts_openai_base_url: str | None = None
+    tts_openai_api_key: SecretStr | None = None
+    tts_openai_timeout: float | None = Field(default=None, ge=0.0)
     tts_openai_response_format: Literal["pcm", "wav"] | None = None
+    reply_model_mode: Literal["inherit_active", "configured_model"] | None = None
+    reply_model_id: str | None = None
+    session_mode: Literal["append_current", "isolated_voice"] | None = None
+    voice_pack_dir: str | None = None
+    registered_tts_voices: list[RegisteredTTSVoiceConfig] | None = None
 
 
 class MemorySettingsPatch(BaseModel):
@@ -148,6 +177,7 @@ class LearningSettingsPatch(BaseModel):
     auto_extract_skills: bool | None = None
     auto_sync_filesystem_skills: bool | None = None
     min_steps_for_extraction: int | None = Field(default=None, ge=1, le=100)
+    min_tool_calls_for_extraction: int | None = Field(default=None, ge=0, le=100)
     trajectory_retention_days: int | None = Field(default=None, ge=1, le=3650)
     skill_improvement_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     max_skills: int | None = Field(default=None, ge=1, le=100_000)
@@ -162,6 +192,71 @@ class LocaleDefaultsSettingsPatch(BaseModel):
     response_language: str | None = Field(default=None, min_length=1)
     default_tts_voice: str | None = Field(default=None, min_length=1)
     timezone: str | None = Field(default=None, min_length=1)
+
+
+class AgentSettingsPatch(BaseModel):
+    """可由 WebGUI 更新的 agent 推理設定。"""
+
+    system_prompt: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    repeat_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+    show_token_stats: bool | None = None
+    presets: list[InferencePreset] | None = None
+    active_preset: str | None = None
+
+
+class SecuritySettingsPatch(BaseModel):
+    """可由 WebGUI 更新的非敏感安全設定。"""
+
+    require_approval_for_file_write: bool | None = None
+    max_file_write_size_mb: float | None = Field(default=None, ge=0.0)
+    file_ops_scope: Literal["workspace", "any"] | None = None
+    file_undo_max_size_mb: float | None = Field(default=None, ge=0.0)
+
+
+class ToolsSettingsPatch(BaseModel):
+    """供 WebGUI / TUI 更新 web search / fetch 工具設定。"""
+
+    web_search_engine: Literal[
+        "tavily", "serper", "jina", "exa",
+        "brave", "searxng", "duckduckgo", "duckduckgo_html",
+    ] | None = None
+    web_search_fallback_engines: list[str] | None = None
+    web_search_tavily_api_key: SecretStr | None = None
+    web_search_serper_api_key: SecretStr | None = None
+    web_search_jina_api_key: SecretStr | None = None
+    web_search_exa_api_key: SecretStr | None = None
+    web_search_brave_api_key: SecretStr | None = None
+    web_search_searxng_base_url: str | None = None
+    web_search_language: str | None = None
+    web_search_region: str | None = None
+    web_fetch_extractor: Literal["trafilatura", "jina_reader", "htmlparser"] | None = None
+    web_fetch_jina_api_key: SecretStr | None = None
+
+
+class LocalModelSettingsPatch(BaseModel):
+    """可由 WebGUI 更新的本地模型掛載/卸載設定。"""
+
+    idle_unload_enabled: bool | None = None
+    idle_unload_seconds: int | None = Field(default=None, ge=0, le=86_400)
+
+
+class GGUFSettingsPatch(BaseModel):
+    """GGUF runtime settings patch."""
+
+    n_ctx: int | None = Field(default=None, ge=1, le=262_144)
+
+
+class VLLMSettingsPatch(BaseModel):
+    """vLLM runtime settings patch."""
+
+    max_model_len: int | None = Field(default=None, ge=1, le=262_144)
 
 
 class PathSettingsPatch(BaseModel):
@@ -183,6 +278,7 @@ class DiscordChannelSettingsPatch(BaseModel):
     allowed_channel_ids: list[int] | None = None
     allowed_voice_channel_ids: list[int] | None = None
     allowed_user_ids: list[int] | None = None
+    admin_user_ids: list[int] | None = None
     rate_limit_per_user: int | None = Field(default=None, ge=1, le=10_000)
     message_mode: Literal["all_messages", "mentions_only", "slash_only"] | None = None
     auto_join_policy: Literal["manual_only"] | None = None
@@ -210,12 +306,18 @@ class ChannelsSettingsPatch(BaseModel):
 class UpdateSettingsRequest(BaseModel):
     """`PATCH /v1/settings` request payload。"""
 
+    agent: AgentSettingsPatch | None = None
     voice: VoiceSettingsPatch | None = None
     memory: MemorySettingsPatch | None = None
     learning: LearningSettingsPatch | None = None
     locale_defaults: LocaleDefaultsSettingsPatch | None = None
     paths: PathSettingsPatch | None = None
     channels: ChannelsSettingsPatch | None = None
+    security: SecuritySettingsPatch | None = None
+    tools: ToolsSettingsPatch | None = None
+    local_models: LocalModelSettingsPatch | None = None
+    gguf: GGUFSettingsPatch | None = None
+    vllm: VLLMSettingsPatch | None = None
     download_missing_models: bool = False
     reload_voice: bool = True
     persist: bool = True
@@ -263,7 +365,11 @@ async def update_settings(request: Request, payload: UpdateSettingsRequest) -> d
     config = await _get_config(request.app)
     updated = _apply_settings_patch(config, payload)
     _ensure_config_directories(updated)
-    download_result = await _maybe_prepare_voice_models(updated.voice, payload.download_missing_models)
+    download_result = await _maybe_prepare_voice_models(
+        updated.voice,
+        payload.download_missing_models,
+        prepare_tts=_payload_updates_tts(payload.voice),
+    )
 
     request.app.state.config = updated
     engine = getattr(request.app.state, "engine", None)
@@ -328,19 +434,25 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
     """建立 WebGUI 使用的非敏感設定 payload。"""
     trajectory_path = Path(config.workspace_dir).expanduser() / "trajectories.jsonl"
     skills_db_path = Path(config.skills_dir).expanduser() / "skills.db"
+    configured_provider = _configured_provider(config)
+    voice_recommendations = get_voice_recommendations_payload()
     return {
         "type": "settings",
         "model": config.model,
         "model_config": {
-            "provider": _configured_provider(config),
+            "provider": configured_provider,
             "ollama_base_url": config.ollama.base_url,
             "ollama_model": config.model.removeprefix("ollama:")
-            if config.model.startswith("ollama:")
+            if configured_provider == "ollama"
             else "",
             "openai_compat_provider": config.openai_compat.provider,
             "openai_compat_base_url": config.openai_compat.base_url,
             "openai_compat_model": config.openai_compat.model,
             "openai_compat_api_key_configured": config.openai_compat.api_key is not None,
+            "local_model_path": config.model
+            if configured_provider == "local"
+            else "",
+            "local_model_root": _local_model_root(config),
         },
         "model_setup": {
             "mode": config.model_setup.mode,
@@ -362,6 +474,20 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "default_tts_voice": config.locale_defaults.default_tts_voice,
             "timezone": config.locale_defaults.timezone,
         },
+        "agent": {
+            "system_prompt": config.agent.system_prompt,
+            "temperature": config.agent.temperature,
+            "max_tokens": config.agent.max_tokens,
+            "top_p": config.agent.top_p,
+            "min_p": config.agent.min_p,
+            "top_k": config.agent.top_k,
+            "frequency_penalty": config.agent.frequency_penalty,
+            "presence_penalty": config.agent.presence_penalty,
+            "repeat_penalty": config.agent.repeat_penalty,
+            "show_token_stats": config.agent.show_token_stats,
+            "presets": [preset.model_dump() for preset in config.agent.presets],
+            "active_preset": config.agent.active_preset,
+        },
         "voice": {
             "enabled": config.voice.enabled,
             "stt_backend": config.voice.stt_backend,
@@ -370,6 +496,9 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "stt_device": config.voice.stt_device,
             "stt_model_cache_dir": _stringify_path(config.voice.stt_model_cache_dir),
             "stt_model_path": _stringify_path(config.voice.stt_model_path),
+            "stt_openai_base_url": config.voice.stt_openai_base_url,
+            "stt_openai_api_key_configured": config.voice.stt_openai_api_key is not None,
+            "stt_openai_timeout": config.voice.stt_openai_timeout,
             "supported_stt_backends": sorted(SUPPORTED_STT_BACKENDS),
             "supported_stt_models_by_backend": STT_MODEL_PRESETS_BY_BACKEND,
             "tts_backend": config.voice.tts_backend,
@@ -380,10 +509,28 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "tts_use_gpu": config.voice.tts_use_gpu,
             "tts_kokoro_lang_code": config.voice.tts_kokoro_lang_code,
             "tts_openai_base_url": config.voice.tts_openai_base_url,
+            "tts_openai_api_key_configured": config.voice.tts_openai_api_key is not None,
+            "tts_openai_timeout": config.voice.tts_openai_timeout,
             "tts_openai_response_format": config.voice.tts_openai_response_format,
+            "reply_model_mode": config.voice.reply_model_mode,
+            "reply_model_id": config.voice.reply_model_id,
+            "session_mode": config.voice.session_mode,
+            "voice_pack_dir": _stringify_path(config.voice.voice_pack_dir),
+            "registered_tts_voices": [
+                {
+                    "id": voice.id,
+                    "backend": voice.backend,
+                    "path": str(voice.path),
+                    "label": voice.label,
+                    "source": voice.source,
+                }
+                for voice in config.voice.registered_tts_voices
+            ],
             "supported_tts_backends": sorted(SUPPORTED_TTS_BACKENDS),
             "supported_tts_models_by_backend": TTS_MODEL_PRESETS_BY_BACKEND,
             "supported_tts_voices_by_backend": TTS_VOICE_PRESETS_BY_BACKEND,
+            "recommended_local_tts_backends": voice_recommendations["recommended_local_tts_backends"],
+            "external_api_tts_presets": voice_recommendations["external_api_tts_presets"],
             "sample_rate": config.voice.sample_rate,
             "channels": config.voice.channels,
             "stt_runtime_spec": resolve_bounded_stt_runtime_spec(
@@ -401,20 +548,36 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
         },
         "tools": {
             "web_search_engine": config.tools.web_search_engine,
+            "web_search_fallback_engines": config.tools.web_search_fallback_engines,
             "web_search_searxng_base_url": config.tools.web_search_searxng_base_url,
-            "web_search_brave_api_key_configured": config.tools.web_search_brave_api_key
+            "web_search_language": config.tools.web_search_language,
+            "web_search_region": config.tools.web_search_region,
+            "web_fetch_extractor": config.tools.web_fetch_extractor,
+            "web_fetch_jina_api_key_configured": config.tools.web_fetch_jina_api_key
             is not None,
+            **build_web_search_provider_status_payload(config.tools),
         },
         "learning": {
             "enabled": config.learning.enabled,
             "auto_extract_skills": config.learning.auto_extract_skills,
             "auto_sync_filesystem_skills": config.learning.auto_sync_filesystem_skills,
             "min_steps_for_extraction": config.learning.min_steps_for_extraction,
+            "min_tool_calls_for_extraction": config.learning.min_tool_calls_for_extraction,
             "trajectory_retention_days": config.learning.trajectory_retention_days,
             "skill_improvement_threshold": config.learning.skill_improvement_threshold,
             "max_skills": config.learning.max_skills,
             "trajectory_path": str(trajectory_path),
             "skills_db_path": str(skills_db_path),
+        },
+        "local_models": {
+            "idle_unload_enabled": config.local_models.idle_unload_enabled,
+            "idle_unload_seconds": config.local_models.idle_unload_seconds,
+        },
+        "gguf": {
+            "n_ctx": config.gguf.n_ctx,
+        },
+        "vllm": {
+            "max_model_len": config.vllm.max_model_len,
         },
         "channels": {
             "discord": {
@@ -426,6 +589,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
                 "allowed_channel_ids": config.channels.discord.allowed_channel_ids,
                 "allowed_voice_channel_ids": config.channels.discord.allowed_voice_channel_ids,
                 "allowed_user_ids": config.channels.discord.allowed_user_ids,
+                "admin_user_ids": config.channels.discord.admin_user_ids,
                 "rate_limit_per_user": config.channels.discord.rate_limit_per_user,
                 "message_mode": config.channels.discord.message_mode,
                 "auto_join_policy": config.channels.discord.auto_join_policy,
@@ -444,6 +608,12 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "host": config.web.host,
             "port": config.web.port,
         },
+        "security": {
+            "require_approval_for_file_write": config.security.require_approval_for_file_write,
+            "max_file_write_size_mb": config.security.max_file_write_size_mb,
+            "file_ops_scope": config.security.file_ops_scope,
+            "file_undo_max_size_mb": config.security.file_undo_max_size_mb,
+        },
         "paths": {
             "workspace_dir": config.workspace_dir,
             "sessions_dir": config.sessions_dir,
@@ -455,6 +625,13 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
 
 def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -> MochiConfig:
     updates: dict[str, Any] = {}
+    if payload.agent is not None:
+        updates["agent"] = AgentConfig.model_validate(
+            {
+                **config.agent.model_dump(),
+                **payload.agent.model_dump(exclude_unset=True),
+            }
+        )
     if payload.voice is not None:
         voice_updates = payload.voice.model_dump(exclude_unset=True)
         voice_updates = _normalize_empty_paths(voice_updates, {"stt_model_path"})
@@ -478,6 +655,30 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
             {
                 **config.learning.model_dump(),
                 **payload.learning.model_dump(exclude_unset=True),
+            }
+        )
+
+    if payload.local_models is not None:
+        updates["local_models"] = LocalModelConfig.model_validate(
+            {
+                **config.local_models.model_dump(),
+                **payload.local_models.model_dump(exclude_unset=True),
+            }
+        )
+
+    if payload.gguf is not None:
+        updates["gguf"] = GGUFConfig.model_validate(
+            {
+                **config.gguf.model_dump(),
+                **payload.gguf.model_dump(exclude_unset=True),
+            }
+        )
+
+    if payload.vllm is not None:
+        updates["vllm"] = VLLMConfig.model_validate(
+            {
+                **config.vllm.model_dump(),
+                **payload.vllm.model_dump(exclude_unset=True),
             }
         )
 
@@ -516,6 +717,22 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
     if payload.paths is not None:
         updates.update(_normalize_empty_paths(payload.paths.model_dump(exclude_unset=True), set()))
 
+    if payload.security is not None:
+        updates["security"] = SecurityConfig.model_validate(
+            {
+                **config.security.model_dump(),
+                **payload.security.model_dump(exclude_unset=True),
+            }
+        )
+
+    if payload.tools is not None:
+        updates["tools"] = ToolsConfig.model_validate(
+            {
+                **config.tools.model_dump(),
+                **payload.tools.model_dump(exclude_unset=True),
+            }
+        )
+
     return config.model_copy(update=updates)
 
 
@@ -550,9 +767,34 @@ def _configured_provider(config: MochiConfig) -> str:
         return "ollama"
     if config.model.startswith(("http://", "https://")):
         return config.openai_compat.provider
+    if _looks_like_local_model_path(config.model):
+        return "local"
+    return "ollama"
+
+
+def _looks_like_local_model_path(value: str) -> bool:
+    """用路徑形狀判斷是否為本地模型 spec，避免把 Ollama 裸模型名誤判成 local。"""
+    raw = value.strip()
+    if not raw or raw.startswith(("ollama:", "http://", "https://")):
+        return False
+    normalized = raw.replace("\\", "/")
+    return (
+        raw.startswith(("/", "~/", "./", "../", "\\\\"))
+        or bool(_WINDOWS_ABSOLUTE_PATH_RE.match(raw))
+        or normalized.startswith("/mnt/")
+        or "/" in raw
+        or "\\" in raw
+    )
+
+
+def _local_model_root(config: MochiConfig) -> str:
+    """回傳目前 local model 的表單 root path。"""
+    if _configured_provider(config) != "local":
+        return ""
+    model_path = Path(config.model).expanduser()
     if config.model.lower().endswith(".gguf"):
-        return "gguf"
-    return "safetensors"
+        return str(model_path.parent)
+    return str(model_path.parent if model_path.name else model_path)
 
 
 def _persist_config_if_enabled(
@@ -578,19 +820,29 @@ def _normalize_empty_paths(values: dict[str, Any], nullable_path_keys: set[str])
 
 def _ensure_config_directories(config: MochiConfig) -> None:
     """建立設定指向的資料目錄，不建立模型檔本身。"""
-    Path(config.workspace_dir).expanduser().mkdir(parents=True, exist_ok=True)
-    Path(config.sessions_dir).expanduser().mkdir(parents=True, exist_ok=True)
-    Path(config.skills_dir).expanduser().mkdir(parents=True, exist_ok=True)
-    Path(config.plugins_dir).expanduser().mkdir(parents=True, exist_ok=True)
-    Path(config.memory.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-    Path(config.voice.stt_model_cache_dir).expanduser().mkdir(parents=True, exist_ok=True)
+    _mkdir_if_possible(Path(config.workspace_dir).expanduser())
+    _mkdir_if_possible(Path(config.sessions_dir).expanduser())
+    _mkdir_if_possible(Path(config.skills_dir).expanduser())
+    _mkdir_if_possible(Path(config.plugins_dir).expanduser())
+    _mkdir_if_possible(Path(config.memory.db_path).expanduser().parent)
+    _mkdir_if_possible(Path(config.voice.stt_model_cache_dir).expanduser())
+    _mkdir_if_possible(Path(config.voice.voice_pack_dir).expanduser())
     if config.voice.stt_model_path is not None:
-        Path(config.voice.stt_model_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        _mkdir_if_possible(Path(config.voice.stt_model_path).expanduser().parent)
+
+
+def _mkdir_if_possible(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        return
 
 
 async def _maybe_prepare_voice_models(
     voice: VoiceConfig,
     download_missing_models: bool,
+    *,
+    prepare_tts: bool = False,
 ) -> dict[str, Any]:
     backend = voice.stt_backend
     stt_cfg = {
@@ -601,36 +853,100 @@ async def _maybe_prepare_voice_models(
     if not download_missing_models:
         return {"requested": False, "status": "skipped"}
 
+    stt_result: dict[str, Any]
     if backend == "openai-whisper":
         updated = await ensure_model_available(stt_cfg, download_fn=_download_file)
-        return {
+        stt_result = {
             "requested": True,
             "status": "ready" if updated.get("model_path") else "not_supported",
             "model_path": updated.get("model_path"),
         }
-
-    if backend == "qwen-asr":
+    elif backend == "qwen-asr":
         updated = await ensure_qwen_model_available(stt_cfg, snapshot_fn=_snapshot_qwen_model)
         qwen_cfg = updated.get("qwen_asr", {})
         model_dir = qwen_cfg.get("model_dir") if isinstance(qwen_cfg, dict) else None
-        return {
+        stt_result = {
             "requested": True,
             "status": "ready" if model_dir else "not_supported",
             "model_path": model_dir,
         }
-
-    if backend in {"auto", "faster-whisper"}:
-        return {
+    elif backend in {"auto", "faster-whisper"}:
+        stt_result = {
             "requested": True,
             "status": "runtime_download_on_first_use",
             "model_cache_dir": str(voice.stt_model_cache_dir),
         }
+    else:
+        stt_result = {
+            "requested": True,
+            "status": "not_supported",
+            "reason": f"Automatic model download is not implemented for STT backend {backend!r}.",
+        }
 
-    return {
-        "requested": True,
-        "status": "not_supported",
-        "reason": f"Automatic model download is not implemented for STT backend {backend!r}.",
+    tts_result = (
+        await ensure_tts_runtime_available(voice)
+        if prepare_tts
+        else {
+            "requested": False,
+            "backend": str(voice.tts_backend),
+            "status": "skipped",
+        }
+    )
+    combined_status = _combine_voice_prepare_status(stt_result, tts_result)
+    payload: dict[str, Any] = {
+        "requested": bool(stt_result.get("requested")) or bool(tts_result.get("requested")),
+        "status": combined_status,
+        "stt": stt_result,
+        "tts": tts_result,
     }
+    if combined_status == "attention_required":
+        payload["message"] = _voice_prepare_attention_message(stt_result, tts_result)
+    return payload
+
+
+def _payload_updates_tts(payload: VoiceSettingsPatch | None) -> bool:
+    if payload is None:
+        return False
+    return any(
+        field_name.startswith("tts_")
+        or field_name in {"voice_pack_dir", "registered_tts_voices"}
+        for field_name in payload.model_fields_set
+    )
+
+
+def _combine_voice_prepare_status(
+    stt_result: dict[str, Any],
+    tts_result: dict[str, Any],
+) -> str:
+    statuses = [
+        str(stt_result.get("status", "")).strip(),
+        str(tts_result.get("status", "")).strip(),
+    ]
+    if "prepare_failed" in statuses:
+        return "attention_required"
+    if "runtime_download_on_first_use" in statuses:
+        return "runtime_download_on_first_use"
+    if "ready" in statuses:
+        return "ready"
+    for candidate in statuses:
+        if candidate and candidate != "skipped":
+            return candidate
+    return "skipped"
+
+
+def _voice_prepare_attention_message(
+    stt_result: dict[str, Any],
+    tts_result: dict[str, Any],
+) -> str:
+    for label, result in (("STT", stt_result), ("TTS", tts_result)):
+        if str(result.get("status", "")).strip() != "prepare_failed":
+            continue
+        error = str(result.get("error", "")).strip()
+        backend = str(result.get("backend", "")).strip()
+        if backend:
+            return f"{label} backend {backend} could not be prepared automatically: {error}"
+        return f"{label} backend could not be prepared automatically: {error}"
+    return "One or more voice backends could not be prepared automatically."
 
 
 async def _download_file(model_name: str, model_url: str, target: Path) -> None:

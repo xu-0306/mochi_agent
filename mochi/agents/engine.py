@@ -7,10 +7,16 @@ import inspect
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+import tempfile
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    logger = logging.getLogger(__name__)
 from pydantic import SecretStr
 
 from mochi.agents.compaction import ConversationCompactor
@@ -25,9 +31,16 @@ from mochi.agents.events import (
 )
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
+from mochi.backends.base import BaseLLMBackend
 from mochi.backends.router import BackendRouter
 from mochi.backends.types import Message, ModelInfo
-from mochi.config.schema import MochiConfig
+from mochi.backends.vllm_runtime import ManagedVLLMRuntimeManager
+from mochi.backends.vllm_utils import (
+    configured_vllm_launch_mode,
+    managed_vllm_base_url,
+    resolve_vllm_managed_model_spec,
+)
+from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.learning.evaluator import OutcomeEvaluator
 from mochi.learning.extractor import SkillExtractor
 from mochi.learning.improver import SkillImprover
@@ -37,22 +50,14 @@ from mochi.learning.trajectory import TrajectoryLogger
 from mochi.learning.types import Trajectory, TrajectoryStep
 from mochi.memory.conversation import ConversationMemory
 from mochi.memory.store import MemoryStore
+from mochi.projects.execution_scope import ExecutionScopeResolver
+from mochi.projects.store import ProjectStore
 from mochi.sessions.store import SessionStore
-from mochi.tools.execute_code import ExecuteCodeTool
-from mochi.tools.file_ops import FileReadTool, FileWriteTool
-from mochi.tools.literature_search import (
-    ArxivSearchTool,
-    CrossrefSearchTool,
-    PubMedSearchTool,
-    SemanticScholarSearchTool,
-)
-from mochi.tools.mcp_client import MCPCallTool
-from mochi.tools.memory_save import MemorySaveTool
-from mochi.tools.memory_search import MemorySearchTool
+from mochi.agents.tool_exposure import ToolExposurePlanner
+from mochi.tools.base import ToolExecutionContext
+from mochi.tools.mcp_client import McpRuntimeManager
 from mochi.tools.registry import ToolRegistry
-from mochi.tools.shell import ShellTool
-from mochi.tools.web_fetch import WebFetchTool
-from mochi.tools.web_search import WebSearchTool
+from mochi.tools.registry_factory import ToolRegistryFactory
 from mochi.voice.events import VoiceEvent
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS, VoiceRouter
 from mochi.voice.session_manager import VoiceSessionManager
@@ -73,6 +78,8 @@ class AgentEngine:
         voice_vad: object | None = None,
         voice_stt: object | None = None,
         voice_tts: object | None = None,
+        vllm_runtime_manager: object | None = None,
+        mcp_runtime_manager: McpRuntimeManager | None = None,
     ) -> None:
         """初始化 AgentEngine（同步部分）。
 
@@ -88,15 +95,31 @@ class AgentEngine:
                 if config.openai_compat.api_key is not None
                 else ""
             ),
+            gguf_config=config.gguf,
+            huggingface_config=config.huggingface,
+            llama_cpp_runtime=config.local_models.llama_cpp,
+            workspace_dir=config.workspace_dir,
+            local_model_idle_unload_enabled=config.local_models.idle_unload_enabled,
+            local_model_idle_unload_seconds=config.local_models.idle_unload_seconds,
         )
-        self._tool_registry = ToolRegistry(
-            extra_dirs=config.tools.extra_tools_dirs or None,
-            discover_builtin=False,
+        logger.info(
+            "AgentEngine state roots: workspace={} sessions={} skills={} plugins={}",
+            config.workspace_dir,
+            config.sessions_dir,
+            config.skills_dir,
+            config.plugins_dir,
         )
         self._prompt_builder = PromptBuilder(config.agent.system_prompt)
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
         self._session_store = SessionStore(sessions_dir=config.sessions_dir)
+        self._project_store = ProjectStore(Path(config.workspace_dir).expanduser() / "projects.json")
+        self._execution_scope_resolver = ExecutionScopeResolver(
+            default_workspace_dir=config.workspace_dir,
+            session_store=self._session_store,
+            project_store=self._project_store,
+        )
         self._contexts: dict[str, ContextManager] = {}
+        self._tool_execution_contexts: dict[tuple[str, str], ToolExecutionContext] = {}
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
         self._skill_loader = self._make_skill_loader()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
@@ -110,8 +133,18 @@ class AgentEngine:
         self._voice_router: VoiceRouter | None = None
         self._voice_last_load_error: str | None = None
         self._voice_session_manager = VoiceSessionManager()
+        self._vllm_runtime_manager = vllm_runtime_manager
+        self._mcp_runtime_manager = mcp_runtime_manager
+        self._tool_registry_factory = ToolRegistryFactory(
+            config,
+            memory_store=self._memory_store,
+            mcp_runtime_manager=self._mcp_runtime_manager,
+        )
+        self._tool_registry = self._tool_registry_factory.create_registry(config.workspace_dir)
+        self._tool_exposure_planner = ToolExposurePlanner(
+            tool_groups=self._tool_registry_factory.tool_groups,
+        )
         self._initialized = False
-        self._register_builtin_tools()
 
     async def initialize(self) -> None:
         """非同步初始化：載入後端並完成準備。"""
@@ -123,12 +156,36 @@ class AgentEngine:
         self,
         message: str,
         session_id: str | None = None,
+        inference_overrides: dict[str, Any] | None = None,
+        project_id: str | None = None,
+        workspace_dir: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        async for event in self._run_chat(
+            message,
+            session_id=session_id,
+            inference_overrides=inference_overrides,
+            project_id=project_id,
+            workspace_dir=workspace_dir,
+            backend_override=None,
+        ):
+            yield event
+
+    async def _run_chat(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        inference_overrides: dict[str, Any] | None = None,
+        project_id: str | None = None,
+        workspace_dir: str | None = None,
+        backend_override: BaseLLMBackend | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """執行單輪對話，回傳事件串流。
 
         Args:
             message: 使用者輸入文字。
             session_id: 會話 ID（預留，Phase 2 實作持久化）。
+            inference_overrides: 推理參數覆蓋（per-request）。
 
         Yields:
             AgentEvent 事件流。
@@ -144,44 +201,88 @@ class AgentEngine:
             memory_top_k=self._config.memory.fts_top_k,
         )
         skills_context = await self._build_skills_context(message)
+        resolved = self._resolve_inference_params(inference_overrides)
         system_prompt = self._prompt_builder.build_system_prompt(
             skills_context=skills_context,
             memory_context=self._merge_memory_and_summary_context(
                 memory_context=prompt_context.memory_context,
                 summary=prompt_context.summary,
             ),
+            base_prompt=resolved["system_prompt"],
         )
         trajectory_id = self._start_trajectory(message)
         turn_id = str(uuid4())
         turn_event_seq = 0
         user_msg = Message(role="user", content=message)
         await self._persist_session_message(session_key, user_msg, turn_id=turn_id)
+        scope = await self._execution_scope_resolver.resolve(
+            session_id=session_key,
+            project_id=project_id,
+            workspace_dir=workspace_dir,
+        )
+        effective_workspace_dir = scope.workspace_dir
+        session_bound_workspace = (
+            scope.project_id is not None
+            or effective_workspace_dir != self._config.workspace_dir
+        )
+        workspace_registry = self._tool_registry
+        owns_workspace_registry = False
+        if effective_workspace_dir != self._config.workspace_dir:
+            workspace_registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
+            owns_workspace_registry = True
+        tool_execution_context = self._get_tool_execution_context(
+            session_id=session_key,
+            workspace_dir=effective_workspace_dir,
+        )
+        active_backend = backend_override or self._router.active
+        exposure_plan = self._tool_exposure_planner.plan(
+            message=message,
+            available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
+            backend=active_backend,
+            session_bound_workspace=session_bound_workspace,
+        )
+        tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
 
         react_loop = AsyncReActLoop(
-            backend=self._router.active,
-            tool_registry=self._tool_registry,
+            backend=active_backend,
+            tool_registry=tool_registry,
+            tool_execution_context=tool_execution_context,
             max_iterations=self._config.agent.max_react_iterations,
         )
 
         final_text = ""
-        async for event in react_loop.run(
-            system_prompt=system_prompt,
-            history=prompt_context.history,
-            user_message=message,
-        ):
-            self._log_agent_event(trajectory_id, event)
-            if isinstance(event, FinalAnswerEvent):
-                final_text = event.content
-                event.trajectory_id = trajectory_id
-            event.turn_id = turn_id  # type: ignore[attr-defined]
-            turn_event_seq += 1
-            await self._persist_turn_event(
-                session_key,
-                event,
-                turn_id=turn_id,
-                seq=turn_event_seq,
-            )
-            yield event
+        await self._router.mark_backend_busy(active_backend)
+        try:
+            async for event in react_loop.run(
+                system_prompt=system_prompt,
+                history=prompt_context.history,
+                user_message=message,
+                temperature=resolved["temperature"],
+                max_tokens=resolved["max_tokens"],
+                top_p=resolved["top_p"],
+                min_p=resolved["min_p"],
+                top_k=resolved["top_k"],
+                frequency_penalty=resolved["frequency_penalty"],
+                presence_penalty=resolved["presence_penalty"],
+                repeat_penalty=resolved["repeat_penalty"],
+            ):
+                self._log_agent_event(trajectory_id, event)
+                if isinstance(event, FinalAnswerEvent):
+                    final_text = event.content
+                    event.trajectory_id = trajectory_id
+                event.turn_id = turn_id  # type: ignore[attr-defined]
+                turn_event_seq += 1
+                await self._persist_turn_event(
+                    session_key,
+                    event,
+                    turn_id=turn_id,
+                    seq=turn_event_seq,
+                )
+                yield event
+        finally:
+            await self._router.mark_backend_idle(active_backend)
+            if owns_workspace_registry:
+                await self._close_tool_registry(workspace_registry)
 
         await self._finish_learning_cycle(trajectory_id)
 
@@ -197,27 +298,37 @@ class AgentEngine:
         self._initialized = True
         return backend.get_model_info()
 
+    async def unload_active_local_model(self) -> ModelInfo | None:
+        """手動卸載目前 active 的本地模型。"""
+        backend = await self._router.unload_active_local_model()
+        if backend is None:
+            return None
+        return backend.get_model_info()
+
     def get_model_info(self) -> ModelInfo:
         """回傳目前活躍模型資訊；尚未初始化時依 config 產生摘要。"""
         if self._initialized:
             return self._router.active.get_model_info()
 
-        model_spec = self._config.model
-        if model_spec.startswith("ollama:"):
-            return ModelInfo(
-                name=model_spec[len("ollama:"):],
-                backend_type="ollama",
-                supports_tool_calling=True,
-            )
-        if model_spec.startswith(("http://", "https://")):
-            return ModelInfo(
-                name=model_spec,
-                backend_type="openai_compat",
-                supports_tool_calling=True,
-            )
-        if model_spec.lower().endswith(".gguf"):
-            return ModelInfo(name=model_spec, backend_type="gguf")
-        return ModelInfo(name=model_spec, backend_type="safetensors")
+        try:
+            return self._router._resolve(self._config.model).get_model_info()  # noqa: SLF001
+        except ValueError:
+            model_spec = self._config.model
+            if model_spec.startswith("ollama:"):
+                return ModelInfo(
+                    name=model_spec[len("ollama:"):],
+                    backend_type="ollama",
+                    supports_tool_calling=True,
+                )
+            if model_spec.startswith(("http://", "https://")):
+                return ModelInfo(
+                    name=model_spec,
+                    backend_type="openai_compat",
+                    supports_tool_calling=True,
+                )
+            if model_spec.lower().endswith(".gguf"):
+                return ModelInfo(name=model_spec, backend_type="gguf")
+            return ModelInfo(name=model_spec, backend_type="safetensors")
 
     async def switch_ollama_backend(
         self,
@@ -239,7 +350,7 @@ class AgentEngine:
         base_url: str,
         model: str,
         api_key: str = "",
-        provider: Literal["openai_compat", "gemini", "anthropic"] = "openai_compat",
+        provider: Literal["openai_compat", "gemini", "anthropic", "vllm"] = "openai_compat",
     ) -> ModelInfo:
         """以 OpenAI-compatible API 設定切換活躍後端。"""
         backend = await self._router.switch_openai_compat(
@@ -252,7 +363,7 @@ class AgentEngine:
         self._config.openai_compat.base_url = normalized_base_url
         self._config.openai_compat.model = model.strip()
         self._config.openai_compat.provider = cast(
-            Literal["openai_compat", "gemini", "anthropic"],
+            Literal["openai_compat", "gemini", "anthropic", "vllm"],
             provider,
         )
         if api_key:
@@ -280,14 +391,52 @@ class AgentEngine:
     async def apply_config(self, config: MochiConfig, *, reload_voice: bool = False) -> None:
         """套用新的 runtime 設定，並重建與路徑相關的共享元件。"""
         previous_voice = self._config.voice
+        previous_router_config = (
+            self._config.model,
+            self._config.ollama.model_dump(),
+            self._config.openai_compat.model_dump(),
+            self._config.gguf.model_dump(),
+            self._config.huggingface.model_dump(),
+            self._config.local_models.model_dump(),
+            self._config.workspace_dir,
+        )
         self._config = config
+        self._prompt_builder = PromptBuilder(config.agent.system_prompt)
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
         self._session_store = SessionStore(sessions_dir=config.sessions_dir)
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
         self._skill_loader = self._make_skill_loader()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
         self._contexts.clear()
+        self._tool_execution_contexts.clear()
         self._register_builtin_tools()
+        self._router.apply_settings(
+            ollama_base_url=config.ollama.base_url,
+            openai_default_model=config.openai_compat.model,
+            openai_api_key=(
+                config.openai_compat.api_key.get_secret_value()
+                if config.openai_compat.api_key is not None
+                else ""
+            ),
+            gguf_config=config.gguf,
+            huggingface_config=config.huggingface,
+            llama_cpp_runtime=config.local_models.llama_cpp,
+            workspace_dir=config.workspace_dir,
+            local_model_idle_unload_enabled=config.local_models.idle_unload_enabled,
+            local_model_idle_unload_seconds=config.local_models.idle_unload_seconds,
+        )
+
+        current_router_config = (
+            config.model,
+            config.ollama.model_dump(),
+            config.openai_compat.model_dump(),
+            config.gguf.model_dump(),
+            config.huggingface.model_dump(),
+            config.local_models.model_dump(),
+            config.workspace_dir,
+        )
+        if self._initialized and current_router_config != previous_router_config:
+            await self._router.load(config.model)
 
         if reload_voice or config.voice != previous_voice:
             await self._voice_session_manager.release_all()
@@ -386,20 +535,25 @@ class AgentEngine:
 
     async def close(self) -> None:
         """釋放所有資源。"""
-        for tool in self._tool_registry.list_tools():
+        await self._close_tool_registry(self._tool_registry)
+        await self._router.close()
+        if self._initialized:
+            logger.info("AgentEngine closed.")
+        await self._voice_session_manager.release_all()
+        if self._voice_router is not None:
+            await self._voice_router.close()
+            self._voice_router = None
+        await self._stop_vllm_runtime_manager()
+
+    async def _close_tool_registry(self, registry: ToolRegistry) -> None:
+        """Close tool instances registered in one registry."""
+        for tool in registry.list_tools():
             close_method = getattr(tool, "close", None)
             if close_method is None:
                 continue
             maybe_awaitable = close_method()
             if inspect.isawaitable(maybe_awaitable):
                 await maybe_awaitable
-        if self._initialized:
-            await self._router.active.close()
-            logger.info("AgentEngine closed.")
-        await self._voice_session_manager.release_all()
-        if self._voice_router is not None:
-            await self._voice_router.close()
-            self._voice_router = None
 
     def _skills_db_path(self) -> Path:
         """取得本地技能庫 SQLite 路徑。"""
@@ -408,6 +562,47 @@ class AgentEngine:
     def _trajectories_jsonl_path(self) -> Path:
         """取得本地 trajectory JSONL 路徑。"""
         return Path(self._config.workspace_dir).expanduser() / "trajectories.jsonl"
+
+    def _resolve_inference_params(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
+        """解析本輪推理參數（override > active preset > default）。"""
+        agent = self._config.agent
+        resolved = {
+            "system_prompt": agent.system_prompt,
+            "temperature": agent.temperature,
+            "max_tokens": agent.max_tokens,
+            "top_p": agent.top_p,
+            "min_p": agent.min_p,
+            "top_k": agent.top_k,
+            "frequency_penalty": agent.frequency_penalty,
+            "presence_penalty": agent.presence_penalty,
+            "repeat_penalty": agent.repeat_penalty,
+        }
+
+        preset = next(
+            (candidate for candidate in agent.presets if candidate.name == agent.active_preset),
+            None,
+        )
+        if preset is not None:
+            resolved.update(
+                {
+                    "temperature": preset.temperature,
+                    "max_tokens": preset.max_tokens,
+                    "top_p": preset.top_p,
+                    "min_p": preset.min_p,
+                    "top_k": preset.top_k,
+                    "frequency_penalty": preset.frequency_penalty,
+                    "presence_penalty": preset.presence_penalty,
+                    "repeat_penalty": preset.repeat_penalty,
+                }
+            )
+            if preset.system_prompt:
+                resolved["system_prompt"] = preset.system_prompt
+
+        if overrides:
+            for key, value in overrides.items():
+                resolved[key] = value
+
+        return resolved
 
     async def _build_skills_context(self, message: str) -> str:
         """搜尋相關技能並格式化為 system prompt context。"""
@@ -531,6 +726,9 @@ class AgentEngine:
             return
         if len(trajectory.steps) < self._config.learning.min_steps_for_extraction:
             return
+        tool_call_count = sum(1 for step in trajectory.steps if step.step_type == "tool_call")
+        if tool_call_count < self._config.learning.min_tool_calls_for_extraction:
+            return
         try:
             extracted = await self._skill_extractor.extract(trajectory, self._router.active)
             matches = await self._skill_library.search(
@@ -567,13 +765,27 @@ class AgentEngine:
             )
         )
         self._tool_registry.register(
-            FileReadTool(workspace_dir=self._config.workspace_dir)
+            FileReadTool(
+                workspace_dir=self._config.workspace_dir,
+                path_scope=self._config.security.file_ops_scope,
+            )
         )
         self._tool_registry.register(
             FileWriteTool(
                 workspace_dir=self._config.workspace_dir,
+                path_scope=self._config.security.file_ops_scope,
                 require_approval=self._config.security.require_approval_for_file_write,
                 max_write_size_mb=self._config.security.max_file_write_size_mb,
+                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
+            )
+        )
+        self._tool_registry.register(
+            FileEditTool(
+                workspace_dir=self._config.workspace_dir,
+                path_scope=self._config.security.file_ops_scope,
+                require_approval=self._config.security.require_approval_for_file_write,
+                max_write_size_mb=self._config.security.max_file_write_size_mb,
+                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
             )
         )
 
@@ -638,7 +850,14 @@ class AgentEngine:
         )
 
         # --- MCP ---
-        self._tool_registry.register(MCPCallTool())
+        if self._mcp_runtime_manager is not None:
+            self._tool_registry.register(MCPCallTool(runtime=self._mcp_runtime_manager))
+            self._tool_registry.register(McpListResourcesTool(runtime=self._mcp_runtime_manager))
+            self._tool_registry.register(McpReadResourceTool(runtime=self._mcp_runtime_manager))
+            for tool in self._mcp_runtime_manager.materialize_tools():
+                self._tool_registry.register(tool)
+        else:
+            self._tool_registry.register(MCPCallTool())
 
         # --- 記憶 ---
         self._tool_registry.register(
@@ -658,6 +877,106 @@ class AgentEngine:
         # --- 實用工具 ---
         self._tool_registry.register(CalculatorTool())
         self._tool_registry.register(DateTimeTool())
+
+    def _build_tool_registry_for_workspace(self, workspace_dir: str) -> ToolRegistry:
+        """Build a tool registry for one effective workspace."""
+        registry = ToolRegistry(
+            extra_dirs=self._config.tools.extra_tools_dirs or None,
+            discover_builtin=False,
+        )
+
+        for tool in self._tool_registry.list_tools():
+            if tool.name in {
+                "shell",
+                "file_read",
+                "file_write",
+                "file_edit",
+                "execute_code",
+                "memory_search",
+                "memory_save",
+            }:
+                continue
+            registry.register(tool)
+
+        registry.register(
+            ShellTool(
+                allowlist=self._config.security.shell_command_allowlist,
+                workspace_dir=workspace_dir,
+                require_approval=self._config.security.require_approval_for_shell,
+            )
+        )
+        registry.register(
+            FileReadTool(
+                workspace_dir=workspace_dir,
+                path_scope=self._config.security.file_ops_scope,
+            )
+        )
+        registry.register(
+            FileWriteTool(
+                workspace_dir=workspace_dir,
+                path_scope=self._config.security.file_ops_scope,
+                require_approval=self._config.security.require_approval_for_file_write,
+                max_write_size_mb=self._config.security.max_file_write_size_mb,
+                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
+            )
+        )
+        registry.register(
+            FileEditTool(
+                workspace_dir=workspace_dir,
+                path_scope=self._config.security.file_ops_scope,
+                require_approval=self._config.security.require_approval_for_file_write,
+                max_write_size_mb=self._config.security.max_file_write_size_mb,
+                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
+            )
+        )
+        registry.register(
+            ExecuteCodeTool(
+                workspace_dir=workspace_dir,
+                require_approval=self._config.security.require_approval_for_shell,
+            )
+        )
+        registry.register(
+            MemorySearchTool(
+                memory_store=self._memory_store,
+                workspace_dir=workspace_dir,
+                default_top_k=self._config.memory.fts_top_k,
+            )
+        )
+        registry.register(
+            MemorySaveTool(
+                memory_store=self._memory_store,
+                workspace_dir=workspace_dir,
+            )
+        )
+
+        return registry
+
+    def _get_tool_execution_context(
+        self,
+        *,
+        session_id: str,
+        workspace_dir: str,
+    ) -> ToolExecutionContext:
+        key = (session_id, str(workspace_dir))
+        existing = self._tool_execution_contexts.get(key)
+        if existing is not None:
+            return existing
+
+        context = ToolExecutionContext(
+            workspace_dir=str(workspace_dir),
+            session_id=session_id,
+            project_workspace=str(workspace_dir),
+            tool_result_store_dir=str(
+                Path(tempfile.gettempdir()) / "mochi-tool-results" / session_id
+            ),
+            permission_policy={
+                "require_approval_for_file_write": self._config.security.require_approval_for_file_write,
+                "require_approval_for_shell": self._config.security.require_approval_for_shell,
+                "file_ops_scope": self._config.security.file_ops_scope,
+            },
+        )
+        self._tool_execution_contexts[key] = context
+        return context
 
     async def _get_context(self, session_id: str) -> ContextManager:
         """取得或建立指定 session 的上下文管理器。"""
@@ -789,6 +1108,7 @@ class AgentEngine:
                 "tool_name": event.tool_name,
                 "result": copy.deepcopy(event.result),
                 "error": event.error,
+                "metadata": copy.deepcopy(event.metadata),
             }
         if isinstance(event, FinalAnswerEvent):
             return "final_answer", {
@@ -805,11 +1125,32 @@ class AgentEngine:
         if self._voice_stt is None or self._voice_tts is None:
             raise RuntimeError("Voice STT/TTS is not initialized.")
 
+        async def _voice_agent_chat(
+            message: str,
+            session_id: str | None = None,
+        ) -> AsyncIterator[AgentEvent]:
+            resolved_session_id = self._resolve_voice_agent_session_id(session_id)
+            reply_backend = await self._acquire_voice_reply_backend()
+            if reply_backend is None:
+                async for event in self.chat(message, session_id=resolved_session_id):
+                    yield event
+                return
+
+            try:
+                async for event in self._run_chat(
+                    message,
+                    session_id=resolved_session_id,
+                    backend_override=reply_backend,
+                ):
+                    yield event
+            finally:
+                await reply_backend.close()
+
         return VoiceSession(
             vad=self._acquire_voice_vad(),
             stt=self._voice_stt,
             tts=self._voice_tts,
-            agent_chat=self.chat,
+            agent_chat=_voice_agent_chat,
             sample_rate=self._config.voice.sample_rate,
         )
 
@@ -846,6 +1187,140 @@ class AgentEngine:
                 return vad
             raise RuntimeError("Voice VAD is not initialized.")
         return self._voice_vad_factory()
+
+    def _resolve_voice_agent_session_id(self, session_id: str | None) -> str | None:
+        if self._config.voice.session_mode != "isolated_voice":
+            return session_id
+        return f"voice::{session_id or 'default'}"
+
+    async def _acquire_voice_reply_backend(self) -> BaseLLMBackend | None:
+        if self._config.voice.reply_model_mode == "inherit_active":
+            return None
+        model_id = self._config.voice.reply_model_id
+        if not model_id:
+            raise RuntimeError("voice.reply_model_id is required when reply_model_mode=configured_model.")
+        configured_model = self._find_configured_model(model_id)
+        if configured_model is None:
+            raise RuntimeError(f"Voice reply model {model_id!r} is not configured.")
+
+        resolved_model_spec = configured_model.model_spec
+        resolved_model_name = configured_model.model
+        resolved_base_url = configured_model.base_url
+        if (
+            configured_model.provider == "vllm"
+            and configured_vllm_launch_mode(configured_model) == "managed"
+        ):
+            managed_model_spec = self._resolve_vllm_managed_model_spec(configured_model)
+            managed_base_url = await self._start_managed_vllm_runtime(
+                model_id=configured_model.id,
+                model_spec=managed_model_spec,
+                base_url=managed_vllm_base_url(configured_model.base_url),
+            )
+            resolved_model_spec = managed_base_url
+            resolved_model_name = managed_model_spec
+            resolved_base_url = managed_base_url
+
+        api_key = self._resolve_voice_reply_api_key(
+            configured_model=configured_model,
+            base_url=resolved_base_url,
+        )
+        return await self._router.acquire_temporary_backend(
+            model_spec=resolved_model_spec,
+            model_name=resolved_model_name,
+            provider=configured_model.provider,
+            base_url=resolved_base_url,
+            api_key=api_key,
+        )
+
+    def _find_configured_model(self, model_id: str) -> ConfiguredModelConfig | None:
+        for model in self._config.model_setup.configured_models:
+            if model.id == model_id or model.model_spec == model_id:
+                return model
+            if model.provider == "ollama" and model.model == model_id:
+                return model
+        return None
+
+    def _resolve_voice_reply_api_key(
+        self,
+        *,
+        configured_model: ConfiguredModelConfig,
+        base_url: str | None,
+    ) -> str:
+        normalized_base_url = (base_url or configured_model.base_url or configured_model.model_spec).rstrip("/")
+
+        if configured_model.provider == "vllm":
+            vllm_api_key = self._config.vllm.api_key
+            if vllm_api_key is not None:
+                return vllm_api_key.get_secret_value()
+
+        openai_api_key = self._config.openai_compat.api_key
+        if openai_api_key is None:
+            return ""
+        if self._config.openai_compat.provider != configured_model.provider:
+            return ""
+        if self._config.openai_compat.base_url.rstrip("/") != normalized_base_url:
+            return ""
+        return openai_api_key.get_secret_value()
+
+    def _get_or_create_vllm_runtime_manager(self) -> object:
+        manager = self._vllm_runtime_manager
+        if manager is not None:
+            return manager
+        manager = ManagedVLLMRuntimeManager()
+        self._vllm_runtime_manager = manager
+        return manager
+
+    async def _stop_vllm_runtime_manager(self) -> None:
+        manager = self._vllm_runtime_manager
+        if manager is None:
+            return
+        stop = getattr(manager, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            payload = stop()
+            if inspect.isawaitable(payload):
+                await payload
+        except Exception:
+            logger.warning("Failed to stop vLLM runtime manager during engine shutdown.")
+
+    async def _start_managed_vllm_runtime(
+        self,
+        *,
+        model_id: str | None,
+        model_spec: str,
+        base_url: str,
+    ) -> str:
+        manager = self._get_or_create_vllm_runtime_manager()
+        start = getattr(manager, "start", None)
+        if not callable(start):
+            raise RuntimeError("vLLM runtime manager does not support start().")
+
+        try:
+            payload = start(
+                model_id=model_id,
+                model_spec=model_spec,
+                base_url=base_url,
+                launch_mode="managed",
+                config=self._config,
+            )
+            if inspect.isawaitable(payload):
+                payload = await payload
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if isinstance(payload, dict):
+            runtime_base_url = payload.get("base_url")
+            if isinstance(runtime_base_url, str) and runtime_base_url.strip():
+                return runtime_base_url.strip().rstrip("/")
+        raise RuntimeError("Managed vLLM runtime start did not return a valid base_url.")
+
+    def _resolve_vllm_managed_model_spec(self, model: ConfiguredModelConfig) -> str:
+        return resolve_vllm_managed_model_spec(
+            model,
+            self._config,
+            error_factory=lambda detail, _status: RuntimeError(detail),
+        )
 
     @staticmethod
     def _make_injected_vad_factory(vad: object | None) -> Callable[[], object] | None:

@@ -22,9 +22,9 @@ DEFAULT_UI_LOCALE = "auto"
 DEFAULT_UI_LOCALE_FALLBACK = "en-US"
 DEFAULT_RESPONSE_LANGUAGE = "same_as_user"
 DEFAULT_TIMEZONE = "auto"
-DEFAULT_TTS_VOICE = "en-US-AriaNeural"
+DEFAULT_TTS_VOICE = "af_heart"
 DEFAULT_EDGE_TTS_VOICE_PRESETS = [
-    DEFAULT_TTS_VOICE,
+    "en-US-AriaNeural",
     "en-US-JennyNeural",
     "zh-CN-XiaoxiaoNeural",
     "zh-TW-HsiaoChenNeural",

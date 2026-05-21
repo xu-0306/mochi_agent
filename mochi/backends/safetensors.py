@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
+
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.tool_call_simulator import ToolCallSimulator
@@ -56,13 +65,35 @@ class SafetensorsBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """執行生成。"""
         if stream:
-            return self._stream_generate(messages, tools, temperature, max_tokens)
+            return self._stream_generate(
+                messages,
+                tools,
+                temperature,
+                max_tokens,
+                top_p,
+                top_k,
+                repeat_penalty,
+            )
 
-        return await self._generate_nonstream(messages, tools, temperature, max_tokens)
+        return await self._generate_nonstream(
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+            top_p,
+            top_k,
+            repeat_penalty,
+        )
 
     async def _generate_nonstream(
         self,
@@ -70,6 +101,9 @@ class SafetensorsBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         temperature: float,
         max_tokens: int,
+        top_p: float,
+        top_k: int,
+        repeat_penalty: float,
     ) -> GenerationResult:
         """執行 non-stream 生成。"""
         pipeline = await self._ensure_pipeline_loaded()
@@ -79,6 +113,9 @@ class SafetensorsBackend(BaseLLMBackend):
             prompt,
             max_new_tokens=max_tokens,
             temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repeat_penalty,
             do_sample=temperature > 0,
             return_full_text=True,
         )
@@ -90,13 +127,24 @@ class SafetensorsBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         temperature: float,
         max_tokens: int,
+        top_p: float,
+        top_k: int,
+        repeat_penalty: float,
     ) -> AsyncIterator[StreamChunk]:
         """執行最小可用 stream 生成。
 
         transformers family 在 MVP 先使用 pseudo-stream：
         先完成 non-stream 生成，再以單次 delta + final chunk 輸出。
         """
-        result = await self._generate_nonstream(messages, tools, temperature, max_tokens)
+        result = await self._generate_nonstream(
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+            top_p,
+            top_k,
+            repeat_penalty,
+        )
 
         if result.content:
             yield StreamChunk(delta=result.content)
@@ -116,9 +164,11 @@ class SafetensorsBackend(BaseLLMBackend):
             metadata={
                 "model_dir": self.model_dir,
                 "dependency_ready": self._dependency_error is None,
+                "dependency_error": self._dependency_error,
                 "loaded": self._pipeline is not None,
                 "device": self.device,
                 "torch_dtype": self.torch_dtype,
+                "idle_unloaded": self._pipeline is None,
             },
         )
 
@@ -128,7 +178,30 @@ class SafetensorsBackend(BaseLLMBackend):
 
     async def close(self) -> None:
         """釋放後端資源。"""
+        pipeline = self._pipeline
         self._pipeline = None
+        if pipeline is None:
+            return
+
+        try:
+            model = getattr(pipeline, "model", None)
+            if model is not None:
+                for attr_name in ("cpu",):
+                    method = getattr(model, attr_name, None)
+                    if callable(method):
+                        try:
+                            method()
+                        except Exception as exc:
+                            logger.debug("Safetensors model {}() during close failed: {}", attr_name, exc)
+                        break
+        finally:
+            try:
+                del pipeline
+            except Exception:
+                pass
+
+        gc.collect()
+        self._release_cuda_cache()
 
     async def _ensure_pipeline_loaded(self) -> Any:
         """確保 pipeline 已載入。"""
@@ -146,10 +219,25 @@ class SafetensorsBackend(BaseLLMBackend):
             return self._pipeline
 
         factory = self._pipeline_factory or self._default_pipeline_factory
+        started_at = time.perf_counter()
+        logger.info(
+            "Loading safetensors pipeline for '{}' (device={}, torch_dtype={})",
+            self.model_dir,
+            self.device,
+            self.torch_dtype,
+        )
+        self._log_runtime_environment()
         try:
             self._pipeline = await asyncio.to_thread(factory)
         except Exception as exc:
             raise self._build_generate_error("model_load_failed", str(exc)) from exc
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "Loaded safetensors pipeline for '{}' in {:.2f}s",
+            self.model_dir,
+            elapsed,
+        )
+        self._log_loaded_pipeline_details(self._pipeline)
         return self._pipeline
 
     def _default_pipeline_factory(self) -> Any:
@@ -168,6 +256,11 @@ class SafetensorsBackend(BaseLLMBackend):
         torch_dtype = self._resolve_torch_dtype()
         if torch_dtype is not None:
             kwargs["torch_dtype"] = torch_dtype
+        logger.info(
+            "Initializing transformers pipeline for '{}' with kwargs={}",
+            self.model_dir,
+            self._summarize_pipeline_kwargs(kwargs),
+        )
         return pipeline(**kwargs)
 
     def _resolve_torch_dtype(self) -> Any | None:
@@ -297,9 +390,86 @@ class SafetensorsBackend(BaseLLMBackend):
             return f"Missing dependencies: {pkg_list}. Install with `uv sync --extra hf`."
         return None
 
+    def _release_cuda_cache(self) -> None:
+        """盡量主動釋放 CUDA 快取，降低閒置 VRAM 佔用。"""
+        try:
+            import torch  # type: ignore[import-not-found]
+        except Exception:
+            return
+
+        try:
+            if not torch.cuda.is_available():
+                return
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+            logger.info("Released safetensors CUDA cache for '{}'", self.model_dir)
+        except Exception as exc:
+            logger.debug("Safetensors CUDA cache release failed for '{}': {}", self.model_dir, exc)
+
     def _build_generate_error(self, code: str, detail: str) -> RuntimeError:
         """建立一致的 generate 錯誤語義。"""
         return RuntimeError(f"safetensors generate unavailable [{code}]: {detail}")
+
+    def _log_runtime_environment(self) -> None:
+        """記錄載入前 runtime 診斷，便於確認 CUDA / dtype 狀態。"""
+        try:
+            import torch  # type: ignore[import-not-found]
+        except Exception as exc:
+            logger.info("Safetensors runtime torch import failed: {}", exc)
+            return
+
+        cuda_available = bool(torch.cuda.is_available())
+        device_count = int(torch.cuda.device_count()) if cuda_available else 0
+        device_name = (
+            str(torch.cuda.get_device_name(0))
+            if cuda_available and device_count > 0
+            else "n/a"
+        )
+        logger.info(
+            "Safetensors runtime env: torch={}, compiled_cuda={}, cuda_available={}, device_count={}, device0={}",
+            getattr(torch, "__version__", "unknown"),
+            getattr(torch.version, "cuda", None),
+            cuda_available,
+            device_count,
+            device_name,
+        )
+
+    def _log_loaded_pipeline_details(self, pipeline: Any) -> None:
+        """記錄 pipeline 建立後的模型放置資訊。"""
+        model = getattr(pipeline, "model", None)
+        if model is None:
+            logger.info("Safetensors pipeline details unavailable: pipeline.model missing")
+            return
+
+        device = getattr(model, "device", None)
+        hf_device_map = getattr(model, "hf_device_map", None)
+        dtype = getattr(model, "dtype", None)
+        logger.info(
+            "Safetensors pipeline model placement: device={}, dtype={}, hf_device_map={}",
+            str(device) if device is not None else "unknown",
+            str(dtype) if dtype is not None else "unknown",
+            self._summarize_device_map(hf_device_map),
+        )
+
+    def _summarize_pipeline_kwargs(self, kwargs: dict[str, Any]) -> dict[str, str]:
+        """將 pipeline kwargs 壓成穩定、可讀的 log 內容。"""
+        summary: dict[str, str] = {}
+        for key, value in kwargs.items():
+            if key in {"model", "tokenizer"}:
+                summary[key] = str(value)
+            else:
+                summary[key] = str(value)
+        return summary
+
+    def _summarize_device_map(self, device_map: Any) -> str:
+        """避免把巨大 device map 原樣灌進 log。"""
+        if isinstance(device_map, dict):
+            preview = list(device_map.items())[:8]
+            suffix = "" if len(device_map) <= 8 else f" ... (+{len(device_map) - 8} more)"
+            return f"{preview}{suffix}"
+        return str(device_map)
 
     def _resolve_input_tokens(self, raw_result: Any, prompt: str) -> int:
         """解析輸入 token 數，缺值時回退到估算。"""

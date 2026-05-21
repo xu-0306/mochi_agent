@@ -1,102 +1,135 @@
-# Inspired by hermes-agent/tools/registry.py design pattern
-"""工具自動發現注冊表。"""
+"""Tool registry and discovery helpers."""
 
 from __future__ import annotations
 
-import importlib
 import importlib.util
 import inspect
 import sys
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
 
-from mochi.tools.base import BaseTool, ToolResult
+    logger = logging.getLogger(__name__)
+
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+
+ToolFactory = Any
 
 
 class ToolRegistry:
-    """工具注冊表 — 自動掃描目錄並注冊 BaseTool 子類。
-
-    放入 tools/ 或 tools/custom/ 目錄的 Python 檔案，
-    只要 export 繼承 BaseTool 的類，就會被自動發現並注冊。
-    """
+    """Registry for built-in, discovered, and factory-backed tools."""
 
     def __init__(
         self,
         extra_dirs: list[str] | None = None,
         discover_builtin: bool = True,
     ) -> None:
-        """初始化注冊表並執行自動發現。
-
-        Args:
-            extra_dirs: 額外掃描目錄列表（絕對路徑或相對路徑）。
-            discover_builtin: 是否自動掃描 mochi.tools 內建工具與 custom 目錄。
-        """
         self._tools: dict[str, BaseTool] = {}
+        self._factories: dict[str, ToolFactory] = {}
         if discover_builtin:
             package_dir = Path(__file__).resolve().parent
             self._discover(package_dir)
             self._discover(package_dir / "custom")
         if extra_dirs:
-            for d in extra_dirs:
-                self._discover(Path(d))
+            for directory in extra_dirs:
+                self._discover(Path(directory))
 
     def register(self, tool: BaseTool) -> None:
-        """手動注冊工具。
-
-        Args:
-            tool: BaseTool 實例。
-        """
         self._tools[tool.name] = tool
-        logger.debug(f"Registered tool: {tool.name}")
+        logger.debug("Registered tool: {}", tool.name)
+
+    def register_factory(self, name: str, factory: ToolFactory) -> None:
+        self._factories[name] = factory
+        logger.debug("Registered tool factory: {}", name)
 
     def get(self, name: str) -> BaseTool | None:
-        """依名稱取得工具實例。
+        tool = self._tools.get(name)
+        if tool is not None:
+            return tool
 
-        Args:
-            name: 工具名稱。
-        """
-        return self._tools.get(name)
+        factory = self._factories.get(name)
+        if factory is None:
+            return None
+
+        try:
+            instance = factory()
+        except TypeError:
+            instance = factory(name)
+        if not isinstance(instance, BaseTool):
+            raise TypeError(f"Factory for tool '{name}' did not return BaseTool.")
+        self._tools[name] = instance
+        return instance
 
     def list_tools(self) -> list[BaseTool]:
-        """回傳所有已注冊的工具列表。"""
+        for name in list(self._factories):
+            self.get(name)
         return list(self._tools.values())
 
     def get_schemas(self) -> list[dict[str, Any]]:
-        """回傳所有工具的 OpenAI function calling schema 列表。"""
-        return [t.to_schema_dict() for t in self._tools.values()]
+        return [tool.to_schema_dict() for tool in self.list_tools()]
 
-    async def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
-        """執行指定工具。
+    def create_view(self, tool_names: list[str]) -> ToolRegistry:
+        """Create a shallow registry view containing only the selected tools."""
+        registry = ToolRegistry(discover_builtin=False)
+        for name in tool_names:
+            tool = self.get(name)
+            if tool is not None:
+                registry.register(tool)
+        return registry
 
-        Args:
-            name: 工具名稱。
-            args: 工具參數字典。
-
-        Returns:
-            ToolResult 執行結果。
-
-        Raises:
-            KeyError: 若工具不存在。
-        """
-        tool = self._tools.get(name)
+    async def execute(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
+        tool = self.get(name)
         if tool is None:
             raise KeyError(f"Tool '{name}' not found in registry.")
+
         try:
+            validation_error = tool.validate_input(args, context)
+            if validation_error is not None:
+                return validation_error
+
+            permission_error = tool.check_permissions(args, context)
+            if permission_error is not None:
+                return permission_error
+
+            execute_signature = inspect.signature(tool.execute)
+            if "context" in execute_signature.parameters:
+                return await tool.execute(**args, context=context)
             return await tool.execute(**args)
         except Exception as exc:
-            logger.warning(f"Tool '{name}' execution error: {exc}")
+            logger.warning("Tool '{}' execution error: {}", name, exc)
             return ToolResult(error=str(exc))
 
-    def _discover(self, directory: Path) -> None:
-        """遞迴掃描目錄，自動 import 並注冊 BaseTool 子類。
+    def format_result_for_model(
+        self,
+        name: str,
+        result: ToolResult,
+        *,
+        max_chars: int = 2000,
+    ) -> str:
+        tool = self.get(name)
+        if tool is None:
+            raise KeyError(f"Tool '{name}' not found in registry.")
+        return tool.format_result_for_model(result, max_chars=max_chars)
 
-        Args:
-            directory: 掃描目錄路徑。
-        """
+    def summarize_result_for_ui(self, name: str, result: ToolResult) -> str:
+        tool = self.get(name)
+        if tool is None:
+            raise KeyError(f"Tool '{name}' not found in registry.")
+        return tool.summarize_result_for_ui(result)
+
+    def _discover(self, directory: Path) -> None:
         if not directory.is_dir():
-            logger.debug(f"Tool discovery: directory not found: {directory}")
+            logger.debug("Tool discovery directory not found: {}", directory)
             return
 
         for py_file in directory.rglob("*.py"):
@@ -111,13 +144,28 @@ class ToolRegistry:
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)  # type: ignore[union-attr]
 
-                for _name, obj in inspect.getmembers(module, inspect.isclass):
+                build_tool = getattr(module, "build_tool", None)
+                if callable(build_tool):
+                    instance = build_tool()
+                    if isinstance(instance, BaseTool):
+                        self.register(instance)
+
+                manifest = getattr(module, "TOOL_FACTORIES", None)
+                if isinstance(manifest, dict):
+                    for name, factory in manifest.items():
+                        if callable(factory):
+                            self.register_factory(str(name), factory)
+
+                for _, obj in inspect.getmembers(module, inspect.isclass):
                     if (
                         issubclass(obj, BaseTool)
                         and obj is not BaseTool
                         and not inspect.isabstract(obj)
                     ):
-                        instance = obj()
+                        try:
+                            instance = obj()
+                        except TypeError:
+                            continue
                         self.register(instance)
             except Exception as exc:
-                logger.warning(f"Failed to load tool from {py_file}: {exc}")
+                logger.warning("Failed to load tool from {}: {}", py_file, exc)

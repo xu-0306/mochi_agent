@@ -2,6 +2,7 @@
 
 import * as React from 'react'
 import { usePathname, useRouter } from 'next/navigation'
+import { useProjectStore } from '@/lib/stores/project-store'
 import { useSessionStore } from '@/lib/stores/session-store'
 import { useUIStore } from '@/lib/stores/ui-store'
 
@@ -23,7 +24,8 @@ function isPrimaryModifierPressed(event: KeyboardEvent): boolean {
 export function useGlobalShortcuts(): void {
   const router = useRouter()
   const pathname = usePathname()
-  const createSession = useSessionStore((state) => state.createSession)
+  const createDraftSession = useSessionStore((state) => state.createDraftSession)
+  const activeProjectId = useProjectStore((state) => state.activeProjectId)
   const toggleSidebar = useUIStore((state) => state.toggleSidebar)
 
   React.useEffect(() => {
@@ -37,7 +39,7 @@ export function useGlobalShortcuts(): void {
 
       if (key === '/' || key === '?') {
         event.preventDefault()
-        createSession()
+        createDraftSession(activeProjectId)
         if (pathname !== '/') {
           router.push('/')
         }
@@ -93,5 +95,5 @@ export function useGlobalShortcuts(): void {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [createSession, pathname, router, toggleSidebar])
+  }, [activeProjectId, createDraftSession, pathname, router, toggleSidebar])
 }

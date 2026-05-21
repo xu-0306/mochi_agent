@@ -28,7 +28,7 @@ locale_defaults:
   ui_locale: "auto"               # auto = 由瀏覽器/客戶端偵測
   ui_locale_fallback: "en-US"     # 無法偵測時的 UI fallback
   response_language: "same_as_user" # 預設跟隨使用者輸入語言
-  default_tts_voice: "en-US-AriaNeural"
+  default_tts_voice: "af_heart"
   timezone: "auto"                # 儲存層仍保留 UTC；顯示層再轉換
 
 # Agent 核心設定
@@ -38,6 +38,27 @@ agent:
     Reply in the same language as the user unless they request otherwise.
   max_react_iterations: 10
   max_context_tokens: 3000
+  temperature: 0.7
+  max_tokens: 4096
+  top_p: 1.0
+  min_p: 0.0
+  top_k: 0
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+  repeat_penalty: 1.0
+  show_token_stats: false
+  presets:
+    - name: "default"
+      system_prompt: ""
+      temperature: 0.7
+      max_tokens: 4096
+      top_p: 1.0
+      min_p: 0.0
+      top_k: 0
+      frequency_penalty: 0.0
+      presence_penalty: 0.0
+      repeat_penalty: 1.0
+  active_preset: "default"
 
 # Ollama 後端設定
 ollama:
@@ -49,6 +70,13 @@ gguf:
   n_ctx: 4096
   n_gpu_layers: -1    # -1 = 全部 GPU，0 = 純 CPU
   n_threads: null     # null = 自動
+  n_batch: 512
+  n_ubatch: 512
+  n_threads_batch: null
+  flash_attn: false
+  offload_kqv: true
+  use_mmap: true
+  use_mlock: false
 
 # HuggingFace 後端設定（Phase 3）
 huggingface:
@@ -57,6 +85,14 @@ huggingface:
   trust_remote_code: false
 
 # 語音管線設定（Phase 4，預設關閉）
+local_models:
+  roots: []
+  scan_max_depth: 3
+  scan_max_entries: 500
+  runtime: "inprocess"
+  idle_unload_enabled: false
+  idle_unload_seconds: 300
+
 voice:
   enabled: false
   stt_backend: "faster-whisper"   # 可選：auto/faster-whisper/openai-api/openai-whisper/qwen-asr/vosk/whisper-cpp/whisperlivekit
@@ -66,9 +102,9 @@ voice:
   stt_openai_base_url: null       # 只在 stt_backend=openai-api 時使用，可填 http://host/v1
   stt_openai_api_key: null        # 只在 stt_backend=openai-api 時使用
   stt_openai_timeout: 60.0        # openai-api transcription HTTP timeout（秒）
-  tts_backend: "edge-tts"         # 可選：auto/coqui-tts/edge-tts/kokoro-tts/openai-tts/piper
+  tts_backend: "kokoro-tts"       # 可選：auto/coqui-tts/edge-tts/external-api/kokoro-tts/openai-tts/piper
   tts_model: null                 # 只在 coqui-tts/openai-tts 等需要模型名的後端使用
-  tts_voice: "en-US-AriaNeural"
+  tts_voice: "af_heart"
   tts_language: null              # 只在特定 TTS 後端使用（例如 coqui-tts）
   tts_speed: 1.0
   tts_use_gpu: false              # 只在支援 GPU 的本地 TTS 後端使用
@@ -163,6 +199,8 @@ security:
     - "date"
     - "which"
   max_file_write_size_mb: 10.0
+  file_ops_scope: "workspace"
+  file_undo_max_size_mb: 2.0
 
 # Web API 伺服器設定
 web:

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import sys
 
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 
 def setup_logging(level: str = "INFO") -> None:

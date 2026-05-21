@@ -37,12 +37,17 @@ class DiscordAdapter(BaseChannel):
         allowed_channel_ids: Sequence[int] | None = None,
         allowed_voice_channel_ids: Sequence[int] | None = None,
         allowed_user_ids: Sequence[int] | None = None,
+        admin_user_ids: Sequence[int] | None = None,
         rate_limit_per_user: int = 10,
         message_mode: Literal["all_messages", "mentions_only", "slash_only"] = "mentions_only",
         auto_join_policy: Literal["manual_only"] = "manual_only",
         voice_auto_reply: bool = True,
         voice_stt_enabled: bool = True,
         voice_tts_enabled: bool = True,
+        voice_session_mode: Literal["append_current", "isolated_voice"] = "append_current",
+        voice_reply_model_mode: Literal["inherit_active", "configured_model"] = "inherit_active",
+        voice_reply_model_id: str = "",
+        voice_reply_tts_voice: str = "",
         voice_runtime: DiscordVoiceRuntime | None = None,
         voice_sample_rate: int = 16000,
     ) -> None:
@@ -54,12 +59,19 @@ class DiscordAdapter(BaseChannel):
         self._allowed_channel_ids = set(allowed_channel_ids or [])
         self._allowed_voice_channel_ids = set(allowed_voice_channel_ids or [])
         self._allowed_user_ids = set(allowed_user_ids or [])
+        self._admin_user_ids = set(admin_user_ids or [])
         self._rate_limit_per_user = max(1, rate_limit_per_user)
         self._message_mode = message_mode
         self._auto_join_policy = auto_join_policy
         self._voice_auto_reply = voice_auto_reply
         self._voice_stt_enabled = voice_stt_enabled
         self._voice_tts_enabled = voice_tts_enabled
+        self._voice_session_mode = voice_session_mode
+        self._voice_reply_model_mode = voice_reply_model_mode
+        self._voice_reply_model_id = voice_reply_model_id.strip()
+        self._voice_reply_tts_voice = voice_reply_tts_voice.strip()
+        self._voice_session_factory: Any | None = None
+        self._reply_synthesizer: Any | None = None
         self._recent_user_events: dict[str, deque[float]] = defaultdict(deque)
         self._pending_slash_interactions: dict[str, Any] = {}
         self._client: Any | None = None
@@ -326,6 +338,14 @@ class DiscordAdapter(BaseChannel):
         async def leave_command(interaction: Any) -> None:
             await self._handle_slash_command(interaction, "leave", [])
 
+        @tree.command(name="voice-config", description="Show Discord voice conversation settings.")
+        async def voice_config_command(interaction: Any) -> None:
+            await self._handle_slash_command(interaction, "voice-config", [])
+
+        @tree.command(name="voice-set", description="Update one Discord voice conversation setting.")
+        async def voice_set_command(interaction: Any, key: str, value: str) -> None:
+            await self._handle_slash_command(interaction, "voice-set", [key, value])
+
         client.tree = tree
         return tree
 
@@ -427,10 +447,12 @@ class DiscordAdapter(BaseChannel):
             "allowed_channel_ids": sorted(self._allowed_channel_ids),
             "allowed_voice_channel_ids": sorted(self._allowed_voice_channel_ids),
             "allowed_user_ids": sorted(self._allowed_user_ids),
+            "admin_user_ids": sorted(self._admin_user_ids),
             "rate_limit_per_user": self._rate_limit_per_user,
             "application_commands_synced": self._application_commands_synced,
             "pending_interaction_count": len(self._pending_slash_interactions),
             "bot_token_configured": bool(self._bot_token),
+            "voice_conversation_settings": self.get_voice_conversation_settings(),
             "voice_ingress": self._voice_ingress.get_status(),
             "voice_runtime": self._voice_runtime.get_status(),
         }
@@ -512,9 +534,104 @@ class DiscordAdapter(BaseChannel):
         reply_synthesizer: Any | None = None,
     ) -> None:
         """注入 Discord voice runtime 所需的 engine 整合點。"""
+        if voice_session_factory is not None:
+            self._voice_session_factory = voice_session_factory
+        if reply_synthesizer is not None:
+            self._reply_synthesizer = reply_synthesizer
+        self._refresh_runtime_integrations()
+
+    def _refresh_runtime_integrations(self) -> None:
         self._voice_runtime.configure_integrations(
-            voice_session_factory=voice_session_factory,
-            reply_synthesizer=reply_synthesizer,
+            voice_session_factory=self._wrapped_voice_session_factory(),
+            reply_synthesizer=self._reply_synthesizer,
+        )
+
+    def _wrapped_voice_session_factory(self) -> Any | None:
+        if self._voice_session_factory is None:
+            return None
+
+        async def _factory(session_id: str) -> object:
+            effective_session_id = self._resolve_voice_session_id(session_id)
+            return await self._voice_session_factory(effective_session_id)
+
+        return _factory
+
+    def _resolve_voice_session_id(self, session_id: str) -> str:
+        return session_id
+
+    def is_admin_user(self, user_id: str) -> bool:
+        """判斷 Discord 使用者是否具備 admin 權限。"""
+        if not self._admin_user_ids:
+            return True
+        if not user_id.strip().isdigit():
+            return False
+        return int(user_id.strip()) in self._admin_user_ids
+
+    def get_voice_conversation_settings(self) -> dict[str, str]:
+        """回傳 Discord voice conversation 相關設定。"""
+        return {
+            "session_mode": self._voice_session_mode,
+            "reply_model_mode": self._voice_reply_model_mode,
+            "reply_model_id": self._voice_reply_model_id,
+            "tts_voice": self._voice_reply_tts_voice,
+        }
+
+    def update_voice_conversation_setting(self, key: str, value: str) -> tuple[str, str]:
+        """更新 Discord voice conversation 設定，回傳正規化後的 key/value。"""
+        normalized_key = key.strip().lower().replace("-", "_")
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("Voice setting value must not be empty.")
+
+        if normalized_key == "session_mode":
+            aliases = {
+                "shared": "shared",
+                "append_current": "append_current",
+                "voice_room": "voice_room",
+                "per_guild": "per_guild",
+                "per_channel": "per_channel",
+                "isolated_voice": "isolated_voice",
+            }
+            mapped_value = aliases.get(normalized_value)
+            allowed = set(aliases)
+            if mapped_value is None:
+                raise ValueError(
+                    "Unsupported session_mode. Use one of: "
+                    "append_current, isolated_voice, shared, voice_room, "
+                    "per_guild, per_channel."
+                )
+            self._voice_session_mode = mapped_value
+            self._refresh_runtime_integrations()
+            return "session_mode", mapped_value
+
+        if normalized_key == "reply_model_mode":
+            aliases = {
+                "inherit_active": "inherit_active",
+                "agent-default": "agent-default",
+                "agent_default": "agent-default",
+                "configured_model": "configured_model",
+                "fixed": "fixed",
+            }
+            canonical = aliases.get(normalized_value.replace("-", "_"), aliases.get(normalized_value))
+            if canonical is None:
+                raise ValueError(
+                    "Unsupported reply_model_mode. Use one of: "
+                    "inherit_active, configured_model, agent-default, fixed."
+                )
+            self._voice_reply_model_mode = canonical
+            return "reply_model_mode", canonical
+
+        if normalized_key in {"reply_model_id", "reply_model"}:
+            self._voice_reply_model_id = normalized_value
+            return "reply_model_id", normalized_value
+
+        if normalized_key in {"tts_voice", "voice"}:
+            self._voice_reply_tts_voice = normalized_value
+            return "tts_voice", normalized_value
+
+        raise ValueError(
+            "Unsupported setting key. Use one of: "
+            "session_mode, reply_model_mode, reply_model_id, tts_voice."
         )
 
     async def _ingest_voice_chunk_from_transport(
