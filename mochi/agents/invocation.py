@@ -37,7 +37,13 @@ class AgentInvocationRequest:
     tool_mode: ToolMode = "auto"
     execution_profile: ExecutionProfile = "chat"
     system_prompt_addendum: str | None = None
+    tool_names_override: list[str] | None = None
+    tool_allowlist: list[str] | None = None
+    tool_denylist: list[str] | None = None
+    max_iterations_override: int | None = None
     persist_session: bool = True
+    persist_turn_events: bool | None = None
+    persist_learning: bool | None = None
 
 
 @dataclass

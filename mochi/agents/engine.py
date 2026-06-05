@@ -486,6 +486,13 @@ class AgentEngine:
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_mode=request.tool_mode,
         )
+        exposure_plan = self._apply_invocation_tool_overrides(
+            exposure_plan,
+            available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
+            tool_names_override=request.tool_names_override,
+            tool_allowlist=request.tool_allowlist,
+            tool_denylist=request.tool_denylist,
+        )
         exposure_plan = self._apply_execution_profile(exposure_plan, request.execution_profile)
         attachment_context = self._build_attachment_prompt_context(
             attachments=request.attachments,
@@ -502,7 +509,9 @@ class AgentEngine:
             task_workspace_dir=request.task_workspace_dir,
             system_prompt_addendum=request.system_prompt_addendum,
         )
-        trajectory_id = self._start_trajectory(request.message)
+        persist_turn_events = request.persist_session if request.persist_turn_events is None else request.persist_turn_events
+        persist_learning = request.persist_session if request.persist_learning is None else request.persist_learning
+        trajectory_id = self._start_trajectory(request.message) if persist_learning else None
         turn_id = str(uuid4())
         turn_event_seq = 0
         user_msg = Message(
@@ -523,7 +532,11 @@ class AgentEngine:
             backend=active_backend,
             tool_registry=tool_registry,
             tool_execution_context=tool_execution_context,
-            max_iterations=self._config.agent.max_react_iterations,
+            max_iterations=(
+                request.max_iterations_override
+                if isinstance(request.max_iterations_override, int) and request.max_iterations_override > 0
+                else self._config.agent.max_react_iterations
+            ),
         )
         diagnostics = AgentInvocationDiagnostics(
             execution_profile=request.execution_profile,
@@ -567,7 +580,7 @@ class AgentEngine:
                     event.trajectory_id = trajectory_id
                 event.turn_id = turn_id  # type: ignore[attr-defined]
                 turn_event_seq += 1
-                if request.persist_session:
+                if persist_turn_events:
                     await self._persist_turn_event(
                         session_key,
                         event,
@@ -582,7 +595,8 @@ class AgentEngine:
             if owns_workspace_registry:
                 await self._close_tool_registry(workspace_registry)
 
-        await self._finish_learning_cycle(trajectory_id)
+        if persist_learning:
+            await self._finish_learning_cycle(trajectory_id)
 
         if request.persist_session:
             assistant_msg = Message(role="assistant", content=final_text)
@@ -601,51 +615,76 @@ class AgentEngine:
         exposure_plan: ToolExposurePlan,
         execution_profile: str,
     ) -> ToolExposurePlan:
-        readonly_blocked = {
-            "file_write",
-            "file_edit",
-            "exec_command",
-            "shell",
-            "execute_code",
-            "execute_code_v2",
-            "write_stdin",
-            "kill_session",
-            "process_stop",
-            "mcp_call",
+        readonly_allowed = {
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "csv_read",
+            "pdf_read",
+            "docx_read",
+            "notebook_read",
+            "memory_search",
+            "tool_search",
+            "get_current_time",
+            "calculator",
         }
-        if execution_profile in {"subagent_readonly", "judge", "verifier"}:
+        evidence_allowed = {
+            *readonly_allowed,
+            "web_search",
+            "web_fetch",
+            "web_crawl",
+            "arxiv_search",
+            "semantic_scholar_search",
+            "crossref_search",
+            "pubmed_search",
+            "mcp_list_resources",
+            "mcp_read_resource",
+        }
+        if execution_profile == "subagent_readonly":
             return ToolExposurePlan(
-                tool_names=[name for name in exposure_plan.tool_names if name not in readonly_blocked],
+                tool_names=[name for name in exposure_plan.tool_names if name in readonly_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
             )
-        if execution_profile == "subagent_research":
-            allowed = {
-                "file_read",
-                "glob_search",
-                "grep_search",
-                "csv_read",
-                "pdf_read",
-                "docx_read",
-                "notebook_read",
-                "memory_search",
-                "web_search",
-                "web_fetch",
-                "web_crawl",
-                "mcp_list_resources",
-                "mcp_read_resource",
-                "tool_search",
-            }
+        if execution_profile in {"subagent_research", "judge", "verifier"}:
             return ToolExposurePlan(
-                tool_names=[
-                    name
-                    for name in exposure_plan.tool_names
-                    if name in allowed and name not in readonly_blocked
-                ],
+                tool_names=[name for name in exposure_plan.tool_names if name in evidence_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
             )
         return exposure_plan
+
+    @staticmethod
+    def _apply_invocation_tool_overrides(
+        exposure_plan: ToolExposurePlan,
+        *,
+        available_tool_names: list[str],
+        tool_names_override: list[str] | None,
+        tool_allowlist: list[str] | None,
+        tool_denylist: list[str] | None,
+    ) -> ToolExposurePlan:
+        available = set(available_tool_names)
+        if tool_names_override is not None:
+            tool_names = [
+                name
+                for name in dict.fromkeys(tool_names_override)
+                if isinstance(name, str) and name in available
+            ]
+        else:
+            tool_names = list(exposure_plan.tool_names)
+
+        if tool_allowlist is not None:
+            allowed = {name for name in tool_allowlist if isinstance(name, str)}
+            tool_names = [name for name in tool_names if name in allowed]
+        if tool_denylist is not None:
+            denied = {name for name in tool_denylist if isinstance(name, str)}
+            tool_names = [name for name in tool_names if name not in denied]
+
+        return ToolExposurePlan(
+            tool_names=tool_names[: exposure_plan.limit] if exposure_plan.limit > 0 else [],
+            matched_groups=exposure_plan.matched_groups,
+            limit=exposure_plan.limit,
+        )
 
     async def switch_model(self, model_spec: str) -> ModelInfo:
         """切換活躍模型並回傳新模型資訊。"""
