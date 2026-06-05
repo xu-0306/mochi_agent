@@ -24,6 +24,7 @@ from mochi.agents.multi_agent.evaluator import (
     resolve_evidence_gate_status,
 )
 from mochi.agents.multi_agent.protocols import (
+    DrZeroSelfEvolveProtocol,
     MultiAgentDebateProtocol,
     ProtocolConfig,
     TeacherStudentDistillProtocol,
@@ -40,6 +41,7 @@ from mochi.agents.multi_agent.research import (
     synthesize_research_brief,
 )
 from mochi.agents.multi_agent.roles import (
+    build_dr_zero_roles,
     build_multi_agent_debate_roles,
     build_teacher_student_roles,
 )
@@ -565,6 +567,16 @@ class MultiAgentOrchestrator:
             )
             return [teacher_output, student_output], {}
 
+        if isinstance(protocol_config, DrZeroSelfEvolveProtocol):
+            return await self._run_model_backed_dr_zero(
+                task_input=task_input,
+                protocol_config=protocol_config,
+                guidance_messages=guidance_messages,
+                selected_models_roles=selected_models_roles,
+                ordered_models=ordered_models,
+                emit=emit,
+            )
+
         return await self._run_model_backed_debate(
             task_input=task_input,
             protocol_config=protocol_config,
@@ -574,6 +586,180 @@ class MultiAgentOrchestrator:
             ordered_models=ordered_models,
             emit=emit,
         )
+
+    async def _run_model_backed_dr_zero(
+        self,
+        *,
+        task_input: str,
+        protocol_config: DrZeroSelfEvolveProtocol,
+        guidance_messages: list[str],
+        selected_models_roles: dict[str, str],
+        ordered_models: list[str],
+        emit: Any,
+    ) -> tuple[list[CandidateOutput], dict[str, Any]]:
+        roles = build_dr_zero_roles(
+            proposer_role_id=protocol_config.proposer_role_id,
+            solver_role_id=protocol_config.solver_role_id,
+            verifier_role_id=protocol_config.verifier_role_id,
+        )
+        proposer_role = roles[0]
+        solver_role = roles[1]
+        proposer_model_id = _resolve_protocol_role_model_id(
+            role_id=proposer_role.role_id,
+            selected_models_roles=selected_models_roles,
+            ordered_fallback=ordered_models,
+            fallback_index=0,
+        )
+        solver_model_id = _resolve_protocol_role_model_id(
+            role_id=solver_role.role_id,
+            selected_models_roles=selected_models_roles,
+            ordered_fallback=ordered_models,
+            fallback_index=1,
+            default_model_id=proposer_model_id,
+        )
+        if not proposer_model_id or not solver_model_id:
+            return [], {}
+
+        proposer_prompt = _build_dr_zero_proposer_prompt(
+            task_input=task_input,
+            sample_size=protocol_config.proposal_sample_size,
+            guidance_messages=guidance_messages,
+        )
+        proposer_output = await self._generate_role_candidate(
+            role_id=proposer_role.role_id,
+            role_title=proposer_role.title,
+            role_instruction=proposer_role.instruction,
+            model_id=proposer_model_id,
+            task_input=task_input,
+            guidance_messages=guidance_messages,
+            supporting_candidates=[],
+            prompt_override=proposer_prompt,
+        )
+        emit(
+            "role_output",
+            asdict(
+                RoleOutputPayload(
+                    role_id=proposer_output.role_id,
+                    content=proposer_output.content,
+                    round_index=1,
+                    candidate_id=proposer_output.candidate_id,
+                    model_id=proposer_model_id,
+                )
+            ),
+        )
+
+        synthetic_tasks, parse_diagnostics = _parse_dr_zero_synthetic_tasks(
+            proposer_output.content,
+            task_input=task_input,
+            sample_size=protocol_config.proposal_sample_size,
+        )
+        solver_outputs: list[CandidateOutput] = []
+        solver_rollouts: list[dict[str, Any]] = []
+        for task_index, synthetic_task in enumerate(synthetic_tasks, start=1):
+            for rollout_index in range(1, protocol_config.solver_rollouts_per_task + 1):
+                candidate_id = f"{solver_role.role_id}_{task_index}_{rollout_index}"
+                solver_prompt = _build_dr_zero_solver_prompt(
+                    root_task=task_input,
+                    synthetic_task=synthetic_task,
+                    guidance_messages=guidance_messages,
+                    rollout_index=rollout_index,
+                )
+                raw_solver_output = await self._generate_role_candidate(
+                    role_id=solver_role.role_id,
+                    role_title=solver_role.title,
+                    role_instruction=solver_role.instruction,
+                    model_id=solver_model_id,
+                    task_input=task_input,
+                    guidance_messages=guidance_messages,
+                    supporting_candidates=[proposer_output],
+                    prompt_override=solver_prompt,
+                )
+                solver_output = CandidateOutput(
+                    candidate_id=candidate_id,
+                    role_id=solver_role.role_id,
+                    content=raw_solver_output.content,
+                    metadata={
+                        **dict(raw_solver_output.metadata),
+                        "synthetic_task": dict(synthetic_task),
+                        "synthetic_task_id": synthetic_task["task_id"],
+                        "task_index": task_index,
+                        "rollout_index": rollout_index,
+                    },
+                )
+                solver_outputs.append(solver_output)
+                solver_rollout = {
+                    "candidate_id": solver_output.candidate_id,
+                    "role_id": solver_output.role_id,
+                    "model_id": solver_model_id,
+                    "synthetic_task_id": synthetic_task["task_id"],
+                    "task_index": task_index,
+                    "rollout_index": rollout_index,
+                    "content": solver_output.content,
+                    "metadata": dict(solver_output.metadata),
+                }
+                solver_rollouts.append(solver_rollout)
+                emit(
+                    "role_output",
+                    asdict(
+                        RoleOutputPayload(
+                            role_id=solver_output.role_id,
+                            content=solver_output.content,
+                            round_index=1,
+                            candidate_id=solver_output.candidate_id,
+                            model_id=solver_model_id,
+                        )
+                    ),
+                )
+
+        verifier_model_id = (
+            selected_models_roles.get(protocol_config.verifier_role_id)
+            or selected_models_roles.get("verifier")
+            or selected_models_roles.get("judge")
+        )
+        protocol_artifacts = {
+            "synthetic_tasks": {
+                "protocol": protocol_config.protocol,
+                "root_task": task_input,
+                "proposer_role_id": proposer_role.role_id,
+                "proposer_model_id": proposer_model_id,
+                "tasks": synthetic_tasks,
+                "parse_diagnostics": parse_diagnostics,
+            },
+            "solver_rollouts": {
+                "protocol": protocol_config.protocol,
+                "solver_role_id": solver_role.role_id,
+                "solver_model_id": solver_model_id,
+                "rollout_count": len(solver_rollouts),
+                "rollouts": solver_rollouts,
+            },
+            "reward_summary": {
+                "protocol": protocol_config.protocol,
+                "status": "pending_verification",
+                "basis": "verifier_and_evaluator_downstream",
+                "verifier_role_id": protocol_config.verifier_role_id,
+                "verifier_model_id": verifier_model_id,
+                "synthetic_task_count": len(synthetic_tasks),
+                "solver_rollout_count": len(solver_rollouts),
+            },
+            "curriculum_state": {
+                "protocol": protocol_config.protocol,
+                "iterations_configured": protocol_config.iterations,
+                "current_iteration": 1,
+                "proposal_sample_size": protocol_config.proposal_sample_size,
+                "solver_rollouts_per_task": protocol_config.solver_rollouts_per_task,
+                "next_iteration_ready": False,
+            },
+            "drzero_iteration_summary": {
+                "protocol": protocol_config.protocol,
+                "iteration_index": 1,
+                "proposer_model_id": proposer_model_id,
+                "solver_model_id": solver_model_id,
+                "synthetic_task_count": len(synthetic_tasks),
+                "solver_rollout_count": len(solver_rollouts),
+                "proposal_parse_status": parse_diagnostics["status"],
+            },
+        }
+        return solver_outputs, protocol_artifacts
 
     async def _generate_role_candidate(
         self,
@@ -1054,6 +1240,88 @@ class MultiAgentOrchestrator:
                 ),
             )
             return [teacher_output, student_output], {}
+
+        if isinstance(protocol_config, DrZeroSelfEvolveProtocol):
+            roles = build_dr_zero_roles(
+                proposer_role_id=protocol_config.proposer_role_id,
+                solver_role_id=protocol_config.solver_role_id,
+                verifier_role_id=protocol_config.verifier_role_id,
+            )
+            proposer_role = roles[0]
+            solver_role = roles[1]
+            synthetic_task = {
+                "task_id": "task-1",
+                "question": task_input,
+                "difficulty": "placeholder",
+                "rationale": "Placeholder task for Dr.Zero scaffold execution.",
+                "metadata": {"placeholder": True},
+            }
+            proposer_output = CandidateOutput(
+                candidate_id=proposer_role.role_id,
+                role_id=proposer_role.role_id,
+                content=json.dumps({"tasks": [synthetic_task]}, ensure_ascii=False),
+            )
+            solver_output = CandidateOutput(
+                candidate_id=solver_role.role_id,
+                role_id=solver_role.role_id,
+                content=f"Solver answer for: {task_input}",
+                metadata={"synthetic_task": synthetic_task, "synthetic_task_id": "task-1"},
+            )
+            emit(
+                "role_output",
+                asdict(
+                    RoleOutputPayload(
+                        role_id=proposer_output.role_id,
+                        content=proposer_output.content,
+                        round_index=1,
+                        candidate_id=proposer_output.candidate_id,
+                    )
+                ),
+            )
+            emit(
+                "role_output",
+                asdict(
+                    RoleOutputPayload(
+                        role_id=solver_output.role_id,
+                        content=solver_output.content,
+                        round_index=1,
+                        candidate_id=solver_output.candidate_id,
+                    )
+                ),
+            )
+            return [solver_output], {
+                "synthetic_tasks": {
+                    "protocol": protocol_config.protocol,
+                    "root_task": task_input,
+                    "tasks": [synthetic_task],
+                    "parse_diagnostics": {"status": "placeholder", "parsed_task_count": 1},
+                },
+                "solver_rollouts": {
+                    "protocol": protocol_config.protocol,
+                    "rollout_count": 1,
+                    "rollouts": [solver_output.to_dict()],
+                },
+                "reward_summary": {
+                    "protocol": protocol_config.protocol,
+                    "status": "pending_verification",
+                    "basis": "placeholder_scaffold",
+                    "synthetic_task_count": 1,
+                    "solver_rollout_count": 1,
+                },
+                "curriculum_state": {
+                    "protocol": protocol_config.protocol,
+                    "iterations_configured": protocol_config.iterations,
+                    "current_iteration": 1,
+                    "next_iteration_ready": False,
+                },
+                "drzero_iteration_summary": {
+                    "protocol": protocol_config.protocol,
+                    "iteration_index": 1,
+                    "synthetic_task_count": 1,
+                    "solver_rollout_count": 1,
+                    "proposal_parse_status": "placeholder",
+                },
+            }
 
         roles = build_multi_agent_debate_roles(
             debater_a_role_id=protocol_config.debater_a_role_id,
@@ -1557,6 +1825,8 @@ def _deterministic_score(candidate: CandidateOutput) -> float:
     base = 0.7
     if "student" in candidate.role_id or candidate.role_id.endswith("_a"):
         base = 0.9
+    if "solver" in candidate.role_id:
+        base = 0.9
     length_component = min(len(candidate.content) / 1000.0, 0.09)
     return round(base + length_component, 4)
 
@@ -1661,6 +1931,15 @@ def _resolve_judge_model_id(
             or selected_models_roles.get(protocol_config.teacher_role_id)
             or (ordered_models[0] if ordered_models else None)
         )
+    if isinstance(protocol_config, DrZeroSelfEvolveProtocol):
+        return (
+            selected_models_roles.get("judge")
+            or selected_models_roles.get("evaluator")
+            or selected_models_roles.get(protocol_config.verifier_role_id)
+            or selected_models_roles.get(protocol_config.proposer_role_id)
+            or (ordered_models[2] if len(ordered_models) > 2 else None)
+            or (ordered_models[0] if ordered_models else None)
+        )
     return (
         selected_models_roles.get(protocol_config.judge_role_id)
         or selected_models_roles.get("judge")
@@ -1682,6 +1961,161 @@ def _resolve_verifier_model_id(
         protocol_config=protocol_config,
         selected_models_roles=selected_models_roles,
     )
+
+
+def _build_dr_zero_proposer_prompt(
+    *,
+    task_input: str,
+    sample_size: int,
+    guidance_messages: list[str],
+) -> str:
+    lines = [
+        "Create synthetic search-agent training tasks.",
+        f"Root objective:\n{task_input.strip()}",
+        "",
+        f"Return JSON only with key `tasks`, containing exactly {sample_size} items when possible.",
+        "Each task item should include `question`, optional `difficulty`, optional `rationale`, and optional `metadata`.",
+        "Tasks must be hard enough to improve a solver but still answerable with available evidence/search tools.",
+    ]
+    if guidance_messages:
+        lines.extend(["", "Guidance:", *[f"- {item}" for item in guidance_messages]])
+    return "\n".join(lines)
+
+
+def _build_dr_zero_solver_prompt(
+    *,
+    root_task: str,
+    synthetic_task: Mapping[str, Any],
+    guidance_messages: list[str],
+    rollout_index: int,
+) -> str:
+    question = str(synthetic_task.get("question") or synthetic_task.get("task") or "").strip()
+    lines = [
+        "Solve this Dr.Zero synthetic task as a search-capable solver.",
+        f"Root objective:\n{root_task.strip()}",
+        "",
+        f"Synthetic task id: {synthetic_task.get('task_id')}",
+        f"Synthetic question:\n{question}",
+        f"Rollout index: {rollout_index}",
+        "",
+        "Use available read/research tools when helpful. Return a concise answer with evidence-aware rationale.",
+    ]
+    if guidance_messages:
+        lines.extend(["", "Guidance:", *[f"- {item}" for item in guidance_messages]])
+    return "\n".join(lines)
+
+
+def _parse_dr_zero_synthetic_tasks(
+    content: str,
+    *,
+    task_input: str,
+    sample_size: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    parsed = _parse_json_payload(content)
+    raw_tasks: Any = None
+    status = "parsed"
+    reason: str | None = None
+    if isinstance(parsed, Mapping):
+        raw_tasks = parsed.get("tasks") or parsed.get("questions") or parsed.get("items")
+    elif isinstance(parsed, list):
+        raw_tasks = parsed
+
+    tasks: list[dict[str, Any]] = []
+    if isinstance(raw_tasks, list):
+        for index, item in enumerate(raw_tasks[:sample_size], start=1):
+            normalized = _normalize_dr_zero_task(item, fallback_question=task_input, index=index)
+            if normalized is not None:
+                tasks.append(normalized)
+
+    if not tasks:
+        status = "fallback"
+        reason = "Proposer output did not contain parseable task JSON."
+        tasks = [
+            {
+                "task_id": "task-1",
+                "question": task_input.strip(),
+                "difficulty": "unknown",
+                "rationale": "Fallback task derived from the root objective.",
+                "metadata": {"fallback": True},
+            }
+        ]
+
+    diagnostics = {
+        "status": status,
+        "requested_sample_size": sample_size,
+        "parsed_task_count": len(tasks),
+        "fallback_reason": reason,
+    }
+    return tasks, diagnostics
+
+
+def _normalize_dr_zero_task(
+    item: Any,
+    *,
+    fallback_question: str,
+    index: int,
+) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        question = item.strip()
+        if not question:
+            return None
+        return {
+            "task_id": f"task-{index}",
+            "question": question,
+            "difficulty": "unspecified",
+            "rationale": "",
+            "metadata": {},
+        }
+    if not isinstance(item, Mapping):
+        return None
+    question = (
+        item.get("question")
+        or item.get("task")
+        or item.get("prompt")
+        or item.get("query")
+        or fallback_question
+    )
+    question_text = str(question or "").strip()
+    if not question_text:
+        return None
+    task_id = str(item.get("task_id") or item.get("id") or f"task-{index}").strip()
+    metadata = item.get("metadata")
+    return {
+        "task_id": task_id or f"task-{index}",
+        "question": question_text,
+        "difficulty": str(item.get("difficulty") or "unspecified"),
+        "rationale": str(item.get("rationale") or item.get("reason") or ""),
+        "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+    }
+
+
+def _parse_json_payload(content: str) -> Any:
+    text = content.strip()
+    if not text:
+        return None
+    candidates = [text]
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            stripped = part.strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].strip()
+            if stripped:
+                candidates.append(stripped)
+    object_start = text.find("{")
+    object_end = text.rfind("}")
+    if 0 <= object_start < object_end:
+        candidates.append(text[object_start : object_end + 1])
+    array_start = text.find("[")
+    array_end = text.rfind("]")
+    if 0 <= array_start < array_end:
+        candidates.append(text[array_start : array_end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def _build_role_prompt(

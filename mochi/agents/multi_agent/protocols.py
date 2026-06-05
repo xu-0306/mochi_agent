@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
-ProtocolName = Literal["teacher_student_distill", "multi_agent_debate"]
+ProtocolName = Literal["teacher_student_distill", "multi_agent_debate", "dr_zero_self_evolve"]
 
 
 @dataclass(frozen=True)
@@ -31,14 +31,28 @@ class MultiAgentDebateProtocol:
     guidance_required: bool = False
 
 
-ProtocolConfig = TeacherStudentDistillProtocol | MultiAgentDebateProtocol
+@dataclass(frozen=True)
+class DrZeroSelfEvolveProtocol:
+    """Dr.Zero-style self-evolution protocol setting."""
+
+    protocol: Literal["dr_zero_self_evolve"] = "dr_zero_self_evolve"
+    iterations: int = 1
+    proposal_sample_size: int = 3
+    solver_rollouts_per_task: int = 1
+    proposer_role_id: str = "proposer"
+    solver_role_id: str = "solver"
+    verifier_role_id: str = "verifier"
+    guidance_required: bool = False
+
+
+ProtocolConfig = TeacherStudentDistillProtocol | MultiAgentDebateProtocol | DrZeroSelfEvolveProtocol
 
 
 def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) -> ProtocolConfig:
     """將 API-style payload 正規化為協議 dataclass。"""
     if payload is None:
         return TeacherStudentDistillProtocol()
-    if isinstance(payload, (TeacherStudentDistillProtocol, MultiAgentDebateProtocol)):
+    if isinstance(payload, (TeacherStudentDistillProtocol, MultiAgentDebateProtocol, DrZeroSelfEvolveProtocol)):
         return payload
 
     raw_protocol = str(payload.get("protocol", "teacher_student_distill")).strip()
@@ -57,15 +71,39 @@ def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) ->
             judge_role_id=_clean_role_id(payload.get("judge_role_id"), default="judge"),
             guidance_required=bool(payload.get("guidance_required", False)),
         )
+    if raw_protocol == "dr_zero_self_evolve":
+        return DrZeroSelfEvolveProtocol(
+            iterations=_bounded_int(payload.get("iterations"), default=1, minimum=1, maximum=8),
+            proposal_sample_size=_bounded_int(
+                payload.get("proposal_sample_size"),
+                default=3,
+                minimum=1,
+                maximum=20,
+            ),
+            solver_rollouts_per_task=_bounded_int(
+                payload.get("solver_rollouts_per_task"),
+                default=1,
+                minimum=1,
+                maximum=8,
+            ),
+            proposer_role_id=_clean_role_id(payload.get("proposer_role_id"), default="proposer"),
+            solver_role_id=_clean_role_id(payload.get("solver_role_id"), default="solver"),
+            verifier_role_id=_clean_role_id(payload.get("verifier_role_id"), default="verifier"),
+            guidance_required=bool(payload.get("guidance_required", False)),
+        )
     raise ValueError(f"Unsupported multi-agent protocol: {raw_protocol}")
 
 
 def _bounded_rounds(value: Any, *, default: int) -> int:
+    return _bounded_int(value, default=default, minimum=1, maximum=8)
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = default
-    return min(max(parsed, 1), 8)
+    return min(max(parsed, minimum), maximum)
 
 
 def _clean_role_id(value: Any, *, default: str) -> str:

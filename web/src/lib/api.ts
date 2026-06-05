@@ -4278,7 +4278,7 @@ export async function resolveApproval(
   return normalizeApprovalSummary(payload)
 }
 
-export type AgentRunProtocolId = 'teacher_student_distill' | 'multi_agent_debate' | (string & {})
+export type AgentRunProtocolId = 'teacher_student_distill' | 'multi_agent_debate' | 'dr_zero_self_evolve' | (string & {})
 
 export interface AgentRunArtifact {
   artifact_id: string | null

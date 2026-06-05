@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-RoleKind = Literal["teacher", "student", "debater", "judge"]
+RoleKind = Literal["teacher", "student", "debater", "judge", "proposer", "solver", "verifier"]
 
 
 @dataclass(frozen=True)
@@ -76,5 +76,40 @@ def build_multi_agent_debate_roles(
             kind="judge",
             title="Judge",
             instruction="Pick the most robust argument based on correctness and clarity.",
+        ),
+    ]
+
+
+def build_dr_zero_roles(
+    *,
+    proposer_role_id: str = "proposer",
+    solver_role_id: str = "solver",
+    verifier_role_id: str = "verifier",
+) -> list[AgentRoleProfile]:
+    """Build default roles for the Dr.Zero self-evolve protocol."""
+    return [
+        AgentRoleProfile(
+            role_id=proposer_role_id,
+            kind="proposer",
+            title="Proposer",
+            instruction=(
+                "Generate diverse, hard-but-solvable synthetic tasks for a search-capable "
+                "solver. Return JSON when possible."
+            ),
+        ),
+        AgentRoleProfile(
+            role_id=solver_role_id,
+            kind="solver",
+            title="Solver",
+            instruction=(
+                "Solve the proposed task using available read and research tools. "
+                "Ground the answer in verifiable evidence."
+            ),
+        ),
+        AgentRoleProfile(
+            role_id=verifier_role_id,
+            kind="verifier",
+            title="Verifier",
+            instruction="Verify solver rollouts and reward correctness, difficulty, and solvability.",
         ),
     ]

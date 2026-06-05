@@ -57,16 +57,38 @@ def export_run_to_dataset_records(run: MultiAgentRunResult) -> list[dict[str, An
         if isinstance(run.artifacts.get("source_quality_table"), dict):
             record["evidence"]["source_quality_table"] = dict(run.artifacts["source_quality_table"])
 
+    if run.protocol == "dr_zero_self_evolve":
+        dr_zero_metadata = {
+            "synthetic_tasks": run.artifacts.get("synthetic_tasks"),
+            "solver_rollouts": run.artifacts.get("solver_rollouts"),
+            "reward_summary": run.artifacts.get("reward_summary"),
+            "curriculum_state": run.artifacts.get("curriculum_state"),
+            "iteration_summary": run.artifacts.get("drzero_iteration_summary"),
+        }
+        record["metadata"]["dr_zero"] = {
+            key: value for key, value in dr_zero_metadata.items() if isinstance(value, dict)
+        }
+        if isinstance(run.artifacts.get("synthetic_tasks"), dict):
+            record["synthetic_tasks"] = dict(run.artifacts["synthetic_tasks"])
+        if isinstance(run.artifacts.get("solver_rollouts"), dict):
+            record["solver_rollouts"] = dict(run.artifacts["solver_rollouts"])
+        if isinstance(run.artifacts.get("reward_summary"), dict):
+            record["reward_summary"] = dict(run.artifacts["reward_summary"])
+
     return [record]
 
 
 def _dataset_mode_for_protocol(protocol: str) -> str:
+    if protocol == "dr_zero_self_evolve":
+        return "self_evolve_search"
     if protocol == "multi_agent_debate":
         return "preference_pair"
     return "trajectory_distillation"
 
 
 def _supervision_shape_for_protocol(protocol: str) -> str:
+    if protocol == "dr_zero_self_evolve":
+        return "solver_rollout_with_reward"
     if protocol == "multi_agent_debate":
         return "pairwise_preference"
     return "single_target"

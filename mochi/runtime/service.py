@@ -29,7 +29,11 @@ from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
 AGENT_RUN_ACTIVE_STATUS = {"running"}
-AGENT_RUN_SUPPORTED_PROTOCOLS = {"teacher_student_distill", "multi_agent_debate"}
+AGENT_RUN_SUPPORTED_PROTOCOLS = {
+    "teacher_student_distill",
+    "multi_agent_debate",
+    "dr_zero_self_evolve",
+}
 SCHEDULE_RUNTIME_KEYS = {
     "enabled",
     "interval_seconds",
@@ -695,6 +699,11 @@ class RuntimeService:
             ("claim_evidence_map", "Claim Evidence Map"),
             ("research_brief", "Research Brief"),
             ("subagent_runtime", "Subagent Runtime Trace"),
+            ("synthetic_tasks", "Synthetic Tasks"),
+            ("solver_rollouts", "Solver Rollouts"),
+            ("reward_summary", "Reward Summary"),
+            ("curriculum_state", "Curriculum State"),
+            ("drzero_iteration_summary", "Dr.Zero Iteration Summary"),
         ):
             artifact_content = result.artifacts.get(artifact_type) if isinstance(result.artifacts, dict) else None
             if not isinstance(artifact_content, dict):
@@ -1781,7 +1790,14 @@ def _resolve_protocol_payload(run: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(rounds, int):
         rounds = research.get("debate_rounds")
     if protocol_id in AGENT_RUN_SUPPORTED_PROTOCOLS:
-        payload: dict[str, Any] = {"protocol": protocol_id}
+        payload: dict[str, Any] = {
+            "protocol": protocol_id,
+            **{
+                str(key): value
+                for key, value in protocol_config.items()
+                if isinstance(key, str)
+            },
+        }
         if isinstance(rounds, int) and rounds > 0:
             payload["rounds"] = rounds
         return payload

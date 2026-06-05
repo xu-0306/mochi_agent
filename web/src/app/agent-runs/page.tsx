@@ -36,6 +36,11 @@ const PROTOCOL_OPTIONS: Array<{
     label: 'Multi Agent Debate',
     description: 'Multiple agents debate and converge on conclusions.',
   },
+  {
+    id: 'dr_zero_self_evolve',
+    label: 'Dr.Zero Self-Evolve',
+    description: 'Proposer generates hard-but-solvable tasks; solver creates evidence-aware rollouts.',
+  },
 ]
 
 const TERMINAL_RUN_STATUSES = new Set([
@@ -59,6 +64,9 @@ function createSubagentDraft(defaultModelId: string | null): SubagentDraft {
 }
 
 function defaultRolesForProtocol(protocolId: api.AgentRunProtocolId): string[] {
+  if (protocolId === 'dr_zero_self_evolve') {
+    return ['proposer', 'solver', 'verifier']
+  }
   if (protocolId === 'multi_agent_debate') {
     return ['debater_a', 'debater_b', 'judge']
   }
@@ -437,6 +445,18 @@ export default function AgentRunsPage() {
         schedule,
         summary: {
           ...(evidenceQueries.length > 0 ? { evidence_queries: evidenceQueries } : {}),
+          ...(protocolId === 'dr_zero_self_evolve' && runTemplate !== 'research_debate'
+            ? {
+                protocol_config: {
+                  iterations: 1,
+                  proposal_sample_size: 3,
+                  solver_rollouts_per_task: 1,
+                  proposer_role_id: 'proposer',
+                  solver_role_id: 'solver',
+                  verifier_role_id: 'verifier',
+                },
+              }
+            : {}),
           ...(protocolId === 'multi_agent_debate' || runTemplate === 'research_debate'
             ? { protocol_config: { rounds: parsePositiveInteger(debateRounds, 2) } }
             : {}),
