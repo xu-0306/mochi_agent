@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { Brain, Loader2, Mic, MicOff, Volume2, XCircle } from 'lucide-react'
+import { AlertTriangle, Brain, Loader2, Mic, MicOff, Volume2, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -13,16 +13,22 @@ import {
 } from '@/components/ui/dialog'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
-import { type VoiceRuntimePhase } from '@/lib/voice-ws'
+import { buildVoiceMeterAmplitudes } from '@/lib/voice-capture'
+import { type VoiceRuntimePhase, type VoiceVadState } from '@/lib/voice-ws'
 import { Waveform } from './Waveform'
 
 interface VoiceOverlayProps {
   open: boolean
   phase: VoiceRuntimePhase
   isRecording: boolean
+  inputLevel: number
+  hasInputSignal: boolean
+  microphoneLabel: string | null
+  vadState: VoiceVadState | null
   partialTranscription: string
   finalTranscription: string
   assistantText: string
+  captureWarning: string | null
   errorMessage: string | null
   onToggleRecording: () => void
   onInterrupt: () => void
@@ -54,9 +60,14 @@ export function VoiceOverlay({
   open,
   phase,
   isRecording,
+  inputLevel,
+  hasInputSignal,
+  microphoneLabel,
+  vadState,
   partialTranscription,
   finalTranscription,
   assistantText,
+  captureWarning,
   errorMessage,
   onToggleRecording,
   onInterrupt,
@@ -67,6 +78,10 @@ export function VoiceOverlay({
   const showSpinner = phase === 'connecting' || phase === 'transcribing'
   const showThinking = phase === 'thinking'
   const showSynthesis = phase === 'synthesizing'
+  const waveformAmplitudes = React.useMemo(
+    () => buildVoiceMeterAmplitudes(inputLevel),
+    [inputLevel]
+  )
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => (!nextOpen ? onClose() : undefined)}>
@@ -84,6 +99,7 @@ export function VoiceOverlay({
         <div className="space-y-4 px-5 py-4">
           <div className="rounded-lg border border-border bg-surface-layer px-4 py-4">
             <Waveform
+              amplitudes={isRecording ? waveformAmplitudes : undefined}
               isActive={isRecording || showSpinner || showSynthesis}
               className="mx-auto"
             />
@@ -93,7 +109,33 @@ export function VoiceOverlay({
               {showSynthesis ? <Volume2 className="h-3.5 w-3.5 text-primary-400" /> : null}
               <span>{phaseLabel(phase, t)}</span>
             </div>
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-2 text-[11px] text-muted-foreground">
+              <span className="rounded-full border border-border px-2 py-1">
+                {microphoneLabel
+                  ? `${t('chat.voice.microphone')}: ${microphoneLabel}`
+                  : t('chat.voice.deviceUnknown')}
+              </span>
+              {isRecording ? (
+                <span className="rounded-full border border-border px-2 py-1">
+                  {hasInputSignal
+                    ? t('chat.voice.signalDetected')
+                    : t('chat.voice.signalWaiting')}
+                </span>
+              ) : null}
+              {vadState === 'speech_started' ? (
+                <span className="rounded-full border border-border px-2 py-1">
+                  {t('chat.voice.vadDetected')}
+                </span>
+              ) : null}
+            </div>
           </div>
+
+          {captureWarning ? (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-foreground">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+              <span className="break-words">{captureWarning}</span>
+            </div>
+          ) : null}
 
           <div className="space-y-2">
             <p className="text-[11px] uppercase text-muted-foreground">{t('chat.voice.transcription')}</p>

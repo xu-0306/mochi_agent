@@ -173,6 +173,22 @@ class WebFetchTool(BaseTool):
         )
 
     @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def is_open_world(self) -> bool:
+        return True
+
+    @property
+    def is_concurrency_safe(self) -> bool:
+        return True
+
+    @property
+    def search_hint(self) -> str | None:
+        return "Use this after search when you need the content of one known URL."
+
+    @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",

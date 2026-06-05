@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from mochi.backends.base import BaseLLMBackend
 
@@ -21,8 +22,12 @@ class ToolExposurePlanner:
 
     _RISKY_TOOLS: frozenset[str] = frozenset(
         {
+            "exec_command",
             "shell",
             "execute_code",
+            "execute_code_v2",
+            "write_stdin",
+            "kill_session",
             "file_write",
             "file_edit",
             "process_stop",
@@ -31,13 +36,26 @@ class ToolExposurePlanner:
     )
     _STRICT_BLOCKED_TOOLS: frozenset[str] = frozenset(
         {
+            "exec_command",
             "shell",
             "execute_code",
+            "execute_code_v2",
+            "write_stdin",
+            "kill_session",
             "process_stop",
             "mcp_call",
         }
     )
-    _CONTEXTUAL_TOOLS: frozenset[str] = frozenset({"process_poll", "process_stop"})
+    _CONTEXTUAL_TOOLS: frozenset[str] = frozenset(
+        {
+            "read_session",
+            "write_stdin",
+            "kill_session",
+            "list_sessions",
+            "process_poll",
+            "process_stop",
+        }
+    )
     _AUTONOMY_LIMITS: dict[str, tuple[int, int]] = {
         "strict": (4, 2),
         "trusted_workspace": (6, 3),
@@ -45,40 +63,143 @@ class ToolExposurePlanner:
         "high_autonomy": (10, 4),
     }
     _TOOL_PRIORITY: dict[str, int] = {
+        "glob_search": 5,
+        "grep_search": 8,
         "file_read": 10,
+        "csv_read": 11,
+        "pdf_read": 12,
+        "docx_read": 13,
+        "notebook_read": 14,
+        "tool_search": 15,
         "file_write": 20,
         "file_edit": 30,
-        "shell": 40,
+        "exec_command": 40,
         "execute_code": 50,
-        "process_poll": 60,
-        "process_stop": 70,
-        "memory_search": 80,
-        "memory_save": 90,
-        "web_search": 100,
-        "web_fetch": 110,
-        "get_current_time": 120,
-        "calculator": 130,
+        "execute_code_v2": 55,
+        "read_session": 60,
+        "write_stdin": 70,
+        "list_sessions": 80,
+        "kill_session": 90,
+        "process_poll": 100,
+        "process_stop": 110,
+        "shell": 120,
+        "memory_search": 130,
+        "memory_save": 140,
+        "web_search": 150,
+        "web_fetch": 160,
+        "web_crawl": 165,
+        "get_current_time": 170,
+        "calculator": 180,
     }
-
     _GROUP_KEYWORDS: dict[str, tuple[str, ...]] = {
         "web": (
-            "today", "weather", "news", "latest", "search", "url", "http", "https",
-            "今天", "天氣", "新聞", "最新", "查詢", "搜尋", "網址", "網頁",
+            "today",
+            "weather",
+            "news",
+            "latest",
+            "search web",
+            "crawl",
+            "site",
+            "url",
+            "http",
+            "https",
         ),
         "workspace": (
-            "code", "file", "test", "run", "debug", "repo", "project", "shell",
-            "程式", "代碼", "檔案", "測試", "執行", "除錯", "專案", "倉庫",
+            "code",
+            "file",
+            "files",
+            "find",
+            "search",
+            "grep",
+            "glob",
+            "todo",
+            "test",
+            "run",
+            "debug",
+            "repo",
+            "project",
+            "workspace",
+            "shell",
+            "exec",
+            "session",
+            "stdin",
         ),
         "literature": (
-            "paper", "arxiv", "pubmed", "doi", "citation", "literature",
-            "論文", "文獻", "引用", "doi",
+            "paper",
+            "arxiv",
+            "pubmed",
+            "doi",
+            "citation",
+            "literature",
         ),
         "memory": (
-            "remember", "memory", "skill", "記住", "記憶", "技能",
+            "remember",
+            "memory",
+            "skill",
         ),
         "mcp": (
-            "mcp", "resource", "server", "資源", "伺服器",
+            "mcp",
+            "resource",
+            "server",
         ),
+    }
+    _CONTEXT_KEYWORDS: tuple[str, ...] = (
+        "background",
+        "process",
+        "poll",
+        "tail",
+        "stop",
+        "session",
+        "stdin",
+        "pty",
+    )
+    _TOOL_DISCOVERY_KEYWORDS: tuple[str, ...] = (
+        "which tool",
+        "what tool",
+        "available tools",
+        "list tools",
+        "find tool",
+        "tool should i use",
+        "tool to use",
+    )
+    _ATTACHED_WORKSPACE_FILE_MARKERS: tuple[str, ...] = (
+        "attached workspace files:",
+        "attached workspace file:",
+    )
+    _READ_ONLY_FILE_INTENT_KEYWORDS: tuple[str, ...] = (
+        "read",
+        "inspect",
+        "review",
+        "summarize",
+        "summary",
+        "analyze",
+        "analyse",
+        "extract",
+        "file-reading",
+    )
+    _FILETYPE_TOOL_KEYWORDS: dict[str, tuple[str, ...]] = {
+        "pdf_read": ("pdf",),
+        "csv_read": ("csv", "tsv", "spreadsheet"),
+        "docx_read": ("docx", "word document", ".docx"),
+        "notebook_read": ("notebook", "ipynb", "jupyter"),
+    }
+    _INTENT_REQUIRED_TOOL_KEYWORDS: dict[str, tuple[str, ...]] = {
+        "glob_search": ("find", "search", "grep", "glob", "todo", "match"),
+        "grep_search": ("find", "search", "grep", "todo", "match"),
+        "pdf_read": ("pdf",),
+        "csv_read": ("csv", "tsv", "spreadsheet"),
+        "docx_read": ("docx", "word document", ".docx"),
+        "notebook_read": ("notebook", "ipynb", "jupyter"),
+        "tool_search": (
+            "which tool",
+            "what tool",
+            "available tools",
+            "list tools",
+            "find tool",
+            "tool should i use",
+            "tool to use",
+        ),
+        "web_crawl": ("crawl", "site", "url", "http", "https"),
     }
 
     def __init__(self, *, tool_groups: dict[str, list[str]]) -> None:
@@ -92,8 +213,22 @@ class ToolExposurePlanner:
         backend: BaseLLMBackend,
         session_bound_workspace: bool,
         autonomy_mode: str | None = None,
+        preferred_tool_names: list[str] | None = None,
+        tool_mode: Literal["disabled", "auto", "required"] = "auto",
     ) -> ToolExposurePlan:
+        if tool_mode == "disabled":
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=[],
+                limit=0,
+            )
         lowered = message.lower()
+        attached_workspace_files = any(
+            marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
+        )
+        read_only_file_request = attached_workspace_files and any(
+            keyword in lowered for keyword in self._READ_ONLY_FILE_INTENT_KEYWORDS
+        )
         matched_groups: list[str] = []
         for group_name in ("web", "workspace", "literature", "memory", "mcp"):
             if any(keyword in lowered for keyword in self._GROUP_KEYWORDS[group_name]):
@@ -102,13 +237,52 @@ class ToolExposurePlanner:
         if not matched_groups:
             matched_groups.append("workspace" if session_bound_workspace else "web")
 
+        available_order = {name: index for index, name in enumerate(available_tool_names)}
+        grouped_tool_names = {
+            tool_name
+            for tool_names in self._tool_groups.values()
+            for tool_name in tool_names
+        }
+        preferred = [
+            tool_name
+            for tool_name in (preferred_tool_names or [])
+            if tool_name in available_order
+        ]
+        if "tool_search" in available_order and any(
+            keyword in lowered for keyword in self._TOOL_DISCOVERY_KEYWORDS
+        ):
+            preferred = ["tool_search", *[tool_name for tool_name in preferred if tool_name != "tool_search"]]
+        if attached_workspace_files and "file_read" in available_order:
+            preferred = ["file_read", *[tool_name for tool_name in preferred if tool_name != "file_read"]]
+        for tool_name, keywords in self._FILETYPE_TOOL_KEYWORDS.items():
+            if tool_name not in available_order:
+                continue
+            if any(keyword in lowered for keyword in keywords):
+                preferred.append(tool_name)
+        preferred = list(dict.fromkeys(preferred))
+
         selected: list[str] = []
         available = set(available_tool_names)
+        for tool_name in preferred:
+            if tool_name not in selected:
+                selected.append(tool_name)
         for group_name in matched_groups:
             for tool_name in self._tool_groups.get(group_name, []):
                 if tool_name in available and tool_name not in selected:
                     selected.append(tool_name)
-        selected.sort(key=lambda name: self._TOOL_PRIORITY.get(name, 1000))
+        for tool_name in available_tool_names:
+            if tool_name in selected or tool_name in grouped_tool_names:
+                continue
+            selected.append(tool_name)
+
+        preferred_set = set(preferred)
+        selected.sort(
+            key=lambda name: (
+                0 if name in preferred_set else 1,
+                self._TOOL_PRIORITY.get(name, 1000),
+                available_order.get(name, 10_000),
+            )
+        )
 
         base_limit = 6 if backend.get_model_info().backend_type in {"gguf", "safetensors"} else 10
         effective_mode = autonomy_mode or "trusted_workspace"
@@ -117,9 +291,13 @@ class ToolExposurePlanner:
         filtered: list[str] = []
         risky_count = 0
         for tool_name in selected:
+            if not self._tool_matches_message(tool_name, lowered):
+                continue
             if tool_name in self._CONTEXTUAL_TOOLS and not any(
-                keyword in lowered for keyword in ("background", "process", "poll", "tail", "stop")
+                keyword in lowered for keyword in self._CONTEXT_KEYWORDS
             ):
+                continue
+            if read_only_file_request and tool_name in self._RISKY_TOOLS:
                 continue
             if effective_mode == "strict" and tool_name in self._STRICT_BLOCKED_TOOLS:
                 continue
@@ -134,3 +312,9 @@ class ToolExposurePlanner:
             matched_groups=matched_groups,
             limit=limit,
         )
+
+    def _tool_matches_message(self, tool_name: str, lowered_message: str) -> bool:
+        keywords = self._INTENT_REQUIRED_TOOL_KEYWORDS.get(tool_name)
+        if not keywords:
+            return True
+        return any(keyword in lowered_message for keyword in keywords)

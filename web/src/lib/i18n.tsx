@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import { DEFAULT_CODE_THEME, normalizeCodeTheme, type UICodeTheme } from '@/lib/code-theme'
 
 export type UILanguage = 'zh-TW' | 'en'
 export type UILanguageMode = 'auto' | UILanguage
@@ -41,6 +42,8 @@ type I18nContextValue = {
   appearanceMode: UIAppearanceMode
   setAppearanceMode: (mode: UIAppearanceMode) => void
   appearance: UIAppearance
+  codeTheme: UICodeTheme
+  setCodeTheme: (theme: UICodeTheme) => void
   timezone: UITimezone
   setTimezone: (timezone: UITimezone) => void
   resolvedTimeZone: string | undefined
@@ -100,7 +103,10 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'chat.thinking': '思考中',
     'chat.voice.assistant': '助理回覆',
     'chat.voice.close': '關閉',
+    'chat.voice.deviceUnknown': '未識別麥克風',
     'chat.voice.interrupt': '中斷',
+    'chat.voice.microphone': '麥克風',
+    'chat.voice.noInputDetected': '尚未偵測到麥克風輸入訊號，請檢查瀏覽器權限與目前選用的錄音裝置。',
     'chat.voice.phase.connecting': '連線中',
     'chat.voice.phase.error': '錯誤',
     'chat.voice.phase.idle': '待命',
@@ -110,10 +116,13 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'chat.voice.phase.thinking': '思考中',
     'chat.voice.phase.transcribing': '語音轉寫中',
     'chat.voice.record': '開始錄音',
+    'chat.voice.signalDetected': '已收到麥克風訊號',
+    'chat.voice.signalWaiting': '等待麥克風訊號',
     'chat.voice.startPrompt': '開始錄音後即可說話。',
     'chat.voice.stop': '停止',
     'chat.voice.title': '語音對話',
     'chat.voice.transcription': '轉寫結果',
+    'chat.voice.vadDetected': '已偵測到語音',
     'chat.voice.waiting': '等待回覆中。',
     'chat.tool.args': '參數',
     'chat.tool.error': '錯誤',
@@ -423,8 +432,17 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'app.shortcuts.toggleSidebar': '切換側欄 (⌘B)',
     'sidebar.settings': '設定',
     'sidebar.skills': 'Skill 庫',
+    'sidebar.workflows': '工作流',
     'sidebar.thisWeek': '本週',
     'sidebar.today': '今天',
+    'workflows.apiUnavailable': '這個後端目前尚未提供 Workflows API。',
+    'workflows.backToList': '返回工作流',
+    'workflows.create': '建立工作流',
+    'workflows.createDescription': '設定 protocol 與 subagent。模型來自已設定的 providers。',
+    'workflows.createError': '無法建立工作流。',
+    'workflows.description': '建立並監看結構化多代理工作流，支援協作、蒐證、評分與排程。',
+    'workflows.loadError': '無法載入工作流。',
+    'workflows.title': '工作流',
     'skills.card.created': 'Created',
     'skills.card.delete': '刪除 {name}',
     'skills.card.noDescription': '無描述',
@@ -574,7 +592,10 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'chat.thinking': 'Thinking',
     'chat.voice.assistant': 'Assistant',
     'chat.voice.close': 'Close',
+    'chat.voice.deviceUnknown': 'Unknown microphone',
     'chat.voice.interrupt': 'Interrupt',
+    'chat.voice.microphone': 'Microphone',
+    'chat.voice.noInputDetected': 'No microphone input signal detected yet. Check browser permission and the selected recording device.',
     'chat.voice.phase.connecting': 'Connecting',
     'chat.voice.phase.error': 'Error',
     'chat.voice.phase.idle': 'Idle',
@@ -584,10 +605,13 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'chat.voice.phase.thinking': 'Thinking',
     'chat.voice.phase.transcribing': 'Transcribing',
     'chat.voice.record': 'Record',
+    'chat.voice.signalDetected': 'Microphone signal detected',
+    'chat.voice.signalWaiting': 'Waiting for microphone signal',
     'chat.voice.startPrompt': 'Start recording to speak.',
     'chat.voice.stop': 'Stop',
     'chat.voice.title': 'Voice Session',
     'chat.voice.transcription': 'Transcription',
+    'chat.voice.vadDetected': 'Speech detected',
     'chat.voice.waiting': 'Waiting for response.',
     'chat.tool.args': 'Arguments',
     'chat.tool.error': 'Error',
@@ -916,8 +940,17 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'app.shortcuts.toggleSidebar': 'Toggle sidebar (⌘B)',
     'sidebar.settings': 'Settings',
     'sidebar.skills': 'Skill Library',
+    'sidebar.workflows': 'Workflows',
     'sidebar.thisWeek': 'This week',
     'sidebar.today': 'Today',
+    'workflows.apiUnavailable': 'Workflows API is not available on this backend yet.',
+    'workflows.backToList': 'Back to Workflows',
+    'workflows.create': 'Create Workflow',
+    'workflows.createDescription': 'Configure protocol and subagents. Models come from configured providers.',
+    'workflows.createError': 'Unable to create Workflow.',
+    'workflows.description': 'Create and monitor structured multi-agent workflows for collaboration, evidence gathering, evaluation, and scheduling.',
+    'workflows.loadError': 'Unable to load Workflows.',
+    'workflows.title': 'Workflows',
     'skills.card.created': 'Created',
     'skills.card.delete': 'Delete {name}',
     'skills.card.noDescription': 'No description',
@@ -1008,11 +1041,14 @@ const messages: Record<UILanguage, Record<TranslationKey, string>> = {
     'settings.preferences.description': 'Adjust language, appearance, font size, and time zone. Preferences are stored in this browser only.',
     'settings.preferences.language': 'UI language',
     'settings.preferences.appearance': 'Appearance mode',
+    'settings.preferences.codeTheme': 'Code theme',
     'settings.preferences.fontSize': 'Font size',
     'settings.preferences.timezone': 'Time zone',
     'settings.preferences.appearanceHelp': 'Appearance can follow your system, or be pinned to dark/light.',
+    'settings.preferences.codeThemeHelp': 'The selected code theme applies to every code block across the WebGUI.',
     'settings.preferences.fontHelp': 'Font size affects readability across the main WebGUI.',
     'settings.preferences.timezoneHelp': 'Time zone affects display only. Storage and API timestamps remain UTC.',
+    'settings.preferences.codeThemePreview': 'Code theme preview',
     'settings.preferences.language.default': 'Default / Auto-detect',
     'settings.preferences.language.zhTW': 'Traditional Chinese',
     'settings.preferences.language.en': 'English',
@@ -1111,6 +1147,7 @@ type UIPreferences = {
   languageMode: UILanguageMode
   fontSize: UIFontSize
   appearanceMode: UIAppearanceMode
+  codeTheme: UICodeTheme
   timezone: UITimezone
 }
 
@@ -1119,6 +1156,7 @@ function buildDefaultPreferences(): UIPreferences {
     languageMode: DEFAULT_LANGUAGE_MODE,
     fontSize: DEFAULT_FONT_SIZE,
     appearanceMode: DEFAULT_APPEARANCE_MODE,
+    codeTheme: DEFAULT_CODE_THEME,
     timezone: AUTO_TIMEZONE,
   }
 }
@@ -1203,6 +1241,7 @@ function parseStoredPreferences(raw: string | null): UIPreferences {
       ?? parsed.theme
       ?? parsed.colorScheme
     ),
+    codeTheme: normalizeCodeTheme(parsed.codeTheme ?? parsed.code_theme ?? parsed.syntaxTheme),
     timezone: normalizeTimezone(parsed.timezone ?? parsed.time_zone ?? parsed.tz),
   }
 }
@@ -1231,6 +1270,7 @@ function persistPreferences(preferences: UIPreferences) {
         languageMode: preferences.languageMode,
         fontSize: preferences.fontSize,
         appearanceMode: preferences.appearanceMode,
+        codeTheme: preferences.codeTheme,
         timezone: preferences.timezone,
       })
     )
@@ -1244,6 +1284,7 @@ function arePreferencesEqual(left: UIPreferences, right: UIPreferences): boolean
     left.languageMode === right.languageMode
     && left.fontSize === right.fontSize
     && left.appearanceMode === right.appearanceMode
+    && left.codeTheme === right.codeTheme
     && left.timezone === right.timezone
   )
 }
@@ -1258,13 +1299,19 @@ function updateThemeColor(appearance: UIAppearance) {
     ?.setAttribute('content', THEME_COLOR_BY_APPEARANCE[appearance])
 }
 
-function applyDocumentPreferences(language: UILanguage, fontSize: UIFontSize, appearance: UIAppearance) {
+function applyDocumentPreferences(
+  language: UILanguage,
+  fontSize: UIFontSize,
+  appearance: UIAppearance,
+  codeTheme: UICodeTheme
+) {
   if (typeof document === 'undefined') {
     return
   }
   document.documentElement.lang = language
   document.documentElement.dataset.fontSize = fontSize
   document.documentElement.dataset.theme = appearance
+  document.documentElement.dataset.codeTheme = codeTheme
   document.documentElement.style.colorScheme = appearance
   updateThemeColor(appearance)
 }
@@ -1280,7 +1327,7 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
   const [browserLanguage, setBrowserLanguage] = React.useState<UILanguage>(DEFAULT_LANGUAGE)
   const [systemAppearance, setSystemAppearance] = React.useState<UIAppearance>(DEFAULT_APPEARANCE)
   const [initialized, setInitialized] = React.useState(false)
-  const { languageMode, fontSize, appearanceMode, timezone } = preferences
+  const { languageMode, fontSize, appearanceMode, codeTheme, timezone } = preferences
   const language = React.useMemo(
     () => resolveLanguageFromMode(languageMode, browserLanguage),
     [browserLanguage, languageMode]
@@ -1300,7 +1347,7 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     setBrowserLanguage(nextBrowserLanguage)
     setSystemAppearance(nextSystemAppearance)
     setPreferences(nextPreferences)
-    applyDocumentPreferences(nextLanguage, nextPreferences.fontSize, nextAppearance)
+    applyDocumentPreferences(nextLanguage, nextPreferences.fontSize, nextAppearance, nextPreferences.codeTheme)
     setInitialized(true)
   }, [])
 
@@ -1308,9 +1355,9 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     if (!initialized) {
       return
     }
-    applyDocumentPreferences(language, fontSize, appearance)
+    applyDocumentPreferences(language, fontSize, appearance, codeTheme)
     persistPreferences(preferences)
-  }, [appearance, fontSize, initialized, language, preferences, timezone])
+  }, [appearance, codeTheme, fontSize, initialized, language, preferences, timezone])
 
   React.useEffect(() => {
     if (!initialized || appearanceMode !== 'system' || typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
@@ -1358,7 +1405,7 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
       setPreferences((previous) => (
         arePreferencesEqual(previous, nextPreferences) ? previous : nextPreferences
       ))
-      applyDocumentPreferences(nextLanguage, nextPreferences.fontSize, nextAppearance)
+      applyDocumentPreferences(nextLanguage, nextPreferences.fontSize, nextAppearance, nextPreferences.codeTheme)
     }
 
     window.addEventListener('storage', handleStorage)
@@ -1409,6 +1456,18 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     []
   )
 
+  const setCodeTheme = React.useCallback(
+    (nextTheme: UICodeTheme) => {
+      const normalizedTheme = normalizeCodeTheme(nextTheme)
+      setPreferences((previous) => (
+        previous.codeTheme === normalizedTheme
+          ? previous
+          : { ...previous, codeTheme: normalizedTheme }
+      ))
+    },
+    []
+  )
+
   const setTimezone = React.useCallback(
     (nextTimezone: UITimezone) => {
       const normalizedTimezone = normalizeTimezone(nextTimezone)
@@ -1446,12 +1505,14 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
       appearanceMode,
       setAppearanceMode,
       appearance,
+      codeTheme,
+      setCodeTheme,
       timezone,
       setTimezone,
       resolvedTimeZone,
       t,
     }),
-    [appearance, appearanceMode, fontSize, language, languageMode, locale, resolvedTimeZone, setAppearanceMode, setFontSize, setLanguage, setLanguageMode, setTimezone, t, timezone]
+    [appearance, appearanceMode, codeTheme, fontSize, language, languageMode, locale, resolvedTimeZone, setAppearanceMode, setCodeTheme, setFontSize, setLanguage, setLanguageMode, setTimezone, t, timezone]
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

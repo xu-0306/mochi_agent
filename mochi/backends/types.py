@@ -1,4 +1,4 @@
-"""後端共用型別定義。"""
+"""Common backend message and tool payload types."""
 
 from __future__ import annotations
 
@@ -7,80 +7,78 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Literal
 
-# 角色類型
 Role = Literal["system", "user", "assistant", "tool"]
 
 
 @dataclass
 class ToolCall:
-    """LLM 回覆中的工具呼叫請求。"""
+    """One backend-emitted function call."""
 
     id: str
-    """工具呼叫唯一 ID。"""
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class AttachmentRef:
+    """Structured reference to one user-provided workspace attachment."""
 
     name: str
-    """工具名稱。"""
+    path: str
+    size: int | None = None
+    content_type: str | None = None
 
-    arguments: dict[str, Any]
-    """工具參數（JSON 物件）。"""
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": self.path,
+            "size": self.size,
+            "content_type": self.content_type,
+        }
 
 
 @dataclass
 class Message:
-    """對話訊息。"""
+    """One chat message passed through a backend."""
 
     role: Role
-    """發言角色。"""
-
     content: str
-    """訊息內容。"""
-
     tool_calls: list[ToolCall] = field(default_factory=partial(list[ToolCall]))
-    """若 role=assistant 且含工具呼叫則填入此欄。"""
-
     tool_call_id: str | None = None
-    """若 role=tool，對應的 ToolCall.id。"""
-
     name: str | None = None
-    """工具名稱（role=tool 時使用）。"""
+    attachments: list[AttachmentRef] = field(default_factory=partial(list[AttachmentRef]))
 
     def to_dict(self) -> dict[str, Any]:
-        """轉為 OpenAI chat message 格式字典。"""
-        d: dict[str, Any] = {"role": self.role, "content": self.content}
+        """Serialize into an OpenAI-compatible chat message payload."""
+        payload: dict[str, Any] = {"role": self.role, "content": self.content}
         if self.tool_calls:
-            d["tool_calls"] = [
+            payload["tool_calls"] = [
                 {
-                    "id": tc.id,
+                    "id": tool_call.id,
                     "type": "function",
                     "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                        "name": tool_call.name,
+                        "arguments": json.dumps(tool_call.arguments, ensure_ascii=False),
                     },
                 }
-                for tc in self.tool_calls
+                for tool_call in self.tool_calls
             ]
         if self.tool_call_id:
-            d["tool_call_id"] = self.tool_call_id
+            payload["tool_call_id"] = self.tool_call_id
         if self.name:
-            d["name"] = self.name
-        return d
+            payload["name"] = self.name
+        return payload
 
 
 @dataclass
 class ToolSchema:
-    """工具的 JSON Schema 描述（OpenAI function calling 格式）。"""
+    """One callable tool schema."""
 
     name: str
-    """工具名稱。"""
-
     description: str
-    """工具用途描述。"""
-
     parameters: dict[str, Any]
-    """JSON Schema 格式的參數定義。"""
 
     def to_dict(self) -> dict[str, Any]:
-        """轉為 OpenAI tools 格式字典。"""
         return {
             "type": "function",
             "function": {
@@ -93,59 +91,33 @@ class ToolSchema:
 
 @dataclass
 class GenerationResult:
-    """非串流模式的完整生成結果。"""
+    """Non-stream generation output."""
 
     content: str
-    """生成的文字內容。"""
-
     tool_calls: list[ToolCall] = field(default_factory=partial(list[ToolCall]))
-    """工具呼叫請求列表。"""
-
     input_tokens: int = 0
-    """輸入 token 數量。"""
-
     output_tokens: int = 0
-    """輸出 token 數量。"""
-
     model: str = ""
-    """實際使用的模型名稱。"""
-
     finish_reason: str = "stop"
-    """停止原因（stop / tool_calls / length）。"""
 
 
 @dataclass
 class StreamChunk:
-    """串流模式的單一 chunk。"""
+    """One streamed chunk."""
 
     delta: str = ""
-    """本次增量文字。"""
-
     tool_call_delta: ToolCall | None = None
-    """本次增量工具呼叫（部分填充）。"""
-
     is_final: bool = False
-    """是否為最後一個 chunk。"""
-
     finish_reason: str | None = None
-    """最終 chunk 的停止原因。"""
 
 
 @dataclass
 class ModelInfo:
-    """模型基本資訊。"""
+    """Basic model metadata exposed by a backend."""
 
     name: str
-    """模型名稱。"""
-
     backend_type: str
-    """後端類型（ollama / gguf / safetensors / openai_compat）。"""
-
+    provider: str | None = None
     context_length: int = 4096
-    """最大上下文視窗（tokens）。"""
-
     supports_tool_calling: bool = False
-    """是否原生支援 function calling。"""
-
     metadata: dict[str, Any] = field(default_factory=partial(dict[str, Any]))
-    """後端自訂元資料。"""

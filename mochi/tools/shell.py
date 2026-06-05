@@ -1,4 +1,4 @@
-"""Shell 工具 — 在安全限制下執行命令。"""
+"""Legacy shell tool kept for backwards compatibility."""
 
 from __future__ import annotations
 
@@ -7,10 +7,16 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from mochi.config import defaults
+from mochi.security import (
+    deny_security_decision,
+    require_approval_decision,
+    with_task_isolation_scope,
+)
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.tools.process_service import ProcessService
 from mochi.utils.security import (
-    is_safe_command,
+    explain_unsafe_shell_command,
     normalize_workspace_dir,
     resolve_path_in_workspace,
 )
@@ -19,7 +25,7 @@ ShellRunner = Callable[[str, Path, int], Awaitable[tuple[int, str, str]]]
 
 
 class ShellTool(BaseTool):
-    """受控 Shell 命令執行工具（deny-by-default）。"""
+    """Legacy compatibility shell tool with strict allowlist + approval checks."""
 
     def __init__(
         self,
@@ -31,17 +37,8 @@ class ShellTool(BaseTool):
         runner: ShellRunner | None = None,
         process_service: ProcessService | None = None,
     ) -> None:
-        """初始化 Shell 工具。
-
-        Args:
-            allowlist: 允許執行的命令白名單（只比對 base command）。
-            workspace_dir: 工作目錄根路徑，`cwd` 只能在此範圍內。
-            require_approval: 是否要求傳入 approved=True 才執行。
-            default_timeout_sec: 預設命令逾時秒數。
-            runner: 可注入的命令執行器（便於測試或替換 runtime）。
-        """
         self._allowlist = allowlist or ["ls", "cat", "pwd", "echo", "date", "which"]
-        self._workspace_dir = normalize_workspace_dir(workspace_dir or "~/.mochi")
+        self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         self._require_approval = require_approval
         self._default_timeout_sec = default_timeout_sec
         self._runner = runner or self._default_runner
@@ -49,28 +46,24 @@ class ShellTool(BaseTool):
 
     @property
     def name(self) -> str:
-        """工具名稱。"""
         return "shell"
 
     @property
     def description(self) -> str:
-        """工具用途描述。"""
         return (
-            "Run an allowlisted shell command in the workspace under approval and path "
-            "constraints. Use for simple command-line inspection or automation when file "
-            "tools are not enough. Commands outside the allowlist or workspace policy "
-            "are rejected."
+            "Legacy compatibility shell runner for simple allowlisted commands in the "
+            "workspace. Prefer exec_command for general command execution and session-based "
+            "flows. Commands outside the allowlist or workspace policy are rejected."
         )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
-        """JSON Schema 格式參數。"""
         return {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Shell command to run. Only allowlisted commands are permitted.",
+                    "description": "Legacy compatibility command. Only allowlisted commands are permitted.",
                 },
                 "cwd": {
                     "type": "string",
@@ -104,7 +97,6 @@ class ShellTool(BaseTool):
 
     @property
     def requires_approval(self) -> bool:
-        """此工具是否預設需要審批。"""
         return self._require_approval
 
     async def execute(
@@ -118,23 +110,41 @@ class ShellTool(BaseTool):
         process_label: str | None = None,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
-        """執行受控 shell 命令。"""
         if not command.strip():
             return ToolResult(error="`command` must not be empty.")
 
-        if not is_safe_command(command, self._allowlist):
+        shell_reason = explain_unsafe_shell_command(command, self._allowlist)
+        if shell_reason is not None:
+            decision = deny_security_decision(
+                reason=shell_reason,
+                approval_kind="shell",
+                approval_scope="dangerous_command",
+                replay_safe=False,
+                policy_source="shell_policy",
+            )
             return ToolResult(
-                error=(
-                    "Command denied by policy: only allowlist commands without shell chaining "
-                    "syntax are allowed."
-                ),
-                metadata={"allowlist": sorted(set(self._allowlist))},
+                error=shell_reason,
+                metadata={
+                    "allowlist": sorted(set(self._allowlist)),
+                    **decision.to_metadata(),
+                },
             )
 
         if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="Shell commands require explicit approval in the current autonomy mode.",
+                approval_kind="shell",
+                approval_scope="workspace",
+                replay_safe=True,
+                policy_source="runtime_policy",
+            )
+            decision = with_task_isolation_scope(
+                decision,
+                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
+            )
             return ToolResult(
                 error="Shell command requires approval.",
-                metadata={"requires_approval": True},
+                metadata=decision.to_metadata(),
             )
 
         workspace_root = self._resolve_workspace_root(context)
@@ -172,7 +182,7 @@ class ShellTool(BaseTool):
 
         try:
             returncode, stdout, stderr = await self._runner(command, working_dir, effective_timeout)
-        except Exception as exc:  # pragma: no cover - 防禦性保護
+        except Exception as exc:  # pragma: no cover
             return ToolResult(
                 error=f"Shell execution failed: {exc}",
                 metadata={"command": command, "cwd": str(working_dir)},
@@ -208,7 +218,6 @@ class ShellTool(BaseTool):
 
     @staticmethod
     async def _default_runner(command: str, cwd: Path, timeout_sec: int) -> tuple[int, str, str]:
-        """預設 subprocess runner。"""
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),

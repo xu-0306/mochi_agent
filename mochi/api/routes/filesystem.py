@@ -1,7 +1,9 @@
-"""Filesystem metadata API routes。"""
+"""Filesystem metadata and preview API routes."""
 
 from __future__ import annotations
 
+import asyncio
+import mimetypes
 import os
 import re
 import time
@@ -10,8 +12,12 @@ from string import ascii_uppercase
 from typing import Annotated, Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse
 
+from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config  # pyright: ignore[reportPrivateUsage]
+from mochi.tools.docx_read import extract_docx_paragraphs
+from mochi.tools.pdf_read import extract_pdf_pages
 
 router = APIRouter(prefix="/v1/filesystem", tags=["filesystem"])
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
@@ -19,11 +25,7 @@ _SAFE_PACKAGE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _path_from_client(value: str) -> Path:
-    """將前端傳入路徑轉成後端可理解的 Path。
-
-    WSL/Linux 後端常會收到 Windows 形式 `H:\\...`；若 `/mnt/h` 存在，
-    轉成 `/mnt/h/...` 以符合後端實際檔案系統。
-    """
+    """Normalize user-provided local paths across Windows and WSL layouts."""
     raw = value.strip()
     match = _WINDOWS_ABSOLUTE_PATH_RE.match(raw)
     if match and os.name != "nt":
@@ -42,7 +44,6 @@ def _add_root(
     name: str,
     path: Path,
 ) -> None:
-    """加入 root 候選，並依字串路徑去重。"""
     normalized = str(path.expanduser())
     if normalized in seen:
         return
@@ -51,7 +52,6 @@ def _add_root(
 
 
 def _windows_drive_roots() -> list[Path]:
-    """Windows 平台列舉可用磁碟根目錄。"""
     if os.name != "nt":
         return []
 
@@ -67,12 +67,6 @@ def _windows_drive_roots() -> list[Path]:
 
 
 def _coerce_browse_directory(path: str) -> tuple[Path, Path | None]:
-    """將使用者輸入路徑轉成可列出的資料夾。
-
-    若輸入是檔案、或是尚未存在的檔案路徑，改列 parent directory。
-    回傳 `(directory_to_list, selected_path)`；`selected_path` 代表原本使用者
-    指向的檔案/不存在路徑，可供 UI 未來做高亮。
-    """
     requested = _path_from_client(path)
     if requested.exists():
         if requested.is_dir():
@@ -121,7 +115,6 @@ async def _write_upload_file(upload: UploadFile, target: Path) -> int:
 
 @router.get("/roots")
 async def list_filesystem_roots(request: Request) -> dict[str, Any]:
-    """回傳 WebGUI 可瀏覽的預設根目錄集合。"""
     roots: list[dict[str, str]] = []
     seen_paths: set[str] = set()
 
@@ -160,7 +153,6 @@ async def list_filesystem_roots(request: Request) -> dict[str, Any]:
 
 @router.get("/list")
 async def list_directory(path: str = Query(..., min_length=1)) -> dict[str, Any]:
-    """列出單一資料夾的一層子項目。"""
     current, selected_path = _coerce_browse_directory(path)
 
     try:
@@ -202,11 +194,6 @@ async def import_local_files(
     target_dir: Annotated[str | None, Form()] = None,
     package_name: Annotated[str | None, Form()] = None,
 ) -> dict[str, Any]:
-    """匯入瀏覽器選取的本機檔案/資料夾到後端受控目錄。
-
-    瀏覽器不提供可給後端直接使用的 client absolute path，因此這個 endpoint
-    實作的是「選取後上傳」，並回傳後端實際保存路徑。
-    """
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
@@ -232,12 +219,14 @@ async def import_local_files(
         target = package_root / relative
         size = await _write_upload_file(upload, target)
         total_bytes += size
-        saved_files.append({
-            "name": fallback_name,
-            "path": str(target),
-            "relative_path": str(relative).replace("\\", "/"),
-            "size": size,
-        })
+        saved_files.append(
+            {
+                "name": fallback_name,
+                "path": str(target),
+                "relative_path": str(relative).replace("\\", "/"),
+                "size": size,
+            }
+        )
 
     imported_path = package_root
     if len(saved_files) == 1:
@@ -250,4 +239,88 @@ async def import_local_files(
         "file_count": len(saved_files),
         "total_bytes": total_bytes,
         "files": saved_files,
+    }
+
+
+@router.get("/file")
+async def read_workspace_file(request: Request, path: str = Query(..., min_length=1)) -> FileResponse:
+    target = await _resolve_preview_target(request, path)
+    media_type, _ = mimetypes.guess_type(target.name)
+    return FileResponse(target, media_type=media_type or "application/octet-stream")
+
+
+@router.get("/preview-text")
+async def preview_workspace_text(
+    request: Request,
+    path: str = Query(..., min_length=1),
+    max_chars: int = Query(default=12000, ge=1, le=100000),
+) -> dict[str, Any]:
+    target = await _resolve_preview_target(request, path)
+    suffix = target.suffix.lower()
+
+    if suffix == ".docx":
+        payload = await _preview_docx(target, max_chars)
+    elif suffix == ".pdf":
+        payload = await _preview_pdf(target, max_chars)
+    else:
+        payload = await _preview_text_file(target, max_chars)
+
+    return {
+        "type": "filesystem_preview_text",
+        "path": str(target),
+        "name": target.name,
+        "text": payload["text"],
+        "truncated": payload["truncated"],
+        "media_type": payload["media_type"],
+    }
+
+
+async def _resolve_preview_target(request: Request, path: str) -> Path:
+    requested = _path_from_client(path)
+    if not requested.exists() or not requested.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    config = await _get_config(request.app)
+    allowed_roots = {Path(config.workspace_dir).expanduser().resolve()}
+    project_store = _get_project_store(request.app, config=config)
+    for project in await project_store.list_projects():
+        workspace_dir = project.get("workspace_dir")
+        if isinstance(workspace_dir, str) and workspace_dir.strip():
+            allowed_roots.add(Path(workspace_dir).expanduser().resolve())
+
+    resolved = requested.expanduser().resolve()
+    for root in allowed_roots:
+        if resolved == root or resolved.is_relative_to(root):
+            return resolved
+
+    raise HTTPException(status_code=403, detail="Path is outside allowed preview roots")
+
+
+async def _preview_docx(path: Path, max_chars: int) -> dict[str, Any]:
+    payload = await asyncio.to_thread(extract_docx_paragraphs, path, max_chars)
+    return {
+        "text": "\n\n".join(payload["paragraphs"]).strip(),
+        "truncated": bool(payload["truncated"]),
+        "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+
+
+async def _preview_pdf(path: Path, max_chars: int) -> dict[str, Any]:
+    payload = await asyncio.to_thread(extract_pdf_pages, path, max_chars=max_chars)
+    return {
+        "text": "\n\n".join(
+            f"Page {page['page']}\n{page['text']}".strip()
+            for page in payload["pages"]
+        ).strip(),
+        "truncated": bool(payload["truncated"]),
+        "media_type": "application/pdf",
+    }
+
+
+async def _preview_text_file(path: Path, max_chars: int) -> dict[str, Any]:
+    text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    return {
+        "text": text[:max_chars],
+        "truncated": len(text) > max_chars,
+        "media_type": mimetypes.guess_type(path.name)[0] or "text/plain",
     }

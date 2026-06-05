@@ -144,9 +144,12 @@ async def _inspect_configured_model(
 def _default_skills_db_path() -> Path:
     """依目前設定推導預設技能庫 SQLite 路徑。"""
     from mochi.config.manager import load_config
+    from mochi.learning.skill_library_factory import resolve_skills_db_path
 
     cfg = load_config()
-    return Path(os.path.expanduser(cfg.skills_dir)) / "skills.db"
+    return resolve_skills_db_path(
+        skills_dir=cfg.skills_dir,
+    )
 
 
 def _default_skills_dir() -> Path:
@@ -616,7 +619,11 @@ async def _chat_tui_async(
 
     engine = AgentEngine(cfg)
     current_session = session_id.strip() or DEFAULT_TUI_SESSION_ID
-    session_store = SessionStore(sessions_dir=getattr(cfg, "sessions_dir", "~/.mochi/sessions"))
+    from mochi.config import defaults
+
+    session_store = SessionStore(
+        sessions_dir=getattr(cfg, "sessions_dir", defaults.default_sessions_dir())
+    )
     supported_search_engines = set(supported_web_search_provider_names(include_aliases=True))
     supported_fetch_extractors = {"trafilatura", "jina_reader", "htmlparser"}
     provider_specs = [

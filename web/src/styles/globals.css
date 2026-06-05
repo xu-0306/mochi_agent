@@ -70,6 +70,117 @@
   --bg-overlay: rgba(20, 20, 24, 0.45);
 }
 
+:root,
+[data-code-theme="vscode-dark-plus"] {
+  --code-fg: #d4d4d4;
+  --code-surface: #1e1e1e;
+  --code-toolbar: #252526;
+  --code-border: #303031;
+  --code-inline-bg: #2a2d2e;
+  --code-inline-border: #3a3d41;
+  --code-inline-fg: #e6edf3;
+  --code-selection: #add6ff26;
+  --code-comment: #6a9955;
+  --code-keyword: #c586c0;
+  --code-string: #ce9178;
+  --code-function: #dcdcaa;
+  --code-number: #b5cea8;
+  --code-type: #4ec9b0;
+  --code-variable: #9cdcfe;
+  --code-attribute: #9cdcfe;
+  --code-operator: #d4d4d4;
+  --code-meta: #569cd6;
+  --code-tag: #569cd6;
+}
+
+[data-code-theme="github-dark"] {
+  --code-fg: #c9d1d9;
+  --code-surface: #0d1117;
+  --code-toolbar: #161b22;
+  --code-border: rgba(240, 246, 252, 0.1);
+  --code-inline-bg: rgba(110, 118, 129, 0.2);
+  --code-inline-border: rgba(240, 246, 252, 0.08);
+  --code-inline-fg: #e6edf3;
+  --code-selection: rgba(56, 139, 253, 0.28);
+  --code-comment: #8b949e;
+  --code-keyword: #ff7b72;
+  --code-string: #a5d6ff;
+  --code-function: #d2a8ff;
+  --code-number: #79c0ff;
+  --code-type: #ffa657;
+  --code-variable: #ffa657;
+  --code-attribute: #7ee787;
+  --code-operator: #ff7b72;
+  --code-meta: #7ee787;
+  --code-tag: #7ee787;
+}
+
+[data-code-theme="monokai"] {
+  --code-fg: #f8f8f2;
+  --code-surface: #161821;
+  --code-toolbar: #1c1f2b;
+  --code-border: rgba(255, 255, 255, 0.1);
+  --code-inline-bg: rgba(255, 255, 255, 0.08);
+  --code-inline-border: rgba(255, 255, 255, 0.06);
+  --code-inline-fg: #f8f8f2;
+  --code-selection: rgba(73, 72, 62, 0.9);
+  --code-comment: #75715e;
+  --code-keyword: #f92672;
+  --code-string: #e6db74;
+  --code-function: #a6e22e;
+  --code-number: #ae81ff;
+  --code-type: #66d9ef;
+  --code-variable: #fd971f;
+  --code-attribute: #a6e22e;
+  --code-operator: #f92672;
+  --code-meta: #66d9ef;
+  --code-tag: #f92672;
+}
+
+[data-code-theme="vscode-light-plus"] {
+  --code-fg: #000000;
+  --code-surface: #ffffff;
+  --code-toolbar: #f3f3f3;
+  --code-border: #d4d4d4;
+  --code-inline-bg: #f3f3f3;
+  --code-inline-border: #cecece;
+  --code-inline-fg: #000000;
+  --code-selection: #add6ff80;
+  --code-comment: #008000;
+  --code-keyword: #af00db;
+  --code-string: #a31515;
+  --code-function: #795e26;
+  --code-number: #098658;
+  --code-type: #267f99;
+  --code-variable: #001080;
+  --code-attribute: #e50000;
+  --code-operator: #000000;
+  --code-meta: #0451a5;
+  --code-tag: #800000;
+}
+
+[data-code-theme="github-light"] {
+  --code-fg: #1f2328;
+  --code-surface: #f6f8fa;
+  --code-toolbar: #eff2f5;
+  --code-border: rgba(31, 35, 40, 0.12);
+  --code-inline-bg: rgba(175, 184, 193, 0.2);
+  --code-inline-border: rgba(31, 35, 40, 0.08);
+  --code-inline-fg: #24292f;
+  --code-selection: rgba(84, 174, 255, 0.25);
+  --code-comment: #6e7781;
+  --code-keyword: #cf222e;
+  --code-string: #0a3069;
+  --code-function: #8250df;
+  --code-number: #0550ae;
+  --code-type: #953800;
+  --code-variable: #953800;
+  --code-attribute: #116329;
+  --code-operator: #cf222e;
+  --code-meta: #116329;
+  --code-tag: #116329;
+}
+
 @media (prefers-color-scheme: light) {
   [data-theme="system"] {
     --background: 240 5% 99%;
@@ -191,6 +302,134 @@
   }
   .bg-elevated-layer {
     background-color: var(--bg-elevated);
+  }
+
+  .mochi-code-frame {
+    background-color: var(--code-surface);
+    border-color: var(--code-border);
+  }
+
+  .mochi-code-toolbar {
+    background-color: var(--code-toolbar);
+    border-color: var(--code-border);
+  }
+
+  .mochi-code-block {
+    background: transparent;
+    color: var(--code-fg);
+  }
+
+  .mochi-code-content,
+  .mochi-code-content.hljs {
+    display: block;
+    background: transparent !important;
+    color: var(--code-fg);
+  }
+
+  .mochi-inline-code {
+    border: 1px solid var(--code-inline-border);
+    background-color: var(--code-inline-bg);
+    color: var(--code-inline-fg);
+    border-radius: 0.4rem;
+    padding: 0.12rem 0.4rem;
+  }
+
+  :not(pre) > code:not(.mochi-inline-code) {
+    border: 1px solid var(--code-inline-border);
+    background-color: var(--code-inline-bg);
+    color: var(--code-inline-fg);
+    border-radius: 0.4rem;
+    padding: 0.12rem 0.4rem;
+  }
+
+  pre:not(.mochi-code-block) {
+    background-color: var(--code-surface);
+    color: var(--code-fg);
+    border: 1px solid var(--code-border);
+    border-radius: 0.75rem;
+    padding: 0.85rem 1rem;
+  }
+
+  pre:not(.mochi-code-block) > code:not(.mochi-code-content) {
+    display: block;
+    background: transparent;
+    color: inherit;
+  }
+
+  .mochi-code-content::selection,
+  .mochi-inline-code::selection {
+    background: var(--code-selection);
+  }
+
+  .mochi-code-content .hljs-comment,
+  .mochi-code-content .hljs-quote {
+    color: var(--code-comment);
+    font-style: italic;
+  }
+
+  .mochi-code-content .hljs-keyword,
+  .mochi-code-content .hljs-selector-tag,
+  .mochi-code-content .hljs-literal,
+  .mochi-code-content .hljs-name,
+  .mochi-code-content .hljs-section,
+  .mochi-code-content .hljs-link {
+    color: var(--code-keyword);
+  }
+
+  .mochi-code-content .hljs-string,
+  .mochi-code-content .hljs-doctag,
+  .mochi-code-content .hljs-regexp,
+  .mochi-code-content .hljs-addition,
+  .mochi-code-content .hljs-attribute {
+    color: var(--code-string);
+  }
+
+  .mochi-code-content .hljs-title,
+  .mochi-code-content .hljs-title.class_,
+  .mochi-code-content .hljs-title.function_,
+  .mochi-code-content .hljs-function .hljs-title {
+    color: var(--code-function);
+  }
+
+  .mochi-code-content .hljs-number,
+  .mochi-code-content .hljs-symbol,
+  .mochi-code-content .hljs-bullet {
+    color: var(--code-number);
+  }
+
+  .mochi-code-content .hljs-type,
+  .mochi-code-content .hljs-built_in,
+  .mochi-code-content .hljs-class .hljs-title {
+    color: var(--code-type);
+  }
+
+  .mochi-code-content .hljs-variable,
+  .mochi-code-content .hljs-template-variable,
+  .mochi-code-content .hljs-params {
+    color: var(--code-variable);
+  }
+
+  .mochi-code-content .hljs-attr,
+  .mochi-code-content .hljs-selector-attr,
+  .mochi-code-content .hljs-selector-class,
+  .mochi-code-content .hljs-selector-id {
+    color: var(--code-attribute);
+  }
+
+  .mochi-code-content .hljs-operator,
+  .mochi-code-content .hljs-punctuation,
+  .mochi-code-content .hljs-subst {
+    color: var(--code-operator);
+  }
+
+  .mochi-code-content .hljs-meta,
+  .mochi-code-content .hljs-meta .hljs-keyword {
+    color: var(--code-meta);
+  }
+
+  .mochi-code-content .hljs-tag,
+  .mochi-code-content .hljs-selector-pseudo {
+    color: var(--code-tag);
   }
 
   /* Primary color utilities */

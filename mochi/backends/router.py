@@ -111,6 +111,7 @@ class BackendRouter:
         base_url: str,
         model: str,
         api_key: str = "",
+        provider: str = "openai_compat",
     ) -> BaseLLMBackend:
         normalized_base_url = base_url.strip().rstrip("/")
         normalized_model = model.strip()
@@ -122,6 +123,7 @@ class BackendRouter:
             base_url=normalized_base_url,
             model=normalized_model,
             api_key=api_key,
+            provider=provider,
         )
         self._openai_default_model = normalized_model
         self._openai_api_key = api_key
@@ -258,6 +260,7 @@ class BackendRouter:
                 base_url=resolved_base_url,
                 model=resolved_model_name,
                 api_key=resolved_api_key,
+                provider=provider or "openai_compat",
             )
 
         if model_spec.lower().endswith(".gguf"):

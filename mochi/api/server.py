@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import Body, FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from loguru import logger
@@ -43,6 +43,11 @@ def create_app() -> FastAPI:
         chunk_base64: str = Field(..., min_length=1)
         speaker_id: str | None = None
         auto_end: bool = True
+
+    class VoicePrepareRequest(BaseModel):
+        """預載 WebGUI 語音 runtime 的請求。"""
+
+        session_id: str | None = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -79,6 +84,7 @@ def create_app() -> FastAPI:
     )
 
     from mochi.api.routes import (
+        agent_runs_router,
         approvals_router,
         chat_router,
         file_ops_router,
@@ -94,6 +100,7 @@ def create_app() -> FastAPI:
 
     app.include_router(chat_router)
     app.include_router(tasks_router)
+    app.include_router(agent_runs_router)
     app.include_router(approvals_router)
     app.include_router(models_router)
     app.include_router(skills_router)
@@ -128,6 +135,34 @@ def create_app() -> FastAPI:
             "phase": "bounded",
             "loaded": False,
             "error": "Engine does not provide get_voice_runtime_status().",
+        })
+
+    @app.post("/v1/voice/prepare")
+    async def prepare_voice_runtime(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        """預先載入 WebGUI 語音所需 runtime，讓開始錄音可直接進入待機。"""
+        engine = await _get_or_create_engine(app)
+        session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        if session_id is not None:
+            session_id = str(session_id)
+        prepare_runtime = getattr(engine, "prepare_voice_runtime", None)
+        if callable(prepare_runtime):
+            prepared = await _maybe_await(
+                _call_with_supported_kwargs(prepare_runtime, session_id=session_id)
+            )
+            if isinstance(prepared, dict):
+                return _attach_voice_bridge_diagnostics(app, prepared)
+
+        get_status = getattr(engine, "get_voice_runtime_status", None)
+        if callable(get_status):
+            status = await _maybe_await(_call_with_supported_kwargs(get_status))
+            if isinstance(status, dict):
+                return _attach_voice_bridge_diagnostics(app, status)
+
+        return _attach_voice_bridge_diagnostics(app, {
+            "type": "voice_runtime_status",
+            "phase": "bounded",
+            "loaded": False,
+            "error": "Engine does not provide prepare_voice_runtime().",
         })
 
     @app.get("/v1/channels")
@@ -602,6 +637,13 @@ async def _shutdown_engine(app: FastAPI) -> None:
             await _maybe_await(stop_all())
         app.state.channel_manager = None
 
+    runtime_service = cast(Any | None, getattr(app.state, "runtime_service", None))
+    if runtime_service is not None:
+        close_runtime_service = getattr(runtime_service, "close", None)
+        if callable(close_runtime_service):
+            await _maybe_await(close_runtime_service())
+    app.state.runtime_service = None
+
     engine = cast(Any, app.state.engine)
     if engine is not None:
         close = getattr(engine, "close", None)
@@ -615,7 +657,6 @@ async def _shutdown_engine(app: FastAPI) -> None:
         if callable(stop):
             await _maybe_await(stop())
     app.state.vllm_runtime_manager = None
-    app.state.runtime_service = None
 
 
 def _create_voice_bridge_diagnostics_state() -> dict[str, Any]:
@@ -715,7 +756,7 @@ def _resolve_initial_cors_origins() -> list[str]:
     try:
         config = load_config()
     except Exception as exc:  # pragma: no cover - fallback path
-        logger.warning("Failed to load config for CORS setup: {}", exc)
+        logger.warning("Failed to load config for CORS setup: %s", exc)
         if env_origins is not None:
             return env_origins
         return ["http://localhost:3000"]

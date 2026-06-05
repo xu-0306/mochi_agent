@@ -31,6 +31,13 @@ def _safe_debug_log(message: str, *args: Any) -> None:
 
 def user_config_path() -> Path:
     """回傳目前使用者的 Mochi YAML 設定檔路徑。"""
+    if defaults.running_on_windows():
+        return defaults.default_config_path()
+    return _legacy_home_config_path()
+
+
+def _legacy_home_config_path() -> Path:
+    """Return the historic home-scoped config path for backward compatibility."""
     home = os.getenv("HOME")
     if home:
         return Path(home).expanduser() / ".mochi" / "config.yaml"
@@ -176,6 +183,67 @@ def _apply_platform_path_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _normalize_windows_runtime_paths(raw: dict[str, Any]) -> dict[str, Any]:
+    """Map legacy Windows `~/.mochi/...` runtime paths into the project-local `.mochi/...` tree."""
+    if not defaults.running_on_windows():
+        return raw
+
+    merged = dict(raw)
+    for key in ("workspace_dir", "sessions_dir", "skills_dir", "plugins_dir"):
+        merged[key] = _normalize_windows_runtime_path_value(merged.get(key))
+
+    memory_section = _coerce_mapping(merged.get("memory"))
+    memory_section["db_path"] = _normalize_windows_runtime_path_value(memory_section.get("db_path"))
+    merged["memory"] = memory_section
+    return merged
+
+
+def _normalize_windows_runtime_path_value(value: Any) -> Any:
+    if not isinstance(value, (str, Path)):
+        return value
+
+    raw = str(value).replace("\\", "/")
+    target_root = defaults.default_workspace_dir().replace("\\", "/")
+    for legacy_root in _legacy_windows_state_roots():
+        if raw == legacy_root:
+            return target_root
+        prefix = f"{legacy_root}/"
+        if raw.startswith(prefix):
+            suffix = raw[len(prefix):]
+            return f"{target_root}/{suffix}"
+    return value
+
+
+def _legacy_windows_state_roots() -> tuple[str, ...]:
+    roots = ["~/.mochi"]
+    expanded = _legacy_home_config_path().parent.as_posix()
+    if expanded not in roots:
+        roots.append(expanded)
+    return tuple(roots)
+
+
+def _should_persist_windows_migration(
+    *,
+    source_path: Path,
+    original: dict[str, Any],
+    normalized: dict[str, Any],
+) -> bool:
+    if not defaults.running_on_windows():
+        return False
+
+    try:
+        normalized_source = source_path.expanduser().resolve(strict=False)
+        legacy_source = _legacy_home_config_path().expanduser().resolve(strict=False)
+        current_source = user_config_path().expanduser().resolve(strict=False)
+    except OSError:
+        return original != normalized
+
+    return (
+        normalized_source == legacy_source
+        or (normalized_source == current_source and original != normalized)
+    )
+
+
 def load_config(config_path: str | Path | None = None) -> MochiConfig:
     """從 YAML 檔案載入設定，找不到時回傳預設值。
 
@@ -193,6 +261,7 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
     else:
         search_paths.extend([
             user_config_path(),
+            _legacy_home_config_path(),
             PROJECT_DEFAULT_CONFIG_PATH,
         ])
 
@@ -200,13 +269,22 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
         if path.exists():
             _safe_debug_log("Loading config from {}", path)
             raw = _coerce_mapping(yaml.safe_load(path.read_text(encoding="utf-8")) or {})
-            return MochiConfig.model_validate(
-                _apply_env_overrides(_apply_platform_path_defaults(raw))
-            )
+            prepared = _apply_env_overrides(_apply_platform_path_defaults(raw))
+            normalized = _normalize_windows_runtime_paths(prepared)
+            config = MochiConfig.model_validate(normalized)
+            if config_path is None and _should_persist_windows_migration(
+                source_path=path,
+                original=prepared,
+                normalized=normalized,
+            ):
+                save_config(config, user_config_path())
+            return config
 
     _safe_debug_log("No config file found, using defaults.")
     return MochiConfig.model_validate(
-        _apply_env_overrides(_apply_platform_path_defaults({}))
+        _normalize_windows_runtime_paths(
+            _apply_env_overrides(_apply_platform_path_defaults({}))
+        )
     )
 
 

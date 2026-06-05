@@ -5,14 +5,16 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from mochi.backends.inference_capabilities import ReasoningEffort
+from mochi.backends.types import AttachmentRef
 from mochi.agents.events import (
     ErrorEvent,
     FinalAnswerEvent,
@@ -29,10 +31,27 @@ from mochi.utils.streaming import sse_stream
 router = APIRouter(prefix="/v1")
 
 
+class ChatAttachmentInput(BaseModel):
+    """Structured attachment metadata from the WebGUI."""
+
+    name: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    size: int | None = Field(default=None, ge=0)
+    content_type: str | None = None
+
+    def to_attachment_ref(self) -> AttachmentRef:
+        return AttachmentRef(
+            name=self.name,
+            path=self.path,
+            size=self.size,
+            content_type=self.content_type,
+        )
+
+
 class ChatRequest(BaseModel):
     """`POST /v1/chat` request payload。"""
 
-    message: str = Field(min_length=1)
+    message: str = Field(min_length=0)
     session_id: str | None = None
     project_id: str | None = None
     model: str | None = Field(default=None, min_length=1)
@@ -45,6 +64,9 @@ class ChatRequest(BaseModel):
     frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     repeat_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
+    selected_skill_ids: list[str] | None = None
+    attachments: list[ChatAttachmentInput] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -56,6 +78,34 @@ class ChatResponse(BaseModel):
     final_answer: str
     trajectory_id: str | None = None
     events: list[dict[str, Any]]
+
+
+class ChatContextResponse(BaseModel):
+    """`POST /v1/chat/context` response payload."""
+
+    type: str = "chat_context"
+    session_id: str
+    model: str
+    backend_type: str = ""
+    context_length: int
+    estimated_prompt_tokens: int
+    reserved_output_tokens: int
+    remaining_tokens: int
+    usage_ratio: float
+    summary_tokens: int
+    history_tokens: int
+    memory_tokens: int
+    skills_tokens: int
+    tool_tokens: int
+    draft_tokens: int
+    compaction_triggered: bool
+    compaction_reason: str | None = None
+    compaction_mode: Literal["legacy", "semantic"] = "legacy"
+    summary_mode: Literal["deterministic", "hybrid"] | None = None
+    state_tokens: int = 0
+    recent_raw_tokens: int = 0
+    approximate: bool = True
+    reasoning_effort: ReasoningEffort | None = None
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -80,6 +130,8 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             inference_overrides=_build_inference_overrides(payload),
             project_id=resolved_project_id,
             workspace_dir=resolved_workspace_dir,
+            selected_skill_ids=payload.selected_skill_ids,
+            attachments=_resolve_chat_attachments(payload),
         )
     )
     events, final_answer, trajectory_id = await _collect_chat_result(stream)
@@ -94,6 +146,37 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         trajectory_id=trajectory_id,
         events=events,
     )
+
+
+@router.post("/chat/context", response_model=ChatContextResponse)
+async def chat_context(request: Request, payload: ChatRequest) -> ChatContextResponse:
+    """Preview the next-request context budget without sending a chat turn."""
+    if payload.model:
+        from mochi.api.routes.models import switch_model_runtime
+
+        await switch_model_runtime(request, payload.model)
+    engine = await _get_or_create_engine(request.app)
+    session_id = payload.session_id or "draft-session"
+    resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
+        request,
+        payload,
+        session_id,
+    )
+
+    preview = await _maybe_await(
+        engine.preview_chat_context(
+            payload.message,
+            session_id=session_id,
+            inference_overrides=_build_inference_overrides(payload),
+            project_id=resolved_project_id,
+            workspace_dir=resolved_workspace_dir,
+            selected_skill_ids=payload.selected_skill_ids,
+            attachments=_resolve_chat_attachments(payload),
+        )
+    )
+    if isinstance(preview, dict):
+        return ChatContextResponse.model_validate(preview)
+    raise HTTPException(status_code=500, detail="Engine did not return a chat context snapshot.")
 
 
 @router.post("/chat/stream")
@@ -118,6 +201,8 @@ async def chat_stream(request: Request, payload: ChatRequest) -> StreamingRespon
             inference_overrides=_build_inference_overrides(payload),
             project_id=resolved_project_id,
             workspace_dir=resolved_workspace_dir,
+            selected_skill_ids=payload.selected_skill_ids,
+            attachments=_resolve_chat_attachments(payload),
         )
     )
     headers = {
@@ -274,8 +359,13 @@ def _build_inference_overrides(payload: ChatRequest) -> dict[str, Any]:
         "frequency_penalty": payload.frequency_penalty,
         "presence_penalty": payload.presence_penalty,
         "repeat_penalty": payload.repeat_penalty,
+        "reasoning_effort": payload.reasoning_effort,
     }
     return {key: value for key, value in overrides.items() if value is not None}
+
+
+def _resolve_chat_attachments(payload: ChatRequest) -> list[AttachmentRef]:
+    return [attachment.to_attachment_ref() for attachment in payload.attachments or []]
 
 
 async def _persist_turn_events(

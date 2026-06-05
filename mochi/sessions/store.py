@@ -7,11 +7,13 @@ import json
 import re
 from pathlib import Path
 
+from mochi.config import defaults
+
 
 class SessionStore:
     """會話儲存（JSONL 格式，Append-only）。"""
 
-    def __init__(self, sessions_dir: str | Path = "~/.mochi/sessions") -> None:
+    def __init__(self, sessions_dir: str | Path = defaults.default_sessions_dir()) -> None:
         """初始化 SessionStore。
 
         Args:

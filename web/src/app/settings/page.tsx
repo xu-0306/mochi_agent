@@ -33,6 +33,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PathPicker } from '@/components/settings/PathPicker'
+import { CodeThemePreview } from '@/components/settings/CodeThemePreview'
 import {
   DEFAULT_SETTINGS_TAB,
   SettingsNav,
@@ -53,10 +54,11 @@ import {
   type UILanguageMode,
   useI18n,
 } from '@/lib/i18n'
+import { CODE_THEME_OPTIONS, type UICodeTheme } from '@/lib/code-theme'
 import {
-  agentSettingsToParams,
   getActivePreset,
   inferencePresetToParams,
+  resolveEffectiveInferenceParams,
   type InferenceParams,
 } from '@/lib/stores/inference-store'
 import {
@@ -1453,7 +1455,7 @@ function InferenceSettingsForm({
   onUpdated: (settings: api.Settings) => void
 }) {
   const { t } = useI18n()
-  const [params, setParams] = React.useState<InferenceParams>(agentSettingsToParams(agent))
+  const [params, setParams] = React.useState<InferenceParams>(resolveEffectiveInferenceParams(undefined, agent))
   const [presets, setPresets] = React.useState<api.InferencePreset[]>(agent?.presets ?? [])
   const [activePresetName, setActivePresetName] = React.useState(getActivePreset(agent)?.name ?? 'default')
   const [selectedPresetName, setSelectedPresetName] = React.useState(getActivePreset(agent)?.name ?? 'default')
@@ -1463,7 +1465,7 @@ function InferenceSettingsForm({
   const [message, setMessage] = React.useState<FormMessage>(null)
 
   React.useEffect(() => {
-    setParams(agentSettingsToParams(agent))
+    setParams(resolveEffectiveInferenceParams(undefined, agent))
     setPresets(agent?.presets ?? [])
     const nextPreset = getActivePreset(agent)?.name ?? 'default'
     setActivePresetName(nextPreset)
@@ -1490,6 +1492,7 @@ function InferenceSettingsForm({
     frequency_penalty: params.frequencyPenalty,
     presence_penalty: params.presencePenalty,
     repeat_penalty: params.repeatPenalty,
+    reasoning_effort: params.reasoningEffort,
   }), [params])
 
   const persistAgent = React.useCallback(async (nextAgent: api.AgentSettingsUpdate) => {
@@ -1508,6 +1511,16 @@ function InferenceSettingsForm({
     setMessage(null)
 
     try {
+      const targetPresetName =
+        selectedPresetName ||
+        getActivePreset(agent)?.name ||
+        presets[0]?.name ||
+        'default'
+      const nextPresets = presets.some((preset) => preset.name === targetPresetName)
+        ? presets.map((preset) => (
+            preset.name === targetPresetName ? buildPresetFromParams(targetPresetName) : preset
+          ))
+        : [...presets, buildPresetFromParams(targetPresetName)]
       const settings = await persistAgent({
         system_prompt: params.systemPrompt,
         temperature: params.temperature,
@@ -1518,10 +1531,14 @@ function InferenceSettingsForm({
         frequency_penalty: params.frequencyPenalty,
         presence_penalty: params.presencePenalty,
         repeat_penalty: params.repeatPenalty,
+        reasoning_effort: params.reasoningEffort,
         show_token_stats: params.showTokenStats,
+        presets: nextPresets,
+        active_preset: activePresetName,
       })
       setPresets(settings.agent?.presets ?? [])
       setActivePresetName(settings.agent?.active_preset ?? activePresetName)
+      setSelectedPresetName(targetPresetName)
       setMessage({ type: 'success', text: 'Inference settings saved.' })
     } catch (updateError) {
       setMessage({ type: 'error', text: messageWithDetail('Failed to save inference settings', updateError) })
@@ -1641,7 +1658,12 @@ function InferenceSettingsForm({
           </Button>
         </div>
 
-        <InferenceControls value={params} onChange={setParam} />
+        <InferenceControls
+          value={params}
+          onChange={setParam}
+          supportsReasoningEffort
+          reasoningEffortOptions={['none', 'minimal', 'low', 'medium', 'high', 'xhigh']}
+        />
 
         <SettingMessage message={message} />
 
@@ -5116,6 +5138,8 @@ function PreferencesPanel() {
     setLanguageMode,
     appearanceMode,
     setAppearanceMode,
+    codeTheme,
+    setCodeTheme,
     fontSize,
     setFontSize,
     timezone,
@@ -5135,6 +5159,7 @@ function PreferencesPanel() {
     { value: 'dark', label: t('settings.preferences.appearance.dark') },
     { value: 'light', label: t('settings.preferences.appearance.light') },
   ]
+  const codeThemeOptions = CODE_THEME_OPTIONS
 
   const fontSizeOptions: Array<{ value: UIFontSize; label: string }> = [
     { value: 'compact', label: t('settings.preferences.font.compact') },
@@ -5168,7 +5193,7 @@ function PreferencesPanel() {
         <p className="mt-0.5 text-xs text-muted-foreground">{t('settings.preferences.description')}</p>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 px-4 py-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid grid-cols-1 gap-3 px-4 py-4 md:grid-cols-2 xl:grid-cols-5">
         <label className="space-y-1.5">
           <SettingLabel>{t('settings.preferences.language')}</SettingLabel>
           <Select value={languageMode} onValueChange={(value) => setLanguageMode(value as UILanguageMode)}>
@@ -5218,6 +5243,22 @@ function PreferencesPanel() {
         </label>
 
         <label className="space-y-1.5">
+          <SettingLabel>{t('settings.preferences.codeTheme')}</SettingLabel>
+          <Select value={codeTheme} onValueChange={(value) => setCodeTheme(value as UICodeTheme)}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {codeThemeOptions.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </label>
+
+        <label className="space-y-1.5">
           <SettingLabel>{t('settings.preferences.timezone')}</SettingLabel>
           <Select value={timezone} onValueChange={setTimezone}>
             <SelectTrigger>
@@ -5236,8 +5277,16 @@ function PreferencesPanel() {
 
       <div className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
         <p>{t('settings.preferences.appearanceHelp')}</p>
+        <p>{t('settings.preferences.codeThemeHelp')}</p>
         <p>{t('settings.preferences.fontHelp')}</p>
         <p className="mt-1">{t('settings.preferences.timezoneHelp')}</p>
+      </div>
+
+      <div className="border-t border-border px-4 py-4">
+        <div className="mb-2">
+          <h4 className="text-sm font-medium text-foreground">{t('settings.preferences.codeThemePreview')}</h4>
+        </div>
+        <CodeThemePreview />
       </div>
     </section>
   )

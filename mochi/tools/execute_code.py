@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from mochi.config import defaults
+from mochi.security import require_approval_decision
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.tools.process_service import ProcessService
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
@@ -38,7 +40,7 @@ class ExecuteCodeTool(BaseTool):
             python_executable: 指定 Python 執行檔路徑。
             runner: 可注入執行器（便於測試）。
         """
-        self._workspace_dir = normalize_workspace_dir(workspace_dir or "~/.mochi")
+        self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         self._require_approval = require_approval
         self._default_timeout_sec = default_timeout_sec
         self._python_executable = python_executable or sys.executable
@@ -113,9 +115,16 @@ class ExecuteCodeTool(BaseTool):
             return ToolResult(error="`code` must not be empty.")
 
         if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="Code execution requires explicit approval.",
+                approval_kind="other",
+                approval_scope="dangerous_command",
+                replay_safe=True,
+                policy_source="execute_code_policy",
+            )
             return ToolResult(
                 error="Code execution requires approval.",
-                metadata={"requires_approval": True},
+                metadata=decision.to_metadata(),
             )
 
         workspace_root = self._resolve_workspace_root(context)

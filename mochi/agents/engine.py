@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import inspect
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
@@ -21,6 +22,12 @@ from pydantic import SecretStr
 
 from mochi.agents.compaction import ConversationCompactor
 from mochi.agents.context import ContextManager
+from mochi.agents.context_snapshot import (
+    ChatContextSnapshot,
+    estimate_backend_text_tokens,
+    estimate_messages_tokens,
+)
+from mochi.agents.multi_agent.evidence_collector import collect_evidence_packets
 from mochi.agents.events import (
     AgentEvent,
     ErrorEvent,
@@ -29,11 +36,22 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.agents.invocation import (
+    AgentInvocationDiagnostics,
+    AgentInvocationRequest,
+    AgentInvocationResult,
+)
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
 from mochi.backends.base import BaseLLMBackend
+from mochi.backends.inference_capabilities import (
+    InferenceCapabilities,
+    ReasoningEffort,
+    resolve_model_inference_capabilities,
+    sanitize_inference_params_for_capabilities,
+)
 from mochi.backends.router import BackendRouter
-from mochi.backends.types import Message, ModelInfo
+from mochi.backends.types import AttachmentRef, GenerationResult, Message, ModelInfo
 from mochi.backends.vllm_runtime import ManagedVLLMRuntimeManager
 from mochi.backends.vllm_utils import (
     configured_vllm_launch_mode,
@@ -45,7 +63,9 @@ from mochi.learning.evaluator import OutcomeEvaluator
 from mochi.learning.extractor import SkillExtractor
 from mochi.learning.improver import SkillImprover
 from mochi.learning.skill_library import SkillLibrary
+from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
+from mochi.learning.skill_selector import SkillSelection, SkillSelector
 from mochi.learning.trajectory import TrajectoryLogger
 from mochi.learning.types import Trajectory, TrajectoryStep
 from mochi.memory.conversation import ConversationMemory
@@ -54,11 +74,24 @@ from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.projects.store import ProjectStore
 from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
 from mochi.sessions.store import SessionStore
-from mochi.agents.tool_exposure import ToolExposurePlanner
+from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
 from mochi.tools.base import ToolExecutionContext
-from mochi.tools.mcp_client import McpRuntimeManager
+from mochi.tools.execute_code import ExecuteCodeTool
+from mochi.tools.file_ops import FileEditTool, FileReadTool, FileWriteTool
+from mochi.tools.literature_search import (
+    ArxivSearchTool,
+    CrossrefSearchTool,
+    PubMedSearchTool,
+    SemanticScholarSearchTool,
+)
+from mochi.tools.mcp_client import MCPCallTool, McpListResourcesTool, McpReadResourceTool, McpRuntimeManager
+from mochi.tools.memory_save import MemorySaveTool
+from mochi.tools.memory_search import MemorySearchTool
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.registry_factory import ToolRegistryFactory
+from mochi.tools.shell import ShellTool
+from mochi.tools.web_fetch import WebFetchTool
+from mochi.tools.web_search import WebSearchTool
 from mochi.voice.events import VoiceEvent
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS, VoiceRouter
 from mochi.voice.session_manager import VoiceSessionManager
@@ -123,6 +156,7 @@ class AgentEngine:
         self._tool_execution_contexts: dict[tuple[str, str], ToolExecutionContext] = {}
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
         self._skill_loader = self._make_skill_loader()
+        self._skill_selector = self._make_skill_selector()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
         self._outcome_evaluator = OutcomeEvaluator()
         self._skill_extractor = SkillExtractor()
@@ -162,70 +196,255 @@ class AgentEngine:
         workspace_dir: str | None = None,
         task_workspace_dir: str | None = None,
         permission_policy: dict[str, Any] | None = None,
+        selected_skill_ids: list[str] | None = None,
+        attachments: list[AttachmentRef] | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        async for event in self._run_chat(
-            message,
-            session_id=session_id,
-            inference_overrides=inference_overrides,
-            project_id=project_id,
-            workspace_dir=workspace_dir,
-            task_workspace_dir=task_workspace_dir,
-            permission_policy=permission_policy,
-            backend_override=None,
-        ):
+        result = await self._invoke_shared_runtime(
+            AgentInvocationRequest(
+                message=message,
+                session_id=session_id,
+                inference_overrides=inference_overrides,
+                project_id=project_id,
+                workspace_dir=workspace_dir,
+                task_workspace_dir=task_workspace_dir,
+                permission_policy=permission_policy,
+                selected_skill_ids=selected_skill_ids,
+                attachments=attachments,
+                backend_override=None,
+                tool_mode="auto",
+                execution_profile="chat",
+                persist_session=True,
+            )
+        )
+        for event in result.events:
             yield event
 
-    async def _run_chat(
+    async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+        """Invoke the shared agent runtime and collect finalized output."""
+        return await self._invoke_shared_runtime(request)
+
+    async def preview_chat_context(
         self,
         message: str,
-        *,
         session_id: str | None = None,
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
-        task_workspace_dir: str | None = None,
-        permission_policy: dict[str, Any] | None = None,
-        backend_override: BaseLLMBackend | None = None,
-    ) -> AsyncIterator[AgentEvent]:
-        """執行單輪對話，回傳事件串流。
-
-        Args:
-            message: 使用者輸入文字。
-            session_id: 會話 ID（預留，Phase 2 實作持久化）。
-            inference_overrides: 推理參數覆蓋（per-request）。
-
-        Yields:
-            AgentEvent 事件流。
-        """
+        selected_skill_ids: list[str] | None = None,
+        attachments: list[AttachmentRef] | None = None,
+    ) -> dict[str, Any]:
+        """Estimate the next request budget without mutating the session."""
         if not self._initialized:
             await self.initialize()
 
         session_key = session_id or "default"
         context = await self._get_context(session_key)
-        prompt_context = await context.prepare_prompt_context(
+        resolved = self._resolve_inference_params(inference_overrides)
+        prompt_context = await context.preview_prompt_context(
             message,
             history_limit=self._config.memory.max_short_term_messages,
             memory_top_k=self._config.memory.fts_top_k,
         )
-        skills_context = await self._build_skills_context(message)
-        resolved = self._resolve_inference_params(inference_overrides)
+        skill_selection = await self._select_skills(
+            message,
+            selected_skill_ids=selected_skill_ids,
+        )
+        skills_context = self._render_skills_context(skill_selection)
+        model_info = self.get_model_info()
+        scope = await self._execution_scope_resolver.resolve(
+            session_id=session_key,
+            project_id=project_id,
+            workspace_dir=workspace_dir,
+        )
+        effective_workspace_dir = scope.workspace_dir
+        workspace_registry = self._tool_registry
+        if effective_workspace_dir != self._config.workspace_dir:
+            workspace_registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
+
+        active_backend = self._router.active
+        capabilities = self._inference_capabilities_for_backend(active_backend)
+        sanitized = sanitize_inference_params_for_capabilities(resolved, capabilities)
+        reasoning_effort = sanitized.get("reasoning_effort")
+        planner_message = self._build_tool_planner_message(message, attachments)
+        exposure_plan = self._tool_exposure_planner.plan(
+            message=planner_message,
+            available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
+            backend=active_backend,
+            session_bound_workspace=(
+                scope.project_id is not None
+                or effective_workspace_dir != self._config.workspace_dir
+            ),
+            autonomy_mode=(
+                inference_overrides.get("autonomy_mode")
+                if isinstance(inference_overrides, dict) and inference_overrides.get("autonomy_mode")
+                else self._config.security.autonomy_mode
+            ),
+            preferred_tool_names=skill_selection.preferred_tool_names,
+        )
+        tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
+        tool_schemas = tool_registry.get_schemas()
+        attachment_context = self._build_attachment_prompt_context(
+            attachments=attachments,
+            available_tool_names=exposure_plan.tool_names,
+        )
+
         system_prompt = self._prompt_builder.build_system_prompt(
             skills_context=skills_context,
             memory_context=self._merge_memory_and_summary_context(
                 memory_context=prompt_context.memory_context,
                 summary=prompt_context.summary,
             ),
-            base_prompt=resolved["system_prompt"],
+            attachment_context=attachment_context,
+            base_prompt=str(sanitized.get("system_prompt") or resolved["system_prompt"]),
+            task_workspace_dir=None,
         )
-        trajectory_id = self._start_trajectory(message)
-        turn_id = str(uuid4())
-        turn_event_seq = 0
-        user_msg = Message(role="user", content=message)
-        await self._persist_session_message(session_key, user_msg, turn_id=turn_id)
+
+        system_estimate = estimate_backend_text_tokens(
+            system_prompt,
+            backend=active_backend,
+            model_info=model_info,
+        )
+        history_estimate = estimate_messages_tokens(
+            prompt_context.history,
+            model_name=model_info.name,
+        )
+        draft_estimate = estimate_backend_text_tokens(
+            message,
+            backend=active_backend,
+            model_info=model_info,
+        )
+        tool_estimate = estimate_backend_text_tokens(
+            json.dumps(tool_schemas, ensure_ascii=False, sort_keys=True),
+            backend=active_backend,
+            model_info=model_info,
+        )
+        summary_estimate = estimate_backend_text_tokens(
+            prompt_context.summary or "",
+            backend=active_backend,
+            model_info=model_info,
+        )
+        state_estimate = estimate_backend_text_tokens(
+            json.dumps(
+                prompt_context.summary_state.to_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if prompt_context.summary_state is not None
+            else "",
+            backend=active_backend,
+            model_info=model_info,
+        )
+        memory_estimate = estimate_backend_text_tokens(
+            prompt_context.memory_context or "",
+            backend=active_backend,
+            model_info=model_info,
+        )
+        skills_estimate = estimate_backend_text_tokens(
+            skills_context or "",
+            backend=active_backend,
+            model_info=model_info,
+        )
+
+        estimated_prompt_tokens = (
+            system_estimate.tokens
+            + history_estimate.tokens
+            + draft_estimate.tokens
+            + tool_estimate.tokens
+        )
+        reserved_output_tokens = int(sanitized.get("max_tokens") or 0)
+        context_length = max(1, int(model_info.context_length))
+        remaining_tokens = max(context_length - estimated_prompt_tokens - reserved_output_tokens, 0)
+        usage_ratio = min(
+            1.0,
+            max(0.0, (estimated_prompt_tokens + reserved_output_tokens) / context_length),
+        )
+
+        snapshot = ChatContextSnapshot(
+            type="chat_context",
+            session_id=session_key,
+            model=model_info.name,
+            backend_type=model_info.backend_type,
+            context_length=context_length,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            remaining_tokens=remaining_tokens,
+            usage_ratio=usage_ratio,
+            summary_tokens=summary_estimate.tokens,
+            history_tokens=history_estimate.tokens,
+            memory_tokens=memory_estimate.tokens,
+            skills_tokens=skills_estimate.tokens,
+            tool_tokens=tool_estimate.tokens,
+            draft_tokens=draft_estimate.tokens,
+            compaction_triggered=context.summary is not None,
+            compaction_reason=(
+                prompt_context.compaction_diagnostics.reason
+                if prompt_context.compaction_diagnostics is not None
+                else ("history_window" if context.summary is not None else None)
+            ),
+            compaction_mode=(
+                prompt_context.compaction_diagnostics.compaction_mode
+                if prompt_context.compaction_diagnostics is not None
+                else "legacy"
+            ),
+            summary_mode=(
+                prompt_context.compaction_diagnostics.summary_mode
+                if prompt_context.compaction_diagnostics is not None
+                else None
+            ),
+            state_tokens=state_estimate.tokens,
+            recent_raw_tokens=history_estimate.tokens,
+            approximate=any(
+                estimate.approximate
+                for estimate in (
+                    system_estimate,
+                    history_estimate,
+                    draft_estimate,
+                    tool_estimate,
+                    summary_estimate,
+                    state_estimate,
+                    memory_estimate,
+                    skills_estimate,
+                )
+            ),
+            reasoning_effort=cast(ReasoningEffort | None, reasoning_effort),
+        )
+        return snapshot.to_dict()
+
+    async def _run_chat(
+        self,
+        request: AgentInvocationRequest,
+    ) -> AsyncIterator[AgentEvent]:
+        result = await self._invoke_shared_runtime(request)
+        for event in result.events:
+            yield event
+        return
+
+    async def _invoke_shared_runtime(
+        self,
+        request: AgentInvocationRequest,
+    ) -> AgentInvocationResult:
+        if not self._initialized:
+            await self.initialize()
+
+        session_key = request.session_id or "default"
+        context = await self._get_context(session_key)
+        resolved = self._resolve_inference_params(request.inference_overrides)
+        prompt_context = await context.prepare_prompt_context(
+            request.message,
+            history_limit=self._config.memory.max_short_term_messages,
+            memory_top_k=self._config.memory.fts_top_k,
+            reserve_output_tokens=int(resolved.get("max_tokens") or 0),
+        )
+        skill_selection = await self._select_skills(
+            request.message,
+            selected_skill_ids=request.selected_skill_ids,
+        )
+        skills_context = self._render_skills_context(skill_selection)
+        planner_message = self._build_tool_planner_message(request.message, request.attachments)
         scope = await self._execution_scope_resolver.resolve(
             session_id=session_key,
-            project_id=project_id,
-            workspace_dir=workspace_dir,
+            project_id=request.project_id,
+            workspace_dir=request.workspace_dir,
         )
         effective_workspace_dir = scope.workspace_dir
         session_bound_workspace = (
@@ -237,48 +456,110 @@ class AgentEngine:
         if effective_workspace_dir != self._config.workspace_dir:
             workspace_registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
             owns_workspace_registry = True
-        tool_execution_context = self._get_tool_execution_context(
-            session_id=session_key,
-            workspace_dir=effective_workspace_dir,
-            task_workspace_dir=task_workspace_dir,
-            permission_policy_override=permission_policy,
+
+        configured_model_id = (
+            str(resolved.get("model")).strip()
+            if isinstance(resolved.get("model"), str) and str(resolved.get("model")).strip()
+            else None
         )
-        active_backend = backend_override or self._router.active
+        owns_invocation_backend = False
+        if request.backend_override is not None:
+            active_backend = request.backend_override
+        elif configured_model_id:
+            active_backend = await self._acquire_configured_model_backend(configured_model_id)
+            owns_invocation_backend = True
+        else:
+            active_backend = self._router.active
+        capabilities = self._inference_capabilities_for_backend(active_backend)
+        sanitized = sanitize_inference_params_for_capabilities(resolved, capabilities)
+        reasoning_effort = sanitized.get("reasoning_effort")
         exposure_plan = self._tool_exposure_planner.plan(
-            message=message,
+            message=planner_message,
             available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
             backend=active_backend,
             session_bound_workspace=session_bound_workspace,
             autonomy_mode=(
-                permission_policy.get("autonomy_mode")
-                if isinstance(permission_policy, dict)
+                request.permission_policy.get("autonomy_mode")
+                if isinstance(request.permission_policy, dict)
                 else self._config.security.autonomy_mode
             ),
+            preferred_tool_names=skill_selection.preferred_tool_names,
+            tool_mode=request.tool_mode,
+        )
+        exposure_plan = self._apply_execution_profile(exposure_plan, request.execution_profile)
+        attachment_context = self._build_attachment_prompt_context(
+            attachments=request.attachments,
+            available_tool_names=exposure_plan.tool_names,
+        )
+        system_prompt = self._prompt_builder.build_system_prompt(
+            skills_context=skills_context,
+            memory_context=self._merge_memory_and_summary_context(
+                memory_context=prompt_context.memory_context,
+                summary=prompt_context.summary,
+            ),
+            attachment_context=attachment_context,
+            base_prompt=resolved["system_prompt"],
+            task_workspace_dir=request.task_workspace_dir,
+            system_prompt_addendum=request.system_prompt_addendum,
+        )
+        trajectory_id = self._start_trajectory(request.message)
+        turn_id = str(uuid4())
+        turn_event_seq = 0
+        user_msg = Message(
+            role="user",
+            content=request.message,
+            attachments=list(request.attachments or []),
+        )
+        if request.persist_session:
+            await self._persist_session_message(session_key, user_msg, turn_id=turn_id)
+        tool_execution_context = self._get_tool_execution_context(
+            session_id=session_key,
+            workspace_dir=effective_workspace_dir,
+            task_workspace_dir=request.task_workspace_dir,
+            permission_policy_override=request.permission_policy,
         )
         tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
-
         react_loop = AsyncReActLoop(
             backend=active_backend,
             tool_registry=tool_registry,
             tool_execution_context=tool_execution_context,
             max_iterations=self._config.agent.max_react_iterations,
         )
+        diagnostics = AgentInvocationDiagnostics(
+            execution_profile=request.execution_profile,
+            tool_mode=request.tool_mode,
+            exposed_tools=list(exposure_plan.tool_names),
+            matched_tool_groups=list(exposure_plan.matched_groups),
+        )
+        if request.tool_mode == "required" and not exposure_plan.tool_names:
+            diagnostics.fallback_reason = "tool_mode_required_but_no_tools_exposed"
 
+        events: list[AgentEvent] = []
         final_text = ""
         await self._router.mark_backend_busy(active_backend)
         try:
             async for event in react_loop.run(
                 system_prompt=system_prompt,
                 history=prompt_context.history,
-                user_message=message,
-                temperature=resolved["temperature"],
-                max_tokens=resolved["max_tokens"],
-                top_p=resolved["top_p"],
-                min_p=resolved["min_p"],
-                top_k=resolved["top_k"],
-                frequency_penalty=resolved["frequency_penalty"],
-                presence_penalty=resolved["presence_penalty"],
-                repeat_penalty=resolved["repeat_penalty"],
+                user_message=request.message,
+                temperature=cast(float, sanitized.get("temperature", resolved["temperature"])),
+                max_tokens=cast(int, sanitized.get("max_tokens", resolved["max_tokens"])),
+                top_p=cast(float, sanitized.get("top_p", resolved["top_p"])),
+                min_p=cast(float, sanitized.get("min_p", resolved["min_p"])),
+                top_k=cast(int, sanitized.get("top_k", resolved["top_k"])),
+                frequency_penalty=cast(
+                    float,
+                    sanitized.get("frequency_penalty", resolved["frequency_penalty"]),
+                ),
+                presence_penalty=cast(
+                    float,
+                    sanitized.get("presence_penalty", resolved["presence_penalty"]),
+                ),
+                repeat_penalty=cast(
+                    float,
+                    sanitized.get("repeat_penalty", resolved["repeat_penalty"]),
+                ),
+                reasoning_effort=cast(ReasoningEffort | None, reasoning_effort),
             ):
                 self._log_agent_event(trajectory_id, event)
                 if isinstance(event, FinalAnswerEvent):
@@ -286,24 +567,85 @@ class AgentEngine:
                     event.trajectory_id = trajectory_id
                 event.turn_id = turn_id  # type: ignore[attr-defined]
                 turn_event_seq += 1
-                await self._persist_turn_event(
-                    session_key,
-                    event,
-                    turn_id=turn_id,
-                    seq=turn_event_seq,
-                )
-                yield event
+                if request.persist_session:
+                    await self._persist_turn_event(
+                        session_key,
+                        event,
+                        turn_id=turn_id,
+                        seq=turn_event_seq,
+                    )
+                events.append(event)
         finally:
             await self._router.mark_backend_idle(active_backend)
+            if owns_invocation_backend:
+                await active_backend.close()
             if owns_workspace_registry:
                 await self._close_tool_registry(workspace_registry)
 
         await self._finish_learning_cycle(trajectory_id)
 
-        assistant_msg = Message(role="assistant", content=final_text)
-        context.add_message(user_msg)
-        context.add_message(assistant_msg)
-        await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
+        if request.persist_session:
+            assistant_msg = Message(role="assistant", content=final_text)
+            context.add_message(user_msg)
+            context.add_message(assistant_msg)
+            await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
+
+        return AgentInvocationResult(
+            content=final_text,
+            events=events,
+            diagnostics=diagnostics,
+        )
+
+    def _apply_execution_profile(
+        self,
+        exposure_plan: ToolExposurePlan,
+        execution_profile: str,
+    ) -> ToolExposurePlan:
+        readonly_blocked = {
+            "file_write",
+            "file_edit",
+            "exec_command",
+            "shell",
+            "execute_code",
+            "execute_code_v2",
+            "write_stdin",
+            "kill_session",
+            "process_stop",
+            "mcp_call",
+        }
+        if execution_profile in {"subagent_readonly", "judge", "verifier"}:
+            return ToolExposurePlan(
+                tool_names=[name for name in exposure_plan.tool_names if name not in readonly_blocked],
+                matched_groups=exposure_plan.matched_groups,
+                limit=exposure_plan.limit,
+            )
+        if execution_profile == "subagent_research":
+            allowed = {
+                "file_read",
+                "glob_search",
+                "grep_search",
+                "csv_read",
+                "pdf_read",
+                "docx_read",
+                "notebook_read",
+                "memory_search",
+                "web_search",
+                "web_fetch",
+                "web_crawl",
+                "mcp_list_resources",
+                "mcp_read_resource",
+                "tool_search",
+            }
+            return ToolExposurePlan(
+                tool_names=[
+                    name
+                    for name in exposure_plan.tool_names
+                    if name in allowed and name not in readonly_blocked
+                ],
+                matched_groups=exposure_plan.matched_groups,
+                limit=exposure_plan.limit,
+            )
+        return exposure_plan
 
     async def switch_model(self, model_spec: str) -> ModelInfo:
         """切換活躍模型並回傳新模型資訊。"""
@@ -325,24 +667,36 @@ class AgentEngine:
             return self._router.active.get_model_info()
 
         try:
-            return self._router._resolve(self._config.model).get_model_info()  # noqa: SLF001
+            return self._router._resolve(  # noqa: SLF001
+                self._config.model,
+                model_name=self._config.openai_compat.model,
+                provider=self._config.openai_compat.provider,
+                base_url=self._config.openai_compat.base_url,
+                api_key=(
+                    self._config.openai_compat.api_key.get_secret_value()
+                    if self._config.openai_compat.api_key is not None
+                    else ""
+                ),
+            ).get_model_info()
         except ValueError:
             model_spec = self._config.model
             if model_spec.startswith("ollama:"):
                 return ModelInfo(
                     name=model_spec[len("ollama:"):],
+                    provider="ollama",
                     backend_type="ollama",
                     supports_tool_calling=True,
                 )
             if model_spec.startswith(("http://", "https://")):
                 return ModelInfo(
                     name=model_spec,
+                    provider=self._config.openai_compat.provider,
                     backend_type="openai_compat",
                     supports_tool_calling=True,
                 )
             if model_spec.lower().endswith(".gguf"):
-                return ModelInfo(name=model_spec, backend_type="gguf")
-            return ModelInfo(name=model_spec, backend_type="safetensors")
+                return ModelInfo(name=model_spec, backend_type="gguf", provider="local")
+            return ModelInfo(name=model_spec, backend_type="safetensors", provider="local")
 
     async def switch_ollama_backend(
         self,
@@ -371,6 +725,7 @@ class AgentEngine:
             base_url=base_url,
             model=model,
             api_key=api_key,
+            provider=provider,
         )
         normalized_base_url = base_url.strip().rstrip("/")
         self._config.model = normalized_base_url
@@ -420,6 +775,7 @@ class AgentEngine:
         self._session_store = SessionStore(sessions_dir=config.sessions_dir)
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
         self._skill_loader = self._make_skill_loader()
+        self._skill_selector = self._make_skill_selector()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
         self._contexts.clear()
         self._tool_execution_contexts.clear()
@@ -507,6 +863,16 @@ class AgentEngine:
         """釋放指定 session_id 的語音會話快取。"""
         return await self._voice_session_manager.release(session_id=session_id)
 
+    async def prepare_voice_runtime(
+        self,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """預載共享 voice runtime，並可選擇預先建立指定 session。"""
+        await self._ensure_voice_runtime_loaded()
+        if session_id is not None:
+            await self.get_or_create_voice_session(session_id=session_id)
+        return await self.get_voice_runtime_status()
+
     async def get_voice_runtime_status(self) -> dict[str, Any]:
         """取得共享語音 runtime 狀態摘要（供 API 與監看使用）。"""
         active_runtime = None
@@ -571,7 +937,9 @@ class AgentEngine:
 
     def _skills_db_path(self) -> Path:
         """取得本地技能庫 SQLite 路徑。"""
-        return Path(self._config.skills_dir).expanduser() / "skills.db"
+        return resolve_skills_db_path(
+            skills_dir=self._config.skills_dir,
+        )
 
     def _trajectories_jsonl_path(self) -> Path:
         """取得本地 trajectory JSONL 路徑。"""
@@ -590,6 +958,7 @@ class AgentEngine:
             "frequency_penalty": agent.frequency_penalty,
             "presence_penalty": agent.presence_penalty,
             "repeat_penalty": agent.repeat_penalty,
+            "reasoning_effort": agent.reasoning_effort,
         }
 
         preset = next(
@@ -607,6 +976,7 @@ class AgentEngine:
                     "frequency_penalty": preset.frequency_penalty,
                     "presence_penalty": preset.presence_penalty,
                     "repeat_penalty": preset.repeat_penalty,
+                    "reasoning_effort": preset.reasoning_effort,
                 }
             )
             if preset.system_prompt:
@@ -630,10 +1000,53 @@ class AgentEngine:
             return ""
         return self._prompt_builder.format_skills_context(skills)
 
+    async def _select_skills(
+        self,
+        message: str,
+        *,
+        selected_skill_ids: list[str] | None = None,
+    ) -> SkillSelection:
+        """Select explicit and inferred skills for one turn."""
+        if not self._config.learning.enabled:
+            return SkillSelection(
+                explicit_skills=[],
+                suggested_skills=[],
+                preferred_tool_names=[],
+            )
+        try:
+            return await self._skill_selector.select(
+                message,
+                selected_skill_ids=selected_skill_ids,
+            )
+        except Exception as exc:  # pragma: no cover - unexpected selector failures
+            logger.warning(f"Skill search failed: {exc}")
+            return SkillSelection(
+                explicit_skills=[],
+                suggested_skills=[],
+                preferred_tool_names=[],
+            )
+
+    def _render_skills_context(self, selection: SkillSelection) -> str:
+        """Render selected skills into prompt context."""
+        if selection.explicit_skills:
+            return self._prompt_builder.format_selected_skills_context(
+                explicit_skills=selection.explicit_skills,
+                suggested_skills=selection.suggested_skills,
+            )
+        return self._prompt_builder.format_skills_context(selection.suggested_skills)
+
     def _make_skill_loader(self) -> SkillLoader:
         return SkillLoader.from_paths(
             self._config.skills_dir,
             system_skills_dir=default_system_skills_dir(),
+        )
+
+    def _make_skill_selector(self) -> SkillSelector:
+        return SkillSelector(
+            library=self._skill_library,
+            loader=self._skill_loader,
+            auto_sync=self._config.learning.auto_sync_filesystem_skills,
+            max_skills=3,
         )
 
     async def _sync_filesystem_skills(self) -> None:
@@ -1006,8 +1419,13 @@ class AgentEngine:
             project_workspace=existing.project_workspace,
             task_sandbox_dir=existing.task_sandbox_dir,
             permission_policy=merged_policy,
+            read_state_cache=existing.read_state_cache,
             tool_result_store_dir=existing.tool_result_store_dir,
+            tool_result_references=existing.tool_result_references,
+            transport_diagnostics=existing.transport_diagnostics,
+            state=existing.state,
             progress_callback=existing.progress_callback,
+            cancellation_requested=existing.cancellation_requested,
         )
 
     async def _get_context(self, session_id: str) -> ContextManager:
@@ -1018,14 +1436,22 @@ class AgentEngine:
 
         context = ContextManager(
             conversation_memory=ConversationMemory(
-                max_messages=self._config.memory.max_short_term_messages
+                max_messages=max(
+                    self._config.memory.max_short_term_messages * 2,
+                    self._config.memory.semantic_keep_recent_messages + 12,
+                )
             ),
             memory_store=self._memory_store,
-            compactor=ConversationCompactor.from_max_messages(
-                self._config.memory.max_short_term_messages
+            compactor=ConversationCompactor.from_settings(
+                max_messages=self._config.memory.max_short_term_messages,
+                semantic_compaction_enabled=self._config.memory.semantic_compaction_enabled,
+                summary_mode=self._config.memory.semantic_summary_mode,
+                max_input_tokens=self._config.memory.max_short_term_tokens,
+                keep_recent_messages=self._config.memory.semantic_keep_recent_messages,
             ),
             history_window=self._config.memory.max_short_term_messages,
             memory_top_k=self._config.memory.fts_top_k,
+            max_short_term_tokens=self._config.memory.max_short_term_tokens,
         )
         await self._restore_session_history(session_id, context)
         self._contexts[session_id] = context
@@ -1049,6 +1475,32 @@ class AgentEngine:
             return f"Conversation summary:\n{summary_text}"
         return f"{memory_text}\n\nConversation summary:\n{summary_text}"
 
+    def _inference_capabilities_for_backend(
+        self,
+        backend: BaseLLMBackend,
+    ) -> InferenceCapabilities:
+        """Return provider-aware inference capabilities for the active backend."""
+        try:
+            model_info = backend.get_model_info()
+        except Exception:
+            logger.debug("Unable to inspect backend inference capabilities.", exc_info=True)
+            return InferenceCapabilities(
+                provider=None,
+                supported_inference_parameters=(
+                    "system_prompt",
+                    "temperature",
+                    "max_tokens",
+                    "top_p",
+                    "min_p",
+                    "top_k",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "repeat_penalty",
+                ),
+                supported_reasoning_efforts=(),
+            )
+        return resolve_model_inference_capabilities(model_info)
+
     async def _restore_session_history(
         self,
         session_id: str,
@@ -1062,7 +1514,13 @@ class AgentEngine:
             role = event.get("role")
             content = event.get("content")
             if role in {"system", "user", "assistant", "tool"} and isinstance(content, str):
-                context.add_message(Message(role=role, content=content))
+                context.add_message(
+                    Message(
+                        role=role,
+                        content=content,
+                        attachments=self._deserialize_message_attachments(event.get("attachments")),
+                    )
+                )
 
     async def _persist_session_messages(
         self,
@@ -1092,6 +1550,7 @@ class AgentEngine:
                 "turn_id": turn_id,
                 "role": message.role,
                 "content": message.content,
+                "attachments": [attachment.to_dict() for attachment in message.attachments],
                 "timestamp": timestamp,
             },
         )
@@ -1151,6 +1610,120 @@ class AgentEngine:
             return "error", {"message": event.message, "code": event.code}
         return None, {}
 
+    def _build_tool_planner_message(
+        self,
+        message: str,
+        attachments: list[AttachmentRef] | None,
+    ) -> str:
+        if not attachments:
+            return message
+
+        lines = [message.strip(), "Attached workspace files:"]
+        for attachment in attachments:
+            lines.append(f"- {attachment.path} ({attachment.name})")
+        return "\n".join(line for line in lines if line)
+
+    def _build_attachment_prompt_context(
+        self,
+        *,
+        attachments: list[AttachmentRef] | None,
+        available_tool_names: list[str],
+    ) -> str:
+        if not attachments:
+            return ""
+
+        lines = [
+            "These files are already imported into the workspace for the current turn.",
+            "Inspect them only when needed, and prefer the most specific read-only reader that is actually available.",
+            "Attachments:",
+        ]
+        available = set(available_tool_names)
+        for attachment in attachments:
+            hints = self._attachment_reader_hints(attachment, available)
+            label = f"- `{attachment.name}` at `{attachment.path}`"
+            if attachment.size is not None:
+                label += f" ({attachment.size} bytes)"
+            if hints:
+                label += f" -> suggested reader {', '.join(f'`{hint}`' for hint in hints)}"
+            lines.append(label)
+        return "\n".join(lines)
+
+    def _attachment_reader_hints(
+        self,
+        attachment: AttachmentRef,
+        available_tool_names: set[str],
+    ) -> list[str]:
+        suffix = Path(attachment.path or attachment.name).suffix.lower()
+        preferred_by_suffix = {
+            ".docx": ["docx_read"],
+            ".pdf": ["pdf_read"],
+            ".csv": ["csv_read"],
+            ".tsv": ["csv_read"],
+            ".ipynb": ["notebook_read"],
+        }
+        preferred = [
+            tool_name
+            for tool_name in preferred_by_suffix.get(suffix, [])
+            if tool_name in available_tool_names
+        ]
+        if preferred:
+            return preferred
+
+        text_suffixes = {
+            ".txt",
+            ".md",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".html",
+            ".css",
+            ".scss",
+            ".sql",
+            ".xml",
+            ".log",
+        }
+        if suffix in text_suffixes and "file_read" in available_tool_names:
+            return ["file_read"]
+        return []
+
+    def _deserialize_message_attachments(self, value: Any) -> list[AttachmentRef]:
+        if not isinstance(value, list):
+            return []
+
+        attachments: list[AttachmentRef] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            path = item.get("path")
+            size = item.get("size")
+            content_type = item.get("content_type")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if not isinstance(path, str) or not path.strip():
+                continue
+            attachments.append(
+                AttachmentRef(
+                    name=name.strip(),
+                    path=path.strip(),
+                    size=size if isinstance(size, int) and size >= 0 else None,
+                    content_type=(
+                        content_type.strip()
+                        if isinstance(content_type, str) and content_type.strip()
+                        else None
+                    ),
+                )
+            )
+        return attachments
+
     async def _create_voice_session(self) -> VoiceSession:
         """建立語音會話協調器（lazy）。"""
         await self._ensure_voice_runtime_loaded()
@@ -1169,11 +1742,17 @@ class AgentEngine:
                 return
 
             try:
-                async for event in self._run_chat(
-                    message,
-                    session_id=resolved_session_id,
-                    backend_override=reply_backend,
-                ):
+                result = await self._invoke_shared_runtime(
+                    AgentInvocationRequest(
+                        message=message,
+                        session_id=resolved_session_id,
+                        backend_override=reply_backend,
+                        tool_mode="auto",
+                        execution_profile="chat",
+                        persist_session=True,
+                    )
+                )
+                for event in result.events:
                     yield event
             finally:
                 await reply_backend.close()
@@ -1231,10 +1810,130 @@ class AgentEngine:
         model_id = self._config.voice.reply_model_id
         if not model_id:
             raise RuntimeError("voice.reply_model_id is required when reply_model_mode=configured_model.")
+        return await self._acquire_configured_model_backend(model_id)
+
+    async def generate_with_configured_model(
+        self,
+        *,
+        model_id: str,
+        messages: list[Message],
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
+    ) -> GenerationResult:
+        backend = await self._acquire_configured_model_backend(model_id)
+        try:
+            result = await backend.generate(
+                messages,
+                tools=None,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repeat_penalty=repeat_penalty,
+                reasoning_effort=reasoning_effort,
+                stream=False,
+            )
+            if not isinstance(result, GenerationResult):
+                raise RuntimeError("Configured model generation expected non-stream GenerationResult.")
+            return result
+        finally:
+            await backend.close()
+
+    async def collect_agent_run_evidence(
+        self,
+        *,
+        queries: list[str],
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        policy = _resolve_agent_run_evidence_collection_policy(metadata)
+        scope_request = _resolve_agent_run_evidence_scope_request(metadata)
+        session_id = scope_request["session_id"] or f"agent-run-evidence:{uuid4()}"
+        scope = await self._execution_scope_resolver.resolve(
+            session_id=session_id,
+            project_id=scope_request["project_id"],
+            workspace_dir=scope_request["workspace_dir"],
+        )
+        effective_workspace_dir = scope.workspace_dir
+        task_workspace_dir = scope_request["task_workspace_dir"]
+        permission_policy = _resolve_agent_run_evidence_permission_policy(metadata)
+
+        registry = self._tool_registry
+        owns_registry = False
+        if effective_workspace_dir != self._config.workspace_dir:
+            registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
+            owns_registry = True
+
+        try:
+            search_tool = registry.get("web_search")
+            mode_requires_web = str(policy["mode"]).strip().lower() in {"web", "hybrid"}
+            if mode_requires_web and search_tool is None:
+                return [], {
+                    "query_count": len([item for item in queries if isinstance(item, str) and item.strip()]),
+                    "collected_packet_count": 0,
+                    "provider_counts": {},
+                    "queries": [
+                        {
+                            "query": item,
+                            "packet_count": 0,
+                            "error": "web_search tool is not available.",
+                        }
+                        for item in queries
+                        if isinstance(item, str) and item.strip()
+                    ],
+                }
+            tool_execution_context = self._get_tool_execution_context(
+                session_id=session_id,
+                workspace_dir=effective_workspace_dir,
+                task_workspace_dir=task_workspace_dir,
+                permission_policy_override=permission_policy,
+            )
+
+            async def execute_tool(name: str, args: dict[str, Any]) -> Any:
+                return await registry.execute(name, args, context=tool_execution_context)
+
+            rag_mcp_servers = _resolve_agent_run_rag_mcp_servers(
+                metadata=metadata,
+                runtime_manager=self._mcp_runtime_manager,
+            )
+            return await collect_evidence_packets(
+                queries=queries,
+                execute_tool=execute_tool,
+                search_tool=search_tool,
+                fetch_tool=registry.get("web_fetch"),
+                memory_search_tool=registry.get("memory_search"),
+                mcp_list_resources_tool=registry.get("mcp_list_resources"),
+                mcp_read_resource_tool=registry.get("mcp_read_resource"),
+                rag_provider=str(policy["rag_provider"]),
+                rag_mcp_servers=rag_mcp_servers,
+                mode=str(policy["mode"]),
+                max_results_per_query=int(policy["max_results_per_query"]),
+                max_fetch_per_query=int(policy["max_fetch_per_query"]),
+                max_content_chars=int(policy["max_content_chars"]),
+            )
+        finally:
+            if owns_registry:
+                await self._close_tool_registry(registry)
+
+    async def _acquire_configured_model_backend(self, model_id: str) -> BaseLLMBackend:
         configured_model = self._find_configured_model(model_id)
         if configured_model is None:
-            raise RuntimeError(f"Voice reply model {model_id!r} is not configured.")
+            raise RuntimeError(f"Configured model {model_id!r} is not available.")
+        return await self._acquire_backend_for_configured_model(configured_model)
 
+    async def _acquire_backend_for_configured_model(
+        self,
+        configured_model: ConfiguredModelConfig,
+    ) -> BaseLLMBackend:
         resolved_model_spec = configured_model.model_spec
         resolved_model_name = configured_model.model
         resolved_base_url = configured_model.base_url
@@ -1369,3 +2068,166 @@ class AgentEngine:
                 ) from exc
 
         return _factory
+
+
+def _resolve_agent_run_evidence_collection_policy(
+    metadata: dict[str, Any] | None,
+) -> dict[str, int | bool | str]:
+    policy: dict[str, int | bool | str] = {
+        "enabled": True,
+        "mode": "hybrid",
+        "rag_provider": "memory",
+        "max_results_per_query": 3,
+        "max_fetch_per_query": 2,
+        "max_content_chars": 2000,
+    }
+    if not isinstance(metadata, dict):
+        return policy
+
+    candidates = []
+    evaluation_policy = metadata.get("evaluation_policy")
+    summary = metadata.get("summary")
+    if isinstance(evaluation_policy, dict):
+        candidates.append(evaluation_policy.get("evidence_collection"))
+    if isinstance(summary, dict):
+        candidates.append(summary.get("evidence_collection"))
+
+    for value in candidates:
+        if not isinstance(value, dict):
+            continue
+        enabled = value.get("enabled")
+        if isinstance(enabled, bool):
+            policy["enabled"] = enabled
+        mode = value.get("mode")
+        if isinstance(mode, str) and mode.strip():
+            policy["mode"] = mode.strip()
+        rag_provider = value.get("rag_provider")
+        if isinstance(rag_provider, str) and rag_provider.strip():
+            policy["rag_provider"] = rag_provider.strip()
+        for key in ("max_results_per_query", "max_fetch_per_query", "max_content_chars"):
+            raw = value.get(key)
+            if isinstance(raw, int) and raw > 0:
+                policy[key] = raw
+        break
+    return policy
+
+
+def _resolve_agent_run_evidence_scope_request(
+    metadata: dict[str, Any] | None,
+) -> dict[str, str | None]:
+    session_id = _resolve_agent_run_metadata_string(
+        metadata,
+        "session_id",
+    )
+    project_id = _resolve_agent_run_metadata_string(
+        metadata,
+        "project_id",
+    )
+    workspace_dir = (
+        _resolve_agent_run_metadata_string(metadata, "project_workspace_dir")
+        or _resolve_agent_run_metadata_string(metadata, "workspace_dir")
+    )
+    task_workspace_dir = _resolve_agent_run_metadata_string(
+        metadata,
+        "task_workspace_dir",
+    )
+    return {
+        "session_id": session_id,
+        "project_id": project_id,
+        "workspace_dir": workspace_dir,
+        "task_workspace_dir": task_workspace_dir,
+    }
+
+
+def _resolve_agent_run_evidence_permission_policy(
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    permission_keys = {
+        "autonomy_mode",
+        "require_approval_for_shell",
+        "require_approval_for_file_write",
+        "require_approval_for_exec",
+        "file_ops_scope",
+        "approved_tool_calls",
+        "denied_tool_calls",
+    }
+    for candidate in _iter_agent_run_metadata_candidates(metadata):
+        raw_policy = candidate.get("permission_policy")
+        if isinstance(raw_policy, dict):
+            filtered = {
+                key: value
+                for key, value in raw_policy.items()
+                if key in permission_keys
+            }
+            if filtered:
+                return filtered
+        raw_security = candidate.get("security")
+        if isinstance(raw_security, dict):
+            filtered = {
+                key: value
+                for key, value in raw_security.items()
+                if key in permission_keys
+            }
+            if filtered:
+                return filtered
+    return None
+
+
+def _resolve_agent_run_rag_mcp_servers(
+    *,
+    metadata: dict[str, Any] | None,
+    runtime_manager: object | None,
+) -> list[str]:
+    servers: list[str] = []
+    if isinstance(metadata, dict):
+        evaluation_policy = metadata.get("evaluation_policy")
+        summary = metadata.get("summary")
+        candidates = []
+        if isinstance(evaluation_policy, dict):
+            candidates.append(evaluation_policy.get("evidence_collection"))
+        if isinstance(summary, dict):
+            candidates.append(summary.get("evidence_collection"))
+        for value in candidates:
+            if not isinstance(value, dict):
+                continue
+            raw_servers = value.get("rag_mcp_servers")
+            if isinstance(raw_servers, list):
+                servers = [item.strip() for item in raw_servers if isinstance(item, str) and item.strip()]
+                break
+    if servers:
+        return servers
+    if runtime_manager is None:
+        return []
+    list_server_names = getattr(runtime_manager, "list_server_names", None)
+    if not callable(list_server_names):
+        return []
+    try:
+        payload = list_server_names()
+    except TypeError:
+        payload = list_server_names(enabled_only=True)
+    return [item for item in payload if isinstance(item, str) and item.strip()]
+
+
+def _resolve_agent_run_metadata_string(
+    metadata: dict[str, Any] | None,
+    key: str,
+) -> str | None:
+    for candidate in _iter_agent_run_metadata_candidates(metadata):
+        value = candidate.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _iter_agent_run_metadata_candidates(
+    metadata: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return []
+
+    candidates: list[dict[str, Any]] = [metadata]
+    for key in ("summary", "task", "run", "agent_run"):
+        nested = metadata.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    return candidates

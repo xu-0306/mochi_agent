@@ -12,6 +12,8 @@ import { CopyButton } from './CopyButton'
 import type { FileChangeSummary } from '@/lib/chat-p2'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
+import { createMarkdownCodeComponents } from '@/components/code/markdown-code'
+import { ChatAttachments } from './ChatAttachments'
 
 interface ChatMessageProps {
   message: Message
@@ -68,6 +70,10 @@ export function ChatMessage({
       second: '2-digit',
     },
   })
+  const markdownCodeComponents = React.useMemo(
+    () => createMarkdownCodeComponents({ showCopyButton: true }),
+    []
+  )
 
   React.useEffect(() => {
     setDraftContent(content)
@@ -212,7 +218,12 @@ export function ChatMessage({
                   </div>
                 </div>
               ) : (
-                <div>{content}</div>
+                <div className="space-y-3">
+                  {content ? <div>{content}</div> : null}
+                  {message.attachments && message.attachments.length > 0 ? (
+                    <ChatAttachments attachments={message.attachments} variant="message" />
+                  ) : null}
+                </div>
               )}
             </div>
           </div>
@@ -243,36 +254,7 @@ export function ChatMessage({
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   rehypePlugins={[rehypeHighlight]}
-                  components={{
-                    code(props: React.ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
-                      const { children, className, inline, ...rest } = props
-                      const codeText = String(children ?? '').replace(/\n$/, '')
-
-                      if (inline) {
-                        return (
-                          <code
-                            className="rounded bg-elevated-layer px-1.5 py-0.5 text-[0.9em]"
-                            {...rest}
-                          >
-                            {children}
-                          </code>
-                        )
-                      }
-
-                      return (
-                        <div className="relative my-4 overflow-hidden rounded-lg border border-border bg-canvas">
-                          <div className="flex items-center justify-end border-b border-border px-2 py-1">
-                            <CopyButton text={codeText} label="Copy code" />
-                          </div>
-                          <pre className="overflow-x-auto p-3">
-                            <code className={className} {...rest}>
-                              {children}
-                            </code>
-                          </pre>
-                        </div>
-                      )
-                    },
-                  }}
+                  components={markdownCodeComponents}
                 >
                   {content}
                 </ReactMarkdown>

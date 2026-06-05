@@ -34,6 +34,11 @@ interface InferencePanelProps {
   onReset: () => void
   onSavePreset: () => void
   isSavingPreset?: boolean
+  supportsReasoningEffort?: boolean
+  showReasoningEffort?: boolean
+  reasoningEffortOptions?: api.ReasoningEffort[]
+  disabledKeys?: Array<keyof InferenceParams>
+  disabledReason?: string | null
   agent?: AgentSettings
   settings?: api.Settings | null
   onSettingsUpdated?: (settings: api.Settings) => void
@@ -50,6 +55,11 @@ function PanelBody({
   onReset,
   onSavePreset,
   isSavingPreset,
+  supportsReasoningEffort = false,
+  showReasoningEffort = true,
+  reasoningEffortOptions,
+  disabledKeys,
+  disabledReason,
   settings,
   onSettingsUpdated,
 }: Omit<InferencePanelProps, 'open' | 'mobileOpen' | 'onOpenChange' | 'onMobileOpenChange' | 'agent'>) {
@@ -195,7 +205,15 @@ function PanelBody({
             </div>
           ) : null}
 
-          <InferenceControls value={value} onChange={onChange} />
+          <InferenceControls
+            value={value}
+            onChange={onChange}
+            supportsReasoningEffort={supportsReasoningEffort}
+            showReasoningEffort={showReasoningEffort}
+            reasoningEffortOptions={reasoningEffortOptions}
+            disabledKeys={disabledKeys}
+            disabledReason={disabledReason}
+          />
         </div>
       </div>
     </div>

@@ -71,6 +71,7 @@ class SafetensorsBackend(BaseLLMBackend):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """執行生成。"""
@@ -159,6 +160,7 @@ class SafetensorsBackend(BaseLLMBackend):
         return ModelInfo(
             name=self.model_dir,
             backend_type="safetensors",
+            provider="local",
             context_length=4096,
             supports_tool_calling=False,
             metadata={

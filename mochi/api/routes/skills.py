@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Protocol, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from mochi.api.server import _get_config  # pyright: ignore[reportPrivateUsage]
 from mochi.learning.skill_library import SkillLibrary
+from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
 
 router = APIRouter(prefix="/v1")
@@ -45,10 +45,15 @@ async def _get_skill_library(request: Request) -> SupportsSkillLibrary:
         return existing
 
     config = await _get_config(request.app)
-    db_path = getattr(config, "skills_dir", None)
-    if db_path is None:
+    skills_dir = getattr(config, "skills_dir", None)
+    if skills_dir is None:
         raise RuntimeError("Config does not provide skills_dir")
-    return SkillLibrary(db_path=Path(db_path).expanduser() / "skills.db")
+
+    library = SkillLibrary(
+        db_path=resolve_skills_db_path(skills_dir=skills_dir),
+    )
+    request.app.state.skill_library = library
+    return library
 
 
 async def _sync_filesystem_skills(request: Request, library: SupportsSkillLibrary) -> None:

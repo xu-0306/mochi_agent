@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from mochi.config import defaults
 from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.memory_guard import is_suspicious_memory_payload
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
 
 
@@ -43,6 +45,33 @@ class JsonlMemoryStore:
     async def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         """搜尋 JSONL 記憶。"""
         return await asyncio.to_thread(self._search_sync, query, top_k)
+
+    async def update(
+        self,
+        memory_id: str,
+        *,
+        content: str | None = None,
+        category: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._update_sync,
+            memory_id,
+            content,
+            category,
+            metadata,
+        )
+
+    async def delete(self, memory_id: str) -> bool:
+        return await asyncio.to_thread(self._delete_sync, memory_id)
+
+    async def export(
+        self,
+        *,
+        category: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._export_sync, category, limit)
 
     def _append_entry_sync(self, entry: dict[str, Any]) -> None:
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +111,75 @@ class JsonlMemoryStore:
         matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
         return [entry for _, _, entry in matches[:top_k]]
 
+    def _load_entries_sync(self) -> list[dict[str, Any]]:
+        if not self._file_path.exists():
+            return []
+
+        entries: list[dict[str, Any]] = []
+        with self._file_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    entries.append(parsed)
+        return entries
+
+    def _write_entries_sync(self, entries: list[dict[str, Any]]) -> None:
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._file_path.open("w", encoding="utf-8") as file:
+            for entry in entries:
+                file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _update_sync(
+        self,
+        memory_id: str,
+        content: str | None,
+        category: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        entries = self._load_entries_sync()
+        updated: dict[str, Any] | None = None
+        for entry in entries:
+            if str(entry.get("id")) != memory_id:
+                continue
+            if content is not None:
+                entry["content"] = content
+            if category is not None:
+                entry["category"] = category
+            if metadata is not None:
+                entry["metadata"] = metadata
+            updated = dict(entry)
+            break
+        if updated is None:
+            return None
+        self._write_entries_sync(entries)
+        return updated
+
+    def _delete_sync(self, memory_id: str) -> bool:
+        entries = self._load_entries_sync()
+        remaining = [entry for entry in entries if str(entry.get("id")) != memory_id]
+        if len(remaining) == len(entries):
+            return False
+        self._write_entries_sync(remaining)
+        return True
+
+    def _export_sync(
+        self,
+        category: str | None,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        entries = self._load_entries_sync()
+        if category is not None:
+            entries = [entry for entry in entries if str(entry.get("category")) == category]
+        if limit is not None:
+            entries = entries[:limit]
+        return [dict(entry) for entry in entries]
+
 
 class MemorySaveTool(BaseTool):
     """將內容保存到長期記憶的工具。"""
@@ -104,7 +202,7 @@ class MemorySaveTool(BaseTool):
             self._memory_store = memory_store
             return
 
-        workspace = normalize_workspace_dir(workspace_dir or "~/.mochi")
+        workspace = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         file_path = resolve_path_in_workspace(memory_file, workspace)
         self._memory_store = JsonlMemoryStore(file_path)
 
@@ -152,6 +250,8 @@ class MemorySaveTool(BaseTool):
             return ToolResult(error="`content` must not be empty.")
         if metadata is not None and not isinstance(metadata, dict):
             return ToolResult(error="`metadata` must be an object.")
+        if is_suspicious_memory_payload(content=content, metadata=metadata):
+            return ToolResult(error="Suspicious memory content blocked by security policy.")
 
         memory_id = await self._memory_store.save(
             content=content,

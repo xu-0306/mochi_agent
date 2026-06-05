@@ -15,24 +15,28 @@ _AUTONOMY_DEFAULTS: dict[AutonomyMode, dict[str, Any]] = {
         "autonomy_mode": "strict",
         "require_approval_for_shell": True,
         "require_approval_for_file_write": True,
+        "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
     },
     "trusted_workspace": {
         "autonomy_mode": "trusted_workspace",
         "require_approval_for_shell": True,
         "require_approval_for_file_write": False,
+        "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
     },
     "auto_review": {
         "autonomy_mode": "auto_review",
         "require_approval_for_shell": False,
         "require_approval_for_file_write": False,
+        "require_approval_for_exec": False,
         "file_ops_scope": "workspace",
     },
     "high_autonomy": {
         "autonomy_mode": "high_autonomy",
         "require_approval_for_shell": False,
         "require_approval_for_file_write": False,
+        "require_approval_for_exec": False,
         "file_ops_scope": "any",
     },
 }
@@ -45,6 +49,7 @@ class RuntimePermissionPolicy:
     autonomy_mode: AutonomyMode
     require_approval_for_shell: bool
     require_approval_for_file_write: bool
+    require_approval_for_exec: bool
     file_ops_scope: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,6 +57,7 @@ class RuntimePermissionPolicy:
             "autonomy_mode": self.autonomy_mode,
             "require_approval_for_shell": self.require_approval_for_shell,
             "require_approval_for_file_write": self.require_approval_for_file_write,
+            "require_approval_for_exec": self.require_approval_for_exec,
             "file_ops_scope": self.file_ops_scope,
         }
 
@@ -98,6 +104,7 @@ def resolve_runtime_permission_policy(
     effective_mode = security.autonomy_mode
     effective_shell = security.require_approval_for_shell
     effective_file_write = security.require_approval_for_file_write
+    effective_exec = security.require_approval_for_exec
     effective_scope = security.file_ops_scope
 
     if isinstance(overrides, dict):
@@ -107,6 +114,8 @@ def resolve_runtime_permission_policy(
             effective_shell = overrides["require_approval_for_shell"]
         if isinstance(overrides.get("require_approval_for_file_write"), bool):
             effective_file_write = overrides["require_approval_for_file_write"]
+        if isinstance(overrides.get("require_approval_for_exec"), bool):
+            effective_exec = overrides["require_approval_for_exec"]
         if isinstance(overrides.get("file_ops_scope"), str):
             effective_scope = overrides["file_ops_scope"]
 
@@ -114,6 +123,7 @@ def resolve_runtime_permission_policy(
         autonomy_mode=effective_mode,
         require_approval_for_shell=effective_shell,
         require_approval_for_file_write=effective_file_write,
+        require_approval_for_exec=effective_exec,
         file_ops_scope=effective_scope,
     )
 

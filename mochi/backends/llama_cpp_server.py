@@ -179,6 +179,7 @@ class LlamaCppServerBackend(BaseLLMBackend):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         delegate = await self._ensure_server_ready()
@@ -193,6 +194,7 @@ class LlamaCppServerBackend(BaseLLMBackend):
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repeat_penalty=repeat_penalty,
+            reasoning_effort=reasoning_effort,
             stream=stream,
         )
 
@@ -203,6 +205,7 @@ class LlamaCppServerBackend(BaseLLMBackend):
         return ModelInfo(
             name=self.model_path,
             backend_type="gguf",
+            provider="local",
             context_length=self.n_ctx,
             supports_tool_calling=True,
             metadata={

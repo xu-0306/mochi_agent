@@ -5,6 +5,7 @@
  */
 
 import type {
+  ChatAttachment,
   Message,
   MessageEventType,
   ReasoningStep,
@@ -17,9 +18,12 @@ import {
   extractInlineReasoning,
   finalizeInlineReasoningBuffer,
 } from '@/lib/reasoning'
+import { buildReasoningStepId, mergeReasoningStep } from '@/lib/reasoning-steps'
 
 const API_BASE = '/v1'
 const LOCAL_DEV_API_ORIGIN = 'http://127.0.0.1:8000'
+
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
 type ApiPrimitive = string | number | boolean | null
 type ApiValue = ApiPrimitive | ApiValue[] | { [key: string]: ApiValue }
@@ -47,11 +51,41 @@ function getStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string')
 }
 
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return (
+    value === 'none' ||
+    value === 'minimal' ||
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh'
+  )
+}
+
 function getRecordArray(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) {
     return []
   }
   return value.filter(isRecord)
+}
+
+function normalizeAttachments(value: unknown): ChatAttachment[] {
+  const attachments: ChatAttachment[] = []
+  getRecordArray(value).forEach((item, index) => {
+    const name = getNonEmptyString(item.name)
+    const path = getNonEmptyString(item.path)
+    if (!name || !path) {
+      return
+    }
+    attachments.push({
+      id: getNonEmptyString(item.id) ?? `attachment-${index}-${path}`,
+      name,
+      path,
+      size: getNumber(item.size) ?? null,
+      contentType: getNonEmptyString(item.content_type) ?? getNonEmptyString(item.contentType),
+    })
+  })
+  return attachments
 }
 
 function toIsoString(value: unknown): string {
@@ -151,6 +185,10 @@ export function resolveChatStreamTarget(options: SendMessageOptions = {}): Reque
   return isLocalModelSpec(options.model) ? 'direct' : 'proxy'
 }
 
+export function resolveChatTarget(options: Pick<SendMessageOptions, 'model'> = {}): RequestTarget {
+  return isLocalModelSpec(options.model) ? 'direct' : 'proxy'
+}
+
 async function requestJson<T>(path: string, init?: RequestInit, target: RequestTarget = 'proxy'): Promise<T> {
   let response: Response
   const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData
@@ -192,6 +230,8 @@ export interface SendMessageOptions {
   sessionId?: string
   projectId?: string | null
   model?: string
+  selectedSkillIds?: string[]
+  attachments?: ChatAttachment[]
   temperature?: number
   maxTokens?: number
   systemPrompt?: string
@@ -201,6 +241,7 @@ export interface SendMessageOptions {
   frequencyPenalty?: number
   presencePenalty?: number
   repeatPenalty?: number
+  reasoningEffort?: ReasoningEffort | null
   signal?: AbortSignal
 }
 
@@ -251,6 +292,7 @@ export interface SessionMessageEvent {
   type: 'message'
   role?: string
   content?: string
+  attachments?: unknown
   timestamp?: string
   turn_id?: string | number
   turnId?: string | number
@@ -292,6 +334,28 @@ export interface BackendChatResponse {
   events: BackendChatEvent[]
 }
 
+export interface ChatContextSnapshot {
+  type: 'chat_context'
+  session_id: string
+  model: string
+  backend_type: string
+  context_length: number
+  estimated_prompt_tokens: number
+  reserved_output_tokens: number
+  remaining_tokens: number
+  usage_ratio: number
+  summary_tokens: number
+  history_tokens: number
+  memory_tokens: number
+  skills_tokens: number
+  tool_tokens: number
+  draft_tokens: number
+  compaction_triggered: boolean
+  compaction_reason?: string | null
+  approximate: boolean
+  reasoning_effort?: ReasoningEffort | null
+}
+
 export interface PostChatPayload {
   message: string
   session_id?: string
@@ -299,6 +363,9 @@ export interface PostChatPayload {
   project_id?: string | null
   projectId?: string | null
   model?: string
+  selected_skill_ids?: string[]
+  selectedSkillIds?: string[]
+  attachments?: ChatAttachment[]
   system_prompt?: string
   temperature?: number
   max_tokens?: number
@@ -308,6 +375,7 @@ export interface PostChatPayload {
   frequency_penalty?: number
   presence_penalty?: number
   repeat_penalty?: number
+  reasoning_effort?: ReasoningEffort | null
 }
 
 export interface SendMessageResult {
@@ -349,6 +417,7 @@ interface NormalizedMessageEvent {
   kind: 'message'
   role: 'user' | 'assistant' | 'system'
   content: string
+  attachments: ChatAttachment[]
   timestamp?: string
   turnKey: string | null
 }
@@ -458,9 +527,10 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
 
   if (type === 'message') {
     const role = getString(event.role)
-    const content = getNonEmptyString(event.content)
+    const content = getString(event.content) ?? ''
+    const attachments = normalizeAttachments(event.attachments)
 
-    if (!role || !content) {
+    if (!role) {
       return null
     }
 
@@ -468,10 +538,15 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       return null
     }
 
+    if (content.trim().length === 0 && attachments.length === 0) {
+      return null
+    }
+
     return {
       kind: 'message',
       role,
       content,
+      attachments,
       timestamp,
       turnKey,
     }
@@ -585,7 +660,14 @@ function buildReasoningStep(
   event: NormalizedTurnEvent,
   index: number
 ): ReasoningStep | null {
-  const id = buildMessageId(`reasoning-${event.phase}`, index, event.turnKey, event.timestamp)
+  const id = buildReasoningStepId({
+    phase: event.phase,
+    turnKey: event.turnKey,
+    timestamp: event.timestamp,
+    index,
+    toolCallId: event.toolCallId,
+    content: event.toolError ?? event.content,
+  })
   const timestamp = toMessageTimestamp(event.timestamp)
 
   switch (event.phase) {
@@ -840,6 +922,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
           messages[existingIndex] = appendInlineReasoning({
             ...messages[existingIndex],
             content: event.content,
+            attachments: event.attachments,
             timestamp: toMessageTimestamp(event.timestamp),
           }, {
             content: event.content,
@@ -855,6 +938,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
         id: buildMessageId(`timeline-${event.role}`, index, event.turnKey, event.timestamp),
         type: event.role,
         content: event.content,
+        attachments: event.attachments,
         timestamp: toMessageTimestamp(event.timestamp),
         turnKey: event.turnKey,
         turnId: event.turnKey,
@@ -962,7 +1046,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
       const target = messages[existingIndex]
       messages[existingIndex] = {
         ...target,
-        reasoningSteps: [...(target.reasoningSteps ?? []), step],
+        reasoningSteps: mergeReasoningStep(target.reasoningSteps ?? [], step),
       }
       return
     }
@@ -1006,6 +1090,8 @@ export async function sendMessage(
       session_id: options.sessionId,
       project_id: options.projectId,
       model: options.model,
+      selected_skill_ids: options.selectedSkillIds,
+      attachments: options.attachments,
       system_prompt: options.systemPrompt,
       temperature: options.temperature,
       max_tokens: options.maxTokens,
@@ -1015,6 +1101,7 @@ export async function sendMessage(
       frequency_penalty: options.frequencyPenalty,
       presence_penalty: options.presencePenalty,
       repeat_penalty: options.repeatPenalty,
+      reasoning_effort: options.reasoningEffort,
     }),
   })
 
@@ -1037,6 +1124,8 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       session_id: payload.session_id ?? payload.sessionId,
       project_id: payload.project_id ?? payload.projectId,
       model: payload.model,
+      selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
+      attachments: payload.attachments,
       system_prompt: payload.system_prompt,
       temperature: payload.temperature,
       max_tokens: payload.max_tokens,
@@ -1046,8 +1135,40 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       frequency_penalty: payload.frequency_penalty,
       presence_penalty: payload.presence_penalty,
       repeat_penalty: payload.repeat_penalty,
+      reasoning_effort: payload.reasoning_effort,
     }),
   })
+}
+
+export async function fetchChatContextPreview(
+  payload: PostChatPayload & { signal?: AbortSignal }
+): Promise<ChatContextSnapshot> {
+  return requestJson<ChatContextSnapshot>(
+    '/chat/context',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        message: payload.message,
+        session_id: payload.session_id ?? payload.sessionId,
+        project_id: payload.project_id ?? payload.projectId,
+        model: payload.model,
+        selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
+        attachments: payload.attachments,
+        system_prompt: payload.system_prompt,
+        temperature: payload.temperature,
+        max_tokens: payload.max_tokens,
+        top_p: payload.top_p,
+        min_p: payload.min_p,
+        top_k: payload.top_k,
+        frequency_penalty: payload.frequency_penalty,
+        presence_penalty: payload.presence_penalty,
+        repeat_penalty: payload.repeat_penalty,
+        reasoning_effort: payload.reasoning_effort,
+      }),
+      signal: payload.signal,
+    },
+    resolveChatTarget({ model: payload.model })
+  )
 }
 
 function normalizeStreamEvent(value: unknown): StreamChatEvent | null {
@@ -1241,6 +1362,8 @@ async function requestStreamResponse(
         session_id: options.sessionId,
         project_id: options.projectId,
         model: options.model,
+        selected_skill_ids: options.selectedSkillIds,
+        attachments: options.attachments,
         system_prompt: options.systemPrompt,
         temperature: options.temperature,
         max_tokens: options.maxTokens,
@@ -1250,6 +1373,7 @@ async function requestStreamResponse(
         frequency_penalty: options.frequencyPenalty,
         presence_penalty: options.presencePenalty,
         repeat_penalty: options.repeatPenalty,
+        reasoning_effort: options.reasoningEffort,
       }),
       signal: options.signal,
       cache: 'no-store',
@@ -2813,6 +2937,39 @@ export async function importFilesystemFiles(
   }
 }
 
+export interface FilesystemPreviewTextResult {
+  type: 'filesystem_preview_text'
+  path: string
+  name: string
+  text: string
+  truncated: boolean
+  mediaType: string
+}
+
+export function buildFilesystemFileUrl(path: string): string {
+  const query = new URLSearchParams({ path })
+  return `${resolveApiUrl('/filesystem/file')}?${query.toString()}`
+}
+
+export async function fetchFilesystemPreviewText(
+  path: string,
+  maxChars = 12000
+): Promise<FilesystemPreviewTextResult> {
+  const query = new URLSearchParams({
+    path,
+    max_chars: String(maxChars),
+  })
+  const payload = await requestJson<Record<string, unknown>>(`/filesystem/preview-text?${query.toString()}`)
+  return {
+    type: 'filesystem_preview_text',
+    path: getString(payload.path) ?? path,
+    name: getString(payload.name) ?? path.split(/[\\/]/).pop() ?? path,
+    text: getString(payload.text) ?? '',
+    truncated: getBoolean(payload.truncated) ?? false,
+    mediaType: getString(payload.media_type) ?? 'text/plain',
+  }
+}
+
 interface BackendSettings {
   type: 'settings'
   model: string
@@ -2845,6 +3002,7 @@ export interface InferencePreset {
   frequency_penalty: number
   presence_penalty: number
   repeat_penalty: number
+  reasoning_effort?: ReasoningEffort | null
 }
 
 export interface AgentSettings {
@@ -2857,6 +3015,7 @@ export interface AgentSettings {
   frequency_penalty: number
   presence_penalty: number
   repeat_penalty: number
+  reasoning_effort?: ReasoningEffort | null
   show_token_stats: boolean
   presets: InferencePreset[]
   active_preset: string
@@ -3593,6 +3752,16 @@ export async function fetchVoiceStatus(): Promise<VoiceRuntimeStatus> {
   return normalizeVoiceRuntimeStatus(payload)
 }
 
+export async function prepareVoiceRuntime(sessionId?: string): Promise<VoiceRuntimeStatus> {
+  const payload = await requestJson<BackendVoiceRuntimeStatus>('/voice/prepare', {
+    method: 'POST',
+    body: JSON.stringify({
+      session_id: sessionId ?? null,
+    }),
+  })
+  return normalizeVoiceRuntimeStatus(payload)
+}
+
 export async function fetchVoiceCatalog(): Promise<VoiceCatalog> {
   const payload = await requestJson<BackendVoiceCatalog>('/voice/voices')
   return normalizeVoiceCatalog(payload)
@@ -3700,6 +3869,7 @@ export interface InferencePresetInput {
   frequency_penalty: number
   presence_penalty: number
   repeat_penalty: number
+  reasoning_effort?: ReasoningEffort | null
 }
 
 export interface AgentSettingsUpdate {
@@ -3712,6 +3882,7 @@ export interface AgentSettingsUpdate {
   frequency_penalty?: number
   presence_penalty?: number
   repeat_penalty?: number
+  reasoning_effort?: ReasoningEffort | null
   show_token_stats?: boolean
   presets?: InferencePresetInput[]
   active_preset?: string
@@ -3778,6 +3949,7 @@ function normalizeInferencePreset(value: unknown): InferencePreset | null {
   if (!name) {
     return null
   }
+  const reasoningEffort = getString(value.reasoning_effort)
 
   return {
     name,
@@ -3790,6 +3962,9 @@ function normalizeInferencePreset(value: unknown): InferencePreset | null {
     frequency_penalty: getNumber(value.frequency_penalty) ?? 0.0,
     presence_penalty: getNumber(value.presence_penalty) ?? 0.0,
     repeat_penalty: getNumber(value.repeat_penalty) ?? 1.0,
+    reasoning_effort: isReasoningEffort(reasoningEffort)
+      ? reasoningEffort
+      : null,
   }
 }
 
@@ -3801,6 +3976,7 @@ function normalizeAgentSettings(value: unknown): AgentSettings | undefined {
   const presets = getRecordArray(value.presets)
     .map(normalizeInferencePreset)
     .filter((preset): preset is InferencePreset => preset !== null)
+  const reasoningEffort = getString(value.reasoning_effort)
 
   return {
     system_prompt: getString(value.system_prompt) ?? '',
@@ -3812,6 +3988,9 @@ function normalizeAgentSettings(value: unknown): AgentSettings | undefined {
     frequency_penalty: getNumber(value.frequency_penalty) ?? 0.0,
     presence_penalty: getNumber(value.presence_penalty) ?? 0.0,
     repeat_penalty: getNumber(value.repeat_penalty) ?? 1.0,
+    reasoning_effort: isReasoningEffort(reasoningEffort)
+      ? reasoningEffort
+      : null,
     show_token_stats: getBoolean(value.show_token_stats) ?? false,
     presets,
     active_preset: getString(value.active_preset) ?? (presets[0]?.name ?? 'default'),
@@ -3970,6 +4149,14 @@ export interface ApprovalSummary {
   created_at: string
   resolved_at: string | null
   decision: string | null
+  reason: string | null
+  policy_reason: string | null
+  requires_approval: boolean
+  approval_kind: string
+  approval_scope: string
+  replay_safe: boolean
+  security_decision: string | null
+  policy_source: string | null
 }
 
 export interface CreateTaskInput {
@@ -4025,6 +4212,14 @@ function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
     created_at: getString(record.created_at) ?? new Date(0).toISOString(),
     resolved_at: getNullableString(record.resolved_at),
     decision: getNullableString(record.decision),
+    reason: getNullableString(record.reason),
+    policy_reason: getNullableString(record.policy_reason),
+    requires_approval: getBoolean(record.requires_approval) ?? false,
+    approval_kind: getString(record.approval_kind) ?? 'other',
+    approval_scope: getString(record.approval_scope) ?? 'workspace',
+    replay_safe: getBoolean(record.replay_safe) ?? false,
+    security_decision: getNullableString(record.security_decision),
+    policy_source: getNullableString(record.policy_source),
   }
 }
 
@@ -4081,4 +4276,347 @@ export async function resolveApproval(
     body: JSON.stringify(input),
   })
   return normalizeApprovalSummary(payload)
+}
+
+export type AgentRunProtocolId = 'teacher_student_distill' | 'multi_agent_debate' | (string & {})
+
+export interface AgentRunArtifact {
+  artifact_id: string | null
+  artifact_type: string
+  title: string | null
+  uri: string | null
+  mime_type: string | null
+  size_bytes: number | null
+  metadata: Record<string, unknown>
+}
+
+export interface AgentRunSummary {
+  run_id: string
+  protocol_id: string
+  title: string | null
+  topic: string | null
+  status: string
+  selected_models_roles: Record<string, unknown>
+  evaluation_policy: Record<string, unknown>
+  schedule: Record<string, unknown>
+  summary: Record<string, unknown>
+  latest_error: string | null
+  evidence_status: Record<string, unknown>
+  artifacts: AgentRunArtifact[]
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface AgentRunDetail extends AgentRunSummary {
+  events: Array<Record<string, unknown>>
+}
+
+export interface AgentRunAttemptPackage {
+  manifest_version: string
+  package_type: string
+  exported_at: string
+  run_id: string
+  protocol_id: string
+  attempt_id: string | null
+  selected_scope: string
+  schedule_attempt: Record<string, unknown> | null
+  artifact_count: number
+  event_count: number
+  role_output_count: number
+  replay_ready: boolean
+  artifacts: Array<Record<string, unknown>>
+  events: Array<Record<string, unknown>>
+  role_outputs: Array<Record<string, unknown>>
+  evaluation_events: Array<Record<string, unknown>>
+  dataset_records: Array<Record<string, unknown>>
+  run_summary: Record<string, unknown> | null
+  evidence_summary: Record<string, unknown> | null
+  verification_summary: Record<string, unknown> | null
+  final_selected_candidate: Record<string, unknown> | null
+}
+
+export interface AgentRunDatasetPackage {
+  manifest_version: string
+  package_type: string
+  exported_at: string
+  run_id: string
+  protocol_id: string
+  attempt_count: number
+  dataset_record_count: number
+  training_ready_count: number
+  excluded_record_count: number
+  attempts: Array<Record<string, unknown>>
+  all_records: Array<Record<string, unknown>>
+  training_ready_records: Array<Record<string, unknown>>
+  excluded_records_summary: Record<string, unknown>
+}
+
+export interface AgentRunSubagentInput {
+  role: string
+  model_id: string
+}
+
+export interface CreateAgentRunInput {
+  protocol_id: AgentRunProtocolId
+  title?: string | null
+  topic?: string | null
+  subagents?: AgentRunSubagentInput[]
+  selected_models_roles?: Record<string, unknown>
+  evaluation_policy?: Record<string, unknown>
+  schedule?: Record<string, unknown>
+  summary?: Record<string, unknown>
+  latest_error?: string | null
+  evidence_status?: Record<string, unknown>
+  artifacts?: Array<{
+    artifact_id?: string | null
+    artifact_type: string
+    title?: string | null
+    uri?: string | null
+    mime_type?: string | null
+    size_bytes?: number | null
+    metadata?: Record<string, unknown>
+  }>
+}
+
+export interface AppendAgentRunGuidanceInput {
+  guidance: string
+  author?: string | null
+  metadata?: Record<string, unknown>
+}
+
+function normalizeAgentRunArtifact(payload: unknown): AgentRunArtifact | null {
+  const record = isRecord(payload) ? payload : {}
+  const artifactType = getString(record.artifact_type)
+  if (!artifactType) {
+    return null
+  }
+
+  return {
+    artifact_id: getNullableString(record.artifact_id),
+    artifact_type: artifactType,
+    title: getNullableString(record.title),
+    uri: getNullableString(record.uri),
+    mime_type: getNullableString(record.mime_type),
+    size_bytes: getNumber(record.size_bytes) ?? null,
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+  }
+}
+
+function normalizeAgentRunSummary(payload: unknown): AgentRunSummary {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    run_id: getString(record.run_id) ?? '',
+    protocol_id: getString(record.protocol_id) ?? '',
+    title: getNullableString(record.title),
+    topic: getNullableString(record.topic),
+    status: getString(record.status) ?? 'unknown',
+    selected_models_roles: isRecord(record.selected_models_roles)
+      ? record.selected_models_roles
+      : {},
+    evaluation_policy: isRecord(record.evaluation_policy) ? record.evaluation_policy : {},
+    schedule: isRecord(record.schedule) ? record.schedule : {},
+    summary: isRecord(record.summary) ? record.summary : {},
+    latest_error: getNullableString(record.latest_error),
+    evidence_status: isRecord(record.evidence_status) ? record.evidence_status : {},
+    artifacts: getRecordArray(record.artifacts)
+      .map((item) => normalizeAgentRunArtifact(item))
+      .filter((item): item is AgentRunArtifact => item !== null),
+    created_at: getString(record.created_at) ?? new Date(0).toISOString(),
+    updated_at: getString(record.updated_at) ?? new Date(0).toISOString(),
+    started_at: getNullableString(record.started_at),
+    finished_at: getNullableString(record.finished_at),
+  }
+}
+
+function normalizeAgentRunDetail(payload: unknown): AgentRunDetail {
+  const summary = normalizeAgentRunSummary(payload)
+  const record = isRecord(payload) ? payload : {}
+  return {
+    ...summary,
+    events: getRecordArray(record.events),
+  }
+}
+
+function normalizeAgentRunAttemptPackage(payload: unknown): AgentRunAttemptPackage {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    manifest_version: getString(record.manifest_version) ?? '',
+    package_type: getString(record.package_type) ?? '',
+    exported_at: getString(record.exported_at) ?? new Date(0).toISOString(),
+    run_id: getString(record.run_id) ?? '',
+    protocol_id: getString(record.protocol_id) ?? '',
+    attempt_id: getNullableString(record.attempt_id),
+    selected_scope: getString(record.selected_scope) ?? '',
+    schedule_attempt: isRecord(record.schedule_attempt) ? record.schedule_attempt : null,
+    artifact_count: getNumber(record.artifact_count) ?? 0,
+    event_count: getNumber(record.event_count) ?? 0,
+    role_output_count: getNumber(record.role_output_count) ?? 0,
+    replay_ready: Boolean(record.replay_ready),
+    artifacts: getRecordArray(record.artifacts),
+    events: getRecordArray(record.events),
+    role_outputs: getRecordArray(record.role_outputs),
+    evaluation_events: getRecordArray(record.evaluation_events),
+    dataset_records: getRecordArray(record.dataset_records),
+    run_summary: isRecord(record.run_summary) ? record.run_summary : null,
+    evidence_summary: isRecord(record.evidence_summary) ? record.evidence_summary : null,
+    verification_summary: isRecord(record.verification_summary) ? record.verification_summary : null,
+    final_selected_candidate: isRecord(record.final_selected_candidate)
+      ? record.final_selected_candidate
+      : null,
+  }
+}
+
+function normalizeAgentRunDatasetPackage(payload: unknown): AgentRunDatasetPackage {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    manifest_version: getString(record.manifest_version) ?? '',
+    package_type: getString(record.package_type) ?? '',
+    exported_at: getString(record.exported_at) ?? new Date(0).toISOString(),
+    run_id: getString(record.run_id) ?? '',
+    protocol_id: getString(record.protocol_id) ?? '',
+    attempt_count: getNumber(record.attempt_count) ?? 0,
+    dataset_record_count: getNumber(record.dataset_record_count) ?? 0,
+    training_ready_count: getNumber(record.training_ready_count) ?? 0,
+    excluded_record_count: getNumber(record.excluded_record_count) ?? 0,
+    attempts: getRecordArray(record.attempts),
+    all_records: getRecordArray(record.all_records),
+    training_ready_records: getRecordArray(record.training_ready_records),
+    excluded_records_summary: isRecord(record.excluded_records_summary)
+      ? record.excluded_records_summary
+      : {},
+  }
+}
+
+export async function fetchAgentRuns(): Promise<AgentRunSummary[]> {
+  const payload = await requestJson<unknown>('/agent-runs')
+  if (Array.isArray(payload)) {
+    return payload.map((item) => normalizeAgentRunSummary(item))
+  }
+  if (isRecord(payload) && Array.isArray(payload.items)) {
+    return payload.items.map((item) => normalizeAgentRunSummary(item))
+  }
+  return []
+}
+
+export async function fetchAgentRun(runId: string): Promise<AgentRunDetail> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}`)
+  return normalizeAgentRunDetail(payload)
+}
+
+export async function fetchAgentRunAttemptPackage(
+  runId: string,
+  attemptId: string
+): Promise<AgentRunAttemptPackage> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/packages/attempts/${encodeURIComponent(attemptId)}`
+  )
+  return normalizeAgentRunAttemptPackage(payload)
+}
+
+export async function fetchAgentRunDatasetPackage(
+  runId: string
+): Promise<AgentRunDatasetPackage> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/packages/dataset`
+  )
+  return normalizeAgentRunDatasetPackage(payload)
+}
+
+export async function createAgentRun(input: CreateAgentRunInput): Promise<AgentRunSummary> {
+  const builtSelectedModelsRoles = (() => {
+    if (input.selected_models_roles) {
+      return input.selected_models_roles
+    }
+    if (!input.subagents || input.subagents.length === 0) {
+      return {}
+    }
+
+    const by_role: Record<string, string> = {}
+    const subagents = input.subagents
+      .map((item) => ({
+        role: item.role.trim(),
+        model_id: item.model_id.trim(),
+      }))
+      .filter((item) => item.role.length > 0 && item.model_id.length > 0)
+
+    for (const item of subagents) {
+      by_role[item.role] = item.model_id
+    }
+
+    return {
+      subagents,
+      by_role,
+      entries: subagents,
+    }
+  })()
+
+  const payload = await requestJson<unknown>('/agent-runs', {
+    method: 'POST',
+    body: JSON.stringify({
+      protocol_id: input.protocol_id,
+      title: input.title ?? null,
+      topic: input.topic ?? null,
+      selected_models_roles: builtSelectedModelsRoles,
+      evaluation_policy: input.evaluation_policy ?? {},
+      schedule: input.schedule ?? {},
+      summary: input.summary ?? {},
+      latest_error: input.latest_error ?? null,
+      evidence_status: input.evidence_status ?? {},
+      artifacts: (input.artifacts ?? []).map((artifact) => ({
+        artifact_id: artifact.artifact_id ?? null,
+        artifact_type: artifact.artifact_type,
+        title: artifact.title ?? null,
+        uri: artifact.uri ?? null,
+        mime_type: artifact.mime_type ?? null,
+        size_bytes: artifact.size_bytes ?? null,
+        metadata: artifact.metadata ?? {},
+      })),
+    }),
+  })
+  return normalizeAgentRunSummary(payload)
+}
+
+export async function appendAgentRunGuidance(
+  runId: string,
+  input: AppendAgentRunGuidanceInput
+): Promise<AgentRunDetail> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}/guidance`, {
+    method: 'POST',
+    body: JSON.stringify({
+      guidance: input.guidance,
+      author: input.author ?? null,
+      metadata: input.metadata ?? {},
+    }),
+  })
+  return normalizeAgentRunDetail(payload)
+}
+
+export async function startAgentRun(runId: string): Promise<AgentRunSummary> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}/start`, {
+    method: 'POST',
+  })
+  return normalizeAgentRunSummary(payload)
+}
+
+export async function pauseAgentRun(runId: string): Promise<AgentRunSummary> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}/pause`, {
+    method: 'POST',
+  })
+  return normalizeAgentRunSummary(payload)
+}
+
+export async function resumeAgentRun(runId: string): Promise<AgentRunSummary> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST',
+  })
+  return normalizeAgentRunSummary(payload)
+}
+
+export async function cancelAgentRun(runId: string): Promise<AgentRunSummary> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST',
+  })
+  return normalizeAgentRunSummary(payload)
 }

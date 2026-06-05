@@ -13,6 +13,7 @@ import {
   Search,
   Settings,
   Trash2,
+  Workflow,
   Zap,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -276,7 +277,17 @@ export function Sidebar() {
             </>
           ) : null}
 
-          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-2')}>
+          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-3')}>
+            <Button
+              variant="ghost"
+              size={collapsed ? 'icon' : 'sm'}
+              onClick={() => router.push('/agent-runs')}
+              title={t('sidebar.workflows')}
+              className={collapsed ? 'w-9' : 'justify-start'}
+            >
+              <Workflow className="h-4 w-4" />
+              {!collapsed && <span>{t('sidebar.workflows')}</span>}
+            </Button>
             <Button
               variant="ghost"
               size={collapsed ? 'icon' : 'sm'}
@@ -285,7 +296,7 @@ export function Sidebar() {
               className={collapsed ? 'w-9' : 'justify-start'}
             >
               <Library className="h-4 w-4" />
-              {!collapsed && <span>Skills</span>}
+              {!collapsed && <span>{t('sidebar.skills')}</span>}
             </Button>
             <Button
               variant="ghost"

@@ -56,11 +56,17 @@ class OllamaBackend(BaseLLMBackend):
 
     def get_model_info(self) -> ModelInfo:
         """回傳 Ollama 後端的模型資訊。"""
+        supports_reasoning_effort = self._supports_reasoning_effort_model(self.model)
         return ModelInfo(
             name=self.model,
             backend_type="ollama",
+            provider="ollama",
             context_length=4096,
             supports_tool_calling=True,
+            metadata={
+                "supports_reasoning_effort": supports_reasoning_effort,
+                "reasoning_effort_param": "think" if supports_reasoning_effort else None,
+            },
         )
 
     async def health_check(self) -> bool:
@@ -84,6 +90,7 @@ class OllamaBackend(BaseLLMBackend):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """呼叫 Ollama /api/chat 進行推理。
@@ -114,6 +121,9 @@ class OllamaBackend(BaseLLMBackend):
             "stream": stream,
             "options": options,
         }
+        think_value = self._reasoning_effort_to_think_value(reasoning_effort)
+        if think_value is not None:
+            payload["think"] = think_value
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
 
@@ -136,6 +146,9 @@ class OllamaBackend(BaseLLMBackend):
         data = resp.json()
         msg = data.get("message", {})
         content: str = msg.get("content", "")
+        thinking = msg.get("thinking", "")
+        if isinstance(thinking, str) and thinking:
+            content = f"<think>{thinking}</think>\n\n{content}" if content else f"<think>{thinking}</think>"
 
         tool_calls: list[ToolCall] = []
         for tc in msg.get("tool_calls", []):
@@ -180,6 +193,9 @@ class OllamaBackend(BaseLLMBackend):
                     done: bool = data.get("done", False)
                     msg = data.get("message", {})
                     delta: str = msg.get("content", "")
+                    thinking_delta = msg.get("thinking", "")
+                    if isinstance(thinking_delta, str) and thinking_delta:
+                        delta = f"<think>{thinking_delta}</think>" if not delta else f"<think>{thinking_delta}</think>{delta}"
 
                     yield StreamChunk(
                         delta=delta,
@@ -212,3 +228,15 @@ class OllamaBackend(BaseLLMBackend):
             metadata["status_code"] = exc.response.status_code
             metadata["response_text"] = exc.response.text
         return BackendRequestError(str(exc), metadata=metadata)
+
+    @staticmethod
+    def _supports_reasoning_effort_model(model: str) -> bool:
+        """Return whether an Ollama model is known to accept low/medium/high think levels."""
+        return "gpt-oss" in model.lower()
+
+    def _reasoning_effort_to_think_value(self, effort: str | None) -> str | None:
+        if effort not in {"low", "medium", "high"}:
+            return None
+        if not self._supports_reasoning_effort_model(self.model):
+            return None
+        return effort

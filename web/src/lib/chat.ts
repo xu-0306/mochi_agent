@@ -32,6 +32,14 @@ export interface TokenStats {
   finishReason?: string
 }
 
+export interface ChatAttachment {
+  id?: string
+  name: string
+  path: string
+  size?: number | null
+  contentType?: string | null
+}
+
 export interface Message {
   id: string
   type: MessageType
@@ -44,6 +52,7 @@ export interface Message {
   errorCode?: string
   isStreaming?: boolean
   tokenStats?: TokenStats
+  attachments?: ChatAttachment[]
   reasoningBuffer?: {
     visible: string
     reasoning: string

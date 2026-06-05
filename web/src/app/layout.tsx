@@ -36,7 +36,14 @@ export default function RootLayout({
       var theme = mode === 'dark' || mode === 'light'
         ? mode
         : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      var codeTheme = parsed && typeof parsed === 'object'
+        ? (parsed.codeTheme ?? parsed.code_theme ?? parsed.syntaxTheme)
+        : null;
+      if (typeof codeTheme !== 'string' || !codeTheme) {
+        codeTheme = 'vscode-dark-plus';
+      }
       document.documentElement.dataset.theme = theme;
+      document.documentElement.dataset.codeTheme = codeTheme;
       document.documentElement.style.colorScheme = theme;
       var metaTheme = document.querySelector('meta[name="theme-color"]');
       if (metaTheme) {
@@ -73,6 +80,7 @@ export default function RootLayout({
     <html
       lang="en"
       data-theme="light"
+      data-code-theme="vscode-dark-plus"
       suppressHydrationWarning
     >
       <body

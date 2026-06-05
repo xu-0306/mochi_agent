@@ -22,6 +22,7 @@ dependencies = [
     "accelerate>=0.33",
     "torch>=2.4",
     "safetensors>=0.4",
+    "pypdf>=6.12.2",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +53,7 @@ tts-extras = [
     # coqui-tts 已停止維護，需手動安裝或用 TTS>=0.22：
     # pip install TTS
     # kokoro-tts 需手動安裝（PyPI 套件名稱與版本變動頻繁）
+    "kokoro>=0.9.4",
 ]
 
 channels = [

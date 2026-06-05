@@ -12,6 +12,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from mochi.backends.inference_capabilities import (
+    ReasoningEffort,
+    resolve_model_inference_capabilities,
+)
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.types import (
     GenerationResult,
@@ -47,6 +51,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         model: str,
         api_key: str = "",
         timeout: float = 120.0,
+        provider: str = "openai_compat",
     ) -> None:
         """初始化 OpenAI-compatible 後端。
 
@@ -63,6 +68,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         self._health_urls = endpoint.health_urls
         self.model = model
         self.api_key = api_key
+        self.provider = provider
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def generate(
@@ -77,6 +83,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         """呼叫 Chat Completions API 進行生成。
@@ -100,6 +107,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                 top_p,
                 frequency_penalty,
                 presence_penalty,
+                reasoning_effort,
                 stream,
             )
             if self._api_mode == "responses"
@@ -111,6 +119,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                 top_p,
                 frequency_penalty,
                 presence_penalty,
+                reasoning_effort,
                 stream,
             )
         )
@@ -125,14 +134,26 @@ class OpenAICompatBackend(BaseLLMBackend):
 
     def get_model_info(self) -> ModelInfo:
         """回傳目前模型資訊。"""
+        capabilities = resolve_model_inference_capabilities(
+            ModelInfo(
+                name=self.model,
+                provider=self.provider,
+                backend_type="openai_compat",
+                supports_tool_calling=True,
+                metadata={"api_mode": self._api_mode},
+            )
+        )
         return ModelInfo(
             name=self.model,
+            provider=self.provider,
             backend_type="openai_compat",
             supports_tool_calling=True,
             metadata={
                 "base_url": self.base_url,
                 "api_url": self._request_url,
                 "api_mode": self._api_mode,
+                "provider": self.provider,
+                **capabilities.to_metadata(),
             },
         )
 
@@ -380,21 +401,34 @@ class OpenAICompatBackend(BaseLLMBackend):
         top_p: float,
         frequency_penalty: float,
         presence_penalty: float,
+        reasoning_effort: str | None,
         stream: bool,
     ) -> dict[str, Any]:
         """建立 Chat Completions payload。"""
+        capabilities = resolve_model_inference_capabilities(self.get_model_info())
+        supported = set(capabilities.supported_inference_parameters)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [m.to_dict() for m in messages],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-            "frequency_penalty": frequency_penalty,
-            "presence_penalty": presence_penalty,
             "stream": stream,
         }
+        if "temperature" in supported:
+            payload["temperature"] = temperature
+        if "max_tokens" in supported:
+            payload["max_tokens"] = max_tokens
+        if "top_p" in supported:
+            payload["top_p"] = top_p
+        if "frequency_penalty" in supported:
+            payload["frequency_penalty"] = frequency_penalty
+        if "presence_penalty" in supported:
+            payload["presence_penalty"] = presence_penalty
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
+        if (
+            "reasoning_effort" in supported
+            and reasoning_effort in capabilities.supported_reasoning_efforts
+        ):
+            payload["reasoning_effort"] = cast(ReasoningEffort, reasoning_effort)
         return payload
 
     def _build_responses_payload(
@@ -406,20 +440,28 @@ class OpenAICompatBackend(BaseLLMBackend):
         top_p: float,
         frequency_penalty: float,
         presence_penalty: float,
+        reasoning_effort: str | None,
         stream: bool,
     ) -> dict[str, Any]:
         """建立 Responses API payload。"""
         instructions = "\n\n".join(m.content for m in messages if m.role == "system" and m.content)
+        capabilities = resolve_model_inference_capabilities(self.get_model_info())
+        supported = set(capabilities.supported_inference_parameters)
         payload: dict[str, Any] = {
             "model": self.model,
             "input": self._build_responses_input(messages),
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-            "top_p": top_p,
-            "frequency_penalty": frequency_penalty,
-            "presence_penalty": presence_penalty,
             "stream": stream,
         }
+        if "temperature" in supported:
+            payload["temperature"] = temperature
+        if "max_tokens" in supported:
+            payload["max_output_tokens"] = max_tokens
+        if "top_p" in supported:
+            payload["top_p"] = top_p
+        if "frequency_penalty" in supported:
+            payload["frequency_penalty"] = frequency_penalty
+        if "presence_penalty" in supported:
+            payload["presence_penalty"] = presence_penalty
         if instructions:
             payload["instructions"] = instructions
         if tools:
@@ -432,6 +474,11 @@ class OpenAICompatBackend(BaseLLMBackend):
                 }
                 for tool in tools
             ]
+        if (
+            "reasoning_effort" in supported
+            and reasoning_effort in capabilities.supported_reasoning_efforts
+        ):
+            payload["reasoning"] = {"effort": cast(ReasoningEffort, reasoning_effort)}
         return payload
 
     def _build_responses_input(self, messages: list[Message]) -> list[dict[str, Any]]:

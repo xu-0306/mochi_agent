@@ -98,6 +98,17 @@ def _session_title(session_id: str, events: list[dict]) -> str:
         ):
             return event["content"].strip()[:80]
 
+        if event.get("type") == "message" and event.get("role") == "user":
+            attachments = event.get("attachments")
+            if isinstance(attachments, list):
+                names = [
+                    item.get("name", "").strip()
+                    for item in attachments
+                    if isinstance(item, dict) and isinstance(item.get("name"), str)
+                ]
+                if names:
+                    return ", ".join(names)[:80]
+
     return session_id
 
 

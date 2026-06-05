@@ -72,6 +72,43 @@ class MemoryStore:
             return []
         return await asyncio.to_thread(self._search_sync, query, top_k)
 
+    async def update(
+        self,
+        memory_id: str,
+        *,
+        content: str | None = None,
+        category: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> MemoryEntry | None:
+        """Update an existing memory entry and return the new value."""
+        await self._ensure_initialized()
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("metadata must be a dict")
+        return await asyncio.to_thread(
+            self._update_sync,
+            memory_id,
+            content,
+            category,
+            None if metadata is None else json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        )
+
+    async def delete(self, memory_id: str) -> bool:
+        """Delete one memory entry by id."""
+        await self._ensure_initialized()
+        return await asyncio.to_thread(self._delete_sync, memory_id)
+
+    async def export(
+        self,
+        *,
+        category: str | None = None,
+        limit: int | None = None,
+    ) -> list[MemoryEntry]:
+        """Export memory entries, optionally filtered by category."""
+        await self._ensure_initialized()
+        if limit is not None and limit <= 0:
+            return []
+        return await asyncio.to_thread(self._export_sync, category, limit)
+
     async def get_user_profile(self) -> str:
         """取得使用者模型（USER.md 等價內容）。"""
         await self._ensure_initialized()
@@ -242,6 +279,104 @@ class MemoryStore:
                 """,
                 (like, like, like, top_k),
             ).fetchall()
+            return [self._row_to_memory_entry(row, with_score=False) for row in rows]
+        finally:
+            conn.close()
+
+    def _update_sync(
+        self,
+        memory_id: str,
+        content: str | None,
+        category: str | None,
+        metadata_json: str | None,
+    ) -> MemoryEntry | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT id, content, category, metadata_json, created_at
+                FROM memories
+                WHERE id = ?
+                """,
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            next_content = str(row["content"]) if content is None else content
+            next_category = str(row["category"]) if category is None else category
+            next_metadata_json = str(row["metadata_json"]) if metadata_json is None else metadata_json
+
+            conn.execute(
+                """
+                UPDATE memories
+                SET content = ?, category = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (next_content, next_category, next_metadata_json, memory_id),
+            )
+
+            if self._supports_fts5:
+                try:
+                    conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+                    conn.execute(
+                        """
+                        INSERT INTO memories_fts (id, content, category, metadata)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (memory_id, next_content, next_category, next_metadata_json),
+                    )
+                except sqlite3.OperationalError:
+                    self._supports_fts5 = False
+
+            conn.commit()
+            return self._row_to_memory_entry(
+                {
+                    "id": memory_id,
+                    "content": next_content,
+                    "category": next_category,
+                    "metadata_json": next_metadata_json,
+                    "created_at": str(row["created_at"]),
+                },
+                with_score=False,
+            )
+        finally:
+            conn.close()
+
+    def _delete_sync(self, memory_id: str) -> bool:
+        conn = self._connect()
+        try:
+            if self._supports_fts5:
+                try:
+                    conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+                except sqlite3.OperationalError:
+                    self._supports_fts5 = False
+            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def _export_sync(
+        self,
+        category: str | None,
+        limit: int | None,
+    ) -> list[MemoryEntry]:
+        conn = self._connect()
+        try:
+            query = (
+                "SELECT id, content, category, metadata_json, created_at "
+                "FROM memories"
+            )
+            params: list[Any] = []
+            if category is not None:
+                query += " WHERE category = ?"
+                params.append(category)
+            query += " ORDER BY created_at DESC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             return [self._row_to_memory_entry(row, with_score=False) for row in rows]
         finally:
             conn.close()

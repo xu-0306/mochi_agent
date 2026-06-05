@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
     logger = logging.getLogger(__name__)
 
+from mochi.security import deny_security_decision
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 ToolFactory = Any
@@ -94,6 +96,10 @@ class ToolRegistry:
 
         execution_args = dict(args)
         try:
+            denied_result = self._check_denied_tool_call(name=name, args=execution_args, context=context)
+            if denied_result is not None:
+                return denied_result
+
             validation_error = tool.validate_input(execution_args, context)
             if validation_error is not None:
                 return validation_error
@@ -115,6 +121,60 @@ class ToolRegistry:
         except Exception as exc:
             logger.warning("Tool '{}' execution error: {}", name, exc)
             return ToolResult(error=str(exc))
+
+    @staticmethod
+    def _tool_call_signature(*, name: str, args: dict[str, Any]) -> str:
+        return json.dumps(
+            {"tool_name": name, "arguments": args},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+    def _check_denied_tool_call(
+        self,
+        *,
+        name: str,
+        args: dict[str, Any],
+        context: ToolExecutionContext | None,
+    ) -> ToolResult | None:
+        if context is None:
+            return None
+
+        signature = self._tool_call_signature(name=name, args=args)
+        denied_signatures = context.state.setdefault("denied_tool_call_signatures", set())
+        if not isinstance(denied_signatures, set):
+            denied_signatures = set()
+            context.state["denied_tool_call_signatures"] = denied_signatures
+
+        denied_calls = context.permission_policy.get("denied_tool_calls")
+        if isinstance(denied_calls, list):
+            for candidate in denied_calls:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_name = candidate.get("tool_name")
+                candidate_args = candidate.get("arguments")
+                if candidate_name != name or not isinstance(candidate_args, dict):
+                    continue
+                denied_signatures.add(
+                    self._tool_call_signature(name=str(candidate_name), args=candidate_args)
+                )
+
+        if signature not in denied_signatures:
+            return None
+
+        decision = deny_security_decision(
+            reason="This exact tool call was already denied and cannot be retried unchanged.",
+            approval_scope="task_resume",
+            replay_safe=False,
+            policy_source="approval_memory",
+        )
+        return ToolResult(
+            error="This exact tool call was already denied and cannot be retried unchanged.",
+            metadata=decision.to_metadata(),
+            retryable=False,
+            suggestion="Change the arguments or choose a different approach before retrying.",
+        )
 
     @staticmethod
     def _is_auto_approved_call(

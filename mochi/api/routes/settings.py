@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, SecretStr
 
 from mochi.api.server import _get_config, _maybe_await, _rebuild_channel_manager
+from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config.defaults import DEFAULT_EDGE_TTS_VOICE_PRESETS
 from mochi.config.manager import save_config
 from mochi.config.schema import (
@@ -30,6 +31,7 @@ from mochi.config.schema import (
     VLLMConfig,
     VoiceConfig,
 )
+from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.security.policy import autonomy_mode_defaults
 from mochi.tools.web_search_providers import build_web_search_provider_status_payload
 from mochi.voice.model_manager import (
@@ -168,6 +170,10 @@ class MemorySettingsPatch(BaseModel):
 
     db_path: str | None = None
     max_short_term_messages: int | None = Field(default=None, ge=1, le=500)
+    semantic_compaction_enabled: bool | None = None
+    semantic_summary_mode: Literal["deterministic", "hybrid"] | None = None
+    max_short_term_tokens: int | None = Field(default=None, ge=256, le=1_000_000)
+    semantic_keep_recent_messages: int | None = Field(default=None, ge=2, le=200)
     fts_top_k: int | None = Field(default=None, ge=1, le=50)
 
 
@@ -207,6 +213,7 @@ class AgentSettingsPatch(BaseModel):
     frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     repeat_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     show_token_stats: bool | None = None
     presets: list[InferencePreset] | None = None
     active_preset: str | None = None
@@ -436,7 +443,9 @@ async def setup_discord(request: Request, payload: DiscordSetupRequest) -> dict[
 def _settings_payload(config: MochiConfig) -> dict[str, Any]:
     """建立 WebGUI 使用的非敏感設定 payload。"""
     trajectory_path = Path(config.workspace_dir).expanduser() / "trajectories.jsonl"
-    skills_db_path = Path(config.skills_dir).expanduser() / "skills.db"
+    skills_db_path = resolve_skills_db_path(
+        skills_dir=config.skills_dir,
+    )
     configured_provider = _configured_provider(config)
     voice_recommendations = get_voice_recommendations_payload()
     return {
@@ -487,6 +496,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "frequency_penalty": config.agent.frequency_penalty,
             "presence_penalty": config.agent.presence_penalty,
             "repeat_penalty": config.agent.repeat_penalty,
+            "reasoning_effort": config.agent.reasoning_effort,
             "show_token_stats": config.agent.show_token_stats,
             "presets": [preset.model_dump() for preset in config.agent.presets],
             "active_preset": config.agent.active_preset,
@@ -547,6 +557,10 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
         "memory": {
             "db_path": _stringify_path(config.memory.db_path),
             "max_short_term_messages": config.memory.max_short_term_messages,
+            "semantic_compaction_enabled": config.memory.semantic_compaction_enabled,
+            "semantic_summary_mode": config.memory.semantic_summary_mode,
+            "max_short_term_tokens": config.memory.max_short_term_tokens,
+            "semantic_keep_recent_messages": config.memory.semantic_keep_recent_messages,
             "fts_top_k": config.memory.fts_top_k,
         },
         "tools": {

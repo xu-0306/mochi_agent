@@ -59,14 +59,24 @@ interface SessionStore {
 function extractLastMessage(detail: SessionDetail): string {
   const latestMessageEvent = [...detail.events]
     .reverse()
-    .find(
-      (event) =>
-        event.type === 'message' &&
-        typeof event.content === 'string' &&
-        event.content.trim().length > 0
-    )
+    .find((event) => event.type === 'message')
 
-  return latestMessageEvent?.content ?? ''
+  if (!latestMessageEvent) {
+    return ''
+  }
+
+  if (typeof latestMessageEvent.content === 'string' && latestMessageEvent.content.trim().length > 0) {
+    return latestMessageEvent.content
+  }
+
+  const attachments = Array.isArray((latestMessageEvent as { attachments?: unknown }).attachments)
+    ? (latestMessageEvent as { attachments?: Array<{ name?: unknown }> }).attachments ?? []
+    : []
+  const names = attachments
+    .map((attachment) => (typeof attachment?.name === 'string' ? attachment.name.trim() : ''))
+    .filter((name) => name.length > 0)
+
+  return names.join(', ')
 }
 
 function extractTitle(detail: SessionDetail): string {

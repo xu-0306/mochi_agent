@@ -7,6 +7,7 @@ from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
+from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config import defaults
 from mochi.config.defaults import (
     DEFAULT_MODEL,
@@ -581,6 +582,14 @@ class MemoryConfig(BaseModel):
     """SQLite 資料庫路徑。"""
 
     max_short_term_messages: int = 50
+
+    semantic_compaction_enabled: bool = True
+
+    semantic_summary_mode: Literal["deterministic", "hybrid"] = "hybrid"
+
+    max_short_term_tokens: int | None = Field(default=6000, ge=256, le=1_000_000)
+
+    semantic_keep_recent_messages: int = Field(default=8, ge=2, le=200)
     """短期記憶最大訊息數量。"""
 
     fts_top_k: int = 5
@@ -618,6 +627,7 @@ class InferencePreset(BaseModel):
     """Presence penalty。"""
 
     repeat_penalty: float = Field(default=1.0, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     """Repeat penalty。"""
 
 
@@ -632,6 +642,21 @@ class SecurityConfig(BaseModel):
 
     require_approval_for_file_write: bool = False
     """寫入檔案前是否需要使用者確認。"""
+
+    require_approval_for_exec: bool = True
+    """Exec runtime 命令是否預設需要顯式審批。"""
+
+    exec_allowed_env_vars: list[str] = Field(default_factory=lambda: _empty_list_typed(str))
+    """Exec runtime 可直接覆寫的環境變數白名單。"""
+
+    exec_default_shell: Literal["auto", "bash", "sh", "pwsh", "powershell", "cmd"] = "auto"
+    """Exec runtime 預設 shell provider。"""
+
+    exec_session_output_limit: int = Field(default=8000, ge=256, le=1_000_000)
+    """Exec session tail 緩衝上限（字元數）。"""
+
+    exec_default_timeout_sec: int = Field(default=30, ge=1, le=86_400)
+    """Exec runtime 預設 timeout（秒）。"""
 
     shell_command_allowlist: list[str] = Field(
         default_factory=lambda: ["ls", "cat", "pwd", "echo", "date", "which"]
@@ -854,6 +879,7 @@ class AgentConfig(BaseModel):
     """Presence penalty。"""
 
     repeat_penalty: float = Field(default=1.0, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     """Repeat penalty。"""
 
     show_token_stats: bool = False

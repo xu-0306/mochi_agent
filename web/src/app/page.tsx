@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
-import { AlertCircle, Loader2, MoreHorizontal, Settings, SlidersHorizontal } from 'lucide-react'
+import { AlertCircle, ListTodo, Loader2, MoreHorizontal, Settings, SlidersHorizontal, Workflow } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ChatInput, type ChatInputModelOption } from '@/components/chat/ChatInput'
 import { ChatMessage } from '@/components/chat/ChatMessage'
@@ -13,13 +13,14 @@ import { ScrollToBottom } from '@/components/chat/ScrollToBottom'
 import { TaskPanel } from '@/components/chat/TaskPanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import * as api from '@/lib/api'
-import type { Message, ReasoningStep } from '@/lib/chat'
+import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
 import {
   findRegeneratePrompt,
   isConversationEffectivelyEmpty,
   type FileChangeSummary,
 } from '@/lib/chat-p2'
 import { useI18n } from '@/lib/i18n'
+import { mergeReasoningStep } from '@/lib/reasoning-steps'
 import {
   getActivePreset,
   resolveEffectiveInferenceParams,
@@ -27,9 +28,12 @@ import {
 } from '@/lib/stores/inference-store'
 import { useProjectStore } from '@/lib/stores/project-store'
 import { useSessionStore } from '@/lib/stores/session-store'
+import { resolveVoiceOverlayPhase, resolveVoicePhaseFromRuntime } from '@/lib/voice-phase'
 import {
   VoiceWsClient,
+  type VoiceCaptureDiagnostics,
   type VoiceRuntimePhase,
+  type VoiceVadState,
   type VoiceTurnResult,
 } from '@/lib/voice-ws'
 
@@ -58,6 +62,8 @@ interface ApiCompat {
       sessionId?: string
       projectId?: string | null
       model?: string
+      selectedSkillIds?: string[]
+      attachments?: ChatAttachment[]
       systemPrompt?: string
       temperature?: number
       maxTokens?: number
@@ -67,6 +73,7 @@ interface ApiCompat {
       frequencyPenalty?: number
       presencePenalty?: number
       repeatPenalty?: number
+      reasoningEffort?: api.ReasoningEffort | null
     }
   ) => Promise<unknown>
   postChat?: (payload: {
@@ -76,6 +83,9 @@ interface ApiCompat {
     project_id?: string | null
     projectId?: string | null
     model?: string
+    selected_skill_ids?: string[]
+    selectedSkillIds?: string[]
+    attachments?: ChatAttachment[]
     system_prompt?: string
     temperature?: number
     max_tokens?: number
@@ -85,6 +95,7 @@ interface ApiCompat {
     frequency_penalty?: number
     presence_penalty?: number
     repeat_penalty?: number
+    reasoning_effort?: api.ReasoningEffort | null
   }) => Promise<unknown>
 }
 
@@ -111,6 +122,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
+function getStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+const INFERENCE_PARAM_KEY_MAP: Record<string, keyof ReturnType<typeof resolveEffectiveInferenceParams>> = {
+  temperature: 'temperature',
+  max_tokens: 'maxTokens',
+  top_p: 'topP',
+  min_p: 'minP',
+  top_k: 'topK',
+  frequency_penalty: 'frequencyPenalty',
+  presence_penalty: 'presencePenalty',
+  repeat_penalty: 'repeatPenalty',
 }
 
 function resolveModelId(model: Record<string, unknown> | null | undefined): string | null {
@@ -254,6 +283,8 @@ async function requestChat(
   sessionId: string | undefined,
   projectId: string | null | undefined,
   model: string | null,
+  selectedSkillIds: string[],
+  attachments: ChatAttachment[],
   inference: {
     systemPrompt: string
     temperature: number
@@ -264,6 +295,7 @@ async function requestChat(
     frequencyPenalty: number
     presencePenalty: number
     repeatPenalty: number
+    reasoningEffort: api.ReasoningEffort | null
   }
 ): Promise<BackendChatResponse> {
   const client = api as ApiCompat
@@ -276,6 +308,9 @@ async function requestChat(
       sessionId,
       projectId,
       model: model ?? undefined,
+      selected_skill_ids: selectedSkillIds,
+      selectedSkillIds,
+      attachments,
       system_prompt: inference.systemPrompt,
       temperature: inference.temperature,
       max_tokens: inference.maxTokens,
@@ -285,6 +320,7 @@ async function requestChat(
       frequency_penalty: inference.frequencyPenalty,
       presence_penalty: inference.presencePenalty,
       repeat_penalty: inference.repeatPenalty,
+      reasoning_effort: inference.reasoningEffort,
     })
     return response as BackendChatResponse
   }
@@ -294,6 +330,8 @@ async function requestChat(
       sessionId,
       projectId: projectId ?? undefined,
       model: model ?? undefined,
+      selectedSkillIds,
+      attachments,
       systemPrompt: inference.systemPrompt,
       temperature: inference.temperature,
       maxTokens: inference.maxTokens,
@@ -303,6 +341,7 @@ async function requestChat(
       frequencyPenalty: inference.frequencyPenalty,
       presencePenalty: inference.presencePenalty,
       repeatPenalty: inference.repeatPenalty,
+      reasoningEffort: inference.reasoningEffort,
     })
     return response as BackendChatResponse
   }
@@ -316,32 +355,6 @@ function isStreamUnavailable(error: unknown): boolean {
 
 function isVoiceStatusUnavailable(error: unknown): boolean {
   return error instanceof api.ApiError && (error.status === 404 || error.status === 405)
-}
-
-function resolveVoicePhaseFromRuntime(status: api.VoiceRuntimeStatus | null): VoiceRuntimePhase | null {
-  if (!status) {
-    return null
-  }
-
-  if (status.error) {
-    return 'error'
-  }
-
-  const phase = status.phase?.toLowerCase()
-  if (
-    phase === 'idle' ||
-    phase === 'connecting' ||
-    phase === 'ready' ||
-    phase === 'listening' ||
-    phase === 'transcribing' ||
-    phase === 'thinking' ||
-    phase === 'synthesizing' ||
-    phase === 'error'
-  ) {
-    return phase
-  }
-
-  return status.ready ? 'ready' : 'connecting'
 }
 
 function isLocalModelId(modelId: string | null): boolean {
@@ -366,35 +379,6 @@ function buildTurnPlaceholder(
     reasoningSteps: [],
     isStreaming: true,
   }
-}
-
-function mergeReasoningStep(steps: ReasoningStep[], nextStep: ReasoningStep): ReasoningStep[] {
-  if (!nextStep.toolCallId) {
-    return [...steps, nextStep]
-  }
-
-  const existingIndex = steps.findIndex(
-    (step) =>
-      step.toolCallId === nextStep.toolCallId &&
-      (step.type === 'tool_call' || step.type === 'tool_result')
-  )
-
-  if (existingIndex === -1) {
-    return [...steps, nextStep]
-  }
-
-  const existing = steps[existingIndex]
-  const merged: ReasoningStep =
-    nextStep.type === 'tool_result'
-      ? {
-          ...existing,
-          ...nextStep,
-          type: 'tool_result',
-          status: nextStep.status,
-        }
-      : { ...existing, ...nextStep }
-
-  return steps.map((step, index) => (index === existingIndex ? merged : step))
 }
 
 function applyStreamChunk(
@@ -454,10 +438,13 @@ export default function ChatPage() {
   const [modelOptions, setModelOptions] = React.useState<ChatInputModelOption[]>([])
   const [currentModel, setCurrentModel] = React.useState<string | null>(null)
   const [currentModelLoaded, setCurrentModelLoaded] = React.useState<boolean | null>(null)
+  const [activeModelInfo, setActiveModelInfo] = React.useState<Record<string, unknown> | null>(null)
+  const [activeLocalRuntimeStatus, setActiveLocalRuntimeStatus] = React.useState<api.LocalActiveModelRuntimeStatus | null>(null)
+  const [isUnloadingCurrentModel, setIsUnloadingCurrentModel] = React.useState(false)
   const [modelSwitchError, setModelSwitchError] = React.useState<string | null>(null)
-  const [skills, setSkills] = React.useState<api.Skill[]>([])
   const [settings, setSettings] = React.useState<api.Settings | null>(null)
   const [mobileInferenceOpen, setMobileInferenceOpen] = React.useState(false)
+  const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
   const [selectedPresetName, setSelectedPresetName] = React.useState('default')
   const [savingPreset, setSavingPreset] = React.useState(false)
   const [voiceOpen, setVoiceOpen] = React.useState(false)
@@ -466,6 +453,10 @@ export default function ChatPage() {
   const [voicePartialTranscription, setVoicePartialTranscription] = React.useState('')
   const [voiceFinalTranscription, setVoiceFinalTranscription] = React.useState('')
   const [voiceAssistantText, setVoiceAssistantText] = React.useState('')
+  const [voiceInputLevel, setVoiceInputLevel] = React.useState(0)
+  const [voiceVadState, setVoiceVadState] = React.useState<VoiceVadState | null>(null)
+  const [voiceCaptureDiagnostics, setVoiceCaptureDiagnostics] = React.useState<VoiceCaptureDiagnostics | null>(null)
+  const [voiceCaptureWarning, setVoiceCaptureWarning] = React.useState<string | null>(null)
   const [voiceErrorMessage, setVoiceErrorMessage] = React.useState<string | null>(null)
   const [voiceRuntimeStatus, setVoiceRuntimeStatus] = React.useState<api.VoiceRuntimeStatus | null>(null)
   const [, setVoiceRuntimeLoading] = React.useState(false)
@@ -489,6 +480,7 @@ export default function ChatPage() {
     updateLastMessage,
   } = useSessionStore()
   const activeProjectId = useProjectStore((state) => state.activeProjectId)
+  const projects = useProjectStore((state) => state.projects)
   const {
     panelOpen,
     setPanelOpen,
@@ -498,13 +490,50 @@ export default function ChatPage() {
     resetSessionOverride,
   } = useInferenceStore()
   const currentSession = sessions.find((session) => session.id === currentSessionId)
+  const effectiveProjectId = currentSession?.projectId ?? activeProjectId
   const activeAgentSettings = settings?.agent
   const activePreset = getActivePreset(activeAgentSettings)
+  const activeModelMetadata = isRecord(activeModelInfo?.metadata) ? activeModelInfo.metadata : null
+  const supportedReasoningEfforts = React.useMemo(
+    () =>
+      getStringArray(activeModelMetadata?.supported_reasoning_efforts).filter(
+        (value): value is api.ReasoningEffort =>
+          value === 'none' ||
+          value === 'minimal' ||
+          value === 'low' ||
+          value === 'medium' ||
+          value === 'high' ||
+          value === 'xhigh'
+      ),
+    [activeModelMetadata]
+  )
+  const supportedInferenceParameters = React.useMemo(
+    () => getStringArray(activeModelMetadata?.supported_inference_parameters),
+    [activeModelMetadata]
+  )
+  const supportsReasoningEffort = supportedReasoningEfforts.length > 0
+  const disabledInferenceKeys = React.useMemo(
+    () =>
+      Object.entries(INFERENCE_PARAM_KEY_MAP)
+        .filter(([key]) => supportedInferenceParameters.length > 0 && !supportedInferenceParameters.includes(key))
+        .map(([, value]) => value),
+    [supportedInferenceParameters]
+  )
+  const disabledReason = React.useMemo(() => {
+    if (disabledInferenceKeys.length === 0) {
+      return null
+    }
+    return getString(activeModelMetadata?.inference_policy_message) ?? 'This model ignores some chat inference controls.'
+  }, [activeModelMetadata, disabledInferenceKeys.length])
   const sessionOverride = currentSessionId ? sessionOverridesById[currentSessionId] : undefined
   const effectiveInference = React.useMemo(
     () => resolveEffectiveInferenceParams(sessionOverride, activeAgentSettings),
     [activeAgentSettings, sessionOverride]
   )
+  const uploadTargetDir =
+    projects.find((project) => project.id === effectiveProjectId)?.workspaceDir ??
+    getString(settings?.paths?.workspace_dir) ??
+    undefined
 
   React.useEffect(() => {
     const presetNames = activeAgentSettings?.presets.map((preset) => preset.name) ?? []
@@ -552,19 +581,13 @@ export default function ChatPage() {
     let cancelled = false
     const loadSettings = async () => {
       try {
-        const [nextSettings, nextSkills] = await Promise.all([
-          api.fetchSettings(),
-          api.fetchSkills({ limit: 50 }),
-        ])
+        const nextSettings = await api.fetchSettings()
         if (cancelled) {
           return
         }
         setSettings(nextSettings)
-        setSkills(nextSkills)
       } catch {
-        if (!cancelled) {
-          setSkills([])
-        }
+        // keep previous settings on transient failures
       }
     }
 
@@ -666,6 +689,9 @@ export default function ChatPage() {
           setVoiceErrorMessage(null)
         }
       },
+      onRecordingChange: (recording) => {
+        setVoiceRecording(recording)
+      },
       onPartialTranscription: (text) => {
         setVoicePartialTranscription(text)
       },
@@ -679,14 +705,48 @@ export default function ChatPage() {
       onTurnDone: (result) => {
         appendVoiceMessages(result)
       },
+      onCaptureDiagnostics: (diagnostics) => {
+        setVoiceCaptureDiagnostics(diagnostics)
+        setVoiceInputLevel(diagnostics.inputLevel)
+      },
+      onVadState: (state) => {
+        setVoiceVadState(state)
+        if (state === 'speech_started') {
+          setVoiceCaptureWarning(null)
+        }
+      },
       onError: (message, code) => {
         setVoiceErrorMessage(code ? `${message} (${code})` : message)
-        setVoiceRecording(false)
+        setVoiceCaptureWarning(null)
       },
     })
     voiceClientRef.current = client
     return client
   }, [appendVoiceMessages])
+
+  React.useEffect(() => {
+    if (
+      !voiceRecording ||
+      voicePhase !== 'listening' ||
+      !voiceCaptureDiagnostics?.capturing ||
+      voiceCaptureDiagnostics.hasInputSignal
+    ) {
+      setVoiceCaptureWarning(null)
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setVoiceCaptureWarning(t('chat.voice.noInputDetected'))
+    }, 2500)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    t,
+    voiceCaptureDiagnostics?.capturing,
+    voiceCaptureDiagnostics?.hasInputSignal,
+    voicePhase,
+    voiceRecording,
+  ])
 
   const refreshVoiceRuntimeStatus = React.useCallback(async (): Promise<api.VoiceRuntimeStatus | null> => {
     setVoiceRuntimeLoading(true)
@@ -729,17 +789,21 @@ export default function ChatPage() {
   }, [])
 
   const loadModels = React.useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch('/v1/models', {
-      cache: 'no-store',
-      signal,
-    })
-    if (!response.ok) {
-      throw new Error(`GET /v1/models failed: ${response.status}`)
+    const [modelsResponse, localRuntimeResult] = await Promise.all([
+      fetch('/v1/models', {
+        cache: 'no-store',
+        signal,
+      }),
+      api.fetchActiveLocalModelRuntimeStatus().catch(() => null),
+    ])
+    if (!modelsResponse.ok) {
+      throw new Error(`GET /v1/models failed: ${modelsResponse.status}`)
     }
 
-    const payload = (await response.json()) as ModelsResponse
+    const payload = (await modelsResponse.json()) as ModelsResponse
     const nextOptions = deriveModelOptions(payload)
     const activeModel = resolveActiveModelId(payload, nextOptions)
+    const nextActiveModelInfo = isRecord(payload.active_model) ? payload.active_model : null
     const activeModelMetadata = isRecord(payload.active_model?.metadata) ? payload.active_model?.metadata : null
     const loaded =
       activeModelMetadata && typeof activeModelMetadata.loaded === 'boolean'
@@ -749,6 +813,8 @@ export default function ChatPage() {
     setModelOptions(nextOptions)
     setCurrentModel(activeModel)
     setCurrentModelLoaded(loaded)
+    setActiveModelInfo(nextActiveModelInfo)
+    setActiveLocalRuntimeStatus(localRuntimeResult)
   }, [])
 
   React.useEffect(() => {
@@ -808,11 +874,12 @@ export default function ChatPage() {
         throw new Error(`POST /v1/models/switch failed: ${response.status}`)
       }
 
-      await response.json()
+      const nextModelPayload = (await response.json().catch(() => null)) as Record<string, unknown> | null
       const nextSettings = await api.fetchSettings()
       const nextModel = modelId
 
       setCurrentModel(nextModel)
+      setActiveModelInfo(isRecord(nextModelPayload?.active_model) ? nextModelPayload?.active_model : null)
       setSettings(nextSettings)
       setModelOptions((prev) => {
         if (prev.some((option) => option.id === nextModel)) {
@@ -836,11 +903,29 @@ export default function ChatPage() {
     }
   }, [t])
 
+  const handleUnloadCurrentModel = React.useCallback(async () => {
+    setIsUnloadingCurrentModel(true)
+    setModelSwitchError(null)
+    try {
+      const result = await api.unloadActiveLocalModelRuntime()
+      setActiveLocalRuntimeStatus(result.activeRuntime)
+      setCurrentModelLoaded(result.activeRuntime.loaded)
+      window.dispatchEvent(new Event(MODELS_UPDATED_EVENT))
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Failed to unload current local model.'
+      setModelSwitchError(`Failed to unload current local model: ${detail}`)
+    } finally {
+      setIsUnloadingCurrentModel(false)
+    }
+  }, [])
+
   const handleSend = React.useCallback(
     async (
       text: string,
       options?: {
         forceSessionId?: string
+        selectedSkillIds?: string[]
+        attachments?: ChatAttachment[]
       }
     ) => {
       if (isStreaming) {
@@ -848,6 +933,8 @@ export default function ChatPage() {
       }
 
       const targetSessionId = options?.forceSessionId ?? currentSessionId
+      const selectedSkillIds = options?.selectedSkillIds ?? []
+      const attachments = options?.attachments ?? []
       const initialSessionId = targetSessionId ?? createDraftSession(activeProjectId)
       const targetSession = sessions.find((session) => session.id === initialSessionId)
       const sessionId = (
@@ -860,8 +947,14 @@ export default function ChatPage() {
         id: `user-${Date.now()}`,
         type: 'user',
         content: text,
+        attachments,
         timestamp: new Date(),
       }
+      const lastMessageSummary =
+        text.trim() ||
+        (attachments.length > 0
+          ? attachments.slice(0, 2).map((attachment) => attachment.name).join(', ')
+          : '')
 
       const placeholderContent = isLocalModelId(currentModel) && currentModelLoaded === false
         ? t('chat.loadingLocalModel')
@@ -873,7 +966,7 @@ export default function ChatPage() {
         buildTurnPlaceholder(turnKey, { content: placeholderContent }),
       ])
       setIsStreaming(true)
-      updateLastMessage(sessionId, text)
+      updateLastMessage(sessionId, lastMessageSummary)
       const abortController = new AbortController()
       activeAbortControllerRef.current = abortController
 
@@ -886,6 +979,8 @@ export default function ChatPage() {
             projectId:
               sessions.find((session) => session.id === sessionId)?.projectId ?? activeProjectId ?? null,
             model: currentModel ?? undefined,
+            selectedSkillIds,
+            attachments,
             systemPrompt: effectiveInference.systemPrompt,
             temperature: effectiveInference.temperature,
             maxTokens: effectiveInference.maxTokens,
@@ -895,6 +990,7 @@ export default function ChatPage() {
             frequencyPenalty: effectiveInference.frequencyPenalty,
             presencePenalty: effectiveInference.presencePenalty,
             repeatPenalty: effectiveInference.repeatPenalty,
+            reasoningEffort: effectiveInference.reasoningEffort,
             signal: abortController.signal,
             onSessionId: (nextSessionId) => {
               if (nextSessionId && nextSessionId !== targetSessionId) {
@@ -925,6 +1021,8 @@ export default function ChatPage() {
             sessionId,
             sessions.find((session) => session.id === sessionId)?.projectId ?? activeProjectId ?? null,
             currentModel,
+            selectedSkillIds,
+            attachments,
             effectiveInference
           )
           const eventMessages = response.events?.length
@@ -992,6 +1090,7 @@ export default function ChatPage() {
       activeProjectId,
       createDraftSession,
       currentModel,
+      currentModelLoaded,
       currentSessionId,
       effectiveInference,
       isStreaming,
@@ -1002,6 +1101,10 @@ export default function ChatPage() {
       updateLastMessage,
     ]
   )
+
+  const handleSearchSkills = React.useCallback(async (query: string) => {
+    return api.fetchSkills({ q: query, limit: 20 })
+  }, [])
 
   const headerModelLabel =
     modelOptions.find((option) => option.id === currentModel)?.label ??
@@ -1043,8 +1146,25 @@ export default function ChatPage() {
     setVoicePartialTranscription('')
     setVoiceFinalTranscription('')
     setVoiceAssistantText('')
+    setVoiceInputLevel(0)
+    setVoiceVadState(null)
+    setVoiceCaptureDiagnostics(null)
+    setVoiceCaptureWarning(null)
     setVoiceErrorMessage(null)
     try {
+      setVoicePhase('connecting')
+      const preparedStatus = await api.prepareVoiceRuntime(sessionId)
+      setVoiceRuntimeStatus(preparedStatus)
+      const preparedPhase = resolveVoicePhaseFromRuntime(preparedStatus)
+      if (preparedPhase) {
+        setVoicePhase(preparedPhase)
+      }
+      if (preparedStatus.error) {
+        setVoiceErrorMessage(preparedStatus.error)
+        setVoicePhase('error')
+        setVoiceRecording(false)
+        return
+      }
       await client.startRecording()
       setVoiceRecording(true)
     } catch (error) {
@@ -1063,6 +1183,9 @@ export default function ChatPage() {
     client.interrupt()
     setVoiceRecording(false)
     setVoicePartialTranscription('')
+    setVoiceInputLevel(0)
+    setVoiceVadState(null)
+    setVoiceCaptureWarning(null)
   }, [])
 
   const handleVoiceClose = React.useCallback(() => {
@@ -1080,6 +1203,10 @@ export default function ChatPage() {
     setVoicePartialTranscription('')
     setVoiceFinalTranscription('')
     setVoiceAssistantText('')
+    setVoiceInputLevel(0)
+    setVoiceVadState(null)
+    setVoiceCaptureDiagnostics(null)
+    setVoiceCaptureWarning(null)
     setVoiceErrorMessage(null)
   }, [])
 
@@ -1154,7 +1281,7 @@ export default function ChatPage() {
 
   const handleEditAndResend = React.useCallback(async (message: Message, nextContent: string) => {
     if (!currentSessionId || !message.turnId) {
-      await handleSend(nextContent)
+      await handleSend(nextContent, { attachments: message.attachments ?? [] })
       return
     }
 
@@ -1164,7 +1291,10 @@ export default function ChatPage() {
       message.turnId,
       currentSession?.projectId
     )
-    await handleSend(nextContent, { forceSessionId: forkedSessionId })
+    await handleSend(nextContent, {
+      forceSessionId: forkedSessionId,
+      attachments: message.attachments ?? [],
+    })
   }, [currentSessionId, forkSessionFromTurn, handleSend, sessions])
 
   const handleStarterPrompt = React.useCallback((prompt: string) => {
@@ -1200,6 +1330,7 @@ export default function ChatPage() {
       frequencyPenalty: preset.frequency_penalty,
       presencePenalty: preset.presence_penalty,
       repeatPenalty: preset.repeat_penalty,
+      reasoningEffort: preset.reasoning_effort ?? null,
     })
   }, [activeAgentSettings, currentSessionId, replaceSessionOverride, selectedPresetName])
 
@@ -1235,6 +1366,7 @@ export default function ChatPage() {
             frequency_penalty: effectiveInference.frequencyPenalty,
             presence_penalty: effectiveInference.presencePenalty,
             repeat_penalty: effectiveInference.repeatPenalty,
+            reasoning_effort: effectiveInference.reasoningEffort,
           }
         : preset
     )
@@ -1254,6 +1386,7 @@ export default function ChatPage() {
             frequency_penalty: preset.frequency_penalty,
             presence_penalty: preset.presence_penalty,
             repeat_penalty: preset.repeat_penalty,
+            reasoning_effort: preset.reasoning_effort ?? null,
           })),
           active_preset: activeAgentSettings.active_preset,
         },
@@ -1285,6 +1418,16 @@ export default function ChatPage() {
             </div>
             <Button
               variant="ghost"
+              size="sm"
+              title={t('sidebar.workflows')}
+              onClick={() => router.push('/agent-runs')}
+              className="max-sm:w-8 max-sm:px-0"
+            >
+              <Workflow className="h-4 w-4" />
+              <span className="hidden sm:inline">{t('sidebar.workflows')}</span>
+            </Button>
+            <Button
+              variant="ghost"
               size="icon-sm"
               title={t('chat.moreOptions')}
               onClick={() => setExportOpen(true)}
@@ -1292,18 +1435,32 @@ export default function ChatPage() {
               <MoreHorizontal className="h-4 w-4" />
             </Button>
             <Button
-              variant="ghost"
+              variant={panelOpen || mobileInferenceOpen ? 'secondary' : 'ghost'}
               size="icon-sm"
               title="Inference"
               onClick={() => {
+                setTaskPanelOpen(false)
                 if (window.innerWidth < 768) {
                   setMobileInferenceOpen(true)
                 } else {
+                  setMobileInferenceOpen(false)
                   setPanelOpen(!panelOpen)
                 }
               }}
             >
               <SlidersHorizontal className="h-4 w-4" />
+            </Button>
+            <Button
+              variant={taskPanelOpen ? 'secondary' : 'ghost'}
+              size="icon-sm"
+              title="Tasks"
+              onClick={() => {
+                setMobileInferenceOpen(false)
+                setPanelOpen(false)
+                setTaskPanelOpen((open) => !open)
+              }}
+            >
+              <ListTodo className="h-4 w-4" />
             </Button>
             <Button
               variant="ghost"
@@ -1318,36 +1475,37 @@ export default function ChatPage() {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <div className="relative flex-1">
+        <div className="flex-1">
           <ScrollToBottom visible={showScrollToBottom} onClick={scrollToBottom} />
           <div ref={scrollRef} className="h-full overflow-y-auto">
-          <div className="mx-auto flex w-full max-w-4xl flex-col px-4 py-8 sm:px-6">
-            {showEmptyState ? (
-              <EmptyState
-                onPrompt={handleStarterPrompt}
-                onVoice={() => void handleVoiceEntry()}
-                onSettings={() => router.push('/settings')}
-              />
-            ) : (
-              <div className="space-y-6">
-                {messages.map((message) => (
-                  <ChatMessage
-                    key={message.id}
-                    message={
-                      message.type === 'assistant' && !effectiveInference.showTokenStats
-                        ? { ...message, tokenStats: undefined }
-                        : message
-                    }
-                    onRegenerate={message.type === 'assistant' ? handleRegenerate : undefined}
-                    onEditAndResend={message.type === 'user' ? handleEditAndResend : undefined}
-                    onUndoFileChange={handleUndoFileChange}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+            <div className="mx-auto flex w-full max-w-4xl flex-col px-4 py-8 sm:px-6">
+              {showEmptyState ? (
+                <EmptyState
+                  onPrompt={handleStarterPrompt}
+                  onVoice={() => void handleVoiceEntry()}
+                  onSettings={() => router.push('/settings')}
+                />
+              ) : (
+                <div className="space-y-6">
+                  {messages.map((message) => (
+                    <ChatMessage
+                      key={message.id}
+                      message={
+                        message.type === 'assistant' && !effectiveInference.showTokenStats
+                          ? { ...message, tokenStats: undefined }
+                          : message
+                      }
+                      onRegenerate={message.type === 'assistant' ? handleRegenerate : undefined}
+                      onEditAndResend={message.type === 'user' ? handleEditAndResend : undefined}
+                      onUndoFileChange={handleUndoFileChange}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
+        <TaskPanel open={taskPanelOpen} onOpenChange={setTaskPanelOpen} />
         <InferencePanel
           open={panelOpen}
           mobileOpen={mobileInferenceOpen}
@@ -1360,14 +1518,17 @@ export default function ChatPage() {
           value={effectiveInference}
           onChange={handleSessionInferenceChange}
           onApplyPreset={handleApplyPresetToSession}
-          onReset={handleResetSessionInference}
+        onReset={handleResetSessionInference}
           onSavePreset={handleSaveInferencePreset}
           isSavingPreset={savingPreset}
+          supportsReasoningEffort={supportsReasoningEffort}
+          showReasoningEffort={false}
+          disabledKeys={disabledInferenceKeys}
+          disabledReason={disabledReason}
           agent={activeAgentSettings}
           settings={settings}
           onSettingsUpdated={setSettings}
         />
-        <TaskPanel />
       </div>
 
       {modelSwitchError ? (
@@ -1382,6 +1543,9 @@ export default function ChatPage() {
       ) : null}
 
       <ChatInput
+        sessionId={currentSessionId}
+        projectId={effectiveProjectId}
+        uploadTargetDir={uploadTargetDir}
         onSend={handleSend}
         onStop={handleStopGeneration}
         onVoice={handleVoiceEntry}
@@ -1390,8 +1554,14 @@ export default function ChatPage() {
         disabled={false}
         models={modelOptions}
         currentModel={currentModel}
-        skills={skills}
+        inference={effectiveInference}
+        onSearchSkills={handleSearchSkills}
         onSwitchModel={handleSwitchModel}
+        activeLocalRuntimeStatus={activeLocalRuntimeStatus}
+        onUnloadCurrentModel={handleUnloadCurrentModel}
+        isUnloadingCurrentModel={isUnloadingCurrentModel}
+        reasoningOptions={supportedReasoningEfforts}
+        onReasoningEffortChange={(value) => handleSessionInferenceChange('reasoningEffort', value)}
       />
 
       <ExportDialog
@@ -1402,11 +1572,16 @@ export default function ChatPage() {
 
       <VoiceOverlay
         open={voiceOpen}
-        phase={resolveVoicePhaseFromRuntime(voiceRuntimeStatus) ?? voicePhase}
+        phase={resolveVoiceOverlayPhase(voicePhase, voiceRuntimeStatus)}
         isRecording={voiceRecording}
+        inputLevel={voiceInputLevel}
+        hasInputSignal={voiceCaptureDiagnostics?.hasInputSignal ?? false}
+        microphoneLabel={voiceCaptureDiagnostics?.microphoneLabel ?? null}
+        vadState={voiceVadState}
         partialTranscription={voicePartialTranscription}
         finalTranscription={voiceFinalTranscription}
         assistantText={voiceAssistantText}
+        captureWarning={voiceCaptureWarning}
         errorMessage={voiceErrorMessage ?? voiceRuntimeStatus?.error ?? null}
         onToggleRecording={handleVoiceToggleRecording}
         onInterrupt={handleVoiceInterrupt}

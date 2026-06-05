@@ -1,5 +1,10 @@
 'use client'
 
+import {
+  calculateVoiceInputLevel,
+  hasVoiceInputSignal,
+} from './voice-capture'
+
 const DEFAULT_INPUT_SAMPLE_RATE_HZ = 16_000
 const DEFAULT_OUTPUT_PCM_SAMPLE_RATE_HZ = 24_000
 const PROCESSOR_BUFFER_SIZE = 4096
@@ -15,6 +20,7 @@ export type VoiceRuntimePhase =
   | 'error'
 
 export type VoiceStage = 'transcribing' | 'thinking' | 'synthesizing'
+export type VoiceVadState = 'speech_started' | 'speech_ended'
 
 export interface VoiceTurnResult {
   turnId: number | null
@@ -22,12 +28,25 @@ export interface VoiceTurnResult {
   assistantText: string
 }
 
+export interface VoiceCaptureDiagnostics {
+  capturing: boolean
+  microphoneLabel: string | null
+  channelCount: number | null
+  sampleRateHz: number | null
+  chunksSent: number
+  inputLevel: number
+  hasInputSignal: boolean
+}
+
 export interface VoiceWsCallbacks {
   onPhaseChange?: (phase: VoiceRuntimePhase) => void
+  onRecordingChange?: (recording: boolean) => void
   onPartialTranscription?: (text: string) => void
   onFinalTranscription?: (text: string) => void
   onAssistantText?: (text: string) => void
   onTurnDone?: (result: VoiceTurnResult) => void
+  onCaptureDiagnostics?: (diagnostics: VoiceCaptureDiagnostics) => void
+  onVadState?: (state: VoiceVadState) => void
   onError?: (message: string, code?: string) => void
 }
 
@@ -62,6 +81,10 @@ interface VoiceAudioChunkMessage extends VoiceServerMessageBase {
   data?: unknown
 }
 
+interface VoiceVadStateMessage extends VoiceServerMessageBase {
+  state?: unknown
+}
+
 interface VoiceErrorMessage extends VoiceServerMessageBase {
   code?: unknown
   message?: unknown
@@ -84,9 +107,12 @@ export class VoiceWsClient {
   private audioContext: AudioContext | null = null
   private sourceNode: MediaStreamAudioSourceNode | null = null
   private processorNode: ScriptProcessorNode | null = null
+  private silenceNode: GainNode | null = null
   private isRecording = false
+  private turnPending = false
   private phase: VoiceRuntimePhase = 'idle'
   private pendingPlay = Promise.resolve()
+  private captureDiagnostics = createEmptyCaptureDiagnostics()
 
   constructor(options: VoiceWsClientOptions) {
     this.options = options
@@ -143,6 +169,10 @@ export class VoiceWsClient {
     }
     await this.connect()
 
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('This browser does not support microphone capture.')
+    }
+
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -164,12 +194,35 @@ export class VoiceWsClient {
     // Browser compatibility fallback: AudioWorklet is preferred, but not yet wired in this repo.
     const processorNode = audioContext.createScriptProcessor(PROCESSOR_BUFFER_SIZE, 1, 1)
     this.processorNode = processorNode
+    const silenceNode = audioContext.createGain()
+    silenceNode.gain.value = 0
+    this.silenceNode = silenceNode
+
+    const track = stream.getAudioTracks()[0] ?? null
+    const settings = track?.getSettings?.() ?? {}
+    this.captureDiagnostics = {
+      capturing: true,
+      microphoneLabel: track?.label?.trim() || null,
+      channelCount:
+        typeof settings.channelCount === 'number' ? settings.channelCount : 1,
+      sampleRateHz:
+        typeof settings.sampleRate === 'number'
+          ? settings.sampleRate
+          : audioContext.sampleRate,
+      chunksSent: 0,
+      inputLevel: 0,
+      hasInputSignal: false,
+    }
+    this.publishCaptureDiagnostics()
+    this.turnPending = false
 
     processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
       if (!this.isRecording) {
         return
       }
       const input = event.inputBuffer.getChannelData(0)
+      const inputLevel = calculateVoiceInputLevel(input)
+      const hasSignal = hasVoiceInputSignal(inputLevel)
       const pcm16 = resampleFloat32ToPcm16(
         input,
         audioContext.sampleRate,
@@ -178,6 +231,27 @@ export class VoiceWsClient {
       if (pcm16.length === 0) {
         return
       }
+      const nextChunksSent = this.captureDiagnostics.chunksSent + 1
+      const nextHasInputSignal =
+        this.captureDiagnostics.hasInputSignal || hasSignal
+      const levelChangedEnough =
+        Math.abs(inputLevel - this.captureDiagnostics.inputLevel) >= 0.05
+      const signalStateChanged = nextHasInputSignal !== this.captureDiagnostics.hasInputSignal
+
+      this.captureDiagnostics = {
+        ...this.captureDiagnostics,
+        chunksSent: nextChunksSent,
+        inputLevel,
+        hasInputSignal: nextHasInputSignal,
+      }
+      if (signalStateChanged || levelChangedEnough || nextChunksSent % 4 === 0) {
+        this.publishCaptureDiagnostics()
+      }
+
+      if (this.turnPending) {
+        return
+      }
+
       this.sendJson({
         type: 'audio_chunk',
         data: int16ToBase64(pcm16),
@@ -185,9 +259,11 @@ export class VoiceWsClient {
     }
 
     sourceNode.connect(processorNode)
-    processorNode.connect(audioContext.destination)
+    processorNode.connect(silenceNode)
+    silenceNode.connect(audioContext.destination)
 
     this.isRecording = true
+    this.options.onRecordingChange?.(true)
     this.setPhase('listening')
   }
 
@@ -196,20 +272,35 @@ export class VoiceWsClient {
       return
     }
     this.isRecording = false
+    this.options.onRecordingChange?.(false)
     this.stopAudioCapture()
-    this.sendJson({ type: 'vad_end' })
-    this.setPhase('transcribing')
+    if (!this.turnPending) {
+      this.turnPending = true
+      this.sendJson({ type: 'vad_end' })
+      this.setPhase('transcribing')
+      return
+    }
+    if (this.phase === 'listening') {
+      this.setPhase('ready')
+    }
   }
 
   interrupt(): void {
     this.isRecording = false
+    this.turnPending = false
+    this.options.onRecordingChange?.(false)
     this.stopAudioCapture()
     this.sendJson({ type: 'interrupt' })
     this.setPhase('ready')
   }
 
   async disconnect(): Promise<void> {
+    const wasRecording = this.isRecording
     this.isRecording = false
+    this.turnPending = false
+    if (wasRecording) {
+      this.options.onRecordingChange?.(false)
+    }
     this.stopAudioCapture()
 
     if (this.ws) {
@@ -239,7 +330,7 @@ export class VoiceWsClient {
     }
 
     ws.onerror = () => {
-      this.raiseError('Voice websocket error.')
+      this.failRecording('Voice websocket error.')
     }
 
     ws.onclose = () => {
@@ -276,6 +367,7 @@ export class VoiceWsClient {
       const msg = payload as unknown as VoiceStageMessage
       const stage = typeof msg.stage === 'string' ? msg.stage : ''
       if (stage === 'transcribing' || stage === 'thinking' || stage === 'synthesizing') {
+        this.turnPending = true
         this.setPhase(stage)
       }
       return
@@ -299,6 +391,15 @@ export class VoiceWsClient {
       return
     }
 
+    if (msgType === 'vad_state') {
+      const msg = payload as unknown as VoiceVadStateMessage
+      const state = typeof msg.state === 'string' ? msg.state : ''
+      if (state === 'speech_started' || state === 'speech_ended') {
+        this.options.onVadState?.(state)
+      }
+      return
+    }
+
     if (msgType === 'done') {
       const msg = payload as unknown as VoiceServerMessageBase
       void this.handleTurnDone(this.extractTurnId(msg))
@@ -306,18 +407,28 @@ export class VoiceWsClient {
     }
 
     if (msgType === 'interrupted') {
+      this.turnPending = false
       this.turns.clear()
       this.turnOrder.length = 0
-      this.setPhase('ready')
+      this.setPhase(this.isRecording ? 'listening' : 'ready')
       return
     }
 
     if (msgType === 'error') {
       const msg = payload as unknown as VoiceErrorMessage
-      this.raiseError(
-        typeof msg.message === 'string' ? msg.message : 'Voice request failed.',
-        typeof msg.code === 'string' ? msg.code : undefined,
-      )
+      const message =
+        typeof msg.message === 'string' ? msg.message : 'Voice request failed.'
+      const code =
+        typeof msg.code === 'string' ? msg.code : undefined
+      this.turns.clear()
+      this.turnOrder.length = 0
+      this.turnPending = false
+      if (this.isRecording) {
+        this.setPhase('listening')
+        this.options.onError?.(message, code)
+        return
+      }
+      this.raiseError(message, code)
       return
     }
   }
@@ -325,7 +436,8 @@ export class VoiceWsClient {
   private async handleTurnDone(turnId: number | null): Promise<void> {
     const turn = this.turns.get(turnId)
     if (!turn) {
-      this.setPhase('ready')
+      this.turnPending = false
+      this.setPhase(this.isRecording ? 'listening' : 'ready')
       return
     }
 
@@ -342,10 +454,9 @@ export class VoiceWsClient {
     })
     this.turns.delete(turnId)
     this.turnOrder.splice(this.turnOrder.indexOf(turnId), 1)
+    this.turnPending = false
 
-    if (!this.isRecording) {
-      this.setPhase('ready')
-    }
+    this.setPhase(this.isRecording ? 'listening' : 'ready')
   }
 
   private async playAudio(audioBytes: Uint8Array): Promise<void> {
@@ -376,6 +487,10 @@ export class VoiceWsClient {
       this.processorNode.disconnect()
       this.processorNode = null
     }
+    if (this.silenceNode) {
+      this.silenceNode.disconnect()
+      this.silenceNode = null
+    }
     if (this.sourceNode) {
       this.sourceNode.disconnect()
       this.sourceNode = null
@@ -385,6 +500,14 @@ export class VoiceWsClient {
         track.stop()
       }
       this.stream = null
+    }
+    if (this.captureDiagnostics.capturing || this.captureDiagnostics.inputLevel !== 0) {
+      this.captureDiagnostics = {
+        ...this.captureDiagnostics,
+        capturing: false,
+        inputLevel: 0,
+      }
+      this.publishCaptureDiagnostics()
     }
   }
 
@@ -432,8 +555,27 @@ export class VoiceWsClient {
   }
 
   private raiseError(message: string, code?: string): void {
+    this.turnPending = false
     this.setPhase('error')
     this.options.onError?.(message, code)
+  }
+
+  private failRecording(message: string, code?: string): void {
+    const wasRecording = this.isRecording
+    this.isRecording = false
+    this.turnPending = false
+    this.turns.clear()
+    this.turnOrder.length = 0
+    if (wasRecording) {
+      this.options.onRecordingChange?.(false)
+    }
+    this.stopAudioCapture()
+    this.setPhase('error')
+    this.options.onError?.(message, code)
+  }
+
+  private publishCaptureDiagnostics(): void {
+    this.options.onCaptureDiagnostics?.({ ...this.captureDiagnostics })
   }
 
   private buildSocketUrl(): string {
@@ -594,4 +736,16 @@ function waitForAudioSourceEnded(source: AudioBufferSourceNode): Promise<void> {
   return new Promise((resolve) => {
     source.onended = () => resolve()
   })
+}
+
+function createEmptyCaptureDiagnostics(): VoiceCaptureDiagnostics {
+  return {
+    capturing: false,
+    microphoneLabel: null,
+    channelCount: null,
+    sampleRateHz: null,
+    chunksSent: 0,
+    inputLevel: 0,
+    hasInputSignal: false,
+  }
 }

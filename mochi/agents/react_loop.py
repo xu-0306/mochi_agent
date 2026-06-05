@@ -81,6 +81,7 @@ class AsyncReActLoop:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """執行完整 ReAct 迴圈，以非同步生成器形式產出事件流。
 
@@ -117,6 +118,7 @@ class AsyncReActLoop:
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repeat_penalty=repeat_penalty,
+            reasoning_effort=reasoning_effort,
         ):
             yield event
 
@@ -148,6 +150,7 @@ class AsyncReActLoop:
         frequency_penalty: float,
         presence_penalty: float,
         repeat_penalty: float,
+        reasoning_effort: str | None,
     ) -> AsyncIterator[AgentEvent]:
         """非串流模式 ReAct 迴圈（Phase 1 主要執行路徑）。
 
@@ -172,19 +175,22 @@ class AsyncReActLoop:
 
                 started_at = time.perf_counter()
                 try:
-                    result = await self._backend.generate(
-                        messages=messages,
-                        tools=tools if tools else None,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        top_p=top_p,
-                        min_p=min_p,
-                        top_k=top_k,
-                        frequency_penalty=frequency_penalty,
-                        presence_penalty=presence_penalty,
-                        repeat_penalty=repeat_penalty,
-                        stream=False,
-                    )
+                    generate_kwargs = {
+                        "messages": messages,
+                        "tools": tools if tools else None,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "top_p": top_p,
+                        "min_p": min_p,
+                        "top_k": top_k,
+                        "frequency_penalty": frequency_penalty,
+                        "presence_penalty": presence_penalty,
+                        "repeat_penalty": repeat_penalty,
+                        "stream": False,
+                    }
+                    if reasoning_effort is not None:
+                        generate_kwargs["reasoning_effort"] = reasoning_effort
+                    result = await self._backend.generate(**generate_kwargs)
                 except Exception as exc:
                     logger.exception(f"ReAct loop backend error: {exc}")
                     yield ErrorEvent(
@@ -235,7 +241,11 @@ class AsyncReActLoop:
                                 )
                                 tool_output = tr.output
                                 tool_error = tr.error
-                                tool_metadata = tr.metadata
+                                tool_metadata = (
+                                    dict(tr.metadata)
+                                    if isinstance(tr.metadata, dict)
+                                    else {}
+                                )
                                 tool_result_payload = tr
                                 formatted_content = self._tool_registry.format_result_for_model(
                                     tc.name,

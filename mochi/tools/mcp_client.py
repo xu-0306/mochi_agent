@@ -64,6 +64,14 @@ class McpRuntimeManager:
     def get_server(self, name: str) -> McpServerConfig | None:
         return self._servers.get(name)
 
+    def list_server_names(self, *, enabled_only: bool = True) -> list[str]:
+        names: list[str] = []
+        for name, server in self._servers.items():
+            if enabled_only and not server.enabled:
+                continue
+            names.append(name)
+        return names
+
     async def refresh_server(self, name: str) -> None:
         adapter = self._require_adapter(name)
         self._tool_cache[name] = await self._list_tools_from_adapter(adapter)

@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -66,11 +66,14 @@ logs/
 *.pth
 
 # Agent / local workspace state
+.mochi/
 .agents/
 .claude/
 .codex/
 .codex
 .gemini/
+.superpowers/
+.tmp/
 mochi/config.yaml
 mochi/workspace/
 mochi/sessions/
@@ -80,6 +83,7 @@ mochi/memory/
 
 # Local scratch files
 1.txt
+PLAN.md
 _YesCode.bat
 _YesCode - C.bat
 交接.md
@@ -91,6 +95,7 @@ CLAUDE.md
 Mochi_Spec.md
 Makefile
 documents/
+implementation_plan.md
 scripts/
 tests/
 web/README.md
@@ -98,4 +103,5 @@ web/next-env.d.ts
 web/tsconfig.tsbuildinfo
 
 # Reference snapshots (large, not required for runtime)
+legacy/
 reference/

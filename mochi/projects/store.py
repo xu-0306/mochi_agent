@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TypedDict
 from uuid import uuid4
 
+from mochi.config import defaults
 from mochi.utils.security import normalize_workspace_dir
 
 
@@ -25,7 +26,7 @@ class ProjectRecord(TypedDict):
 class ProjectStore:
     """JSON-backed project persistence."""
 
-    def __init__(self, path: str | Path = "~/.mochi/projects.json") -> None:
+    def __init__(self, path: str | Path = Path(defaults.default_workspace_dir()) / "projects.json") -> None:
         self._path = Path(path).expanduser()
 
     async def list_projects(self) -> list[ProjectRecord]:

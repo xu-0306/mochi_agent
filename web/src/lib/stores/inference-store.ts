@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { AgentSettings, InferencePreset } from '@/lib/api'
+import type { AgentSettings, InferencePreset, ReasoningEffort } from '@/lib/api'
 
 export interface InferenceParams {
   systemPrompt: string
@@ -14,6 +14,7 @@ export interface InferenceParams {
   frequencyPenalty: number
   presencePenalty: number
   repeatPenalty: number
+  reasoningEffort: ReasoningEffort | null
   showTokenStats: boolean
 }
 
@@ -43,6 +44,7 @@ export function inferencePresetToParams(preset: InferencePreset): InferenceParam
     frequencyPenalty: preset.frequency_penalty,
     presencePenalty: preset.presence_penalty,
     repeatPenalty: preset.repeat_penalty,
+    reasoningEffort: preset.reasoning_effort ?? null,
     showTokenStats: false,
   }
 }
@@ -58,6 +60,7 @@ export function agentSettingsToParams(agent?: AgentSettings): InferenceParams {
     frequencyPenalty: agent?.frequency_penalty ?? 0.0,
     presencePenalty: agent?.presence_penalty ?? 0.0,
     repeatPenalty: agent?.repeat_penalty ?? 1.0,
+    reasoningEffort: agent?.reasoning_effort ?? null,
     showTokenStats: agent?.show_token_stats ?? false,
   }
 }
@@ -76,10 +79,13 @@ export function resolveEffectiveInferenceParams(
   const activePreset = getActivePreset(agent)
   const presetParams = activePreset ? inferencePresetToParams(activePreset) : agentSettingsToParams(agent)
   const agentParams = agentSettingsToParams(agent)
+  const presetSystemPrompt = activePreset?.system_prompt || undefined
 
   return {
     ...agentParams,
     ...presetParams,
+    systemPrompt: presetSystemPrompt ?? agentParams.systemPrompt,
+    showTokenStats: agentParams.showTokenStats,
     ...sessionOverride,
   }
 }

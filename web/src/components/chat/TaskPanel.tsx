@@ -1,9 +1,19 @@
 'use client'
 
 import * as React from 'react'
-import { Badge } from '@/components/ui/badge'
+import { PanelRightClose } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
+import type { ApprovalSummary, TaskDetail, TaskSummary } from '@/lib/api'
 import { useTaskStore } from '@/lib/stores/task-store'
+import { cn } from '@/lib/utils'
 
 function statusVariant(status: string): 'neutral' | 'warning' | 'success' | 'error' | 'outline' {
   const normalized = status.toLowerCase()
@@ -38,82 +48,150 @@ function previewText(value: string, max = 80): string {
   return `${trimmed.slice(0, max)}...`
 }
 
-export function TaskPanel() {
-  const {
-    tasks,
-    approvals,
-    selectedTaskId,
-    selectedTaskDetail,
-    isLoading,
-    isLoadingDetail,
-    isResolvingApprovalId,
-    isMutatingTaskId,
-    error,
-    load,
-    selectTask,
-    approve,
-    reject,
-    resume,
-    cancel,
-  } = useTaskStore()
+function formatMetadataLabel(value: string): string {
+  return value
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
 
-  React.useEffect(() => {
-    void load()
-    const timer = window.setInterval(() => {
-      void load()
-    }, 8000)
-    return () => window.clearInterval(timer)
-  }, [load])
+interface TaskPanelProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}
+
+function TaskPanelBody({
+  isLoading,
+  approvals,
+  tasks,
+  selectedTaskId,
+  selectedTaskDetail,
+  isLoadingDetail,
+  isResolvingApprovalId,
+  isMutatingTaskId,
+  error,
+  load,
+  selectTask,
+  approve,
+  reject,
+  resume,
+  cancel,
+  onClose,
+}: {
+  isLoading: boolean
+  approvals: ApprovalSummary[]
+  tasks: TaskSummary[]
+  selectedTaskId: string | null
+  selectedTaskDetail: TaskDetail | null
+  isLoadingDetail: boolean
+  isResolvingApprovalId: string | null
+  isMutatingTaskId: string | null
+  error: string | null
+  load: () => Promise<void>
+  selectTask: (taskId: string) => Promise<void>
+  approve: (approvalId: string) => Promise<void>
+  reject: (approvalId: string) => Promise<void>
+  resume: (taskId: string) => Promise<void>
+  cancel: (taskId: string) => Promise<void>
+  onClose?: () => void
+}) {
+  const pendingApprovals = approvals.filter((item) => item.status === 'pending')
 
   return (
-    <aside className="hidden w-80 border-l border-border bg-surface-layer lg:flex lg:h-full lg:flex-col">
+    <div className="flex h-full flex-col bg-surface-layer">
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <div>
           <h2 className="text-sm font-semibold text-foreground">Tasks</h2>
           <p className="text-xs text-muted-foreground">Background runs & approvals</p>
         </div>
-        <Button size="sm" variant="ghost" onClick={() => void load()} loading={isLoading}>
-          Refresh
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button size="sm" variant="ghost" onClick={() => void load()} loading={isLoading}>
+            Refresh
+          </Button>
+          {onClose ? (
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              onClick={onClose}
+              title="Hide tasks"
+              aria-label="Hide tasks"
+              className="hidden lg:inline-flex"
+            >
+              <PanelRightClose className="h-4 w-4" />
+            </Button>
+          ) : null}
+        </div>
       </div>
 
       <div className="border-b border-border px-4 py-3">
         <p className="mb-2 text-xs font-medium text-muted-foreground">Pending approvals</p>
         <div className="max-h-44 space-y-2 overflow-y-auto">
-          {approvals.filter((item) => item.status === 'pending').length === 0 ? (
+          {pendingApprovals.length === 0 ? (
             <p className="text-xs text-muted-foreground">No pending approvals.</p>
           ) : (
-            approvals
-              .filter((item) => item.status === 'pending')
-              .map((approval) => (
-                <div key={approval.approval_id} className="rounded-md border border-border bg-canvas px-2.5 py-2">
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <span className="truncate text-xs font-medium text-foreground">{approval.tool_name}</span>
-                    <Badge variant={statusVariant(approval.status)}>{approval.status}</Badge>
-                  </div>
-                  <p className="mb-2 text-[11px] text-muted-foreground">Task: {approval.task_id}</p>
-                  <div className="flex gap-1.5">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      className="h-7 px-2 text-xs"
-                      loading={isResolvingApprovalId === approval.approval_id}
-                      onClick={() => void approve(approval.approval_id)}
-                    >
-                      Approve
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-7 px-2 text-xs"
-                      loading={isResolvingApprovalId === approval.approval_id}
-                      onClick={() => void reject(approval.approval_id)}
-                    >
-                      Reject
-                    </Button>
-                  </div>
+            pendingApprovals.map((approval) => (
+              <div key={approval.approval_id} className="rounded-md border border-border bg-canvas px-2.5 py-2">
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-medium text-foreground">{approval.tool_name}</span>
+                  <Badge variant={statusVariant(approval.status)}>{approval.status}</Badge>
                 </div>
-              ))
+                <p className="mb-2 text-[11px] text-muted-foreground">Task: {approval.task_id}</p>
+                <div className="mb-2 space-y-1 text-[11px] text-muted-foreground">
+                  <p>
+                    Decision: <span className="text-foreground">{approval.security_decision ? formatMetadataLabel(approval.security_decision) : '-'}</span>
+                  </p>
+                  <p>
+                    Kind: <span className="text-foreground">{formatMetadataLabel(approval.approval_kind)}</span>
+                  </p>
+                  <p>
+                    Scope: <span className="text-foreground">{formatMetadataLabel(approval.approval_scope)}</span>
+                  </p>
+                  <p>
+                    Requires approval: <span className="text-foreground">{approval.requires_approval ? 'Yes' : 'No'}</span>
+                  </p>
+                  <p>
+                    Replay safe: <span className="text-foreground">{approval.replay_safe ? 'Yes' : 'No'}</span>
+                  </p>
+                  {approval.policy_source ? (
+                    <p>
+                      Policy source: <span className="text-foreground">{formatMetadataLabel(approval.policy_source)}</span>
+                    </p>
+                  ) : null}
+                  {approval.reason ? (
+                    <p>
+                      User reason: <span className="text-foreground">{approval.reason}</span>
+                    </p>
+                  ) : null}
+                  {approval.policy_reason ? (
+                    <p>
+                      Policy reason: <span className="text-foreground">{approval.policy_reason}</span>
+                    </p>
+                  ) : null}
+                </div>
+                <div className="flex gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 px-2 text-xs"
+                    loading={isResolvingApprovalId === approval.approval_id}
+                    onClick={() => void approve(approval.approval_id)}
+                  >
+                    Approve
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    loading={isResolvingApprovalId === approval.approval_id}
+                    onClick={() => void reject(approval.approval_id)}
+                  >
+                    Reject
+                  </Button>
+                </div>
+              </div>
+            ))
           )}
         </div>
       </div>
@@ -130,12 +208,12 @@ export function TaskPanel() {
                   key={task.task_id}
                   type="button"
                   onClick={() => void selectTask(task.task_id)}
-                  className={[
+                  className={cn(
                     'w-full rounded-md border px-2.5 py-2 text-left',
                     selectedTaskId === task.task_id
                       ? 'border-primary/40 bg-primary/5'
-                      : 'border-border bg-canvas hover:bg-muted/40',
-                  ].join(' ')}
+                      : 'border-border bg-canvas hover:bg-muted/40'
+                  )}
                 >
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <span className="truncate text-xs font-medium text-foreground">{task.task_id}</span>
@@ -196,6 +274,114 @@ export function TaskPanel() {
           {error ? <p className="mt-2 text-xs text-destructive">{error}</p> : null}
         </div>
       </div>
-    </aside>
+    </div>
+  )
+}
+
+export function TaskPanel({ open, onOpenChange }: TaskPanelProps) {
+  const {
+    tasks,
+    approvals,
+    selectedTaskId,
+    selectedTaskDetail,
+    isLoading,
+    isLoadingDetail,
+    isResolvingApprovalId,
+    isMutatingTaskId,
+    error,
+    load,
+    selectTask,
+    approve,
+    reject,
+    resume,
+    cancel,
+  } = useTaskStore()
+  const [isDesktop, setIsDesktop] = React.useState(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return false
+    }
+    return window.matchMedia('(min-width: 1024px)').matches
+  })
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return
+    }
+    const mediaQuery = window.matchMedia('(min-width: 1024px)')
+    const syncDesktopState = () => {
+      setIsDesktop(mediaQuery.matches)
+    }
+    syncDesktopState()
+    mediaQuery.addEventListener('change', syncDesktopState)
+    return () => mediaQuery.removeEventListener('change', syncDesktopState)
+  }, [])
+
+  React.useEffect(() => {
+    void load()
+    const timer = window.setInterval(() => {
+      void load()
+    }, 8000)
+    return () => window.clearInterval(timer)
+  }, [load])
+
+  return (
+    <>
+      <aside
+        className={cn(
+          'hidden border-l border-border bg-surface-layer lg:flex lg:h-full lg:flex-col',
+          open ? 'lg:w-80' : 'lg:w-0 lg:overflow-hidden lg:border-l-0',
+          'transition-all duration-200'
+        )}
+      >
+        {open ? (
+          <TaskPanelBody
+            isLoading={isLoading}
+            approvals={approvals}
+            tasks={tasks}
+            selectedTaskId={selectedTaskId}
+            selectedTaskDetail={selectedTaskDetail}
+            isLoadingDetail={isLoadingDetail}
+            isResolvingApprovalId={isResolvingApprovalId}
+            isMutatingTaskId={isMutatingTaskId}
+            error={error}
+            load={load}
+            selectTask={selectTask}
+            approve={approve}
+            reject={reject}
+            resume={resume}
+            cancel={cancel}
+            onClose={() => onOpenChange(false)}
+          />
+        ) : null}
+      </aside>
+
+      {!isDesktop ? (
+        <Sheet open={open} onOpenChange={onOpenChange}>
+          <SheetContent side="right" className="w-full max-w-md p-0 lg:hidden">
+            <SheetHeader className="sr-only">
+              <SheetTitle>Tasks</SheetTitle>
+              <SheetDescription>Background runs and pending approvals.</SheetDescription>
+            </SheetHeader>
+            <TaskPanelBody
+              isLoading={isLoading}
+              approvals={approvals}
+              tasks={tasks}
+              selectedTaskId={selectedTaskId}
+              selectedTaskDetail={selectedTaskDetail}
+              isLoadingDetail={isLoadingDetail}
+              isResolvingApprovalId={isResolvingApprovalId}
+              isMutatingTaskId={isMutatingTaskId}
+              error={error}
+              load={load}
+              selectTask={selectTask}
+              approve={approve}
+              reject={reject}
+              resume={resume}
+              cancel={cancel}
+            />
+          </SheetContent>
+        </Sheet>
+      ) : null}
+    </>
   )
 }

@@ -44,6 +44,7 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     config = await _get_config(app)
     if existing is not None:
         existing.update_security_config(config.security)
+        await existing.start()
         return existing
 
     engine = await _get_or_create_engine(app)
@@ -52,5 +53,6 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     service = RuntimeService(engine=engine, store=store)
     service.update_security_config(config.security)
     service.set_runtime_tasks_root(Path(config.sessions_dir) / "runtime-tasks")
+    await service.start()
     app.state.runtime_service = service
     return service

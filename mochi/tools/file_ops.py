@@ -8,12 +8,14 @@ import difflib
 from pathlib import Path
 from typing import Any
 
+from mochi.config import defaults
+from mochi.security import require_approval_decision, with_task_isolation_scope
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
 from mochi.utils.security import (
+    check_file_tool_path,
     content_size_bytes,
     is_within_write_size_limit,
     normalize_workspace_dir,
-    resolve_path_with_scope,
     size_limit_bytes,
 )
 
@@ -33,7 +35,7 @@ class FileReadTool(BaseTool):
         max_read_bytes: int = 1024 * 1024,
         reader: FileReader | None = None,
     ) -> None:
-        self._workspace_dir = normalize_workspace_dir(workspace_dir or "~/.mochi")
+        self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         self._path_scope = path_scope
         self._default_encoding = default_encoding
         self._max_read_bytes = max_read_bytes
@@ -63,6 +65,22 @@ class FileReadTool(BaseTool):
                     "minimum": 1,
                     "description": "Maximum bytes allowed for this read. Overrides the default limit.",
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "Starting line number for partial reads. Uses 1-based indexing.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of lines to return from the starting line.",
+                },
+                "line_numbers": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Whether to prefix returned lines with their line number.",
+                },
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -76,21 +94,46 @@ class FileReadTool(BaseTool):
     def is_concurrency_safe(self) -> bool:
         return True
 
+    def _resolve_workspace_root(self, context: ToolExecutionContext | None) -> Path:
+        if context is not None:
+            for candidate in (
+                context.task_sandbox_dir,
+                context.project_workspace,
+                context.workspace_dir,
+            ):
+                if candidate:
+                    return normalize_workspace_dir(candidate)
+        return self._workspace_dir
+
     async def execute(
         self,
         *,
         path: str,
         encoding: str | None = None,
         max_bytes: int | None = None,
+        offset: int = 1,
+        limit: int | None = None,
+        line_numbers: bool = True,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
         if not path.strip():
             return ToolResult(error="`path` must not be empty.")
+        if offset <= 0:
+            return ToolResult(error="`offset` must be greater than 0.")
+        if limit is not None and limit <= 0:
+            return ToolResult(error="`limit` must be greater than 0.")
 
-        try:
-            target = resolve_path_with_scope(path, self._workspace_dir, self._path_scope)
-        except ValueError as exc:
-            return ToolResult(error=str(exc))
+        workspace_root = self._resolve_workspace_root(context)
+        target, security_decision = check_file_tool_path(
+            path,
+            workspace_dir=workspace_root,
+            scope=self._path_scope,
+        )
+        if security_decision is not None or target is None:
+            return ToolResult(
+                error=security_decision.reason if security_decision is not None else "Path denied.",
+                metadata=security_decision.to_metadata() if security_decision is not None else {},
+            )
 
         if not target.exists():
             return ToolResult(error=f"File not found: {target}")
@@ -113,6 +156,33 @@ class FileReadTool(BaseTool):
 
         active_encoding = encoding or self._default_encoding
         text = await self._reader(target, active_encoding)
+        lines = text.splitlines()
+        if lines and offset > len(lines):
+            return ToolResult(
+                error=(
+                    f"File exists but is shorter than the provided offset ({offset}). "
+                    f"The file has {len(lines)} lines."
+                ),
+                metadata={"path": str(target), "total_lines": len(lines), "partial": False},
+            )
+
+        rendered_text = text
+        partial = False
+        start_line = 1
+        end_line = len(lines)
+        if limit is not None or offset != 1:
+            partial = True
+            start_idx = offset - 1
+            selected_lines = lines[start_idx:] if limit is None else lines[start_idx : start_idx + limit]
+            start_line = offset
+            end_line = offset + len(selected_lines) - 1 if selected_lines else offset - 1
+            if line_numbers:
+                rendered_text = "\n".join(
+                    f"{line_no}: {line}"
+                    for line_no, line in enumerate(selected_lines, start=offset)
+                )
+            else:
+                rendered_text = "\n".join(selected_lines)
 
         if context is not None:
             stat = await asyncio.to_thread(target.stat)
@@ -122,12 +192,20 @@ class FileReadTool(BaseTool):
                 encoding=active_encoding,
                 mtime_ns=getattr(stat, "st_mtime_ns", None),
                 size_bytes=file_size,
-                partial=False,
+                partial=partial,
             )
 
         return ToolResult(
-            output=text,
-            metadata={"path": str(target), "size_bytes": file_size, "partial": False},
+            output=rendered_text,
+            metadata={
+                "path": str(target),
+                "size_bytes": file_size,
+                "partial": partial,
+                "start_line": start_line,
+                "end_line": end_line,
+                "total_lines": len(lines),
+                "line_numbers": line_numbers,
+            },
         )
 
     @staticmethod
@@ -149,7 +227,7 @@ class FileWriteTool(BaseTool):
         default_encoding: str = "utf-8",
         writer: FileWriter | None = None,
     ) -> None:
-        self._workspace_dir = normalize_workspace_dir(workspace_dir or "~/.mochi")
+        self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         self._path_scope = path_scope
         self._require_approval = require_approval
         self._max_write_size_mb = max_write_size_mb
@@ -192,6 +270,17 @@ class FileWriteTool(BaseTool):
     def requires_approval(self) -> bool:
         return self._require_approval
 
+    def _resolve_workspace_root(self, context: ToolExecutionContext | None) -> Path:
+        if context is not None:
+            for candidate in (
+                context.task_sandbox_dir,
+                context.project_workspace,
+                context.workspace_dir,
+            ):
+                if candidate:
+                    return normalize_workspace_dir(candidate)
+        return self._workspace_dir
+
     async def execute(
         self,
         *,
@@ -205,10 +294,22 @@ class FileWriteTool(BaseTool):
         if not path.strip():
             return ToolResult(error="`path` must not be empty.")
 
+        workspace_root = self._resolve_workspace_root(context)
         if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="File writes require explicit approval in the current autonomy mode.",
+                approval_kind="file_write",
+                approval_scope="workspace",
+                replay_safe=True,
+                policy_source="runtime_policy",
+            )
+            decision = with_task_isolation_scope(
+                decision,
+                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
+            )
             return ToolResult(
                 error="File write requires approval.",
-                metadata={"requires_approval": True},
+                metadata=decision.to_metadata(),
             )
 
         active_encoding = encoding or self._default_encoding
@@ -226,10 +327,16 @@ class FileWriteTool(BaseTool):
                 metadata={"size_bytes": content_size},
             )
 
-        try:
-            target = resolve_path_with_scope(path, self._workspace_dir, self._path_scope)
-        except ValueError as exc:
-            return ToolResult(error=str(exc))
+        target, security_decision = check_file_tool_path(
+            path,
+            workspace_dir=workspace_root,
+            scope=self._path_scope,
+        )
+        if security_decision is not None or target is None:
+            return ToolResult(
+                error=security_decision.reason if security_decision is not None else "Path denied.",
+                metadata=security_decision.to_metadata() if security_decision is not None else {},
+            )
 
         existing_result = await _load_existing_content(target, active_encoding)
         if existing_result.error is not None:
@@ -329,18 +436,35 @@ class FileEditTool(FileWriteTool):
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
         if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="File edits require explicit approval in the current autonomy mode.",
+                approval_kind="file_edit",
+                approval_scope="workspace",
+                replay_safe=True,
+                policy_source="runtime_policy",
+            )
+            decision = with_task_isolation_scope(
+                decision,
+                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
+            )
             return ToolResult(
                 error="File edit requires approval.",
-                metadata={"requires_approval": True},
+                metadata=decision.to_metadata(),
             )
         if not old_string:
             return ToolResult(error="`old_string` must not be empty.")
 
         active_encoding = encoding or self._default_encoding
-        try:
-            target = resolve_path_with_scope(path, self._workspace_dir, self._path_scope)
-        except ValueError as exc:
-            return ToolResult(error=str(exc))
+        target, security_decision = check_file_tool_path(
+            path,
+            workspace_dir=self._workspace_dir,
+            scope=self._path_scope,
+        )
+        if security_decision is not None or target is None:
+            return ToolResult(
+                error=security_decision.reason if security_decision is not None else "Path denied.",
+                metadata=security_decision.to_metadata() if security_decision is not None else {},
+            )
 
         existing_result = await _load_existing_content(target, active_encoding)
         if existing_result.error is not None:

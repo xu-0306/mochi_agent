@@ -1552,11 +1552,13 @@ def _configured_model_from_config(config: MochiConfig) -> ConfiguredModelConfig:
 def _serialize_model_info(info: Any) -> dict[str, Any]:
     """??ModelInfo-like ??麾?改? JSON-safe dict??"""
     if is_dataclass(info):
-        return jsonable_encoder(asdict(info))
+        payload = asdict(info)
+        return jsonable_encoder({key: value for key, value in payload.items() if value is not None})
     if hasattr(info, "model_dump"):
-        return jsonable_encoder(info.model_dump())
+        payload = info.model_dump()
+        return jsonable_encoder({key: value for key, value in payload.items() if value is not None})
     if isinstance(info, dict):
-        return jsonable_encoder(info)
+        return jsonable_encoder({key: value for key, value in info.items() if value is not None})
     return jsonable_encoder(
         {
             "name": getattr(info, "name", ""),
