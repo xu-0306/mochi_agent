@@ -116,6 +116,7 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
 
         await switch_model_runtime(request, payload.model)
     engine = await _get_or_create_engine(request.app)
+    await _ensure_runtime_delegate(request)
     session_id = payload.session_id or str(uuid4())
     resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
         request,
@@ -156,6 +157,7 @@ async def chat_context(request: Request, payload: ChatRequest) -> ChatContextRes
 
         await switch_model_runtime(request, payload.model)
     engine = await _get_or_create_engine(request.app)
+    await _ensure_runtime_delegate(request)
     session_id = payload.session_id or "draft-session"
     resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
         request,
@@ -450,6 +452,12 @@ async def _get_session_store(request: Request) -> SessionStore:
     store = SessionStore(config.sessions_dir)
     request.app.state.session_store = store
     return store
+
+
+async def _ensure_runtime_delegate(request: Request) -> None:
+    from mochi.api.routes.approvals import _get_runtime_service
+
+    await _get_runtime_service(request.app)
 
 
 async def _resolve_chat_project_context(

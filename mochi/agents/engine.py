@@ -640,9 +640,35 @@ class AgentEngine:
             "mcp_list_resources",
             "mcp_read_resource",
         }
+        execution_request_allowed = {
+            *evidence_allowed,
+        }
+        controller_exec_allowed = {
+            *evidence_allowed,
+            "exec_command",
+            "read_session",
+            "list_sessions",
+            "process_poll",
+        }
         if execution_profile == "subagent_readonly":
             return ToolExposurePlan(
                 tool_names=[name for name in exposure_plan.tool_names if name in readonly_allowed],
+                matched_groups=exposure_plan.matched_groups,
+                limit=exposure_plan.limit,
+            )
+        if execution_profile == "subagent_execution_request":
+            return ToolExposurePlan(
+                tool_names=[name for name in exposure_plan.tool_names if name in execution_request_allowed],
+                matched_groups=exposure_plan.matched_groups,
+                limit=exposure_plan.limit,
+            )
+        if execution_profile == "controller_exec":
+            controller_tools = list(exposure_plan.tool_names)
+            for name in ("exec_command", "read_session", "list_sessions", "process_poll"):
+                if name not in controller_tools:
+                    controller_tools.append(name)
+            return ToolExposurePlan(
+                tool_names=[name for name in controller_tools if name in controller_exec_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
             )

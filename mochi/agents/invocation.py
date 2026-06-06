@@ -15,6 +15,8 @@ ExecutionProfile = Literal[
     "task",
     "subagent_readonly",
     "subagent_research",
+    "subagent_execution_request",
+    "controller_exec",
     "judge",
     "verifier",
 ]

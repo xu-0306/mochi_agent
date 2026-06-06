@@ -75,12 +75,39 @@ def export_run_to_dataset_records(run: MultiAgentRunResult) -> list[dict[str, An
         if isinstance(run.artifacts.get("reward_summary"), dict):
             record["reward_summary"] = dict(run.artifacts["reward_summary"])
 
+    if run.protocol == "controlled_subagent_execution":
+        controlled_metadata = {
+            "execution_plan": run.artifacts.get("execution_plan"),
+            "execution_requests": run.artifacts.get("execution_requests"),
+            "controller_decisions": run.artifacts.get("controller_decisions"),
+            "execution_results": run.artifacts.get("execution_results"),
+            "produced_artifacts": run.artifacts.get("produced_artifacts"),
+            "evaluation_summary": run.artifacts.get("evaluation_summary"),
+            "runtime": run.artifacts.get("controlled_execution_runtime"),
+        }
+        record["metadata"]["controlled_execution"] = {
+            key: value for key, value in controlled_metadata.items() if isinstance(value, dict)
+        }
+        for key in (
+            "execution_plan",
+            "execution_requests",
+            "controller_decisions",
+            "execution_results",
+            "produced_artifacts",
+            "evaluation_summary",
+            "controlled_execution_runtime",
+        ):
+            if isinstance(run.artifacts.get(key), dict):
+                record[key] = dict(run.artifacts[key])
+
     return [record]
 
 
 def _dataset_mode_for_protocol(protocol: str) -> str:
     if protocol == "dr_zero_self_evolve":
         return "self_evolve_search"
+    if protocol == "controlled_subagent_execution":
+        return "agentic_execution"
     if protocol == "multi_agent_debate":
         return "preference_pair"
     return "trajectory_distillation"
@@ -89,6 +116,8 @@ def _dataset_mode_for_protocol(protocol: str) -> str:
 def _supervision_shape_for_protocol(protocol: str) -> str:
     if protocol == "dr_zero_self_evolve":
         return "solver_rollout_with_reward"
+    if protocol == "controlled_subagent_execution":
+        return "plan_execute_evaluate_trace"
     if protocol == "multi_agent_debate":
         return "pairwise_preference"
     return "single_target"
@@ -107,6 +136,12 @@ def _build_supervision_payload(run: MultiAgentRunResult) -> dict[str, Any]:
             "chosen_candidate_id": selected_id,
             "rejected_candidate_id": rejected_id,
             "comparison_basis": "llm_first_policy",
+        }
+    if run.protocol == "controlled_subagent_execution":
+        return {
+            "type": "agentic_execution_trace",
+            "selected_candidate_id": selected_id,
+            "execution_result_shape": "plan_execute_evaluate",
         }
     return {
         "type": "sft",

@@ -42,6 +42,8 @@ class RuntimeStore:
                     workspace_dir TEXT,
                     project_workspace_dir TEXT,
                     task_workspace_dir TEXT,
+                    task_type TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     inference_overrides_json TEXT NOT NULL,
                     permission_override_json TEXT,
                     final_answer TEXT,
@@ -160,6 +162,8 @@ class RuntimeStore:
             _ensure_column(conn, "task_runs", "finished_at", "TEXT")
             _ensure_column(conn, "task_runs", "project_workspace_dir", "TEXT")
             _ensure_column(conn, "task_runs", "task_workspace_dir", "TEXT")
+            _ensure_column(conn, "task_runs", "task_type", "TEXT")
+            _ensure_column(conn, "task_runs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "approval_requests", "metadata_json", "TEXT")
             _ensure_column(conn, "agent_runs", "title", "TEXT")
             _ensure_column(conn, "agent_runs", "topic", "TEXT")
@@ -178,6 +182,8 @@ class RuntimeStore:
         workspace_dir: str | None,
         project_workspace_dir: str | None,
         task_workspace_dir: str | None,
+        task_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
         inference_overrides: dict[str, Any] | None = None,
         permission_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -190,10 +196,10 @@ class RuntimeStore:
                     """
                     INSERT INTO task_runs (
                         id, status, input, session_id, project_id, workspace_dir,
-                        project_workspace_dir, task_workspace_dir,
+                        project_workspace_dir, task_workspace_dir, task_type, metadata_json,
                         inference_overrides_json, permission_override_json, final_answer,
                         error, started_at, finished_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -204,6 +210,8 @@ class RuntimeStore:
                         workspace_dir,
                         project_workspace_dir,
                         task_workspace_dir,
+                        task_type,
+                        json.dumps(metadata or {}, ensure_ascii=False),
                         json.dumps(inference_overrides or {}, ensure_ascii=False),
                         json.dumps(permission_override or {}, ensure_ascii=False),
                         None,
@@ -315,6 +323,7 @@ class RuntimeStore:
             payload = dict(row)
             payload["inference_overrides"] = json.loads(payload.pop("inference_overrides_json") or "{}")
             payload["permission_override"] = json.loads(payload.pop("permission_override_json") or "{}")
+            payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
             return payload
 
         return await asyncio.to_thread(_op)
@@ -337,6 +346,7 @@ class RuntimeStore:
                 payload["permission_override"] = json.loads(
                     payload.pop("permission_override_json") or "{}"
                 )
+                payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
                 output.append(payload)
             return output
 

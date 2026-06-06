@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
-ProtocolName = Literal["teacher_student_distill", "multi_agent_debate", "dr_zero_self_evolve"]
+ProtocolName = Literal[
+    "teacher_student_distill",
+    "multi_agent_debate",
+    "dr_zero_self_evolve",
+    "controlled_subagent_execution",
+]
 
 
 @dataclass(frozen=True)
@@ -45,14 +50,44 @@ class DrZeroSelfEvolveProtocol:
     guidance_required: bool = False
 
 
-ProtocolConfig = TeacherStudentDistillProtocol | MultiAgentDebateProtocol | DrZeroSelfEvolveProtocol
+@dataclass(frozen=True)
+class ControlledSubagentExecutionProtocol:
+    """Controller-gated subagent execution protocol setting."""
+
+    protocol: Literal["controlled_subagent_execution"] = "controlled_subagent_execution"
+    max_execution_requests: int = 5
+    max_commands_per_request: int = 1
+    default_timeout_sec: int = 300
+    background_allowed: bool = True
+    workspace_mode: Literal["task_sandbox"] = "task_sandbox"
+    planner_role_id: str = "planner"
+    executor_role_id: str = "executor"
+    controller_role_id: str = "controller"
+    evaluator_role_id: str = "evaluator"
+    guidance_required: bool = False
+
+
+ProtocolConfig = (
+    TeacherStudentDistillProtocol
+    | MultiAgentDebateProtocol
+    | DrZeroSelfEvolveProtocol
+    | ControlledSubagentExecutionProtocol
+)
 
 
 def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) -> ProtocolConfig:
     """將 API-style payload 正規化為協議 dataclass。"""
     if payload is None:
         return TeacherStudentDistillProtocol()
-    if isinstance(payload, (TeacherStudentDistillProtocol, MultiAgentDebateProtocol, DrZeroSelfEvolveProtocol)):
+    if isinstance(
+        payload,
+        (
+            TeacherStudentDistillProtocol,
+            MultiAgentDebateProtocol,
+            DrZeroSelfEvolveProtocol,
+            ControlledSubagentExecutionProtocol,
+        ),
+    ):
         return payload
 
     raw_protocol = str(payload.get("protocol", "teacher_student_distill")).strip()
@@ -89,6 +124,34 @@ def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) ->
             proposer_role_id=_clean_role_id(payload.get("proposer_role_id"), default="proposer"),
             solver_role_id=_clean_role_id(payload.get("solver_role_id"), default="solver"),
             verifier_role_id=_clean_role_id(payload.get("verifier_role_id"), default="verifier"),
+            guidance_required=bool(payload.get("guidance_required", False)),
+        )
+    if raw_protocol == "controlled_subagent_execution":
+        return ControlledSubagentExecutionProtocol(
+            max_execution_requests=_bounded_int(
+                payload.get("max_execution_requests"),
+                default=5,
+                minimum=1,
+                maximum=20,
+            ),
+            max_commands_per_request=_bounded_int(
+                payload.get("max_commands_per_request"),
+                default=1,
+                minimum=1,
+                maximum=5,
+            ),
+            default_timeout_sec=_bounded_int(
+                payload.get("default_timeout_sec"),
+                default=300,
+                minimum=1,
+                maximum=86_400,
+            ),
+            background_allowed=bool(payload.get("background_allowed", True)),
+            workspace_mode="task_sandbox",
+            planner_role_id=_clean_role_id(payload.get("planner_role_id"), default="planner"),
+            executor_role_id=_clean_role_id(payload.get("executor_role_id"), default="executor"),
+            controller_role_id=_clean_role_id(payload.get("controller_role_id"), default="controller"),
+            evaluator_role_id=_clean_role_id(payload.get("evaluator_role_id"), default="evaluator"),
             guidance_required=bool(payload.get("guidance_required", False)),
         )
     raise ValueError(f"Unsupported multi-agent protocol: {raw_protocol}")

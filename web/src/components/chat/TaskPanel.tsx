@@ -219,6 +219,9 @@ function TaskPanelBody({
                     <span className="truncate text-xs font-medium text-foreground">{task.task_id}</span>
                     <Badge variant={statusVariant(task.status)}>{task.status}</Badge>
                   </div>
+                  {task.task_type ? (
+                    <p className="mb-1 text-[11px] text-muted-foreground">{formatMetadataLabel(task.task_type)}</p>
+                  ) : null}
                   <p className="text-[11px] text-muted-foreground">{previewText(task.input_message)}</p>
                 </button>
               ))

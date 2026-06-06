@@ -32,6 +32,7 @@ class ToolExposurePlanner:
             "file_edit",
             "process_stop",
             "mcp_call",
+            "delegate_subagent_task",
         }
     )
     _STRICT_BLOCKED_TOOLS: frozenset[str] = frozenset(
@@ -71,6 +72,7 @@ class ToolExposurePlanner:
         "docx_read": 13,
         "notebook_read": 14,
         "tool_search": 15,
+        "delegate_subagent_task": 18,
         "file_write": 20,
         "file_edit": 30,
         "exec_command": 40,
@@ -123,6 +125,14 @@ class ToolExposurePlanner:
             "exec",
             "session",
             "stdin",
+            "subagent",
+            "delegate",
+            "background task",
+            "controlled execution",
+            "子代理",
+            "子agent",
+            "背景任務",
+            "受控執行",
         ),
         "literature": (
             "paper",
@@ -198,6 +208,12 @@ class ToolExposurePlanner:
             "find tool",
             "tool should i use",
             "tool to use",
+        ),
+        "delegate_subagent_task": (
+            "subagent",
+            "delegate",
+            "background task",
+            "controlled execution",
         ),
         "web_crawl": ("crawl", "site", "url", "http", "https"),
     }

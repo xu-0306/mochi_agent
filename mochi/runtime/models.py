@@ -17,6 +17,8 @@ class TaskCreateRequest(BaseModel):
     project_id: str | None = None
     project_workspace_dir: str | None = None
     workspace_dir: str | None = None
+    task_type: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
     inference_overrides: dict[str, Any] = Field(default_factory=dict)
 
 

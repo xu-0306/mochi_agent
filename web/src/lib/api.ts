@@ -4125,6 +4125,8 @@ export interface TaskSummary {
   task_id: string
   session_id: string | null
   project_id: string | null
+  task_type: string | null
+  metadata: Record<string, unknown>
   status: string
   input_message: string
   final_answer: string | null
@@ -4180,6 +4182,8 @@ function normalizeTaskSummary(payload: unknown): TaskSummary {
     task_id: getString(record.task_id) ?? '',
     session_id: getNullableString(record.session_id),
     project_id: getNullableString(record.project_id),
+    task_type: getNullableString(record.task_type),
+    metadata: isRecord(record.metadata) ? record.metadata : {},
     status: getString(record.status) ?? 'unknown',
     input_message: getString(record.input_message) ?? '',
     final_answer: getNullableString(record.final_answer),
@@ -4278,7 +4282,12 @@ export async function resolveApproval(
   return normalizeApprovalSummary(payload)
 }
 
-export type AgentRunProtocolId = 'teacher_student_distill' | 'multi_agent_debate' | 'dr_zero_self_evolve' | (string & {})
+export type AgentRunProtocolId =
+  | 'teacher_student_distill'
+  | 'multi_agent_debate'
+  | 'dr_zero_self_evolve'
+  | 'controlled_subagent_execution'
+  | (string & {})
 
 export interface AgentRunArtifact {
   artifact_id: string | null

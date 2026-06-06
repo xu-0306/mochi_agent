@@ -5,7 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-RoleKind = Literal["teacher", "student", "debater", "judge", "proposer", "solver", "verifier"]
+RoleKind = Literal[
+    "teacher",
+    "student",
+    "debater",
+    "judge",
+    "proposer",
+    "solver",
+    "verifier",
+    "planner",
+    "executor",
+    "controller",
+    "evaluator",
+]
 
 
 @dataclass(frozen=True)
@@ -111,5 +123,47 @@ def build_dr_zero_roles(
             kind="verifier",
             title="Verifier",
             instruction="Verify solver rollouts and reward correctness, difficulty, and solvability.",
+        ),
+    ]
+
+
+def build_controlled_execution_roles(
+    *,
+    planner_role_id: str = "planner",
+    executor_role_id: str = "executor",
+    controller_role_id: str = "controller",
+    evaluator_role_id: str = "evaluator",
+) -> list[AgentRoleProfile]:
+    """Build roles for controller-gated subagent execution."""
+    return [
+        AgentRoleProfile(
+            role_id=planner_role_id,
+            kind="planner",
+            title="Planner",
+            instruction="Create a concise executable plan with expected artifacts and success criteria.",
+        ),
+        AgentRoleProfile(
+            role_id=executor_role_id,
+            kind="executor",
+            title="Executor",
+            instruction=(
+                "Propose structured execution requests for the plan. Do not claim to run commands; "
+                "return JSON requests for controller review."
+            ),
+        ),
+        AgentRoleProfile(
+            role_id=controller_role_id,
+            kind="controller",
+            title="Controller",
+            instruction=(
+                "Review execution requests for safety and task fit. Approve, reject, or rewrite "
+                "commands before shared runtime execution."
+            ),
+        ),
+        AgentRoleProfile(
+            role_id=evaluator_role_id,
+            kind="evaluator",
+            title="Evaluator",
+            instruction="Summarize execution results, produced artifacts, metrics, and next steps.",
         ),
     ]

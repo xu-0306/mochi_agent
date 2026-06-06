@@ -41,6 +41,11 @@ const PROTOCOL_OPTIONS: Array<{
     label: 'Dr.Zero Self-Evolve',
     description: 'Proposer generates hard-but-solvable tasks; solver creates evidence-aware rollouts.',
   },
+  {
+    id: 'controlled_subagent_execution',
+    label: 'Controlled Subagent Execution',
+    description: 'Subagents propose execution requests; a controller gates runtime execution.',
+  },
 ]
 
 const TERMINAL_RUN_STATUSES = new Set([
@@ -69,6 +74,9 @@ function defaultRolesForProtocol(protocolId: api.AgentRunProtocolId): string[] {
   }
   if (protocolId === 'multi_agent_debate') {
     return ['debater_a', 'debater_b', 'judge']
+  }
+  if (protocolId === 'controlled_subagent_execution') {
+    return ['planner', 'executor', 'controller', 'evaluator']
   }
   return ['teacher', 'student']
 }
@@ -459,6 +467,17 @@ export default function AgentRunsPage() {
             : {}),
           ...(protocolId === 'multi_agent_debate' || runTemplate === 'research_debate'
             ? { protocol_config: { rounds: parsePositiveInteger(debateRounds, 2) } }
+            : {}),
+          ...(protocolId === 'controlled_subagent_execution' && runTemplate !== 'research_debate'
+            ? {
+                protocol_config: {
+                  max_execution_requests: 5,
+                  max_commands_per_request: 1,
+                  default_timeout_sec: 300,
+                  background_allowed: true,
+                  workspace_mode: 'task_sandbox',
+                },
+              }
             : {}),
         },
         evaluation_policy: {

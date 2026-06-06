@@ -19,11 +19,12 @@ from mochi.runtime.agent_run_packages import (
     summarize_package_materialization,
 )
 from mochi.runtime.approvals import ApprovalStatus, InMemoryApprovalStore
+from mochi.runtime.delegate import set_delegate_subagent_task_launcher
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.models import AgentRunCreateRequest, AgentRunGuidanceRequest, TaskCreateRequest
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
-from mochi.security.policy import build_runtime_permission_policy_dict
+from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
 from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_exec_runtime
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
@@ -33,6 +34,7 @@ AGENT_RUN_SUPPORTED_PROTOCOLS = {
     "teacher_student_distill",
     "multi_agent_debate",
     "dr_zero_self_evolve",
+    "controlled_subagent_execution",
 }
 SCHEDULE_RUNTIME_KEYS = {
     "enabled",
@@ -80,6 +82,7 @@ class RuntimeService:
         self._scheduler_poll_interval_seconds = self._DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
+        set_delegate_subagent_task_launcher(self.create_controlled_subagent_task)
 
     def set_runtime_tasks_root(self, root_dir: Path) -> None:
         self._runtime_tasks_root = Path(root_dir)
@@ -145,6 +148,8 @@ class RuntimeService:
             workspace_dir=project_workspace_dir,
             project_workspace_dir=project_workspace_dir,
             task_workspace_dir=str(task_workspace_dir),
+            task_type=payload.task_type,
+            metadata=payload.metadata,
             inference_overrides=payload.inference_overrides,
         )
         self._active_jobs[task_id] = asyncio.create_task(
@@ -153,6 +158,42 @@ class RuntimeService:
         )
         summary["pending_approval"] = None
         return _task_summary(summary)
+
+    async def create_controlled_subagent_task(
+        self,
+        *,
+        objective: str,
+        session_id: str | None = None,
+        project_id: str | None = None,
+        workspace_dir: str | None = None,
+        suggested_roles: list[str] | None = None,
+        suggested_models: dict[str, str] | None = None,
+        execution_budget: dict[str, Any] | None = None,
+        expected_artifacts: list[str] | None = None,
+    ) -> dict[str, Any]:
+        protocol_config = _controlled_execution_protocol_config(execution_budget or {})
+        selected_models_roles = {
+            "by_role": dict(suggested_models or {}),
+            "subagents": [
+                {"role": str(role), "model_id": str((suggested_models or {}).get(str(role), ""))}
+                for role in (suggested_roles or [])
+                if str(role).strip()
+            ],
+        }
+        payload = TaskCreateRequest(
+            input_message=objective,
+            session_id=session_id,
+            project_id=project_id,
+            workspace_dir=workspace_dir,
+            task_type="controlled_subagent_execution",
+            metadata={
+                "protocol": "controlled_subagent_execution",
+                "protocol_config": protocol_config,
+                "selected_models_roles": selected_models_roles,
+                "expected_artifacts": list(expected_artifacts or []),
+            },
+        )
+        return await self.create_task(payload)
 
     async def create_agent_run(self, payload: AgentRunCreateRequest) -> dict[str, Any]:
         run_id = str(uuid4())
@@ -509,8 +550,19 @@ class RuntimeService:
         )
 
         try:
-            orchestrator = MultiAgentOrchestrator(engine=self._engine)
+            orchestrator = MultiAgentOrchestrator(
+                engine=self._engine,
+                exec_runtime=self._exec_runtime,
+                exec_approval_store=self._exec_approval_store,
+                controlled_exec_require_approval=resolve_runtime_permission_policy(
+                    self._security_config
+                ).require_approval_for_exec,
+            )
             protocol_payload = _resolve_protocol_payload(run)
+            task_workspace_dir = None
+            if run.get("protocol_id") == "controlled_subagent_execution":
+                task_workspace_dir = (self._runtime_tasks_root / f"agent-run-{run_id}" / "workspace").resolve()
+                task_workspace_dir.mkdir(parents=True, exist_ok=True)
             request = MultiAgentRunRequest(
                 run_id=run_id,
                 task_input=_agent_run_task_input(run),
@@ -523,6 +575,8 @@ class RuntimeService:
                     "evaluation_policy": run.get("evaluation_policy") or {},
                     "schedule": run.get("schedule") or {},
                     "summary": run.get("summary") or {},
+                    "workspace_dir": run.get("summary", {}).get("workspace_dir") if isinstance(run.get("summary"), dict) else None,
+                    "task_workspace_dir": str(task_workspace_dir) if task_workspace_dir is not None else None,
                 },
             )
             result = await orchestrator.run(request)
@@ -704,6 +758,13 @@ class RuntimeService:
             ("reward_summary", "Reward Summary"),
             ("curriculum_state", "Curriculum State"),
             ("drzero_iteration_summary", "Dr.Zero Iteration Summary"),
+            ("execution_plan", "Execution Plan"),
+            ("execution_requests", "Execution Requests"),
+            ("controller_decisions", "Controller Decisions"),
+            ("execution_results", "Execution Results"),
+            ("produced_artifacts", "Produced Artifacts"),
+            ("evaluation_summary", "Evaluation Summary"),
+            ("controlled_execution_runtime", "Controlled Execution Runtime"),
         ):
             artifact_content = result.artifacts.get(artifact_type) if isinstance(result.artifacts, dict) else None
             if not isinstance(artifact_content, dict):
@@ -1148,6 +1209,11 @@ class RuntimeService:
         final_answer: str | None = None
 
         try:
+            task_type = str(task.get("task_type") or "")
+            if task_type == "controlled_subagent_execution":
+                await self._run_controlled_subagent_task(task=task, task_id=task_id)
+                return
+
             effective_permission_policy = build_runtime_permission_policy_dict(
                 self._security_config,
                 overrides=permission_override,
@@ -1211,6 +1277,48 @@ class RuntimeService:
             current = asyncio.current_task()
             if active is not None and (active is current or active.done()):
                 self._active_jobs.pop(task_id, None)
+
+    async def _run_controlled_subagent_task(self, *, task: dict[str, Any], task_id: str) -> None:
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        protocol_config = (
+            metadata.get("protocol_config") if isinstance(metadata.get("protocol_config"), dict) else {}
+        )
+        selected_models_roles = (
+            metadata.get("selected_models_roles")
+            if isinstance(metadata.get("selected_models_roles"), dict)
+            else {}
+        )
+        orchestrator = MultiAgentOrchestrator(
+            engine=self._engine,
+            exec_runtime=self._exec_runtime,
+            exec_approval_store=self._exec_approval_store,
+            controlled_exec_require_approval=resolve_runtime_permission_policy(
+                self._security_config
+            ).require_approval_for_exec,
+        )
+        result = await orchestrator.run(
+            MultiAgentRunRequest(
+                run_id=task_id,
+                task_input=str(task.get("input") or ""),
+                protocol={"protocol": "controlled_subagent_execution", **protocol_config},
+                guidance_messages=[],
+                metadata={
+                    "selected_models_roles": selected_models_roles,
+                    "summary": metadata,
+                    "workspace_dir": task.get("project_workspace_dir") or task.get("workspace_dir"),
+                    "task_workspace_dir": task.get("task_workspace_dir"),
+                },
+            )
+        )
+        for event in result.events:
+            await self._store.append_task_event(task_id, event.to_dict())
+        final_answer = str((result.artifacts or {}).get("final_answer") or "")
+        await self._store.update_task_status(
+            task_id,
+            "succeeded" if result.state == "succeeded" else str(result.state),
+            final_answer=final_answer,
+            error=None if result.state == "succeeded" else str(result.state),
+        )
 
     async def _transition_agent_run(
         self,
@@ -1611,6 +1719,8 @@ def _task_summary(task: dict[str, Any]) -> dict[str, Any]:
         "project_id": task.get("project_id"),
         "project_workspace_dir": task.get("project_workspace_dir") or task.get("workspace_dir"),
         "task_workspace_dir": task.get("task_workspace_dir"),
+        "task_type": task.get("task_type"),
+        "metadata": task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
         "final_answer": task.get("final_answer"),
         "error": task.get("error"),
         "started_at": task.get("started_at"),
@@ -1802,6 +1912,23 @@ def _resolve_protocol_payload(run: dict[str, Any]) -> dict[str, Any]:
             payload["rounds"] = rounds
         return payload
     return {"protocol": "teacher_student_distill"}
+
+
+def _controlled_execution_protocol_config(execution_budget: dict[str, Any]) -> dict[str, Any]:
+    def _positive_int(key: str, default: int, maximum: int) -> int:
+        try:
+            value = int(execution_budget.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(1, min(value, maximum))
+
+    return {
+        "max_execution_requests": _positive_int("max_execution_requests", 5, 20),
+        "max_commands_per_request": _positive_int("max_commands_per_request", 1, 5),
+        "default_timeout_sec": _positive_int("default_timeout_sec", 300, 86_400),
+        "background_allowed": bool(execution_budget.get("background_allowed", True)),
+        "workspace_mode": "task_sandbox",
+    }
 
 
 def _agent_run_task_input(run: dict[str, Any]) -> str:

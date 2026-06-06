@@ -15,6 +15,7 @@ from mochi.tools.exec_command import ExecCommandTool
 from mochi.tools.execute_code import ExecuteCodeTool
 from mochi.tools.execute_code_v2 import ExecuteCodeV2Tool
 from mochi.tools.csv_read import CsvReadTool
+from mochi.tools.delegate_subagent_task import DelegateSubagentTaskTool
 from mochi.tools.docx_read import DocxReadTool
 from mochi.tools.file_ops import FileEditTool, FileReadTool, FileWriteTool
 from mochi.tools.glob_search import GlobSearchTool
@@ -129,6 +130,7 @@ class ToolRegistryFactory:
             BuiltInToolSpec("web_crawl", "shared", "web", self._build_web_crawl),
             BuiltInToolSpec("get_current_time", "shared", "web", self._build_datetime),
             BuiltInToolSpec("calculator", "shared", "web", self._build_calculator),
+            BuiltInToolSpec("delegate_subagent_task", "workspace", "workspace", self._build_delegate_subagent_task),
             BuiltInToolSpec("exec_command", "workspace", "workspace", self._build_exec_command),
             BuiltInToolSpec("read_session", "workspace", "workspace", self._build_read_session),
             BuiltInToolSpec("write_stdin", "workspace", "workspace", self._build_write_stdin),
@@ -182,6 +184,15 @@ class ToolRegistryFactory:
             language=tc.web_search_language,
             region=tc.web_search_region,
         )
+
+    def _build_delegate_subagent_task(
+        self,
+        config: MochiConfig,
+        workspace_dir: str,
+        services: dict[str, Any],
+    ) -> BaseTool:
+        del config, workspace_dir, services
+        return DelegateSubagentTaskTool()
 
     def _build_web_fetch(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del workspace_dir, services
