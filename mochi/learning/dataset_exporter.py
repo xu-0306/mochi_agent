@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mochi.agents.multi_agent.execution_policy import run_uses_controlled_execution
 from mochi.agents.multi_agent.orchestrator import MultiAgentRunResult
 from mochi.agents.multi_agent.research import policy_requests_dataset_output
 
@@ -13,6 +14,11 @@ def export_run_to_dataset_records(run: MultiAgentRunResult) -> list[dict[str, An
 
     if not policy_requests_dataset_output(run.metadata):
         return []
+    controlled_execution = run_uses_controlled_execution(
+        run.protocol,
+        metadata=run.metadata,
+        artifacts=run.artifacts,
+    )
 
     record: dict[str, Any] = {
         "contract": "dataset_record",
@@ -20,9 +26,12 @@ def export_run_to_dataset_records(run: MultiAgentRunResult) -> list[dict[str, An
         "input": run.task_input,
         "candidates": [candidate.to_dict() for candidate in run.candidates],
         "metadata": {
-            "dataset_mode": _dataset_mode_for_protocol(run.protocol),
+            "dataset_mode": _dataset_mode_for_run(run.protocol, controlled_execution=controlled_execution),
             "capability_family": "multi_agent_orchestration",
-            "supervision_shape": _supervision_shape_for_protocol(run.protocol),
+            "supervision_shape": _supervision_shape_for_run(
+                run.protocol,
+                controlled_execution=controlled_execution,
+            ),
             "teacher_role": "orchestrator",
             "source_provenance": {
                 "source_type": "multi_agent_run",
@@ -75,7 +84,7 @@ def export_run_to_dataset_records(run: MultiAgentRunResult) -> list[dict[str, An
         if isinstance(run.artifacts.get("reward_summary"), dict):
             record["reward_summary"] = dict(run.artifacts["reward_summary"])
 
-    if run.protocol == "controlled_subagent_execution":
+    if controlled_execution:
         controlled_metadata = {
             "execution_plan": run.artifacts.get("execution_plan"),
             "execution_requests": run.artifacts.get("execution_requests"),
@@ -103,20 +112,20 @@ def export_run_to_dataset_records(run: MultiAgentRunResult) -> list[dict[str, An
     return [record]
 
 
-def _dataset_mode_for_protocol(protocol: str) -> str:
+def _dataset_mode_for_run(protocol: str, *, controlled_execution: bool) -> str:
     if protocol == "dr_zero_self_evolve":
         return "self_evolve_search"
-    if protocol == "controlled_subagent_execution":
+    if controlled_execution:
         return "agentic_execution"
     if protocol == "multi_agent_debate":
         return "preference_pair"
     return "trajectory_distillation"
 
 
-def _supervision_shape_for_protocol(protocol: str) -> str:
+def _supervision_shape_for_run(protocol: str, *, controlled_execution: bool) -> str:
     if protocol == "dr_zero_self_evolve":
         return "solver_rollout_with_reward"
-    if protocol == "controlled_subagent_execution":
+    if controlled_execution:
         return "plan_execute_evaluate_trace"
     if protocol == "multi_agent_debate":
         return "pairwise_preference"
@@ -125,6 +134,11 @@ def _supervision_shape_for_protocol(protocol: str) -> str:
 
 def _build_supervision_payload(run: MultiAgentRunResult) -> dict[str, Any]:
     selected_id = run.selected_candidate_id
+    controlled_execution = run_uses_controlled_execution(
+        run.protocol,
+        metadata=run.metadata,
+        artifacts=run.artifacts,
+    )
     if run.protocol == "multi_agent_debate":
         rejected_id = None
         for candidate in run.candidates:
@@ -137,7 +151,7 @@ def _build_supervision_payload(run: MultiAgentRunResult) -> dict[str, Any]:
             "rejected_candidate_id": rejected_id,
             "comparison_basis": "llm_first_policy",
         }
-    if run.protocol == "controlled_subagent_execution":
+    if controlled_execution:
         return {
             "type": "agentic_execution_trace",
             "selected_candidate_id": selected_id,

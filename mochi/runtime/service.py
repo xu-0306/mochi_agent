@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mochi.agents.multi_agent.execution_policy import (
+    execution_policy_to_dict,
+    parse_subagent_execution_policy,
+)
 from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunRequest
 from mochi.api.routes.chat import _serialize_event
 from mochi.config.schema import SecurityConfig
@@ -30,6 +34,7 @@ from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
 AGENT_RUN_ACTIVE_STATUS = {"running"}
+DELEGATED_MULTI_AGENT_TASK_TYPE = "delegated_multi_agent"
 AGENT_RUN_SUPPORTED_PROTOCOLS = {
     "teacher_student_distill",
     "multi_agent_debate",
@@ -82,7 +87,7 @@ class RuntimeService:
         self._scheduler_poll_interval_seconds = self._DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
-        set_delegate_subagent_task_launcher(self.create_controlled_subagent_task)
+        set_delegate_subagent_task_launcher(self.create_delegated_subagent_task)
 
     def set_runtime_tasks_root(self, root_dir: Path) -> None:
         self._runtime_tasks_root = Path(root_dir)
@@ -159,19 +164,29 @@ class RuntimeService:
         summary["pending_approval"] = None
         return _task_summary(summary)
 
-    async def create_controlled_subagent_task(
+    async def create_delegated_subagent_task(
         self,
         *,
         objective: str,
+        protocol: str | None = None,
+        protocol_config: dict[str, Any] | None = None,
         session_id: str | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
         suggested_roles: list[str] | None = None,
         suggested_models: dict[str, str] | None = None,
         execution_budget: dict[str, Any] | None = None,
+        execution_policy: dict[str, Any] | None = None,
         expected_artifacts: list[str] | None = None,
     ) -> dict[str, Any]:
-        protocol_config = _controlled_execution_protocol_config(execution_budget or {})
+        effective_protocol = str(protocol or "controlled_subagent_execution").strip() or "controlled_subagent_execution"
+        raw_protocol_config = dict(protocol_config or {})
+        if effective_protocol == "controlled_subagent_execution" and not raw_protocol_config:
+            raw_protocol_config = _controlled_execution_protocol_config(execution_budget or {})
+        parsed_execution_policy = parse_subagent_execution_policy(
+            execution_policy or (raw_protocol_config if effective_protocol == "controlled_subagent_execution" else None),
+            legacy_protocol=effective_protocol,
+        )
         selected_models_roles = {
             "by_role": dict(suggested_models or {}),
             "subagents": [
@@ -185,19 +200,47 @@ class RuntimeService:
             session_id=session_id,
             project_id=project_id,
             workspace_dir=workspace_dir,
-            task_type="controlled_subagent_execution",
+            task_type=DELEGATED_MULTI_AGENT_TASK_TYPE,
             metadata={
-                "protocol": "controlled_subagent_execution",
-                "protocol_config": protocol_config,
+                "protocol": effective_protocol,
+                "protocol_config": raw_protocol_config,
+                "execution_policy": execution_policy_to_dict(parsed_execution_policy),
                 "selected_models_roles": selected_models_roles,
                 "expected_artifacts": list(expected_artifacts or []),
             },
         )
         return await self.create_task(payload)
 
+    async def create_controlled_subagent_task(
+        self,
+        *,
+        objective: str,
+        session_id: str | None = None,
+        project_id: str | None = None,
+        workspace_dir: str | None = None,
+        suggested_roles: list[str] | None = None,
+        suggested_models: dict[str, str] | None = None,
+        execution_budget: dict[str, Any] | None = None,
+        expected_artifacts: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return await self.create_delegated_subagent_task(
+            objective=objective,
+            protocol="controlled_subagent_execution",
+            protocol_config={},
+            session_id=session_id,
+            project_id=project_id,
+            workspace_dir=workspace_dir,
+            suggested_roles=suggested_roles,
+            suggested_models=suggested_models,
+            execution_budget=execution_budget,
+            execution_policy={},
+            expected_artifacts=expected_artifacts,
+        )
+
     async def create_agent_run(self, payload: AgentRunCreateRequest) -> dict[str, Any]:
         run_id = str(uuid4())
         schedule = _normalize_agent_run_schedule(payload.schedule)
+        run_policy = _normalize_agent_run_policy(payload.run_policy)
         run = await self._store.create_agent_run(
             run_id=run_id,
             protocol_id=payload.protocol_id,
@@ -205,6 +248,7 @@ class RuntimeService:
             topic=payload.topic,
             selected_models_roles=payload.selected_models_roles,
             evaluation_policy=payload.evaluation_policy,
+            run_policy=run_policy,
             schedule=schedule,
             summary=payload.summary,
             latest_error=payload.latest_error,
@@ -261,11 +305,11 @@ class RuntimeService:
         current_status = str(run.get("status") or "created")
         if current_status in AGENT_RUN_TERMINAL_STATUS:
             return _agent_run_summary(run)
-        if current_status not in {"created", "paused", "running"}:
+        if current_status not in {"created", "paused", "running", "partial", "awaiting_resources"}:
             return _agent_run_summary(run)
 
-        if current_status in {"created", "paused"}:
-            if current_status == "created":
+        if current_status in {"created", "paused", "partial", "awaiting_resources"}:
+            if current_status in {"created", "partial", "awaiting_resources"}:
                 await self._begin_agent_run_attempt(run_id, source="manual")
             await self._store.update_agent_run_status(run_id, "running", latest_error=None)
             attempt_id = await self._get_current_attempt_id(run_id)
@@ -313,7 +357,7 @@ class RuntimeService:
         current_status = str(run.get("status") or "created")
         if current_status in AGENT_RUN_TERMINAL_STATUS:
             return _agent_run_summary(run)
-        if current_status != "paused":
+        if current_status not in {"paused", "awaiting_resources", "partial"}:
             return _agent_run_summary(run)
 
         await self._store.update_agent_run_status(run_id, "running", latest_error=None)
@@ -568,6 +612,7 @@ class RuntimeService:
                 task_input=_agent_run_task_input(run),
                 protocol=protocol_payload,
                 guidance_messages=await self._collect_guidance_messages(run_id),
+                run_policy=run.get("run_policy") if isinstance(run.get("run_policy"), dict) else {},
                 metadata={
                     "title": run.get("title"),
                     "topic": run.get("topic"),
@@ -599,16 +644,17 @@ class RuntimeService:
                 run_id,
                 attempt_id=attempt_id,
             )
+            completion_status = _resolve_agent_run_completion_status(result)
             await self._update_agent_run_schedule_completion(
                 run_id,
-                completion_status="succeeded" if result.state == "succeeded" else str(result.state),
+                completion_status=completion_status,
                 attempt_id=attempt_id,
                 package_summary=package_summary,
             )
             await self._store.update_agent_run_status(
                 run_id,
-                "succeeded" if result.state == "succeeded" else result.state,
-                latest_error=None,
+                completion_status,
+                latest_error=_agent_run_latest_error(result),
             )
         except asyncio.CancelledError:
             current_run = await self._store.get_agent_run(run_id)
@@ -1210,8 +1256,8 @@ class RuntimeService:
 
         try:
             task_type = str(task.get("task_type") or "")
-            if task_type == "controlled_subagent_execution":
-                await self._run_controlled_subagent_task(task=task, task_id=task_id)
+            if task_type in {DELEGATED_MULTI_AGENT_TASK_TYPE, "controlled_subagent_execution"}:
+                await self._run_delegated_multi_agent_task(task=task, task_id=task_id)
                 return
 
             effective_permission_policy = build_runtime_permission_policy_dict(
@@ -1278,10 +1324,19 @@ class RuntimeService:
             if active is not None and (active is current or active.done()):
                 self._active_jobs.pop(task_id, None)
 
-    async def _run_controlled_subagent_task(self, *, task: dict[str, Any], task_id: str) -> None:
+    async def _run_delegated_multi_agent_task(self, *, task: dict[str, Any], task_id: str) -> None:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        legacy_protocol = (
+            "controlled_subagent_execution"
+            if str(task.get("task_type") or "") == "controlled_subagent_execution"
+            else "teacher_student_distill"
+        )
         protocol_config = (
             metadata.get("protocol_config") if isinstance(metadata.get("protocol_config"), dict) else {}
+        )
+        protocol_id = str(metadata.get("protocol") or legacy_protocol).strip() or legacy_protocol
+        execution_policy = (
+            metadata.get("execution_policy") if isinstance(metadata.get("execution_policy"), dict) else {}
         )
         selected_models_roles = (
             metadata.get("selected_models_roles")
@@ -1300,11 +1355,12 @@ class RuntimeService:
             MultiAgentRunRequest(
                 run_id=task_id,
                 task_input=str(task.get("input") or ""),
-                protocol={"protocol": "controlled_subagent_execution", **protocol_config},
+                protocol={"protocol": protocol_id, **protocol_config, "execution_policy": execution_policy},
                 guidance_messages=[],
                 metadata={
                     "selected_models_roles": selected_models_roles,
                     "summary": metadata,
+                    "execution_policy": execution_policy,
                     "workspace_dir": task.get("project_workspace_dir") or task.get("workspace_dir"),
                     "task_workspace_dir": task.get("task_workspace_dir"),
                 },
@@ -1319,6 +1375,9 @@ class RuntimeService:
             final_answer=final_answer,
             error=None if result.state == "succeeded" else str(result.state),
         )
+
+    async def _run_controlled_subagent_task(self, *, task: dict[str, Any], task_id: str) -> None:
+        await self._run_delegated_multi_agent_task(task=task, task_id=task_id)
 
     async def _transition_agent_run(
         self,

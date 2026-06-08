@@ -8,6 +8,14 @@ from mochi.agents.multi_agent.evaluator import (
     LLMFirstScoringPolicy,
     resolve_evidence_gate_status,
 )
+from mochi.agents.multi_agent.execution_coordinator import SubagentExecutionCoordinator
+from mochi.agents.multi_agent.execution_policy import (
+    LEGACY_CONTROLLED_SUBAGENT_PROTOCOL,
+    SubagentExecutionPolicy,
+    execution_policy_to_dict,
+    parse_subagent_execution_policy,
+    run_uses_controlled_execution,
+)
 from mochi.agents.multi_agent.orchestrator import (
     BoundedRunStateMachine,
     CandidateOutput,
@@ -41,6 +49,7 @@ __all__ = [
     "CandidateOutput",
     "CandidateScore",
     "ControlledSubagentExecutionProtocol",
+    "LEGACY_CONTROLLED_SUBAGENT_PROTOCOL",
     "EvidenceGateResult",
     "DrZeroSelfEvolveProtocol",
     "LLMFirstScoringPolicy",
@@ -53,11 +62,16 @@ __all__ = [
     "ProtocolName",
     "RunState",
     "RunStateTransitionError",
+    "SubagentExecutionCoordinator",
+    "SubagentExecutionPolicy",
     "TeacherStudentDistillProtocol",
     "build_dr_zero_roles",
     "build_controlled_execution_roles",
     "build_multi_agent_debate_roles",
     "build_teacher_student_roles",
+    "execution_policy_to_dict",
     "parse_protocol_config",
+    "parse_subagent_execution_policy",
     "resolve_evidence_gate_status",
+    "run_uses_controlled_execution",
 ]

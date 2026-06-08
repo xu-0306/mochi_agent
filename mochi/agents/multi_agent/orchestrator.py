@@ -16,6 +16,13 @@ from mochi.agents.multi_agent.context import (
     summarize_candidate_outputs,
     verification_reduce,
 )
+from mochi.agents.multi_agent.execution_coordinator import SubagentExecutionCoordinator
+from mochi.agents.multi_agent.execution_policy import (
+    LEGACY_CONTROLLED_SUBAGENT_PROTOCOL,
+    SubagentExecutionPolicy,
+    execution_policy_to_dict,
+    parse_subagent_execution_policy,
+)
 from mochi.agents.multi_agent.evaluator import (
     CandidateVerification,
     CandidateScore,
@@ -42,17 +49,16 @@ from mochi.agents.multi_agent.research import (
     synthesize_research_brief,
 )
 from mochi.agents.multi_agent.roles import (
-    build_controlled_execution_roles,
     build_dr_zero_roles,
     build_multi_agent_debate_roles,
     build_teacher_student_roles,
 )
+from mochi.agents.multi_agent.utils import parse_json_payload
 from mochi.agents.context_snapshot import estimate_text_tokens
 from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.types import GenerationResult, Message
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
-from mochi.tools.exec_command import ExecCommandTool
 
 RunState = Literal["queued", "running", "awaiting_guidance", "succeeded", "failed", "cancelled"]
 RunEventType = Literal["state_changed", "guidance", "role_output", "verification", "evaluation", "artifact"]
@@ -252,6 +258,10 @@ class MultiAgentOrchestrator:
         """Run one multi-agent orchestration."""
         run_id = request.run_id or str(uuid4())
         protocol_config = parse_protocol_config(request.protocol)
+        execution_policy = parse_subagent_execution_policy(
+            _resolve_execution_policy_payload(request.protocol, request.metadata),
+            legacy_protocol=protocol_config.protocol,
+        )
         state_machine = BoundedRunStateMachine(initial_state="queued")
         events: list[MultiAgentRunEvent] = []
         self._invocation_traces = []
@@ -310,6 +320,7 @@ class MultiAgentOrchestrator:
 
         selected_models_roles = _resolve_selected_model_roles(request.metadata)
         effective_metadata = dict(request.metadata)
+        effective_metadata["execution_policy"] = execution_policy_to_dict(execution_policy)
         research_policy = ResearchDebatePolicy.from_metadata(effective_metadata)
         precomputed_artifacts: dict[str, Any] = {}
         evidence_packets: list[dict[str, Any]] = []
@@ -328,12 +339,26 @@ class MultiAgentOrchestrator:
                 metadata=effective_metadata,
                 policy=research_policy,
             )
+        (
+            guidance_messages,
+            controlled_execution_artifacts,
+        ) = await self._prepare_controlled_execution_context(
+            task_input=request.task_input,
+            protocol_config=protocol_config,
+            guidance_messages=guidance_messages,
+            selected_models_roles=selected_models_roles,
+            execution_policy=execution_policy,
+            metadata=effective_metadata,
+            emit=emit,
+        )
+        precomputed_artifacts.update(controlled_execution_artifacts)
         protocol_metadata = dict(effective_metadata)
         candidates, protocol_artifacts = await self._run_protocol(
             request.task_input,
             protocol_config=protocol_config,
             guidance_messages=guidance_messages,
             selected_models_roles=selected_models_roles,
+            execution_policy=execution_policy,
             metadata=protocol_metadata,
             emit=emit,
         )
@@ -430,6 +455,8 @@ class MultiAgentOrchestrator:
             "final_answer": final_candidate.content if final_candidate is not None else "",
             "candidate_count": len(candidates),
         }
+        if execution_policy.mode != "disabled":
+            artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
         artifacts.update(protocol_artifacts)
         if self._invocation_traces:
             subagent_runtime = _build_subagent_runtime_artifact(self._invocation_traces)
@@ -473,6 +500,7 @@ class MultiAgentOrchestrator:
         protocol_config: ProtocolConfig,
         guidance_messages: list[str],
         selected_models_roles: dict[str, str],
+        execution_policy: SubagentExecutionPolicy,
         metadata: dict[str, Any],
         emit: Any,
     ) -> tuple[list[CandidateOutput], dict[str, Any]]:
@@ -482,6 +510,7 @@ class MultiAgentOrchestrator:
                 protocol_config=protocol_config,
                 guidance_messages=guidance_messages,
                 selected_models_roles=selected_models_roles,
+                execution_policy=execution_policy,
                 metadata=metadata,
                 emit=emit,
             )
@@ -506,6 +535,7 @@ class MultiAgentOrchestrator:
         protocol_config: ProtocolConfig,
         guidance_messages: list[str],
         selected_models_roles: dict[str, str],
+        execution_policy: SubagentExecutionPolicy,
         metadata: dict[str, Any],
         emit: Any,
     ) -> tuple[list[CandidateOutput], dict[str, Any]]:
@@ -591,7 +621,7 @@ class MultiAgentOrchestrator:
         if isinstance(protocol_config, ControlledSubagentExecutionProtocol):
             return await self._run_model_backed_controlled_execution(
                 task_input=task_input,
-                protocol_config=protocol_config,
+                execution_policy=execution_policy,
                 guidance_messages=guidance_messages,
                 selected_models_roles=selected_models_roles,
                 metadata=metadata,
@@ -783,286 +813,94 @@ class MultiAgentOrchestrator:
         }
         return solver_outputs, protocol_artifacts
 
+    async def _prepare_controlled_execution_context(
+        self,
+        *,
+        task_input: str,
+        protocol_config: ProtocolConfig,
+        guidance_messages: list[str],
+        selected_models_roles: dict[str, str],
+        execution_policy: SubagentExecutionPolicy,
+        metadata: dict[str, Any],
+        emit: Any,
+    ) -> tuple[list[str], dict[str, Any]]:
+        if execution_policy.mode != "controlled":
+            return guidance_messages, {}
+        if protocol_config.protocol == LEGACY_CONTROLLED_SUBAGENT_PROTOCOL:
+            return guidance_messages, {}
+        if not self._can_use_model_backed_execution(selected_models_roles):
+            return guidance_messages, {}
+
+        coordinator = SubagentExecutionCoordinator(
+            generate_role_candidate=self._generate_role_candidate,
+            invoke_text=self._invoke_configured_text,
+            exec_runtime=self._exec_runtime,
+            exec_approval_store=self._exec_approval_store,
+            require_approval=self._controlled_exec_require_approval,
+        )
+        _raw_candidates, artifacts = await coordinator.run(
+            task_input=task_input,
+            execution_policy=execution_policy,
+            guidance_messages=guidance_messages,
+            selected_models_roles=selected_models_roles,
+            ordered_models=list(selected_models_roles.values()),
+            metadata=metadata,
+            emit=emit,
+            resolve_model_id=_resolve_protocol_role_model_id,
+            primary_workflow=False,
+        )
+        if not artifacts:
+            return guidance_messages, {}
+
+        summary = artifacts.get("evaluation_summary")
+        summary_text = summary.get("summary") if isinstance(summary, dict) else None
+        if isinstance(summary_text, str) and summary_text.strip():
+            enriched_guidance = list(guidance_messages)
+            enriched_guidance.append(
+                "Controlled execution context summary:\n"
+                + summary_text.strip()
+            )
+            return enriched_guidance, artifacts
+        return guidance_messages, artifacts
+
     async def _run_model_backed_controlled_execution(
         self,
         *,
         task_input: str,
-        protocol_config: ControlledSubagentExecutionProtocol,
+        execution_policy: SubagentExecutionPolicy,
         guidance_messages: list[str],
         selected_models_roles: dict[str, str],
         metadata: dict[str, Any],
         ordered_models: list[str],
         emit: Any,
     ) -> tuple[list[CandidateOutput], dict[str, Any]]:
-        roles = build_controlled_execution_roles(
-            planner_role_id=protocol_config.planner_role_id,
-            executor_role_id=protocol_config.executor_role_id,
-            controller_role_id=protocol_config.controller_role_id,
-            evaluator_role_id=protocol_config.evaluator_role_id,
-        )
-        planner_role, executor_role, controller_role, evaluator_role = roles
-        planner_model_id = _resolve_protocol_role_model_id(
-            role_id=planner_role.role_id,
-            selected_models_roles=selected_models_roles,
-            ordered_fallback=ordered_models,
-            fallback_index=0,
-        )
-        executor_model_id = _resolve_protocol_role_model_id(
-            role_id=executor_role.role_id,
-            selected_models_roles=selected_models_roles,
-            ordered_fallback=ordered_models,
-            fallback_index=1,
-            default_model_id=planner_model_id,
-        )
-        controller_model_id = _resolve_protocol_role_model_id(
-            role_id=controller_role.role_id,
-            selected_models_roles=selected_models_roles,
-            ordered_fallback=ordered_models,
-            fallback_index=2,
-            default_model_id=planner_model_id,
-        )
-        evaluator_model_id = _resolve_protocol_role_model_id(
-            role_id=evaluator_role.role_id,
-            selected_models_roles=selected_models_roles,
-            ordered_fallback=ordered_models,
-            fallback_index=3,
-            default_model_id=controller_model_id,
-        )
-        if not planner_model_id or not executor_model_id or not controller_model_id or not evaluator_model_id:
-            return [], {}
-
-        planner_output = await self._generate_role_candidate(
-            role_id=planner_role.role_id,
-            role_title=planner_role.title,
-            role_instruction=planner_role.instruction,
-            model_id=planner_model_id,
-            task_input=task_input,
-            guidance_messages=guidance_messages,
-            supporting_candidates=[],
-        )
-        emit(
-            "role_output",
-            asdict(
-                RoleOutputPayload(
-                    role_id=planner_output.role_id,
-                    content=planner_output.content,
-                    round_index=1,
-                    candidate_id=planner_output.candidate_id,
-                    model_id=planner_model_id,
-                )
-            ),
-        )
-
-        executor_prompt = _build_controlled_execution_request_prompt(
-            task_input=task_input,
-            execution_plan=planner_output.content,
-            max_execution_requests=protocol_config.max_execution_requests,
-            max_commands_per_request=protocol_config.max_commands_per_request,
-            default_timeout_sec=protocol_config.default_timeout_sec,
-            background_allowed=protocol_config.background_allowed,
-            guidance_messages=guidance_messages,
-        )
-        executor_content, executor_diagnostics = await self._invoke_configured_text(
-            model_id=executor_model_id,
-            system_prompt=executor_role.instruction,
-            user_prompt=executor_prompt,
-            temperature=0.1,
-            max_tokens=1600,
-            execution_profile="subagent_execution_request",
-            tool_mode="auto",
-            system_prompt_addendum=(
-                f"Role identity: {executor_role.title} ({executor_role.role_id}).\n"
-                f"Role instruction: {executor_role.instruction}"
-            ),
-            session_scope=f"role::{executor_role.role_id}",
-        )
-        executor_output = CandidateOutput(
-            candidate_id=executor_role.role_id,
-            role_id=executor_role.role_id,
-            content=executor_content,
-            metadata={"model_id": executor_model_id, "diagnostics": executor_diagnostics},
-        )
-        emit(
-            "role_output",
-            asdict(
-                RoleOutputPayload(
-                    role_id=executor_output.role_id,
-                    content=executor_output.content,
-                    round_index=1,
-                    candidate_id=executor_output.candidate_id,
-                    model_id=executor_model_id,
-                )
-            ),
-        )
-
-        execution_requests, request_parse_diagnostics = _parse_controlled_execution_requests(
-            executor_content,
-            max_execution_requests=protocol_config.max_execution_requests,
-            max_commands_per_request=protocol_config.max_commands_per_request,
-            default_timeout_sec=protocol_config.default_timeout_sec,
-            background_allowed=protocol_config.background_allowed,
-        )
-        controller_decisions: list[dict[str, Any]] = []
-        execution_results: list[dict[str, Any]] = []
-        task_workspace_dir = _metadata_string(metadata, "task_workspace_dir")
-        workspace_dir = task_workspace_dir or _metadata_string(metadata, "workspace_dir")
-
-        for request_index, execution_request in enumerate(execution_requests, start=1):
-            controller_prompt = _build_controller_decision_prompt(
-                task_input=task_input,
-                execution_plan=planner_output.content,
-                execution_request=execution_request,
-            )
-            decision_content, controller_diagnostics = await self._invoke_configured_text(
-                model_id=controller_model_id,
-                system_prompt=controller_role.instruction,
-                user_prompt=controller_prompt,
-                temperature=0.0,
-                max_tokens=900,
-                execution_profile="controller_exec",
-                tool_mode="auto",
-                system_prompt_addendum=(
-                    f"Role identity: {controller_role.title} ({controller_role.role_id}).\n"
-                    f"Role instruction: {controller_role.instruction}"
-                ),
-                session_scope=f"role::{controller_role.role_id}::{request_index}",
-            )
-            decision = _parse_controller_decision(
-                decision_content,
-                execution_request=execution_request,
-                diagnostics=controller_diagnostics,
-                request_index=request_index,
-            )
-            controller_decisions.append(decision)
-            if decision["status"] != "approved":
-                execution_results.append(
-                    {
-                        "request_id": execution_request["request_id"],
-                        "status": "skipped",
-                        "reason": decision.get("reason") or "Controller did not approve execution.",
-                    }
-                )
-                continue
-            execution_results.append(
-                await self._execute_controlled_command(
-                    execution_request=execution_request,
-                    controller_decision=decision,
-                    workspace_dir=workspace_dir,
-                    default_timeout_sec=protocol_config.default_timeout_sec,
-                )
-            )
-
-        evaluator_prompt = _build_controlled_evaluator_prompt(
-            task_input=task_input,
-            execution_plan=planner_output.content,
-            execution_requests=execution_requests,
-            controller_decisions=controller_decisions,
-            execution_results=execution_results,
-        )
-        evaluator_content, evaluator_diagnostics = await self._invoke_configured_text(
-            model_id=evaluator_model_id,
-            system_prompt=evaluator_role.instruction,
-            user_prompt=evaluator_prompt,
-            temperature=0.1,
-            max_tokens=1200,
-            execution_profile="subagent_readonly",
-            tool_mode="auto",
-            system_prompt_addendum=(
-                f"Role identity: {evaluator_role.title} ({evaluator_role.role_id}).\n"
-                f"Role instruction: {evaluator_role.instruction}"
-            ),
-            session_scope=f"role::{evaluator_role.role_id}",
-        )
-        evaluator_output = CandidateOutput(
-            candidate_id=evaluator_role.role_id,
-            role_id=evaluator_role.role_id,
-            content=evaluator_content,
-            metadata={"model_id": evaluator_model_id, "diagnostics": evaluator_diagnostics},
-        )
-        emit(
-            "role_output",
-            asdict(
-                RoleOutputPayload(
-                    role_id=evaluator_output.role_id,
-                    content=evaluator_output.content,
-                    round_index=1,
-                    candidate_id=evaluator_output.candidate_id,
-                    model_id=evaluator_model_id,
-                )
-            ),
-        )
-        evaluation_summary = _build_controlled_execution_summary(
-            evaluator_output=evaluator_output,
-            execution_results=execution_results,
-            controller_decisions=controller_decisions,
-        )
-        protocol_artifacts = {
-            "execution_plan": {
-                "content": planner_output.content,
-                "model_id": planner_model_id,
-            },
-            "execution_requests": {
-                "items": execution_requests,
-                "parse_diagnostics": request_parse_diagnostics,
-            },
-            "controller_decisions": {"items": controller_decisions},
-            "execution_results": {"items": execution_results},
-            "produced_artifacts": _collect_controlled_execution_artifacts(execution_results),
-            "evaluation_summary": evaluation_summary,
-            "controlled_execution_runtime": {
-                "execution_boundary": "subagents_propose_controller_approves_shared_runtime_executes",
-                "workspace_mode": protocol_config.workspace_mode,
-                "workspace_dir": workspace_dir,
-                "request_count": len(execution_requests),
-                "executed_count": sum(1 for item in execution_results if item.get("status") not in {"skipped"}),
-                "approval_pending_count": sum(1 for item in execution_results if item.get("status") == "approval_pending"),
-            },
-        }
-        return [planner_output, executor_output, evaluator_output], protocol_artifacts
-
-    async def _execute_controlled_command(
-        self,
-        *,
-        execution_request: dict[str, Any],
-        controller_decision: dict[str, Any],
-        workspace_dir: str | None,
-        default_timeout_sec: int,
-    ) -> dict[str, Any]:
-        command = str(controller_decision.get("command") or execution_request.get("command") or "").strip()
-        if not command:
-            return {
-                "request_id": execution_request["request_id"],
-                "status": "failed",
-                "error": "Controller approved execution without a command.",
-            }
-        tool = ExecCommandTool(
-            runtime=self._exec_runtime,
-            approval_store=self._exec_approval_store,
-            workspace_dir=workspace_dir,
+        coordinator = SubagentExecutionCoordinator(
+            generate_role_candidate=self._generate_role_candidate,
+            invoke_text=self._invoke_configured_text,
+            exec_runtime=self._exec_runtime,
+            exec_approval_store=self._exec_approval_store,
             require_approval=self._controlled_exec_require_approval,
-            default_timeout_sec=default_timeout_sec,
         )
-        result = await tool.execute(
-            command=command,
-            shell=str(controller_decision.get("shell") or execution_request.get("shell") or "powershell"),
-            workdir=controller_decision.get("workdir") or execution_request.get("workdir"),
-            timeout=controller_decision.get("timeout") or execution_request.get("timeout") or default_timeout_sec,
-            background=bool(controller_decision.get("background", execution_request.get("background", False))),
+        raw_candidates, protocol_artifacts = await coordinator.run(
+            task_input=task_input,
+            execution_policy=execution_policy,
+            guidance_messages=guidance_messages,
+            selected_models_roles=selected_models_roles,
+            ordered_models=ordered_models,
+            metadata=metadata,
+            emit=emit,
+            resolve_model_id=_resolve_protocol_role_model_id,
         )
-        metadata = dict(result.metadata or {})
-        status = str(metadata.get("status") or "completed")
-        if result.error and status != "approval_pending":
-            status = "failed"
-        return {
-            "request_id": execution_request["request_id"],
-            "status": status,
-            "command": command,
-            "shell": str(controller_decision.get("shell") or execution_request.get("shell") or "powershell"),
-            "stdout": result.output.get("stdout") if isinstance(result.output, dict) else None,
-            "stderr": result.output.get("stderr") if isinstance(result.output, dict) else None,
-            "error": result.error,
-            "metadata": metadata,
-        }
+        candidates = [
+            CandidateOutput(
+                candidate_id=str(item.get("candidate_id") or ""),
+                role_id=str(item.get("role_id") or ""),
+                content=str(item.get("content") or ""),
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in raw_candidates
+        ]
+        return candidates, protocol_artifacts
 
     async def _generate_role_candidate(
         self,
@@ -2206,6 +2044,35 @@ def _resolve_selected_model_roles(metadata: Mapping[str, Any] | None) -> dict[st
     return resolved
 
 
+def _resolve_execution_policy_payload(
+    protocol: Mapping[str, Any] | ProtocolConfig | None,
+    metadata: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if isinstance(metadata, Mapping):
+        payload = metadata.get("execution_policy")
+        if isinstance(payload, Mapping):
+            return payload
+        summary = metadata.get("summary")
+        if isinstance(summary, Mapping):
+            nested = summary.get("execution_policy")
+            if isinstance(nested, Mapping):
+                return nested
+    if isinstance(protocol, Mapping):
+        payload = protocol.get("execution_policy")
+        if isinstance(payload, Mapping):
+            return payload
+        if str(protocol.get("protocol") or "").strip() == LEGACY_CONTROLLED_SUBAGENT_PROTOCOL:
+            return {
+                "mode": "controlled",
+                **{
+                    str(key): value
+                    for key, value in protocol.items()
+                    if isinstance(key, str) and key not in {"protocol", "execution_policy"}
+                },
+            }
+    return None
+
+
 def _resolve_protocol_role_model_id(
     *,
     role_id: str,
@@ -2323,7 +2190,7 @@ def _parse_dr_zero_synthetic_tasks(
     task_input: str,
     sample_size: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    parsed = _parse_json_payload(content)
+    parsed = parse_json_payload(content)
     raw_tasks: Any = None
     status = "parsed"
     reason: str | None = None
@@ -2399,276 +2266,6 @@ def _normalize_dr_zero_task(
         "rationale": str(item.get("rationale") or item.get("reason") or ""),
         "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
     }
-
-
-def _parse_json_payload(content: str) -> Any:
-    text = content.strip()
-    if not text:
-        return None
-    candidates = [text]
-    if "```" in text:
-        parts = text.split("```")
-        for part in parts:
-            stripped = part.strip()
-            if stripped.startswith("json"):
-                stripped = stripped[4:].strip()
-            if stripped:
-                candidates.append(stripped)
-    object_start = text.find("{")
-    object_end = text.rfind("}")
-    if 0 <= object_start < object_end:
-        candidates.append(text[object_start : object_end + 1])
-    array_start = text.find("[")
-    array_end = text.rfind("]")
-    if 0 <= array_start < array_end:
-        candidates.append(text[array_start : array_end + 1])
-    for candidate in candidates:
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
-def _build_controlled_execution_request_prompt(
-    *,
-    task_input: str,
-    execution_plan: str,
-    max_execution_requests: int,
-    max_commands_per_request: int,
-    default_timeout_sec: int,
-    background_allowed: bool,
-    guidance_messages: list[str],
-) -> str:
-    guidance = "\n".join(f"- {item}" for item in guidance_messages if item.strip())
-    return "\n".join(
-        [
-            "Propose controller-reviewed execution requests for the task.",
-            f"Task:\n{task_input.strip()}",
-            f"Execution plan:\n{execution_plan.strip()}",
-            f"Maximum requests: {max_execution_requests}",
-            f"Maximum commands per request: {max_commands_per_request}",
-            f"Default timeout seconds: {default_timeout_sec}",
-            f"Background allowed: {str(background_allowed).lower()}",
-            f"Guidance:\n{guidance or '- Keep execution minimal and reversible.'}",
-            "",
-            "Return JSON only with key `execution_requests`.",
-            "Each item must include command, rationale, expected_artifacts, and success_metric.",
-            "Optional fields: shell, workdir, timeout, background.",
-        ]
-    )
-
-
-def _parse_controlled_execution_requests(
-    content: str,
-    *,
-    max_execution_requests: int,
-    max_commands_per_request: int,
-    default_timeout_sec: int,
-    background_allowed: bool,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    parsed = _parse_json_payload(content)
-    raw_items: Any = None
-    if isinstance(parsed, dict):
-        raw_items = (
-            parsed.get("execution_requests")
-            or parsed.get("requests")
-            or parsed.get("commands")
-            or parsed.get("items")
-        )
-    elif isinstance(parsed, list):
-        raw_items = parsed
-
-    requests: list[dict[str, Any]] = []
-    if isinstance(raw_items, list):
-        for index, item in enumerate(raw_items[:max_execution_requests], start=1):
-            normalized = _normalize_controlled_execution_request(
-                item,
-                index=index,
-                max_commands_per_request=max_commands_per_request,
-                default_timeout_sec=default_timeout_sec,
-                background_allowed=background_allowed,
-            )
-            if normalized is not None:
-                requests.append(normalized)
-
-    status = "parsed" if requests else "fallback_no_execution"
-    reason = None if requests else "Executor output did not contain parseable execution request JSON."
-    return requests, {
-        "status": status,
-        "parsed_request_count": len(requests),
-        "max_execution_requests": max_execution_requests,
-        "reason": reason,
-    }
-
-
-def _normalize_controlled_execution_request(
-    item: Any,
-    *,
-    index: int,
-    max_commands_per_request: int,
-    default_timeout_sec: int,
-    background_allowed: bool,
-) -> dict[str, Any] | None:
-    if isinstance(item, str):
-        payload: dict[str, Any] = {"command": item}
-    elif isinstance(item, Mapping):
-        payload = dict(item)
-    else:
-        return None
-
-    command = str(payload.get("command") or "").strip()
-    if not command:
-        commands = payload.get("commands")
-        if isinstance(commands, list) and commands:
-            command = " && ".join(str(value).strip() for value in commands[:max_commands_per_request] if str(value).strip())
-    if not command:
-        return None
-    try:
-        timeout = int(payload.get("timeout") or payload.get("timeout_sec") or default_timeout_sec)
-    except (TypeError, ValueError):
-        timeout = default_timeout_sec
-    return {
-        "request_id": str(payload.get("request_id") or payload.get("id") or f"exec-request-{index}"),
-        "command": command,
-        "shell": str(payload.get("shell") or "powershell"),
-        "workdir": str(payload.get("workdir")).strip() if payload.get("workdir") else None,
-        "timeout": max(1, min(timeout, 86_400)),
-        "background": bool(payload.get("background", False)) if background_allowed else False,
-        "rationale": str(payload.get("rationale") or "").strip(),
-        "expected_artifacts": [
-            str(value).strip()
-            for value in payload.get("expected_artifacts", [])
-            if str(value).strip()
-        ]
-        if isinstance(payload.get("expected_artifacts"), list)
-        else [],
-        "success_metric": str(payload.get("success_metric") or "").strip(),
-    }
-
-
-def _build_controller_decision_prompt(
-    *,
-    task_input: str,
-    execution_plan: str,
-    execution_request: dict[str, Any],
-) -> str:
-    return "\n".join(
-        [
-            "Review this execution request. Approve only if it is necessary, bounded, and fits the task.",
-            f"Task:\n{task_input.strip()}",
-            f"Execution plan:\n{execution_plan.strip()}",
-            "Execution request JSON:",
-            json.dumps(execution_request, ensure_ascii=False, indent=2),
-            "",
-            "Return JSON only with keys: status, reason, command, shell, workdir, timeout, background.",
-            "status must be one of approved, rejected, rewrite_required.",
-            "Use rewrite_required only when the command should not run as-is.",
-        ]
-    )
-
-
-def _parse_controller_decision(
-    content: str,
-    *,
-    execution_request: dict[str, Any],
-    diagnostics: dict[str, Any],
-    request_index: int,
-) -> dict[str, Any]:
-    parsed = _parse_json_payload(content)
-    payload = dict(parsed) if isinstance(parsed, Mapping) else {}
-    status = str(payload.get("status") or payload.get("decision") or "rejected").strip().lower()
-    if status not in {"approved", "rejected", "rewrite_required"}:
-        status = "rejected"
-    if status == "rewrite_required":
-        status = "rejected"
-    return {
-        "decision_id": f"controller-decision-{request_index}",
-        "request_id": execution_request["request_id"],
-        "status": status,
-        "reason": str(payload.get("reason") or payload.get("rationale") or "").strip(),
-        "command": str(payload.get("command") or execution_request.get("command") or "").strip(),
-        "shell": str(payload.get("shell") or execution_request.get("shell") or "powershell"),
-        "workdir": payload.get("workdir") if isinstance(payload.get("workdir"), str) else execution_request.get("workdir"),
-        "timeout": payload.get("timeout") or execution_request.get("timeout"),
-        "background": bool(payload.get("background", execution_request.get("background", False))),
-        "raw_content": content,
-        "diagnostics": diagnostics,
-    }
-
-
-def _build_controlled_evaluator_prompt(
-    *,
-    task_input: str,
-    execution_plan: str,
-    execution_requests: list[dict[str, Any]],
-    controller_decisions: list[dict[str, Any]],
-    execution_results: list[dict[str, Any]],
-) -> str:
-    return "\n".join(
-        [
-            "Evaluate the controlled subagent execution trace.",
-            f"Task:\n{task_input.strip()}",
-            f"Execution plan:\n{execution_plan.strip()}",
-            "Execution requests:",
-            json.dumps(execution_requests, ensure_ascii=False, indent=2),
-            "Controller decisions:",
-            json.dumps(controller_decisions, ensure_ascii=False, indent=2),
-            "Execution results:",
-            json.dumps(execution_results, ensure_ascii=False, indent=2),
-            "",
-            "Summarize what worked, what failed, produced artifacts, metrics, and next steps.",
-        ]
-    )
-
-
-def _build_controlled_execution_summary(
-    *,
-    evaluator_output: CandidateOutput,
-    execution_results: list[dict[str, Any]],
-    controller_decisions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    status_counts: dict[str, int] = {}
-    for result in execution_results:
-        status = str(result.get("status") or "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
-    approved_count = sum(1 for decision in controller_decisions if decision.get("status") == "approved")
-    return {
-        "status": "completed",
-        "summary": evaluator_output.content,
-        "approved_count": approved_count,
-        "rejected_count": len(controller_decisions) - approved_count,
-        "execution_status_counts": status_counts,
-    }
-
-
-def _collect_controlled_execution_artifacts(execution_results: list[dict[str, Any]]) -> dict[str, Any]:
-    artifacts: list[dict[str, Any]] = []
-    for result in execution_results:
-        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-        session_id = metadata.get("session_id")
-        if isinstance(session_id, str) and session_id:
-            artifacts.append(
-                {
-                    "kind": "exec_session",
-                    "session_id": session_id,
-                    "request_id": result.get("request_id"),
-                    "status": result.get("status"),
-                }
-            )
-    return {"items": artifacts, "count": len(artifacts)}
-
-
-def _metadata_string(metadata: Mapping[str, Any], key: str) -> str | None:
-    value = metadata.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    summary = metadata.get("summary")
-    if isinstance(summary, Mapping):
-        nested = summary.get(key)
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip()
-    return None
 
 
 def _build_role_prompt(

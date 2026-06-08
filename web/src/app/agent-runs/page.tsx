@@ -11,6 +11,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/lib/i18n'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 
 interface SubagentDraft {
@@ -41,11 +42,6 @@ const PROTOCOL_OPTIONS: Array<{
     label: 'Dr.Zero Self-Evolve',
     description: 'Proposer generates hard-but-solvable tasks; solver creates evidence-aware rollouts.',
   },
-  {
-    id: 'controlled_subagent_execution',
-    label: 'Controlled Subagent Execution',
-    description: 'Subagents propose execution requests; a controller gates runtime execution.',
-  },
 ]
 
 const TERMINAL_RUN_STATUSES = new Set([
@@ -75,9 +71,6 @@ function defaultRolesForProtocol(protocolId: api.AgentRunProtocolId): string[] {
   if (protocolId === 'multi_agent_debate') {
     return ['debater_a', 'debater_b', 'judge']
   }
-  if (protocolId === 'controlled_subagent_execution') {
-    return ['planner', 'executor', 'controller', 'evaluator']
-  }
   return ['teacher', 'student']
 }
 
@@ -92,6 +85,59 @@ function createProtocolSubagentDrafts(
     ...createSubagentDraft(defaultModelId),
     role: roles[index] ?? '',
   }))
+}
+
+function normalizeSubagentInputs(subagents: SubagentDraft[]): api.AgentRunSubagentInput[] {
+  return subagents
+    .map((item) => ({
+      role: item.role.trim(),
+      model_id: item.modelId.trim(),
+    }))
+    .filter((item) => item.role.length > 0 && item.model_id.length > 0)
+}
+
+function buildSelectedModelsRolesPayload(
+  subagents: api.AgentRunSubagentInput[],
+  extraByRole: Record<string, string> = {}
+): Record<string, unknown> {
+  const by_role: Record<string, string> = {}
+
+  for (const item of subagents) {
+    by_role[item.role] = item.model_id
+  }
+
+  Object.entries(extraByRole).forEach(([role, modelId]) => {
+    const normalizedModelId = modelId.trim()
+    if (role.trim() && normalizedModelId) {
+      by_role[role] = normalizedModelId
+    }
+  })
+
+  return {
+    subagents,
+    by_role,
+    entries: Object.entries(by_role).map(([role, model_id]) => ({ role, model_id })),
+  }
+}
+
+function buildExecutionPolicyPayload(input: {
+  enabled: boolean
+  maxExecutionRequests: string
+  maxCommandsPerRequest: string
+  defaultTimeoutSec: string
+  backgroundAllowed: boolean
+}): Record<string, unknown> | null {
+  if (!input.enabled) {
+    return null
+  }
+
+  return {
+    mode: 'controlled',
+    max_execution_requests: parsePositiveInteger(input.maxExecutionRequests, 1),
+    max_commands_per_request: parsePositiveInteger(input.maxCommandsPerRequest, 1),
+    default_timeout_sec: parsePositiveInteger(input.defaultTimeoutSec, 300),
+    background_allowed: input.backgroundAllowed,
+  }
 }
 
 function formatDateTime(value: string | null): string {
@@ -190,6 +236,11 @@ export default function AgentRunsPage() {
   const [citationPolicy, setCitationPolicy] = React.useState('claim_level_required')
   const [localWorkerCount, setLocalWorkerCount] = React.useState('3')
   const [debateRounds, setDebateRounds] = React.useState('2')
+  const [controlledExecutionEnabled, setControlledExecutionEnabled] = React.useState(false)
+  const [maxExecutionRequests, setMaxExecutionRequests] = React.useState('1')
+  const [maxCommandsPerRequest, setMaxCommandsPerRequest] = React.useState('1')
+  const [defaultExecutionTimeoutSec, setDefaultExecutionTimeoutSec] = React.useState('300')
+  const [controlledExecutionBackgroundAllowed, setControlledExecutionBackgroundAllowed] = React.useState(false)
   const [scheduleEnabled, setScheduleEnabled] = React.useState(false)
   const [scheduleType, setScheduleType] = React.useState<'interval' | 'once' | 'cron'>('interval')
   const [scheduleIntervalSeconds, setScheduleIntervalSeconds] = React.useState('3600')
@@ -364,12 +415,7 @@ export default function AgentRunsPage() {
 
   const handleCreate = React.useCallback(async () => {
     setCreateError(null)
-    const normalizedSubagents = subagents
-      .map((item) => ({
-        role: item.role.trim(),
-        model_id: item.modelId.trim(),
-      }))
-      .filter((item) => item.role.length > 0 && item.model_id.length > 0)
+    const normalizedSubagents = normalizeSubagentInputs(subagents)
 
     if (normalizedSubagents.length === 0) {
       setCreateError('Add at least one subagent with role and model.')
@@ -386,6 +432,42 @@ export default function AgentRunsPage() {
         .split('\n')
         .map((item) => item.trim())
         .filter((item) => item.length > 0)
+      const executionPolicy = buildExecutionPolicyPayload({
+        enabled: controlledExecutionEnabled,
+        maxExecutionRequests,
+        maxCommandsPerRequest,
+        defaultTimeoutSec: defaultExecutionTimeoutSec,
+        backgroundAllowed: controlledExecutionBackgroundAllowed,
+      })
+      const fallbackControlledModelId =
+        normalizedSubagents[0]?.model_id || defaultModelId?.trim() || ''
+      const selectedModelsRoles =
+        runTemplate === 'research_debate'
+          ? buildSelectedModelsRolesPayload([], {
+              debater_a: localWorkerModelId.trim(),
+              debater_b: localWorkerModelId.trim(),
+              judge: smartModelId.trim(),
+              verifier: smartModelId.trim(),
+              planner: smartModelId.trim(),
+              synthesizer: smartModelId.trim(),
+              local_worker: localWorkerModelId.trim(),
+              skeptic: localWorkerModelId.trim(),
+              ...(controlledExecutionEnabled
+                ? {
+                    executor: localWorkerModelId.trim() || smartModelId.trim(),
+                    controller: smartModelId.trim(),
+                    evaluator: smartModelId.trim(),
+                  }
+                : {}),
+            })
+          : controlledExecutionEnabled
+            ? buildSelectedModelsRolesPayload(normalizedSubagents, {
+                planner: fallbackControlledModelId,
+                executor: fallbackControlledModelId,
+                controller: fallbackControlledModelId,
+                evaluator: fallbackControlledModelId,
+              })
+            : undefined
       const schedule = (() => {
         if (!scheduleEnabled) {
           return {}
@@ -435,21 +517,7 @@ export default function AgentRunsPage() {
         title: title.trim() || null,
         topic: topic.trim() || null,
         subagents: runTemplate === 'research_debate' ? [] : normalizedSubagents,
-        selected_models_roles:
-          runTemplate === 'research_debate'
-            ? {
-                by_role: {
-                  debater_a: localWorkerModelId.trim(),
-                  debater_b: localWorkerModelId.trim(),
-                  judge: smartModelId.trim(),
-                  verifier: smartModelId.trim(),
-                  planner: smartModelId.trim(),
-                  synthesizer: smartModelId.trim(),
-                  local_worker: localWorkerModelId.trim(),
-                  skeptic: localWorkerModelId.trim(),
-                },
-              }
-            : undefined,
+        selected_models_roles: selectedModelsRoles,
         schedule,
         summary: {
           ...(evidenceQueries.length > 0 ? { evidence_queries: evidenceQueries } : {}),
@@ -468,17 +536,7 @@ export default function AgentRunsPage() {
           ...(protocolId === 'multi_agent_debate' || runTemplate === 'research_debate'
             ? { protocol_config: { rounds: parsePositiveInteger(debateRounds, 2) } }
             : {}),
-          ...(protocolId === 'controlled_subagent_execution' && runTemplate !== 'research_debate'
-            ? {
-                protocol_config: {
-                  max_execution_requests: 5,
-                  max_commands_per_request: 1,
-                  default_timeout_sec: 300,
-                  background_allowed: true,
-                  workspace_mode: 'task_sandbox',
-                },
-              }
-            : {}),
+          ...(executionPolicy ? { execution_policy: executionPolicy } : {}),
         },
         evaluation_policy: {
           evidence_collection: {
@@ -549,6 +607,11 @@ export default function AgentRunsPage() {
       setCitationPolicy('claim_level_required')
       setLocalWorkerCount('3')
       setDebateRounds('2')
+      setControlledExecutionEnabled(false)
+      setMaxExecutionRequests('1')
+      setMaxCommandsPerRequest('1')
+      setDefaultExecutionTimeoutSec('300')
+      setControlledExecutionBackgroundAllowed(false)
       setScheduleEnabled(false)
       setScheduleType('interval')
       setScheduleIntervalSeconds('3600')
@@ -570,7 +633,10 @@ export default function AgentRunsPage() {
     }
   }, [
     citationPolicy,
+    controlledExecutionBackgroundAllowed,
+    controlledExecutionEnabled,
     defaultModelId,
+    defaultExecutionTimeoutSec,
     debateRounds,
     evidenceCollectionEnabled,
     evidenceCollectionMode,
@@ -578,6 +644,8 @@ export default function AgentRunsPage() {
     localWorkerCount,
     localWorkerModelId,
     loadRuns,
+    maxCommandsPerRequest,
+    maxExecutionRequests,
     maxContentChars,
     maxFetchPerQuery,
     maxResultsPerQuery,
@@ -871,6 +939,78 @@ export default function AgentRunsPage() {
                   ))}
                 </div>
               )}
+
+              <div className="space-y-3 rounded-lg border border-border bg-surface-layer p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-foreground">Controlled Execution Capability</label>
+                    <p className="text-xs text-muted-foreground">
+                      Attach shared planner, executor, controller, and evaluator roles without switching the workflow protocol.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={controlledExecutionEnabled}
+                    onCheckedChange={(checked) => setControlledExecutionEnabled(Boolean(checked))}
+                  />
+                </div>
+
+                {controlledExecutionEnabled ? (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Max Requests
+                      </label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={20}
+                        value={maxExecutionRequests}
+                        onChange={(event) => setMaxExecutionRequests(event.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Max Commands / Request
+                      </label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={5}
+                        value={maxCommandsPerRequest}
+                        onChange={(event) => setMaxCommandsPerRequest(event.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Default Timeout (sec)
+                      </label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={86400}
+                        value={defaultExecutionTimeoutSec}
+                        onChange={(event) => setDefaultExecutionTimeoutSec(event.target.value)}
+                      />
+                    </div>
+                    <label className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+                      <span>Allow background commands</span>
+                      <Switch
+                        checked={controlledExecutionBackgroundAllowed}
+                        onCheckedChange={(checked) => setControlledExecutionBackgroundAllowed(Boolean(checked))}
+                      />
+                    </label>
+                    <p className="text-xs text-muted-foreground sm:col-span-2">
+                      {runTemplate === 'research_debate'
+                        ? 'Research Debate keeps the multi_agent_debate protocol and adds execution-specific roles behind the scenes.'
+                        : 'Standard workflows reuse the first selected subagent model for execution-specific roles unless the backend overrides them later.'}
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    When disabled, subagents stay in reasoning-only mode and no shared execution policy is attached.
+                  </p>
+                )}
+              </div>
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
