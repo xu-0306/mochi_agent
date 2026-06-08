@@ -46,6 +46,39 @@ export function findRegeneratePrompt(
   return null
 }
 
+export function findEditForkTurnId(
+  messages: Message[],
+  targetMessageId: string,
+): string | null {
+  const targetIndex = messages.findIndex((message) => (
+    message.id === targetMessageId && message.type === 'user'
+  ))
+
+  if (targetIndex === -1) {
+    return null
+  }
+
+  const targetTurnId = messages[targetIndex].turnId ?? messages[targetIndex].turnKey ?? null
+  if (!targetTurnId) {
+    return null
+  }
+
+  for (let index = targetIndex - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    const candidateTurnId = message.turnId ?? message.turnKey ?? null
+
+    if (!candidateTurnId || candidateTurnId === targetTurnId) {
+      continue
+    }
+
+    if (message.type === 'assistant') {
+      return candidateTurnId
+    }
+  }
+
+  return null
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }

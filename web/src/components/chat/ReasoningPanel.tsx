@@ -109,7 +109,13 @@ export function ReasoningPanel({
             <p className="text-sm font-medium text-foreground">
               {summary.title}
             </p>
-            <p className="truncate text-xs text-muted-foreground">
+            <p
+              className={cn(
+                'truncate text-xs',
+                summary.hasError ? 'text-error/90' : 'text-muted-foreground'
+              )}
+              title={summary.latestIssue ?? undefined}
+            >
               {summary.detail}
             </p>
           </div>
@@ -146,6 +152,11 @@ export function ReasoningPanel({
                 {step.content ? (
                   <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/90">
                     {step.content}
+                  </p>
+                ) : null}
+                {step.errorCode ? (
+                  <p className="mt-1 break-all text-xs text-error/90">
+                    {step.errorCode}
                   </p>
                 ) : null}
                 {(() => {

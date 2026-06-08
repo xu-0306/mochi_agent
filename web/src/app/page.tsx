@@ -15,6 +15,7 @@ import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import * as api from '@/lib/api'
 import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
 import {
+  findEditForkTurnId,
   findRegeneratePrompt,
   isConversationEffectivelyEmpty,
   type FileChangeSummary,
@@ -26,6 +27,7 @@ import {
   resolveEffectiveInferenceParams,
   useInferenceStore,
 } from '@/lib/stores/inference-store'
+import { useChatRuntimeStore } from '@/lib/stores/chat-runtime-store'
 import { useProjectStore } from '@/lib/stores/project-store'
 import { useSessionStore } from '@/lib/stores/session-store'
 import { resolveVoiceOverlayPhase, resolveVoicePhaseFromRuntime } from '@/lib/voice-phase'
@@ -433,8 +435,6 @@ function applyStreamChunk(
 export default function ChatPage() {
   const router = useRouter()
   const { t } = useI18n()
-  const [messages, setMessages] = React.useState<Message[]>(() => createInitialMessages(t))
-  const [isStreaming, setIsStreaming] = React.useState(false)
   const [modelOptions, setModelOptions] = React.useState<ChatInputModelOption[]>([])
   const [currentModel, setCurrentModel] = React.useState<string | null>(null)
   const [currentModelLoaded, setCurrentModelLoaded] = React.useState<boolean | null>(null)
@@ -466,7 +466,6 @@ export default function ChatPage() {
   const shouldAutoScrollRef = React.useRef(true)
   const voiceClientRef = React.useRef<VoiceWsClient | null>(null)
   const voiceSessionIdRef = React.useRef<string | null>(null)
-  const activeAbortControllerRef = React.useRef<AbortController | null>(null)
 
   const {
     sessions,
@@ -489,8 +488,19 @@ export default function ChatPage() {
     replaceSessionOverride,
     resetSessionOverride,
   } = useInferenceStore()
+  const messagesBySessionId = useChatRuntimeStore((state) => state.messagesBySessionId)
+  const streamingSessionId = useChatRuntimeStore((state) => state.streamingSessionId)
+  const setSessionMessages = useChatRuntimeStore((state) => state.setSessionMessages)
+  const updateSessionMessages = useChatRuntimeStore((state) => state.updateSessionMessages)
+  const hydrateSessionMessages = useChatRuntimeStore((state) => state.hydrateSessionMessages)
+  const startStreaming = useChatRuntimeStore((state) => state.startStreaming)
+  const finishStreaming = useChatRuntimeStore((state) => state.finishStreaming)
+  const abortStreaming = useChatRuntimeStore((state) => state.abortStreaming)
   const currentSession = sessions.find((session) => session.id === currentSessionId)
   const effectiveProjectId = currentSession?.projectId ?? activeProjectId
+  const hasActiveStream = streamingSessionId !== null
+  const isStreaming = hasActiveStream
+  const currentSessionMessages = currentSessionId ? messagesBySessionId[currentSessionId] : undefined
   const activeAgentSettings = settings?.agent
   const activePreset = getActivePreset(activeAgentSettings)
   const activeModelMetadata = isRecord(activeModelInfo?.metadata) ? activeModelInfo.metadata : null
@@ -534,6 +544,33 @@ export default function ChatPage() {
     projects.find((project) => project.id === effectiveProjectId)?.workspaceDir ??
     getString(settings?.paths?.workspace_dir) ??
     undefined
+  const messages = React.useMemo<Message[]>(() => {
+    if (currentSessionMessages && currentSessionMessages.length > 0) {
+      return currentSessionMessages
+    }
+
+    if (!currentSessionId) {
+      return createInitialMessages(t)
+    }
+
+    if (currentSessionDetail?.id === currentSessionId) {
+      const replayMessages = api.buildMessagesFromSessionEvents(currentSessionDetail.events)
+      return replayMessages.length > 0 ? replayMessages : createInitialMessages(t)
+    }
+
+    if (isLoadingDetail) {
+      return [
+        {
+          id: `loading-${currentSessionId}`,
+          type: 'system',
+          content: t('chat.loadingSession'),
+          timestamp: new Date(),
+        },
+      ]
+    }
+
+    return createInitialMessages(t)
+  }, [currentSessionDetail, currentSessionId, currentSessionMessages, isLoadingDetail, t])
 
   React.useEffect(() => {
     const presetNames = activeAgentSettings?.presets.map((preset) => preset.name) ?? []
@@ -604,28 +641,31 @@ export default function ChatPage() {
   }, [])
 
   React.useEffect(() => {
-    if (!currentSessionId) {
-      setMessages(createInitialMessages(t))
+    if (!currentSessionId || currentSessionDetail?.id !== currentSessionId) {
       return
     }
+    const replayMessages = api.buildMessagesFromSessionEvents(currentSessionDetail.events)
+    if (replayMessages.length > 0) {
+      hydrateSessionMessages(currentSessionId, replayMessages)
+    }
+  }, [currentSessionDetail, currentSessionId, hydrateSessionMessages])
 
-    if (currentSessionDetail?.id === currentSessionId) {
-      const replayMessages = api.buildMessagesFromSessionEvents(currentSessionDetail.events)
-      setMessages(replayMessages.length > 0 ? replayMessages : createInitialMessages(t))
-      return
+  const resolveMessagesForSession = React.useCallback((sessionId: string): Message[] => {
+    const runtimeMessages = useChatRuntimeStore.getState().messagesBySessionId[sessionId]
+    if (runtimeMessages && runtimeMessages.length > 0) {
+      return runtimeMessages
     }
 
-    if (isLoadingDetail) {
-      setMessages([
-        {
-          id: `loading-${currentSessionId}`,
-          type: 'system',
-          content: t('chat.loadingSession'),
-          timestamp: new Date(),
-        },
-      ])
+    const detail = useSessionStore.getState().currentSessionDetail
+    if (detail?.id === sessionId) {
+      const replayMessages = api.buildMessagesFromSessionEvents(detail.events)
+      if (replayMessages.length > 0) {
+        return replayMessages
+      }
     }
-  }, [currentSessionDetail, currentSessionId, isLoadingDetail, t])
+
+    return createInitialMessages(t)
+  }, [t])
 
   const appendVoiceMessages = React.useCallback(
     (result: VoiceTurnResult) => {
@@ -656,7 +696,7 @@ export default function ChatPage() {
       }
 
       if (newMessages.length > 0) {
-        setMessages((prev) => [...prev, ...newMessages])
+        setSessionMessages(sessionId, [...resolveMessagesForSession(sessionId), ...newMessages])
       }
       if (assistantText) {
         updateLastMessage(sessionId, assistantText)
@@ -667,7 +707,7 @@ export default function ChatPage() {
       setVoiceFinalTranscription(transcript)
       setVoiceAssistantText(assistantText)
     },
-    [activeProjectId, createDraftSession, currentSessionId, selectSession, updateLastMessage]
+    [activeProjectId, createDraftSession, currentSessionId, resolveMessagesForSession, selectSession, setSessionMessages, updateLastMessage]
   )
 
   const ensureVoiceClient = React.useCallback((sessionId: string): VoiceWsClient => {
@@ -779,7 +819,6 @@ export default function ChatPage() {
 
   React.useEffect(() => {
     return () => {
-      activeAbortControllerRef.current?.abort()
       const client = voiceClientRef.current
       voiceClientRef.current = null
       if (client) {
@@ -928,7 +967,7 @@ export default function ChatPage() {
         attachments?: ChatAttachment[]
       }
     ) => {
-      if (isStreaming) {
+      if (hasActiveStream) {
         return
       }
 
@@ -960,15 +999,14 @@ export default function ChatPage() {
         ? t('chat.loadingLocalModel')
         : ''
 
-      setMessages((prev) => [
-        ...prev,
+      setSessionMessages(sessionId, [
+        ...resolveMessagesForSession(sessionId),
         userMessage,
         buildTurnPlaceholder(turnKey, { content: placeholderContent }),
       ])
-      setIsStreaming(true)
       updateLastMessage(sessionId, lastMessageSummary)
       const abortController = new AbortController()
-      activeAbortControllerRef.current = abortController
+      startStreaming(sessionId, abortController)
 
       try {
         let streamed = false
@@ -1007,7 +1045,7 @@ export default function ChatPage() {
               setCurrentModel(chunk.model)
             }
 
-            setMessages((prev) => applyStreamChunk(prev, chunk, turnKey))
+            updateSessionMessages(sessionId, (prev) => applyStreamChunk(prev, chunk, turnKey))
           }
         } catch (streamError) {
           if (!isStreamUnavailable(streamError)) {
@@ -1041,8 +1079,8 @@ export default function ChatPage() {
                 },
               ]
 
-          setMessages((prev) => [
-            ...prev.filter((message) => message.turnKey !== turnKey),
+          setSessionMessages(sessionId, [
+            ...resolveMessagesForSession(sessionId).filter((message) => message.turnKey !== turnKey),
             ...eventMessages,
           ])
 
@@ -1064,13 +1102,13 @@ export default function ChatPage() {
         }
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
-          setMessages((prev) => prev.map((message) =>
+          updateSessionMessages(sessionId, (prev) => prev.map((message) =>
             message.turnKey === turnKey ? { ...message, isStreaming: false } : message
           ))
           return
         }
         const detail = error instanceof Error ? error.message : null
-        setMessages((prev) => [
+        updateSessionMessages(sessionId, (prev) => [
           ...prev.filter((message) => message.turnKey !== turnKey),
           {
             id: `error-${Date.now()}`,
@@ -1082,8 +1120,7 @@ export default function ChatPage() {
           },
         ])
       } finally {
-        activeAbortControllerRef.current = null
-        setIsStreaming(false)
+        finishStreaming(sessionId)
       }
     },
     [
@@ -1093,11 +1130,16 @@ export default function ChatPage() {
       currentModelLoaded,
       currentSessionId,
       effectiveInference,
-      isStreaming,
+      finishStreaming,
+      hasActiveStream,
       materializeDraftSession,
+      resolveMessagesForSession,
       selectSession,
+      setSessionMessages,
       sessions,
+      startStreaming,
       t,
+      updateSessionMessages,
       updateLastMessage,
     ]
   )
@@ -1230,12 +1272,14 @@ export default function ChatPage() {
   }, [handleVoiceShortcut])
 
   const handleStopGeneration = React.useCallback(() => {
-    activeAbortControllerRef.current?.abort()
-  }, [])
+    abortStreaming()
+  }, [abortStreaming])
 
   const handleBuiltinCommand = React.useCallback((command: 'clear' | 'settings' | 'voice' | 'model' | 'export') => {
     if (command === 'clear') {
-      setMessages(createInitialMessages(t))
+      if (currentSessionId) {
+        setSessionMessages(currentSessionId, createInitialMessages(t))
+      }
       return
     }
     if (command === 'settings') {
@@ -1255,7 +1299,7 @@ export default function ChatPage() {
     if (command === 'export') {
       setExportOpen(true)
     }
-  }, [handleVoiceEntry, router, t])
+  }, [currentSessionId, handleVoiceEntry, router, setSessionMessages, t])
 
   const handleUndoFileChange = React.useCallback(async (change: FileChangeSummary) => {
     if (!change.undoAvailable || !change.undoAction) {
@@ -1286,16 +1330,21 @@ export default function ChatPage() {
     }
 
     const currentSession = sessions.find((session) => session.id === currentSessionId)
-    const forkedSessionId = await forkSessionFromTurn(
-      currentSessionId,
-      message.turnId,
-      currentSession?.projectId
-    )
+    const projectId = currentSession?.projectId ?? null
+    const forkTurnId = findEditForkTurnId(messages, message.id)
+    const replacementSessionId = forkTurnId
+      ? await forkSessionFromTurn(
+          currentSessionId,
+          forkTurnId,
+          projectId
+        )
+      : createDraftSession(projectId)
+
     await handleSend(nextContent, {
-      forceSessionId: forkedSessionId,
+      forceSessionId: replacementSessionId,
       attachments: message.attachments ?? [],
     })
-  }, [currentSessionId, forkSessionFromTurn, handleSend, sessions])
+  }, [createDraftSession, currentSessionId, forkSessionFromTurn, handleSend, messages, sessions])
 
   const handleStarterPrompt = React.useCallback((prompt: string) => {
     void handleSend(prompt)
@@ -1474,8 +1523,8 @@ export default function ChatPage() {
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
-        <div className="flex-1">
+      <div className="relative flex flex-1 overflow-hidden">
+        <div className="min-w-0 flex-1">
           <ScrollToBottom visible={showScrollToBottom} onClick={scrollToBottom} />
           <div ref={scrollRef} className="h-full overflow-y-auto">
             <div className="mx-auto flex w-full max-w-4xl flex-col px-4 py-8 sm:px-6">

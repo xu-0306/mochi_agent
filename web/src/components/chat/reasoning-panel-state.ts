@@ -4,10 +4,11 @@ export interface ReasoningPanelSummary {
   title: string
   detail: string
   hasError: boolean
+  latestIssue: string | null
 }
 
 interface SummaryOptions {
-  steps: Array<Pick<ReasoningStep, 'type' | 'toolName' | 'content' | 'status'>>
+  steps: Array<Pick<ReasoningStep, 'type' | 'toolName' | 'content' | 'status' | 'errorCode'>>
   isStreaming: boolean
   generationTimeMs?: number
 }
@@ -29,6 +30,28 @@ function countUniqueTools(
   ).size
 }
 
+function summarizeIssue(
+  steps: Array<Pick<ReasoningStep, 'type' | 'content' | 'status' | 'errorCode'>>
+): string | null {
+  const issueStep = [...steps].reverse().find(
+    (step) => step.type === 'error' || step.status === 'error'
+  )
+  if (!issueStep) {
+    return null
+  }
+
+  const firstLine = issueStep.content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0)
+
+  const summary = firstLine ?? issueStep.errorCode ?? 'Unknown issue'
+  if (summary.length <= 96) {
+    return summary
+  }
+  return `${summary.slice(0, 93)}...`
+}
+
 export function deriveReasoningPanelSummary({
   steps,
   isStreaming,
@@ -36,13 +59,15 @@ export function deriveReasoningPanelSummary({
 }: SummaryOptions): ReasoningPanelSummary {
   const latestTool = [...steps].reverse().find((step) => step.toolName)?.toolName
   const toolCount = countUniqueTools(steps)
-  const hasError = steps.some((step) => step.type === 'error' || step.status === 'error')
+  const latestIssue = summarizeIssue(steps)
+  const hasError = latestIssue !== null
 
   if (isStreaming) {
     return {
       title: 'Thinking…',
       detail: latestTool ? `${steps.length} steps, latest: ${latestTool}` : `${steps.length} steps`,
       hasError,
+      latestIssue,
     }
   }
 
@@ -54,14 +79,15 @@ export function deriveReasoningPanelSummary({
   if (toolCount > 0) {
     detailParts.push(`${toolCount} tool${toolCount === 1 ? '' : 's'}`)
   }
-  if (hasError) {
-    detailParts.push('includes issue')
+  if (latestIssue) {
+    detailParts.push(`issue: ${latestIssue}`)
   }
 
   return {
     title: duration,
     detail: detailParts.join(' · '),
     hasError,
+    latestIssue,
   }
 }
 

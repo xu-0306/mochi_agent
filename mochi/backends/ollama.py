@@ -117,7 +117,7 @@ class OllamaBackend(BaseLLMBackend):
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": self._serialize_messages(messages),
             "stream": stream,
             "options": options,
         }
@@ -125,7 +125,7 @@ class OllamaBackend(BaseLLMBackend):
         if think_value is not None:
             payload["think"] = think_value
         if tools:
-            payload["tools"] = [t.to_dict() for t in tools]
+            payload["tools"] = self._serialize_tools(tools)
 
         if stream:
             return self._stream_generate(payload)
@@ -138,17 +138,24 @@ class OllamaBackend(BaseLLMBackend):
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             logger.error(f"Ollama API error {exc.response.status_code}: {exc.response.text}")
-            raise self._wrap_request_error(exc, stage="generate") from exc
+            raise self._wrap_request_error(
+                exc,
+                stage="generate",
+                payload_preview=self._build_payload_preview(payload),
+            ) from exc
         except httpx.RequestError as exc:
             logger.error(f"Ollama connection error: {exc}")
-            raise self._wrap_request_error(exc, stage="generate") from exc
+            raise self._wrap_request_error(
+                exc,
+                stage="generate",
+                payload_preview=self._build_payload_preview(payload),
+            ) from exc
 
         data = resp.json()
         msg = data.get("message", {})
         content: str = msg.get("content", "")
-        thinking = msg.get("thinking", "")
-        if isinstance(thinking, str) and thinking:
-            content = f"<think>{thinking}</think>\n\n{content}" if content else f"<think>{thinking}</think>"
+        raw_thinking = msg.get("thinking", "")
+        thinking = raw_thinking if isinstance(raw_thinking, str) else ""
 
         tool_calls: list[ToolCall] = []
         for tc in msg.get("tool_calls", []):
@@ -164,12 +171,30 @@ class OllamaBackend(BaseLLMBackend):
                     id=tc.get("id", str(uuid.uuid4())),
                     name=fn.get("name", ""),
                     arguments=raw_args,
+                    index=fn.get("index") if isinstance(fn.get("index"), int) else None,
                 )
             )
+
+        if not tool_calls:
+            content = self._combine_reasoning_and_content(reasoning=thinking, content=content)
+            if not content.strip():
+                logger.warning("Ollama returned an empty non-tool response.")
+                raise BackendRequestError(
+                    "Ollama returned an empty response with no content or tool calls.",
+                    metadata={
+                        "backend_name": "ollama",
+                        "request_url": f"{self.base_url}/api/chat",
+                        "stage": "generate",
+                        "model": self.model,
+                        "request_payload_preview": self._build_payload_preview(payload),
+                        "response_preview": self._build_response_preview(data),
+                    },
+                )
 
         usage = data.get("prompt_eval_count", 0), data.get("eval_count", 0)
         return GenerationResult(
             content=content,
+            thinking=thinking,
             tool_calls=tool_calls,
             input_tokens=usage[0],
             output_tokens=usage[1],
@@ -212,11 +237,74 @@ class OllamaBackend(BaseLLMBackend):
         """關閉 HTTP client 連線。"""
         await self._client.aclose()
 
+    def _serialize_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+        """Serialize chat history into the Ollama-native message shape."""
+        serialized: list[dict[str, Any]] = []
+        for message in messages:
+            payload: dict[str, Any] = {
+                "role": message.role,
+                "content": self._serialize_tool_message_content(message)
+                if message.role == "tool"
+                else message.content,
+            }
+            if message.thinking:
+                payload["thinking"] = message.thinking
+            if message.role == "assistant" and message.tool_calls:
+                payload["tool_calls"] = [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            **(
+                                {"index": tool_call.index}
+                                if tool_call.index is not None
+                                else {}
+                            ),
+                        }
+                    }
+                    for tool_call in message.tool_calls
+                ]
+            if message.role == "tool" and message.name:
+                payload["tool_name"] = message.name
+            serialized.append(payload)
+        return serialized
+
+    def _serialize_tools(self, tools: list[ToolSchema]) -> list[dict[str, Any]]:
+        """Serialize tool schemas into the Ollama-native tools contract."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in tools
+        ]
+
+    def _serialize_tool_message_content(self, message: Message) -> str:
+        """Strip generic reinjection wrappers from tool messages for Ollama-native turns."""
+        if message.role != "tool":
+            return message.content
+
+        tool_name = message.name or "tool"
+        result_prefix = f"Tool {tool_name} result:\n"
+        error_prefix = f"Tool {tool_name} error:\n"
+        if message.content.startswith(result_prefix):
+            return message.content[len(result_prefix) :]
+        if message.content.startswith(error_prefix):
+            return f"Error: {message.content[len(error_prefix):]}"
+        return message.content
+
     def _wrap_request_error(
         self,
         exc: httpx.HTTPError,
         *,
         stage: str,
+        payload_preview: dict[str, Any] | None = None,
     ) -> BackendRequestError:
         metadata: dict[str, Any] = {
             "backend_name": "ollama",
@@ -224,10 +312,94 @@ class OllamaBackend(BaseLLMBackend):
             "stage": stage,
             "model": self.model,
         }
+        if payload_preview is not None:
+            metadata["request_payload_preview"] = payload_preview
         if isinstance(exc, httpx.HTTPStatusError):
             metadata["status_code"] = exc.response.status_code
             metadata["response_text"] = exc.response.text
         return BackendRequestError(str(exc), metadata=metadata)
+
+    def _build_payload_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        messages = payload.get("messages")
+        summarized_messages: list[dict[str, Any]] = []
+        if isinstance(messages, list):
+            raw_items = messages[-3:]
+            for raw in raw_items:
+                if not isinstance(raw, dict):
+                    continue
+                entry: dict[str, Any] = {
+                    "role": raw.get("role"),
+                    "content_preview": self._truncate_preview(str(raw.get("content", ""))),
+                }
+                thinking = raw.get("thinking")
+                if isinstance(thinking, str) and thinking:
+                    entry["thinking_preview"] = self._truncate_preview(thinking)
+                tool_name = raw.get("tool_name")
+                if isinstance(tool_name, str) and tool_name:
+                    entry["tool_name"] = tool_name
+                tool_calls = raw.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    entry["tool_calls"] = [
+                        {
+                            "id": item.get("id"),
+                            "type": item.get("type"),
+                            "function": (
+                                {
+                                    "name": item.get("function", {}).get("name"),
+                                    "arguments_type": type(item.get("function", {}).get("arguments")).__name__,
+                                }
+                                if isinstance(item, dict) and isinstance(item.get("function"), dict)
+                                else None
+                            ),
+                        }
+                        for item in tool_calls[:4]
+                        if isinstance(item, dict)
+                    ]
+                summarized_messages.append(entry)
+
+        return {
+            "model": payload.get("model"),
+            "stream": payload.get("stream"),
+            "message_count": len(messages) if isinstance(messages, list) else None,
+            "tool_count": len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
+            "tail_messages": summarized_messages,
+        }
+
+    def _build_response_preview(self, data: dict[str, Any]) -> dict[str, Any]:
+        msg = data.get("message", {})
+        preview: dict[str, Any] = {
+            "model": data.get("model", self.model),
+            "done": data.get("done"),
+            "done_reason": data.get("done_reason"),
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "eval_count": data.get("eval_count"),
+        }
+        if isinstance(msg, dict):
+            preview["message"] = {
+                "role": msg.get("role"),
+                "content_preview": self._truncate_preview(str(msg.get("content", ""))),
+                "thinking_preview": self._truncate_preview(str(msg.get("thinking", ""))),
+                "tool_call_count": (
+                    len(msg.get("tool_calls", []))
+                    if isinstance(msg.get("tool_calls"), list)
+                    else None
+                ),
+            }
+        return preview
+
+    @staticmethod
+    def _truncate_preview(value: str, max_chars: int = 240) -> str:
+        if len(value) <= max_chars:
+            return value
+        return value[: max_chars - 14] + "...[truncated]"
+
+    @staticmethod
+    def _combine_reasoning_and_content(*, reasoning: str, content: str) -> str:
+        if reasoning and content:
+            return f"<think>{reasoning}</think>\n\n{content}"
+        if reasoning:
+            return f"<think>{reasoning}</think>"
+        return content
 
     @staticmethod
     def _supports_reasoning_effort_model(model: str) -> bool:

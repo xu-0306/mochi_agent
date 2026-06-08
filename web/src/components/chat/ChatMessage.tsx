@@ -22,6 +22,24 @@ interface ChatMessageProps {
   onUndoFileChange?: (change: FileChangeSummary) => Promise<void> | void
 }
 
+function hasWideMarkdownContent(content: string): boolean {
+  if (!content.trim()) {
+    return false
+  }
+
+  if (/```[\s\S]*?```/.test(content)) {
+    return true
+  }
+
+  if (/^\|.+\|\s*$/m.test(content)) {
+    return true
+  }
+
+  return content
+    .split(/\r?\n/)
+    .some((line) => line.trim().length >= 96 && !/\s/.test(line.trim()))
+}
+
 function formatTokenStats(message: Message): string | null {
   if (!message.tokenStats) {
     return null
@@ -74,6 +92,7 @@ export function ChatMessage({
     () => createMarkdownCodeComponents({ showCopyButton: true }),
     []
   )
+  const prefersWideAssistantLayout = type === 'assistant' && hasWideMarkdownContent(content)
 
   React.useEffect(() => {
     setDraftContent(content)
@@ -129,7 +148,12 @@ export function ChatMessage({
   if (type === 'user') {
     return (
       <div className="group flex justify-end animate-slide-up">
-        <div className="flex max-w-[720px] flex-col items-end gap-1">
+        <div
+          className={cn(
+            'flex max-w-[720px] flex-col gap-1',
+            isEditing ? 'w-full items-stretch' : 'items-end'
+          )}
+        >
           <div className="relative w-full">
             {!isEditing ? (
               <div className="pointer-events-none absolute top-2 right-2 z-10 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
@@ -161,6 +185,7 @@ export function ChatMessage({
                 'bg-primary-500 px-4 py-3 text-white',
                 'rounded-[18px_18px_6px_18px]',
                 'whitespace-pre-wrap break-words text-sm leading-relaxed shadow-sm',
+                isEditing ? 'w-full' : null,
                 !isEditing && onEditAndResend ? 'pr-16' : null
               )}
             >
@@ -227,7 +252,13 @@ export function ChatMessage({
               )}
             </div>
           </div>
-          <span className="px-1 text-[11px] text-muted-foreground" title={timestampTitle}>
+          <span
+            className={cn(
+              'px-1 text-[11px] text-muted-foreground',
+              isEditing ? 'self-end' : null
+            )}
+            title={timestampTitle}
+          >
             {timestampLabel}
           </span>
         </div>
@@ -238,7 +269,14 @@ export function ChatMessage({
   return (
     <div className="group animate-slide-up">
       <div className="flex justify-start">
-        <div className="w-full max-w-[760px]">
+        <div
+          className={cn(
+            'w-full',
+            prefersWideAssistantLayout
+              ? 'max-w-[min(1120px,calc(100vw-10rem))]'
+              : 'max-w-[760px]'
+          )}
+        >
           <ReasoningPanel
             steps={reasoningSteps ?? []}
             isStreaming={isStreaming}

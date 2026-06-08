@@ -1,12 +1,14 @@
 # Inspired by openclaw/src/agents/pi-embedded-runner design pattern
-"""Async ReAct 迴圈 — 核心推理引擎。"""
+"""Async ReAct loop for tool-capable backends."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+import re
 import time
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     from loguru import logger
@@ -24,7 +26,7 @@ from mochi.agents.events import (
     ToolCallResultEvent,
 )
 from mochi.backends.base import BackendRequestError
-from mochi.backends.types import Message
+from mochi.backends.types import Message, ToolCall
 from mochi.tools.base import ToolResult
 from mochi.tools.transport_guard import ToolResultTransportGuard
 
@@ -36,14 +38,7 @@ if TYPE_CHECKING:
 
 
 class AsyncReActLoop:
-    """非同步 ReAct（Reasoning + Acting）迴圈。
-
-    流程（非串流模式，Phase 1）：
-        1. 組裝 messages（system + history + user）
-        2. 呼叫 LLM（non-stream）
-        3. 若 LLM 請求工具呼叫 → 執行工具 → 觀察結果 → 繼續
-        4. 無工具呼叫 → 輸出最終回答，結束迴圈
-    """
+    """Run a non-streaming ReAct loop until a final answer is produced."""
 
     def __init__(
         self,
@@ -53,18 +48,12 @@ class AsyncReActLoop:
         max_iterations: int = 10,
         max_tool_message_chars: int = 2000,
     ) -> None:
-        """初始化 ReAct 迴圈。
-
-        Args:
-            backend: LLM 後端實例。
-            tool_registry: 工具注冊表，None 表示不使用工具。
-            max_iterations: 最大迭代次數（防止無限循環）。
-        """
         self._backend = backend
         self._tool_registry = tool_registry
         self._tool_execution_context = tool_execution_context
         self._max_iterations = max_iterations
         self._max_tool_message_chars = max(256, max_tool_message_chars)
+        self._max_repeated_tool_rounds = 3
         self._transport_guard = ToolResultTransportGuard()
         self._last_transport_diagnostics: dict[str, Any] | None = None
 
@@ -83,24 +72,6 @@ class AsyncReActLoop:
         repeat_penalty: float = 1.0,
         reasoning_effort: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """執行完整 ReAct 迴圈，以非同步生成器形式產出事件流。
-
-        Args:
-            system_prompt: 組裝好的系統提示詞。
-            history: 對話歷史（不含本輪 user message）。
-            user_message: 本輪使用者輸入。
-            temperature: 採樣溫度。
-            max_tokens: 最大輸出 token 數。
-            top_p: Top-p 取樣。
-            min_p: Min-p 取樣。
-            top_k: Top-k 取樣。
-            frequency_penalty: Frequency penalty。
-            presence_penalty: Presence penalty。
-            repeat_penalty: Repeat penalty。
-
-        Yields:
-            各類 AgentEvent（工具呼叫、最終回答、錯誤等）。
-        """
         messages: list[Message] = [
             Message(role="system", content=system_prompt),
             *history,
@@ -123,18 +94,17 @@ class AsyncReActLoop:
             yield event
 
     def _collect_tool_schemas(self) -> list[ToolSchema]:
-        """從 tool_registry 收集工具 schema。"""
-        from mochi.backends.types import ToolSchema as _TS
+        from mochi.backends.types import ToolSchema as _ToolSchema
 
         if self._tool_registry is None:
             return []
         return [
-            _TS(
-                name=s["function"]["name"],
-                description=s["function"]["description"],
-                parameters=s["function"].get("parameters", {}),
+            _ToolSchema(
+                name=schema["function"]["name"],
+                description=schema["function"]["description"],
+                parameters=schema["function"].get("parameters", {}),
             )
-            for s in self._tool_registry.get_schemas()
+            for schema in self._tool_registry.get_schemas()
         ]
 
     async def _run_nonstream(
@@ -152,15 +122,6 @@ class AsyncReActLoop:
         repeat_penalty: float,
         reasoning_effort: str | None,
     ) -> AsyncIterator[AgentEvent]:
-        """非串流模式 ReAct 迴圈（Phase 1 主要執行路徑）。
-
-        Args:
-            messages: 已組裝的訊息列表。
-            tools: 可用工具列表。
-
-        Yields:
-            AgentEvent 事件流。
-        """
         from mochi.backends.types import GenerationResult
 
         final_text = ""
@@ -168,6 +129,22 @@ class AsyncReActLoop:
         total_output_tokens = 0
         total_generation_time_ms = 0.0
         finish_reason = "stop"
+        last_tool_signature: tuple[str, ...] | None = None
+        repeated_tool_rounds = 0
+        web_fetch_guard_state: dict[str, Any] = {
+            "last_failed_url": None,
+            "failure_streak": 0,
+            "blocked_urls": {},
+        }
+        literature_state: dict[str, Any] = {
+            "research_mode": False,
+            "paper_hits": 0,
+            "abstract_hits": 0,
+            "fetched_docs": 0,
+            "fetched_chars": 0,
+            "summary_ready": False,
+            "prompt_injected": False,
+        }
 
         try:
             for iteration in range(self._max_iterations):
@@ -175,7 +152,7 @@ class AsyncReActLoop:
 
                 started_at = time.perf_counter()
                 try:
-                    generate_kwargs = {
+                    generate_kwargs: dict[str, Any] = {
                         "messages": messages,
                         "tools": tools if tools else None,
                         "temperature": temperature,
@@ -208,58 +185,101 @@ class AsyncReActLoop:
                 total_output_tokens += result.output_tokens
                 finish_reason = result.finish_reason or finish_reason
 
-                # 若有工具呼叫
                 if result.tool_calls:
-                    if result.content:
-                        yield ThinkingEvent(content=result.content)
+                    current_tool_signature = self._build_tool_call_signature(result.tool_calls)
+                    if current_tool_signature == last_tool_signature:
+                        repeated_tool_rounds += 1
+                    else:
+                        last_tool_signature = current_tool_signature
+                        repeated_tool_rounds = 1
+                    if repeated_tool_rounds >= self._max_repeated_tool_rounds:
+                        logger.warning(
+                            "ReAct loop detected repeated tool-call pattern "
+                            f"({repeated_tool_rounds} consecutive rounds)"
+                        )
+                        yield ErrorEvent(
+                            message="Model repeated the same tool-call pattern without making progress.",
+                            code="REPEATED_TOOL_LOOP",
+                            metadata=self._build_repeated_tool_loop_metadata(
+                                finish_reason=finish_reason,
+                                repeated_tool_rounds=repeated_tool_rounds,
+                                tool_calls=result.tool_calls,
+                            ),
+                        )
+                        return
+
+                    thought_content = result.thinking or result.content
+                    if thought_content:
+                        yield ThinkingEvent(content=thought_content)
 
                     messages.append(
                         Message(
                             role="assistant",
                             content=result.content,
+                            thinking=result.thinking,
                             tool_calls=result.tool_calls,
                         )
                     )
 
-                    for tc in result.tool_calls:
+                    for tool_call in result.tool_calls:
                         yield ToolCallRequestEvent(
-                            call_id=tc.id,
-                            tool_name=tc.name,
-                            arguments=tc.arguments,
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
                         )
 
                         tool_output: Any = None
                         tool_error: str | None = None
                         tool_metadata: dict[str, Any] = {}
                         tool_result_payload = ToolResult(output=None, error=None)
+                        self._mark_literature_research_mode(tool_call, literature_state)
+                        guarded_tool_result = self._build_guarded_tool_result(
+                            tool_call=tool_call,
+                            literature_state=literature_state,
+                            web_fetch_guard_state=web_fetch_guard_state,
+                        )
+                        if guarded_tool_result is not None:
+                            tool_output = guarded_tool_result.output
+                            tool_error = guarded_tool_result.error
+                            tool_metadata = (
+                                dict(guarded_tool_result.metadata)
+                                if isinstance(guarded_tool_result.metadata, dict)
+                                else {}
+                            )
+                            tool_result_payload = guarded_tool_result
+                            formatted_content = self._format_tool_message_content(
+                                output=tool_output,
+                                error=tool_error,
+                            )
                         if self._tool_registry is not None:
-                            try:
-                                tr = await self._tool_registry.execute(
-                                    tc.name,
-                                    tc.arguments,
-                                    context=self._tool_execution_context,
-                                )
-                                tool_output = tr.output
-                                tool_error = tr.error
-                                tool_metadata = (
-                                    dict(tr.metadata)
-                                    if isinstance(tr.metadata, dict)
-                                    else {}
-                                )
-                                tool_result_payload = tr
-                                formatted_content = self._tool_registry.format_result_for_model(
-                                    tc.name,
-                                    tr,
-                                    max_chars=self._max_tool_message_chars,
-                                )
-                            except Exception as exc:
-                                tool_error = str(exc)
-                                tool_result_payload = ToolResult(output=tool_output, error=tool_error)
-                                formatted_content = self._format_tool_message_content(
-                                    output=tool_output,
-                                    error=tool_error,
-                                )
-                        else:
+                            if guarded_tool_result is None:
+                                try:
+                                    tool_result = await self._tool_registry.execute(
+                                        tool_call.name,
+                                        tool_call.arguments,
+                                        context=self._tool_execution_context,
+                                    )
+                                    tool_output = tool_result.output
+                                    tool_error = tool_result.error
+                                    tool_metadata = (
+                                        dict(tool_result.metadata)
+                                        if isinstance(tool_result.metadata, dict)
+                                        else {}
+                                    )
+                                    tool_result_payload = tool_result
+                                    formatted_content = self._tool_registry.format_result_for_model(
+                                        tool_call.name,
+                                        tool_result,
+                                        max_chars=self._max_tool_message_chars,
+                                    )
+                                except Exception as exc:
+                                    tool_error = str(exc)
+                                    tool_result_payload = ToolResult(output=tool_output, error=tool_error)
+                                    formatted_content = self._format_tool_message_content(
+                                        output=tool_output,
+                                        error=tool_error,
+                                    )
+                        elif guarded_tool_result is None:
                             tool_error = "No tool registry configured."
                             tool_result_payload = ToolResult(output=tool_output, error=tool_error)
                             formatted_content = self._format_tool_message_content(
@@ -267,8 +287,19 @@ class AsyncReActLoop:
                                 error=tool_error,
                             )
 
+                        self._update_web_fetch_guard_state(
+                            tool_call=tool_call,
+                            tool_result=tool_result_payload,
+                            web_fetch_guard_state=web_fetch_guard_state,
+                        )
+                        self._update_literature_state(
+                            tool_call=tool_call,
+                            tool_result=tool_result_payload,
+                            literature_state=literature_state,
+                        )
+
                         tool_content, transport_diagnostics = self._guard_tool_message(
-                            tool_name=tc.name,
+                            tool_name=tool_call.name,
                             result=tool_result_payload,
                             formatted_content=formatted_content,
                         )
@@ -279,8 +310,8 @@ class AsyncReActLoop:
                         }
 
                         yield ToolCallResultEvent(
-                            call_id=tc.id,
-                            tool_name=tc.name,
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
                             result=tool_output,
                             error=tool_error,
                             metadata=tool_metadata,
@@ -290,19 +321,46 @@ class AsyncReActLoop:
                             Message(
                                 role="tool",
                                 content=tool_content,
-                                tool_call_id=tc.id,
-                                name=tc.name,
+                                tool_call_id=tool_call.id,
+                                name=tool_call.name,
                             )
                         )
-                    continue  # 繼續下一輪
+                    if literature_state["summary_ready"] and not literature_state["prompt_injected"]:
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=self._build_literature_summary_prompt(literature_state),
+                            )
+                        )
+                        literature_state["prompt_injected"] = True
+                    continue
 
-                # 無工具呼叫 → 最終回答
                 final_text = result.content
+                if not final_text.strip():
+                    backend_info = self._backend.get_model_info()
+                    logger.warning("ReAct loop received an empty final response from the backend.")
+                    yield ErrorEvent(
+                        message="Model returned an empty response.",
+                        metadata={
+                            "backend": {
+                                "backend_type": backend_info.backend_type,
+                                "model": backend_info.name,
+                                "finish_reason": finish_reason,
+                            }
+                        },
+                    )
+                    return
+                last_tool_signature = None
+                repeated_tool_rounds = 0
                 break
-
             else:
                 logger.warning(f"ReAct loop reached max iterations ({self._max_iterations})")
-
+                yield ErrorEvent(
+                    message="Model reached the maximum tool-call iterations without producing a final answer.",
+                    code="MAX_ITERATIONS_REACHED",
+                    metadata=self._build_max_iterations_metadata(finish_reason=finish_reason),
+                )
+                return
         except Exception as exc:
             logger.exception(f"ReAct loop error: {exc}")
             yield ErrorEvent(
@@ -320,7 +378,6 @@ class AsyncReActLoop:
         )
 
     def _format_tool_message_content(self, *, output: Any, error: str | None) -> str:
-        """將工具結果轉成可回灌給模型的穩定 JSON 文字。"""
         if error:
             payload: dict[str, Any] = {"ok": False, "error": error}
         else:
@@ -399,6 +456,313 @@ class AsyncReActLoop:
         if self._last_transport_diagnostics is not None:
             metadata["transport"] = dict(self._last_transport_diagnostics)
         return metadata
+
+    def _build_max_iterations_metadata(self, *, finish_reason: str) -> dict[str, Any]:
+        backend_info = self._backend.get_model_info()
+        backend_metadata: dict[str, Any] = {
+            "backend_type": backend_info.backend_type,
+            "model": backend_info.name,
+            "finish_reason": finish_reason,
+        }
+        if isinstance(backend_info.metadata, dict):
+            api_mode = backend_info.metadata.get("api_mode")
+            if isinstance(api_mode, str):
+                backend_metadata["api_mode"] = api_mode
+
+        metadata: dict[str, Any] = {
+            "backend": backend_metadata,
+            "loop": {
+                "max_iterations": self._max_iterations,
+            },
+        }
+        if self._last_transport_diagnostics is not None:
+            metadata["transport"] = dict(self._last_transport_diagnostics)
+        return metadata
+
+    def _build_repeated_tool_loop_metadata(
+        self,
+        *,
+        finish_reason: str,
+        repeated_tool_rounds: int,
+        tool_calls: list[ToolCall],
+    ) -> dict[str, Any]:
+        backend_info = self._backend.get_model_info()
+        backend_metadata: dict[str, Any] = {
+            "backend_type": backend_info.backend_type,
+            "model": backend_info.name,
+            "finish_reason": finish_reason,
+        }
+        if isinstance(backend_info.metadata, dict):
+            api_mode = backend_info.metadata.get("api_mode")
+            if isinstance(api_mode, str):
+                backend_metadata["api_mode"] = api_mode
+
+        metadata: dict[str, Any] = {
+            "backend": backend_metadata,
+            "loop": {
+                "repeated_tool_rounds": repeated_tool_rounds,
+                "tool_calls": [
+                    {
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                    }
+                    for tool_call in tool_calls
+                ],
+            },
+        }
+        if self._last_transport_diagnostics is not None:
+            metadata["transport"] = dict(self._last_transport_diagnostics)
+        return metadata
+
+    @staticmethod
+    def _build_tool_call_signature(tool_calls: list[ToolCall]) -> tuple[str, ...]:
+        return tuple(
+            f"{tool_call.name}:{json.dumps(AsyncReActLoop._normalize_tool_arguments(tool_call.arguments), ensure_ascii=False, sort_keys=True, default=str)}"
+            for tool_call in tool_calls
+        )
+
+    @staticmethod
+    def _normalize_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+        return {
+            str(key): AsyncReActLoop._normalize_tool_argument_value(str(key), value)
+            for key, value in sorted(arguments.items())
+        }
+
+    @staticmethod
+    def _normalize_tool_argument_value(key: str, value: Any) -> Any:
+        if isinstance(value, str):
+            if key == "url":
+                return AsyncReActLoop._normalize_url(value)
+            if key in {"query", "title", "doi", "pmid", "paper_id", "arxiv_id"}:
+                return AsyncReActLoop._normalize_text(value)
+            return value.strip()
+        if isinstance(value, dict):
+            return {
+                str(child_key): AsyncReActLoop._normalize_tool_argument_value(str(child_key), child_value)
+                for child_key, child_value in sorted(value.items())
+            }
+        if isinstance(value, list):
+            return [AsyncReActLoop._normalize_tool_argument_value(key, item) for item in value]
+        return value
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        lowered = value.strip().lower()
+        lowered = re.sub(r"[\s\-_]+", " ", lowered)
+        return re.sub(r"\s+", " ", lowered)
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        cleaned = url.strip()
+        if not cleaned:
+            return ""
+        parts = urlsplit(cleaned)
+        path = parts.path.rstrip("/")
+        query = "&".join(sorted(filter(None, parts.query.split("&"))))
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
+
+    def _build_guarded_tool_result(
+        self,
+        *,
+        tool_call: ToolCall,
+        literature_state: dict[str, Any],
+        web_fetch_guard_state: dict[str, Any],
+    ) -> ToolResult | None:
+        if tool_call.name == "web_fetch":
+            normalized_url = self._normalize_url(str(tool_call.arguments.get("url", "")))
+            blocked_urls = web_fetch_guard_state.get("blocked_urls", {})
+            if isinstance(blocked_urls, dict) and normalized_url in blocked_urls:
+                blocked_info = blocked_urls[normalized_url]
+                failure_count = blocked_info.get("failure_count", 2) if isinstance(blocked_info, dict) else 2
+                status_code = blocked_info.get("status_code") if isinstance(blocked_info, dict) else None
+                return ToolResult(
+                    error=(
+                        "Skipping repeated fetch because this URL already failed multiple times: "
+                        f"{tool_call.arguments.get('url', '')}"
+                    ),
+                    metadata={
+                        "url": tool_call.arguments.get("url", ""),
+                        "status_code": status_code,
+                        "guard": "repeated_web_fetch_failure",
+                        "failure_count": failure_count,
+                    },
+                    retryable=False,
+                    suggestion="Use another source or summarize from the evidence already collected.",
+                )
+
+        if literature_state["summary_ready"] and self._is_research_retrieval_tool_call(tool_call):
+            return ToolResult(
+                error=(
+                    "Sufficient literature evidence is already collected. "
+                    "Do not call more search or fetch tools; synthesize the answer now."
+                ),
+                metadata={
+                    "guard": "literature_summary_ready",
+                    "paper_hits": literature_state["paper_hits"],
+                    "abstract_hits": literature_state["abstract_hits"],
+                    "fetched_docs": literature_state["fetched_docs"],
+                    "fetched_chars": literature_state["fetched_chars"],
+                },
+                retryable=False,
+                suggestion="Summarize the retrieved papers now and cite the most relevant evidence.",
+            )
+        return None
+
+    def _update_web_fetch_guard_state(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        web_fetch_guard_state: dict[str, Any],
+    ) -> None:
+        if tool_call.name != "web_fetch":
+            return
+        normalized_url = self._normalize_url(str(tool_call.arguments.get("url", "")))
+        if not normalized_url:
+            return
+
+        blocked_urls = web_fetch_guard_state.setdefault("blocked_urls", {})
+        if not isinstance(blocked_urls, dict):
+            blocked_urls = {}
+            web_fetch_guard_state["blocked_urls"] = blocked_urls
+
+        if tool_result.error:
+            last_failed_url = web_fetch_guard_state.get("last_failed_url")
+            failure_streak = int(web_fetch_guard_state.get("failure_streak", 0))
+            failure_streak = failure_streak + 1 if last_failed_url == normalized_url else 1
+            web_fetch_guard_state["last_failed_url"] = normalized_url
+            web_fetch_guard_state["failure_streak"] = failure_streak
+            if failure_streak >= 2:
+                blocked_urls[normalized_url] = {
+                    "failure_count": failure_streak,
+                    "status_code": tool_result.metadata.get("status_code"),
+                }
+            return
+
+        if web_fetch_guard_state.get("last_failed_url") == normalized_url:
+            web_fetch_guard_state["last_failed_url"] = None
+            web_fetch_guard_state["failure_streak"] = 0
+        blocked_urls.pop(normalized_url, None)
+
+    def _mark_literature_research_mode(self, tool_call: ToolCall, literature_state: dict[str, Any]) -> None:
+        if self._is_literature_tool_name(tool_call.name) or self._tool_call_mentions_literature(tool_call):
+            literature_state["research_mode"] = True
+
+    def _update_literature_state(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        literature_state: dict[str, Any],
+    ) -> None:
+        self._mark_literature_research_mode(tool_call, literature_state)
+        if tool_result.error:
+            return
+
+        if tool_call.name in {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"}:
+            output = tool_result.output if isinstance(tool_result.output, list) else []
+            literature_state["paper_hits"] += len(output)
+            literature_state["abstract_hits"] += sum(
+                1
+                for item in output
+                if isinstance(item, dict)
+                and any(
+                    isinstance(item.get(field), str) and item.get(field, "").strip()
+                    for field in ("abstract", "summary")
+                )
+            )
+        elif tool_call.name == "web_fetch":
+            url = str(tool_call.arguments.get("url", ""))
+            if literature_state["research_mode"] or self._looks_like_academic_url(url):
+                output = tool_result.output
+                if isinstance(output, str) and output.strip():
+                    literature_state["fetched_docs"] += 1
+                    literature_state["fetched_chars"] += len(output)
+
+        literature_state["summary_ready"] = self._has_sufficient_literature_evidence(literature_state)
+
+    @staticmethod
+    def _is_literature_tool_name(tool_name: str) -> bool:
+        return tool_name in {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"}
+
+    def _tool_call_mentions_literature(self, tool_call: ToolCall) -> bool:
+        query = tool_call.arguments.get("query")
+        if isinstance(query, str):
+            normalized = self._normalize_text(query)
+            if any(
+                token in normalized
+                for token in (
+                    "paper",
+                    "papers",
+                    "literature",
+                    "research",
+                    "study",
+                    "studies",
+                    "doi",
+                    "arxiv",
+                    "pubmed",
+                    "論文",
+                    "文獻",
+                    "研究",
+                )
+            ):
+                return True
+        url = tool_call.arguments.get("url")
+        return isinstance(url, str) and self._looks_like_academic_url(url)
+
+    def _is_research_retrieval_tool_call(self, tool_call: ToolCall) -> bool:
+        return tool_call.name in {
+            "web_search",
+            "web_fetch",
+            "arxiv_search",
+            "semantic_scholar_search",
+            "crossref_search",
+            "pubmed_search",
+        }
+
+    def _has_sufficient_literature_evidence(self, literature_state: dict[str, Any]) -> bool:
+        if not literature_state["research_mode"]:
+            return False
+        paper_hits = int(literature_state["paper_hits"])
+        abstract_hits = int(literature_state["abstract_hits"])
+        fetched_docs = int(literature_state["fetched_docs"])
+        fetched_chars = int(literature_state["fetched_chars"])
+        return (
+            (paper_hits >= 3 and abstract_hits >= 2)
+            or (paper_hits >= 2 and fetched_docs >= 1 and (abstract_hits >= 1 or fetched_chars >= 2500))
+            or (paper_hits >= 2 and fetched_docs >= 2)
+        )
+
+    def _build_literature_summary_prompt(self, literature_state: dict[str, Any]) -> str:
+        return (
+            "You already have enough literature evidence. "
+            f"Collected about {literature_state['paper_hits']} paper records, "
+            f"{literature_state['abstract_hits']} abstracts, and "
+            f"{literature_state['fetched_docs']} fetched documents. "
+            "Stop calling more search or fetch tools unless a core fact is still missing. "
+            "Now synthesize the retrieved papers, compare the most relevant findings, and mention uncertainty when needed."
+        )
+
+    @staticmethod
+    def _looks_like_academic_url(url: str) -> bool:
+        normalized_url = AsyncReActLoop._normalize_url(url)
+        return any(
+            host_fragment in normalized_url
+            for host_fragment in (
+                "arxiv.org",
+                "doi.org",
+                "semanticscholar.org",
+                "pubmed.ncbi.nlm.nih.gov",
+                "ncbi.nlm.nih.gov",
+                "openreview.net",
+                "aclanthology.org",
+                "biorxiv.org",
+                "medrxiv.org",
+                "springer.com",
+                "nature.com",
+                "sciencedirect.com",
+            )
+        )
 
     @staticmethod
     def _truncate_text(value: str, max_chars: int) -> str:
