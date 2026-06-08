@@ -17,6 +17,7 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    index: int | None = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class Message:
 
     role: Role
     content: str
+    thinking: str = ""
     tool_calls: list[ToolCall] = field(default_factory=partial(list[ToolCall]))
     tool_call_id: str | None = None
     name: str | None = None
@@ -94,6 +96,7 @@ class GenerationResult:
     """Non-stream generation output."""
 
     content: str
+    thinking: str = ""
     tool_calls: list[ToolCall] = field(default_factory=partial(list[ToolCall]))
     input_tokens: int = 0
     output_tokens: int = 0

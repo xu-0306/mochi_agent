@@ -89,6 +89,7 @@ def create_app() -> FastAPI:
         chat_router,
         file_ops_router,
         filesystem_router,
+        model_auth_router,
         models_router,
         projects_router,
         sessions_router,
@@ -102,6 +103,7 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router)
     app.include_router(agent_runs_router)
     app.include_router(approvals_router)
+    app.include_router(model_auth_router)
     app.include_router(models_router)
     app.include_router(skills_router)
     app.include_router(projects_router)

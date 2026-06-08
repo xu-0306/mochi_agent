@@ -177,6 +177,22 @@ class OpenAICompatConfig(BaseModel):
     """HTTP 請求逾時秒數。"""
 
 
+class OpenAICodexConfig(BaseModel):
+    """OpenAI Codex OAuth-backed transport settings."""
+
+    base_url: str = "https://chatgpt.com/backend-api"
+    """OpenAI Codex backend base URL."""
+
+    model: str = "gpt-5.4"
+    """OpenAI Codex model identifier."""
+
+    auth_profile_id: str | None = None
+    """External auth profile id stored outside config.yaml."""
+
+    timeout: float = 120.0
+    """HTTP request timeout."""
+
+
 class VLLMConfig(BaseModel):
     """Managed vLLM runtime 閮剖?"""
 
@@ -245,7 +261,7 @@ class ConfiguredModelConfig(BaseModel):
     id: str = Field(min_length=1)
     """模型清單項目的穩定識別碼；可由 `/v1/models/switch` 使用。"""
 
-    provider: Literal["ollama", "openai_compat", "gemini", "anthropic", "vllm", "local"]
+    provider: Literal["ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"]
     """模型供應商 preset。"""
 
     model: str = Field(min_length=1)
@@ -265,6 +281,13 @@ class ConfiguredModelConfig(BaseModel):
 
     launch_mode: Literal["external", "managed"] | None = None
     """底層 backend family。"""
+
+
+    auth_profile_id: str | None = None
+    """External auth profile id used by OAuth-backed providers."""
+
+    auth_mode: Literal["none", "api_key", "oauth"] | None = None
+    """Auth mode metadata for the configured model entry."""
 
 
 class ModelSetupConfig(BaseModel):
@@ -915,6 +938,7 @@ class MochiConfig(BaseModel):
 
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     openai_compat: OpenAICompatConfig = Field(default_factory=OpenAICompatConfig)
+    openai_codex: OpenAICodexConfig = Field(default_factory=OpenAICodexConfig)
     vllm: VLLMConfig = Field(default_factory=VLLMConfig)
     gguf: GGUFConfig = Field(default_factory=GGUFConfig)
     huggingface: HuggingFaceConfig = Field(default_factory=HuggingFaceConfig)

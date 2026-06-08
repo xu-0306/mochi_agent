@@ -84,6 +84,12 @@ type ApiModule = typeof api & {
   fetchModels?: () => Promise<unknown[]>
   fetchChannelsStatus?: () => Promise<api.ChannelsStatus>
   configureModel?: (input: api.ConfigureModelInput) => Promise<api.ConfigureModelResult>
+  fetchOpenAICodexAuthStatus?: () => Promise<api.OpenAICodexAuthStatus>
+  importOpenAICodexCliLogin?: () => Promise<api.OpenAICodexImportResult>
+  startOpenAICodexBrowserLogin?: (frontendOrigin?: string) => Promise<api.OpenAICodexLoginStartResult>
+  completeOpenAICodexBrowserLogin?: (input: api.OpenAICodexLoginCompleteInput) => Promise<api.OpenAICodexImportResult>
+  refreshOpenAICodexAuth?: () => Promise<api.OpenAICodexImportResult>
+  logoutOpenAICodexAuth?: () => Promise<api.OpenAICodexLogoutResult>
   fetchOllamaModels?: (baseUrl: string) => Promise<api.OllamaModelsResult>
   fetchLocalModels?: (root: string) => Promise<api.LocalModelsResult>
   fetchLocalModelCapabilities?: (model: string) => Promise<api.LocalModelCapabilitiesResult>
@@ -603,7 +609,9 @@ function activeConfiguredModel(settings: unknown, models: api.ModelInfo[]): api.
       provider,
       modelSpec: rootModel || remoteBaseUrl,
       baseUrl: remoteBaseUrl ?? (isUrlLike(rootModel) ? rootModel : null),
-      backendType: 'openai_compat',
+      backendType: provider === 'openai_codex' ? 'openai_codex' : 'openai_compat',
+      authProfileId: null,
+      authMode: null,
       contextLength: null,
       supportsToolCalling: null,
       metadata: {},
@@ -683,6 +691,8 @@ function modelInfoFromRecord(record: Record<string, unknown>): api.ModelInfo | n
     modelSpec: stringField(record, 'model_spec'),
     baseUrl: stringField(record, 'base_url'),
     backendType: stringField(record, 'backend_type') ?? '',
+    authProfileId: stringField(record, 'auth_profile_id'),
+    authMode: stringField(record, 'auth_mode'),
     contextLength: typeof record.context_length === 'number' ? record.context_length : null,
     supportsToolCalling: typeof record.supports_tool_calling === 'boolean' ? record.supports_tool_calling : null,
     metadata: {},
@@ -727,6 +737,8 @@ function configuredModelRecordFromModelInfo(modelInfo: api.ModelInfo): Record<st
     model_spec: modelInfo.modelSpec || null,
     base_url: modelInfo.baseUrl,
     backend_type: modelInfo.backendType ?? null,
+    auth_profile_id: modelInfo.authProfileId,
+    auth_mode: modelInfo.authMode,
   }
 }
 
@@ -1308,6 +1320,13 @@ const providerOptions: Array<{
     needsApiKey: true,
   },
   {
+    value: 'openai_codex',
+    label: 'OpenAI Codex',
+    defaultBaseUrl: 'https://chatgpt.com/backend-api',
+    defaultModel: 'gpt-5.4',
+    needsApiKey: false,
+  },
+  {
     value: 'gemini',
     label: 'Gemini',
     defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
@@ -1702,6 +1721,7 @@ function isProviderChoice(value: unknown): value is ProviderChoice {
   return (
     value === 'ollama' ||
     value === 'openai_compat' ||
+    value === 'openai_codex' ||
     value === 'gemini' ||
     value === 'anthropic' ||
     value === 'local'
@@ -1716,6 +1736,7 @@ function providerDescription(provider: ProviderChoice, t: Translator): string {
   const keys: Record<ProviderChoice, string> = {
     ollama: 'settings.provider.ollama.description',
     openai_compat: 'settings.provider.openaiCompat.description',
+    openai_codex: 'settings.provider.openaiCodex.description',
     gemini: 'settings.provider.gemini.description',
     anthropic: 'settings.provider.anthropic.description',
     vllm: 'settings.provider.openaiCompat.description',
@@ -1728,12 +1749,42 @@ function providerNote(provider: ProviderChoice, t: Translator): string {
   const keys: Record<ProviderChoice, string> = {
     ollama: 'settings.provider.ollama.note',
     openai_compat: 'settings.provider.openaiCompat.note',
+    openai_codex: 'settings.provider.openaiCodex.note',
     gemini: 'settings.provider.gemini.note',
     anthropic: 'settings.provider.anthropic.note',
     vllm: 'settings.provider.openaiCompat.note',
     local: 'settings.provider.local.note',
   }
   return t(keys[provider])
+}
+
+function openAICodexStatusVariant(status: string | null | undefined, configured: boolean | null | undefined): 'success' | 'warning' | 'error' | 'neutral' {
+  if (!configured) {
+    return 'neutral'
+  }
+  if (status === 'refresh_failed' || status === 'expired') {
+    return 'error'
+  }
+  if (status === 'expiring') {
+    return 'warning'
+  }
+  return 'success'
+}
+
+function openAICodexStatusLabel(status: string | null | undefined, configured: boolean | null | undefined): string {
+  if (!configured) {
+    return 'Not connected'
+  }
+  if (status === 'refresh_failed') {
+    return 'Refresh failed'
+  }
+  if (status === 'expired') {
+    return 'Expired'
+  }
+  if (status === 'expiring') {
+    return 'Expiring soon'
+  }
+  return 'Connected'
 }
 
 function configuredProvider(modelConfig: Record<string, unknown>, configuredModel: string | null): ProviderChoice {
@@ -1749,6 +1800,10 @@ function configuredProvider(modelConfig: Record<string, unknown>, configuredMode
     return 'local'
   }
   if (configuredModel?.startsWith('http://') || configuredModel?.startsWith('https://')) {
+    const codexBaseUrl = getStringSetting(modelConfig, 'openai_codex_base_url').trim()
+    if (codexBaseUrl && configuredModel === codexBaseUrl) {
+      return 'openai_codex'
+    }
     const remoteProvider = modelConfig.openai_compat_provider
     return isProviderChoice(remoteProvider) && remoteProvider !== 'ollama'
       ? remoteProvider
@@ -1767,6 +1822,9 @@ function configuredBaseUrl(
   if (provider === 'ollama') {
     return getStringSetting(modelConfig, 'ollama_base_url', providerOption(provider).defaultBaseUrl)
   }
+  if (provider === 'openai_codex') {
+    return getStringSetting(modelConfig, 'openai_codex_base_url', providerOption(provider).defaultBaseUrl)
+  }
   return getStringSetting(modelConfig, 'openai_compat_base_url', providerOption(provider).defaultBaseUrl)
 }
 
@@ -1784,6 +1842,9 @@ function configuredModelName(
       configuredModel?.replace(/^ollama:/, '') ||
       providerOption(provider).defaultModel
     )
+  }
+  if (provider === 'openai_codex') {
+    return getStringSetting(modelConfig, 'openai_codex_model', providerOption(provider).defaultModel)
   }
   return getStringSetting(modelConfig, 'openai_compat_model', providerOption(provider).defaultModel)
 }
@@ -2239,6 +2300,11 @@ function ModelConnectionForm({
   const [convertingLocalModel, setConvertingLocalModel] = React.useState(false)
   const [convertMessage, setConvertMessage] = React.useState<FormMessage>(null)
   const [convertedOutputPath, setConvertedOutputPath] = React.useState<string | null>(null)
+  const [openAICodexStatus, setOpenAICodexStatus] = React.useState<api.OpenAICodexAuthStatus | null>(null)
+  const [openAICodexAuthBusy, setOpenAICodexAuthBusy] = React.useState(false)
+  const [openAICodexAuthMessage, setOpenAICodexAuthMessage] = React.useState<FormMessage>(null)
+  const [openAICodexLoginStart, setOpenAICodexLoginStart] = React.useState<api.OpenAICodexLoginStartResult | null>(null)
+  const [openAICodexManualCallbackUrl, setOpenAICodexManualCallbackUrl] = React.useState('')
   const [submitting, setSubmitting] = React.useState(false)
   const [message, setMessage] = React.useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [editingModelId, setEditingModelId] = React.useState<string | null>(null)
@@ -2250,6 +2316,7 @@ function ModelConnectionForm({
   const [entrySubmitting, setEntrySubmitting] = React.useState(false)
   const [entryMessage, setEntryMessage] = React.useState<FormMessage>(null)
   const discoveryKeyRef = React.useRef(`${initialProvider}:${baseUrl}`)
+  const openAICodexPopupRef = React.useRef<Window | null>(null)
   const localModelOptions = React.useMemo(
     () => localModels.map((entry) => modelInfoId(entry)).filter((id) => id.length > 0),
     [localModels]
@@ -2339,6 +2406,7 @@ function ModelConnectionForm({
     setConvertingLocalModel(false)
     setConvertMessage(null)
     setConvertedOutputPath(null)
+    setOpenAICodexAuthMessage(null)
     setMessage(null)
   }
 
@@ -2419,6 +2487,115 @@ function ModelConnectionForm({
       setDiscovering(false)
     }
   }, [baseUrl, provider, t])
+
+  React.useEffect(() => {
+    if (provider !== 'openai_codex') {
+      openAICodexPopupRef.current?.close()
+      openAICodexPopupRef.current = null
+      setOpenAICodexAuthBusy(false)
+      setOpenAICodexAuthMessage(null)
+      setOpenAICodexLoginStart(null)
+      setOpenAICodexManualCallbackUrl('')
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      const loadStatus = async () => {
+        setOpenAICodexAuthBusy(true)
+        setOpenAICodexAuthMessage(null)
+        try {
+          if (typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function') {
+            throw new Error('OpenAI Codex auth status API client is unavailable.')
+          }
+          const result = await settingsApi.fetchOpenAICodexAuthStatus()
+          setOpenAICodexStatus(result)
+        } catch (statusError) {
+          setOpenAICodexStatus(null)
+          setOpenAICodexAuthMessage({
+            type: 'error',
+            text: messageWithDetail('Failed to load OpenAI Codex auth status', statusError),
+          })
+        } finally {
+          setOpenAICodexAuthBusy(false)
+        }
+      }
+
+      void loadStatus()
+    }, 150)
+
+    return () => window.clearTimeout(timer)
+  }, [provider])
+
+  React.useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (!openAICodexLoginStart) {
+        return
+      }
+      const expectedOrigin = (() => {
+        try {
+          return new URL(openAICodexLoginStart.callbackUrl).origin
+        } catch {
+          return null
+        }
+      })()
+      if (!expectedOrigin || event.origin !== expectedOrigin) {
+        return
+      }
+      if (openAICodexPopupRef.current && event.source !== openAICodexPopupRef.current) {
+        return
+      }
+      const payload = asRecord(event.data)
+      if (!payload || payload.type !== 'mochi-openai-codex-auth-callback') {
+        return
+      }
+
+      const status = typeof payload.status === 'string' ? payload.status : 'error'
+      const callbackMessage = typeof payload.message === 'string' && payload.message.trim()
+        ? payload.message
+        : 'OpenAI Codex login callback returned without a message.'
+
+      openAICodexPopupRef.current?.close()
+      openAICodexPopupRef.current = null
+
+      if (status !== 'success') {
+        setOpenAICodexAuthBusy(false)
+        setOpenAICodexAuthMessage({
+          type: 'error',
+          text: callbackMessage,
+        })
+        return
+      }
+
+      const refreshStatus = async () => {
+        setOpenAICodexAuthBusy(true)
+        try {
+          if (typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function') {
+            throw new Error('OpenAI Codex auth status API client is unavailable.')
+          }
+          const statusResult = await settingsApi.fetchOpenAICodexAuthStatus()
+          setOpenAICodexStatus(statusResult)
+          setOpenAICodexLoginStart(null)
+          setOpenAICodexManualCallbackUrl('')
+          setOpenAICodexAuthMessage({
+            type: 'success',
+            text: callbackMessage,
+          })
+        } catch (statusError) {
+          setOpenAICodexAuthMessage({
+            type: 'error',
+            text: messageWithDetail('OpenAI Codex login completed but status refresh failed', statusError),
+          })
+        } finally {
+          setOpenAICodexAuthBusy(false)
+        }
+      }
+
+      void refreshStatus()
+    }
+
+    window.addEventListener('message', handleMessage)
+    return () => window.removeEventListener('message', handleMessage)
+  }, [openAICodexLoginStart])
 
   React.useEffect(() => {
     if (provider !== 'ollama') {
@@ -2572,6 +2749,163 @@ function ModelConnectionForm({
     }
     if (provider === 'local') {
       void discoverLocalModels()
+    }
+  }
+
+  const importOpenAICodexCliLogin = async () => {
+    setOpenAICodexAuthBusy(true)
+    setOpenAICodexAuthMessage(null)
+    try {
+      if (typeof settingsApi.importOpenAICodexCliLogin !== 'function' || typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function') {
+        throw new Error('OpenAI Codex auth API client is unavailable.')
+      }
+      await settingsApi.importOpenAICodexCliLogin()
+      const status = await settingsApi.fetchOpenAICodexAuthStatus()
+      setOpenAICodexStatus(status)
+      setOpenAICodexAuthMessage({
+        type: 'success',
+        text: 'Imported Codex CLI login.',
+      })
+    } catch (importError) {
+      setOpenAICodexAuthMessage({
+        type: 'error',
+        text: messageWithDetail('Failed to import Codex CLI login', importError),
+      })
+    } finally {
+      setOpenAICodexAuthBusy(false)
+    }
+  }
+
+  const connectOpenAICodexLogin = async () => {
+    setOpenAICodexAuthBusy(true)
+    setOpenAICodexAuthMessage(null)
+    const popup = typeof window !== 'undefined'
+      ? window.open('', 'mochi-openai-codex-login', 'popup=yes,width=560,height=760')
+      : null
+
+    try {
+      if (
+        typeof settingsApi.startOpenAICodexBrowserLogin !== 'function' ||
+        typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function'
+      ) {
+        throw new Error('OpenAI Codex browser login API client is unavailable.')
+      }
+      const login = await settingsApi.startOpenAICodexBrowserLogin(
+        typeof window !== 'undefined' ? window.location.origin : undefined
+      )
+      setOpenAICodexLoginStart(login)
+      setOpenAICodexManualCallbackUrl('')
+
+      if (popup) {
+        popup.location.href = login.authUrl
+        openAICodexPopupRef.current = popup
+      }
+
+      setOpenAICodexAuthMessage({
+        type: 'success',
+        text: login.callbackReady
+          ? (popup
+            ? 'Browser login window opened. Complete sign-in there.'
+            : 'Browser login link prepared. Open the sign-in URL below.')
+          : 'Browser login started, but local callback binding is unavailable. After sign-in, paste the full callback URL below.',
+      })
+    } catch (loginError) {
+      popup?.close()
+      openAICodexPopupRef.current = null
+      setOpenAICodexAuthMessage({
+        type: 'error',
+        text: messageWithDetail('Failed to start OpenAI Codex browser login', loginError),
+      })
+    } finally {
+      setOpenAICodexAuthBusy(false)
+    }
+  }
+
+  const completeOpenAICodexLogin = async () => {
+    const callbackUrl = openAICodexManualCallbackUrl.trim()
+    if (!callbackUrl) {
+      setOpenAICodexAuthMessage({
+        type: 'error',
+        text: 'Paste the full callback URL before completing OpenAI Codex login.',
+      })
+      return
+    }
+
+    setOpenAICodexAuthBusy(true)
+    setOpenAICodexAuthMessage(null)
+    try {
+      if (
+        typeof settingsApi.completeOpenAICodexBrowserLogin !== 'function' ||
+        typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function'
+      ) {
+        throw new Error('OpenAI Codex browser login API client is unavailable.')
+      }
+      await settingsApi.completeOpenAICodexBrowserLogin({ callbackUrl })
+      const status = await settingsApi.fetchOpenAICodexAuthStatus()
+      setOpenAICodexStatus(status)
+      setOpenAICodexLoginStart(null)
+      setOpenAICodexManualCallbackUrl('')
+      setOpenAICodexAuthMessage({
+        type: 'success',
+        text: 'OpenAI Codex browser login saved.',
+      })
+    } catch (completeError) {
+      setOpenAICodexAuthMessage({
+        type: 'error',
+        text: messageWithDetail('Failed to complete OpenAI Codex browser login', completeError),
+      })
+    } finally {
+      setOpenAICodexAuthBusy(false)
+    }
+  }
+
+  const refreshOpenAICodexLogin = async () => {
+    setOpenAICodexAuthBusy(true)
+    setOpenAICodexAuthMessage(null)
+    try {
+      if (typeof settingsApi.refreshOpenAICodexAuth !== 'function' || typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function') {
+        throw new Error('OpenAI Codex auth API client is unavailable.')
+      }
+      await settingsApi.refreshOpenAICodexAuth()
+      const status = await settingsApi.fetchOpenAICodexAuthStatus()
+      setOpenAICodexStatus(status)
+      setOpenAICodexAuthMessage({
+        type: 'success',
+        text: 'Refreshed Codex CLI login import.',
+      })
+    } catch (refreshError) {
+      setOpenAICodexAuthMessage({
+        type: 'error',
+        text: messageWithDetail('Failed to refresh Codex CLI login import', refreshError),
+      })
+    } finally {
+      setOpenAICodexAuthBusy(false)
+    }
+  }
+
+  const logoutOpenAICodexLogin = async () => {
+    setOpenAICodexAuthBusy(true)
+    setOpenAICodexAuthMessage(null)
+    try {
+      if (typeof settingsApi.logoutOpenAICodexAuth !== 'function' || typeof settingsApi.fetchOpenAICodexAuthStatus !== 'function') {
+        throw new Error('OpenAI Codex auth API client is unavailable.')
+      }
+      await settingsApi.logoutOpenAICodexAuth()
+      const status = await settingsApi.fetchOpenAICodexAuthStatus()
+      setOpenAICodexStatus(status)
+      setOpenAICodexLoginStart(null)
+      setOpenAICodexManualCallbackUrl('')
+      setOpenAICodexAuthMessage({
+        type: 'success',
+        text: 'Removed stored OpenAI Codex login.',
+      })
+    } catch (logoutError) {
+      setOpenAICodexAuthMessage({
+        type: 'error',
+        text: messageWithDetail('Failed to remove stored OpenAI Codex login', logoutError),
+      })
+    } finally {
+      setOpenAICodexAuthBusy(false)
     }
   }
 
@@ -2769,12 +3103,16 @@ function ModelConnectionForm({
           throw new Error(t('settings.modelConnection.ggufRuntimeMissing'))
         }
       }
+      if (provider === 'openai_codex' && !openAICodexStatus?.activeProfileId) {
+        throw new Error('Connect ChatGPT or import a Codex CLI login before connecting OpenAI Codex.')
+      }
 
       const result = await settingsApi.configureModel({
         provider,
         model,
         baseUrl: provider === 'local' ? undefined : baseUrl,
-        apiKey: provider === 'local' ? '' : apiKey,
+        apiKey: provider === 'local' || provider === 'openai_codex' ? '' : apiKey,
+        authProfileId: provider === 'openai_codex' ? openAICodexStatus?.activeProfileId ?? undefined : undefined,
         persist: true,
       })
       onConfigured(result)
@@ -2830,6 +3168,8 @@ function ModelConnectionForm({
               modelSpec: outputPath,
               baseUrl: null,
               backendType: 'gguf',
+              authProfileId: null,
+              authMode: null,
               contextLength: null,
               supportsToolCalling: null,
               metadata: {},
@@ -2874,7 +3214,9 @@ function ModelConnectionForm({
     setEditingModelId(modelInfoId(entry))
     const nextProvider = (entry.provider && isProviderChoice(entry.provider))
       ? entry.provider
-      : (entry.backendType === 'openai_compat' ? 'openai_compat' : 'local')
+      : (entry.backendType === 'openai_codex'
+        ? 'openai_codex'
+        : (entry.backendType === 'openai_compat' ? 'openai_compat' : 'local'))
     setEditingProvider(nextProvider)
     setEditingModelName(entry.name || '')
     setEditingModelSpec(entry.modelSpec || modelInfoId(entry))
@@ -2911,7 +3253,8 @@ function ModelConnectionForm({
         model: editingModelName.trim(),
         modelSpec: payloadModelSpec,
         baseUrl: editingProvider === 'local' ? null : editingBaseUrl.trim(),
-        apiKey: editingApiKey.trim() || null,
+        apiKey: editingProvider === 'openai_codex' ? null : (editingApiKey.trim() || null),
+        authProfileId: editingProvider === 'openai_codex' ? openAICodexStatus?.activeProfileId ?? null : null,
         persist: true,
       })
       const availableModels = result.availableModels
@@ -2995,35 +3338,44 @@ function ModelConnectionForm({
         </div>
 
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(220px,320px)]">
-          <label className="min-w-0 space-y-1.5">
-            <span className="text-xs font-medium text-muted-foreground">
-              {provider === 'local' ? t('settings.modelConnection.localRootPath') : t('settings.form.apiUrl')}
-            </span>
-            <div className="flex min-w-0 gap-2">
-              <Input
-                value={baseUrl}
-                onChange={(event) => {
-                  setBaseUrl(event.target.value)
-                  setDiscoverMessage(null)
-                }}
-                placeholder={provider === 'local' ? t('settings.modelConnection.localRootPlaceholder') : currentProvider.defaultBaseUrl}
-                className="min-w-0 font-mono text-xs"
-              />
-              {provider === 'ollama' || provider === 'local' ? (
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="icon-sm"
-                  loading={discovering}
-                  aria-label={provider === 'local' ? t('settings.modelConnection.scanLocal') : t('settings.modelConnection.refreshOllama')}
-                  title={provider === 'local' ? t('settings.modelConnection.scanLocal') : t('settings.modelConnection.refreshOllama')}
-                  onClick={discoverCurrentProviderModels}
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                </Button>
-              ) : null}
+          {provider === 'openai_codex' ? (
+            <div className="min-w-0 space-y-1.5">
+              <span className="text-xs font-medium text-muted-foreground">Backend URL</span>
+              <div className="rounded-md border border-border bg-surface-layer px-3 py-2 font-mono text-xs text-muted-foreground">
+                {currentProvider.defaultBaseUrl}
+              </div>
             </div>
-          </label>
+          ) : (
+            <label className="min-w-0 space-y-1.5">
+              <span className="text-xs font-medium text-muted-foreground">
+                {provider === 'local' ? t('settings.modelConnection.localRootPath') : t('settings.form.apiUrl')}
+              </span>
+              <div className="flex min-w-0 gap-2">
+                <Input
+                  value={baseUrl}
+                  onChange={(event) => {
+                    setBaseUrl(event.target.value)
+                    setDiscoverMessage(null)
+                  }}
+                  placeholder={provider === 'local' ? t('settings.modelConnection.localRootPlaceholder') : currentProvider.defaultBaseUrl}
+                  className="min-w-0 font-mono text-xs"
+                />
+                {provider === 'ollama' || provider === 'local' ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="icon-sm"
+                    loading={discovering}
+                    aria-label={provider === 'local' ? t('settings.modelConnection.scanLocal') : t('settings.modelConnection.refreshOllama')}
+                    title={provider === 'local' ? t('settings.modelConnection.scanLocal') : t('settings.modelConnection.refreshOllama')}
+                    onClick={discoverCurrentProviderModels}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  </Button>
+                ) : null}
+              </div>
+            </label>
+          )}
 
           <label className="min-w-0 space-y-1.5">
             <span className="text-xs font-medium text-muted-foreground">
@@ -3055,7 +3407,118 @@ function ModelConnectionForm({
           </label>
         </div>
 
-        {provider !== 'local' ? (
+        {provider === 'openai_codex' ? (
+          <div className="space-y-3 rounded-md border border-border bg-canvas px-3 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold text-foreground">OpenAI Codex Login</p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Sign in with ChatGPT in your browser, or import the existing `codex` login from `.codex/auth.json`.
+                </p>
+              </div>
+              <Badge variant={openAICodexStatusVariant(openAICodexStatus?.status, openAICodexStatus?.configured)}>
+                {openAICodexStatusLabel(openAICodexStatus?.status, openAICodexStatus?.configured)}
+              </Badge>
+            </div>
+
+            <div className="rounded-md border border-border bg-surface-layer px-3 py-2 text-xs text-muted-foreground">
+              {openAICodexStatus?.activeProfileId
+                ? `Active profile: ${openAICodexStatus.activeProfileId}`
+                : 'No imported OpenAI Codex login'}
+            </div>
+
+            {openAICodexStatus?.profiles?.[0]?.email ? (
+              <div className="rounded-md border border-border bg-surface-layer px-3 py-2 text-xs text-muted-foreground">
+                Account: {openAICodexStatus.profiles[0].email}
+                {openAICodexStatus.profiles[0].expiresAt
+                  ? ` | Expires: ${new Date(openAICodexStatus.profiles[0].expiresAt * 1000).toLocaleString()}`
+                  : ''}
+              </div>
+            ) : null}
+
+            {openAICodexStatus?.lastRefreshError ? (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                Refresh error: {openAICodexStatus.lastRefreshError}
+              </div>
+            ) : null}
+
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" variant="secondary" loading={openAICodexAuthBusy} onClick={() => void importOpenAICodexCliLogin()}>
+                <Download className="h-3.5 w-3.5" />
+                Import Codex CLI Login
+              </Button>
+              <Button type="button" variant="outline" loading={openAICodexAuthBusy} onClick={() => void connectOpenAICodexLogin()}>
+                <Globe className="h-3.5 w-3.5" />
+                Connect ChatGPT
+              </Button>
+              <Button type="button" variant="secondary" loading={openAICodexAuthBusy} onClick={() => void refreshOpenAICodexLogin()}>
+                <RefreshCw className="h-3.5 w-3.5" />
+                Refresh Login
+              </Button>
+              <Button type="button" variant="ghost" loading={openAICodexAuthBusy} onClick={() => void logoutOpenAICodexLogin()}>
+                <Trash2 className="h-3.5 w-3.5" />
+                Logout
+              </Button>
+            </div>
+
+            {openAICodexLoginStart ? (
+              <div className="space-y-3 rounded-md border border-border bg-surface-layer px-3 py-3">
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold text-foreground">Browser OAuth in progress</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Callback expires at {new Date(openAICodexLoginStart.expiresAt * 1000).toLocaleString()}.
+                  </p>
+                </div>
+
+                <div className="rounded-md border border-border bg-canvas px-3 py-2 text-xs text-muted-foreground">
+                  Sign-in URL:{' '}
+                  <a
+                    href={openAICodexLoginStart.authUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="break-all text-primary-400 underline underline-offset-2"
+                  >
+                    {openAICodexLoginStart.authUrl}
+                  </a>
+                </div>
+
+                <div className="rounded-md border border-border bg-canvas px-3 py-2 text-xs text-muted-foreground">
+                  Callback URL: <span className="break-all font-mono">{openAICodexLoginStart.callbackUrl}</span>
+                </div>
+
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">Manual callback URL</span>
+                  <Input
+                    value={openAICodexManualCallbackUrl}
+                    onChange={(event) => setOpenAICodexManualCallbackUrl(event.target.value)}
+                    placeholder="Paste the full callback URL here if the popup cannot finish automatically"
+                    className="font-mono text-xs"
+                  />
+                </label>
+
+                <div className="flex flex-wrap gap-2">
+                  <Button type="button" variant="secondary" loading={openAICodexAuthBusy} onClick={() => void completeOpenAICodexLogin()}>
+                    Save Browser Login
+                  </Button>
+                </div>
+
+                {openAICodexLoginStart.guidance.length > 0 ? (
+                  <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+                    {openAICodexLoginStart.guidance.map((item, index) => (
+                      <p key={`${item}-${index}`} className={index === 0 ? '' : 'mt-1'}>
+                        {item}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            <SettingMessage message={openAICodexAuthMessage} />
+          </div>
+        ) : null}
+
+        {provider !== 'local' && provider !== 'openai_codex' ? (
           <label className="block space-y-1.5">
             <span className="text-xs font-medium text-muted-foreground">{t('settings.form.apiKey')}</span>
             <div className="relative">
@@ -3292,6 +3755,10 @@ function ModelConnectionForm({
                           placeholder={t('settings.modelConnection.localModelPath')}
                           className="font-mono text-xs"
                         />
+                      ) : editingProvider === 'openai_codex' ? (
+                        <div className="rounded-md border border-border bg-surface-layer px-3 py-2 font-mono text-xs text-muted-foreground">
+                          {editingBaseUrl || 'https://chatgpt.com/backend-api'}
+                        </div>
                       ) : (
                         <Input
                           value={editingBaseUrl}
@@ -3300,7 +3767,7 @@ function ModelConnectionForm({
                           className="font-mono text-xs"
                         />
                       )}
-                      {editingProvider !== 'local' && editingProvider !== 'ollama' ? (
+                      {editingProvider !== 'local' && editingProvider !== 'ollama' && editingProvider !== 'openai_codex' ? (
                         <>
                           <Input
                             type="password"
@@ -3312,6 +3779,11 @@ function ModelConnectionForm({
                           />
                           <p className="text-[11px] text-muted-foreground">{t('settings.savedModels.apiKeyHint')}</p>
                         </>
+                      ) : null}
+                      {editingProvider === 'openai_codex' ? (
+                        <p className="text-[11px] text-muted-foreground">
+                          OpenAI Codex uses the imported OAuth profile and does not store an API key on the model entry.
+                        </p>
                       ) : null}
                       <div className="flex items-center justify-end gap-2">
                         <Button
@@ -5531,9 +6003,13 @@ export default function SettingsPage() {
                         local_model_root: isLocalModel
                           ? withNullableString(localModelRootFromModelInfo(savedModelInfo))
                           : null,
-                        openai_compat_provider: result.provider === 'ollama' || isLocalModel ? null : result.provider,
-                        openai_compat_base_url: result.provider === 'ollama' || isLocalModel ? null : withNullableString(remoteBaseUrl),
+                        openai_compat_provider: result.provider === 'ollama' || isLocalModel || result.provider === 'openai_codex' ? null : result.provider,
+                        openai_compat_base_url: result.provider === 'ollama' || isLocalModel || result.provider === 'openai_codex' ? null : withNullableString(remoteBaseUrl),
                         openai_compat_model: savedBackendType === 'openai_compat' ? savedModelName : '',
+                        openai_codex_base_url: result.provider === 'openai_codex' ? withNullableString(remoteBaseUrl) : null,
+                        openai_codex_model: result.provider === 'openai_codex' ? savedModelName : null,
+                        openai_codex_auth_profile_id: result.provider === 'openai_codex' ? withNullableString(savedModelInfo.authProfileId) : null,
+                        openai_codex_auth_configured: result.provider === 'openai_codex' ? Boolean(savedModelInfo.authProfileId) : false,
                       },
                       model_setup: {
                         ...(current.model_setup ?? {}),

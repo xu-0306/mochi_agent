@@ -26,6 +26,11 @@ from mochi.api.server import (
     _get_or_create_engine,
     _maybe_await,
 )
+from mochi.auth.openai_codex import (
+    OPENAI_CODEX_DEFAULT_BASE_URL,
+    OpenAICodexAuthService,
+    normalize_openai_codex_base_url,
+)
 from mochi.backends.local_models import (
     BaseLocalModelConverter,
     LlamaCppLocalModelConverter,
@@ -57,12 +62,16 @@ from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 
 router = APIRouter(prefix="/v1")
 
-ModelProvider = Literal["ollama", "openai_compat", "gemini", "anthropic", "vllm", "local"]
+ModelProvider = Literal["ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"]
 
 _REMOTE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "openai_compat": {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o-mini",
+    },
+    "openai_codex": {
+        "base_url": OPENAI_CODEX_DEFAULT_BASE_URL,
+        "model": "gpt-5.4",
     },
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -136,6 +145,7 @@ class ConfigureModelRequest(BaseModel):
     model: str = Field(min_length=1)
     base_url: str | None = None
     api_key: str | None = None
+    auth_profile_id: str | None = None
     persist: bool = True
 
 
@@ -159,6 +169,7 @@ class UpdateConfiguredModelPayload(BaseModel):
     model_spec: str | None = None
     base_url: str | None = None
     api_key: str | None = None
+    auth_profile_id: str | None = None
     persist: bool = True
 
 
@@ -358,7 +369,7 @@ async def get_models(request: Request) -> ModelsResponse:
         supported_model_spec_formats=list(_SUPPORTED_MODEL_SPEC_FORMATS),
         active_model=active_model,
         available_models=_serialize_configured_models(config),
-        configured_remote_provider=getattr(config.openai_compat, "provider", None),
+        configured_remote_provider=_active_remote_provider_from_config(config),
     )
 
 
@@ -795,7 +806,7 @@ async def update_configured_model(
         raise HTTPException(status_code=404, detail=f"Configured model was not found: {target_id}")
 
     next_provider = payload.provider or existing.provider
-    if next_provider not in {"ollama", "openai_compat", "gemini", "anthropic", "vllm", "local"}:
+    if next_provider not in {"ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"}:
         raise HTTPException(status_code=400, detail=f"Unsupported provider '{next_provider}'.")
 
     next_model = (payload.model if payload.model is not None else existing.model).strip()
@@ -870,7 +881,14 @@ async def update_configured_model(
         provided_base_url = payload.base_url if payload.base_url is not None else (
             existing.base_url or existing.model_spec
         )
-        normalized_base_url = (provided_base_url or provider_defaults["base_url"]).strip().rstrip("/")
+        try:
+            normalized_base_url = (
+                normalize_openai_codex_base_url(provided_base_url)
+                if next_provider == "openai_codex"
+                else (provided_base_url or provider_defaults["base_url"]).strip().rstrip("/")
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not normalized_base_url.startswith(("http://", "https://")):
             raise HTTPException(
                 status_code=400,
@@ -882,6 +900,8 @@ async def update_configured_model(
     backend_type = (
         "ollama"
         if next_provider == "ollama"
+        else "openai_codex"
+        if next_provider == "openai_codex"
         else "openai_compat"
         if next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}
         else "gguf"
@@ -900,6 +920,26 @@ async def update_configured_model(
         else f"{next_provider}:{next_base_url}:{next_model}"
     )
     next_label = next_model if next_provider in {"ollama", "local"} else f"{next_model} ({next_provider})"
+    next_auth_profile_id = (
+        payload.auth_profile_id
+        if "auth_profile_id" in payload.model_fields_set
+        else existing.auth_profile_id
+    )
+    if next_provider == "openai_codex":
+        auth_service = _openai_codex_auth_service(updated)
+        next_auth_profile_id = auth_service.resolve_profile_id(next_auth_profile_id)
+        if next_auth_profile_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No OpenAI Codex auth profile is available. Import Codex CLI login first.",
+            )
+    next_auth_mode = (
+        "oauth"
+        if next_provider == "openai_codex"
+        else "api_key"
+        if next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}
+        else None
+    )
 
     replacement = ConfiguredModelConfig(
         id=next_id,
@@ -910,6 +950,8 @@ async def update_configured_model(
         label=next_label,
         backend_type=backend_type,
         launch_mode=next_launch_mode,
+        auth_profile_id=next_auth_profile_id,
+        auth_mode=next_auth_mode,
     )
 
     deduped_models = [
@@ -926,7 +968,12 @@ async def update_configured_model(
 
     api_key_changed = "api_key" in payload.model_fields_set
     api_key_configured = False
-    if next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}:
+    if next_provider == "openai_codex":
+        updated.openai_codex.base_url = (next_base_url or next_model_spec).rstrip("/")
+        updated.openai_codex.model = next_model
+        updated.openai_codex.auth_profile_id = next_auth_profile_id
+        api_key_configured = False
+    elif next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}:
         updated.openai_compat.provider = next_provider
         updated.openai_compat.base_url = (next_base_url or next_model_spec).rstrip("/")
         updated.openai_compat.model = next_model
@@ -1117,6 +1164,67 @@ async def configure_model(
             config_path=str(persisted_path) if persisted_path is not None else None,
         )
 
+    if payload.provider == "openai_codex":
+        provider_defaults = _REMOTE_PROVIDER_DEFAULTS[payload.provider]
+        try:
+            normalized_base_url = normalize_openai_codex_base_url(
+                payload.base_url or provider_defaults["base_url"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        normalized_model = payload.model.strip() or provider_defaults["model"]
+        auth_service = _openai_codex_auth_service(config)
+        auth_profile_id = auth_service.resolve_profile_id(
+            payload.auth_profile_id or config.openai_codex.auth_profile_id
+        )
+        if auth_profile_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No OpenAI Codex auth profile is available. Import Codex CLI login first.",
+            )
+        switch_openai_codex = getattr(engine, "switch_openai_codex_backend", None)
+        try:
+            if callable(switch_openai_codex):
+                model_info = await _maybe_await(
+                    switch_openai_codex(
+                        base_url=normalized_base_url,
+                        model=normalized_model,
+                        auth_profile_id=auth_profile_id,
+                    )
+                )
+            else:
+                model_info = await _maybe_await(engine.switch_model(normalized_base_url))
+        except (RuntimeError, ValueError) as exc:
+            raise _translate_model_switch_error(exc) from exc
+
+        updated = config.model_copy(deep=True)
+        updated.model = normalized_base_url
+        updated.openai_codex.base_url = normalized_base_url
+        updated.openai_codex.model = normalized_model
+        updated.openai_codex.auth_profile_id = auth_profile_id
+        updated.model_setup.configured_models = _upsert_configured_model(
+            updated.model_setup.configured_models,
+            _configured_model_from_parts(
+                provider=payload.provider,
+                model=normalized_model,
+                model_spec=normalized_base_url,
+                base_url=normalized_base_url,
+                active_model=model_info,
+                auth_profile_id=auth_profile_id,
+                auth_mode="oauth",
+            ),
+        )
+        request.app.state.config = updated
+        persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
+        return ConfigureModelResponse(
+            provider=payload.provider,
+            active_model=_serialize_model_info(model_info),
+            available_models=_serialize_configured_models(updated),
+            api_key_configured=False,
+            persisted=persisted_path is not None,
+            config_path=str(persisted_path) if persisted_path is not None else None,
+        )
+
     if payload.provider == "vllm" and _should_use_managed_vllm_mode(payload):
         managed_model_spec = _normalize_vllm_managed_model_spec(payload.model, config)
         manager = _get_or_create_vllm_runtime_manager(request)
@@ -1286,6 +1394,31 @@ async def _load_active_model_info(request: Request) -> dict[str, Any] | None:
     return None
 
 
+def _openai_codex_auth_service(config: MochiConfig) -> OpenAICodexAuthService:
+    return OpenAICodexAuthService(config.workspace_dir)
+
+
+def _is_openai_codex_remote_config(config: MochiConfig) -> bool:
+    if not config.model.startswith(("http://", "https://")):
+        return False
+    try:
+        normalized_base_url = normalize_openai_codex_base_url(config.openai_codex.base_url)
+    except ValueError:
+        return False
+    if config.model.rstrip("/") != normalized_base_url:
+        return False
+    auth_service = _openai_codex_auth_service(config)
+    return auth_service.resolve_profile_id(config.openai_codex.auth_profile_id) is not None
+
+
+def _active_remote_provider_from_config(config: MochiConfig) -> str | None:
+    if not config.model.startswith(("http://", "https://")):
+        return None
+    if _is_openai_codex_remote_config(config):
+        return "openai_codex"
+    return config.openai_compat.provider
+
+
 def _configured_model_from_parts(
     *,
     provider: ModelProvider,
@@ -1294,6 +1427,8 @@ def _configured_model_from_parts(
     base_url: str | None,
     active_model: Any,
     launch_mode: Literal["external", "managed"] | None = None,
+    auth_profile_id: str | None = None,
+    auth_mode: Literal["none", "api_key", "oauth"] | None = None,
 ) -> ConfiguredModelConfig:
     """????賹??謜? runtime ?桀???梁???豯??賹?????獢???朝?"""
     backend_type = _model_info_backend_type(active_model) or (
@@ -1305,7 +1440,7 @@ def _configured_model_from_parts(
             else "safetensors"
         )
         if provider == "local"
-        else "openai_compat"
+        else ("openai_codex" if provider == "openai_codex" else "openai_compat")
     )
     model_id = (
         model_spec
@@ -1325,6 +1460,8 @@ def _configured_model_from_parts(
         label=label,
         backend_type=backend_type,
         launch_mode=resolved_launch_mode,
+        auth_profile_id=auth_profile_id,
+        auth_mode=auth_mode,
     )
 
 
@@ -1396,6 +1533,14 @@ def _is_configured_model_active(config: MochiConfig, model: ConfiguredModelConfi
         )
     if model.provider == "local":
         return _local_model_specs_equivalent(config.model, model.model_spec)
+    if model.provider == "openai_codex":
+        expected_base_url = (model.base_url or model.model_spec).rstrip("/")
+        return (
+            config.model.rstrip("/") == expected_base_url
+            and config.openai_codex.base_url.rstrip("/") == expected_base_url
+            and config.openai_codex.model == model.model
+            and config.openai_codex.auth_profile_id == model.auth_profile_id
+        )
     expected_base_url = (model.base_url or model.model_spec).rstrip("/")
     expected_model_spec = model.model_spec
     if _is_managed_vllm_configured_model(model):
@@ -1434,6 +1579,18 @@ async def _switch_configured_model(
 
     if model.provider == "local":
         return await _maybe_await(engine.switch_model(model.model_spec))
+
+    if model.provider == "openai_codex":
+        switch_openai_codex = getattr(engine, "switch_openai_codex_backend", None)
+        if callable(switch_openai_codex):
+            return await _maybe_await(
+                switch_openai_codex(
+                    base_url=model.base_url or model.model_spec,
+                    model=model.model,
+                    auth_profile_id=model.auth_profile_id or config.openai_codex.auth_profile_id,
+                )
+            )
+        return await _maybe_await(engine.switch_model(model.base_url or model.model_spec))
 
     effective_model = model.model
     effective_base_url = model.base_url or model.model_spec
@@ -1482,6 +1639,12 @@ def _apply_configured_model_to_config(
         return updated
     if model.provider == "local":
         return updated
+    if model.provider == "openai_codex":
+        updated.model = (model.base_url or model.model_spec).rstrip("/")
+        updated.openai_codex.base_url = (model.base_url or model.model_spec).rstrip("/")
+        updated.openai_codex.model = model.model
+        updated.openai_codex.auth_profile_id = model.auth_profile_id
+        return updated
 
     if _is_managed_vllm_configured_model(model):
         updated.model = _managed_vllm_base_url(model.base_url)
@@ -1524,7 +1687,19 @@ def _configured_model_from_config(config: MochiConfig) -> ConfiguredModelConfig:
             backend_type="ollama",
         )
     if config.model.startswith(("http://", "https://")):
-        provider = config.openai_compat.provider
+        provider = _active_remote_provider_from_config(config) or config.openai_compat.provider
+        if provider == "openai_codex":
+            return ConfiguredModelConfig(
+                id=f"openai_codex:{config.openai_codex.base_url.rstrip('/')}:{config.openai_codex.model}",
+                provider="openai_codex",
+                model=config.openai_codex.model,
+                model_spec=config.openai_codex.base_url.rstrip("/"),
+                base_url=config.openai_codex.base_url.rstrip("/"),
+                label=f"{config.openai_codex.model} (openai_codex)",
+                backend_type="openai_codex",
+                auth_profile_id=config.openai_codex.auth_profile_id,
+                auth_mode="oauth",
+            )
         return ConfiguredModelConfig(
             id=f"{provider}:{config.openai_compat.base_url.rstrip('/')}:{config.openai_compat.model}",
             provider=provider,
@@ -1533,6 +1708,7 @@ def _configured_model_from_config(config: MochiConfig) -> ConfiguredModelConfig:
             base_url=config.openai_compat.base_url.rstrip("/"),
             label=f"{config.openai_compat.model} ({provider})",
             backend_type="openai_compat",
+            auth_mode="api_key",
         )
     backend_type = (
         "gguf"
@@ -1844,6 +2020,7 @@ def _configured_models_equivalent(
             left.model == right.model
             and left.model_spec == right.model_spec
             and (left.base_url or "") == (right.base_url or "")
+            and (left.auth_profile_id or "") == (right.auth_profile_id or "")
         )
     )
 

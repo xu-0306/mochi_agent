@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import inspect
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 import tempfile
@@ -58,6 +59,11 @@ from mochi.backends.vllm_utils import (
     managed_vllm_base_url,
     resolve_vllm_managed_model_spec,
 )
+from mochi.auth.openai_codex import (
+    OPENAI_CODEX_DEFAULT_BASE_URL,
+    OpenAICodexAuthService,
+    normalize_openai_codex_base_url,
+)
 from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.learning.evaluator import OutcomeEvaluator
 from mochi.learning.extractor import SkillExtractor
@@ -99,6 +105,32 @@ from mochi.voice.status import build_voice_runtime_status
 from mochi.voice.voice_session import VoiceSession
 
 
+def _active_remote_provider(config: MochiConfig) -> str | None:
+    if not config.model.startswith(("http://", "https://")):
+        return None
+    try:
+        normalized_codex_base_url = normalize_openai_codex_base_url(config.openai_codex.base_url)
+    except ValueError:
+        normalized_codex_base_url = None
+    if (
+        normalized_codex_base_url == OPENAI_CODEX_DEFAULT_BASE_URL.rstrip("/")
+        and config.model.rstrip("/") == normalized_codex_base_url
+        and OpenAICodexAuthService(config.workspace_dir).resolve_profile_id(
+            config.openai_codex.auth_profile_id
+        )
+        is not None
+    ):
+        return "openai_codex"
+    return config.openai_compat.provider
+
+
+def _active_remote_model_name(config: MochiConfig) -> str:
+    provider = _active_remote_provider(config)
+    if provider == "openai_codex":
+        return config.openai_codex.model
+    return config.openai_compat.model
+
+
 class AgentEngine:
     """頂層 Agent 引擎，整合後端、工具、Prompt 組裝與 ReAct 迴圈。
 
@@ -121,12 +153,19 @@ class AgentEngine:
             config: Mochi 完整設定。
         """
         self._config = config
+        initial_remote_provider = _active_remote_provider(config)
         self._router = BackendRouter(
             ollama_base_url=config.ollama.base_url,
             openai_default_model=config.openai_compat.model,
             openai_api_key=(
                 config.openai_compat.api_key.get_secret_value()
                 if config.openai_compat.api_key is not None
+                else ""
+            ),
+            openai_codex_default_model=config.openai_codex.model,
+            openai_codex_access_token=(
+                self._resolve_openai_codex_access_token(config.openai_codex.auth_profile_id)
+                if initial_remote_provider == "openai_codex"
                 else ""
             ),
             gguf_config=config.gguf,
@@ -181,9 +220,23 @@ class AgentEngine:
         )
         self._initialized = False
 
+    @staticmethod
+    def _default_max_iterations_for_backend(base_iterations: int, backend: BaseLLMBackend) -> int:
+        backend_type = backend.get_model_info().backend_type.strip().lower()
+        if backend_type in {"ollama", "gguf", "safetensors"}:
+            return max(base_iterations, 15)
+        return base_iterations
+
     async def initialize(self) -> None:
         """非同步初始化：載入後端並完成準備。"""
-        await self._router.load(self._config.model)
+        if _active_remote_provider(self._config) == "openai_codex":
+            await self.switch_openai_codex_backend(
+                base_url=self._config.openai_codex.base_url,
+                model=self._config.openai_codex.model,
+                auth_profile_id=self._config.openai_codex.auth_profile_id,
+            )
+        else:
+            await self._router.load(self._config.model)
         logger.info(f"AgentEngine initialized with model: {self._config.model}")
         self._initialized = True
 
@@ -199,7 +252,7 @@ class AgentEngine:
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        result = await self._invoke_shared_runtime(
+        async for event in self._run_chat(
             AgentInvocationRequest(
                 message=message,
                 session_id=session_id,
@@ -215,8 +268,7 @@ class AgentEngine:
                 execution_profile="chat",
                 persist_session=True,
             )
-        )
-        for event in result.events:
+        ):
             yield event
 
     async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
@@ -414,14 +466,40 @@ class AgentEngine:
         self,
         request: AgentInvocationRequest,
     ) -> AsyncIterator[AgentEvent]:
-        result = await self._invoke_shared_runtime(request)
-        for event in result.events:
-            yield event
-        return
+        queue: asyncio.Queue[AgentEvent | object] = asyncio.Queue()
+        sentinel = object()
+        invocation_error: Exception | None = None
+
+        async def _emit_event(event: AgentEvent) -> None:
+            await queue.put(event)
+
+        async def _run_invocation() -> None:
+            nonlocal invocation_error
+            try:
+                await self._invoke_shared_runtime(request, event_callback=_emit_event)
+            except Exception as exc:  # pragma: no cover - defensive propagation
+                invocation_error = exc
+            finally:
+                await queue.put(sentinel)
+
+        worker = asyncio.create_task(_run_invocation())
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                yield cast(AgentEvent, item)
+        finally:
+            await worker
+
+        if invocation_error is not None:
+            raise invocation_error
 
     async def _invoke_shared_runtime(
         self,
         request: AgentInvocationRequest,
+        *,
+        event_callback: Callable[[AgentEvent], Awaitable[None] | None] | None = None,
     ) -> AgentInvocationResult:
         if not self._initialized:
             await self.initialize()
@@ -535,7 +613,10 @@ class AgentEngine:
             max_iterations=(
                 request.max_iterations_override
                 if isinstance(request.max_iterations_override, int) and request.max_iterations_override > 0
-                else self._config.agent.max_react_iterations
+                else self._default_max_iterations_for_backend(
+                    self._config.agent.max_react_iterations,
+                    active_backend,
+                )
             ),
         )
         diagnostics = AgentInvocationDiagnostics(
@@ -588,6 +669,10 @@ class AgentEngine:
                         seq=turn_event_seq,
                     )
                 events.append(event)
+                if event_callback is not None:
+                    callback_result = event_callback(event)
+                    if inspect.isawaitable(callback_result):
+                        await cast(Awaitable[None], callback_result)
         finally:
             await self._router.mark_backend_idle(active_backend)
             if owns_invocation_backend:
@@ -732,18 +817,27 @@ class AgentEngine:
             return self._router.active.get_model_info()
 
         try:
+            active_remote_provider = _active_remote_provider(self._config)
             return self._router._resolve(  # noqa: SLF001
                 self._config.model,
-                model_name=self._config.openai_compat.model,
-                provider=self._config.openai_compat.provider,
-                base_url=self._config.openai_compat.base_url,
+                model_name=_active_remote_model_name(self._config),
+                provider=active_remote_provider or self._config.openai_compat.provider,
+                base_url=(
+                    self._config.openai_codex.base_url
+                    if active_remote_provider == "openai_codex"
+                    else self._config.openai_compat.base_url
+                ),
                 api_key=(
-                    self._config.openai_compat.api_key.get_secret_value()
-                    if self._config.openai_compat.api_key is not None
-                    else ""
+                    self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
+                    if active_remote_provider == "openai_codex"
+                    else (
+                        self._config.openai_compat.api_key.get_secret_value()
+                        if self._config.openai_compat.api_key is not None
+                        else ""
+                    )
                 ),
             ).get_model_info()
-        except ValueError:
+        except (RuntimeError, ValueError):
             model_spec = self._config.model
             if model_spec.startswith("ollama:"):
                 return ModelInfo(
@@ -754,9 +848,13 @@ class AgentEngine:
                 )
             if model_spec.startswith(("http://", "https://")):
                 return ModelInfo(
-                    name=model_spec,
-                    provider=self._config.openai_compat.provider,
-                    backend_type="openai_compat",
+                    name=_active_remote_model_name(self._config),
+                    provider=_active_remote_provider(self._config) or self._config.openai_compat.provider,
+                    backend_type=(
+                        "openai_codex"
+                        if _active_remote_provider(self._config) == "openai_codex"
+                        else "openai_compat"
+                    ),
                     supports_tool_calling=True,
                 )
             if model_spec.lower().endswith(".gguf"):
@@ -774,6 +872,39 @@ class AgentEngine:
         self._config.model = f"ollama:{model.strip()}"
         if base_url:
             self._config.ollama.base_url = base_url.strip().rstrip("/")
+        self._initialized = True
+        return backend.get_model_info()
+
+    def _openai_codex_auth_service(self) -> OpenAICodexAuthService:
+        return OpenAICodexAuthService(self._config.workspace_dir)
+
+    def _resolve_openai_codex_access_token(self, auth_profile_id: str | None) -> str:
+        return self._openai_codex_auth_service().resolve_access_token(auth_profile_id)
+
+    async def switch_openai_codex_backend(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        auth_profile_id: str | None = None,
+    ) -> ModelInfo:
+        """Switch to the OpenAI Codex OAuth-backed backend."""
+        auth_service = self._openai_codex_auth_service()
+        resolved_profile_id = auth_service.resolve_profile_id(auth_profile_id)
+        if resolved_profile_id is None:
+            raise RuntimeError("No OpenAI Codex auth profile is available.")
+        normalized_base_url = normalize_openai_codex_base_url(base_url)
+        access_token = self._resolve_openai_codex_access_token(resolved_profile_id)
+        backend = await self._router.switch_openai_codex(
+            base_url=normalized_base_url,
+            model=model,
+            access_token=access_token,
+            auth_profile_id=resolved_profile_id,
+        )
+        self._config.model = normalized_base_url
+        self._config.openai_codex.base_url = normalized_base_url
+        self._config.openai_codex.model = model.strip()
+        self._config.openai_codex.auth_profile_id = resolved_profile_id
         self._initialized = True
         return backend.get_model_info()
 
@@ -800,6 +931,7 @@ class AgentEngine:
             Literal["openai_compat", "gemini", "anthropic", "vllm"],
             provider,
         )
+        self._config.openai_codex.auth_profile_id = None
         if api_key:
             from pydantic import SecretStr
 
@@ -829,6 +961,7 @@ class AgentEngine:
             self._config.model,
             self._config.ollama.model_dump(),
             self._config.openai_compat.model_dump(),
+            self._config.openai_codex.model_dump(),
             self._config.gguf.model_dump(),
             self._config.huggingface.model_dump(),
             self._config.local_models.model_dump(),
@@ -845,12 +978,19 @@ class AgentEngine:
         self._contexts.clear()
         self._tool_execution_contexts.clear()
         self._register_builtin_tools()
+        next_remote_provider = _active_remote_provider(config)
         self._router.apply_settings(
             ollama_base_url=config.ollama.base_url,
             openai_default_model=config.openai_compat.model,
             openai_api_key=(
                 config.openai_compat.api_key.get_secret_value()
                 if config.openai_compat.api_key is not None
+                else ""
+            ),
+            openai_codex_default_model=config.openai_codex.model,
+            openai_codex_access_token=(
+                self._resolve_openai_codex_access_token(config.openai_codex.auth_profile_id)
+                if next_remote_provider == "openai_codex"
                 else ""
             ),
             gguf_config=config.gguf,
@@ -865,13 +1005,21 @@ class AgentEngine:
             config.model,
             config.ollama.model_dump(),
             config.openai_compat.model_dump(),
+            config.openai_codex.model_dump(),
             config.gguf.model_dump(),
             config.huggingface.model_dump(),
             config.local_models.model_dump(),
             config.workspace_dir,
         )
         if self._initialized and current_router_config != previous_router_config:
-            await self._router.load(config.model)
+            if next_remote_provider == "openai_codex":
+                await self.switch_openai_codex_backend(
+                    base_url=config.openai_codex.base_url,
+                    model=config.openai_codex.model,
+                    auth_profile_id=config.openai_codex.auth_profile_id,
+                )
+            else:
+                await self._router.load(config.model)
 
         if reload_voice or config.voice != previous_voice:
             await self._voice_session_manager.release_all()
@@ -2026,6 +2174,11 @@ class AgentEngine:
             provider=configured_model.provider,
             base_url=resolved_base_url,
             api_key=api_key,
+            auth_profile_id=(
+                configured_model.auth_profile_id
+                if configured_model.provider == "openai_codex"
+                else None
+            ),
         )
 
     def _find_configured_model(self, model_id: str) -> ConfiguredModelConfig | None:
@@ -2043,6 +2196,11 @@ class AgentEngine:
         base_url: str | None,
     ) -> str:
         normalized_base_url = (base_url or configured_model.base_url or configured_model.model_spec).rstrip("/")
+
+        if configured_model.provider == "openai_codex":
+            return self._resolve_openai_codex_access_token(
+                configured_model.auth_profile_id or self._config.openai_codex.auth_profile_id
+            )
 
         if configured_model.provider == "vllm":
             vllm_api_key = self._config.vllm.api_key

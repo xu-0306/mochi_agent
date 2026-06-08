@@ -1951,18 +1951,21 @@ export interface ModelInfo {
   modelSpec: string | null
   baseUrl: string | null
   backendType: string
+  authProfileId: string | null
+  authMode: string | null
   contextLength: number | null
   supportsToolCalling: boolean | null
   metadata: Record<string, ApiValue>
 }
 
-export type ModelProvider = 'ollama' | 'openai_compat' | 'gemini' | 'anthropic' | 'vllm' | 'local'
+export type ModelProvider = 'ollama' | 'openai_compat' | 'openai_codex' | 'gemini' | 'anthropic' | 'vllm' | 'local'
 
 export interface ConfigureModelInput {
   provider: ModelProvider
   model: string
   baseUrl?: string
   apiKey?: string
+  authProfileId?: string
   persist?: boolean
 }
 
@@ -2012,6 +2015,7 @@ export interface UpdateModelEntryInput {
   modelSpec: string
   baseUrl?: string | null
   apiKey?: string | null
+  authProfileId?: string | null
   persist?: boolean
 }
 
@@ -2032,6 +2036,134 @@ export interface DeleteModelEntryResult {
   configuredModel: string
   persisted: boolean
   configPath: string | null
+}
+
+interface BackendOpenAICodexAuthProfile {
+  profile_id?: string
+  provider?: string
+  auth_mode?: string
+  source?: string
+  account_id?: string | null
+  email?: string | null
+  display_name?: string | null
+  expires_at?: number | null
+  imported_at?: number | null
+  last_refresh_at?: number | null
+  last_refresh_error?: string | null
+  status?: string
+}
+
+interface BackendOpenAICodexAuthStatusResponse {
+  type: 'openai_codex_auth_status'
+  configured: boolean
+  status?: string
+  active_profile_id?: string | null
+  default_profile_id?: string | null
+  profiles?: BackendOpenAICodexAuthProfile[]
+  last_refresh_error?: string | null
+  auth_mode?: string
+}
+
+interface BackendOpenAICodexImportResponse {
+  type: 'openai_codex_auth_import'
+  profile?: BackendOpenAICodexAuthProfile
+  configured?: boolean
+}
+
+interface BackendOpenAICodexLoginStartResponse {
+  type: 'openai_codex_auth_login_start'
+  auth_url: string
+  callback_url: string
+  flow_id: string
+  expires_at: number
+  callback_ready?: boolean
+  guidance?: string[]
+}
+
+interface BackendOpenAICodexLogoutResponse {
+  type: 'openai_codex_auth_logout'
+  deleted: boolean
+  active_profile_id?: string | null
+}
+
+export interface OpenAICodexAuthProfile {
+  profileId: string
+  provider: string
+  authMode: string
+  source: string
+  accountId: string | null
+  email: string | null
+  displayName: string | null
+  expiresAt: number | null
+  importedAt: number | null
+  lastRefreshAt: number | null
+  lastRefreshError: string | null
+  status: string
+}
+
+export interface OpenAICodexAuthStatus {
+  type: 'openai_codex_auth_status'
+  configured: boolean
+  status: string
+  activeProfileId: string | null
+  defaultProfileId: string | null
+  profiles: OpenAICodexAuthProfile[]
+  lastRefreshError: string | null
+  authMode: string
+}
+
+export interface OpenAICodexImportResult {
+  type: 'openai_codex_auth_import'
+  profile: OpenAICodexAuthProfile | null
+  configured: boolean
+}
+
+export interface OpenAICodexLoginStartResult {
+  type: 'openai_codex_auth_login_start'
+  authUrl: string
+  callbackUrl: string
+  flowId: string
+  expiresAt: number
+  callbackReady: boolean
+  guidance: string[]
+}
+
+export interface OpenAICodexLoginCompleteInput {
+  callbackUrl?: string | null
+  code?: string | null
+  state?: string | null
+}
+
+export interface OpenAICodexLogoutResult {
+  type: 'openai_codex_auth_logout'
+  deleted: boolean
+  activeProfileId: string | null
+}
+
+function normalizeOpenAICodexAuthProfile(
+  profile: BackendOpenAICodexAuthProfile | null | undefined
+): OpenAICodexAuthProfile | null {
+  if (!profile) {
+    return null
+  }
+  const profileId = getString(profile.profile_id)
+  if (!profileId) {
+    return null
+  }
+  return {
+    profileId,
+    provider: getString(profile.provider) ?? 'openai_codex',
+    authMode: getString(profile.auth_mode) ?? 'oauth',
+    source: getString(profile.source) ?? 'codex_cli',
+    accountId: getString(profile.account_id),
+    email: getString(profile.email),
+    displayName: getString(profile.display_name),
+    expiresAt: getNumber(profile.expires_at) ?? null,
+    importedAt: getNumber(profile.imported_at) ?? null,
+    lastRefreshAt: getNumber(profile.last_refresh_at) ?? null,
+    lastRefreshError: getString(profile.last_refresh_error),
+    status: getString(profile.status) ?? 'ready',
+  }
 }
 
 export interface ModelsStatus {
@@ -2069,6 +2201,8 @@ function normalizeModelInfo(model: BackendModelInfo | Record<string, unknown> | 
     modelSpec: getString(model.model_spec),
     baseUrl: getString(model.base_url),
     backendType: getString(model.backend_type) ?? '',
+    authProfileId: getString(model.auth_profile_id),
+    authMode: getString(model.auth_mode),
     contextLength: getNumber(model.context_length) ?? null,
     supportsToolCalling: getBoolean(model.supports_tool_calling) ?? null,
     metadata,
@@ -2123,6 +2257,7 @@ export async function configureModel(input: ConfigureModelInput): Promise<Config
       model: input.model,
       base_url: input.baseUrl,
       api_key: input.apiKey,
+      auth_profile_id: input.authProfileId,
       persist: input.persist,
     }),
   })
@@ -2154,6 +2289,7 @@ export async function updateModelEntry(input: UpdateModelEntryInput): Promise<Up
       model_spec: input.modelSpec,
       base_url: input.baseUrl ?? null,
       api_key: input.apiKey ?? null,
+      auth_profile_id: input.authProfileId ?? null,
       persist: input.persist,
     }),
   })
@@ -2191,6 +2327,91 @@ export async function deleteModelEntry(modelId: string, persist = true): Promise
     configuredModel: payload.configured_model,
     persisted: Boolean(payload.persisted),
     configPath: payload.config_path ?? null,
+  }
+}
+
+export async function fetchOpenAICodexAuthStatus(): Promise<OpenAICodexAuthStatus> {
+  const payload = await requestJson<BackendOpenAICodexAuthStatusResponse>('/model-auth/openai-codex/status')
+  return {
+    type: payload.type,
+    configured: Boolean(payload.configured),
+    status: getString(payload.status) ?? 'missing',
+    activeProfileId: payload.active_profile_id ?? null,
+    defaultProfileId: payload.default_profile_id ?? null,
+    profiles: getRecordArray(payload.profiles).map((profile) =>
+      normalizeOpenAICodexAuthProfile(profile as BackendOpenAICodexAuthProfile)
+    ).filter((profile): profile is OpenAICodexAuthProfile => profile !== null),
+    lastRefreshError: getString(payload.last_refresh_error),
+    authMode: payload.auth_mode ?? 'oauth',
+  }
+}
+
+export async function importOpenAICodexCliLogin(): Promise<OpenAICodexImportResult> {
+  const payload = await requestJson<BackendOpenAICodexImportResponse>('/model-auth/openai-codex/import-codex-cli', {
+    method: 'POST',
+  })
+  return {
+    type: payload.type,
+    profile: normalizeOpenAICodexAuthProfile(payload.profile),
+    configured: payload.configured ?? true,
+  }
+}
+
+export async function startOpenAICodexBrowserLogin(frontendOrigin?: string): Promise<OpenAICodexLoginStartResult> {
+  const payload = await requestJson<BackendOpenAICodexLoginStartResponse>('/model-auth/openai-codex/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      frontend_origin: frontendOrigin ?? (typeof window !== 'undefined' ? window.location.origin : null),
+    }),
+  })
+  return {
+    type: payload.type,
+    authUrl: payload.auth_url,
+    callbackUrl: payload.callback_url,
+    flowId: payload.flow_id,
+    expiresAt: payload.expires_at,
+    callbackReady: Boolean(payload.callback_ready),
+    guidance: Array.isArray(payload.guidance) ? payload.guidance.filter((item): item is string => typeof item === 'string') : [],
+  }
+}
+
+export async function completeOpenAICodexBrowserLogin(
+  input: OpenAICodexLoginCompleteInput
+): Promise<OpenAICodexImportResult> {
+  const payload = await requestJson<BackendOpenAICodexImportResponse>('/model-auth/openai-codex/complete', {
+    method: 'POST',
+    body: JSON.stringify({
+      callback_url: input.callbackUrl ?? null,
+      code: input.code ?? null,
+      state: input.state ?? null,
+    }),
+  })
+  return {
+    type: payload.type,
+    profile: normalizeOpenAICodexAuthProfile(payload.profile),
+    configured: payload.configured ?? true,
+  }
+}
+
+export async function refreshOpenAICodexAuth(): Promise<OpenAICodexImportResult> {
+  const payload = await requestJson<BackendOpenAICodexImportResponse>('/model-auth/openai-codex/refresh', {
+    method: 'POST',
+  })
+  return {
+    type: payload.type,
+    profile: normalizeOpenAICodexAuthProfile(payload.profile),
+    configured: payload.configured ?? true,
+  }
+}
+
+export async function logoutOpenAICodexAuth(): Promise<OpenAICodexLogoutResult> {
+  const payload = await requestJson<BackendOpenAICodexLogoutResponse>('/model-auth/openai-codex/logout', {
+    method: 'POST',
+  })
+  return {
+    type: payload.type,
+    deleted: Boolean(payload.deleted),
+    activeProfileId: payload.active_profile_id ?? null,
   }
 }
 

@@ -17,8 +17,10 @@ from mochi.backends.gguf import GGUFBackend
 from mochi.backends.llama_cpp_server import LlamaCppServerBackend
 from mochi.backends.local_models import discover_llama_cpp_toolchain
 from mochi.backends.ollama import OllamaBackend
+from mochi.backends.openai_codex import OpenAICodexBackend
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.safetensors import SafetensorsBackend
+from mochi.auth.openai_codex import normalize_openai_codex_base_url
 from mochi.config.schema import GGUFConfig, HuggingFaceConfig, LlamaCppRuntimeConfig
 
 
@@ -32,6 +34,8 @@ class BackendRouter:
         ollama_base_url: str = "http://localhost:11434",
         openai_default_model: str = "auto",
         openai_api_key: str = "",
+        openai_codex_default_model: str | None = None,
+        openai_codex_access_token: str = "",
         gguf_config: GGUFConfig | None = None,
         huggingface_config: HuggingFaceConfig | None = None,
         llama_cpp_runtime: LlamaCppRuntimeConfig | None = None,
@@ -40,8 +44,10 @@ class BackendRouter:
         local_model_idle_unload_seconds: int | None = None,
     ) -> None:
         self._ollama_base_url = ollama_base_url
-        self._openai_default_model = openai_default_model
-        self._openai_api_key = openai_api_key
+        self._openai_compat_default_model = openai_default_model
+        self._openai_compat_api_key = openai_api_key
+        self._openai_codex_default_model = openai_codex_default_model or openai_default_model
+        self._openai_codex_access_token = openai_codex_access_token
         self._gguf_config = gguf_config or GGUFConfig()
         self._huggingface_config = huggingface_config or HuggingFaceConfig()
         self._llama_cpp_runtime = llama_cpp_runtime or LlamaCppRuntimeConfig()
@@ -57,6 +63,8 @@ class BackendRouter:
         ollama_base_url: str,
         openai_default_model: str,
         openai_api_key: str,
+        openai_codex_default_model: str | None = None,
+        openai_codex_access_token: str | None = None,
         gguf_config: GGUFConfig,
         huggingface_config: HuggingFaceConfig,
         llama_cpp_runtime: LlamaCppRuntimeConfig,
@@ -65,8 +73,11 @@ class BackendRouter:
         local_model_idle_unload_seconds: int | None,
     ) -> None:
         self._ollama_base_url = ollama_base_url
-        self._openai_default_model = openai_default_model
-        self._openai_api_key = openai_api_key
+        self._openai_compat_default_model = openai_default_model
+        self._openai_compat_api_key = openai_api_key
+        self._openai_codex_default_model = openai_codex_default_model or openai_default_model
+        if openai_codex_access_token is not None:
+            self._openai_codex_access_token = openai_codex_access_token
         self._gguf_config = gguf_config
         self._huggingface_config = huggingface_config
         self._llama_cpp_runtime = llama_cpp_runtime
@@ -125,8 +136,35 @@ class BackendRouter:
             api_key=api_key,
             provider=provider,
         )
-        self._openai_default_model = normalized_model
-        self._openai_api_key = api_key
+        self._openai_compat_default_model = normalized_model
+        self._openai_compat_api_key = api_key
+        return await self._switch_to_backend(backend, normalized_base_url)
+
+    async def switch_openai_codex(
+        self,
+        *,
+        model: str,
+        access_token: str,
+        base_url: str,
+        auth_profile_id: str | None = None,
+    ) -> BaseLLMBackend:
+        normalized_base_url = normalize_openai_codex_base_url(base_url)
+        normalized_model = model.strip()
+        if not normalized_base_url:
+            raise ValueError("OpenAI Codex base_url must not be empty.")
+        if not normalized_model:
+            raise ValueError("OpenAI Codex model must not be empty.")
+        if not access_token.strip():
+            raise ValueError("OpenAI Codex access token must not be empty.")
+        backend = OpenAICodexBackend(
+            base_url=normalized_base_url,
+            model=normalized_model,
+            access_token=access_token,
+            auth_profile_id=auth_profile_id,
+            workspace_dir=self._workspace_dir,
+        )
+        self._openai_codex_default_model = normalized_model
+        self._openai_codex_access_token = access_token
         return await self._switch_to_backend(backend, normalized_base_url)
 
     async def acquire_temporary_backend(
@@ -137,6 +175,7 @@ class BackendRouter:
         provider: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        auth_profile_id: str | None = None,
     ) -> BaseLLMBackend:
         backend = self._resolve(
             model_spec,
@@ -144,6 +183,7 @@ class BackendRouter:
             provider=provider,
             base_url=base_url,
             api_key=api_key,
+            auth_profile_id=auth_profile_id,
         )
         try:
             await self._ensure_backend_ready(backend, model_spec)
@@ -243,6 +283,7 @@ class BackendRouter:
         provider: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        auth_profile_id: str | None = None,
     ) -> BaseLLMBackend:
         if model_spec.startswith("ollama:"):
             resolved_model_name = (model_name or model_spec[len("ollama:"):]).strip()
@@ -253,9 +294,19 @@ class BackendRouter:
 
         if model_spec.startswith(("http://", "https://")):
             resolved_base_url = (base_url or model_spec).strip().rstrip("/")
-            resolved_model_name = (model_name or self._openai_default_model).strip()
-            resolved_api_key = self._openai_api_key if api_key is None else api_key
-            _ = provider
+            if provider == "openai_codex":
+                resolved_base_url = normalize_openai_codex_base_url(resolved_base_url)
+                resolved_model_name = (model_name or self._openai_codex_default_model).strip()
+                resolved_api_key = self._openai_codex_access_token if api_key is None else api_key
+                return OpenAICodexBackend(
+                    base_url=resolved_base_url,
+                    model=resolved_model_name,
+                    access_token=resolved_api_key,
+                    auth_profile_id=auth_profile_id,
+                    workspace_dir=self._workspace_dir,
+                )
+            resolved_model_name = (model_name or self._openai_compat_default_model).strip()
+            resolved_api_key = self._openai_compat_api_key if api_key is None else api_key
             return OpenAICompatBackend(
                 base_url=resolved_base_url,
                 model=resolved_model_name,

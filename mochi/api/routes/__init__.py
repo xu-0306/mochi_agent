@@ -7,6 +7,7 @@ from mochi.api.routes.approvals import router as approvals_router
 from mochi.api.routes.chat import router as chat_router
 from mochi.api.routes.file_ops import router as file_ops_router
 from mochi.api.routes.filesystem import router as filesystem_router
+from mochi.api.routes.model_auth import router as model_auth_router
 from mochi.api.routes.models import router as models_router
 from mochi.api.routes.projects import router as projects_router
 from mochi.api.routes.skills import router as skills_router
@@ -22,6 +23,7 @@ __all__ = [
     "chat_router",
     "file_ops_router",
     "filesystem_router",
+    "model_auth_router",
     "models_router",
     "projects_router",
     "sessions_router",
