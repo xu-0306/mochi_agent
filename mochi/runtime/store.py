@@ -95,6 +95,7 @@ class RuntimeStore:
                     status TEXT NOT NULL,
                     selected_models_roles_json TEXT NOT NULL,
                     evaluation_policy_json TEXT NOT NULL,
+                    run_policy_json TEXT NOT NULL DEFAULT '{}',
                     schedule_json TEXT NOT NULL,
                     summary_json TEXT NOT NULL,
                     latest_error TEXT,
@@ -169,6 +170,7 @@ class RuntimeStore:
             _ensure_column(conn, "agent_runs", "topic", "TEXT")
             _ensure_column(conn, "agent_runs", "latest_error", "TEXT")
             _ensure_column(conn, "agent_runs", "evidence_status_json", "TEXT NOT NULL DEFAULT '{}'")
+            _ensure_column(conn, "agent_runs", "run_policy_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "agent_run_artifacts", "artifact_id", "TEXT")
             conn.commit()
 
@@ -495,6 +497,7 @@ class RuntimeStore:
         topic: str | None,
         selected_models_roles: dict[str, Any] | None = None,
         evaluation_policy: dict[str, Any] | None = None,
+        run_policy: dict[str, Any] | None = None,
         schedule: dict[str, Any] | None = None,
         summary: dict[str, Any] | None = None,
         latest_error: str | None = None,
@@ -510,9 +513,9 @@ class RuntimeStore:
                     """
                     INSERT INTO agent_runs (
                         id, protocol_id, title, topic, status, selected_models_roles_json,
-                        evaluation_policy_json, schedule_json, summary_json, latest_error,
+                        evaluation_policy_json, run_policy_json, schedule_json, summary_json, latest_error,
                         evidence_status_json, started_at, finished_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -522,6 +525,7 @@ class RuntimeStore:
                         "created",
                         json.dumps(selected_models_roles or {}, ensure_ascii=False),
                         json.dumps(evaluation_policy or {}, ensure_ascii=False),
+                        json.dumps(run_policy or {}, ensure_ascii=False),
                         json.dumps(schedule or {}, ensure_ascii=False),
                         json.dumps(summary or {}, ensure_ascii=False),
                         latest_error,
@@ -584,7 +588,7 @@ class RuntimeStore:
                 started_at = now if status == "running" else current_started_at
                 finished_at = (
                     now
-                    if status in {"cancelled", "failed", "succeeded"}
+                    if status in {"cancelled", "failed", "succeeded", "partial"}
                     else None
                 )
                 conn.execute(
@@ -794,6 +798,7 @@ class RuntimeStore:
                 payload["evaluation_policy"] = json.loads(
                     payload.pop("evaluation_policy_json") or "{}"
                 )
+                payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
                 payload["schedule"] = json.loads(payload.pop("schedule_json") or "{}")
                 payload["summary"] = json.loads(payload.pop("summary_json") or "{}")
                 payload["evidence_status"] = json.loads(payload.pop("evidence_status_json") or "{}")
@@ -820,6 +825,7 @@ class RuntimeStore:
                     payload["evaluation_policy"] = json.loads(
                         payload.pop("evaluation_policy_json") or "{}"
                     )
+                    payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
                     payload["schedule"] = json.loads(payload.pop("schedule_json") or "{}")
                     payload["summary"] = json.loads(payload.pop("summary_json") or "{}")
                     payload["evidence_status"] = json.loads(

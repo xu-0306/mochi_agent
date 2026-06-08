@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Mapping
@@ -60,13 +61,24 @@ from mochi.backends.types import GenerationResult, Message
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 
-RunState = Literal["queued", "running", "awaiting_guidance", "succeeded", "failed", "cancelled"]
+RunState = Literal[
+    "queued",
+    "running",
+    "awaiting_guidance",
+    "awaiting_resources",
+    "partial",
+    "succeeded",
+    "failed",
+    "cancelled",
+]
 RunEventType = Literal["state_changed", "guidance", "role_output", "verification", "evaluation", "artifact"]
 
 RUN_STATE_TRANSITIONS: dict[RunState, tuple[RunState, ...]] = {
     "queued": ("running", "cancelled"),
-    "running": ("awaiting_guidance", "succeeded", "failed", "cancelled"),
-    "awaiting_guidance": ("running", "failed", "cancelled"),
+    "running": ("awaiting_guidance", "awaiting_resources", "partial", "succeeded", "failed", "cancelled"),
+    "awaiting_guidance": ("running", "awaiting_resources", "partial", "failed", "cancelled"),
+    "awaiting_resources": (),
+    "partial": (),
     "succeeded": (),
     "failed": (),
     "cancelled": (),
@@ -176,6 +188,7 @@ class MultiAgentRunRequest:
     protocol: Mapping[str, Any] | ProtocolConfig | None = None
     run_id: str | None = None
     guidance_messages: list[str] = field(default_factory=list)
+    run_policy: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -212,6 +225,26 @@ class MultiAgentRunResult:
 
 class RunStateTransitionError(ValueError):
     """Raised on invalid run-state transitions."""
+
+
+class RunPolicyStop(RuntimeError):
+    """Raised when the current run policy requires controlled early termination."""
+
+    def __init__(
+        self,
+        *,
+        status: Literal["partial", "awaiting_resources"],
+        action: str,
+        reason: str,
+        stage: str,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.status = status
+        self.action = action
+        self.reason = reason
+        self.stage = stage
+        self.checkpoint = dict(checkpoint or {})
 
 
 class BoundedRunStateMachine:
@@ -253,6 +286,90 @@ class MultiAgentOrchestrator:
         self._exec_runtime = exec_runtime
         self._exec_approval_store = exec_approval_store
         self._controlled_exec_require_approval = bool(controlled_exec_require_approval)
+        self._run_policy: dict[str, Any] = {}
+        self._deadline_monotonic: float | None = None
+        self._latest_checkpoint: dict[str, Any] = {}
+        self._checkpoint_count = 0
+
+    def _configure_run_policy(self, run_policy: Mapping[str, Any] | None) -> None:
+        self._run_policy = dict(run_policy or {})
+        self._checkpoint_count = 0
+        self._latest_checkpoint = {}
+        max_wall_clock_sec = self._run_policy.get("max_wall_clock_sec")
+        try:
+            max_wall_clock = int(max_wall_clock_sec)
+        except (TypeError, ValueError):
+            max_wall_clock = 0
+        self._deadline_monotonic = (
+            time.monotonic() + max_wall_clock if max_wall_clock > 0 else None
+        )
+
+    def _record_checkpoint(
+        self,
+        *,
+        stage: str,
+        task_input: str,
+        protocol: str,
+        candidates: list[CandidateOutput] | None = None,
+        protocol_artifacts: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._checkpoint_count += 1
+        candidate_items = list(candidates or [])
+        checkpoint = {
+            "checkpoint_index": self._checkpoint_count,
+            "stage": stage,
+            "task_input": task_input,
+            "protocol": protocol,
+            "candidate_ids": [item.candidate_id for item in candidate_items],
+            "candidate_count": len(candidate_items),
+            "artifact_keys": sorted(
+                str(key)
+                for key, value in (protocol_artifacts or {}).items()
+                if isinstance(key, str) and isinstance(value, dict)
+            ),
+            "captured_at": datetime.now(UTC).isoformat(),
+        }
+        if extra:
+            checkpoint["extra"] = dict(extra)
+        self._latest_checkpoint = checkpoint
+
+    def _raise_if_run_policy_exhausted(
+        self,
+        *,
+        stage: str,
+        task_input: str,
+        protocol: str,
+        candidates: list[CandidateOutput] | None = None,
+        protocol_artifacts: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._record_checkpoint(
+            stage=stage,
+            task_input=task_input,
+            protocol=protocol,
+            candidates=candidates,
+            protocol_artifacts=protocol_artifacts,
+            extra=extra,
+        )
+        if self._deadline_monotonic is None:
+            return
+        if time.monotonic() < self._deadline_monotonic:
+            return
+        action = str(self._run_policy.get("on_budget_exhausted") or "pause").strip().lower()
+        if action not in {"pause", "finalize_partial"}:
+            action = "pause"
+        status: Literal["partial", "awaiting_resources"] = (
+            "awaiting_resources" if action == "pause" else "partial"
+        )
+        max_wall_clock_sec = self._run_policy.get("max_wall_clock_sec")
+        raise RunPolicyStop(
+            status=status,
+            action=action,
+            reason=f"Run exceeded max_wall_clock_sec={max_wall_clock_sec}.",
+            stage=stage,
+            checkpoint=self._latest_checkpoint,
+        )
 
     async def run(self, request: MultiAgentRunRequest) -> MultiAgentRunResult:
         """Run one multi-agent orchestration."""
@@ -318,180 +435,328 @@ class MultiAgentOrchestrator:
                 ),
             )
 
+        self._configure_run_policy(request.run_policy)
         selected_models_roles = _resolve_selected_model_roles(request.metadata)
         effective_metadata = dict(request.metadata)
         effective_metadata["execution_policy"] = execution_policy_to_dict(execution_policy)
         research_policy = ResearchDebatePolicy.from_metadata(effective_metadata)
+        candidates: list[CandidateOutput] = []
         precomputed_artifacts: dict[str, Any] = {}
+        protocol_artifacts: dict[str, Any] = {}
         evidence_packets: list[dict[str, Any]] = []
         evidence_collection_summary: dict[str, Any] | None = None
-        if research_policy.enabled and isinstance(protocol_config, MultiAgentDebateProtocol):
-            (
-                effective_metadata,
-                precomputed_artifacts,
-                evidence_packets,
-                evidence_collection_summary,
-            ) = await self._prepare_research_debate_context(
-                task_input=request.task_input,
-                protocol_config=protocol_config,
-                guidance_messages=guidance_messages,
-                selected_models_roles=selected_models_roles,
-                metadata=effective_metadata,
-                policy=research_policy,
-            )
-        (
-            guidance_messages,
-            controlled_execution_artifacts,
-        ) = await self._prepare_controlled_execution_context(
-            task_input=request.task_input,
-            protocol_config=protocol_config,
-            guidance_messages=guidance_messages,
-            selected_models_roles=selected_models_roles,
-            execution_policy=execution_policy,
-            metadata=effective_metadata,
-            emit=emit,
-        )
-        precomputed_artifacts.update(controlled_execution_artifacts)
-        protocol_metadata = dict(effective_metadata)
-        candidates, protocol_artifacts = await self._run_protocol(
-            request.task_input,
-            protocol_config=protocol_config,
-            guidance_messages=guidance_messages,
-            selected_models_roles=selected_models_roles,
-            execution_policy=execution_policy,
-            metadata=protocol_metadata,
-            emit=emit,
-        )
-        protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
-        for artifact_name, artifact_content in protocol_artifacts.items():
-            if isinstance(artifact_content, dict):
-                emit(
-                    "artifact",
-                    asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
-                )
-        if evidence_collection_summary is None:
-            evidence_packets, evidence_collection_summary = await self._collect_evidence_packets(
-                metadata=effective_metadata,
-            )
-        if evidence_collection_summary is not None:
-            emit(
-                "artifact",
-                asdict(
-                    ArtifactPayload(
-                        name="evidence_summary",
-                        content=dict(evidence_collection_summary),
-                    )
-                ),
-            )
-        verifications, verification_summary = await self._verify_candidates(
-            task_input=request.task_input,
-            protocol_config=protocol_config,
-            guidance_messages=guidance_messages,
-            selected_models_roles=selected_models_roles,
-            candidates=candidates,
-            evidence_packets=evidence_packets,
-            protocol_artifacts=protocol_artifacts,
-            metadata=effective_metadata,
-        )
-        if verification_summary is not None:
-            emit(
-                "verification",
-                asdict(
-                    VerificationPayload(
-                        verifier_model_id=verification_summary.get("verifier_model_id"),
-                        evidence_packet_count=int(verification_summary.get("evidence_packet_count", 0)),
-                        verifications=[
-                            verification.to_dict()
-                            for verification in verifications
-                        ],
-                    )
-                ),
-            )
+        verifications: list[CandidateVerification] = []
+        verification_summary: dict[str, Any] | None = None
+        selected_candidate_id: str | None = None
+        evaluation_payload: EvaluationPayload | None = None
 
-        scores, preferred_candidate_id = await self._evaluate_candidates(
-            task_input=request.task_input,
-            protocol_config=protocol_config,
-            guidance_messages=guidance_messages,
-            selected_models_roles=selected_models_roles,
-            candidates=candidates,
-            protocol_artifacts=protocol_artifacts,
-            metadata=effective_metadata,
-        )
-        scores = _merge_scores_with_verifications(scores, verifications)
-        selected_candidate_id = _select_candidate_id(
-            scores=scores,
-            candidates=candidates,
-            preferred_candidate_id=preferred_candidate_id,
-        )
-        if research_policy.enabled and isinstance(protocol_config, MultiAgentDebateProtocol):
-            research_artifacts = await self._build_research_result_artifacts(
-                task_input=request.task_input,
-                selected_models_roles=selected_models_roles,
-                candidates=candidates,
-                selected_candidate_id=selected_candidate_id,
-                protocol_artifacts=protocol_artifacts,
-                verification_summary=verification_summary,
-                metadata=effective_metadata,
-                policy=research_policy,
-            )
-            for artifact_name, artifact_content in research_artifacts.items():
+        def build_partial_result(stop: RunPolicyStop) -> MultiAgentRunResult:
+            recovery_state = {
+                "status": stop.status,
+                "action": stop.action,
+                "reason": stop.reason,
+                "stage": stop.stage,
+                "checkpoint": dict(stop.checkpoint or self._latest_checkpoint or {}),
+                "unfinished_steps": _remaining_run_steps(
+                    stage=stop.stage,
+                    research_enabled=research_policy.enabled
+                    and isinstance(protocol_config, MultiAgentDebateProtocol),
+                ),
+            }
+            final_candidate = _candidate_by_id(candidates, selected_candidate_id)
+            if final_candidate is None and candidates:
+                final_candidate = candidates[-1]
+            artifacts = {
+                "protocol": protocol_config.protocol,
+                "selected_candidate_id": selected_candidate_id,
+                "final_answer": final_candidate.content if final_candidate is not None else "",
+                "candidate_count": len(candidates),
+                "run_guard_policy": dict(self._run_policy),
+                "recovery_checkpoint": dict(stop.checkpoint or self._latest_checkpoint or {}),
+                "partial_summary": {
+                    "status": stop.status,
+                    "reason": stop.reason,
+                    "stage": stop.stage,
+                    "checkpoint_index": recovery_state["checkpoint"].get("checkpoint_index"),
+                    "candidate_count": len(candidates),
+                    "artifact_keys": sorted(
+                        str(key)
+                        for key, value in protocol_artifacts.items()
+                        if isinstance(key, str) and isinstance(value, dict)
+                    ),
+                    "unfinished_steps": list(recovery_state["unfinished_steps"]),
+                },
+            }
+            if execution_policy.mode != "disabled":
+                artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
+            artifacts.update(protocol_artifacts)
+            if self._invocation_traces:
+                artifacts["subagent_runtime"] = _build_subagent_runtime_artifact(self._invocation_traces)
+            if evidence_collection_summary is not None:
+                artifacts["evidence_collection"] = evidence_collection_summary
+            if verification_summary is not None:
+                artifacts["verification"] = verification_summary
+            for artifact_name, artifact_content in artifacts.items():
                 if isinstance(artifact_content, dict):
                     emit(
                         "artifact",
                         asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
                     )
-            protocol_artifacts.update(research_artifacts)
-        evaluation_payload = EvaluationPayload(
-            policy=self._policy.to_dict(),
-            selected_candidate_id=selected_candidate_id,
-            scores=[score.to_dict() for score in scores],
-        )
-        emit("evaluation", asdict(evaluation_payload))
+            previous_state, current_state = state_machine.transition(stop.status)
+            emit(
+                "state_changed",
+                asdict(
+                    StateChangedPayload(
+                        previous_state=previous_state,
+                        current_state=current_state,
+                        reason="run_policy_exhausted",
+                    )
+                ),
+            )
+            metadata = dict(effective_metadata)
+            metadata["recovery_state"] = recovery_state
+            metadata["degraded"] = False
+            return MultiAgentRunResult(
+                run_id=run_id,
+                protocol=protocol_config.protocol,
+                state=state_machine.state,
+                task_input=request.task_input,
+                candidates=candidates,
+                selected_candidate_id=selected_candidate_id,
+                evaluation=asdict(evaluation_payload) if evaluation_payload is not None else None,
+                artifacts=artifacts,
+                events=events,
+                metadata=metadata,
+            )
 
-        final_candidate = _candidate_by_id(candidates, selected_candidate_id)
-        artifacts = {
-            "protocol": protocol_config.protocol,
-            "selected_candidate_id": selected_candidate_id,
-            "final_answer": final_candidate.content if final_candidate is not None else "",
-            "candidate_count": len(candidates),
-        }
-        if execution_policy.mode != "disabled":
-            artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
-        artifacts.update(protocol_artifacts)
-        if self._invocation_traces:
-            subagent_runtime = _build_subagent_runtime_artifact(self._invocation_traces)
-            artifacts["subagent_runtime"] = subagent_runtime
-            emit("artifact", asdict(ArtifactPayload(name="subagent_runtime", content=subagent_runtime)))
-        if evidence_collection_summary is not None:
-            artifacts["evidence_collection"] = evidence_collection_summary
-        if verification_summary is not None:
-            artifacts["verification"] = verification_summary
-        emit("artifact", asdict(ArtifactPayload(name="run_summary", content=dict(artifacts))))
-
-        previous, current = state_machine.transition("succeeded")
-        emit(
-            "state_changed",
-            asdict(
-                StateChangedPayload(
-                    previous_state=previous,
-                    current_state=current,
-                    reason="run_completed",
+        try:
+            if research_policy.enabled and isinstance(protocol_config, MultiAgentDebateProtocol):
+                (
+                    effective_metadata,
+                    precomputed_artifacts,
+                    evidence_packets,
+                    evidence_collection_summary,
+                ) = await self._prepare_research_debate_context(
+                    task_input=request.task_input,
+                    protocol_config=protocol_config,
+                    guidance_messages=guidance_messages,
+                    selected_models_roles=selected_models_roles,
+                    metadata=effective_metadata,
+                    policy=research_policy,
                 )
-            ),
-        )
+                self._raise_if_run_policy_exhausted(
+                    stage="research_context_prepared",
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    protocol_artifacts=precomputed_artifacts,
+                )
+            (
+                guidance_messages,
+                controlled_execution_artifacts,
+            ) = await self._prepare_controlled_execution_context(
+                task_input=request.task_input,
+                protocol_config=protocol_config,
+                guidance_messages=guidance_messages,
+                selected_models_roles=selected_models_roles,
+                execution_policy=execution_policy,
+                metadata=effective_metadata,
+                emit=emit,
+            )
+            precomputed_artifacts.update(controlled_execution_artifacts)
+            self._raise_if_run_policy_exhausted(
+                stage="controlled_execution_context_prepared",
+                task_input=request.task_input,
+                protocol=protocol_config.protocol,
+                protocol_artifacts=precomputed_artifacts,
+            )
+            protocol_metadata = dict(effective_metadata)
+            candidates, protocol_artifacts = await self._run_protocol(
+                request.task_input,
+                protocol_config=protocol_config,
+                guidance_messages=guidance_messages,
+                selected_models_roles=selected_models_roles,
+                execution_policy=execution_policy,
+                metadata=protocol_metadata,
+                emit=emit,
+            )
+            protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+            self._raise_if_run_policy_exhausted(
+                stage="protocol_completed",
+                task_input=request.task_input,
+                protocol=protocol_config.protocol,
+                candidates=candidates,
+                protocol_artifacts=protocol_artifacts,
+            )
+            for artifact_name, artifact_content in protocol_artifacts.items():
+                if isinstance(artifact_content, dict):
+                    emit(
+                        "artifact",
+                        asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
+                    )
+            if evidence_collection_summary is None:
+                self._raise_if_run_policy_exhausted(
+                    stage="before_evidence_collection",
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    candidates=candidates,
+                    protocol_artifacts=protocol_artifacts,
+                )
+                evidence_packets, evidence_collection_summary = await self._collect_evidence_packets(
+                    metadata=effective_metadata,
+                )
+            if evidence_collection_summary is not None:
+                emit(
+                    "artifact",
+                    asdict(
+                        ArtifactPayload(
+                            name="evidence_summary",
+                            content=dict(evidence_collection_summary),
+                        )
+                    ),
+                )
+            self._raise_if_run_policy_exhausted(
+                stage="evidence_collected",
+                task_input=request.task_input,
+                protocol=protocol_config.protocol,
+                candidates=candidates,
+                protocol_artifacts=protocol_artifacts,
+                extra={"evidence_packet_count": len(evidence_packets)},
+            )
+            verifications, verification_summary = await self._verify_candidates(
+                task_input=request.task_input,
+                protocol_config=protocol_config,
+                guidance_messages=guidance_messages,
+                selected_models_roles=selected_models_roles,
+                candidates=candidates,
+                evidence_packets=evidence_packets,
+                protocol_artifacts=protocol_artifacts,
+                metadata=effective_metadata,
+            )
+            if verification_summary is not None:
+                emit(
+                    "verification",
+                    asdict(
+                        VerificationPayload(
+                            verifier_model_id=verification_summary.get("verifier_model_id"),
+                            evidence_packet_count=int(verification_summary.get("evidence_packet_count", 0)),
+                            verifications=[
+                                verification.to_dict()
+                                for verification in verifications
+                            ],
+                        )
+                    ),
+                )
+            self._raise_if_run_policy_exhausted(
+                stage="verification_completed",
+                task_input=request.task_input,
+                protocol=protocol_config.protocol,
+                candidates=candidates,
+                protocol_artifacts=protocol_artifacts,
+                extra={"verification_count": len(verifications)},
+            )
 
-        return MultiAgentRunResult(
-            run_id=run_id,
-            protocol=protocol_config.protocol,
-            state=state_machine.state,
-            task_input=request.task_input,
-            candidates=candidates,
-            selected_candidate_id=selected_candidate_id,
-            evaluation=asdict(evaluation_payload),
-            artifacts=artifacts,
-            events=events,
-            metadata=effective_metadata,
-        )
+            scores, preferred_candidate_id = await self._evaluate_candidates(
+                task_input=request.task_input,
+                protocol_config=protocol_config,
+                guidance_messages=guidance_messages,
+                selected_models_roles=selected_models_roles,
+                candidates=candidates,
+                protocol_artifacts=protocol_artifacts,
+                metadata=effective_metadata,
+            )
+            scores = _merge_scores_with_verifications(scores, verifications)
+            selected_candidate_id = _select_candidate_id(
+                scores=scores,
+                candidates=candidates,
+                preferred_candidate_id=preferred_candidate_id,
+            )
+            self._raise_if_run_policy_exhausted(
+                stage="evaluation_completed",
+                task_input=request.task_input,
+                protocol=protocol_config.protocol,
+                candidates=candidates,
+                protocol_artifacts=protocol_artifacts,
+                extra={"selected_candidate_id": selected_candidate_id},
+            )
+            if research_policy.enabled and isinstance(protocol_config, MultiAgentDebateProtocol):
+                research_artifacts = await self._build_research_result_artifacts(
+                    task_input=request.task_input,
+                    selected_models_roles=selected_models_roles,
+                    candidates=candidates,
+                    selected_candidate_id=selected_candidate_id,
+                    protocol_artifacts=protocol_artifacts,
+                    verification_summary=verification_summary,
+                    metadata=effective_metadata,
+                    policy=research_policy,
+                )
+                for artifact_name, artifact_content in research_artifacts.items():
+                    if isinstance(artifact_content, dict):
+                        emit(
+                            "artifact",
+                            asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
+                        )
+                protocol_artifacts.update(research_artifacts)
+                self._raise_if_run_policy_exhausted(
+                    stage="research_artifacts_completed",
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    candidates=candidates,
+                    protocol_artifacts=protocol_artifacts,
+                )
+            evaluation_payload = EvaluationPayload(
+                policy=self._policy.to_dict(),
+                selected_candidate_id=selected_candidate_id,
+                scores=[score.to_dict() for score in scores],
+            )
+            emit("evaluation", asdict(evaluation_payload))
+
+            final_candidate = _candidate_by_id(candidates, selected_candidate_id)
+            artifacts = {
+                "protocol": protocol_config.protocol,
+                "selected_candidate_id": selected_candidate_id,
+                "final_answer": final_candidate.content if final_candidate is not None else "",
+                "candidate_count": len(candidates),
+                "run_guard_policy": dict(self._run_policy),
+            }
+            if execution_policy.mode != "disabled":
+                artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
+            artifacts.update(protocol_artifacts)
+            if self._invocation_traces:
+                subagent_runtime = _build_subagent_runtime_artifact(self._invocation_traces)
+                artifacts["subagent_runtime"] = subagent_runtime
+                emit("artifact", asdict(ArtifactPayload(name="subagent_runtime", content=subagent_runtime)))
+            if evidence_collection_summary is not None:
+                artifacts["evidence_collection"] = evidence_collection_summary
+            if verification_summary is not None:
+                artifacts["verification"] = verification_summary
+            emit("artifact", asdict(ArtifactPayload(name="run_summary", content=dict(artifacts))))
+
+            previous, current = state_machine.transition("succeeded")
+            emit(
+                "state_changed",
+                asdict(
+                    StateChangedPayload(
+                        previous_state=previous,
+                        current_state=current,
+                        reason="run_completed",
+                    )
+                ),
+            )
+
+            return MultiAgentRunResult(
+                run_id=run_id,
+                protocol=protocol_config.protocol,
+                state=state_machine.state,
+                task_input=request.task_input,
+                candidates=candidates,
+                selected_candidate_id=selected_candidate_id,
+                evaluation=asdict(evaluation_payload),
+                artifacts=artifacts,
+                events=events,
+                metadata=effective_metadata,
+            )
+        except RunPolicyStop as stop:
+            return build_partial_result(stop)
 
     async def _run_protocol(
         self,
@@ -699,6 +964,13 @@ class MultiAgentOrchestrator:
                 )
             ),
         )
+        self._raise_if_run_policy_exhausted(
+            stage="dr_zero_proposals_generated",
+            task_input=task_input,
+            protocol=protocol_config.protocol,
+            candidates=[proposer_output],
+            extra={"synthetic_task_count": protocol_config.proposal_sample_size},
+        )
 
         synthetic_tasks, parse_diagnostics = _parse_dr_zero_synthetic_tasks(
             proposer_output.content,
@@ -761,6 +1033,16 @@ class MultiAgentOrchestrator:
                             model_id=solver_model_id,
                         )
                     ),
+                )
+                self._raise_if_run_policy_exhausted(
+                    stage=f"dr_zero_rollout_{task_index}_{rollout_index}",
+                    task_input=task_input,
+                    protocol=protocol_config.protocol,
+                    candidates=solver_outputs,
+                    extra={
+                        "synthetic_task_id": synthetic_task["task_id"],
+                        "solver_rollout_count": len(solver_rollouts),
+                    },
                 )
 
         verifier_model_id = (
@@ -2114,8 +2396,7 @@ def _resolve_judge_model_id(
         return (
             selected_models_roles.get("judge")
             or selected_models_roles.get("evaluator")
-            or selected_models_roles.get(protocol_config.evaluator_role_id)
-            or selected_models_roles.get(protocol_config.controller_role_id)
+            or selected_models_roles.get("controller")
             or (ordered_models[3] if len(ordered_models) > 3 else None)
             or (ordered_models[0] if ordered_models else None)
         )
@@ -2945,6 +3226,57 @@ def _parse_evidence_gate(value: Any) -> Any:
             metadata=gate_metadata,
         )
     return resolve_evidence_gate_status(skipped=True, metadata=gate_metadata)
+
+
+def _remaining_run_steps(*, stage: str, research_enabled: bool) -> list[str]:
+    ordered_steps = [
+        ("research_context_prepared", "prepare research context"),
+        ("controlled_execution_context_prepared", "prepare controlled execution context"),
+        ("protocol_completed", "finish protocol role generation"),
+        ("before_evidence_collection", "collect evidence packets"),
+        ("evidence_collected", "complete evidence collection"),
+        ("verification_completed", "verify candidate claims"),
+        ("evaluation_completed", "evaluate and select the winning candidate"),
+        ("research_artifacts_completed", "build final research artifacts"),
+    ]
+    completed_stages = {key for key, _ in ordered_steps}
+    if stage.startswith("debate_round_"):
+        return [
+            "finish remaining debate rounds",
+            "verify candidate claims",
+            "evaluate and select the winning candidate",
+            *(
+                ["build final research artifacts"]
+                if research_enabled
+                else []
+            ),
+        ]
+    if stage.startswith("dr_zero_rollout_"):
+        return [
+            "finish remaining solver rollouts",
+            "verify rollout candidates",
+            "evaluate and select the winning rollout",
+        ]
+    if stage == "dr_zero_proposals_generated":
+        return [
+            "generate solver rollouts",
+            "verify rollout candidates",
+            "evaluate and select the winning rollout",
+        ]
+    remaining: list[str] = []
+    seen_current = False
+    for key, label in ordered_steps:
+        if key == stage:
+            seen_current = True
+            continue
+        if not seen_current:
+            continue
+        if key == "research_artifacts_completed" and not research_enabled:
+            continue
+        remaining.append(label)
+    if stage not in completed_stages and not remaining:
+        remaining.append("resume from the latest checkpoint")
+    return remaining
 
 
 def _safe_float(value: Any) -> float | None:

@@ -49,6 +49,7 @@ class AgentRunCreateRequest(BaseModel):
     topic: str | None = None
     selected_models_roles: dict[str, Any] = Field(default_factory=dict)
     evaluation_policy: dict[str, Any] = Field(default_factory=dict)
+    run_policy: dict[str, Any] = Field(default_factory=dict)
     schedule: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     latest_error: str | None = None
@@ -74,8 +75,11 @@ class AgentRunResponse(BaseModel):
     status: str
     selected_models_roles: dict[str, Any] = Field(default_factory=dict)
     evaluation_policy: dict[str, Any] = Field(default_factory=dict)
+    run_policy: dict[str, Any] = Field(default_factory=dict)
     schedule: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
+    recovery_state: dict[str, Any] = Field(default_factory=dict)
+    degraded: bool = False
     latest_error: str | None = None
     evidence_status: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[AgentRunArtifact] = Field(default_factory=list)

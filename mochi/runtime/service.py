@@ -179,12 +179,18 @@ class RuntimeService:
         execution_policy: dict[str, Any] | None = None,
         expected_artifacts: list[str] | None = None,
     ) -> dict[str, Any]:
-        effective_protocol = str(protocol or "controlled_subagent_execution").strip() or "controlled_subagent_execution"
+        effective_protocol = str(protocol or "teacher_student_distill").strip() or "teacher_student_distill"
         raw_protocol_config = dict(protocol_config or {})
+        raw_execution_policy = dict(execution_policy or {})
         if effective_protocol == "controlled_subagent_execution" and not raw_protocol_config:
             raw_protocol_config = _controlled_execution_protocol_config(execution_budget or {})
+        if not raw_execution_policy and execution_budget:
+            raw_execution_policy = {
+                "mode": "controlled",
+                **_controlled_execution_protocol_config(execution_budget),
+            }
         parsed_execution_policy = parse_subagent_execution_policy(
-            execution_policy or (raw_protocol_config if effective_protocol == "controlled_subagent_execution" else None),
+            raw_execution_policy or (raw_protocol_config if effective_protocol == "controlled_subagent_execution" else None),
             legacy_protocol=effective_protocol,
         )
         selected_models_roles = {
@@ -210,32 +216,6 @@ class RuntimeService:
             },
         )
         return await self.create_task(payload)
-
-    async def create_controlled_subagent_task(
-        self,
-        *,
-        objective: str,
-        session_id: str | None = None,
-        project_id: str | None = None,
-        workspace_dir: str | None = None,
-        suggested_roles: list[str] | None = None,
-        suggested_models: dict[str, str] | None = None,
-        execution_budget: dict[str, Any] | None = None,
-        expected_artifacts: list[str] | None = None,
-    ) -> dict[str, Any]:
-        return await self.create_delegated_subagent_task(
-            objective=objective,
-            protocol="controlled_subagent_execution",
-            protocol_config={},
-            session_id=session_id,
-            project_id=project_id,
-            workspace_dir=workspace_dir,
-            suggested_roles=suggested_roles,
-            suggested_models=suggested_models,
-            execution_budget=execution_budget,
-            execution_policy={},
-            expected_artifacts=expected_artifacts,
-        )
 
     async def create_agent_run(self, payload: AgentRunCreateRequest) -> dict[str, Any]:
         run_id = str(uuid4())
@@ -551,6 +531,12 @@ class RuntimeService:
         if completion_status == "succeeded":
             next_schedule["failure_streak"] = 0
             next_schedule["health_status"] = "healthy"
+        elif completion_status == "awaiting_resources":
+            next_schedule["failure_streak"] = failure_streak
+            next_schedule["health_status"] = "awaiting_resources"
+        elif completion_status == "partial":
+            next_schedule["failure_streak"] = failure_streak
+            next_schedule["health_status"] = "partial"
         else:
             next_schedule["failure_streak"] = failure_streak + 1
             next_schedule["health_status"] = "failing"
@@ -569,6 +555,10 @@ class RuntimeService:
             next_schedule["next_run_at"] = None
             next_schedule["schedule_status"] = "max_runs_reached"
             next_schedule["health_status"] = "completed"
+        elif completion_status == "awaiting_resources":
+            next_schedule["enabled"] = False
+            next_schedule["next_run_at"] = None
+            next_schedule["schedule_status"] = "awaiting_resources"
         elif completion_status != "succeeded" and bool(next_schedule.get("auto_pause_on_failure")):
             next_schedule["enabled"] = False
             next_schedule["next_run_at"] = None
@@ -794,6 +784,9 @@ class RuntimeService:
                 metadata={**attempt_metadata, "content": debate_context_snapshot},
             )
         for artifact_type, title in (
+            ("run_guard_policy", "Run Guard Policy"),
+            ("recovery_checkpoint", "Recovery Checkpoint"),
+            ("partial_summary", "Partial Summary"),
             ("research_plan", "Research Plan"),
             ("source_quality_table", "Source Quality Table"),
             ("claim_evidence_map", "Claim Evidence Map"),
@@ -1376,9 +1369,6 @@ class RuntimeService:
             error=None if result.state == "succeeded" else str(result.state),
         )
 
-    async def _run_controlled_subagent_task(self, *, task: dict[str, Any], task_id: str) -> None:
-        await self._run_delegated_multi_agent_task(task=task, task_id=task_id)
-
     async def _transition_agent_run(
         self,
         run_id: str,
@@ -1925,6 +1915,7 @@ def _exec_error_message(result: dict[str, Any]) -> str:
 
 
 def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
     return {
         "run_id": run["id"],
         "protocol_id": run["protocol_id"],
@@ -1933,8 +1924,11 @@ def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
         "status": run.get("status", "created"),
         "selected_models_roles": run.get("selected_models_roles") or {},
         "evaluation_policy": run.get("evaluation_policy") or {},
+        "run_policy": run.get("run_policy") or {},
         "schedule": run.get("schedule") or {},
-        "summary": run.get("summary") or {},
+        "summary": summary,
+        "recovery_state": summary.get("recovery_state") if isinstance(summary.get("recovery_state"), dict) else {},
+        "degraded": bool(summary.get("degraded", False)),
         "latest_error": run.get("latest_error"),
         "evidence_status": run.get("evidence_status") or {},
         "artifacts": run.get("artifacts") or [],
@@ -1990,6 +1984,39 @@ def _controlled_execution_protocol_config(execution_budget: dict[str, Any]) -> d
     }
 
 
+def _normalize_agent_run_policy(run_policy: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(run_policy or {})
+
+    def _optional_positive_int(key: str, *, maximum: int = 86_400) -> int | None:
+        try:
+            value = int(payload.get(key))
+        except (TypeError, ValueError):
+            return None
+        return max(1, min(value, maximum))
+
+    on_budget_exhausted = str(payload.get("on_budget_exhausted") or "pause").strip().lower()
+    if on_budget_exhausted not in {"pause", "finalize_partial"}:
+        on_budget_exhausted = "pause"
+
+    on_subagent_disconnect = str(payload.get("on_subagent_disconnect") or "retry_then_degrade").strip().lower()
+    if on_subagent_disconnect not in {"retry_then_degrade", "pause", "fail"}:
+        on_subagent_disconnect = "retry_then_degrade"
+
+    normalized = {
+        "max_wall_clock_sec": _optional_positive_int("max_wall_clock_sec"),
+        "heartbeat_timeout_sec": _optional_positive_int("heartbeat_timeout_sec"),
+        "checkpoint_interval_steps": _optional_positive_int("checkpoint_interval_steps", maximum=10_000) or 1,
+        "max_subagent_failures_per_role": _optional_positive_int(
+            "max_subagent_failures_per_role",
+            maximum=100,
+        )
+        or 2,
+        "on_budget_exhausted": on_budget_exhausted,
+        "on_subagent_disconnect": on_subagent_disconnect,
+    }
+    return {key: value for key, value in normalized.items() if value is not None}
+
+
 def _agent_run_task_input(run: dict[str, Any]) -> str:
     summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
     if isinstance(summary.get("task_input"), str) and summary["task_input"].strip():
@@ -2013,9 +2040,42 @@ def _build_agent_run_summary_payload(run: dict[str, Any], result: Any) -> dict[s
             "selected_candidate_id": result.selected_candidate_id,
             "final_answer": (result.artifacts or {}).get("final_answer"),
             "candidate_count": len(result.candidates),
+            "degraded": bool((result.metadata or {}).get("degraded", False)),
         }
     )
+    recovery_state = (result.metadata or {}).get("recovery_state")
+    if isinstance(recovery_state, dict):
+        summary["recovery_state"] = recovery_state
     return summary
+
+
+def _resolve_agent_run_completion_status(result: Any) -> str:
+    state = str(getattr(result, "state", "failed") or "failed")
+    recovery_state = (
+        result.metadata.get("recovery_state")
+        if isinstance(getattr(result, "metadata", None), dict)
+        else None
+    )
+    if state in {"succeeded", "partial", "awaiting_resources", "failed", "cancelled"}:
+        return state
+    if isinstance(recovery_state, dict):
+        action = str(recovery_state.get("action") or "").strip().lower()
+        if action == "pause":
+            return "awaiting_resources"
+        if action == "finalize_partial":
+            return "partial"
+    return state
+
+
+def _agent_run_latest_error(result: Any) -> str | None:
+    metadata = result.metadata if isinstance(getattr(result, "metadata", None), dict) else {}
+    recovery_state = metadata.get("recovery_state")
+    if not isinstance(recovery_state, dict):
+        return None
+    if str(recovery_state.get("status") or "") != "awaiting_resources":
+        return None
+    reason = recovery_state.get("reason")
+    return str(reason) if isinstance(reason, str) and reason.strip() else None
 
 
 def _build_evidence_status_payload(result: Any) -> dict[str, Any]:
