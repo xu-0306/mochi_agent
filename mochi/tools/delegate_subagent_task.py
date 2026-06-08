@@ -36,8 +36,8 @@ class DelegateSubagentTaskTool(BaseTool):
                     "type": "string",
                     "description": (
                         "Optional collaboration protocol. Examples: teacher_student_distill, "
-                        "multi_agent_debate, dr_zero_self_evolve. Defaults to legacy "
-                        "controlled execution behavior for compatibility."
+                        "multi_agent_debate, dr_zero_self_evolve. When omitted, the task uses "
+                        "teacher_student_distill unless an explicit legacy protocol is requested."
                     ),
                 },
                 "protocol_config": {
@@ -96,7 +96,7 @@ class DelegateSubagentTaskTool(BaseTool):
         launcher = get_delegate_subagent_task_launcher()
         if launcher is None:
             return ToolResult(
-                error="Controlled subagent delegation is unavailable because runtime service is not active.",
+                error="Delegated subagent execution is unavailable because runtime service is not active.",
                 retryable=True,
             )
 

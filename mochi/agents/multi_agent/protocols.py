@@ -52,18 +52,9 @@ class DrZeroSelfEvolveProtocol:
 
 @dataclass(frozen=True)
 class ControlledSubagentExecutionProtocol:
-    """Controller-gated subagent execution protocol setting."""
+    """Legacy protocol marker kept only for backward compatibility."""
 
     protocol: Literal["controlled_subagent_execution"] = "controlled_subagent_execution"
-    max_execution_requests: int = 5
-    max_commands_per_request: int = 1
-    default_timeout_sec: int = 300
-    background_allowed: bool = True
-    workspace_mode: Literal["task_sandbox"] = "task_sandbox"
-    planner_role_id: str = "planner"
-    executor_role_id: str = "executor"
-    controller_role_id: str = "controller"
-    evaluator_role_id: str = "evaluator"
     guidance_required: bool = False
 
 
@@ -128,30 +119,6 @@ def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) ->
         )
     if raw_protocol == "controlled_subagent_execution":
         return ControlledSubagentExecutionProtocol(
-            max_execution_requests=_bounded_int(
-                payload.get("max_execution_requests"),
-                default=5,
-                minimum=1,
-                maximum=20,
-            ),
-            max_commands_per_request=_bounded_int(
-                payload.get("max_commands_per_request"),
-                default=1,
-                minimum=1,
-                maximum=5,
-            ),
-            default_timeout_sec=_bounded_int(
-                payload.get("default_timeout_sec"),
-                default=300,
-                minimum=1,
-                maximum=86_400,
-            ),
-            background_allowed=bool(payload.get("background_allowed", True)),
-            workspace_mode="task_sandbox",
-            planner_role_id=_clean_role_id(payload.get("planner_role_id"), default="planner"),
-            executor_role_id=_clean_role_id(payload.get("executor_role_id"), default="executor"),
-            controller_role_id=_clean_role_id(payload.get("controller_role_id"), default="controller"),
-            evaluator_role_id=_clean_role_id(payload.get("evaluator_role_id"), default="evaluator"),
             guidance_required=bool(payload.get("guidance_required", False)),
         )
     raise ValueError(f"Unsupported multi-agent protocol: {raw_protocol}")
