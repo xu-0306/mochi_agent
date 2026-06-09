@@ -642,7 +642,8 @@ class GGUFBackend(BaseLLMBackend):
         except Exception as exc:
             return (
                 "llama-cpp-python is not available. "
-                f"Install with `uv sync --extra gguf`. ({exc.__class__.__name__}: {exc})"
+                "Install it manually only if you intentionally use the legacy GGUFBackend. "
+                f"({exc.__class__.__name__}: {exc})"
             )
         return None
 

@@ -26,10 +26,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gguf = [
-    "llama-cpp-python>=0.3",
-]
-
 hf = [
     # Kept for backward compatibility with existing `uv sync --extra hf` commands.
 ]
@@ -67,7 +63,7 @@ tools = [
 ]
 
 all = [
-    "mochi[gguf,hf,voice,channels,tools]",
+    "mochi[hf,voice,channels,tools]",
     # voice-extras / tts-extras 不放進 all，因為版本波動快，
     # 使用者按需 `uv sync --extra voice-extras` 手動啟用
 ]

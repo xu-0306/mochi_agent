@@ -1379,17 +1379,21 @@ async def install_managed_llama_cpp_runtime(
     own_client = client is None
     http_client = client or httpx.AsyncClient(follow_redirects=True, timeout=300.0)
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="mochi-llama-cpp-install-"))
-    staging_dir = install_dir / ".installing"
+    temp_dir = _create_managed_install_temp_dir(managed_root)
+    staging_dir = install_dir / ".i"
     if staging_dir.exists():
         shutil.rmtree(staging_dir, ignore_errors=True)
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        source_archive = temp_dir / metadata.source_archive_name
-        binary_archive = temp_dir / metadata.binary_asset.name
-        source_extract_dir = temp_dir / "source"
-        binary_extract_dir = temp_dir / "binary"
+        source_archive = temp_dir / "src.tar.gz"
+        binary_archive = temp_dir / (
+            "bin.zip"
+            if metadata.binary_asset.name.lower().endswith(".zip")
+            else "bin.tar.gz"
+        )
+        source_extract_dir = temp_dir / "s"
+        binary_extract_dir = temp_dir / "b"
         await _download_to_file(http_client, metadata.source_archive_url, source_archive)
         await _download_to_file(http_client, metadata.binary_asset.download_url, binary_archive)
 
@@ -1486,6 +1490,22 @@ async def _download_to_file(
                         handle.write(chunk)
     except httpx.HTTPError as exc:
         raise ManagedLlamaCppInstallNetworkError(f"Failed to download {url}: {exc}") from exc
+
+
+def _create_managed_install_temp_dir(managed_root: str | Path) -> Path:
+    """Create a short writable temp directory to avoid Windows path-length failures."""
+    managed_base = Path(managed_root).expanduser().resolve(strict=False)
+    candidates = [
+        managed_base / ".tmp",
+        managed_base,
+    ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return Path(tempfile.mkdtemp(prefix="mli-", dir=candidate))
+        except OSError:
+            continue
+    return Path(tempfile.mkdtemp(prefix="mli-"))
 
 
 def _is_supported_archive_name(name: str) -> bool:

@@ -1275,18 +1275,6 @@ wheels = [
 ]
 
 [[package]]
-name = "llama-cpp-python"
-version = "0.3.20"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "diskcache" },
-    { name = "jinja2" },
-    { name = "numpy" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/45/95/c69c47c9c8dda97f712f5864688d13a22b0159aa9adae91a69067a728532/llama_cpp_python-0.3.20.tar.gz", hash = "sha256:70f01b7d915d31c617dc66610a332cb2d51cde84c8b152d09a352206323616f5", size = 59323017, upload-time = "2026-04-03T06:56:32.455Z" }
-
-[[package]]
 name = "llvmlite"
 version = "0.47.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1551,7 +1539,6 @@ all = [
     { name = "discord-py", extra = ["voice"] },
     { name = "edge-tts" },
     { name = "faster-whisper" },
-    { name = "llama-cpp-python" },
     { name = "numpy" },
     { name = "python-telegram-bot" },
     { name = "silero-vad" },
@@ -1562,9 +1549,6 @@ channels = [
     { name = "discord-ext-voice-recv" },
     { name = "discord-py", extra = ["voice"] },
     { name = "python-telegram-bot" },
-]
-gguf = [
-    { name = "llama-cpp-python" },
 ]
 tools = [
     { name = "trafilatura" },
@@ -1605,10 +1589,9 @@ requires-dist = [
     { name = "faster-whisper", marker = "extra == 'voice'", specifier = ">=1.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "kokoro", marker = "extra == 'tts-extras'", specifier = ">=0.9.4" },
-    { name = "llama-cpp-python", marker = "extra == 'gguf'", specifier = ">=0.3" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "mcp", specifier = ">=1.0" },
-    { name = "mochi", extras = ["gguf", "hf", "voice", "channels", "tools"], marker = "extra == 'all'" },
+    { name = "mochi", extras = ["hf", "voice", "channels", "tools"], marker = "extra == 'all'" },
     { name = "numpy", marker = "extra == 'voice'", specifier = ">=1.26" },
     { name = "openai-whisper", marker = "extra == 'voice-extras'", specifier = ">=20240930" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -1630,7 +1613,7 @@ requires-dist = [
     { name = "whisper-cpp-python", marker = "extra == 'voice-extras'", specifier = ">=0.2" },
     { name = "whisperlivekit", marker = "extra == 'voice-extras'", specifier = ">=0.2" },
 ]
-provides-extras = ["gguf", "hf", "voice", "voice-extras", "tts-extras", "channels", "tools", "all"]
+provides-extras = ["hf", "voice", "voice-extras", "tts-extras", "channels", "tools", "all"]
 
 [package.metadata.requires-dev]
 dev = [

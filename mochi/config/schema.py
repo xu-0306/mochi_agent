@@ -50,7 +50,7 @@ class OllamaConfig(BaseModel):
 
 
 class GGUFConfig(BaseModel):
-    """GGUF（llama-cpp-python）後端設定。"""
+    """GGUF backend settings."""
 
     n_ctx: int = 4096
     """上下文視窗大小。"""

@@ -44,10 +44,19 @@ Base install:
 uv sync
 ```
 
+Recommended diagnostic-friendly bootstrap:
+
+```bash
+# Windows PowerShell
+./scripts/bootstrap.ps1
+
+# Linux/macOS
+./scripts/bootstrap.sh
+```
+
 Common optional extras:
 
 ```bash
-uv sync --extra gguf
 uv sync --extra hf
 uv sync --extra voice
 uv sync --extra channels
@@ -59,6 +68,10 @@ Voice backends with more volatile dependencies are separate:
 ```bash
 uv sync --extra voice-extras
 ```
+
+GGUF model loading no longer uses a Python extra. After `uv sync`, prepare a
+`llama.cpp` runtime from the Settings page's `llama.cpp Runtime` section, or
+register an existing runtime path through the same UI/API surface.
 
 `tools` currently installs higher-quality web content extraction support for `web_fetch`
 via `trafilatura`.
