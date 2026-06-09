@@ -4,6 +4,7 @@ import * as React from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
 import {
+  Archive,
   ArrowLeft,
   Download,
   Pause,
@@ -46,7 +47,14 @@ function formatDateTime(value: string | null): string {
 
 function statusVariant(status: string): BadgeProps['variant'] {
   const normalized = status.toLowerCase()
-  if (normalized === 'running' || normalized === 'queued' || normalized === 'pending') {
+  if (
+    normalized === 'running' ||
+    normalized === 'queued' ||
+    normalized === 'pending' ||
+    normalized === 'awaiting_resources' ||
+    normalized === 'stalled' ||
+    normalized === 'partial'
+  ) {
     return 'warning'
   }
   if (normalized === 'succeeded' || normalized === 'completed' || normalized === 'done') {
@@ -56,6 +64,25 @@ function statusVariant(status: string): BadgeProps['variant'] {
     return 'error'
   }
   return 'neutral'
+}
+
+type TranslateFn = (key: string, values?: Record<string, string | number | boolean | null | undefined>) => string
+
+function translateStatus(status: string, t: TranslateFn): string {
+  const normalized = status.toLowerCase()
+  const key = `agentRuns.status.${normalized}`
+  const translated = t(key)
+  return translated === key ? status : translated
+}
+
+function translateExecStatus(status: string | null | undefined, t: TranslateFn): string {
+  const normalized = status?.trim().toLowerCase()
+  if (!normalized) {
+    return t('common.unknown')
+  }
+  const key = `agentRuns.exec.status.${normalized}`
+  const translated = t(key)
+  return translated === key ? status ?? t('common.unknown') : translated
 }
 
 function jsonPreview(value: unknown): string {
@@ -198,6 +225,14 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' ? value : null
 }
 
+function getNullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
+function getBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
 function getNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
@@ -222,6 +257,70 @@ function scheduleAttemptStatusLabel(attempt: Record<string, unknown>): string {
   return getString(attempt.status) ?? 'unknown'
 }
 
+function booleanLabel(value: boolean, t: TranslateFn): string {
+  return value ? t('agentRuns.exec.boolean.yes') : t('agentRuns.exec.boolean.no')
+}
+
+function mergeRecoveryState(
+  base: api.AgentRunRecoveryState | null | undefined,
+  overlay: api.AgentRunRecoveryState | null | undefined
+): api.AgentRunRecoveryState {
+  const merged: api.AgentRunRecoveryState = { ...(base ?? {}) }
+  for (const [key, value] of Object.entries(overlay ?? {})) {
+    if (value === undefined || value === null || value === '') {
+      continue
+    }
+    merged[key] = value
+  }
+  return merged
+}
+
+function recoveryPrompt(
+  recoveryState: api.AgentRunRecoveryState,
+  runStatus: string,
+  degraded: boolean,
+  t: TranslateFn
+): { operatorMessage: string; resumeHint: string; usedFallback: boolean } {
+  const operatorMessage =
+    getNullableString(recoveryState.operator_message) ??
+    getNullableString(recoveryState.operator_note)
+  const resumeHint =
+    getNullableString(recoveryState.resume_hint) ??
+    getNullableString(recoveryState.suggested_action) ??
+    getNullableString(recoveryState.suggested_operator_action)
+  const status = (getNullableString(recoveryState.status) ?? runStatus).toLowerCase()
+
+  if (operatorMessage || resumeHint) {
+    return {
+      operatorMessage: operatorMessage ?? t(`agentRuns.recovery.${status}.message`),
+      resumeHint: resumeHint ?? t(`agentRuns.recovery.${status}.resume`),
+      usedFallback: false,
+    }
+  }
+
+  if (status === 'awaiting_resources' || status === 'stalled' || status === 'partial' || status === 'degraded') {
+    return {
+      operatorMessage: t(`agentRuns.recovery.${status}.message`),
+      resumeHint: t(`agentRuns.recovery.${status}.resume`),
+      usedFallback: true,
+    }
+  }
+
+  if (degraded) {
+    return {
+      operatorMessage: t('agentRuns.recovery.degraded.message'),
+      resumeHint: t('agentRuns.recovery.degraded.resume'),
+      usedFallback: true,
+    }
+  }
+
+  return {
+    operatorMessage: t('agentRuns.recovery.default.message'),
+    resumeHint: t('agentRuns.recovery.default.resume'),
+    usedFallback: true,
+  }
+}
+
 interface RoleOutputEntry {
   roleId: string
   candidateId: string | null
@@ -231,7 +330,7 @@ interface RoleOutputEntry {
   timestamp: string | null
 }
 
-type RunAction = 'start' | 'pause' | 'resume' | 'cancel'
+type RunAction = 'start' | 'pause' | 'resume' | 'cancel' | 'finalize_partial'
 
 export default function AgentRunDetailPage() {
   const params = useParams<{ runId: string }>()
@@ -242,6 +341,7 @@ export default function AgentRunDetailPage() {
   const [loading, setLoading] = React.useState(true)
   const [refreshing, setRefreshing] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [runHealth, setRunHealth] = React.useState<api.AgentRunHealthSummary | null>(null)
   const [guidanceText, setGuidanceText] = React.useState('')
   const [guidancePending, setGuidancePending] = React.useState(false)
   const [guidanceError, setGuidanceError] = React.useState<string | null>(null)
@@ -249,6 +349,9 @@ export default function AgentRunDetailPage() {
   const [runActionPending, setRunActionPending] = React.useState<RunAction | null>(null)
   const [runActionError, setRunActionError] = React.useState<string | null>(null)
   const [runActionSuccess, setRunActionSuccess] = React.useState<string | null>(null)
+  const [execSession, setExecSession] = React.useState<api.AgentRunExecSessionPayload | null>(null)
+  const [execActionPending, setExecActionPending] = React.useState<string | null>(null)
+  const [execActionError, setExecActionError] = React.useState<string | null>(null)
   const [exportError, setExportError] = React.useState<string | null>(null)
   const [roleFilter, setRoleFilter] = React.useState<string>('all')
   const [candidateFilter, setCandidateFilter] = React.useState<string>('all')
@@ -258,6 +361,7 @@ export default function AgentRunDetailPage() {
     if (!routeRunId) {
       setLoading(false)
       setRun(null)
+      setRunHealth(null)
       setError('Missing run id.')
       return
     }
@@ -270,6 +374,15 @@ export default function AgentRunDetailPage() {
     try {
       const data = await api.fetchAgentRun(routeRunId)
       setRun(data)
+      try {
+        const health = await api.fetchAgentRunHealth(routeRunId)
+        setRunHealth(health)
+      } catch (healthError) {
+        if (!isUnavailableError(healthError)) {
+          console.error(healthError)
+        }
+        setRunHealth(null)
+      }
     } catch (loadError) {
       if (isUnavailableError(loadError)) {
         setError('Agent Run endpoint is unavailable or this run was not found.')
@@ -301,8 +414,12 @@ export default function AgentRunDetailPage() {
   const isTerminal = run ? TERMINAL_RUN_STATUSES.has(runStatus) : false
   const canStart = runStatus === 'created'
   const canPause = runStatus === 'running'
-  const canResume = runStatus === 'paused'
+  const canResume = ['paused', 'awaiting_resources', 'partial', 'stalled'].includes(runStatus)
   const canCancel = !isTerminal
+  const effectiveRecoveryState = React.useMemo(
+    () => mergeRecoveryState(run?.recovery_state, runHealth?.recovery_state),
+    [run?.recovery_state, runHealth?.recovery_state]
+  )
   const recentScheduleAttempts = React.useMemo(
     () => getRecordArray(run?.schedule?.recent_attempts),
     [run]
@@ -449,6 +566,20 @@ export default function AgentRunDetailPage() {
     () => (run ? buildDatasetPackageFallback(run) : null),
     [run]
   )
+  const detachedExecJobs = React.useMemo(() => {
+    const artifactJobs = getRecordArray(getArtifactContent(run, 'detached_exec_jobs', selectedAttemptId)?.items)
+    if (artifactJobs.length > 0) {
+      return artifactJobs
+    }
+    return getRecordArray(runHealth?.detached_exec_jobs?.items)
+  }, [run, runHealth, selectedAttemptId])
+  const subagentHealthSnapshot = React.useMemo(() => {
+    const artifactSnapshot = getArtifactContent(run, 'subagent_health_snapshot', selectedAttemptId)
+    if (artifactSnapshot && Object.keys(artifactSnapshot).length > 0) {
+      return artifactSnapshot
+    }
+    return isRecord(runHealth?.subagent_health_snapshot) ? runHealth.subagent_health_snapshot : null
+  }, [run, runHealth, selectedAttemptId])
   const trainingReadyDatasetPackagePreview = React.useMemo(
     () =>
       datasetPackagePreview
@@ -456,6 +587,53 @@ export default function AgentRunDetailPage() {
         : null,
     [datasetPackagePreview]
   )
+  const recoveryStatus = React.useMemo(
+    () => getNullableString(effectiveRecoveryState.status),
+    [effectiveRecoveryState]
+  )
+  const recoveryPromptCopy = React.useMemo(
+    () => (run ? recoveryPrompt(effectiveRecoveryState, run.status, run.degraded, t) : null),
+    [effectiveRecoveryState, run, t]
+  )
+  const canFinalizePartial = React.useMemo(() => {
+    const explicit = runHealth?.recovery_state?.finalize_partial_ready
+    if (typeof explicit === 'boolean') {
+      return explicit
+    }
+    const status = (getNullableString(effectiveRecoveryState.status) ?? runStatus).toLowerCase()
+    return status === 'awaiting_resources' || status === 'stalled'
+  }, [effectiveRecoveryState.status, runHealth?.recovery_state?.finalize_partial_ready, runStatus])
+  const finalizePartialReason = React.useMemo(
+    () =>
+      getNullableString(effectiveRecoveryState.finalize_partial_reason) ??
+      (canFinalizePartial ? t('agentRuns.recovery.finalizePartialAvailable') : null),
+    [canFinalizePartial, effectiveRecoveryState.finalize_partial_reason, t]
+  )
+  const execJobRows = React.useMemo(() => {
+    const byId = new Map<string, Record<string, unknown>>()
+    for (const job of detachedExecJobs) {
+      const sessionId = getNullableString(job.session_id)
+      if (sessionId) {
+        byId.set(sessionId, job)
+      }
+    }
+    if (execSession?.session_id && !byId.has(execSession.session_id)) {
+      byId.set(execSession.session_id, {
+        session_id: execSession.session_id,
+        status: execSession.lease.status ?? execSession.live_status,
+        command: execSession.lease.command,
+        reattach_supported: execSession.lease.reattach_supported,
+        lease_owner: execSession.lease.lease_owner,
+        workdir: execSession.lease.workdir,
+        log_path: execSession.lease.log_path,
+        approval_state: execSession.lease.approval_state,
+        timeout: execSession.lease.timeout,
+        pid: execSession.lease.pid,
+        background: execSession.lease.background,
+      })
+    }
+    return Array.from(byId.values())
+  }, [detachedExecJobs, execSession])
 
   React.useEffect(() => {
     if (attemptScope === 'latest' || attemptScope === 'all') {
@@ -483,18 +661,29 @@ export default function AgentRunDetailPage() {
         updatedSummary = await api.pauseAgentRun(run.run_id)
       } else if (action === 'resume') {
         updatedSummary = await api.resumeAgentRun(run.run_id)
+      } else if (action === 'finalize_partial') {
+        updatedSummary = await api.finalizeAgentRunPartial(run.run_id)
       } else {
         updatedSummary = await api.cancelAgentRun(run.run_id)
       }
 
       setRun((current) => (current ? { ...current, ...updatedSummary } : current))
-      setRunActionSuccess(`Run ${action} request accepted.`)
+      setRunActionSuccess(
+        action === 'finalize_partial'
+          ? 'Run finalized as partial.'
+          : `Run ${action} request accepted.`
+      )
       await loadRun({ silent: true })
     } catch (actionError) {
       if (isUnavailableError(actionError)) {
         setRunActionError('Run control endpoint is not available on this backend yet.')
       } else {
-        const detail = actionError instanceof Error ? actionError.message : `Unable to ${action} run.`
+        const detail =
+          actionError instanceof Error
+            ? actionError.message
+            : action === 'finalize_partial'
+              ? 'Unable to finalize run as partial.'
+              : `Unable to ${action} run.`
         setRunActionError(detail)
       }
     } finally {
@@ -529,6 +718,32 @@ export default function AgentRunDetailPage() {
       setGuidancePending(false)
     }
   }, [guidanceText, run])
+
+  const handleExecAction = React.useCallback(
+    async (action: 'poll' | 'reattach' | 'stop', sessionId: string) => {
+      if (!run) {
+        return
+      }
+      setExecActionPending(`${action}:${sessionId}`)
+      setExecActionError(null)
+      try {
+        const payload =
+          action === 'poll'
+            ? await api.fetchAgentRunExecSession(run.run_id, sessionId, { yield_time_ms: 50 })
+            : action === 'reattach'
+              ? await api.reattachAgentRunExecSession(run.run_id, sessionId, { yield_time_ms: 50 })
+              : await api.stopAgentRunExecSession(run.run_id, sessionId)
+        setExecSession(payload)
+        await loadRun({ silent: true })
+      } catch (actionError) {
+        const detail = actionError instanceof Error ? actionError.message : `Unable to ${action} exec session.`
+        setExecActionError(detail)
+      } finally {
+        setExecActionPending(null)
+      }
+    },
+    [loadRun, run]
+  )
 
   const handleExportJson = React.useCallback(
     (payload: unknown, suffix: string) => {
@@ -651,6 +866,272 @@ export default function AgentRunDetailPage() {
         ) : run ? (
           <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
             <div className="space-y-6">
+              <Card>
+                <CardHeader>
+                  <CardTitle>{t('agentRuns.recovery.title')}</CardTitle>
+                  <CardDescription>{t('agentRuns.recovery.description')}</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={statusVariant(run.status)}>{translateStatus(run.status, t)}</Badge>
+                    {run.degraded ? <Badge variant="warning">{t('agentRuns.badge.degraded')}</Badge> : null}
+                    {recoveryStatus ? (
+                      <Badge variant="outline">{translateStatus(recoveryStatus, t)}</Badge>
+                    ) : null}
+                    {canFinalizePartial ? (
+                      <Badge variant="outline">{t('agentRuns.badge.finalizePartialReady')}</Badge>
+                    ) : null}
+                  </div>
+                  {recoveryPromptCopy ? (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div className="rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-foreground">
+                        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                          {t('agentRuns.recovery.operatorTitle')}
+                        </p>
+                        <p className="mt-2 whitespace-pre-wrap">{recoveryPromptCopy.operatorMessage}</p>
+                        {recoveryPromptCopy.usedFallback ? (
+                          <p className="mt-2 text-xs text-muted-foreground">{t('agentRuns.recovery.operatorFallback')}</p>
+                        ) : null}
+                      </div>
+                      <div className="rounded-lg border border-border bg-surface-layer p-3 text-sm text-foreground">
+                        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                          {t('agentRuns.recovery.resumeTitle')}
+                        </p>
+                        <p className="mt-2 whitespace-pre-wrap">{recoveryPromptCopy.resumeHint}</p>
+                      </div>
+                    </div>
+                  ) : null}
+                  {run.latest_error ? (
+                    <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                      <p className="text-xs font-medium uppercase tracking-wide">{t('agentRuns.recovery.latestError')}</p>
+                      <p className="mt-2 whitespace-pre-wrap">{run.latest_error}</p>
+                    </div>
+                  ) : null}
+                  {getNullableString(effectiveRecoveryState.suggested_action) || getNullableString(effectiveRecoveryState.suggested_operator_action) ? (
+                    <div className="rounded-lg border border-border bg-surface-layer p-3 text-sm text-foreground">
+                      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        {t('agentRuns.recovery.suggestedAction')}
+                      </p>
+                      <p className="mt-2 whitespace-pre-wrap">
+                        {getNullableString(effectiveRecoveryState.suggested_action) ?? getNullableString(effectiveRecoveryState.suggested_operator_action)}
+                      </p>
+                    </div>
+                  ) : null}
+                  {finalizePartialReason ? (
+                    <div className="rounded-lg border border-border bg-surface-layer p-3 text-sm text-foreground">
+                      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        {t('agentRuns.recovery.finalizePartialReason')}
+                      </p>
+                      <p className="mt-2 whitespace-pre-wrap">{finalizePartialReason}</p>
+                    </div>
+                  ) : null}
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-lg border border-border bg-surface-layer p-3 text-xs text-muted-foreground">
+                      <p className="font-medium uppercase tracking-wide">{t('agentRuns.recovery.policyTitle')}</p>
+                      <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[11px] text-foreground">
+                        {jsonPreview(run.run_policy)}
+                      </pre>
+                    </div>
+                    <div className="rounded-lg border border-border bg-surface-layer p-3 text-xs text-muted-foreground">
+                      <p className="font-medium uppercase tracking-wide">{t('agentRuns.recovery.stateTitle')}</p>
+                      <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[11px] text-foreground">
+                        {jsonPreview(effectiveRecoveryState)}
+                      </pre>
+                    </div>
+                  </div>
+                  {subagentHealthSnapshot ? (
+                    <div className="rounded-lg border border-border bg-surface-layer p-3 text-xs text-muted-foreground">
+                      <p className="font-medium uppercase tracking-wide">{t('agentRuns.recovery.healthTitle')}</p>
+                      <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[11px] text-foreground">
+                        {jsonPreview(subagentHealthSnapshot)}
+                      </pre>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-dashed border-border bg-surface-layer p-3 text-xs text-muted-foreground">
+                      {t('agentRuns.recovery.emptyHealth')}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>{t('agentRuns.exec.title')}</CardTitle>
+                  <CardDescription>{t('agentRuns.exec.description')}</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {execJobRows.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-border bg-surface-layer px-4 py-6 text-sm text-muted-foreground">
+                      {runStatus === 'stalled' ? t('agentRuns.exec.emptyStalled') : t('agentRuns.exec.empty')}
+                    </div>
+                  ) : (
+                    execJobRows.map((job) => {
+                      const sessionId = getNullableString(job.session_id) ?? ''
+                      const isSelectedSession = execSession?.session_id === sessionId
+                      const jobStatus = getNullableString(job.status)
+                      const jobCommand = getNullableString(job.command)
+                      const reattachSupported =
+                        getBoolean(job.reattach_supported) ??
+                        (isSelectedSession ? execSession?.lease.reattach_supported ?? false : false)
+                      return (
+                        <div key={sessionId} className="rounded-lg border border-border bg-surface-layer p-3 text-xs text-muted-foreground">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge variant="outline">{sessionId || t('common.unknown')}</Badge>
+                            <Badge variant="neutral">{translateExecStatus(jobStatus, t)}</Badge>
+                            {isSelectedSession ? (
+                              <Badge variant="outline">
+                                {t('agentRuns.exec.liveStatus')}: {translateExecStatus(execSession?.live_status, t)}
+                              </Badge>
+                            ) : null}
+                            {getBoolean(job.background) ? <Badge variant="outline">{t('agentRuns.exec.background')}</Badge> : null}
+                          </div>
+                          <div className="mt-3 grid gap-3 md:grid-cols-2">
+                            <div className="space-y-1">
+                              <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.command')}</p>
+                              <p className="font-mono text-[11px] text-foreground">
+                                {jobCommand ? truncatePreview(jobCommand, 180) : t('agentRuns.exec.noCommand')}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.reattachSupported')}</p>
+                              <p className="mt-1 text-foreground">{booleanLabel(reattachSupported, t)}</p>
+                            </div>
+                            {getNullableString(job.lease_owner) ? (
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.leaseOwner')}</p>
+                                <p className="mt-1 text-foreground">{getNullableString(job.lease_owner)}</p>
+                              </div>
+                            ) : null}
+                            {getNullableString(job.workdir) ? (
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.workdir')}</p>
+                                <p className="mt-1 break-all text-foreground">{getNullableString(job.workdir)}</p>
+                              </div>
+                            ) : null}
+                            {getNullableString(job.log_path) ? (
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.logPath')}</p>
+                                <p className="mt-1 break-all text-foreground">{getNullableString(job.log_path)}</p>
+                              </div>
+                            ) : null}
+                            {getNullableString(job.approval_state) ? (
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.approval')}</p>
+                                <p className="mt-1 text-foreground">{getNullableString(job.approval_state)}</p>
+                              </div>
+                            ) : null}
+                            {getNumber(job.timeout) !== null ? (
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.timeout')}</p>
+                                <p className="mt-1 text-foreground">{getNumber(job.timeout)}s</p>
+                              </div>
+                            ) : null}
+                            {getNumber(job.pid) !== null ? (
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.pid')}</p>
+                                <p className="mt-1 text-foreground">{getNumber(job.pid)}</p>
+                              </div>
+                            ) : null}
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={!sessionId}
+                              loading={execActionPending === `poll:${sessionId}`}
+                              onClick={() => void handleExecAction('poll', sessionId)}
+                            >
+                              {t('agentRuns.exec.action.poll')}
+                            </Button>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={!sessionId || !reattachSupported}
+                              loading={execActionPending === `reattach:${sessionId}`}
+                              onClick={() => void handleExecAction('reattach', sessionId)}
+                            >
+                              {reattachSupported ? t('agentRuns.exec.action.reattach') : t('agentRuns.exec.action.unavailable')}
+                            </Button>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={!sessionId}
+                              loading={execActionPending === `stop:${sessionId}`}
+                              onClick={() => void handleExecAction('stop', sessionId)}
+                            >
+                              {t('agentRuns.exec.action.stop')}
+                            </Button>
+                          </div>
+                          {isSelectedSession ? (
+                            <div className="mt-3 space-y-3 rounded-lg border border-border bg-canvas p-3">
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.snapshotTitle')}</p>
+                                <p className="mt-1 text-xs text-muted-foreground">{t('agentRuns.exec.snapshotDescription')}</p>
+                              </div>
+                              <div className="grid gap-3 md:grid-cols-2">
+                                <div>
+                                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.status')}</p>
+                                  <p className="mt-1 text-foreground">{translateExecStatus(execSession.session?.status ?? execSession.live_status, t)}</p>
+                                </div>
+                                {execSession.stop_status ? (
+                                  <div>
+                                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.stopStatus')}</p>
+                                    <p className="mt-1 text-foreground">{execSession.stop_status}</p>
+                                  </div>
+                                ) : null}
+                                {execSession.reattach_status ? (
+                                  <div>
+                                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.reattachStatus')}</p>
+                                    <p className="mt-1 text-foreground">{execSession.reattach_status}</p>
+                                  </div>
+                                ) : null}
+                                {execSession.session?.approval_state ? (
+                                  <div>
+                                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.approval')}</p>
+                                    <p className="mt-1 text-foreground">{execSession.session.approval_state}</p>
+                                  </div>
+                                ) : null}
+                              </div>
+                              {execSession.session ? (
+                                <div className="grid gap-3 md:grid-cols-2">
+                                  <div>
+                                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.stdout')}</p>
+                                    <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-surface-layer p-2 text-[11px] text-foreground">
+                                      {execSession.session.stdout || t('agentRuns.exec.stdoutEmpty')}
+                                    </pre>
+                                  </div>
+                                  <div>
+                                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.stderr')}</p>
+                                    <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-surface-layer p-2 text-[11px] text-foreground">
+                                      {execSession.session.stderr || t('agentRuns.exec.stderrEmpty')}
+                                    </pre>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="rounded-lg border border-dashed border-border bg-surface-layer p-3 text-sm text-muted-foreground">
+                                  {t('agentRuns.exec.noSnapshot')}
+                                </div>
+                              )}
+                              <div>
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t('agentRuns.exec.rawPayload')}</p>
+                                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-[11px] text-foreground">
+                                  {jsonPreview(execSession)}
+                                </pre>
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      )
+                    })
+                  )}
+                  {execActionError ? (
+                    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                      {execActionError}
+                    </div>
+                  ) : null}
+                </CardContent>
+              </Card>
+
               <Card>
                 <CardHeader>
                   <CardTitle>Exports</CardTitle>
@@ -982,6 +1463,16 @@ export default function AgentRunDetailPage() {
                     >
                       <Play className="h-3.5 w-3.5" />
                       Resume
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={!canFinalizePartial || runActionPending !== null}
+                      loading={runActionPending === 'finalize_partial'}
+                      onClick={() => void handleRunAction('finalize_partial')}
+                    >
+                      <Archive className="h-3.5 w-3.5" />
+                      {t('agentRuns.actions.finalizePartial')}
                     </Button>
                     <Button
                       variant="destructive"

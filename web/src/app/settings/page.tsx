@@ -5083,6 +5083,27 @@ function SecuritySettingsForm({
   )
   const [requireShellApproval, setRequireShellApproval] = React.useState(security?.require_approval_for_shell ?? true)
   const [requireFileWriteApproval, setRequireFileWriteApproval] = React.useState(security?.require_approval_for_file_write ?? false)
+  const [requireExecApproval, setRequireExecApproval] = React.useState(security?.require_approval_for_exec ?? true)
+  const [agentRunDefaultMaxWallClockSec, setAgentRunDefaultMaxWallClockSec] = React.useState(
+    security?.agent_run_default_max_wall_clock_sec == null ? '' : String(security.agent_run_default_max_wall_clock_sec)
+  )
+  const [agentRunDefaultHeartbeatTimeoutSec, setAgentRunDefaultHeartbeatTimeoutSec] = React.useState(
+    security?.agent_run_default_heartbeat_timeout_sec == null ? '' : String(security.agent_run_default_heartbeat_timeout_sec)
+  )
+  const [agentRunDefaultCheckpointIntervalSteps, setAgentRunDefaultCheckpointIntervalSteps] = React.useState(
+    String(security?.agent_run_default_checkpoint_interval_steps ?? 1)
+  )
+  const [agentRunDefaultMaxSubagentFailuresPerRole, setAgentRunDefaultMaxSubagentFailuresPerRole] = React.useState(
+    String(security?.agent_run_default_max_subagent_failures_per_role ?? 2)
+  )
+  const [agentRunDefaultOnBudgetExhausted, setAgentRunDefaultOnBudgetExhausted] = React.useState<
+    api.SecuritySettings['agent_run_default_on_budget_exhausted']
+  >(security?.agent_run_default_on_budget_exhausted ?? 'pause')
+  const [agentRunDefaultOnSubagentDisconnect, setAgentRunDefaultOnSubagentDisconnect] = React.useState<
+    api.SecuritySettings['agent_run_default_on_subagent_disconnect']
+  >(security?.agent_run_default_on_subagent_disconnect ?? 'retry_then_degrade')
+  const [execDefaultTimeoutSec, setExecDefaultTimeoutSec] = React.useState(String(security?.exec_default_timeout_sec ?? 30))
+  const [execSessionOutputLimit, setExecSessionOutputLimit] = React.useState(String(security?.exec_session_output_limit ?? 8000))
   const [fileOpsScope, setFileOpsScope] = React.useState<'workspace' | 'any'>(security?.file_ops_scope ?? 'workspace')
   const [maxFileWriteSizeMb, setMaxFileWriteSizeMb] = React.useState(String(security?.max_file_write_size_mb ?? 10.0))
   const [fileUndoMaxSizeMb, setFileUndoMaxSizeMb] = React.useState(String(security?.file_undo_max_size_mb ?? 2.0))
@@ -5093,6 +5114,19 @@ function SecuritySettingsForm({
     setAutonomyMode(security?.autonomy_mode ?? 'trusted_workspace')
     setRequireShellApproval(security?.require_approval_for_shell ?? true)
     setRequireFileWriteApproval(security?.require_approval_for_file_write ?? false)
+    setRequireExecApproval(security?.require_approval_for_exec ?? true)
+    setAgentRunDefaultMaxWallClockSec(
+      security?.agent_run_default_max_wall_clock_sec == null ? '' : String(security.agent_run_default_max_wall_clock_sec)
+    )
+    setAgentRunDefaultHeartbeatTimeoutSec(
+      security?.agent_run_default_heartbeat_timeout_sec == null ? '' : String(security.agent_run_default_heartbeat_timeout_sec)
+    )
+    setAgentRunDefaultCheckpointIntervalSteps(String(security?.agent_run_default_checkpoint_interval_steps ?? 1))
+    setAgentRunDefaultMaxSubagentFailuresPerRole(String(security?.agent_run_default_max_subagent_failures_per_role ?? 2))
+    setAgentRunDefaultOnBudgetExhausted(security?.agent_run_default_on_budget_exhausted ?? 'pause')
+    setAgentRunDefaultOnSubagentDisconnect(security?.agent_run_default_on_subagent_disconnect ?? 'retry_then_degrade')
+    setExecDefaultTimeoutSec(String(security?.exec_default_timeout_sec ?? 30))
+    setExecSessionOutputLimit(String(security?.exec_session_output_limit ?? 8000))
     setFileOpsScope(security?.file_ops_scope ?? 'workspace')
     setMaxFileWriteSizeMb(String(security?.max_file_write_size_mb ?? 10.0))
     setFileUndoMaxSizeMb(String(security?.file_undo_max_size_mb ?? 2.0))
@@ -5103,23 +5137,27 @@ function SecuritySettingsForm({
     if (value === 'strict') {
       setRequireShellApproval(true)
       setRequireFileWriteApproval(true)
+      setRequireExecApproval(true)
       setFileOpsScope('workspace')
       return
     }
     if (value === 'trusted_workspace') {
       setRequireShellApproval(true)
       setRequireFileWriteApproval(false)
+      setRequireExecApproval(true)
       setFileOpsScope('workspace')
       return
     }
     if (value === 'high_autonomy') {
       setRequireShellApproval(false)
       setRequireFileWriteApproval(false)
+      setRequireExecApproval(false)
       setFileOpsScope('any')
       return
     }
     setRequireShellApproval(false)
     setRequireFileWriteApproval(false)
+    setRequireExecApproval(false)
     setFileOpsScope('workspace')
   }
 
@@ -5137,6 +5175,23 @@ function SecuritySettingsForm({
           autonomy_mode: autonomyMode,
           require_approval_for_shell: requireShellApproval,
           require_approval_for_file_write: requireFileWriteApproval,
+          require_approval_for_exec: requireExecApproval,
+          agent_run_default_max_wall_clock_sec:
+            agentRunDefaultMaxWallClockSec.trim().length > 0
+              ? Number.parseInt(agentRunDefaultMaxWallClockSec, 10) || 1
+              : null,
+          agent_run_default_heartbeat_timeout_sec:
+            agentRunDefaultHeartbeatTimeoutSec.trim().length > 0
+              ? Number.parseInt(agentRunDefaultHeartbeatTimeoutSec, 10) || 1
+              : null,
+          agent_run_default_checkpoint_interval_steps:
+            Number.parseInt(agentRunDefaultCheckpointIntervalSteps, 10) || 1,
+          agent_run_default_max_subagent_failures_per_role:
+            Number.parseInt(agentRunDefaultMaxSubagentFailuresPerRole, 10) || 0,
+          agent_run_default_on_budget_exhausted: agentRunDefaultOnBudgetExhausted,
+          agent_run_default_on_subagent_disconnect: agentRunDefaultOnSubagentDisconnect,
+          exec_default_timeout_sec: Number.parseInt(execDefaultTimeoutSec, 10) || 30,
+          exec_session_output_limit: Number.parseInt(execSessionOutputLimit, 10) || 8000,
           file_ops_scope: fileOpsScope,
           max_file_write_size_mb: Number.parseFloat(maxFileWriteSizeMb) || 10.0,
           file_undo_max_size_mb: Number.parseFloat(fileUndoMaxSizeMb) || 2.0,
@@ -5189,6 +5244,91 @@ function SecuritySettingsForm({
             <span className="text-sm text-foreground">{t('settings.security.requireFileWriteApproval')}</span>
             <Switch checked={requireFileWriteApproval} onCheckedChange={setRequireFileWriteApproval} />
           </div>
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2 md:col-span-2">
+            <span className="text-sm text-foreground">{t('settings.security.requireExecApproval')}</span>
+            <Switch checked={requireExecApproval} onCheckedChange={setRequireExecApproval} />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.execDefaultTimeoutSec')}</SettingLabel>
+            <Input value={execDefaultTimeoutSec} onChange={(event) => setExecDefaultTimeoutSec(event.target.value)} className="font-mono text-xs" />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.execSessionOutputLimit')}</SettingLabel>
+            <Input value={execSessionOutputLimit} onChange={(event) => setExecSessionOutputLimit(event.target.value)} className="font-mono text-xs" />
+          </label>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.agentRunDefaultMaxWallClockSec')}</SettingLabel>
+            <Input
+              value={agentRunDefaultMaxWallClockSec}
+              onChange={(event) => setAgentRunDefaultMaxWallClockSec(event.target.value)}
+              placeholder={t('settings.security.agentRunDefaultMaxWallClockSecPlaceholder')}
+              className="font-mono text-xs"
+            />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.agentRunDefaultHeartbeatTimeoutSec')}</SettingLabel>
+            <Input
+              value={agentRunDefaultHeartbeatTimeoutSec}
+              onChange={(event) => setAgentRunDefaultHeartbeatTimeoutSec(event.target.value)}
+              placeholder={t('settings.security.agentRunDefaultHeartbeatTimeoutSecPlaceholder')}
+              className="font-mono text-xs"
+            />
+          </label>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.agentRunDefaultCheckpointIntervalSteps')}</SettingLabel>
+            <Input
+              value={agentRunDefaultCheckpointIntervalSteps}
+              onChange={(event) => setAgentRunDefaultCheckpointIntervalSteps(event.target.value)}
+              className="font-mono text-xs"
+            />
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.agentRunDefaultMaxSubagentFailuresPerRole')}</SettingLabel>
+            <Input
+              value={agentRunDefaultMaxSubagentFailuresPerRole}
+              onChange={(event) => setAgentRunDefaultMaxSubagentFailuresPerRole(event.target.value)}
+              className="font-mono text-xs"
+            />
+          </label>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.agentRunDefaultOnBudgetExhausted')}</SettingLabel>
+            <Select
+              value={agentRunDefaultOnBudgetExhausted}
+              onValueChange={(value) => setAgentRunDefaultOnBudgetExhausted(value as api.SecuritySettings['agent_run_default_on_budget_exhausted'])}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="pause">{t('settings.security.agentRunDefaultOnBudgetExhausted.pause')}</SelectItem>
+                <SelectItem value="finalize_partial">{t('settings.security.agentRunDefaultOnBudgetExhausted.finalize_partial')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.agentRunDefaultOnSubagentDisconnect')}</SettingLabel>
+            <Select
+              value={agentRunDefaultOnSubagentDisconnect}
+              onValueChange={(value) => setAgentRunDefaultOnSubagentDisconnect(value as api.SecuritySettings['agent_run_default_on_subagent_disconnect'])}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="retry_then_degrade">{t('settings.security.agentRunDefaultOnSubagentDisconnect.retry_then_degrade')}</SelectItem>
+                <SelectItem value="pause">{t('settings.security.agentRunDefaultOnSubagentDisconnect.pause')}</SelectItem>
+                <SelectItem value="fail">{t('settings.security.agentRunDefaultOnSubagentDisconnect.fail')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
         </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           <label className="space-y-1.5 md:col-span-1">

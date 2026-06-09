@@ -693,6 +693,130 @@ class RuntimeStore:
 
         await asyncio.to_thread(_op)
 
+    async def acquire_agent_run_resume_lease(
+        self,
+        run_id: str,
+        *,
+        expected_statuses: set[str],
+        lease: dict[str, Any],
+    ) -> str:
+        await self.initialize()
+        now = _now_iso()
+
+        def _op() -> str:
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT status, summary_json
+                    FROM agent_runs
+                    WHERE id=?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    return "run_not_found"
+                current_status = str(row[0] or "created")
+                summary = json.loads(str(row[1] or "{}"))
+                recovery_state = (
+                    dict(summary.get("recovery_state"))
+                    if isinstance(summary.get("recovery_state"), dict)
+                    else {}
+                )
+                resume_runtime = (
+                    dict(recovery_state.get("resume_runtime"))
+                    if isinstance(recovery_state.get("resume_runtime"), dict)
+                    else {}
+                )
+                active_lease_id = resume_runtime.get("lease_id")
+                active_status = str(resume_runtime.get("status") or "").strip().lower()
+                if current_status not in expected_statuses:
+                    if current_status == "running" and isinstance(active_lease_id, str) and active_lease_id.strip():
+                        return "already_running"
+                    return "invalid_status"
+                if isinstance(active_lease_id, str) and active_lease_id.strip() and active_status == "active":
+                    return "lease_conflict"
+                recovery_state["resume_runtime"] = dict(lease)
+                summary["recovery_state"] = recovery_state
+                conn.execute(
+                    """
+                    UPDATE agent_runs
+                    SET status=?,
+                        latest_error=?,
+                        summary_json=?,
+                        started_at=COALESCE(started_at, ?),
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        "running",
+                        None,
+                        json.dumps(summary, ensure_ascii=False),
+                        now,
+                        now,
+                        run_id,
+                    ),
+                )
+                conn.commit()
+                return "acquired"
+
+        return await asyncio.to_thread(_op)
+
+    async def release_agent_run_resume_lease(
+        self,
+        run_id: str,
+        *,
+        lease_id: str,
+        status: str,
+    ) -> None:
+        await self.initialize()
+        now = _now_iso()
+
+        def _op() -> None:
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT summary_json
+                    FROM agent_runs
+                    WHERE id=?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    return
+                summary = json.loads(str(row[0] or "{}"))
+                recovery_state = (
+                    dict(summary.get("recovery_state"))
+                    if isinstance(summary.get("recovery_state"), dict)
+                    else {}
+                )
+                resume_runtime = (
+                    dict(recovery_state.get("resume_runtime"))
+                    if isinstance(recovery_state.get("resume_runtime"), dict)
+                    else {}
+                )
+                if str(resume_runtime.get("lease_id") or "").strip() != lease_id:
+                    return
+                resume_runtime["status"] = status
+                resume_runtime["released_at"] = now
+                recovery_state["resume_runtime"] = resume_runtime
+                summary["recovery_state"] = recovery_state
+                conn.execute(
+                    """
+                    UPDATE agent_runs
+                    SET summary_json=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps(summary, ensure_ascii=False),
+                        now,
+                        run_id,
+                    ),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_op)
+
     async def append_agent_run_event(self, run_id: str, event: dict[str, Any]) -> None:
         await self.initialize()
         now = _now_iso()

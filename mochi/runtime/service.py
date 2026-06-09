@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,10 @@ from mochi.runtime.approvals import ApprovalStatus, InMemoryApprovalStore
 from mochi.runtime.delegate import set_delegate_subagent_task_launcher
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.models import AgentRunCreateRequest, AgentRunGuidanceRequest, TaskCreateRequest
+from mochi.runtime.recovery import (
+    build_resource_exhaustion_report,
+    classify_agent_run_recovery_issue,
+)
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
 from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
@@ -34,6 +39,8 @@ from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
 AGENT_RUN_ACTIVE_STATUS = {"running"}
+AGENT_RUN_OPERATOR_FINALIZEABLE_STATUS = {"awaiting_resources", "stalled"}
+AGENT_RUN_RESUMABLE_STATUS = {"paused", "awaiting_resources", "partial", "stalled"}
 DELEGATED_MULTI_AGENT_TASK_TYPE = "delegated_multi_agent"
 AGENT_RUN_SUPPORTED_PROTOCOLS = {
     "teacher_student_distill",
@@ -99,6 +106,9 @@ class RuntimeService:
         self._scheduler_poll_interval_seconds = max(0.05, float(seconds))
 
     async def start(self) -> None:
+        recover_detached = getattr(self._exec_runtime, "recover_detached_sessions", None)
+        if callable(recover_detached):
+            await recover_detached()
         active = self._scheduler_task
         if active is not None and not active.done():
             return
@@ -109,14 +119,28 @@ class RuntimeService:
         )
 
     async def close(self) -> None:
+        current_loop = asyncio.get_running_loop()
+
+        def _awaitable_in_current_loop(task: asyncio.Task[Any] | None) -> bool:
+            if task is None:
+                return False
+            get_loop = getattr(task, "get_loop", None)
+            if not callable(get_loop):
+                return True
+            try:
+                return get_loop() is current_loop
+            except RuntimeError:
+                return False
+
         self._scheduler_stop_event.set()
         scheduler_task = self._scheduler_task
         if scheduler_task is not None and not scheduler_task.done():
             scheduler_task.cancel()
-            try:
-                await scheduler_task
-            except asyncio.CancelledError:
-                pass
+            if _awaitable_in_current_loop(scheduler_task):
+                try:
+                    await scheduler_task
+                except asyncio.CancelledError:
+                    pass
         self._scheduler_task = None
 
         for job in list(self._active_jobs.values()):
@@ -127,18 +151,30 @@ class RuntimeService:
                 job.cancel()
 
         for job in list(self._active_jobs.values()):
-            try:
-                await job
-            except asyncio.CancelledError:
-                pass
+            if _awaitable_in_current_loop(job):
+                try:
+                    await job
+                except asyncio.CancelledError:
+                    pass
         for job in list(self._active_agent_run_jobs.values()):
-            try:
-                await job
-            except asyncio.CancelledError:
-                pass
+            if _awaitable_in_current_loop(job):
+                try:
+                    await job
+                except asyncio.CancelledError:
+                    pass
 
         self._active_jobs.clear()
         self._active_agent_run_jobs.clear()
+        close_exec_runtime = getattr(self._exec_runtime, "close", None)
+        if callable(close_exec_runtime):
+            try:
+                signature = inspect.signature(close_exec_runtime)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None and "preserve_detached" in signature.parameters:
+                await close_exec_runtime(preserve_detached=True)
+            else:
+                await close_exec_runtime()
 
     async def create_task(self, payload: TaskCreateRequest) -> dict[str, Any]:
         task_id = str(uuid4())
@@ -220,7 +256,10 @@ class RuntimeService:
     async def create_agent_run(self, payload: AgentRunCreateRequest) -> dict[str, Any]:
         run_id = str(uuid4())
         schedule = _normalize_agent_run_schedule(payload.schedule)
-        run_policy = _normalize_agent_run_policy(payload.run_policy)
+        run_policy = _normalize_agent_run_policy(
+            payload.run_policy,
+            defaults=_default_agent_run_policy_from_security(self._security_config),
+        )
         run = await self._store.create_agent_run(
             run_id=run_id,
             protocol_id=payload.protocol_id,
@@ -278,6 +317,95 @@ class RuntimeService:
             return None
         return build_dataset_package(run)
 
+    async def get_agent_run_exec_session(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        yield_time_ms: int | None = None,
+    ) -> dict[str, Any] | tuple[str, None]:
+        run = await self.get_agent_run(run_id)
+        if run is None:
+            return ("run_not_found", None)
+        lease = _find_agent_run_exec_lease(run, session_id)
+        if lease is None:
+            return ("session_not_found", None)
+        poll = await self._exec_runtime.read_session(session_id, yield_time_ms=yield_time_ms)
+        return _build_agent_run_exec_session_payload(
+            run_id=run_id,
+            session_id=session_id,
+            lease=lease,
+            poll=poll,
+        )
+
+    async def reattach_agent_run_exec_session(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        yield_time_ms: int | None = None,
+    ) -> dict[str, Any] | tuple[str, None]:
+        run = await self.get_agent_run(run_id)
+        if run is None:
+            return ("run_not_found", None)
+        lease = _find_agent_run_exec_lease(run, session_id)
+        if lease is None:
+            return ("session_not_found", None)
+        poll = await self._exec_runtime.read_session(session_id, yield_time_ms=yield_time_ms)
+        await self._store.append_agent_run_event(
+            run_id,
+            {
+                "type": "detached_exec_reattached",
+                "session_id": session_id,
+                "request_id": lease.get("request_id"),
+                "live_status": "available" if poll is not None else "unavailable",
+                "log_path": lease.get("log_path"),
+                "checkpoint_dir": lease.get("checkpoint_dir"),
+            },
+        )
+        payload = _build_agent_run_exec_session_payload(
+            run_id=run_id,
+            session_id=session_id,
+            lease=lease,
+            poll=poll,
+        )
+        payload["reattached"] = True
+        payload["reattach_status"] = payload["live_status"]
+        return payload
+
+    async def stop_agent_run_exec_session(
+        self,
+        run_id: str,
+        session_id: str,
+    ) -> dict[str, Any] | tuple[str, None]:
+        run = await self.get_agent_run(run_id)
+        if run is None:
+            return ("run_not_found", None)
+        lease = _find_agent_run_exec_lease(run, session_id)
+        if lease is None:
+            return ("session_not_found", None)
+        poll = await self._exec_runtime.kill_session(session_id)
+        stop_status = poll.status.value if poll is not None else "unavailable"
+        await self._store.append_agent_run_event(
+            run_id,
+            {
+                "type": "detached_exec_stop",
+                "session_id": session_id,
+                "request_id": lease.get("request_id"),
+                "status": stop_status,
+                "log_path": lease.get("log_path"),
+                "checkpoint_dir": lease.get("checkpoint_dir"),
+            },
+        )
+        payload = _build_agent_run_exec_session_payload(
+            run_id=run_id,
+            session_id=session_id,
+            lease=lease,
+            poll=poll,
+        )
+        payload["stop_status"] = stop_status
+        return payload
+
     async def start_agent_run(self, run_id: str) -> dict[str, Any] | None:
         run = await self._store.get_agent_run(run_id)
         if run is None:
@@ -285,11 +413,11 @@ class RuntimeService:
         current_status = str(run.get("status") or "created")
         if current_status in AGENT_RUN_TERMINAL_STATUS:
             return _agent_run_summary(run)
-        if current_status not in {"created", "paused", "running", "partial", "awaiting_resources"}:
+        if current_status not in {"created", "paused", "running", "partial", "awaiting_resources", "stalled"}:
             return _agent_run_summary(run)
 
-        if current_status in {"created", "paused", "partial", "awaiting_resources"}:
-            if current_status in {"created", "partial", "awaiting_resources"}:
+        if current_status in {"created", "paused", "partial", "awaiting_resources", "stalled"}:
+            if current_status in {"created", "partial", "awaiting_resources", "stalled"}:
                 await self._begin_agent_run_attempt(run_id, source="manual")
             await self._store.update_agent_run_status(run_id, "running", latest_error=None)
             attempt_id = await self._get_current_attempt_id(run_id)
@@ -330,19 +458,60 @@ class RuntimeService:
         updated = await self._store.get_agent_run(run_id)
         return _agent_run_summary(updated or run)
 
-    async def resume_agent_run(self, run_id: str) -> dict[str, Any] | None:
+    async def resume_agent_run(
+        self,
+        run_id: str,
+        *,
+        strategy: str | None = None,
+    ) -> dict[str, Any] | None:
         run = await self._store.get_agent_run(run_id)
         if run is None:
             return None
         current_status = str(run.get("status") or "created")
         if current_status in AGENT_RUN_TERMINAL_STATUS:
             return _agent_run_summary(run)
-        if current_status not in {"paused", "awaiting_resources", "partial"}:
+        if current_status not in AGENT_RUN_RESUMABLE_STATUS:
             return _agent_run_summary(run)
 
-        await self._store.update_agent_run_status(run_id, "running", latest_error=None)
-        await self._store.append_agent_run_event(run_id, {"type": "run_resumed"})
-        await self._ensure_agent_run_job(run_id, job_name=f"runtime-agent-run-resume-{run_id}")
+        effective_strategy = _resolve_agent_run_resume_strategy(strategy, run)
+        lease = _build_agent_run_resume_lease(
+            run_id=run_id,
+            strategy=effective_strategy,
+            checkpoint_index=_recovery_checkpoint_index_from_run(run),
+            source="manual_resume",
+        )
+        lease_status = await self._store.acquire_agent_run_resume_lease(
+            run_id,
+            expected_statuses=set(AGENT_RUN_RESUMABLE_STATUS),
+            lease=lease,
+        )
+        if lease_status == "run_not_found":
+            return None
+        if lease_status in {"already_running", "lease_conflict", "invalid_status"}:
+            updated = await self._store.get_agent_run(run_id)
+            return _agent_run_summary(updated or run)
+
+        attempt_id = await self._get_current_attempt_id(run_id)
+        if current_status in {"awaiting_resources", "partial", "stalled"}:
+            attempt_id = await self._begin_agent_run_attempt(run_id, source="resume")
+        await self._store.append_agent_run_event(
+            run_id,
+            {
+                "type": "run_resumed",
+                "resume_strategy": effective_strategy,
+                "resume_lease_id": lease["lease_id"],
+                "attempt_id": attempt_id,
+            },
+        )
+        try:
+            await self._ensure_agent_run_job(run_id, job_name=f"runtime-agent-run-resume-{run_id}")
+        except Exception:
+            await self._store.release_agent_run_resume_lease(
+                run_id,
+                lease_id=str(lease["lease_id"]),
+                status="failed_to_start",
+            )
+            raise
         updated = await self._store.get_agent_run(run_id)
         return _agent_run_summary(updated or run)
 
@@ -392,6 +561,103 @@ class RuntimeService:
         response["events"] = await self._store.get_agent_run_events(run_id)
         return response
 
+    async def finalize_agent_run_partial(self, run_id: str) -> dict[str, Any] | tuple[str, str | None]:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return ("run_not_found", None)
+
+        current_status = str(run.get("status") or "created")
+        if current_status == "partial":
+            payload = _agent_run_summary(run)
+            payload["events"] = await self._store.get_agent_run_events(run_id)
+            return payload
+        if current_status not in AGENT_RUN_OPERATOR_FINALIZEABLE_STATUS:
+            return ("invalid_status", current_status)
+
+        summary = dict(run.get("summary") or {})
+        recovery_state = (
+            dict(summary.get("recovery_state"))
+            if isinstance(summary.get("recovery_state"), dict)
+            else {}
+        )
+        if recovery_state:
+            recovery_state["status"] = "partial"
+            recovery_state["action"] = "finalize_partial"
+        summary["recovery_state"] = recovery_state
+
+        partial_summary = _build_agent_run_partial_summary(run=run, summary=summary)
+        await self._store.update_agent_run_metadata(
+            run_id,
+            summary=summary,
+            latest_error=run.get("latest_error"),
+        )
+        await self._append_operator_partial_summary_artifact(
+            run_id,
+            partial_summary=partial_summary,
+            recovery_state=recovery_state,
+        )
+        await self._finalize_agent_run_schedule_partial(run_id)
+        await self._store.update_agent_run_status(
+            run_id,
+            "partial",
+            latest_error=run.get("latest_error"),
+        )
+        await self._store.append_agent_run_event(
+            run_id,
+            {
+                "type": "run_finalized_partial",
+                "from_status": current_status,
+                "artifact_count": len(run.get("artifacts") or []),
+            },
+        )
+
+        updated = await self.get_agent_run(run_id)
+        if updated is None:
+            return ("run_not_found", None)
+        return updated
+
+    async def get_agent_run_health(self, run_id: str) -> dict[str, Any] | None:
+        run = await self.get_agent_run(run_id)
+        if run is None:
+            return None
+        summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+        recovery_state = (
+            run.get("recovery_state")
+            if isinstance(run.get("recovery_state"), dict)
+            else {}
+        )
+        recovery_status = str(recovery_state.get("status") or run.get("status") or "created")
+        return {
+            "run_id": run_id,
+            "status": str(run.get("status") or "created"),
+            "degraded": bool(run.get("degraded", False)),
+            "latest_error": run.get("latest_error"),
+            "schedule_health_status": (
+                run.get("schedule", {}).get("health_status")
+                if isinstance(run.get("schedule"), dict)
+                else None
+            ),
+            "recovery_state": {
+                "status": recovery_state.get("status"),
+                "action": recovery_state.get("action"),
+                "reason": recovery_state.get("reason"),
+                "stage": recovery_state.get("stage"),
+                "finalize_partial_ready": recovery_status in AGENT_RUN_OPERATOR_FINALIZEABLE_STATUS,
+                "recommended_resume_conditions": list(
+                    recovery_state.get("recommended_resume_conditions") or []
+                ),
+                "checkpoint_index": (
+                    recovery_state.get("checkpoint", {}).get("checkpoint_index")
+                    if isinstance(recovery_state.get("checkpoint"), dict)
+                    else None
+                ),
+            },
+            "candidate_count": int(summary.get("candidate_count") or 0),
+            "subagent_health_snapshot": _build_operator_subagent_health_summary(run),
+            "role_task_snapshot": _build_operator_role_task_summary(run),
+            "detached_exec_jobs": _build_operator_detached_exec_summary(run),
+        }
+
     async def _scheduler_loop(self) -> None:
         while True:
             try:
@@ -428,7 +694,7 @@ class RuntimeService:
             if not _is_agent_run_schedule_due(schedule, now=now):
                 continue
             current_status = str(run.get("status") or "created")
-            if current_status in {"running", "paused", "cancelled"}:
+            if current_status in {"running", "paused", "cancelled", "stalled"}:
                 continue
             await self._trigger_scheduled_agent_run(run, schedule=schedule, now=now)
 
@@ -537,6 +803,9 @@ class RuntimeService:
         elif completion_status == "partial":
             next_schedule["failure_streak"] = failure_streak
             next_schedule["health_status"] = "partial"
+        elif completion_status == "stalled":
+            next_schedule["failure_streak"] = failure_streak + 1
+            next_schedule["health_status"] = "stalled"
         else:
             next_schedule["failure_streak"] = failure_streak + 1
             next_schedule["health_status"] = "failing"
@@ -559,6 +828,10 @@ class RuntimeService:
             next_schedule["enabled"] = False
             next_schedule["next_run_at"] = None
             next_schedule["schedule_status"] = "awaiting_resources"
+        elif completion_status == "stalled":
+            next_schedule["enabled"] = False
+            next_schedule["next_run_at"] = None
+            next_schedule["schedule_status"] = "stalled"
         elif completion_status != "succeeded" and bool(next_schedule.get("auto_pause_on_failure")):
             next_schedule["enabled"] = False
             next_schedule["next_run_at"] = None
@@ -573,10 +846,22 @@ class RuntimeService:
         await self._store.update_agent_run_schedule(run_id, next_schedule)
 
     async def _run_agent_run(self, *, run_id: str) -> None:
-        run = await self._store.get_agent_run(run_id)
+        run = await self.get_agent_run(run_id)
         if run is None:
             return
         schedule = run.get("schedule") if isinstance(run.get("schedule"), dict) else {}
+        active_resume_runtime = _resume_runtime_from_run(run)
+        active_resume_lease_id = (
+            str(active_resume_runtime.get("lease_id"))
+            if isinstance(active_resume_runtime.get("lease_id"), str) and active_resume_runtime.get("lease_id")
+            else None
+        )
+        active_resume_strategy = _resolve_agent_run_resume_strategy(None, run)
+        active_resume_payload = (
+            _resume_payload_from_run(run)
+            if active_resume_strategy == "continue_from_checkpoint"
+            else None
+        )
         attempt_id = (
             str(schedule.get("current_attempt_id"))
             if isinstance(schedule.get("current_attempt_id"), str) and schedule.get("current_attempt_id")
@@ -612,6 +897,9 @@ class RuntimeService:
                     "summary": run.get("summary") or {},
                     "workspace_dir": run.get("summary", {}).get("workspace_dir") if isinstance(run.get("summary"), dict) else None,
                     "task_workspace_dir": str(task_workspace_dir) if task_workspace_dir is not None else None,
+                    "resume_strategy": active_resume_strategy,
+                    "resume_payload": dict(active_resume_payload or {}),
+                    "resume_runtime": dict(active_resume_runtime or {}),
                 },
             )
             result = await orchestrator.run(request)
@@ -622,6 +910,11 @@ class RuntimeService:
                 await self._store.append_agent_run_event(run_id, event_payload)
 
             summary = _build_agent_run_summary_payload(run, result)
+            summary = _ensure_agent_run_resume_payload(
+                run=run,
+                summary=summary,
+                strategy=active_resume_strategy,
+            )
             evidence_status = _build_evidence_status_payload(result)
             await self._store.update_agent_run_metadata(
                 run_id,
@@ -667,6 +960,52 @@ class RuntimeService:
                 )
             raise
         except Exception as exc:
+            classified = classify_agent_run_recovery_issue(exc)
+            if classified is not None:
+                recovery_summary, latest_error = _build_runtime_resource_recovery_summary(
+                    run=run,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    issue=classified,
+                    exception=exc,
+                )
+                await self._store.append_agent_run_event(
+                    run_id,
+                    {
+                        "type": "run_error",
+                        "error": str(exc),
+                        "attempt_id": attempt_id,
+                        "recovery_status": "awaiting_resources",
+                        "recovery_classification": classified.kind,
+                    },
+                )
+                await self._store.update_agent_run_metadata(
+                    run_id,
+                    summary=recovery_summary,
+                    latest_error=latest_error,
+                )
+                await self._persist_runtime_resource_recovery_artifacts(
+                    run_id,
+                    run=run,
+                    attempt_id=attempt_id,
+                    recovery_summary=recovery_summary,
+                )
+                package_summary = await self._materialize_agent_run_packages(
+                    run_id,
+                    attempt_id=attempt_id,
+                )
+                await self._update_agent_run_schedule_completion(
+                    run_id,
+                    completion_status="awaiting_resources",
+                    attempt_id=attempt_id,
+                    package_summary=package_summary,
+                )
+                await self._store.update_agent_run_status(
+                    run_id,
+                    "awaiting_resources",
+                    latest_error=latest_error,
+                )
+                return
             await self._store.append_agent_run_event(
                 run_id,
                 {
@@ -695,6 +1034,17 @@ class RuntimeService:
                 latest_error=str(exc),
             )
         finally:
+            if active_resume_lease_id is not None:
+                release_status = (
+                    "completed"
+                    if str((await self._store.get_agent_run(run_id) or {}).get("status") or "") in AGENT_RUN_TERMINAL_STATUS | {"awaiting_resources", "stalled"}
+                    else "released"
+                )
+                await self._store.release_agent_run_resume_lease(
+                    run_id,
+                    lease_id=active_resume_lease_id,
+                    status=release_status,
+                )
             active = self._active_agent_run_jobs.get(run_id)
             current = asyncio.current_task()
             if active is not None and (active is current or active.done()):
@@ -787,6 +1137,8 @@ class RuntimeService:
             ("run_guard_policy", "Run Guard Policy"),
             ("recovery_checkpoint", "Recovery Checkpoint"),
             ("partial_summary", "Partial Summary"),
+            ("resource_exhaustion_report", "Resource Exhaustion Report"),
+            ("subagent_health_snapshot", "Subagent Health Snapshot"),
             ("research_plan", "Research Plan"),
             ("source_quality_table", "Source Quality Table"),
             ("claim_evidence_map", "Claim Evidence Map"),
@@ -801,6 +1153,7 @@ class RuntimeService:
             ("execution_requests", "Execution Requests"),
             ("controller_decisions", "Controller Decisions"),
             ("execution_results", "Execution Results"),
+            ("detached_exec_jobs", "Detached Exec Jobs"),
             ("produced_artifacts", "Produced Artifacts"),
             ("evaluation_summary", "Evaluation Summary"),
             ("controlled_execution_runtime", "Controlled Execution Runtime"),
@@ -827,6 +1180,59 @@ class RuntimeService:
                 uri=f"agent-run://{run_id}/artifacts/{attempt_key}/dataset-record-{index}",
                 mime_type="application/json",
                 metadata={**attempt_metadata, "record": record},
+            )
+
+    async def _persist_runtime_resource_recovery_artifacts(
+        self,
+        run_id: str,
+        *,
+        run: dict[str, Any],
+        attempt_id: str | None,
+        recovery_summary: dict[str, Any],
+    ) -> None:
+        attempt_key = attempt_id or "latest"
+        attempt_metadata = {"attempt_id": attempt_id} if attempt_id else {}
+        run_policy = run.get("run_policy") if isinstance(run.get("run_policy"), dict) else {}
+        recovery_state = (
+            recovery_summary.get("recovery_state")
+            if isinstance(recovery_summary.get("recovery_state"), dict)
+            else {}
+        )
+        checkpoint = (
+            recovery_state.get("checkpoint")
+            if isinstance(recovery_state.get("checkpoint"), dict)
+            else {}
+        )
+        partial_summary = {
+            "status": recovery_state.get("status"),
+            "reason": recovery_state.get("reason"),
+            "stage": recovery_state.get("stage"),
+            "checkpoint_index": checkpoint.get("checkpoint_index"),
+            "candidate_count": int(recovery_summary.get("candidate_count") or 0),
+            "artifact_keys": [],
+            "unfinished_steps": list(recovery_state.get("unfinished_steps") or []),
+        }
+        resource_report = (
+            recovery_state.get("resource_exhaustion_report")
+            if isinstance(recovery_state.get("resource_exhaustion_report"), dict)
+            else {}
+        )
+        for artifact_type, title, content in (
+            ("run_guard_policy", "Run Guard Policy", run_policy),
+            ("recovery_checkpoint", "Recovery Checkpoint", checkpoint),
+            ("partial_summary", "Partial Summary", partial_summary),
+            ("resource_exhaustion_report", "Resource Exhaustion Report", resource_report),
+        ):
+            if not isinstance(content, dict) or not content:
+                continue
+            await self._store.append_agent_run_artifact(
+                run_id,
+                artifact_id=f"{run_id}:attempt:{attempt_key}:{artifact_type}",
+                artifact_type=artifact_type,
+                title=title,
+                uri=f"agent-run://{run_id}/artifacts/{attempt_key}/{artifact_type}",
+                mime_type="application/json",
+                metadata={**attempt_metadata, "content": content},
             )
 
     async def _materialize_agent_run_packages(
@@ -1088,6 +1494,12 @@ class RuntimeService:
                 background=bool(payload.get("background", False)),
                 tty=bool(payload.get("tty", False)),
                 approval_state=str(payload.get("approval_state") or "approved"),
+                log_path=str(payload.get("log_path")) if isinstance(payload.get("log_path"), str) else None,
+                checkpoint_dir=(
+                    str(payload.get("checkpoint_dir"))
+                    if isinstance(payload.get("checkpoint_dir"), str)
+                    else None
+                ),
             )
         except Exception as exc:
             return {
@@ -1107,6 +1519,12 @@ class RuntimeService:
             "approval_state": poll.approval_state,
             "stdout": poll.stdout,
             "stderr": poll.stderr,
+            "log_path": str(payload.get("log_path")) if isinstance(payload.get("log_path"), str) else None,
+            "checkpoint_dir": (
+                str(payload.get("checkpoint_dir"))
+                if isinstance(payload.get("checkpoint_dir"), str)
+                else None
+            ),
         }
 
     def _task_approval_summary(self, approval: dict[str, Any]) -> dict[str, Any]:
@@ -1368,6 +1786,56 @@ class RuntimeService:
             final_answer=final_answer,
             error=None if result.state == "succeeded" else str(result.state),
         )
+
+    async def _append_operator_partial_summary_artifact(
+        self,
+        run_id: str,
+        *,
+        partial_summary: dict[str, Any],
+        recovery_state: dict[str, Any],
+    ) -> None:
+        await self._store.append_agent_run_artifact(
+            run_id,
+            artifact_id=f"{run_id}:operator:partial_summary:{uuid4()}",
+            artifact_type="partial_summary",
+            title="Partial Summary",
+            uri=f"agent-run://{run_id}/artifacts/operator/partial-summary",
+            mime_type="application/json",
+            metadata={
+                "operator_action": "finalize_partial",
+                "recovery_status": recovery_state.get("status"),
+                "content": partial_summary,
+            },
+        )
+        checkpoint = recovery_state.get("checkpoint")
+        if isinstance(checkpoint, dict) and checkpoint:
+            await self._store.append_agent_run_artifact(
+                run_id,
+                artifact_id=f"{run_id}:operator:recovery_checkpoint:{uuid4()}",
+                artifact_type="recovery_checkpoint",
+                title="Recovery Checkpoint",
+                uri=f"agent-run://{run_id}/artifacts/operator/recovery-checkpoint",
+                mime_type="application/json",
+                metadata={
+                    "operator_action": "finalize_partial",
+                    "content": checkpoint,
+                },
+            )
+
+    async def _finalize_agent_run_schedule_partial(self, run_id: str) -> None:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return
+        schedule = run.get("schedule") if isinstance(run.get("schedule"), dict) else {}
+        if not _has_runtime_schedule_controls(schedule):
+            return
+        next_schedule = dict(schedule)
+        next_schedule["last_completion_status"] = "partial"
+        next_schedule["health_status"] = "partial"
+        next_schedule["current_attempt_id"] = None
+        if str(next_schedule.get("schedule_status") or "") in {"awaiting_resources", "stalled"}:
+            next_schedule["schedule_status"] = "completed"
+        await self._store.update_agent_run_schedule(run_id, next_schedule)
 
     async def _transition_agent_run(
         self,
@@ -1914,6 +2382,175 @@ def _exec_error_message(result: dict[str, Any]) -> str:
     return "Exec command failed."
 
 
+def _find_agent_run_exec_lease(run: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    target = session_id.strip()
+    if not target:
+        return None
+    artifacts = run.get("artifacts")
+    if not isinstance(artifacts, list):
+        return None
+    fallback_lease: dict[str, Any] | None = None
+
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+        content = metadata.get("content") if isinstance(metadata.get("content"), dict) else {}
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if artifact_type == "detached_exec_jobs":
+            items = content.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and str(item.get("session_id") or "").strip() == target:
+                        return dict(item)
+        if artifact_type == "execution_results":
+            items = content.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    session = _result_session_id_from_execution_result(item)
+                    if session != target:
+                        continue
+                    fallback_lease = {
+                        "session_id": session,
+                        "request_id": item.get("request_id"),
+                        "command": item.get("command"),
+                        "shell": item.get("shell"),
+                        "workdir": item.get("workdir"),
+                        "timeout": item.get("timeout"),
+                        "log_path": item.get("log_path"),
+                        "checkpoint_dir": item.get("checkpoint_dir"),
+                        "status": item.get("status"),
+                        "background": bool(item.get("background")),
+                        "approval_state": (
+                            item.get("metadata", {}).get("approval_state")
+                            if isinstance(item.get("metadata"), dict)
+                            else None
+                        ),
+                        "pid": (
+                            item.get("metadata", {}).get("pid")
+                            if isinstance(item.get("metadata"), dict)
+                            else None
+                        ),
+                        "lease_owner": "runtime_service",
+                        "reattach_supported": True,
+                    }
+    return fallback_lease
+
+
+def _result_session_id_from_execution_result(result: dict[str, Any]) -> str | None:
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    session_id = metadata.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
+def _build_agent_run_exec_session_payload(
+    *,
+    run_id: str,
+    session_id: str,
+    lease: dict[str, Any],
+    poll: Any,
+) -> dict[str, Any]:
+    if poll is None:
+        return {
+            "run_id": run_id,
+            "session_id": session_id,
+            "associated": True,
+            "live_status": "unavailable",
+            "lease": lease,
+            "session": None,
+        }
+    return {
+        "run_id": run_id,
+        "session_id": session_id,
+        "associated": True,
+        "live_status": "available",
+        "lease": lease,
+        "session": {
+            "session_id": poll.session_id,
+            "shell": poll.shell,
+            "status": poll.status.value,
+            "background": poll.background,
+            "tty": poll.tty,
+            "pid": poll.pid,
+            "exit_code": poll.exit_code,
+            "timed_out": poll.timed_out,
+            "approval_state": poll.approval_state,
+            "stdout": poll.stdout,
+            "stderr": poll.stderr,
+        },
+    }
+
+
+def _build_agent_run_partial_summary(
+    *,
+    run: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    effective_summary = summary if isinstance(summary, dict) else {}
+    recovery_state = (
+        effective_summary.get("recovery_state")
+        if isinstance(effective_summary.get("recovery_state"), dict)
+        else {}
+    )
+    checkpoint = (
+        recovery_state.get("checkpoint")
+        if isinstance(recovery_state.get("checkpoint"), dict)
+        else {}
+    )
+    recoverable_artifacts = []
+    artifact_types: list[str] = []
+    for artifact in run.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("artifact_type") or "").strip()
+        if not artifact_type:
+            continue
+        artifact_types.append(artifact_type)
+        if artifact_type not in {
+            "recovery_checkpoint",
+            "partial_summary",
+            "resource_exhaustion_report",
+            "subagent_health_snapshot",
+            "role_task_snapshot",
+            "detached_exec_jobs",
+            "attempt_bundle",
+            "dataset_package_snapshot",
+            "produced_artifacts",
+            "execution_results",
+        }:
+            continue
+        metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+        recoverable_artifacts.append(
+            {
+                "artifact_type": artifact_type,
+                "title": artifact.get("title"),
+                "uri": artifact.get("uri"),
+                "attempt_id": metadata.get("attempt_id"),
+            }
+        )
+    return {
+        "status": "partial",
+        "reason": recovery_state.get("reason"),
+        "stage": recovery_state.get("stage"),
+        "checkpoint_index": checkpoint.get("checkpoint_index"),
+        "candidate_count": int(effective_summary.get("candidate_count") or 0),
+        "artifact_count": len(run.get("artifacts") or []),
+        "artifact_types": sorted(set(artifact_types)),
+        "recoverable_artifacts": recoverable_artifacts,
+        "unfinished_steps": list(recovery_state.get("unfinished_steps") or []),
+        "recommended_resume_conditions": list(
+            recovery_state.get("recommended_resume_conditions") or []
+        ),
+        "degraded": bool(effective_summary.get("degraded", False)),
+        "tracked_role_count": int(_build_operator_role_task_summary(run)["tracked_role_count"]),
+        "detached_exec_job_count": int(_build_operator_detached_exec_summary(run)["total"]),
+    }
+
+
 def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
     summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
     return {
@@ -1984,8 +2621,12 @@ def _controlled_execution_protocol_config(execution_budget: dict[str, Any]) -> d
     }
 
 
-def _normalize_agent_run_policy(run_policy: dict[str, Any] | None) -> dict[str, Any]:
-    payload = dict(run_policy or {})
+def _normalize_agent_run_policy(
+    run_policy: dict[str, Any] | None,
+    *,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {**dict(defaults or {}), **dict(run_policy or {})}
 
     def _optional_positive_int(key: str, *, maximum: int = 86_400) -> int | None:
         try:
@@ -1993,6 +2634,13 @@ def _normalize_agent_run_policy(run_policy: dict[str, Any] | None) -> dict[str, 
         except (TypeError, ValueError):
             return None
         return max(1, min(value, maximum))
+
+    def _optional_nonnegative_int(key: str, *, maximum: int) -> int | None:
+        try:
+            value = int(payload.get(key))
+        except (TypeError, ValueError):
+            return None
+        return max(0, min(value, maximum))
 
     on_budget_exhausted = str(payload.get("on_budget_exhausted") or "pause").strip().lower()
     if on_budget_exhausted not in {"pause", "finalize_partial"}:
@@ -2002,19 +2650,33 @@ def _normalize_agent_run_policy(run_policy: dict[str, Any] | None) -> dict[str, 
     if on_subagent_disconnect not in {"retry_then_degrade", "pause", "fail"}:
         on_subagent_disconnect = "retry_then_degrade"
 
+    max_subagent_failures_per_role = _optional_nonnegative_int(
+        "max_subagent_failures_per_role",
+        maximum=100,
+    )
+
     normalized = {
         "max_wall_clock_sec": _optional_positive_int("max_wall_clock_sec"),
         "heartbeat_timeout_sec": _optional_positive_int("heartbeat_timeout_sec"),
         "checkpoint_interval_steps": _optional_positive_int("checkpoint_interval_steps", maximum=10_000) or 1,
-        "max_subagent_failures_per_role": _optional_positive_int(
-            "max_subagent_failures_per_role",
-            maximum=100,
-        )
-        or 2,
+        "max_subagent_failures_per_role": (
+            2 if max_subagent_failures_per_role is None else max_subagent_failures_per_role
+        ),
         "on_budget_exhausted": on_budget_exhausted,
         "on_subagent_disconnect": on_subagent_disconnect,
     }
     return {key: value for key, value in normalized.items() if value is not None}
+
+
+def _default_agent_run_policy_from_security(security: SecurityConfig) -> dict[str, Any]:
+    return {
+        "max_wall_clock_sec": security.agent_run_default_max_wall_clock_sec,
+        "heartbeat_timeout_sec": security.agent_run_default_heartbeat_timeout_sec,
+        "checkpoint_interval_steps": security.agent_run_default_checkpoint_interval_steps,
+        "max_subagent_failures_per_role": security.agent_run_default_max_subagent_failures_per_role,
+        "on_budget_exhausted": security.agent_run_default_on_budget_exhausted,
+        "on_subagent_disconnect": security.agent_run_default_on_subagent_disconnect,
+    }
 
 
 def _agent_run_task_input(run: dict[str, Any]) -> str:
@@ -2049,6 +2711,410 @@ def _build_agent_run_summary_payload(run: dict[str, Any], result: Any) -> dict[s
     return summary
 
 
+def _recovery_state_from_run(run: dict[str, Any]) -> dict[str, Any]:
+    direct = run.get("recovery_state")
+    if isinstance(direct, dict):
+        return dict(direct)
+    summary = run.get("summary")
+    if isinstance(summary, dict) and isinstance(summary.get("recovery_state"), dict):
+        return dict(summary.get("recovery_state") or {})
+    return {}
+
+
+def _resume_payload_from_run(run: dict[str, Any]) -> dict[str, Any] | None:
+    recovery_state = _recovery_state_from_run(run)
+    payload = recovery_state.get("resume_payload")
+    if isinstance(payload, dict):
+        return dict(payload)
+    return None
+
+
+def _resume_runtime_from_run(run: dict[str, Any]) -> dict[str, Any]:
+    recovery_state = _recovery_state_from_run(run)
+    payload = recovery_state.get("resume_runtime")
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {}
+
+
+def _recovery_checkpoint_index_from_run(run: dict[str, Any]) -> int | None:
+    recovery_state = _recovery_state_from_run(run)
+    checkpoint = recovery_state.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return None
+    try:
+        value = int(checkpoint.get("checkpoint_index"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _normalize_agent_run_resume_strategy(value: str | None) -> str:
+    normalized = str(value or "continue_from_checkpoint").strip().lower()
+    if normalized not in {"continue_from_checkpoint", "restart_attempt"}:
+        return "continue_from_checkpoint"
+    return normalized
+
+
+def _resolve_agent_run_resume_strategy(requested: str | None, run: dict[str, Any]) -> str:
+    if isinstance(requested, str) and requested.strip():
+        return _normalize_agent_run_resume_strategy(requested)
+    payload = _resume_payload_from_run(run)
+    if isinstance(payload, dict):
+        return _normalize_agent_run_resume_strategy(
+            str(
+                payload.get("strategy_default")
+                or payload.get("executor")
+                or "continue_from_checkpoint"
+            )
+        )
+    return "continue_from_checkpoint"
+
+
+def _build_agent_run_resume_lease(
+    *,
+    run_id: str,
+    strategy: str,
+    checkpoint_index: int | None,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "lease_id": f"resume-{uuid4()}",
+        "status": "active",
+        "strategy": _normalize_agent_run_resume_strategy(strategy),
+        "source": source,
+        "acquired_at": _now_iso_utc(),
+        "checkpoint_index": checkpoint_index,
+        "run_id": run_id,
+    }
+
+
+def _candidate_snapshots_from_events(events: Any) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        return []
+    latest: dict[str, dict[str, Any]] = {}
+    ordered: list[str] = []
+    for event in events:
+        if not isinstance(event, dict) or str(event.get("type") or "") != "role_output":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        candidate_id = str(payload.get("candidate_id") or payload.get("role_id") or "").strip()
+        role_id = str(payload.get("role_id") or "").strip()
+        content = payload.get("content")
+        if not candidate_id or not role_id or not isinstance(content, str):
+            continue
+        if candidate_id not in latest:
+            ordered.append(candidate_id)
+        latest[candidate_id] = {
+            "candidate_id": candidate_id,
+            "role_id": role_id,
+            "content": content,
+            "metadata": {
+                key: value
+                for key, value in {
+                    "model_id": payload.get("model_id"),
+                    "round_index": payload.get("round_index"),
+                }.items()
+                if value is not None
+            },
+        }
+    return [latest[candidate_id] for candidate_id in ordered if candidate_id in latest]
+
+
+def _protocol_artifacts_from_run_summary(run_summary: dict[str, Any]) -> dict[str, Any]:
+    excluded = {
+        "protocol",
+        "selected_candidate_id",
+        "final_answer",
+        "candidate_count",
+        "run_guard_policy",
+        "execution_policy",
+        "subagent_runtime",
+        "verification",
+        "evidence_collection",
+    }
+    return {
+        key: dict(value)
+        for key, value in run_summary.items()
+        if isinstance(key, str) and key not in excluded and isinstance(value, dict)
+    }
+
+
+def _build_agent_run_resume_payload(
+    *,
+    run: dict[str, Any],
+    recovery_state: dict[str, Any],
+    strategy: str,
+) -> dict[str, Any]:
+    run_summary = _latest_agent_run_artifact_content(run, "run_summary") or {}
+    evidence_summary = _latest_agent_run_artifact_content(run, "evidence_summary") or {}
+    verification_summary = _latest_agent_run_artifact_content(run, "verification_summary") or {}
+    candidate_snapshots = _candidate_snapshots_from_events(run.get("events"))
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    provided_packets = (
+        summary.get("evidence_packets")
+        if isinstance(summary.get("evidence_packets"), list)
+        else []
+    )
+    collected_packets = (
+        evidence_summary.get("evidence_packets")
+        if isinstance(evidence_summary.get("evidence_packets"), list)
+        else []
+    )
+    evaluation_event = None
+    events = run.get("events")
+    if isinstance(events, list):
+        for event in reversed(events):
+            if not isinstance(event, dict) or str(event.get("type") or "") != "evaluation":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                evaluation_event = dict(payload)
+                break
+    selected_candidate_id = (
+        run_summary.get("selected_candidate_id")
+        if isinstance(run_summary.get("selected_candidate_id"), str)
+        else evaluation_event.get("selected_candidate_id") if isinstance(evaluation_event, dict) else None
+    )
+    checkpoint = (
+        dict(recovery_state.get("checkpoint"))
+        if isinstance(recovery_state.get("checkpoint"), dict)
+        else {}
+    )
+    stage = str(recovery_state.get("stage") or checkpoint.get("stage") or "runtime_service_error").strip()
+    evaluation_payload = dict(evaluation_event) if isinstance(evaluation_event, dict) else None
+    verification_payload = (
+        list(verification_summary.get("verifications") or [])
+        if isinstance(verification_summary.get("verifications"), list)
+        else []
+    )
+    evidence_collection_payload = (
+        dict(evidence_summary)
+        if isinstance(evidence_summary, dict) and evidence_summary
+        else None
+    )
+    role_task_snapshot = (
+        _latest_agent_run_artifact_content(run, "role_task_snapshot")
+        or (
+            dict(recovery_state.get("role_task_snapshot"))
+            if isinstance(recovery_state.get("role_task_snapshot"), dict)
+            else {}
+        )
+    )
+    strategy_default = _normalize_agent_run_resume_strategy(strategy)
+    executor = (
+        strategy_default
+        if _can_continue_agent_run_from_checkpoint(
+            stage=stage,
+            candidates=candidate_snapshots,
+            evaluation_payload=evaluation_payload,
+            role_task_snapshot=role_task_snapshot,
+        )
+        else "restart_attempt"
+    )
+    return {
+        "version": 1,
+        "executor": executor,
+        "strategy_default": executor,
+        "supported_actions": (
+            ["restart_attempt", "continue_from_checkpoint"]
+            if executor == "continue_from_checkpoint"
+            else ["restart_attempt"]
+        ),
+        "stage": stage,
+        "checkpoint": checkpoint,
+        "guidance_messages": [],
+        "metadata_state": {},
+        "precomputed_artifacts": {},
+        "protocol_artifacts": _protocol_artifacts_from_run_summary(run_summary),
+        "candidates": candidate_snapshots,
+        "evidence_packets": [
+            dict(item)
+            for item in [*provided_packets, *collected_packets]
+            if isinstance(item, dict)
+        ],
+        "evidence_collection_summary": evidence_collection_payload,
+        "verifications": verification_payload,
+        "verification_summary": dict(verification_summary) if isinstance(verification_summary, dict) else None,
+        "evaluation": evaluation_payload,
+        "role_task_snapshot": dict(role_task_snapshot) if isinstance(role_task_snapshot, dict) else {},
+        "selected_candidate_id": selected_candidate_id,
+        "degraded": bool(summary.get("degraded", False)),
+    }
+
+
+def _ensure_agent_run_resume_payload(
+    *,
+    run: dict[str, Any],
+    summary: dict[str, Any],
+    strategy: str,
+) -> dict[str, Any]:
+    recovery_state = (
+        dict(summary.get("recovery_state"))
+        if isinstance(summary.get("recovery_state"), dict)
+        else {}
+    )
+    if not recovery_state:
+        return summary
+    existing_resume_runtime = _resume_runtime_from_run(run)
+    if existing_resume_runtime and not isinstance(recovery_state.get("resume_runtime"), dict):
+        recovery_state["resume_runtime"] = dict(existing_resume_runtime)
+    if not _is_structured_agent_run_resume_payload(recovery_state.get("resume_payload")):
+        recovery_state["resume_payload"] = _build_agent_run_resume_payload(
+            run=run,
+            recovery_state=recovery_state,
+            strategy=strategy,
+        )
+    summary["recovery_state"] = recovery_state
+    return summary
+
+
+def _build_runtime_resource_recovery_summary(
+    *,
+    run: dict[str, Any],
+    run_id: str,
+    attempt_id: str | None,
+    issue: Any,
+    exception: BaseException,
+) -> tuple[dict[str, Any], str]:
+    summary = dict(run.get("summary") or {})
+    stage = "runtime_service_error"
+    checkpoint = {
+        "checkpoint_index": 1,
+        "stage": stage,
+        "task_input": _agent_run_task_input(run),
+        "protocol": str(run.get("protocol_id") or ""),
+        "candidate_ids": [],
+        "candidate_count": 0,
+        "artifact_keys": [],
+        "captured_at": _now_iso_utc(),
+        "extra": {
+            "attempt_id": attempt_id,
+            "run_id": run_id,
+            "error": str(exception),
+        },
+    }
+    resource_report = build_resource_exhaustion_report(
+        issue,
+        stage=stage,
+        exception=exception,
+    )
+    summary.update(
+        {
+            "protocol": str(run.get("protocol_id") or ""),
+            "selected_candidate_id": summary.get("selected_candidate_id"),
+            "candidate_count": int(summary.get("candidate_count") or 0),
+            "degraded": False,
+            "recovery_state": {
+                "status": "awaiting_resources",
+                "action": "pause",
+                "reason": issue.reason,
+                "stage": stage,
+                "checkpoint": checkpoint,
+                "unfinished_steps": ["resume from the latest checkpoint"],
+                "resource_exhaustion_report": resource_report,
+                "recommended_resume_conditions": list(
+                    resource_report.get("recommended_resume_conditions") or []
+                ),
+            },
+        }
+    )
+    summary = _ensure_agent_run_resume_payload(
+        run=run,
+        summary=summary,
+        strategy="continue_from_checkpoint",
+    )
+    latest_error = str(issue.reason)
+    return summary, latest_error
+
+
+_AGENT_RUN_RESUME_STAGE_ORDER = {
+    "research_context_prepared": 1,
+    "controlled_execution_context_prepared": 2,
+    "protocol_completed": 3,
+    "before_evidence_collection": 4,
+    "evidence_collected": 5,
+    "verification_completed": 6,
+    "evaluation_completed": 7,
+    "research_artifacts_completed": 8,
+}
+
+
+def _is_structured_agent_run_resume_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    stage = payload.get("stage")
+    checkpoint = payload.get("checkpoint")
+    return isinstance(stage, str) and bool(stage.strip()) and isinstance(checkpoint, dict)
+
+
+def _can_continue_agent_run_from_checkpoint(
+    *,
+    stage: str,
+    candidates: list[dict[str, Any]],
+    evaluation_payload: dict[str, Any] | None,
+    role_task_snapshot: Mapping[str, Any] | None,
+) -> bool:
+    if stage in {"research_context_prepared", "controlled_execution_context_prepared"}:
+        return True
+    if _agent_run_resume_stage_covers(stage, "protocol_completed") and not candidates:
+        return False
+    if stage in {"evaluation_completed", "research_artifacts_completed"} and not isinstance(
+        evaluation_payload,
+        dict,
+    ):
+        return False
+    if _agent_run_stage_supports_role_task_resume(stage) and _agent_run_role_task_snapshot_has_completed_work(
+        role_task_snapshot
+    ):
+        return True
+    return stage in _AGENT_RUN_RESUME_STAGE_ORDER
+
+
+def _agent_run_stage_supports_role_task_resume(stage: str) -> bool:
+    if stage in {
+        "teacher_generation",
+        "student_generation",
+        "research_planning",
+        "research_workers",
+        "research_synthesis",
+        "candidate_evaluation",
+    }:
+        return True
+    return (
+        stage.startswith("debate_round_")
+        or stage.startswith("dr_zero_")
+        or stage.startswith("verification_chunk_")
+    )
+
+
+def _agent_run_role_task_snapshot_has_completed_work(snapshot: Mapping[str, Any] | None) -> bool:
+    if not isinstance(snapshot, Mapping):
+        return False
+    roles = snapshot.get("roles") if isinstance(snapshot.get("roles"), Mapping) else snapshot
+    if not isinstance(roles, Mapping):
+        return False
+    for value in roles.values():
+        if not isinstance(value, Mapping):
+            continue
+        if str(value.get("status") or "").strip() == "completed":
+            return True
+        candidate = value.get("candidate")
+        if isinstance(candidate, Mapping) and str(candidate.get("candidate_id") or "").strip():
+            return True
+    return False
+
+
+def _agent_run_resume_stage_covers(stage: str | None, target_stage: str) -> bool:
+    if not stage:
+        return False
+    stage_rank = _AGENT_RUN_RESUME_STAGE_ORDER.get(stage)
+    target_rank = _AGENT_RUN_RESUME_STAGE_ORDER.get(target_stage)
+    if stage_rank is None or target_rank is None:
+        return False
+    return stage_rank >= target_rank
+
+
 def _resolve_agent_run_completion_status(result: Any) -> str:
     state = str(getattr(result, "state", "failed") or "failed")
     recovery_state = (
@@ -2056,7 +3122,7 @@ def _resolve_agent_run_completion_status(result: Any) -> str:
         if isinstance(getattr(result, "metadata", None), dict)
         else None
     )
-    if state in {"succeeded", "partial", "awaiting_resources", "failed", "cancelled"}:
+    if state in {"succeeded", "partial", "awaiting_resources", "stalled", "failed", "cancelled"}:
         return state
     if isinstance(recovery_state, dict):
         action = str(recovery_state.get("action") or "").strip().lower()
@@ -2072,7 +3138,7 @@ def _agent_run_latest_error(result: Any) -> str | None:
     recovery_state = metadata.get("recovery_state")
     if not isinstance(recovery_state, dict):
         return None
-    if str(recovery_state.get("status") or "") != "awaiting_resources":
+    if str(recovery_state.get("status") or "") not in {"awaiting_resources", "stalled"}:
         return None
     reason = recovery_state.get("reason")
     return str(reason) if isinstance(reason, str) and reason.strip() else None
@@ -2099,3 +3165,127 @@ def _build_evidence_status_payload(result: Any) -> dict[str, Any]:
         payload["evidence_packet_count"] = int(evidence_collection.get("total_packet_count", 0))
         payload["collected_packet_count"] = int(evidence_collection.get("collected_packet_count", 0))
     return payload
+
+
+def _latest_agent_run_artifact_content(run: dict[str, Any], artifact_type: str) -> dict[str, Any] | None:
+    artifacts = run.get("artifacts")
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in reversed(artifacts):
+        if not isinstance(artifact, dict):
+            continue
+        if str(artifact.get("artifact_type") or "") != artifact_type:
+            continue
+        metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+        content = metadata.get("content")
+        if isinstance(content, dict):
+            return dict(content)
+    return None
+
+
+def _build_operator_subagent_health_summary(run: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _latest_agent_run_artifact_content(run, "subagent_health_snapshot") or {}
+    events = list(snapshot.get("events") or []) if isinstance(snapshot.get("events"), list) else []
+    latest_event = events[-1] if events and isinstance(events[-1], dict) else None
+    failure_counts = (
+        dict(snapshot.get("failure_counts"))
+        if isinstance(snapshot.get("failure_counts"), dict)
+        else {}
+    )
+    return {
+        "available": bool(snapshot),
+        "status": str(snapshot.get("status") or "unknown") if snapshot else "missing",
+        "degraded": bool(snapshot.get("degraded", False)) if snapshot else False,
+        "degraded_role_ids": list(snapshot.get("degraded_role_ids") or []) if snapshot else [],
+        "failure_counts": failure_counts,
+        "failure_role_count": len(failure_counts),
+        "event_count": len(events),
+        "latest_event": latest_event,
+    }
+
+
+def _build_operator_role_task_summary(run: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _latest_agent_run_artifact_content(run, "role_task_snapshot") or {}
+    roles = snapshot.get("roles") if isinstance(snapshot.get("roles"), dict) else {}
+    assignments = (
+        snapshot.get("resume_plan", {}).get("assignments")
+        if isinstance(snapshot.get("resume_plan"), dict)
+        and isinstance(snapshot.get("resume_plan", {}).get("assignments"), dict)
+        else {}
+    )
+    status_counts: dict[str, int] = {}
+    summarized_roles = []
+    for role_id, value in roles.items():
+        if not isinstance(role_id, str) or not isinstance(value, dict):
+            continue
+        status = str(value.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        assignment = assignments.get(role_id) if isinstance(assignments, dict) else {}
+        summarized_roles.append(
+            {
+                "role_id": role_id,
+                "status": status,
+                "stage": value.get("stage"),
+                "checkpoint_index": value.get("checkpoint_index"),
+                "assigned_model_id": (
+                    assignment.get("assigned_model_id")
+                    if isinstance(assignment, dict)
+                    else value.get("assigned_model_id")
+                ),
+                "assignment_source": (
+                    assignment.get("assignment_source")
+                    if isinstance(assignment, dict)
+                    else value.get("assignment_source")
+                ),
+                "resume_action": (
+                    assignment.get("resume_action")
+                    if isinstance(assignment, dict)
+                    else value.get("resume_action")
+                ),
+            }
+        )
+    return {
+        "available": bool(snapshot),
+        "tracked_role_count": len(summarized_roles),
+        "status_counts": status_counts,
+        "reassigned_role_count": len(
+            list(snapshot.get("resume_plan", {}).get("reassigned_roles") or [])
+            if isinstance(snapshot.get("resume_plan"), dict)
+            else []
+        ),
+        "blocked_role_count": len(
+            list(snapshot.get("resume_plan", {}).get("blocked_roles") or [])
+            if isinstance(snapshot.get("resume_plan"), dict)
+            else []
+        ),
+        "roles": summarized_roles,
+    }
+
+
+def _build_operator_detached_exec_summary(run: dict[str, Any]) -> dict[str, Any]:
+    detached = _latest_agent_run_artifact_content(run, "detached_exec_jobs") or {}
+    raw_items = detached.get("items") if isinstance(detached.get("items"), list) else []
+    items = [item for item in raw_items if isinstance(item, dict)]
+    status_counts: dict[str, int] = {}
+    summarized_items = []
+    for item in items:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        summarized_items.append(
+            {
+                "session_id": item.get("session_id"),
+                "request_id": item.get("request_id"),
+                "status": status,
+                "background": bool(item.get("background", False)),
+                "reattach_supported": bool(item.get("reattach_supported", False)),
+                "log_path": item.get("log_path"),
+                "checkpoint_dir": item.get("checkpoint_dir"),
+            }
+        )
+    return {
+        "available": bool(detached),
+        "total": len(items),
+        "status_counts": status_counts,
+        "reattachable_count": sum(1 for item in items if bool(item.get("reattach_supported", False))),
+        "items": summarized_items,
+    }

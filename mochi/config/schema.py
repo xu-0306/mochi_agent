@@ -669,6 +669,24 @@ class SecurityConfig(BaseModel):
     require_approval_for_exec: bool = True
     """Exec runtime 命令是否預設需要顯式審批。"""
 
+    agent_run_default_max_wall_clock_sec: int | None = Field(default=None, ge=1, le=86_400)
+    """Default agent-run wall-clock guard. `None` disables the default deadline."""
+
+    agent_run_default_heartbeat_timeout_sec: int | None = Field(default=None, ge=1, le=86_400)
+    """Default subagent heartbeat timeout. `None` disables the stall watchdog."""
+
+    agent_run_default_checkpoint_interval_steps: int = Field(default=1, ge=1, le=10_000)
+    """Default checkpoint cadence for agent runs."""
+
+    agent_run_default_max_subagent_failures_per_role: int = Field(default=2, ge=0, le=100)
+    """Default retry budget before one role is considered degraded or stalled."""
+
+    agent_run_default_on_budget_exhausted: Literal["pause", "finalize_partial"] = "pause"
+    """Default action when the run-level wall-clock budget is exhausted."""
+
+    agent_run_default_on_subagent_disconnect: Literal["retry_then_degrade", "pause", "fail"] = "retry_then_degrade"
+    """Default action when one subagent disconnects or stalls."""
+
     exec_allowed_env_vars: list[str] = Field(default_factory=lambda: _empty_list_typed(str))
     """Exec runtime 可直接覆寫的環境變數白名單。"""
 

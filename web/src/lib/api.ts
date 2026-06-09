@@ -3246,6 +3246,15 @@ export interface SecuritySettings {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
   require_approval_for_shell: boolean
   require_approval_for_file_write: boolean
+  require_approval_for_exec: boolean
+  agent_run_default_max_wall_clock_sec: number | null
+  agent_run_default_heartbeat_timeout_sec: number | null
+  agent_run_default_checkpoint_interval_steps: number
+  agent_run_default_max_subagent_failures_per_role: number
+  agent_run_default_on_budget_exhausted: 'pause' | 'finalize_partial'
+  agent_run_default_on_subagent_disconnect: 'retry_then_degrade' | 'pause' | 'fail'
+  exec_default_timeout_sec: number
+  exec_session_output_limit: number
   max_file_write_size_mb: number
   file_ops_scope: 'workspace' | 'any'
   file_undo_max_size_mb: number
@@ -4113,6 +4122,15 @@ export interface SecuritySettingsUpdate {
   autonomy_mode?: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
   require_approval_for_shell?: boolean
   require_approval_for_file_write?: boolean
+  require_approval_for_exec?: boolean
+  agent_run_default_max_wall_clock_sec?: number | null
+  agent_run_default_heartbeat_timeout_sec?: number | null
+  agent_run_default_checkpoint_interval_steps?: number
+  agent_run_default_max_subagent_failures_per_role?: number
+  agent_run_default_on_budget_exhausted?: 'pause' | 'finalize_partial'
+  agent_run_default_on_subagent_disconnect?: 'retry_then_degrade' | 'pause' | 'fail'
+  exec_default_timeout_sec?: number
+  exec_session_output_limit?: number
   max_file_write_size_mb?: number
   file_ops_scope?: 'workspace' | 'any'
   file_undo_max_size_mb?: number
@@ -4236,6 +4254,25 @@ function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined
     require_approval_for_shell: getBoolean(value.require_approval_for_shell) ?? true,
     require_approval_for_file_write:
       getBoolean(value.require_approval_for_file_write) ?? false,
+    require_approval_for_exec: getBoolean(value.require_approval_for_exec) ?? true,
+    agent_run_default_max_wall_clock_sec: getNumber(value.agent_run_default_max_wall_clock_sec),
+    agent_run_default_heartbeat_timeout_sec: getNumber(value.agent_run_default_heartbeat_timeout_sec),
+    agent_run_default_checkpoint_interval_steps:
+      getNumber(value.agent_run_default_checkpoint_interval_steps) ?? 1,
+    agent_run_default_max_subagent_failures_per_role:
+      getNumber(value.agent_run_default_max_subagent_failures_per_role) ?? 2,
+    agent_run_default_on_budget_exhausted:
+      getString(value.agent_run_default_on_budget_exhausted) === 'finalize_partial'
+        ? 'finalize_partial'
+        : 'pause',
+    agent_run_default_on_subagent_disconnect:
+      getString(value.agent_run_default_on_subagent_disconnect) === 'pause'
+        ? 'pause'
+        : getString(value.agent_run_default_on_subagent_disconnect) === 'fail'
+          ? 'fail'
+          : 'retry_then_degrade',
+    exec_default_timeout_sec: getNumber(value.exec_default_timeout_sec) ?? 30,
+    exec_session_output_limit: getNumber(value.exec_session_output_limit) ?? 8000,
     max_file_write_size_mb: getNumber(value.max_file_write_size_mb) ?? 10.0,
     file_ops_scope: getString(value.file_ops_scope) === 'any' ? 'any' : 'workspace',
     file_undo_max_size_mb: getNumber(value.file_undo_max_size_mb) ?? 2.0,
@@ -4520,6 +4557,45 @@ export interface AgentRunArtifact {
   metadata: Record<string, unknown>
 }
 
+export interface AgentRunRunPolicy {
+  max_wall_clock_sec?: number | null
+  heartbeat_timeout_sec?: number | null
+  checkpoint_interval_steps?: number
+  max_subagent_failures_per_role?: number
+  on_budget_exhausted?: 'pause' | 'finalize_partial'
+  on_subagent_disconnect?: 'retry_then_degrade' | 'pause' | 'fail'
+  [key: string]: unknown
+}
+
+export interface AgentRunScheduleState extends Record<string, unknown> {
+  health_status?: string | null
+  recent_attempts?: Array<Record<string, unknown>>
+}
+
+export interface AgentRunRecoveryState extends Record<string, unknown> {
+  status?: string | null
+  operator_message?: string | null
+  operator_note?: string | null
+  resume_hint?: string | null
+  suggested_action?: string | null
+  suggested_operator_action?: string | null
+  finalize_partial_ready?: boolean
+  finalize_partial_reason?: string | null
+  health_status?: string | null
+}
+
+export interface AgentRunHealthSummary {
+  run_id: string
+  status: string
+  degraded: boolean
+  latest_error: string | null
+  schedule_health_status?: string | null
+  recovery_state: AgentRunRecoveryState
+  candidate_count: number
+  subagent_health_snapshot: Record<string, unknown>
+  detached_exec_jobs: Record<string, unknown>
+}
+
 export interface AgentRunSummary {
   run_id: string
   protocol_id: string
@@ -4528,8 +4604,11 @@ export interface AgentRunSummary {
   status: string
   selected_models_roles: Record<string, unknown>
   evaluation_policy: Record<string, unknown>
-  schedule: Record<string, unknown>
+  run_policy: AgentRunRunPolicy
+  schedule: AgentRunScheduleState
   summary: Record<string, unknown>
+  recovery_state: AgentRunRecoveryState
+  degraded: boolean
   latest_error: string | null
   evidence_status: Record<string, unknown>
   artifacts: AgentRunArtifact[]
@@ -4595,6 +4674,7 @@ export interface CreateAgentRunInput {
   subagents?: AgentRunSubagentInput[]
   selected_models_roles?: Record<string, unknown>
   evaluation_policy?: Record<string, unknown>
+  run_policy?: AgentRunRunPolicy
   schedule?: Record<string, unknown>
   summary?: Record<string, unknown>
   latest_error?: string | null
@@ -4614,6 +4694,50 @@ export interface AppendAgentRunGuidanceInput {
   guidance: string
   author?: string | null
   metadata?: Record<string, unknown>
+}
+
+export interface AgentRunExecLease {
+  session_id: string
+  request_id?: string | null
+  command?: string | null
+  shell?: string | null
+  workdir?: string | null
+  timeout?: number | null
+  log_path?: string | null
+  checkpoint_dir?: string | null
+  status?: string | null
+  background?: boolean
+  approval_state?: string | null
+  pid?: number | null
+  lease_owner?: string | null
+  reattach_supported?: boolean
+  [key: string]: unknown
+}
+
+export interface AgentRunExecSessionSnapshot {
+  session_id: string
+  shell: string | null
+  status: string
+  background: boolean
+  tty: boolean
+  pid: number | null
+  exit_code: number | null
+  timed_out: boolean
+  approval_state: string | null
+  stdout: string
+  stderr: string
+}
+
+export interface AgentRunExecSessionPayload {
+  run_id: string
+  session_id: string
+  associated: boolean
+  live_status: string
+  lease: AgentRunExecLease
+  session: AgentRunExecSessionSnapshot | null
+  stop_status?: string
+  reattached?: boolean
+  reattach_status?: string
 }
 
 function normalizeAgentRunArtifact(payload: unknown): AgentRunArtifact | null {
@@ -4646,8 +4770,13 @@ function normalizeAgentRunSummary(payload: unknown): AgentRunSummary {
       ? record.selected_models_roles
       : {},
     evaluation_policy: isRecord(record.evaluation_policy) ? record.evaluation_policy : {},
-    schedule: isRecord(record.schedule) ? record.schedule : {},
+    run_policy: isRecord(record.run_policy) ? (record.run_policy as AgentRunRunPolicy) : {},
+    schedule: isRecord(record.schedule) ? (record.schedule as AgentRunScheduleState) : {},
     summary: isRecord(record.summary) ? record.summary : {},
+    recovery_state: isRecord(record.recovery_state)
+      ? (record.recovery_state as AgentRunRecoveryState)
+      : {},
+    degraded: getBoolean(record.degraded) ?? false,
     latest_error: getNullableString(record.latest_error),
     evidence_status: isRecord(record.evidence_status) ? record.evidence_status : {},
     artifacts: getRecordArray(record.artifacts)
@@ -4666,6 +4795,73 @@ function normalizeAgentRunDetail(payload: unknown): AgentRunDetail {
   return {
     ...summary,
     events: getRecordArray(record.events),
+  }
+}
+
+function normalizeAgentRunHealthSummary(payload: unknown): AgentRunHealthSummary {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    run_id: getString(record.run_id) ?? '',
+    status: getString(record.status) ?? 'unknown',
+    degraded: getBoolean(record.degraded) ?? false,
+    latest_error: getNullableString(record.latest_error),
+    schedule_health_status: getNullableString(record.schedule_health_status),
+    recovery_state: isRecord(record.recovery_state)
+      ? (record.recovery_state as AgentRunRecoveryState)
+      : {},
+    candidate_count: getNumber(record.candidate_count) ?? 0,
+    subagent_health_snapshot: isRecord(record.subagent_health_snapshot)
+      ? record.subagent_health_snapshot
+      : {},
+    detached_exec_jobs: isRecord(record.detached_exec_jobs)
+      ? record.detached_exec_jobs
+      : {},
+  }
+}
+
+function normalizeAgentRunExecSessionPayload(payload: unknown): AgentRunExecSessionPayload {
+  const record = isRecord(payload) ? payload : {}
+  const lease = isRecord(record.lease) ? record.lease : {}
+  const session = isRecord(record.session) ? record.session : null
+  return {
+    run_id: getString(record.run_id) ?? '',
+    session_id: getString(record.session_id) ?? '',
+    associated: getBoolean(record.associated) ?? false,
+    live_status: getString(record.live_status) ?? 'unavailable',
+    lease: {
+      session_id: getString(lease.session_id) ?? getString(record.session_id) ?? '',
+      request_id: getNullableString(lease.request_id),
+      command: getNullableString(lease.command),
+      shell: getNullableString(lease.shell),
+      workdir: getNullableString(lease.workdir),
+      timeout: getNumber(lease.timeout) ?? null,
+      log_path: getNullableString(lease.log_path),
+      checkpoint_dir: getNullableString(lease.checkpoint_dir),
+      status: getNullableString(lease.status),
+      background: getBoolean(lease.background) ?? false,
+      approval_state: getNullableString(lease.approval_state),
+      pid: getNumber(lease.pid) ?? null,
+      lease_owner: getNullableString(lease.lease_owner),
+      reattach_supported: getBoolean(lease.reattach_supported) ?? false,
+    },
+    session: session
+      ? {
+          session_id: getString(session.session_id) ?? '',
+          shell: getNullableString(session.shell),
+          status: getString(session.status) ?? 'unknown',
+          background: getBoolean(session.background) ?? false,
+          tty: getBoolean(session.tty) ?? false,
+          pid: getNumber(session.pid) ?? null,
+          exit_code: getNumber(session.exit_code) ?? null,
+          timed_out: getBoolean(session.timed_out) ?? false,
+          approval_state: getNullableString(session.approval_state),
+          stdout: getString(session.stdout) ?? '',
+          stderr: getString(session.stderr) ?? '',
+        }
+      : null,
+    stop_status: getNullableString(record.stop_status) ?? undefined,
+    reattached: getBoolean(record.reattached) ?? undefined,
+    reattach_status: getNullableString(record.reattach_status) ?? undefined,
   }
 }
 
@@ -4735,6 +4931,15 @@ export async function fetchAgentRun(runId: string): Promise<AgentRunDetail> {
   return normalizeAgentRunDetail(payload)
 }
 
+export async function fetchAgentRunHealth(
+  runId: string
+): Promise<AgentRunHealthSummary> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/health`
+  )
+  return normalizeAgentRunHealthSummary(payload)
+}
+
 export async function fetchAgentRunAttemptPackage(
   runId: string,
   attemptId: string
@@ -4790,6 +4995,7 @@ export async function createAgentRun(input: CreateAgentRunInput): Promise<AgentR
       topic: input.topic ?? null,
       selected_models_roles: builtSelectedModelsRoles,
       evaluation_policy: input.evaluation_policy ?? {},
+      run_policy: input.run_policy ?? {},
       schedule: input.schedule ?? {},
       summary: input.summary ?? {},
       latest_error: input.latest_error ?? null,
@@ -4849,4 +5055,62 @@ export async function cancelAgentRun(runId: string): Promise<AgentRunSummary> {
     method: 'POST',
   })
   return normalizeAgentRunSummary(payload)
+}
+
+export async function finalizeAgentRunPartial(runId: string): Promise<AgentRunSummary> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/finalize-partial`,
+    {
+      method: 'POST',
+    }
+  )
+  return normalizeAgentRunSummary(payload)
+}
+
+export async function fetchAgentRunExecSession(
+  runId: string,
+  sessionId: string,
+  options?: { yield_time_ms?: number }
+): Promise<AgentRunExecSessionPayload> {
+  const search = new URLSearchParams()
+  if (typeof options?.yield_time_ms === 'number') {
+    search.set('yield_time_ms', String(options.yield_time_ms))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/exec/${encodeURIComponent(sessionId)}${query}`
+  )
+  return normalizeAgentRunExecSessionPayload(payload)
+}
+
+export async function stopAgentRunExecSession(
+  runId: string,
+  sessionId: string
+): Promise<AgentRunExecSessionPayload> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/exec/${encodeURIComponent(sessionId)}/stop`,
+    {
+      method: 'POST',
+    }
+  )
+  return normalizeAgentRunExecSessionPayload(payload)
+}
+
+export async function reattachAgentRunExecSession(
+  runId: string,
+  sessionId: string,
+  options?: { yield_time_ms?: number }
+): Promise<AgentRunExecSessionPayload> {
+  const search = new URLSearchParams()
+  if (typeof options?.yield_time_ms === 'number') {
+    search.set('yield_time_ms', String(options.yield_time_ms))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/reattach-exec/${encodeURIComponent(sessionId)}${query}`,
+    {
+      method: 'POST',
+    }
+  )
+  return normalizeAgentRunExecSessionPayload(payload)
 }

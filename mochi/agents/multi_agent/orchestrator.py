@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import time
@@ -17,7 +18,10 @@ from mochi.agents.multi_agent.context import (
     summarize_candidate_outputs,
     verification_reduce,
 )
-from mochi.agents.multi_agent.execution_coordinator import SubagentExecutionCoordinator
+from mochi.agents.multi_agent.execution_coordinator import (
+    ControlledExecutionResumeHooks,
+    SubagentExecutionCoordinator,
+)
 from mochi.agents.multi_agent.execution_policy import (
     LEGACY_CONTROLLED_SUBAGENT_PROTOCOL,
     SubagentExecutionPolicy,
@@ -60,12 +64,17 @@ from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.types import GenerationResult, Message
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.runtime.recovery import (
+    build_resource_exhaustion_report,
+    classify_agent_run_recovery_issue,
+)
 
 RunState = Literal[
     "queued",
     "running",
     "awaiting_guidance",
     "awaiting_resources",
+    "stalled",
     "partial",
     "succeeded",
     "failed",
@@ -75,9 +84,10 @@ RunEventType = Literal["state_changed", "guidance", "role_output", "verification
 
 RUN_STATE_TRANSITIONS: dict[RunState, tuple[RunState, ...]] = {
     "queued": ("running", "cancelled"),
-    "running": ("awaiting_guidance", "awaiting_resources", "partial", "succeeded", "failed", "cancelled"),
-    "awaiting_guidance": ("running", "awaiting_resources", "partial", "failed", "cancelled"),
+    "running": ("awaiting_guidance", "awaiting_resources", "stalled", "partial", "succeeded", "failed", "cancelled"),
+    "awaiting_guidance": ("running", "awaiting_resources", "stalled", "partial", "failed", "cancelled"),
     "awaiting_resources": (),
+    "stalled": ("running", "failed", "cancelled"),
     "partial": (),
     "succeeded": (),
     "failed": (),
@@ -138,6 +148,56 @@ class ArtifactPayload:
 
     name: str
     content: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ResumeExecutionPayload:
+    """Structured resume payload persisted in recovery metadata."""
+
+    executor: Literal["continue_from_checkpoint", "restart_attempt"]
+    stage: str
+    checkpoint: dict[str, Any]
+    guidance_messages: list[str] = field(default_factory=list)
+    metadata_state: dict[str, Any] = field(default_factory=dict)
+    precomputed_artifacts: dict[str, Any] = field(default_factory=dict)
+    protocol_artifacts: dict[str, Any] = field(default_factory=dict)
+    candidates: list[CandidateOutput] = field(default_factory=list)
+    evidence_packets: list[dict[str, Any]] = field(default_factory=list)
+    evidence_collection_summary: dict[str, Any] | None = None
+    verifications: list[CandidateVerification] = field(default_factory=list)
+    verification_summary: dict[str, Any] | None = None
+    evaluation: EvaluationPayload | None = None
+    role_task_snapshot: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to JSON-safe dict."""
+        continue_supported = self.executor == "continue_from_checkpoint"
+        return {
+            "version": 1,
+            "executor": self.executor,
+            "supported_actions": (
+                ["restart_attempt", "continue_from_checkpoint"]
+                if continue_supported
+                else ["restart_attempt"]
+            ),
+            "stage": self.stage,
+            "checkpoint": _json_safe_clone(self.checkpoint),
+            "guidance_messages": [str(item) for item in self.guidance_messages if str(item).strip()],
+            "metadata_state": _json_safe_clone(self.metadata_state),
+            "precomputed_artifacts": _json_safe_clone(self.precomputed_artifacts),
+            "protocol_artifacts": _json_safe_clone(self.protocol_artifacts),
+            "candidates": [item.to_dict() for item in self.candidates],
+            "evidence_packets": _json_safe_clone(self.evidence_packets),
+            "evidence_collection_summary": _json_safe_clone(self.evidence_collection_summary),
+            "verifications": [item.to_dict() for item in self.verifications],
+            "verification_summary": _json_safe_clone(self.verification_summary),
+            "evaluation": (
+                _json_safe_clone(asdict(self.evaluation))
+                if self.evaluation is not None
+                else None
+            ),
+            "role_task_snapshot": _json_safe_clone(self.role_task_snapshot),
+        }
 
 
 @dataclass(frozen=True)
@@ -233,7 +293,7 @@ class RunPolicyStop(RuntimeError):
     def __init__(
         self,
         *,
-        status: Literal["partial", "awaiting_resources"],
+        status: Literal["partial", "awaiting_resources", "stalled"],
         action: str,
         reason: str,
         stage: str,
@@ -245,6 +305,30 @@ class RunPolicyStop(RuntimeError):
         self.reason = reason
         self.stage = stage
         self.checkpoint = dict(checkpoint or {})
+
+
+class SubagentRoleError(RuntimeError):
+    """Raised when one subagent role exhausts its retry budget."""
+
+    def __init__(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        reason: str,
+        failure_count: int,
+        timeout: bool,
+        cause: BaseException,
+    ) -> None:
+        super().__init__(reason)
+        self.role_id = role_id
+        self.model_id = model_id
+        self.stage = stage
+        self.reason = reason
+        self.failure_count = failure_count
+        self.timeout = timeout
+        self.cause = cause
 
 
 class BoundedRunStateMachine:
@@ -290,11 +374,23 @@ class MultiAgentOrchestrator:
         self._deadline_monotonic: float | None = None
         self._latest_checkpoint: dict[str, Any] = {}
         self._checkpoint_count = 0
+        self._role_failure_counts: dict[str, int] = {}
+        self._degraded_roles: set[str] = set()
+        self._subagent_health_events: list[dict[str, Any]] = []
+        self._role_task_states: dict[str, dict[str, Any]] = {}
+        self._task_states: dict[str, dict[str, Any]] = {}
+        self._role_resume_plan: dict[str, Any] = {}
 
     def _configure_run_policy(self, run_policy: Mapping[str, Any] | None) -> None:
         self._run_policy = dict(run_policy or {})
         self._checkpoint_count = 0
         self._latest_checkpoint = {}
+        self._role_failure_counts = {}
+        self._degraded_roles = set()
+        self._subagent_health_events = []
+        self._role_task_states = {}
+        self._task_states = {}
+        self._role_resume_plan = {}
         max_wall_clock_sec = self._run_policy.get("max_wall_clock_sec")
         try:
             max_wall_clock = int(max_wall_clock_sec)
@@ -302,6 +398,667 @@ class MultiAgentOrchestrator:
             max_wall_clock = 0
         self._deadline_monotonic = (
             time.monotonic() + max_wall_clock if max_wall_clock > 0 else None
+        )
+
+    def _heartbeat_timeout_sec(self) -> int | None:
+        value = self._run_policy.get("heartbeat_timeout_sec")
+        try:
+            timeout = int(value)
+        except (TypeError, ValueError):
+            return None
+        return timeout if timeout > 0 else None
+
+    def _max_subagent_failures_per_role(self) -> int:
+        value = self._run_policy.get("max_subagent_failures_per_role")
+        try:
+            maximum = int(value)
+        except (TypeError, ValueError):
+            maximum = 2
+        return max(0, maximum)
+
+    def _on_subagent_disconnect(self) -> str:
+        action = str(self._run_policy.get("on_subagent_disconnect") or "retry_then_degrade").strip().lower()
+        if action not in {"retry_then_degrade", "pause", "fail"}:
+            return "retry_then_degrade"
+        return action
+
+    def _record_subagent_failure(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        reason: str,
+        timeout: bool,
+    ) -> int:
+        next_count = int(self._role_failure_counts.get(role_id, 0) or 0) + 1
+        self._role_failure_counts[role_id] = next_count
+        self._subagent_health_events.append(
+            {
+                "type": "failure",
+                "role_id": role_id,
+                "model_id": model_id,
+                "stage": stage,
+                "reason": reason,
+                "timeout": timeout,
+                "failure_count": next_count,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        return next_count
+
+    def _mark_degraded_role(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        reason: str,
+    ) -> None:
+        self._degraded_roles.add(role_id)
+        self._subagent_health_events.append(
+            {
+                "type": "degraded",
+                "role_id": role_id,
+                "model_id": model_id,
+                "stage": stage,
+                "reason": reason,
+                "failure_count": int(self._role_failure_counts.get(role_id, 0) or 0),
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        self._mark_role_task_failed(
+            role_id=role_id,
+            model_id=model_id,
+            stage=stage,
+            reason=reason,
+            status="degraded",
+        )
+        self._mark_task_failed(
+            task_key=stage,
+            role_id=role_id,
+            model_id=model_id,
+            stage=stage,
+            reason=reason,
+            status="degraded",
+        )
+
+    def _build_subagent_health_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": "degraded" if self._degraded_roles else "healthy",
+            "degraded": bool(self._degraded_roles),
+            "degraded_role_ids": sorted(self._degraded_roles),
+            "failure_counts": dict(self._role_failure_counts),
+            "events": list(self._subagent_health_events),
+        }
+
+    def _role_checkpoint_index(self) -> int | None:
+        checkpoint_index = self._latest_checkpoint.get("checkpoint_index")
+        try:
+            value = int(checkpoint_index)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _touch_role_task(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None = None,
+        stage: str | None = None,
+    ) -> dict[str, Any]:
+        entry = dict(self._role_task_states.get(role_id) or {})
+        entry["role_id"] = role_id
+        if model_id:
+            entry.setdefault("original_model_id", model_id)
+            entry["assigned_model_id"] = model_id
+        if stage:
+            entry["stage"] = stage
+        checkpoint_index = self._role_checkpoint_index()
+        if checkpoint_index is not None:
+            entry["checkpoint_index"] = checkpoint_index
+        entry["updated_at"] = datetime.now(UTC).isoformat()
+        self._role_task_states[role_id] = entry
+        return entry
+
+    def _touch_task_state(
+        self,
+        *,
+        task_key: str,
+        role_id: str,
+        model_id: str | None = None,
+        stage: str | None = None,
+    ) -> dict[str, Any]:
+        entry = dict(self._task_states.get(task_key) or {})
+        entry["task_key"] = task_key
+        entry["role_id"] = role_id
+        if model_id:
+            entry.setdefault("original_model_id", model_id)
+            entry["assigned_model_id"] = model_id
+        if stage:
+            entry["stage"] = stage
+        checkpoint_index = self._role_checkpoint_index()
+        if checkpoint_index is not None:
+            entry["checkpoint_index"] = checkpoint_index
+        entry["updated_at"] = datetime.now(UTC).isoformat()
+        self._task_states[task_key] = entry
+        return entry
+
+    def _mark_role_task_running(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        depends_on: list[str] | None = None,
+    ) -> None:
+        entry = self._touch_role_task(role_id=role_id, model_id=model_id, stage=stage)
+        entry["status"] = "running"
+        entry["resume_action"] = "rerun"
+        if depends_on:
+            entry["depends_on"] = [str(item) for item in depends_on if str(item).strip()]
+        self._role_task_states[role_id] = entry
+
+    def _mark_task_running(
+        self,
+        *,
+        task_key: str,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        depends_on: list[str] | None = None,
+    ) -> None:
+        entry = self._touch_task_state(task_key=task_key, role_id=role_id, model_id=model_id, stage=stage)
+        entry["status"] = "running"
+        entry["resume_action"] = "rerun"
+        if depends_on:
+            entry["depends_on"] = [str(item) for item in depends_on if str(item).strip()]
+        self._task_states[task_key] = entry
+
+    def _mark_role_task_completed(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        candidate: CandidateOutput | None = None,
+        result_summary: Mapping[str, Any] | None = None,
+    ) -> None:
+        entry = self._touch_role_task(role_id=role_id, model_id=model_id, stage=stage)
+        entry["status"] = "completed"
+        entry["resume_action"] = "reuse_output"
+        entry.pop("last_error", None)
+        if candidate is not None:
+            entry["candidate"] = candidate.to_dict()
+            entry["candidate_id"] = candidate.candidate_id
+            entry["output_preview"] = candidate.content[:240]
+        if isinstance(result_summary, Mapping) and result_summary:
+            entry["result_summary"] = _mapping_to_plain_dict(result_summary)
+        self._role_task_states[role_id] = entry
+
+    def _mark_task_completed(
+        self,
+        *,
+        task_key: str,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        candidate: CandidateOutput | None = None,
+        result_summary: Mapping[str, Any] | None = None,
+    ) -> None:
+        entry = self._touch_task_state(task_key=task_key, role_id=role_id, model_id=model_id, stage=stage)
+        entry["status"] = "completed"
+        entry["resume_action"] = "reuse_output"
+        entry.pop("last_error", None)
+        if candidate is not None:
+            entry["candidate"] = candidate.to_dict()
+            entry["candidate_id"] = candidate.candidate_id
+            entry["output_preview"] = candidate.content[:240]
+        if isinstance(result_summary, Mapping) and result_summary:
+            entry["result_summary"] = _mapping_to_plain_dict(result_summary)
+        self._task_states[task_key] = entry
+
+    def _mark_role_task_failed(
+        self,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        reason: str,
+        status: str = "failed",
+    ) -> None:
+        entry = self._touch_role_task(role_id=role_id, model_id=model_id, stage=stage)
+        entry["status"] = status
+        entry["resume_action"] = "reassign_or_rerun"
+        entry["last_error"] = reason
+        self._role_task_states[role_id] = entry
+
+    def _mark_task_failed(
+        self,
+        *,
+        task_key: str,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+        reason: str,
+        status: str = "failed",
+    ) -> None:
+        entry = self._touch_task_state(task_key=task_key, role_id=role_id, model_id=model_id, stage=stage)
+        entry["status"] = status
+        entry["resume_action"] = "reassign_or_rerun"
+        entry["last_error"] = reason
+        self._task_states[task_key] = entry
+
+    def _mark_role_task_reused(
+        self,
+        *,
+        role_id: str,
+        stage: str,
+        candidate: CandidateOutput | None = None,
+    ) -> None:
+        entry = self._touch_role_task(
+            role_id=role_id,
+            model_id=(
+                str((candidate.metadata or {}).get("model_id"))
+                if candidate is not None and isinstance((candidate.metadata or {}).get("model_id"), str)
+                else None
+            ),
+            stage=stage,
+        )
+        entry["status"] = "completed"
+        entry["resume_action"] = "reuse_output"
+        if candidate is not None:
+            entry["candidate"] = candidate.to_dict()
+            entry["candidate_id"] = candidate.candidate_id
+            entry["output_preview"] = candidate.content[:240]
+        self._role_task_states[role_id] = entry
+
+    def _mark_task_reused(
+        self,
+        *,
+        task_key: str,
+        role_id: str,
+        stage: str,
+        candidate: CandidateOutput | None = None,
+    ) -> None:
+        entry = self._touch_task_state(
+            task_key=task_key,
+            role_id=role_id,
+            model_id=(
+                str((candidate.metadata or {}).get("model_id"))
+                if candidate is not None and isinstance((candidate.metadata or {}).get("model_id"), str)
+                else None
+            ),
+            stage=stage,
+        )
+        entry["status"] = "completed"
+        entry["resume_action"] = "reuse_output"
+        if candidate is not None:
+            entry["candidate"] = candidate.to_dict()
+            entry["candidate_id"] = candidate.candidate_id
+            entry["output_preview"] = candidate.content[:240]
+        self._task_states[task_key] = entry
+
+    def _restore_role_task_snapshot(self, snapshot: Mapping[str, Any] | None) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        roles = snapshot.get("roles") if isinstance(snapshot.get("roles"), Mapping) else snapshot
+        tasks = snapshot.get("tasks") if isinstance(snapshot.get("tasks"), Mapping) else {}
+        restored: dict[str, dict[str, Any]] = {}
+        if isinstance(roles, Mapping):
+            for role_id, value in roles.items():
+                if not isinstance(role_id, str) or not isinstance(value, Mapping):
+                    continue
+                restored[role_id] = _mapping_to_plain_dict(value)
+                restored[role_id]["role_id"] = role_id
+        self._role_task_states = restored
+        restored_tasks: dict[str, dict[str, Any]] = {}
+        if isinstance(tasks, Mapping):
+            for task_key, value in tasks.items():
+                if not isinstance(task_key, str) or not isinstance(value, Mapping):
+                    continue
+                restored_tasks[task_key] = _mapping_to_plain_dict(value)
+                restored_tasks[task_key]["task_key"] = task_key
+        if not restored_tasks and restored:
+            for role_id, value in restored.items():
+                if not isinstance(value, Mapping):
+                    continue
+                stage = value.get("stage")
+                if not isinstance(stage, str) or not stage.strip():
+                    continue
+                task_entry = _mapping_to_plain_dict(value)
+                task_entry["task_key"] = stage
+                task_entry["role_id"] = role_id
+                restored_tasks[stage] = task_entry
+        self._task_states = restored_tasks
+
+    def _build_role_resume_plan(self, *, selected_models_roles: Mapping[str, str]) -> dict[str, Any]:
+        available_roles = {
+            str(role_id): str(model_id)
+            for role_id, model_id in selected_models_roles.items()
+            if isinstance(role_id, str) and role_id.strip() and isinstance(model_id, str) and model_id.strip()
+        }
+        available_models: list[str] = []
+        model_usage: dict[str, int] = {}
+        for model_id in available_roles.values():
+            if model_id not in available_models:
+                available_models.append(model_id)
+            model_usage[model_id] = model_usage.get(model_id, 0) + 1
+
+        assignments: dict[str, Any] = {}
+        reassigned_roles: list[dict[str, Any]] = []
+        blocked_roles: list[str] = []
+        completed_roles: list[str] = []
+        tracked_role_ids = set(self._role_task_states) | set(available_roles)
+        for role_id in sorted(tracked_role_ids):
+            state = dict(self._role_task_states.get(role_id) or {})
+            status = str(state.get("status") or ("pending" if role_id in available_roles else "unknown"))
+            assigned_model_id = available_roles.get(role_id)
+            assignment_source = "current_mapping" if assigned_model_id else "unavailable"
+            if assigned_model_id is None:
+                if status == "completed":
+                    assigned_model_id = (
+                        str(state.get("assigned_model_id") or state.get("original_model_id") or "").strip() or None
+                    )
+                    assignment_source = "checkpoint_completed"
+                    completed_roles.append(role_id)
+                else:
+                    previous_model_id = (
+                        str(state.get("assigned_model_id") or state.get("original_model_id") or "").strip() or None
+                    )
+                    if previous_model_id and previous_model_id in available_models:
+                        assigned_model_id = previous_model_id
+                    elif available_models:
+                        assigned_model_id = min(
+                            available_models,
+                            key=lambda item: (model_usage.get(item, 0), available_models.index(item)),
+                        )
+                    if assigned_model_id is not None:
+                        assignment_source = "reassigned_to_available_model"
+                        model_usage[assigned_model_id] = model_usage.get(assigned_model_id, 0) + 1
+                        reassigned_roles.append(
+                            {
+                                "role_id": role_id,
+                                "assigned_model_id": assigned_model_id,
+                                "previous_model_id": previous_model_id,
+                                "reason": "role mapping missing during resume; reassigned to an available model",
+                            }
+                        )
+                    else:
+                        blocked_roles.append(role_id)
+
+            resume_action = (
+                "reuse_output"
+                if status == "completed"
+                else "blocked"
+                if assignment_source == "unavailable"
+                else "reassign_and_rerun"
+                if assignment_source == "reassigned_to_available_model"
+                else "rerun"
+            )
+            assignments[role_id] = {
+                "role_id": role_id,
+                "status": status,
+                "stage": state.get("stage"),
+                "checkpoint_index": state.get("checkpoint_index"),
+                "original_model_id": state.get("original_model_id"),
+                "assigned_model_id": assigned_model_id,
+                "assignment_source": assignment_source,
+                "resume_action": resume_action,
+                "depends_on": list(state.get("depends_on") or []),
+            }
+
+        self._role_resume_plan = {
+            "available_roles": dict(available_roles),
+            "assignments": assignments,
+            "reassigned_roles": reassigned_roles,
+            "blocked_roles": blocked_roles,
+            "completed_roles": sorted(set(completed_roles)),
+        }
+        return dict(self._role_resume_plan)
+
+    def _apply_role_resume_plan(
+        self,
+        *,
+        selected_models_roles: Mapping[str, str],
+        role_resume_plan: Mapping[str, Any] | None,
+    ) -> dict[str, str]:
+        effective = {
+            str(role_id): str(model_id)
+            for role_id, model_id in selected_models_roles.items()
+            if isinstance(role_id, str) and role_id.strip() and isinstance(model_id, str) and model_id.strip()
+        }
+        assignments = (
+            role_resume_plan.get("assignments")
+            if isinstance(role_resume_plan, Mapping) and isinstance(role_resume_plan.get("assignments"), Mapping)
+            else {}
+        )
+        if isinstance(assignments, Mapping):
+            for role_id, value in assignments.items():
+                if not isinstance(role_id, str) or not isinstance(value, Mapping):
+                    continue
+                assigned_model_id = value.get("assigned_model_id")
+                assignment_source = str(value.get("assignment_source") or "")
+                if (
+                    role_id not in effective
+                    and isinstance(assigned_model_id, str)
+                    and assigned_model_id.strip()
+                    and assignment_source == "reassigned_to_available_model"
+                ):
+                    effective[role_id] = assigned_model_id.strip()
+                entry = self._role_task_states.get(role_id)
+                if isinstance(entry, dict):
+                    entry["assigned_model_id"] = assigned_model_id
+                    entry["assignment_source"] = assignment_source
+                    entry["resume_action"] = value.get("resume_action")
+                    self._role_task_states[role_id] = entry
+        return effective
+
+    def _build_role_task_snapshot(self, *, selected_models_roles: Mapping[str, str]) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "available_roles": {
+                str(role_id): str(model_id)
+                for role_id, model_id in selected_models_roles.items()
+                if isinstance(role_id, str) and isinstance(model_id, str)
+            },
+            "roles": {
+                role_id: _mapping_to_plain_dict(entry)
+                for role_id, entry in sorted(self._role_task_states.items())
+                if isinstance(role_id, str) and isinstance(entry, Mapping)
+            },
+            "tasks": {
+                task_key: _mapping_to_plain_dict(entry)
+                for task_key, entry in sorted(self._task_states.items())
+                if isinstance(task_key, str) and isinstance(entry, Mapping)
+            },
+            "resume_plan": _mapping_to_plain_dict(self._role_resume_plan),
+        }
+
+    def _resume_candidate_for_role(self, role_id: str) -> CandidateOutput | None:
+        entry = self._role_task_states.get(role_id)
+        if not isinstance(entry, Mapping):
+            return None
+        candidate = entry.get("candidate")
+        if not isinstance(candidate, Mapping):
+            return None
+        payload = _candidate_outputs_from_payload([candidate])
+        return payload[0] if payload else None
+
+    def _resume_candidate_for_task(self, task_key: str) -> CandidateOutput | None:
+        entry = self._task_states.get(task_key)
+        if not isinstance(entry, Mapping):
+            return None
+        candidate = entry.get("candidate")
+        if not isinstance(candidate, Mapping):
+            return None
+        payload = _candidate_outputs_from_payload([candidate])
+        return payload[0] if payload else None
+
+    def _resume_task_summary(self, task_key: str) -> dict[str, Any] | None:
+        entry = self._task_states.get(task_key)
+        if not isinstance(entry, Mapping):
+            return None
+        result_summary = entry.get("result_summary")
+        if not isinstance(result_summary, Mapping):
+            return None
+        return _mapping_to_plain_dict(result_summary)
+
+    def _build_role_runtime_context(self, role_id: str) -> str:
+        entry = self._role_task_states.get(role_id)
+        if not isinstance(entry, Mapping):
+            return ""
+        assignment = (
+            self._role_resume_plan.get("assignments", {}).get(role_id)
+            if isinstance(self._role_resume_plan.get("assignments"), Mapping)
+            else None
+        )
+        lines = []
+        status = str(entry.get("status") or "").strip()
+        if status:
+            lines.append(f"status={status}")
+        stage = str(entry.get("stage") or "").strip()
+        if stage:
+            lines.append(f"last_stage={stage}")
+        checkpoint_index = entry.get("checkpoint_index")
+        if checkpoint_index is not None:
+            lines.append(f"checkpoint_index={checkpoint_index}")
+        if isinstance(assignment, Mapping):
+            assigned_model_id = assignment.get("assigned_model_id")
+            if isinstance(assigned_model_id, str) and assigned_model_id.strip():
+                lines.append(f"assigned_model_id={assigned_model_id}")
+            assignment_source = str(assignment.get("assignment_source") or "").strip()
+            if assignment_source:
+                lines.append(f"assignment_source={assignment_source}")
+        output_preview = str(entry.get("output_preview") or "").strip()
+        if output_preview:
+            lines.append(f"previous_output={output_preview}")
+        return "\n".join(lines)
+
+    async def _await_subagent_operation(
+        self,
+        operation: Any,
+        *,
+        role_id: str,
+        model_id: str | None,
+        stage: str,
+    ) -> Any:
+        self._mark_role_task_running(role_id=role_id, model_id=model_id, stage=stage)
+        self._mark_task_running(
+            task_key=stage,
+            role_id=role_id,
+            model_id=model_id,
+            stage=stage,
+        )
+        heartbeat_timeout_sec = self._heartbeat_timeout_sec()
+        while True:
+            try:
+                if heartbeat_timeout_sec is not None:
+                    return await asyncio.wait_for(operation(), timeout=float(heartbeat_timeout_sec))
+                return await operation()
+            except asyncio.TimeoutError as exc:
+                failure_count = self._record_subagent_failure(
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=f"Subagent role {role_id} exceeded heartbeat_timeout_sec={heartbeat_timeout_sec}.",
+                    timeout=True,
+                )
+                if failure_count <= self._max_subagent_failures_per_role():
+                    continue
+                self._mark_role_task_failed(
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=f"Subagent role {role_id} exceeded heartbeat_timeout_sec={heartbeat_timeout_sec}.",
+                )
+                self._mark_task_failed(
+                    task_key=stage,
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=f"Subagent role {role_id} exceeded heartbeat_timeout_sec={heartbeat_timeout_sec}.",
+                )
+                raise SubagentRoleError(
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=f"Subagent role {role_id} exceeded heartbeat_timeout_sec={heartbeat_timeout_sec}.",
+                    failure_count=failure_count,
+                    timeout=True,
+                    cause=exc,
+                ) from exc
+            except Exception as exc:
+                failure_count = self._record_subagent_failure(
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=str(exc).strip() or exc.__class__.__name__,
+                    timeout=False,
+                )
+                if failure_count <= self._max_subagent_failures_per_role():
+                    continue
+                self._mark_role_task_failed(
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=str(exc).strip() or exc.__class__.__name__,
+                )
+                self._mark_task_failed(
+                    task_key=stage,
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=str(exc).strip() or exc.__class__.__name__,
+                )
+                raise SubagentRoleError(
+                    role_id=role_id,
+                    model_id=model_id,
+                    stage=stage,
+                    reason=str(exc).strip() or exc.__class__.__name__,
+                    failure_count=failure_count,
+                    timeout=False,
+                    cause=exc,
+                ) from exc
+
+    def _raise_subagent_disconnect_stop(
+        self,
+        *,
+        error: SubagentRoleError,
+        task_input: str,
+        protocol: str,
+        stage: str,
+        candidates: list[CandidateOutput] | None = None,
+        protocol_artifacts: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        classified = None if error.timeout else classify_agent_run_recovery_issue(error.cause)
+        if classified is not None:
+            raise error.cause
+        action = self._on_subagent_disconnect()
+        if action == "fail":
+            raise error.cause
+        merged_extra = {
+            "role_id": error.role_id,
+            "model_id": error.model_id,
+            "failure_count": error.failure_count,
+            "timeout": error.timeout,
+            **dict(extra or {}),
+        }
+        self._record_checkpoint(
+            stage=stage,
+            task_input=task_input,
+            protocol=protocol,
+            candidates=candidates,
+            protocol_artifacts=protocol_artifacts,
+            extra=merged_extra,
+        )
+        raise RunPolicyStop(
+            status="stalled",
+            action=action,
+            reason=error.reason,
+            stage=stage,
+            checkpoint=self._latest_checkpoint,
         )
 
     def _record_checkpoint(
@@ -333,6 +1090,19 @@ class MultiAgentOrchestrator:
         if extra:
             checkpoint["extra"] = dict(extra)
         self._latest_checkpoint = checkpoint
+
+    def _restore_checkpoint(self, checkpoint: Mapping[str, Any] | None) -> None:
+        if not isinstance(checkpoint, Mapping):
+            return
+        self._latest_checkpoint = {
+            str(key): _json_safe_clone(value)
+            for key, value in checkpoint.items()
+            if isinstance(key, str)
+        }
+        try:
+            self._checkpoint_count = max(0, int(checkpoint.get("checkpoint_index") or 0))
+        except (TypeError, ValueError):
+            self._checkpoint_count = 0
 
     def _raise_if_run_policy_exhausted(
         self,
@@ -419,7 +1189,27 @@ class MultiAgentOrchestrator:
             ),
         )
 
-        guidance_messages = [item.strip() for item in request.guidance_messages if item.strip()]
+        self._configure_run_policy(request.run_policy)
+        requested_guidance_messages = [item.strip() for item in request.guidance_messages if item.strip()]
+        resume_payload = _resolve_resume_execution_payload(request.metadata)
+        selected_models_roles = _resolve_selected_model_roles(request.metadata)
+        effective_metadata = dict(request.metadata)
+        effective_metadata["summary"] = _sanitize_resume_summary(request.metadata.get("summary"))
+        effective_metadata["execution_policy"] = execution_policy_to_dict(execution_policy)
+        candidates: list[CandidateOutput] = []
+        precomputed_artifacts: dict[str, Any] = {}
+        protocol_artifacts: dict[str, Any] = {}
+        evidence_packets: list[dict[str, Any]] = []
+        evidence_collection_summary: dict[str, Any] | None = None
+        verifications: list[CandidateVerification] = []
+        verification_summary: dict[str, Any] | None = None
+        selected_candidate_id: str | None = None
+        evaluation_payload: EvaluationPayload | None = None
+        guidance_messages = (
+            _merge_guidance_messages(resume_payload.guidance_messages, requested_guidance_messages)
+            if resume_payload is not None and resume_payload.executor == "continue_from_checkpoint"
+            else list(requested_guidance_messages)
+        )
         if not guidance_messages:
             guidance_messages.append("Keep outputs concise and grounded.")
 
@@ -435,34 +1225,59 @@ class MultiAgentOrchestrator:
                 ),
             )
 
-        self._configure_run_policy(request.run_policy)
-        selected_models_roles = _resolve_selected_model_roles(request.metadata)
-        effective_metadata = dict(request.metadata)
-        effective_metadata["execution_policy"] = execution_policy_to_dict(execution_policy)
-        research_policy = ResearchDebatePolicy.from_metadata(effective_metadata)
-        candidates: list[CandidateOutput] = []
-        precomputed_artifacts: dict[str, Any] = {}
-        protocol_artifacts: dict[str, Any] = {}
-        evidence_packets: list[dict[str, Any]] = []
-        evidence_collection_summary: dict[str, Any] | None = None
-        verifications: list[CandidateVerification] = []
-        verification_summary: dict[str, Any] | None = None
-        selected_candidate_id: str | None = None
-        evaluation_payload: EvaluationPayload | None = None
-
-        def build_partial_result(stop: RunPolicyStop) -> MultiAgentRunResult:
+        def build_recovery_result(
+            *,
+            status: Literal["partial", "awaiting_resources", "stalled"],
+            action: str,
+            reason: str,
+            stage: str,
+            checkpoint: dict[str, Any] | None = None,
+            resource_report: dict[str, Any] | None = None,
+        ) -> MultiAgentRunResult:
+            protocol_artifact_bundle = {**precomputed_artifacts, **protocol_artifacts}
+            recovery_checkpoint = dict(checkpoint or self._latest_checkpoint or {})
+            role_task_snapshot = self._build_role_task_snapshot(selected_models_roles=selected_models_roles)
+            resume_state_payload = _build_resume_execution_payload(
+                stage=stage,
+                checkpoint=recovery_checkpoint,
+                guidance_messages=guidance_messages,
+                metadata=effective_metadata,
+                precomputed_artifacts=precomputed_artifacts,
+                protocol_artifacts=protocol_artifacts,
+                candidates=candidates,
+                evidence_packets=evidence_packets,
+                evidence_collection_summary=evidence_collection_summary,
+                verifications=verifications,
+                verification_summary=verification_summary,
+                evaluation_payload=evaluation_payload,
+                role_task_snapshot=role_task_snapshot,
+            )
             recovery_state = {
-                "status": stop.status,
-                "action": stop.action,
-                "reason": stop.reason,
-                "stage": stop.stage,
-                "checkpoint": dict(stop.checkpoint or self._latest_checkpoint or {}),
+                "status": status,
+                "action": action,
+                "reason": reason,
+                "stage": stage,
+                "checkpoint": recovery_checkpoint,
+                "resume_executor": resume_state_payload.executor,
+                "resume_payload": resume_state_payload.to_dict(),
+                "role_task_snapshot": role_task_snapshot,
                 "unfinished_steps": _remaining_run_steps(
-                    stage=stop.stage,
+                    stage=stage,
                     research_enabled=research_policy.enabled
                     and isinstance(protocol_config, MultiAgentDebateProtocol),
                 ),
             }
+            if resource_report is not None:
+                recovery_state["resource_exhaustion_report"] = dict(resource_report)
+                recovery_state["recommended_resume_conditions"] = list(
+                    resource_report.get("recommended_resume_conditions") or []
+                )
+            elif status == "stalled":
+                recovery_state["recommended_resume_conditions"] = [
+                    "Resume the run after the stalled subagent or model backend is healthy again.",
+                    "Increase heartbeat_timeout_sec if the role legitimately needs a longer response window.",
+                    "Inspect subagent_health_snapshot for the failing role and stage before retrying.",
+                ]
             final_candidate = _candidate_by_id(candidates, selected_candidate_id)
             if final_candidate is None and candidates:
                 final_candidate = candidates[-1]
@@ -472,26 +1287,31 @@ class MultiAgentOrchestrator:
                 "final_answer": final_candidate.content if final_candidate is not None else "",
                 "candidate_count": len(candidates),
                 "run_guard_policy": dict(self._run_policy),
-                "recovery_checkpoint": dict(stop.checkpoint or self._latest_checkpoint or {}),
+                "recovery_checkpoint": dict(checkpoint or self._latest_checkpoint or {}),
                 "partial_summary": {
-                    "status": stop.status,
-                    "reason": stop.reason,
-                    "stage": stop.stage,
+                    "status": status,
+                    "reason": reason,
+                    "stage": stage,
                     "checkpoint_index": recovery_state["checkpoint"].get("checkpoint_index"),
                     "candidate_count": len(candidates),
                     "artifact_keys": sorted(
                         str(key)
-                        for key, value in protocol_artifacts.items()
+                        for key, value in protocol_artifact_bundle.items()
                         if isinstance(key, str) and isinstance(value, dict)
                     ),
                     "unfinished_steps": list(recovery_state["unfinished_steps"]),
                 },
             }
+            if resource_report is not None:
+                artifacts["resource_exhaustion_report"] = dict(resource_report)
             if execution_policy.mode != "disabled":
                 artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
-            artifacts.update(protocol_artifacts)
+            artifacts.update(protocol_artifact_bundle)
+            artifacts["role_task_snapshot"] = role_task_snapshot
             if self._invocation_traces:
                 artifacts["subagent_runtime"] = _build_subagent_runtime_artifact(self._invocation_traces)
+            if self._subagent_health_events:
+                artifacts["subagent_health_snapshot"] = self._build_subagent_health_snapshot()
             if evidence_collection_summary is not None:
                 artifacts["evidence_collection"] = evidence_collection_summary
             if verification_summary is not None:
@@ -502,20 +1322,24 @@ class MultiAgentOrchestrator:
                         "artifact",
                         asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
                     )
-            previous_state, current_state = state_machine.transition(stop.status)
+            previous_state, current_state = state_machine.transition(status)
             emit(
                 "state_changed",
                 asdict(
                     StateChangedPayload(
                         previous_state=previous_state,
                         current_state=current_state,
-                        reason="run_policy_exhausted",
+                        reason=(
+                            "run_policy_exhausted"
+                            if resource_report is None
+                            else "resource_recovery_triggered"
+                        ),
                     )
                 ),
             )
             metadata = dict(effective_metadata)
             metadata["recovery_state"] = recovery_state
-            metadata["degraded"] = False
+            metadata["degraded"] = bool(self._degraded_roles)
             return MultiAgentRunResult(
                 run_id=run_id,
                 protocol=protocol_config.protocol,
@@ -529,8 +1353,50 @@ class MultiAgentOrchestrator:
                 metadata=metadata,
             )
 
+        resume_stage: str | None = None
+        if resume_payload is not None and resume_payload.executor == "continue_from_checkpoint":
+            resume_stage = resume_payload.stage
+            self._restore_checkpoint(resume_payload.checkpoint)
+            guidance_messages = _merge_guidance_messages(resume_payload.guidance_messages, guidance_messages)
+            effective_metadata = _apply_resume_metadata_state(
+                effective_metadata,
+                resume_payload.metadata_state,
+            )
+            precomputed_artifacts.update(resume_payload.precomputed_artifacts)
+            protocol_artifacts.update(resume_payload.protocol_artifacts)
+            protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+            candidates = list(resume_payload.candidates)
+            evidence_packets = [_json_safe_clone(item) for item in resume_payload.evidence_packets]
+            evidence_collection_summary = (
+                _json_safe_clone(resume_payload.evidence_collection_summary)
+                if isinstance(resume_payload.evidence_collection_summary, dict)
+                else None
+            )
+            verifications = list(resume_payload.verifications)
+            verification_summary = (
+                _json_safe_clone(resume_payload.verification_summary)
+                if isinstance(resume_payload.verification_summary, dict)
+                else None
+            )
+            evaluation_payload = resume_payload.evaluation
+            if evaluation_payload is not None:
+                selected_candidate_id = evaluation_payload.selected_candidate_id
+            self._restore_role_task_snapshot(resume_payload.role_task_snapshot)
+
+        role_resume_plan = self._build_role_resume_plan(selected_models_roles=selected_models_roles)
+        selected_models_roles = self._apply_role_resume_plan(
+            selected_models_roles=selected_models_roles,
+            role_resume_plan=role_resume_plan,
+        )
+        effective_metadata["role_resume_plan"] = _mapping_to_plain_dict(role_resume_plan)
+        research_policy = ResearchDebatePolicy.from_metadata(effective_metadata)
+
         try:
-            if research_policy.enabled and isinstance(protocol_config, MultiAgentDebateProtocol):
+            if (
+                research_policy.enabled
+                and isinstance(protocol_config, MultiAgentDebateProtocol)
+                and not _resume_stage_covers(resume_stage, "research_context_prepared")
+            ):
                 (
                     effective_metadata,
                     precomputed_artifacts,
@@ -550,50 +1416,54 @@ class MultiAgentOrchestrator:
                     protocol=protocol_config.protocol,
                     protocol_artifacts=precomputed_artifacts,
                 )
-            (
-                guidance_messages,
-                controlled_execution_artifacts,
-            ) = await self._prepare_controlled_execution_context(
-                task_input=request.task_input,
-                protocol_config=protocol_config,
-                guidance_messages=guidance_messages,
-                selected_models_roles=selected_models_roles,
-                execution_policy=execution_policy,
-                metadata=effective_metadata,
-                emit=emit,
-            )
-            precomputed_artifacts.update(controlled_execution_artifacts)
-            self._raise_if_run_policy_exhausted(
-                stage="controlled_execution_context_prepared",
-                task_input=request.task_input,
-                protocol=protocol_config.protocol,
-                protocol_artifacts=precomputed_artifacts,
-            )
-            protocol_metadata = dict(effective_metadata)
-            candidates, protocol_artifacts = await self._run_protocol(
-                request.task_input,
-                protocol_config=protocol_config,
-                guidance_messages=guidance_messages,
-                selected_models_roles=selected_models_roles,
-                execution_policy=execution_policy,
-                metadata=protocol_metadata,
-                emit=emit,
-            )
-            protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
-            self._raise_if_run_policy_exhausted(
-                stage="protocol_completed",
-                task_input=request.task_input,
-                protocol=protocol_config.protocol,
-                candidates=candidates,
-                protocol_artifacts=protocol_artifacts,
-            )
-            for artifact_name, artifact_content in protocol_artifacts.items():
-                if isinstance(artifact_content, dict):
-                    emit(
-                        "artifact",
-                        asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
-                    )
-            if evidence_collection_summary is None:
+            if not _resume_stage_covers(resume_stage, "controlled_execution_context_prepared"):
+                (
+                    guidance_messages,
+                    controlled_execution_artifacts,
+                ) = await self._prepare_controlled_execution_context(
+                    task_input=request.task_input,
+                    protocol_config=protocol_config,
+                    guidance_messages=guidance_messages,
+                    selected_models_roles=selected_models_roles,
+                    execution_policy=execution_policy,
+                    metadata=effective_metadata,
+                    emit=emit,
+                )
+                precomputed_artifacts.update(controlled_execution_artifacts)
+                self._raise_if_run_policy_exhausted(
+                    stage="controlled_execution_context_prepared",
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    protocol_artifacts=precomputed_artifacts,
+                )
+            if not _resume_stage_covers(resume_stage, "protocol_completed"):
+                protocol_metadata = dict(effective_metadata)
+                candidates, protocol_artifacts = await self._run_protocol(
+                    request.task_input,
+                    protocol_config=protocol_config,
+                    guidance_messages=guidance_messages,
+                    selected_models_roles=selected_models_roles,
+                    execution_policy=execution_policy,
+                    metadata=protocol_metadata,
+                    emit=emit,
+                )
+                protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+                self._raise_if_run_policy_exhausted(
+                    stage="protocol_completed",
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    candidates=candidates,
+                    protocol_artifacts=protocol_artifacts,
+                )
+                for artifact_name, artifact_content in protocol_artifacts.items():
+                    if isinstance(artifact_content, dict):
+                        emit(
+                            "artifact",
+                            asdict(ArtifactPayload(name=artifact_name, content=artifact_content)),
+                        )
+            else:
+                protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+            if not _resume_stage_covers(resume_stage, "evidence_collected") and evidence_collection_summary is None:
                 self._raise_if_run_policy_exhausted(
                     stage="before_evidence_collection",
                     task_input=request.task_input,
@@ -622,30 +1492,31 @@ class MultiAgentOrchestrator:
                 protocol_artifacts=protocol_artifacts,
                 extra={"evidence_packet_count": len(evidence_packets)},
             )
-            verifications, verification_summary = await self._verify_candidates(
-                task_input=request.task_input,
-                protocol_config=protocol_config,
-                guidance_messages=guidance_messages,
-                selected_models_roles=selected_models_roles,
-                candidates=candidates,
-                evidence_packets=evidence_packets,
-                protocol_artifacts=protocol_artifacts,
-                metadata=effective_metadata,
-            )
-            if verification_summary is not None:
-                emit(
-                    "verification",
-                    asdict(
-                        VerificationPayload(
-                            verifier_model_id=verification_summary.get("verifier_model_id"),
-                            evidence_packet_count=int(verification_summary.get("evidence_packet_count", 0)),
-                            verifications=[
-                                verification.to_dict()
-                                for verification in verifications
-                            ],
-                        )
-                    ),
+            if not _resume_stage_covers(resume_stage, "verification_completed"):
+                verifications, verification_summary = await self._verify_candidates(
+                    task_input=request.task_input,
+                    protocol_config=protocol_config,
+                    guidance_messages=guidance_messages,
+                    selected_models_roles=selected_models_roles,
+                    candidates=candidates,
+                    evidence_packets=evidence_packets,
+                    protocol_artifacts=protocol_artifacts,
+                    metadata=effective_metadata,
                 )
+                if verification_summary is not None:
+                    emit(
+                        "verification",
+                        asdict(
+                            VerificationPayload(
+                                verifier_model_id=verification_summary.get("verifier_model_id"),
+                                evidence_packet_count=int(verification_summary.get("evidence_packet_count", 0)),
+                                verifications=[
+                                    verification.to_dict()
+                                    for verification in verifications
+                                ],
+                            )
+                        ),
+                    )
             self._raise_if_run_policy_exhausted(
                 stage="verification_completed",
                 task_input=request.task_input,
@@ -654,22 +1525,29 @@ class MultiAgentOrchestrator:
                 protocol_artifacts=protocol_artifacts,
                 extra={"verification_count": len(verifications)},
             )
-
-            scores, preferred_candidate_id = await self._evaluate_candidates(
-                task_input=request.task_input,
-                protocol_config=protocol_config,
-                guidance_messages=guidance_messages,
-                selected_models_roles=selected_models_roles,
-                candidates=candidates,
-                protocol_artifacts=protocol_artifacts,
-                metadata=effective_metadata,
-            )
-            scores = _merge_scores_with_verifications(scores, verifications)
-            selected_candidate_id = _select_candidate_id(
-                scores=scores,
-                candidates=candidates,
-                preferred_candidate_id=preferred_candidate_id,
-            )
+            if not _resume_stage_covers(resume_stage, "evaluation_completed"):
+                scores, preferred_candidate_id = await self._evaluate_candidates(
+                    task_input=request.task_input,
+                    protocol_config=protocol_config,
+                    guidance_messages=guidance_messages,
+                    selected_models_roles=selected_models_roles,
+                    candidates=candidates,
+                    protocol_artifacts=protocol_artifacts,
+                    metadata=effective_metadata,
+                )
+                scores = _merge_scores_with_verifications(scores, verifications)
+                selected_candidate_id = _select_candidate_id(
+                    scores=scores,
+                    candidates=candidates,
+                    preferred_candidate_id=preferred_candidate_id,
+                )
+                evaluation_payload = EvaluationPayload(
+                    policy=self._policy.to_dict(),
+                    selected_candidate_id=selected_candidate_id,
+                    scores=[score.to_dict() for score in scores],
+                )
+            elif evaluation_payload is not None:
+                selected_candidate_id = evaluation_payload.selected_candidate_id
             self._raise_if_run_policy_exhausted(
                 stage="evaluation_completed",
                 task_input=request.task_input,
@@ -678,7 +1556,11 @@ class MultiAgentOrchestrator:
                 protocol_artifacts=protocol_artifacts,
                 extra={"selected_candidate_id": selected_candidate_id},
             )
-            if research_policy.enabled and isinstance(protocol_config, MultiAgentDebateProtocol):
+            if (
+                research_policy.enabled
+                and isinstance(protocol_config, MultiAgentDebateProtocol)
+                and not _resume_stage_covers(resume_stage, "research_artifacts_completed")
+            ):
                 research_artifacts = await self._build_research_result_artifacts(
                     task_input=request.task_input,
                     selected_models_roles=selected_models_roles,
@@ -703,28 +1585,37 @@ class MultiAgentOrchestrator:
                     candidates=candidates,
                     protocol_artifacts=protocol_artifacts,
                 )
-            evaluation_payload = EvaluationPayload(
-                policy=self._policy.to_dict(),
-                selected_candidate_id=selected_candidate_id,
-                scores=[score.to_dict() for score in scores],
-            )
-            emit("evaluation", asdict(evaluation_payload))
+            if evaluation_payload is not None:
+                emit("evaluation", asdict(evaluation_payload))
 
             final_candidate = _candidate_by_id(candidates, selected_candidate_id)
+            role_task_snapshot = self._build_role_task_snapshot(selected_models_roles=selected_models_roles)
             artifacts = {
                 "protocol": protocol_config.protocol,
                 "selected_candidate_id": selected_candidate_id,
                 "final_answer": final_candidate.content if final_candidate is not None else "",
                 "candidate_count": len(candidates),
                 "run_guard_policy": dict(self._run_policy),
+                "role_task_snapshot": role_task_snapshot,
             }
             if execution_policy.mode != "disabled":
                 artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
             artifacts.update(protocol_artifacts)
+            emit(
+                "artifact",
+                asdict(ArtifactPayload(name="role_task_snapshot", content=role_task_snapshot)),
+            )
             if self._invocation_traces:
                 subagent_runtime = _build_subagent_runtime_artifact(self._invocation_traces)
                 artifacts["subagent_runtime"] = subagent_runtime
                 emit("artifact", asdict(ArtifactPayload(name="subagent_runtime", content=subagent_runtime)))
+            if self._subagent_health_events:
+                subagent_health_snapshot = self._build_subagent_health_snapshot()
+                artifacts["subagent_health_snapshot"] = subagent_health_snapshot
+                emit(
+                    "artifact",
+                    asdict(ArtifactPayload(name="subagent_health_snapshot", content=subagent_health_snapshot)),
+                )
             if evidence_collection_summary is not None:
                 artifacts["evidence_collection"] = evidence_collection_summary
             if verification_summary is not None:
@@ -753,10 +1644,81 @@ class MultiAgentOrchestrator:
                 evaluation=asdict(evaluation_payload),
                 artifacts=artifacts,
                 events=events,
-                metadata=effective_metadata,
+                metadata={**effective_metadata, "degraded": bool(self._degraded_roles)},
             )
         except RunPolicyStop as stop:
-            return build_partial_result(stop)
+            return build_recovery_result(
+                status=stop.status,
+                action=stop.action,
+                reason=stop.reason,
+                stage=stop.stage,
+                checkpoint=stop.checkpoint,
+            )
+        except SubagentRoleError as exc:
+            try:
+                self._raise_subagent_disconnect_stop(
+                    error=exc,
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    stage=exc.stage,
+                    candidates=candidates,
+                    protocol_artifacts={**precomputed_artifacts, **protocol_artifacts},
+                )
+            except RunPolicyStop as stop:
+                return build_recovery_result(
+                    status=stop.status,
+                    action=stop.action,
+                    reason=stop.reason,
+                    stage=stop.stage,
+                    checkpoint=stop.checkpoint,
+                )
+            except Exception as inner_exc:
+                classified = classify_agent_run_recovery_issue(inner_exc)
+                if classified is None:
+                    raise
+                resource_report = build_resource_exhaustion_report(
+                    classified,
+                    stage=exc.stage,
+                    exception=inner_exc,
+                )
+                return build_recovery_result(
+                    status="awaiting_resources",
+                    action="pause",
+                    reason=classified.reason,
+                    stage=exc.stage,
+                    checkpoint=self._latest_checkpoint,
+                    resource_report=resource_report,
+                )
+        except Exception as exc:
+            classified = classify_agent_run_recovery_issue(exc)
+            if classified is None:
+                raise
+            stage = str(
+                (self._latest_checkpoint.get("stage") if isinstance(self._latest_checkpoint, dict) else None)
+                or "orchestration_interrupted"
+            )
+            if not self._latest_checkpoint:
+                self._record_checkpoint(
+                    stage=stage,
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    candidates=candidates,
+                    protocol_artifacts={**precomputed_artifacts, **protocol_artifacts},
+                    extra={"error": str(exc)},
+                )
+            resource_report = build_resource_exhaustion_report(
+                classified,
+                stage=stage,
+                exception=exc,
+            )
+            return build_recovery_result(
+                status="awaiting_resources",
+                action="pause",
+                reason=classified.reason,
+                stage=stage,
+                checkpoint=self._latest_checkpoint,
+                resource_report=resource_report,
+            )
 
     async def _run_protocol(
         self,
@@ -825,53 +1787,125 @@ class MultiAgentOrchestrator:
                 fallback_index=1,
                 default_model_id=teacher_model_id,
             )
-            if not teacher_model_id or not student_model_id:
+            teacher_output = self._resume_candidate_for_task("teacher_generation")
+            student_output = self._resume_candidate_for_task("student_generation")
+            if teacher_output is None and not teacher_model_id:
+                return [], {}
+            if student_output is None and not student_model_id:
                 return [], {}
 
-            teacher_output = await self._generate_role_candidate(
-                role_id=teacher_role.role_id,
-                role_title=teacher_role.title,
-                role_instruction=teacher_role.instruction,
-                model_id=teacher_model_id,
-                task_input=task_input,
-                guidance_messages=guidance_messages,
-                supporting_candidates=[],
-            )
-            emit(
-                "role_output",
-                asdict(
-                    RoleOutputPayload(
-                        role_id=teacher_output.role_id,
-                        content=teacher_output.content,
-                        round_index=1,
-                        candidate_id=teacher_output.candidate_id,
+            if teacher_output is not None:
+                self._mark_role_task_reused(
+                    role_id=teacher_role.role_id,
+                    stage="teacher_generation",
+                    candidate=teacher_output,
+                )
+                self._mark_task_reused(
+                    task_key="teacher_generation",
+                    role_id=teacher_role.role_id,
+                    stage="teacher_generation",
+                    candidate=teacher_output,
+                )
+            else:
+                try:
+                    teacher_output = await self._generate_role_candidate(
+                        role_id=teacher_role.role_id,
+                        role_title=teacher_role.title,
+                        role_instruction=teacher_role.instruction,
                         model_id=teacher_model_id,
+                        task_input=task_input,
+                        guidance_messages=guidance_messages,
+                        supporting_candidates=[],
+                        stage="teacher_generation",
                     )
-                ),
-            )
+                    emit(
+                        "role_output",
+                        asdict(
+                            RoleOutputPayload(
+                                role_id=teacher_output.role_id,
+                                content=teacher_output.content,
+                                round_index=1,
+                                candidate_id=teacher_output.candidate_id,
+                                model_id=teacher_model_id,
+                            )
+                        )
+                    )
+                except SubagentRoleError as exc:
+                    if (
+                        self._on_subagent_disconnect() == "retry_then_degrade"
+                        and classify_agent_run_recovery_issue(exc.cause) is None
+                    ):
+                        self._mark_degraded_role(
+                            role_id=exc.role_id,
+                            model_id=exc.model_id,
+                            stage=exc.stage,
+                            reason=exc.reason,
+                        )
+                    else:
+                        self._raise_subagent_disconnect_stop(
+                            error=exc,
+                            task_input=task_input,
+                            protocol=protocol_config.protocol,
+                            stage=exc.stage,
+                        )
 
-            student_output = await self._generate_role_candidate(
-                role_id=student_role.role_id,
-                role_title=student_role.title,
-                role_instruction=student_role.instruction,
-                model_id=student_model_id,
-                task_input=task_input,
-                guidance_messages=guidance_messages,
-                supporting_candidates=[teacher_output],
-            )
-            emit(
-                "role_output",
-                asdict(
-                    RoleOutputPayload(
-                        role_id=student_output.role_id,
-                        content=student_output.content,
-                        round_index=1,
-                        candidate_id=student_output.candidate_id,
+            if student_output is not None:
+                self._mark_role_task_reused(
+                    role_id=student_role.role_id,
+                    stage="student_generation",
+                    candidate=student_output,
+                )
+                self._mark_task_reused(
+                    task_key="student_generation",
+                    role_id=student_role.role_id,
+                    stage="student_generation",
+                    candidate=student_output,
+                )
+            else:
+                try:
+                    student_output = await self._generate_role_candidate(
+                        role_id=student_role.role_id,
+                        role_title=student_role.title,
+                        role_instruction=student_role.instruction,
                         model_id=student_model_id,
+                        task_input=task_input,
+                        guidance_messages=guidance_messages,
+                        supporting_candidates=[teacher_output] if teacher_output is not None else [],
+                        stage="student_generation",
                     )
-                ),
-            )
-            return [teacher_output, student_output], {}
+                    emit(
+                        "role_output",
+                        asdict(
+                            RoleOutputPayload(
+                                role_id=student_output.role_id,
+                                content=student_output.content,
+                                round_index=1,
+                                candidate_id=student_output.candidate_id,
+                                model_id=student_model_id,
+                            )
+                        )
+                    )
+                except SubagentRoleError as exc:
+                    if (
+                        teacher_output is not None
+                        and self._on_subagent_disconnect() == "retry_then_degrade"
+                        and classify_agent_run_recovery_issue(exc.cause) is None
+                    ):
+                        self._mark_degraded_role(
+                            role_id=exc.role_id,
+                            model_id=exc.model_id,
+                            stage=exc.stage,
+                            reason=exc.reason,
+                        )
+                        return [teacher_output], {}
+                    self._raise_subagent_disconnect_stop(
+                        error=exc,
+                        task_input=task_input,
+                        protocol=protocol_config.protocol,
+                        stage=exc.stage,
+                        candidates=[teacher_output] if teacher_output is not None else [],
+                    )
+            return [item for item in (teacher_output, student_output) if item is not None], {}
 
         if isinstance(protocol_config, DrZeroSelfEvolveProtocol):
             return await self._run_model_backed_dr_zero(
@@ -942,28 +1976,52 @@ class MultiAgentOrchestrator:
             sample_size=protocol_config.proposal_sample_size,
             guidance_messages=guidance_messages,
         )
-        proposer_output = await self._generate_role_candidate(
-            role_id=proposer_role.role_id,
-            role_title=proposer_role.title,
-            role_instruction=proposer_role.instruction,
-            model_id=proposer_model_id,
-            task_input=task_input,
-            guidance_messages=guidance_messages,
-            supporting_candidates=[],
-            prompt_override=proposer_prompt,
-        )
-        emit(
-            "role_output",
-            asdict(
-                RoleOutputPayload(
-                    role_id=proposer_output.role_id,
-                    content=proposer_output.content,
-                    round_index=1,
-                    candidate_id=proposer_output.candidate_id,
+        proposer_task_key = "dr_zero_proposer"
+        proposer_output = self._resume_candidate_for_task(proposer_task_key)
+        if proposer_output is not None:
+            self._mark_role_task_reused(
+                role_id=proposer_role.role_id,
+                stage=proposer_task_key,
+                candidate=proposer_output,
+            )
+            self._mark_task_reused(
+                task_key=proposer_task_key,
+                role_id=proposer_role.role_id,
+                stage=proposer_task_key,
+                candidate=proposer_output,
+            )
+        else:
+            try:
+                proposer_output = await self._generate_role_candidate(
+                    role_id=proposer_role.role_id,
+                    role_title=proposer_role.title,
+                    role_instruction=proposer_role.instruction,
                     model_id=proposer_model_id,
+                    task_input=task_input,
+                    guidance_messages=guidance_messages,
+                    supporting_candidates=[],
+                    prompt_override=proposer_prompt,
+                    stage=proposer_task_key,
                 )
-            ),
-        )
+            except SubagentRoleError as exc:
+                self._raise_subagent_disconnect_stop(
+                    error=exc,
+                    task_input=task_input,
+                    protocol=protocol_config.protocol,
+                    stage=exc.stage,
+                )
+            emit(
+                "role_output",
+                asdict(
+                    RoleOutputPayload(
+                        role_id=proposer_output.role_id,
+                        content=proposer_output.content,
+                        round_index=1,
+                        candidate_id=proposer_output.candidate_id,
+                        model_id=proposer_model_id,
+                    )
+                ),
+            )
         self._raise_if_run_policy_exhausted(
             stage="dr_zero_proposals_generated",
             task_input=task_input,
@@ -982,34 +2040,84 @@ class MultiAgentOrchestrator:
         for task_index, synthetic_task in enumerate(synthetic_tasks, start=1):
             for rollout_index in range(1, protocol_config.solver_rollouts_per_task + 1):
                 candidate_id = f"{solver_role.role_id}_{task_index}_{rollout_index}"
+                solver_task_key = f"dr_zero_solver:{synthetic_task['task_id']}:{rollout_index}"
                 solver_prompt = _build_dr_zero_solver_prompt(
                     root_task=task_input,
                     synthetic_task=synthetic_task,
                     guidance_messages=guidance_messages,
                     rollout_index=rollout_index,
                 )
-                raw_solver_output = await self._generate_role_candidate(
-                    role_id=solver_role.role_id,
-                    role_title=solver_role.title,
-                    role_instruction=solver_role.instruction,
-                    model_id=solver_model_id,
-                    task_input=task_input,
-                    guidance_messages=guidance_messages,
-                    supporting_candidates=[proposer_output],
-                    prompt_override=solver_prompt,
-                )
-                solver_output = CandidateOutput(
-                    candidate_id=candidate_id,
-                    role_id=solver_role.role_id,
-                    content=raw_solver_output.content,
-                    metadata={
-                        **dict(raw_solver_output.metadata),
-                        "synthetic_task": dict(synthetic_task),
-                        "synthetic_task_id": synthetic_task["task_id"],
-                        "task_index": task_index,
-                        "rollout_index": rollout_index,
-                    },
-                )
+                solver_output = self._resume_candidate_for_task(solver_task_key)
+                if solver_output is None:
+                    try:
+                        raw_solver_output = await self._generate_role_candidate(
+                            role_id=solver_role.role_id,
+                            role_title=solver_role.title,
+                            role_instruction=solver_role.instruction,
+                            model_id=solver_model_id,
+                            task_input=task_input,
+                            guidance_messages=guidance_messages,
+                            supporting_candidates=[proposer_output],
+                            prompt_override=solver_prompt,
+                            stage=solver_task_key,
+                        )
+                    except SubagentRoleError as exc:
+                        if (
+                            self._on_subagent_disconnect() == "retry_then_degrade"
+                            and classify_agent_run_recovery_issue(exc.cause) is None
+                        ):
+                            self._mark_degraded_role(
+                                role_id=exc.role_id,
+                                model_id=exc.model_id,
+                                stage=exc.stage,
+                                reason=exc.reason,
+                            )
+                            continue
+                        self._raise_subagent_disconnect_stop(
+                            error=exc,
+                            task_input=task_input,
+                            protocol=protocol_config.protocol,
+                            stage=exc.stage,
+                            candidates=solver_outputs,
+                            extra={"synthetic_task_id": synthetic_task["task_id"], "rollout_index": rollout_index},
+                        )
+                    solver_output = CandidateOutput(
+                        candidate_id=candidate_id,
+                        role_id=solver_role.role_id,
+                        content=raw_solver_output.content,
+                        metadata={
+                            **dict(raw_solver_output.metadata),
+                            "synthetic_task": dict(synthetic_task),
+                            "synthetic_task_id": synthetic_task["task_id"],
+                            "task_index": task_index,
+                            "rollout_index": rollout_index,
+                        },
+                    )
+                    self._mark_role_task_completed(
+                        role_id=solver_role.role_id,
+                        model_id=solver_model_id,
+                        stage=solver_task_key,
+                        candidate=solver_output,
+                    )
+                    self._mark_task_completed(
+                        task_key=solver_task_key,
+                        role_id=solver_role.role_id,
+                        model_id=solver_model_id,
+                        stage=solver_task_key,
+                        candidate=solver_output,
+                    )
+                else:
+                    self._mark_role_task_reused(
+                        role_id=solver_role.role_id,
+                        stage=solver_task_key,
+                        candidate=solver_output,
+                    )
+                    self._mark_task_reused(
+                        task_key=solver_task_key,
+                        role_id=solver_role.role_id,
+                        stage=solver_task_key,
+                        candidate=solver_output,
+                    )
                 solver_outputs.append(solver_output)
                 solver_rollout = {
                     "candidate_id": solver_output.candidate_id,
@@ -1044,6 +2152,9 @@ class MultiAgentOrchestrator:
                         "solver_rollout_count": len(solver_rollouts),
                     },
                 )
+
+        if not solver_outputs:
+            raise RuntimeError("Dr.Zero solver produced no successful rollouts.")
 
         verifier_model_id = (
             selected_models_roles.get(protocol_config.verifier_role_id)
@@ -1130,6 +2241,7 @@ class MultiAgentOrchestrator:
             emit=emit,
             resolve_model_id=_resolve_protocol_role_model_id,
             primary_workflow=False,
+            resume_hooks=self._build_controlled_execution_resume_hooks(),
         )
         if not artifacts:
             return guidance_messages, {}
@@ -1172,6 +2284,7 @@ class MultiAgentOrchestrator:
             metadata=metadata,
             emit=emit,
             resolve_model_id=_resolve_protocol_role_model_id,
+            resume_hooks=self._build_controlled_execution_resume_hooks(),
         )
         candidates = [
             CandidateOutput(
@@ -1184,6 +2297,109 @@ class MultiAgentOrchestrator:
         ]
         return candidates, protocol_artifacts
 
+    def _build_controlled_execution_resume_hooks(self) -> ControlledExecutionResumeHooks:
+        def _candidate_from_payload(payload: Mapping[str, Any] | None) -> CandidateOutput | None:
+            candidates = _candidate_outputs_from_payload([payload] if isinstance(payload, Mapping) else [])
+            return candidates[0] if candidates else None
+
+        def _mark_running(
+            *,
+            task_key: str,
+            role_id: str,
+            model_id: str | None,
+            stage: str,
+            depends_on: list[str] | None = None,
+        ) -> None:
+            self._mark_role_task_running(
+                role_id=role_id,
+                model_id=model_id,
+                stage=stage,
+                depends_on=depends_on,
+            )
+            self._mark_task_running(
+                task_key=task_key,
+                role_id=role_id,
+                model_id=model_id,
+                stage=stage,
+                depends_on=depends_on,
+            )
+
+        def _mark_completed(
+            *,
+            task_key: str,
+            role_id: str,
+            model_id: str | None,
+            stage: str,
+            candidate: Mapping[str, Any] | None = None,
+            result_summary: Mapping[str, Any] | None = None,
+        ) -> None:
+            restored_candidate = _candidate_from_payload(candidate)
+            self._mark_role_task_completed(
+                role_id=role_id,
+                model_id=model_id,
+                stage=stage,
+                candidate=restored_candidate,
+                result_summary=result_summary,
+            )
+            self._mark_task_completed(
+                task_key=task_key,
+                role_id=role_id,
+                model_id=model_id,
+                stage=stage,
+                candidate=restored_candidate,
+                result_summary=result_summary,
+            )
+
+        def _mark_failed(
+            *,
+            task_key: str,
+            role_id: str,
+            model_id: str | None,
+            stage: str,
+            reason: str,
+        ) -> None:
+            self._mark_role_task_failed(
+                role_id=role_id,
+                model_id=model_id,
+                stage=stage,
+                reason=reason,
+            )
+            self._mark_task_failed(
+                task_key=task_key,
+                role_id=role_id,
+                model_id=model_id,
+                stage=stage,
+                reason=reason,
+            )
+
+        def _mark_reused(
+            *,
+            task_key: str,
+            role_id: str,
+            stage: str,
+            candidate: Mapping[str, Any] | None = None,
+        ) -> None:
+            restored_candidate = _candidate_from_payload(candidate)
+            self._mark_role_task_reused(
+                role_id=role_id,
+                stage=stage,
+                candidate=restored_candidate,
+            )
+            self._mark_task_reused(
+                task_key=task_key,
+                role_id=role_id,
+                stage=stage,
+                candidate=restored_candidate,
+            )
+
+        return ControlledExecutionResumeHooks(
+            get_task_summary=self._resume_task_summary,
+            mark_task_running=_mark_running,
+            mark_task_completed=_mark_completed,
+            mark_task_failed=_mark_failed,
+            mark_task_reused=_mark_reused,
+        )
+
     async def _generate_role_candidate(
         self,
         *,
@@ -1195,6 +2411,7 @@ class MultiAgentOrchestrator:
         guidance_messages: list[str],
         supporting_candidates: list[CandidateOutput],
         prompt_override: str | None = None,
+        stage: str | None = None,
     ) -> CandidateOutput:
         prompt = (
             prompt_override
@@ -1206,26 +2423,49 @@ class MultiAgentOrchestrator:
                 supporting_candidates=supporting_candidates,
             )
         )
-        content, diagnostics = await self._invoke_configured_text(
-            model_id=model_id,
-            system_prompt=role_instruction,
-            user_prompt=prompt,
-            temperature=0.2,
-            max_tokens=1024,
-            execution_profile="subagent_readonly",
-            tool_mode="auto",
-            system_prompt_addendum=(
-                f"Role identity: {role_title} ({role_id}).\n"
-                f"Role instruction: {role_instruction}"
+        role_runtime_context = self._build_role_runtime_context(role_id)
+        if role_runtime_context:
+            prompt = f"{prompt}\n\nRole runtime context:\n{role_runtime_context}"
+        role_stage = stage or f"role::{role_id}"
+        content, diagnostics = await self._await_subagent_operation(
+            lambda: self._invoke_configured_text(
+                model_id=model_id,
+                system_prompt=role_instruction,
+                user_prompt=prompt,
+                temperature=0.2,
+                max_tokens=1024,
+                execution_profile="subagent_readonly",
+                tool_mode="auto",
+                system_prompt_addendum=(
+                    f"Role identity: {role_title} ({role_id}).\n"
+                    f"Role instruction: {role_instruction}"
+                ),
+                session_scope=f"role::{role_id}",
             ),
-            session_scope=f"role::{role_id}",
+            role_id=role_id,
+            model_id=model_id,
+            stage=role_stage,
         )
-        return CandidateOutput(
+        candidate = CandidateOutput(
             candidate_id=role_id,
             role_id=role_id,
             content=content,
             metadata={"model_id": model_id, "diagnostics": diagnostics},
         )
+        self._mark_role_task_completed(
+            role_id=role_id,
+            model_id=model_id,
+            stage=role_stage,
+            candidate=candidate,
+        )
+        self._mark_task_completed(
+            task_key=role_stage,
+            role_id=role_id,
+            model_id=model_id,
+            stage=role_stage,
+            candidate=candidate,
+        )
+        return candidate
 
     def _make_shared_generate(
         self,
@@ -1404,9 +2644,13 @@ class MultiAgentOrchestrator:
 
         latest_candidates: dict[str, CandidateOutput] = {}
         snapshots: list[dict[str, Any]] = []
+        disabled_roles: set[str] = set()
         research_appendix = _research_prompt_appendix(metadata)
         for round_index in range(1, protocol_config.rounds + 1):
             for role, model_id in ((debater_a, debater_a_model_id), (debater_b, debater_b_model_id)):
+                if role.role_id in disabled_roles:
+                    continue
+                task_key = f"debate_round_{round_index}:{role.role_id}"
                 prompt, snapshot = debate_context.build_role_prompt(
                     role_id=role.role_id,
                     role_title=role.title,
@@ -1416,16 +2660,67 @@ class MultiAgentOrchestrator:
                 if research_appendix:
                     prompt = f"{prompt}\n\nResearch context:\n{research_appendix}"
                 snapshots.append(snapshot.to_dict())
-                candidate = await self._generate_role_candidate(
-                    role_id=role.role_id,
-                    role_title=role.title,
-                    role_instruction=role.instruction,
-                    model_id=model_id,
-                    task_input=task_input,
-                    guidance_messages=guidance_messages,
-                    supporting_candidates=list(latest_candidates.values()),
-                    prompt_override=prompt,
-                )
+                candidate = self._resume_candidate_for_task(task_key)
+                if candidate is not None:
+                    self._mark_role_task_reused(
+                        role_id=role.role_id,
+                        stage=task_key,
+                        candidate=candidate,
+                    )
+                    self._mark_task_reused(
+                        task_key=task_key,
+                        role_id=role.role_id,
+                        stage=task_key,
+                        candidate=candidate,
+                    )
+                    latest_candidates[role.role_id] = candidate
+                    debate_context.register_turn(
+                        role_id=role.role_id,
+                        round_index=round_index,
+                        content=candidate.content,
+                        candidate_id=candidate.candidate_id,
+                    )
+                    continue
+                try:
+                    candidate = await self._generate_role_candidate(
+                        role_id=role.role_id,
+                        role_title=role.title,
+                        role_instruction=role.instruction,
+                        model_id=model_id,
+                        task_input=task_input,
+                        guidance_messages=guidance_messages,
+                        supporting_candidates=list(latest_candidates.values()),
+                        prompt_override=prompt,
+                        stage=task_key,
+                    )
+                except SubagentRoleError as exc:
+                    remaining_roles = [
+                        candidate_role.role_id
+                        for candidate_role, _candidate_model_id in ((debater_a, debater_a_model_id), (debater_b, debater_b_model_id))
+                        if candidate_role.role_id not in disabled_roles
+                        and candidate_role.role_id != role.role_id
+                    ]
+                    if (
+                        self._on_subagent_disconnect() == "retry_then_degrade"
+                        and classify_agent_run_recovery_issue(exc.cause) is None
+                        and (latest_candidates or remaining_roles)
+                    ):
+                        self._mark_degraded_role(
+                            role_id=exc.role_id,
+                            model_id=exc.model_id,
+                            stage=exc.stage,
+                            reason=exc.reason,
+                        )
+                        disabled_roles.add(role.role_id)
+                        continue
+                    self._raise_subagent_disconnect_stop(
+                        error=exc,
+                        task_input=task_input,
+                        protocol=protocol_config.protocol,
+                        stage=exc.stage,
+                        candidates=list(latest_candidates.values()),
+                        extra={"round_index": round_index},
+                    )
                 latest_candidates[role.role_id] = candidate
                 debate_context.register_turn(
                     role_id=role.role_id,
@@ -1445,6 +2740,8 @@ class MultiAgentOrchestrator:
                         )
                     ),
                 )
+            if not latest_candidates:
+                raise RuntimeError("All debate roles exhausted before producing any candidate output.")
 
         protocol_artifacts: dict[str, Any] = {
             "debate_state": debate_context.current_state().to_dict(),
@@ -1487,14 +2784,74 @@ class MultiAgentOrchestrator:
             or selected_models_roles.get(protocol_config.debater_a_role_id)
         )
         evidence_queries = _resolve_evidence_queries(metadata)
-        research_plan = await build_research_plan(
-            task_input=task_input,
-            guidance_messages=guidance_messages,
-            existing_queries=evidence_queries,
-            policy=policy,
-            planner_model_id=planner_model_id,
-            generate=generate if callable(generate) else None,
+        research_runtime = metadata.get("research_runtime") if isinstance(metadata.get("research_runtime"), Mapping) else {}
+        saved_planner_summary = self._resume_task_summary("research_planning") or {}
+        research_plan = (
+            saved_planner_summary.get("research_plan")
+            if isinstance(saved_planner_summary.get("research_plan"), Mapping)
+            else research_runtime.get("research_plan")
+            if isinstance(research_runtime, Mapping) and isinstance(research_runtime.get("research_plan"), Mapping)
+            else None
         )
+        if isinstance(research_plan, Mapping):
+            research_plan = _mapping_to_plain_dict(research_plan)
+            self._mark_role_task_reused(
+                role_id="research_planner",
+                stage="research_planning",
+            )
+            self._mark_task_reused(
+                task_key="research_planning",
+                role_id="research_planner",
+                stage="research_planning",
+            )
+        else:
+            try:
+                research_plan = await self._await_subagent_operation(
+                    lambda: build_research_plan(
+                        task_input=task_input,
+                        guidance_messages=guidance_messages,
+                        existing_queries=evidence_queries,
+                        policy=policy,
+                        planner_model_id=planner_model_id,
+                        generate=generate if callable(generate) else None,
+                    ),
+                    role_id="research_planner",
+                    model_id=planner_model_id,
+                    stage="research_planning",
+                )
+                self._mark_role_task_completed(
+                    role_id="research_planner",
+                    model_id=planner_model_id,
+                    stage="research_planning",
+                    result_summary={
+                        "subquestion_count": len(list(research_plan.get("subquestions") or [])),
+                        "research_plan": research_plan,
+                    },
+                )
+                self._mark_task_completed(
+                    task_key="research_planning",
+                    role_id="research_planner",
+                    model_id=planner_model_id,
+                    stage="research_planning",
+                    result_summary={"research_plan": research_plan},
+                )
+            except SubagentRoleError as exc:
+                if self._on_subagent_disconnect() == "fail":
+                    raise
+                self._mark_degraded_role(
+                    role_id=exc.role_id,
+                    model_id=exc.model_id,
+                    stage=exc.stage,
+                    reason=exc.reason,
+                )
+                research_plan = await build_research_plan(
+                    task_input=task_input,
+                    guidance_messages=guidance_messages,
+                    existing_queries=evidence_queries,
+                    policy=policy,
+                    planner_model_id=None,
+                    generate=None,
+                )
         merged_queries = merge_research_queries(
             existing_queries=evidence_queries,
             research_plan=research_plan,
@@ -1510,14 +2867,73 @@ class MultiAgentOrchestrator:
             metadata=updated_metadata,
         )
         source_quality_table = build_source_quality_table(evidence_packets)
-        worker_outputs = await run_research_workers(
-            task_input=task_input,
-            research_plan=research_plan,
-            evidence_packets=evidence_packets,
-            policy=policy,
-            local_worker_model_id=local_worker_model_id,
-            generate=generate if callable(generate) else None,
+        saved_worker_summary = self._resume_task_summary("research_workers") or {}
+        worker_outputs = (
+            saved_worker_summary.get("worker_outputs")
+            if isinstance(saved_worker_summary.get("worker_outputs"), Mapping)
+            else research_runtime.get("worker_outputs")
+            if isinstance(research_runtime, Mapping) and isinstance(research_runtime.get("worker_outputs"), Mapping)
+            else None
         )
+        if isinstance(worker_outputs, Mapping):
+            worker_outputs = _mapping_to_plain_dict(worker_outputs)
+            self._mark_role_task_reused(
+                role_id="research_worker",
+                stage="research_workers",
+            )
+            self._mark_task_reused(
+                task_key="research_workers",
+                role_id="research_worker",
+                stage="research_workers",
+            )
+        else:
+            try:
+                worker_outputs = await self._await_subagent_operation(
+                    lambda: run_research_workers(
+                        task_input=task_input,
+                        research_plan=research_plan,
+                        evidence_packets=evidence_packets,
+                        policy=policy,
+                        local_worker_model_id=local_worker_model_id,
+                        generate=generate if callable(generate) else None,
+                    ),
+                    role_id="research_worker",
+                    model_id=local_worker_model_id,
+                    stage="research_workers",
+                )
+                self._mark_role_task_completed(
+                    role_id="research_worker",
+                    model_id=local_worker_model_id,
+                    stage="research_workers",
+                    result_summary={
+                        "worker_count": len(list(worker_outputs.get("workers") or [])),
+                        "worker_outputs": worker_outputs,
+                    },
+                )
+                self._mark_task_completed(
+                    task_key="research_workers",
+                    role_id="research_worker",
+                    model_id=local_worker_model_id,
+                    stage="research_workers",
+                    result_summary={"worker_outputs": worker_outputs},
+                )
+            except SubagentRoleError as exc:
+                if self._on_subagent_disconnect() == "fail":
+                    raise
+                self._mark_degraded_role(
+                    role_id=exc.role_id,
+                    model_id=exc.model_id,
+                    stage=exc.stage,
+                    reason=exc.reason,
+                )
+                worker_outputs = await run_research_workers(
+                    task_input=task_input,
+                    research_plan=research_plan,
+                    evidence_packets=evidence_packets,
+                    policy=policy,
+                    local_worker_model_id=None,
+                    generate=None,
+                )
         updated_metadata["research_runtime"] = {
             "research_plan": research_plan,
             "source_quality_table": source_quality_table,
@@ -1604,16 +3020,75 @@ class MultiAgentOrchestrator:
         if isinstance(updated_debate_state, dict):
             artifacts["debate_state"] = updated_debate_state
         if policy.wants_output("research_brief"):
-            artifacts["research_brief"] = await synthesize_research_brief(
-                task_input=task_input,
-                selected_candidate=selected_candidate.to_dict() if selected_candidate is not None else None,
-                research_plan=research_plan,
-                source_quality_table=source_quality_table,
-                claim_evidence_map=claim_evidence_map,
-                worker_outputs=worker_outputs,
-                synthesizer_model_id=synthesizer_model_id,
-                generate=generate if callable(generate) else None,
+            saved_synthesis_summary = self._resume_task_summary("research_synthesis") or {}
+            saved_research_brief = (
+                saved_synthesis_summary.get("research_brief")
+                if isinstance(saved_synthesis_summary.get("research_brief"), Mapping)
+                else None
             )
+            if isinstance(saved_research_brief, Mapping):
+                artifacts["research_brief"] = _mapping_to_plain_dict(saved_research_brief)
+                self._mark_role_task_reused(
+                    role_id="research_synthesizer",
+                    stage="research_synthesis",
+                )
+                self._mark_task_reused(
+                    task_key="research_synthesis",
+                    role_id="research_synthesizer",
+                    stage="research_synthesis",
+                )
+            else:
+                try:
+                    artifacts["research_brief"] = await self._await_subagent_operation(
+                        lambda: synthesize_research_brief(
+                            task_input=task_input,
+                            selected_candidate=selected_candidate.to_dict() if selected_candidate is not None else None,
+                            research_plan=research_plan,
+                            source_quality_table=source_quality_table,
+                            claim_evidence_map=claim_evidence_map,
+                            worker_outputs=worker_outputs,
+                            synthesizer_model_id=synthesizer_model_id,
+                            generate=generate if callable(generate) else None,
+                        ),
+                        role_id="research_synthesizer",
+                        model_id=synthesizer_model_id,
+                        stage="research_synthesis",
+                    )
+                    self._mark_role_task_completed(
+                        role_id="research_synthesizer",
+                        model_id=synthesizer_model_id,
+                        stage="research_synthesis",
+                        result_summary={
+                            "artifact_keys": ["research_brief"],
+                            "research_brief": artifacts["research_brief"],
+                        },
+                    )
+                    self._mark_task_completed(
+                        task_key="research_synthesis",
+                        role_id="research_synthesizer",
+                        model_id=synthesizer_model_id,
+                        stage="research_synthesis",
+                        result_summary={"research_brief": artifacts["research_brief"]},
+                    )
+                except SubagentRoleError as exc:
+                    if self._on_subagent_disconnect() == "fail":
+                        raise
+                    self._mark_degraded_role(
+                        role_id=exc.role_id,
+                        model_id=exc.model_id,
+                        stage=exc.stage,
+                        reason=exc.reason,
+                    )
+                    artifacts["research_brief"] = await synthesize_research_brief(
+                        task_input=task_input,
+                        selected_candidate=selected_candidate.to_dict() if selected_candidate is not None else None,
+                        research_plan=research_plan,
+                        source_quality_table=source_quality_table,
+                        claim_evidence_map=claim_evidence_map,
+                        worker_outputs=worker_outputs,
+                        synthesizer_model_id=None,
+                        generate=None,
+                    )
         return artifacts
 
     def _run_placeholder_protocol(
@@ -1889,6 +3364,27 @@ class MultiAgentOrchestrator:
         chunk_level_results: list[dict[str, Any]] = []
         research_appendix = _research_prompt_appendix(metadata)
         for chunk_index, evidence_chunk in enumerate(evidence_chunks):
+            task_key = f"verification_chunk_{chunk_index}"
+            saved_chunk_summary = self._resume_task_summary(task_key)
+            if isinstance(saved_chunk_summary, dict) and isinstance(saved_chunk_summary.get("verifications"), list):
+                parsed = _candidate_verifications_from_payload(saved_chunk_summary.get("verifications"))
+                if parsed:
+                    chunk_payload = [item.to_dict() for item in parsed]
+                    chunk_summaries.append(
+                        {
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(evidence_chunks),
+                            "evidence_packet_count": len(evidence_chunk),
+                            "verifications": chunk_payload,
+                        }
+                    )
+                    chunk_level_results.extend(chunk_payload)
+                    self._mark_task_reused(
+                        task_key=task_key,
+                        role_id="verifier",
+                        stage=task_key,
+                    )
+                    continue
             if isinstance(protocol_config, MultiAgentDebateProtocol) and debate_state is not None:
                 prompt = _build_structured_verifier_prompt(
                     task_input=task_input,
@@ -1910,24 +3406,53 @@ class MultiAgentOrchestrator:
                 )
             if research_appendix:
                 prompt = f"{prompt}\n\nResearch context:\n{research_appendix}"
-            result = await generate(
-                model_id=verifier_model_id,
-                messages=[
-                    Message(
-                        role="system",
-                        content=(
-                            "You verify candidate answers against supplied evidence. "
-                            "Return JSON only with key `candidate_verifications`. "
-                            "Each item must include `candidate_id`, `status`, `rationale`, "
-                            "`citations`, and `issues`."
-                        ),
+            try:
+                result = await self._await_subagent_operation(
+                    lambda: generate(
+                        model_id=verifier_model_id,
+                        messages=[
+                            Message(
+                                role="system",
+                                content=(
+                                    "You verify candidate answers against supplied evidence. "
+                                    "Return JSON only with key `candidate_verifications`. "
+                                    "Each item must include `candidate_id`, `status`, `rationale`, "
+                                    "`citations`, and `issues`."
+                                ),
+                            ),
+                            Message(role="user", content=prompt),
+                        ],
+                        temperature=0.1,
+                        max_tokens=1200,
+                        reasoning_effort=None,
                     ),
-                    Message(role="user", content=prompt),
-                ],
-                temperature=0.1,
-                max_tokens=1200,
-                reasoning_effort=None,
-            )
+                    role_id="verifier",
+                    model_id=verifier_model_id,
+                    stage=task_key,
+                )
+            except SubagentRoleError as exc:
+                if self._on_subagent_disconnect() == "fail":
+                    raise
+                self._mark_degraded_role(
+                    role_id=exc.role_id,
+                    model_id=exc.model_id,
+                    stage=exc.stage,
+                    reason=exc.reason,
+                )
+                fallback_verifications = [
+                    CandidateVerification(
+                        candidate_id=item.candidate_id,
+                        status="skipped",
+                        rationale=f"Verifier degraded: {exc.reason}",
+                        metadata={"verifier_model_id": verifier_model_id, "chunk_index": chunk_index},
+                    )
+                    for item in candidates
+                ]
+                return fallback_verifications, _build_verification_summary(
+                    fallback_verifications,
+                    verifier_model_id=verifier_model_id,
+                    evidence_packets=evidence_packets,
+                )
             parsed = _parse_candidate_verifications(result.content, candidates)
             if not parsed:
                 parsed = [
@@ -1952,6 +3477,13 @@ class MultiAgentOrchestrator:
                 }
             )
             chunk_level_results.extend(chunk_payload)
+            self._mark_task_completed(
+                task_key=task_key,
+                role_id="verifier",
+                model_id=verifier_model_id,
+                stage=task_key,
+                result_summary={"verifications": chunk_payload},
+            )
 
         reduced_payloads = (
             verification_reduce(chunk_level_results)
@@ -1992,6 +3524,15 @@ class MultiAgentOrchestrator:
         )
         summary["chunk_summaries"] = chunk_summaries
         summary["used_chunking"] = len(evidence_chunks) > 1
+        self._mark_role_task_completed(
+            role_id="verifier",
+            model_id=verifier_model_id,
+            stage="verification_completed",
+            result_summary={
+                "verification_count": len(verifications),
+                "evidence_packet_count": len(evidence_packets),
+            },
+        )
         return verifications, summary
 
     async def _collect_evidence_packets(
@@ -2082,6 +3623,24 @@ class MultiAgentOrchestrator:
         )
         if not judge_model_id:
             return None
+        saved_evaluation_summary = self._resume_task_summary("candidate_evaluation") or {}
+        saved_scores = _candidate_scores_from_payload(saved_evaluation_summary.get("scores"))
+        saved_selected_candidate_id = (
+            str(saved_evaluation_summary.get("selected_candidate_id"))
+            if isinstance(saved_evaluation_summary.get("selected_candidate_id"), str)
+            else None
+        )
+        if saved_scores:
+            self._mark_role_task_reused(
+                role_id="judge",
+                stage="candidate_evaluation",
+            )
+            self._mark_task_reused(
+                task_key="candidate_evaluation",
+                role_id="judge",
+                stage="candidate_evaluation",
+            )
+            return saved_scores, saved_selected_candidate_id
 
         debate_state = (
             protocol_artifacts.get("debate_state")
@@ -2107,27 +3666,66 @@ class MultiAgentOrchestrator:
         research_appendix = _research_prompt_appendix(metadata)
         if research_appendix:
             prompt = f"{prompt}\n\nResearch context:\n{research_appendix}"
-        result = await generate(
-            model_id=judge_model_id,
-            messages=[
-                Message(
-                    role="system",
-                    content=(
-                        "You are an evaluator. Return JSON only with keys "
-                        "`selected_candidate_id` and `scores`. Each score item must include "
-                        "`candidate_id`, `score`, `rationale`, and optional `evidence_gate`."
-                    ),
+        try:
+            result = await self._await_subagent_operation(
+                lambda: generate(
+                    model_id=judge_model_id,
+                    messages=[
+                        Message(
+                            role="system",
+                            content=(
+                                "You are an evaluator. Return JSON only with keys "
+                                "`selected_candidate_id` and `scores`. Each score item must include "
+                                "`candidate_id`, `score`, `rationale`, and optional `evidence_gate`."
+                            ),
+                        ),
+                        Message(
+                            role="user",
+                            content=prompt,
+                        ),
+                    ],
+                    temperature=0.1,
+                    max_tokens=900,
+                    reasoning_effort=None,
                 ),
-                Message(
-                    role="user",
-                    content=prompt,
-                ),
-            ],
-            temperature=0.1,
-            max_tokens=900,
-            reasoning_effort=None,
-        )
-        return _parse_judge_scores(result.content, candidates)
+                role_id="judge",
+                model_id=judge_model_id,
+                stage="candidate_evaluation",
+            )
+        except SubagentRoleError as exc:
+            if self._on_subagent_disconnect() == "fail":
+                raise
+            self._mark_degraded_role(
+                role_id=exc.role_id,
+                model_id=exc.model_id,
+                stage=exc.stage,
+                reason=exc.reason,
+            )
+            return None
+        parsed_scores = _parse_judge_scores(result.content, candidates)
+        if parsed_scores is not None:
+            scores, selected_candidate_id = parsed_scores
+            self._mark_role_task_completed(
+                role_id="judge",
+                model_id=judge_model_id,
+                stage="candidate_evaluation",
+                result_summary={
+                    "score_count": len(scores),
+                    "selected_candidate_id": selected_candidate_id,
+                    "scores": [score.to_dict() for score in scores],
+                },
+            )
+            self._mark_task_completed(
+                task_key="candidate_evaluation",
+                role_id="judge",
+                model_id=judge_model_id,
+                stage="candidate_evaluation",
+                result_summary={
+                    "selected_candidate_id": selected_candidate_id,
+                    "scores": [score.to_dict() for score in scores],
+                },
+            )
+        return parsed_scores
 
     def _score_candidates(self, candidates: list[CandidateOutput]) -> list[CandidateScore]:
         scores: list[CandidateScore] = []
@@ -3226,6 +4824,381 @@ def _parse_evidence_gate(value: Any) -> Any:
             metadata=gate_metadata,
         )
     return resolve_evidence_gate_status(skipped=True, metadata=gate_metadata)
+
+
+_RESUME_STAGE_ORDER = {
+    "research_context_prepared": 1,
+    "controlled_execution_context_prepared": 2,
+    "protocol_completed": 3,
+    "before_evidence_collection": 4,
+    "evidence_collected": 5,
+    "verification_completed": 6,
+    "evaluation_completed": 7,
+    "research_artifacts_completed": 8,
+}
+
+
+def _resolve_resume_execution_payload(metadata: Mapping[str, Any] | None) -> ResumeExecutionPayload | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    candidates = [metadata.get("resume_payload"), metadata.get("recovery_state")]
+    summary = metadata.get("summary")
+    if isinstance(summary, Mapping):
+        candidates.append(summary.get("resume_payload"))
+        candidates.append(summary.get("recovery_state"))
+    for candidate in candidates:
+        payload = candidate.get("resume_payload") if isinstance(candidate, Mapping) else candidate
+        parsed = _parse_resume_execution_payload(payload)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_resume_execution_payload(payload: Any) -> ResumeExecutionPayload | None:
+    if not isinstance(payload, Mapping):
+        return None
+    checkpoint = _mapping_to_plain_dict(payload.get("checkpoint"))
+    stage = str(payload.get("stage") or checkpoint.get("stage") or "").strip()
+    if not stage:
+        return None
+    guidance_messages = [
+        str(item).strip()
+        for item in (payload.get("guidance_messages") or [])
+        if isinstance(item, str) and item.strip()
+    ]
+    metadata_state = _mapping_to_plain_dict(payload.get("metadata_state"))
+    precomputed_artifacts = _mapping_to_plain_dict(payload.get("precomputed_artifacts"))
+    protocol_artifacts = _mapping_to_plain_dict(payload.get("protocol_artifacts"))
+    candidates = _candidate_outputs_from_payload(payload.get("candidates"))
+    evidence_packets = _list_of_dicts(payload.get("evidence_packets"))
+    evidence_collection_summary = (
+        _mapping_to_plain_dict(payload.get("evidence_collection_summary"))
+        if isinstance(payload.get("evidence_collection_summary"), Mapping)
+        else None
+    )
+    verifications = _candidate_verifications_from_payload(payload.get("verifications"))
+    verification_summary = (
+        _mapping_to_plain_dict(payload.get("verification_summary"))
+        if isinstance(payload.get("verification_summary"), Mapping)
+        else None
+    )
+    evaluation = _evaluation_payload_from_dict(payload.get("evaluation"))
+    role_task_snapshot = _mapping_to_plain_dict(payload.get("role_task_snapshot"))
+    executor = str(payload.get("executor") or "restart_attempt").strip().lower()
+    if executor == "continue_from_checkpoint" and not _can_continue_from_checkpoint(
+        stage=stage,
+        candidates=candidates,
+        evaluation_payload=evaluation,
+        role_task_snapshot=role_task_snapshot,
+    ):
+        executor = "restart_attempt"
+    if executor not in {"continue_from_checkpoint", "restart_attempt"}:
+        executor = "restart_attempt"
+    return ResumeExecutionPayload(
+        executor=executor,
+        stage=stage,
+        checkpoint=checkpoint,
+        guidance_messages=guidance_messages,
+        metadata_state=metadata_state,
+        precomputed_artifacts=precomputed_artifacts,
+        protocol_artifacts=protocol_artifacts,
+        candidates=candidates,
+        evidence_packets=evidence_packets,
+        evidence_collection_summary=evidence_collection_summary,
+        verifications=verifications,
+        verification_summary=verification_summary,
+        evaluation=evaluation,
+        role_task_snapshot=role_task_snapshot,
+    )
+
+
+def _build_resume_execution_payload(
+    *,
+    stage: str,
+    checkpoint: Mapping[str, Any] | None,
+    guidance_messages: list[str],
+    metadata: Mapping[str, Any],
+    precomputed_artifacts: Mapping[str, Any],
+    protocol_artifacts: Mapping[str, Any],
+    candidates: list[CandidateOutput],
+    evidence_packets: list[dict[str, Any]],
+    evidence_collection_summary: Mapping[str, Any] | None,
+    verifications: list[CandidateVerification],
+    verification_summary: Mapping[str, Any] | None,
+    evaluation_payload: EvaluationPayload | None,
+    role_task_snapshot: Mapping[str, Any] | None,
+) -> ResumeExecutionPayload:
+    executor: Literal["continue_from_checkpoint", "restart_attempt"] = (
+        "continue_from_checkpoint"
+        if _can_continue_from_checkpoint(
+            stage=stage,
+            candidates=candidates,
+            evaluation_payload=evaluation_payload,
+            role_task_snapshot=role_task_snapshot,
+        )
+        else "restart_attempt"
+    )
+    return ResumeExecutionPayload(
+        executor=executor,
+        stage=stage,
+        checkpoint=_mapping_to_plain_dict(checkpoint),
+        guidance_messages=list(guidance_messages),
+        metadata_state=_build_resume_metadata_state(metadata),
+        precomputed_artifacts=_mapping_to_plain_dict(precomputed_artifacts),
+        protocol_artifacts=_mapping_to_plain_dict(protocol_artifacts),
+        candidates=list(candidates),
+        evidence_packets=_list_of_dicts(evidence_packets),
+        evidence_collection_summary=_mapping_to_plain_dict(evidence_collection_summary),
+        verifications=list(verifications),
+        verification_summary=_mapping_to_plain_dict(verification_summary),
+        evaluation=evaluation_payload,
+        role_task_snapshot=_mapping_to_plain_dict(role_task_snapshot),
+    )
+
+
+def _build_resume_metadata_state(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, Mapping):
+        return {}
+    state: dict[str, Any] = {}
+    research_runtime = metadata.get("research_runtime")
+    if isinstance(research_runtime, Mapping):
+        state["research_runtime"] = _mapping_to_plain_dict(research_runtime)
+    return state
+
+
+def _apply_resume_metadata_state(
+    metadata: Mapping[str, Any] | None,
+    resume_state: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    updated = dict(metadata or {})
+    if not isinstance(resume_state, Mapping):
+        return updated
+    research_runtime = resume_state.get("research_runtime")
+    if isinstance(research_runtime, Mapping):
+        updated["research_runtime"] = _mapping_to_plain_dict(research_runtime)
+    return updated
+
+
+def _sanitize_resume_summary(summary: Any) -> dict[str, Any]:
+    payload = _mapping_to_plain_dict(summary)
+    recovery_state = payload.get("recovery_state")
+    if isinstance(recovery_state, dict) and "resume_payload" in recovery_state:
+        trimmed = dict(recovery_state)
+        trimmed.pop("resume_payload", None)
+        payload["recovery_state"] = trimmed
+    return payload
+
+
+def _merge_guidance_messages(base: list[str], extra: list[str]) -> list[str]:
+    merged: list[str] = []
+    for item in [*base, *extra]:
+        text = str(item).strip()
+        if not text or text in merged:
+            continue
+        merged.append(text)
+    return merged
+
+
+def _resume_stage_covers(stage: str | None, target_stage: str) -> bool:
+    if not stage:
+        return False
+    stage_rank = _RESUME_STAGE_ORDER.get(stage)
+    target_rank = _RESUME_STAGE_ORDER.get(target_stage)
+    if stage_rank is None or target_rank is None:
+        return False
+    return stage_rank >= target_rank
+
+
+def _can_continue_from_checkpoint(
+    *,
+    stage: str,
+    candidates: list[CandidateOutput],
+    evaluation_payload: EvaluationPayload | None,
+    role_task_snapshot: Mapping[str, Any] | None,
+) -> bool:
+    if stage in {"research_context_prepared", "controlled_execution_context_prepared"}:
+        return True
+    if _resume_stage_covers(stage, "protocol_completed") and not candidates:
+        return False
+    if stage in {"evaluation_completed", "research_artifacts_completed"} and evaluation_payload is None:
+        return False
+    if _stage_supports_role_task_resume(stage) and _role_task_snapshot_has_completed_work(role_task_snapshot):
+        return True
+    return stage in _RESUME_STAGE_ORDER
+
+
+def _stage_supports_role_task_resume(stage: str) -> bool:
+    if stage in {
+        "teacher_generation",
+        "student_generation",
+        "research_planning",
+        "research_workers",
+        "research_synthesis",
+        "candidate_evaluation",
+        "controlled_execution_planner",
+        "controlled_execution_executor",
+        "controlled_execution_evaluator",
+    }:
+        return True
+    return (
+        stage.startswith("debate_round_")
+        or stage.startswith("dr_zero_")
+        or stage.startswith("controlled_execution_controller:")
+        or stage.startswith("controlled_execution_exec:")
+        or stage.startswith("verification_chunk_")
+    )
+
+
+def _role_task_snapshot_has_completed_work(snapshot: Mapping[str, Any] | None) -> bool:
+    if not isinstance(snapshot, Mapping):
+        return False
+    roles = snapshot.get("roles") if isinstance(snapshot.get("roles"), Mapping) else snapshot
+    if not isinstance(roles, Mapping):
+        return False
+    for value in roles.values():
+        if not isinstance(value, Mapping):
+            continue
+        if str(value.get("status") or "").strip() == "completed":
+            return True
+        candidate = value.get("candidate")
+        if isinstance(candidate, Mapping) and str(candidate.get("candidate_id") or "").strip():
+            return True
+    return False
+
+
+def _candidate_outputs_from_payload(value: Any) -> list[CandidateOutput]:
+    if not isinstance(value, list):
+        return []
+    payload: list[CandidateOutput] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        candidate_id = item.get("candidate_id")
+        role_id = item.get("role_id")
+        content = item.get("content")
+        if not all(isinstance(field, str) and field.strip() for field in (candidate_id, role_id, content)):
+            continue
+        metadata = item.get("metadata")
+        payload.append(
+            CandidateOutput(
+                candidate_id=str(candidate_id),
+                role_id=str(role_id),
+                content=str(content),
+                metadata=_mapping_to_plain_dict(metadata),
+            )
+        )
+    return payload
+
+
+def _candidate_verifications_from_payload(value: Any) -> list[CandidateVerification]:
+    if not isinstance(value, list):
+        return []
+    payload: list[CandidateVerification] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        candidate_id = item.get("candidate_id")
+        status = item.get("status")
+        rationale = item.get("rationale")
+        if (
+            not isinstance(candidate_id, str)
+            or not candidate_id.strip()
+            or status not in {"verified", "skipped", "failed"}
+            or not isinstance(rationale, str)
+        ):
+            continue
+        citations = item.get("citations")
+        issues = item.get("issues")
+        payload.append(
+            CandidateVerification(
+                candidate_id=candidate_id.strip(),
+                status=status,
+                rationale=rationale,
+                citations=_list_of_dicts(citations),
+                issues=[str(issue) for issue in issues if isinstance(issue, str) and issue.strip()]
+                if isinstance(issues, list)
+                else [],
+                metadata=_mapping_to_plain_dict(item.get("metadata")),
+            )
+        )
+    return payload
+
+
+def _candidate_scores_from_payload(value: Any) -> list[CandidateScore]:
+    if not isinstance(value, list):
+        return []
+    payload: list[CandidateScore] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        candidate_id = item.get("candidate_id")
+        score_value = _safe_float(item.get("score"))
+        if not isinstance(candidate_id, str) or not candidate_id.strip() or score_value is None:
+            continue
+        payload.append(
+            CandidateScore(
+                candidate_id=candidate_id,
+                score=score_value,
+                rationale=str(item.get("rationale") or "saved evaluation score"),
+                evidence_gate=_parse_evidence_gate(item.get("evidence_gate")),
+            )
+        )
+    return payload
+
+
+def _evaluation_payload_from_dict(value: Any) -> EvaluationPayload | None:
+    if not isinstance(value, Mapping):
+        return None
+    policy = _mapping_to_plain_dict(value.get("policy"))
+    selected_candidate_id = value.get("selected_candidate_id")
+    scores = value.get("scores")
+    if not isinstance(scores, list):
+        return None
+    return EvaluationPayload(
+        policy=policy,
+        selected_candidate_id=(
+            str(selected_candidate_id).strip()
+            if isinstance(selected_candidate_id, str) and selected_candidate_id.strip()
+            else None
+        ),
+        scores=_list_of_dicts(scores),
+    )
+
+
+def _mapping_to_plain_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): _json_safe_clone(item)
+        for key, item in value.items()
+        if isinstance(key, str)
+    }
+
+
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        _mapping_to_plain_dict(item)
+        for item in value
+        if isinstance(item, Mapping)
+    ]
+
+
+def _json_safe_clone(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_clone(item)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    if isinstance(value, list):
+        return [_json_safe_clone(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe_clone(item) for item in value]
+    return value
 
 
 def _remaining_run_steps(*, stage: str, research_enabled: bool) -> list[str]:

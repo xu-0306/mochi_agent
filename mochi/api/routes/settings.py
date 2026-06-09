@@ -226,6 +226,15 @@ class SecuritySettingsPatch(BaseModel):
     autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] | None = None
     require_approval_for_shell: bool | None = None
     require_approval_for_file_write: bool | None = None
+    require_approval_for_exec: bool | None = None
+    agent_run_default_max_wall_clock_sec: int | None = Field(default=None, ge=1, le=86_400)
+    agent_run_default_heartbeat_timeout_sec: int | None = Field(default=None, ge=1, le=86_400)
+    agent_run_default_checkpoint_interval_steps: int | None = Field(default=None, ge=1, le=10_000)
+    agent_run_default_max_subagent_failures_per_role: int | None = Field(default=None, ge=0, le=100)
+    agent_run_default_on_budget_exhausted: Literal["pause", "finalize_partial"] | None = None
+    agent_run_default_on_subagent_disconnect: Literal["retry_then_degrade", "pause", "fail"] | None = None
+    exec_default_timeout_sec: int | None = Field(default=None, ge=1, le=86_400)
+    exec_session_output_limit: int | None = Field(default=None, ge=256, le=1_000_000)
     max_file_write_size_mb: float | None = Field(default=None, ge=0.0)
     file_ops_scope: Literal["workspace", "any"] | None = None
     file_undo_max_size_mb: float | None = Field(default=None, ge=0.0)
@@ -637,6 +646,15 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "autonomy_mode": config.security.autonomy_mode,
             "require_approval_for_shell": config.security.require_approval_for_shell,
             "require_approval_for_file_write": config.security.require_approval_for_file_write,
+            "require_approval_for_exec": config.security.require_approval_for_exec,
+            "agent_run_default_max_wall_clock_sec": config.security.agent_run_default_max_wall_clock_sec,
+            "agent_run_default_heartbeat_timeout_sec": config.security.agent_run_default_heartbeat_timeout_sec,
+            "agent_run_default_checkpoint_interval_steps": config.security.agent_run_default_checkpoint_interval_steps,
+            "agent_run_default_max_subagent_failures_per_role": config.security.agent_run_default_max_subagent_failures_per_role,
+            "agent_run_default_on_budget_exhausted": config.security.agent_run_default_on_budget_exhausted,
+            "agent_run_default_on_subagent_disconnect": config.security.agent_run_default_on_subagent_disconnect,
+            "exec_default_timeout_sec": config.security.exec_default_timeout_sec,
+            "exec_session_output_limit": config.security.exec_session_output_limit,
             "max_file_write_size_mb": config.security.max_file_write_size_mb,
             "file_ops_scope": config.security.file_ops_scope,
             "file_undo_max_size_mb": config.security.file_undo_max_size_mb,
@@ -752,6 +770,7 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
             for key in (
                 "require_approval_for_shell",
                 "require_approval_for_file_write",
+                "require_approval_for_exec",
                 "file_ops_scope",
             ):
                 security_updates.setdefault(key, mode_defaults[key])

@@ -21,6 +21,7 @@ interface SubagentDraft {
 }
 
 type RunTemplate = 'standard' | 'research_debate'
+type RunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
 
 const PROTOCOL_OPTIONS: Array<{
   id: api.AgentRunProtocolId
@@ -184,7 +185,14 @@ function sourceModeToEvidenceMode(mode: string): string {
 
 function statusVariant(status: string): BadgeProps['variant'] {
   const normalized = status.toLowerCase()
-  if (normalized === 'running' || normalized === 'queued' || normalized === 'pending') {
+  if (
+    normalized === 'running' ||
+    normalized === 'queued' ||
+    normalized === 'pending' ||
+    normalized === 'awaiting_resources' ||
+    normalized === 'stalled' ||
+    normalized === 'partial'
+  ) {
     return 'warning'
   }
   if (normalized === 'succeeded' || normalized === 'completed' || normalized === 'done') {
@@ -196,8 +204,46 @@ function statusVariant(status: string): BadgeProps['variant'] {
   return 'neutral'
 }
 
+function translateRunStatus(status: string, t: (key: string, values?: Record<string, string | number | boolean | null | undefined>) => string): string {
+  const normalized = status.toLowerCase()
+  const key = `agentRuns.status.${normalized}`
+  const translated = t(key)
+  return translated === key ? status : translated
+}
+
 function isUnavailableError(error: unknown): boolean {
   return error instanceof api.ApiError && (error.status === 404 || error.status === 405)
+}
+
+function runPolicyPresetValues(preset: RunPolicyPreset): Required<api.AgentRunRunPolicy> {
+  if (preset === 'short') {
+    return {
+      max_wall_clock_sec: 600,
+      heartbeat_timeout_sec: 45,
+      checkpoint_interval_steps: 1,
+      max_subagent_failures_per_role: 1,
+      on_budget_exhausted: 'pause',
+      on_subagent_disconnect: 'pause',
+    }
+  }
+  if (preset === 'long') {
+    return {
+      max_wall_clock_sec: 5400,
+      heartbeat_timeout_sec: 180,
+      checkpoint_interval_steps: 2,
+      max_subagent_failures_per_role: 3,
+      on_budget_exhausted: 'finalize_partial',
+      on_subagent_disconnect: 'retry_then_degrade',
+    }
+  }
+  return {
+    max_wall_clock_sec: 1800,
+    heartbeat_timeout_sec: 90,
+    checkpoint_interval_steps: 1,
+    max_subagent_failures_per_role: 2,
+    on_budget_exhausted: 'pause',
+    on_subagent_disconnect: 'retry_then_degrade',
+  }
 }
 
 export default function AgentRunsPage() {
@@ -241,6 +287,13 @@ export default function AgentRunsPage() {
   const [maxCommandsPerRequest, setMaxCommandsPerRequest] = React.useState('1')
   const [defaultExecutionTimeoutSec, setDefaultExecutionTimeoutSec] = React.useState('300')
   const [controlledExecutionBackgroundAllowed, setControlledExecutionBackgroundAllowed] = React.useState(false)
+  const [runPolicyPreset, setRunPolicyPreset] = React.useState<RunPolicyPreset>('balanced')
+  const [maxWallClockSec, setMaxWallClockSec] = React.useState('1800')
+  const [heartbeatTimeoutSec, setHeartbeatTimeoutSec] = React.useState('90')
+  const [checkpointIntervalSteps, setCheckpointIntervalSteps] = React.useState('1')
+  const [maxSubagentFailuresPerRole, setMaxSubagentFailuresPerRole] = React.useState('2')
+  const [onBudgetExhausted, setOnBudgetExhausted] = React.useState<NonNullable<api.AgentRunRunPolicy['on_budget_exhausted']>>('pause')
+  const [onSubagentDisconnect, setOnSubagentDisconnect] = React.useState<NonNullable<api.AgentRunRunPolicy['on_subagent_disconnect']>>('retry_then_degrade')
   const [scheduleEnabled, setScheduleEnabled] = React.useState(false)
   const [scheduleType, setScheduleType] = React.useState<'interval' | 'once' | 'cron'>('interval')
   const [scheduleIntervalSeconds, setScheduleIntervalSeconds] = React.useState('3600')
@@ -401,6 +454,20 @@ export default function AgentRunsPage() {
     }
   }, [defaultModelId])
 
+  const handleRunPolicyPresetChange = React.useCallback((preset: RunPolicyPreset) => {
+    setRunPolicyPreset(preset)
+    if (preset === 'custom') {
+      return
+    }
+    const values = runPolicyPresetValues(preset)
+    setMaxWallClockSec(String(values.max_wall_clock_sec))
+    setHeartbeatTimeoutSec(String(values.heartbeat_timeout_sec))
+    setCheckpointIntervalSteps(String(values.checkpoint_interval_steps))
+    setMaxSubagentFailuresPerRole(String(values.max_subagent_failures_per_role))
+    setOnBudgetExhausted(values.on_budget_exhausted)
+    setOnSubagentDisconnect(values.on_subagent_disconnect)
+  }, [])
+
   const toggleResearchOutputTarget = React.useCallback(
     (target: 'research_brief' | 'dataset_package') => {
       setResearchOutputTargets((current) => {
@@ -518,6 +585,14 @@ export default function AgentRunsPage() {
         topic: topic.trim() || null,
         subagents: runTemplate === 'research_debate' ? [] : normalizedSubagents,
         selected_models_roles: selectedModelsRoles,
+        run_policy: {
+          max_wall_clock_sec: parsePositiveInteger(maxWallClockSec, 1800),
+          heartbeat_timeout_sec: parsePositiveInteger(heartbeatTimeoutSec, 90),
+          checkpoint_interval_steps: parsePositiveInteger(checkpointIntervalSteps, 1),
+          max_subagent_failures_per_role: parsePositiveInteger(maxSubagentFailuresPerRole, 2),
+          on_budget_exhausted: onBudgetExhausted,
+          on_subagent_disconnect: onSubagentDisconnect,
+        },
         schedule,
         summary: {
           ...(evidenceQueries.length > 0 ? { evidence_queries: evidenceQueries } : {}),
@@ -612,6 +687,13 @@ export default function AgentRunsPage() {
       setMaxCommandsPerRequest('1')
       setDefaultExecutionTimeoutSec('300')
       setControlledExecutionBackgroundAllowed(false)
+      setRunPolicyPreset('balanced')
+      setMaxWallClockSec('1800')
+      setHeartbeatTimeoutSec('90')
+      setCheckpointIntervalSteps('1')
+      setMaxSubagentFailuresPerRole('2')
+      setOnBudgetExhausted('pause')
+      setOnSubagentDisconnect('retry_then_degrade')
       setScheduleEnabled(false)
       setScheduleType('interval')
       setScheduleIntervalSeconds('3600')
@@ -649,6 +731,12 @@ export default function AgentRunsPage() {
     maxContentChars,
     maxFetchPerQuery,
     maxResultsPerQuery,
+    maxSubagentFailuresPerRole,
+    maxWallClockSec,
+    heartbeatTimeoutSec,
+    checkpointIntervalSteps,
+    onBudgetExhausted,
+    onSubagentDisconnect,
     protocolId,
     ragMcpServersText,
     ragProvider,
@@ -1118,6 +1206,90 @@ export default function AgentRunsPage() {
               </div>
 
               <div className="space-y-3 rounded-lg border border-border bg-surface-layer p-3">
+                <div className="space-y-1">
+                  <label className="text-sm font-medium text-foreground">{t('agentRuns.runPolicy.title')}</label>
+                  <p className="text-xs text-muted-foreground">{t('agentRuns.runPolicy.description')}</p>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {t('agentRuns.runPolicy.preset')}
+                  </label>
+                  <Select value={runPolicyPreset} onValueChange={(value) => handleRunPolicyPresetChange(value as RunPolicyPreset)}>
+                    <SelectTrigger>
+                      <SelectValue placeholder={t('agentRuns.runPolicy.presetPlaceholder')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="short">{t('agentRuns.runPolicy.short')}</SelectItem>
+                      <SelectItem value="balanced">{t('agentRuns.runPolicy.balanced')}</SelectItem>
+                      <SelectItem value="long">{t('agentRuns.runPolicy.long')}</SelectItem>
+                      <SelectItem value="custom">{t('agentRuns.runPolicy.custom')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('agentRuns.runPolicy.maxWallClock')}
+                    </label>
+                    <Input value={maxWallClockSec} onChange={(event) => setMaxWallClockSec(event.target.value)} />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('agentRuns.runPolicy.heartbeatTimeout')}
+                    </label>
+                    <Input value={heartbeatTimeoutSec} onChange={(event) => setHeartbeatTimeoutSec(event.target.value)} />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('agentRuns.runPolicy.checkpointInterval')}
+                    </label>
+                    <Input value={checkpointIntervalSteps} onChange={(event) => setCheckpointIntervalSteps(event.target.value)} />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('agentRuns.runPolicy.maxFailuresPerRole')}
+                    </label>
+                    <Input value={maxSubagentFailuresPerRole} onChange={(event) => setMaxSubagentFailuresPerRole(event.target.value)} />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('agentRuns.runPolicy.budgetExhausted')}
+                    </label>
+                    <Select
+                      value={onBudgetExhausted}
+                      onValueChange={(value) => setOnBudgetExhausted(value as NonNullable<api.AgentRunRunPolicy['on_budget_exhausted']>)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder={t('agentRuns.runPolicy.budgetPlaceholder')} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="pause">{t('agentRuns.runPolicy.budgetPause')}</SelectItem>
+                        <SelectItem value="finalize_partial">{t('agentRuns.runPolicy.budgetFinalizePartial')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('agentRuns.runPolicy.disconnect')}
+                    </label>
+                    <Select
+                      value={onSubagentDisconnect}
+                      onValueChange={(value) => setOnSubagentDisconnect(value as NonNullable<api.AgentRunRunPolicy['on_subagent_disconnect']>)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder={t('agentRuns.runPolicy.disconnectPlaceholder')} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="retry_then_degrade">{t('agentRuns.runPolicy.disconnectRetryThenDegrade')}</SelectItem>
+                        <SelectItem value="pause">{t('agentRuns.runPolicy.disconnectPause')}</SelectItem>
+                        <SelectItem value="fail">{t('agentRuns.runPolicy.disconnectFail')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-3 rounded-lg border border-border bg-surface-layer p-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <label className="text-sm font-medium text-foreground">Automation Schedule</label>
@@ -1272,8 +1444,8 @@ export default function AgentRunsPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle>Recent Runs</CardTitle>
-              <CardDescription>Open a run to inspect logs, artifacts, and guidance controls.</CardDescription>
+              <CardTitle>{t('agentRuns.recentRuns.title')}</CardTitle>
+              <CardDescription>{t('agentRuns.recentRuns.description')}</CardDescription>
             </CardHeader>
             <CardContent>
               {runError ? (
@@ -1288,7 +1460,7 @@ export default function AgentRunsPage() {
                 </div>
               ) : runs.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border bg-surface-layer px-4 py-8 text-center text-sm text-muted-foreground">
-                  No agent runs yet.
+                  {t('agentRuns.recentRuns.empty')}
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -1304,18 +1476,21 @@ export default function AgentRunsPage() {
                         <div className="mb-2 flex items-start justify-between gap-3">
                           <div>
                             <h3 className="text-sm font-semibold text-foreground">
-                              {run.title || run.topic || run.run_id || 'Untitled run'}
+                              {run.title || run.topic || run.run_id || t('agentRuns.run.untitled')}
                             </h3>
                             <p className="mt-0.5 text-xs text-muted-foreground">{run.protocol_id}</p>
                           </div>
-                          <Badge variant={statusVariant(run.status)}>{run.status}</Badge>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge variant={statusVariant(run.status)}>{translateRunStatus(run.status, t)}</Badge>
+                            {run.degraded ? <Badge variant="warning">{t('agentRuns.badge.degraded')}</Badge> : null}
+                          </div>
                         </div>
                         <p className="line-clamp-2 text-sm text-muted-foreground">
-                          {run.topic || 'No topic provided.'}
+                          {run.topic || t('agentRuns.run.noTopic')}
                         </p>
                         <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
-                          <span>Updated: {formatDateTime(run.updated_at)}</span>
-                          <span>{isTerminal ? 'Finished' : 'Active'}</span>
+                          <span>{t('agentRuns.run.updated', { value: formatDateTime(run.updated_at) })}</span>
+                          <span>{isTerminal ? t('agentRuns.run.state.finished') : t('agentRuns.run.state.active')}</span>
                         </div>
                       </Link>
                     )

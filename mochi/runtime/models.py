@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,6 +63,14 @@ class AgentRunGuidanceRequest(BaseModel):
     guidance: str = Field(min_length=1)
     author: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentRunResumeRequest(BaseModel):
+    """Request payload for resuming an Agent Run."""
+
+    strategy: Literal["continue_from_checkpoint", "restart_attempt"] = (
+        "continue_from_checkpoint"
+    )
 
 
 class AgentRunResponse(BaseModel):

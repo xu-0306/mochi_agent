@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -23,7 +25,7 @@ def get_shared_exec_runtime() -> ExecRuntime:
     """Return process-wide shared exec runtime for exec tool family."""
     global _SHARED_RUNTIME
     if _SHARED_RUNTIME is None:
-        _SHARED_RUNTIME = ExecRuntime()
+        _SHARED_RUNTIME = _build_shared_exec_runtime()
     return _SHARED_RUNTIME
 
 
@@ -33,6 +35,22 @@ def get_shared_exec_approval_store() -> InMemoryApprovalStore:
     if _SHARED_APPROVAL_STORE is None:
         _SHARED_APPROVAL_STORE = InMemoryApprovalStore()
     return _SHARED_APPROVAL_STORE
+
+
+def _shared_exec_runtime_state_root() -> Path:
+    return normalize_workspace_dir(Path(defaults.default_workspace_dir()) / "exec-runtime")
+
+
+def _build_shared_exec_runtime() -> ExecRuntime:
+    state_root = _shared_exec_runtime_state_root()
+    kwargs: dict[str, Any] = {}
+    try:
+        signature = inspect.signature(ExecRuntime)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and "state_root" in signature.parameters:
+        kwargs["state_root"] = state_root
+    return ExecRuntime(**kwargs)
 
 
 class ExecCommandTool(BaseTool):
@@ -143,6 +161,9 @@ class ExecCommandTool(BaseTool):
         sandbox_permissions: str = "use_default",
         justification: str | None = None,
         prefix_rule: list[str] | None = None,
+        log_path: str | None = None,
+        checkpoint_dir: str | None = None,
+        detached_layout: Mapping[str, Any] | None = None,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
         del prefix_rule
@@ -157,6 +178,11 @@ class ExecCommandTool(BaseTool):
         normalized_env = self._normalize_env(env)
         if isinstance(normalized_env, ToolResult):
             return normalized_env
+        resolved_layout = _resolve_detached_layout(
+            log_path=log_path,
+            checkpoint_dir=checkpoint_dir,
+            detached_layout=detached_layout,
+        )
 
         workspace_root = self._resolve_workspace_root(context)
         if workdir is None:
@@ -212,6 +238,9 @@ class ExecCommandTool(BaseTool):
                 ),
                 "background": background,
                 "tty": tty,
+                "log_path": resolved_layout.get("log_path"),
+                "checkpoint_dir": resolved_layout.get("checkpoint_dir"),
+                "detached_layout": dict(resolved_layout),
                 "approval_state": "approved",
             }
             request = self._approval_store.create(
@@ -234,6 +263,13 @@ class ExecCommandTool(BaseTool):
                     "approval_kind": "shell",
                     "approval_scope": request.scope,
                     "reason": request.reason,
+                    **_build_exec_session_metadata(
+                        payload=None,
+                        detached_layout=resolved_layout,
+                        background=background,
+                        tty=tty,
+                        approval_state="pending",
+                    ),
                 },
                 retryable=True,
             )
@@ -259,18 +295,29 @@ class ExecCommandTool(BaseTool):
                 background=background,
                 tty=tty,
                 approval_state="not_required",
+                log_path=resolved_layout.get("log_path"),
+                checkpoint_dir=resolved_layout.get("checkpoint_dir"),
             )
         except Exception as exc:
             return ToolResult(error=f"Exec command failed: {exc}")
 
-        payload = _poll_to_payload(result)
-        metadata = {
-            "status": payload["status"],
-            "session_id": payload["session_id"],
-            "approval_id": None,
-            "timed_out": payload["timed_out"],
-            "exit_code": payload["exit_code"],
-        }
+        effective_layout = _realize_detached_layout(
+            session_id=result.session_id,
+            detached=result.detached,
+            detached_layout=resolved_layout,
+        )
+        payload = _poll_to_payload(
+            result,
+            detached_layout=effective_layout,
+        )
+        metadata = _build_exec_session_metadata(
+            payload=payload,
+            detached_layout=effective_layout,
+            background=background,
+            tty=tty,
+            approval_state=result.approval_state,
+        )
+        metadata["approval_id"] = None
         if result.status.value in {"failed", "timed_out"}:
             return ToolResult(
                 error=result.stderr.strip() or f"Command exited with status: {result.status.value}",
@@ -302,8 +349,12 @@ class ExecCommandTool(BaseTool):
         return self._workspace_dir
 
 
-def _poll_to_payload(result: SessionPollResult) -> dict[str, Any]:
-    return {
+def _poll_to_payload(
+    result: SessionPollResult,
+    *,
+    detached_layout: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "session_id": result.session_id,
         "shell": result.shell,
         "status": result.status.value,
@@ -315,4 +366,114 @@ def _poll_to_payload(result: SessionPollResult) -> dict[str, Any]:
         "approval_state": result.approval_state,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        "detached": result.detached,
+        "restored": result.restored,
+        "supports_stdin": result.supports_stdin,
     }
+    payload.update(_layout_metadata(detached_layout))
+    return payload
+
+
+def _resolve_detached_layout(
+    *,
+    log_path: str | None = None,
+    checkpoint_dir: str | None = None,
+    detached_layout: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    layout: dict[str, Any] = {}
+    if detached_layout is not None:
+        layout.update(detached_layout)
+    if log_path:
+        layout.setdefault("log_path", str(Path(log_path).resolve()))
+    if checkpoint_dir:
+        layout.setdefault("checkpoint_dir", str(Path(checkpoint_dir).resolve()))
+    session_log_path = layout.get("session_log_path") or layout.get("log_path")
+    if isinstance(session_log_path, str) and session_log_path.strip():
+        resolved_session_log = str(Path(session_log_path).resolve())
+        layout["session_log_path"] = resolved_session_log
+        layout["log_path"] = resolved_session_log
+    if isinstance(layout.get("checkpoint_dir"), str) and str(layout["checkpoint_dir"]).strip():
+        layout["checkpoint_dir"] = str(Path(str(layout["checkpoint_dir"])).resolve())
+    for key in ("root_dir", "manifest_path", "stdout_log_path", "stderr_log_path", "runtime_state_root"):
+        value = layout.get(key)
+        if isinstance(value, str) and value.strip():
+            layout[key] = str(Path(value).resolve())
+    return layout
+
+
+def _layout_metadata(detached_layout: Mapping[str, Any] | None) -> dict[str, Any]:
+    if detached_layout is None:
+        return {
+            "detached_layout": None,
+            "root_dir": None,
+            "log_path": None,
+            "session_log_path": None,
+            "checkpoint_dir": None,
+            "manifest_path": None,
+            "stdout_log_path": None,
+            "stderr_log_path": None,
+            "runtime_state_root": None,
+        }
+    layout = dict(detached_layout)
+    return {
+        "detached_layout": layout,
+        "root_dir": layout.get("root_dir"),
+        "log_path": layout.get("log_path"),
+        "session_log_path": layout.get("session_log_path") or layout.get("log_path"),
+        "checkpoint_dir": layout.get("checkpoint_dir"),
+        "manifest_path": layout.get("manifest_path"),
+        "stdout_log_path": layout.get("stdout_log_path"),
+        "stderr_log_path": layout.get("stderr_log_path"),
+        "runtime_state_root": layout.get("runtime_state_root"),
+    }
+
+
+def _realize_detached_layout(
+    *,
+    session_id: str | None,
+    detached: bool,
+    detached_layout: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if detached_layout is None:
+        return None
+    layout = dict(detached_layout)
+    runtime_state_root = layout.get("runtime_state_root")
+    if (
+        detached
+        and session_id
+        and isinstance(runtime_state_root, str)
+        and runtime_state_root.strip()
+    ):
+        layout["manifest_path"] = str(
+            (Path(runtime_state_root).resolve() / session_id / "manifest.json").resolve()
+        )
+    return layout
+
+
+def _build_exec_session_metadata(
+    *,
+    payload: Mapping[str, Any] | None,
+    detached_layout: Mapping[str, Any] | None,
+    background: bool,
+    tty: bool,
+    approval_state: str | None,
+) -> dict[str, Any]:
+    payload_dict = dict(payload or {})
+    metadata = {
+        "status": payload_dict.get("status") or ("approval_pending" if approval_state == "pending" else "completed"),
+        "session_id": payload_dict.get("session_id"),
+        "timed_out": bool(payload_dict.get("timed_out", False)),
+        "exit_code": payload_dict.get("exit_code"),
+        "pid": payload_dict.get("pid"),
+        "background": bool(payload_dict.get("background", background)),
+        "tty": bool(payload_dict.get("tty", tty)),
+        "approval_state": approval_state,
+        "detached": bool(payload_dict.get("detached", payload_dict.get("background", background))),
+        "restored": bool(payload_dict.get("restored", False)),
+        "supports_stdin": bool(payload_dict.get("supports_stdin", not bool(payload_dict.get("detached", payload_dict.get("background", background))))),
+        "reattach_supported": bool(payload_dict.get("background", background)),
+        "recovery_supported": bool(payload_dict.get("background", background)),
+        "lease_owner": "runtime_service" if bool(payload_dict.get("background", background)) else None,
+    }
+    metadata.update(_layout_metadata(detached_layout))
+    return metadata

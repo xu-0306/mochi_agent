@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 from fastapi import APIRouter, HTTPException, Request
 
 from mochi.api.routes.approvals import _get_runtime_service
@@ -10,6 +12,7 @@ from mochi.runtime.models import (
     AgentRunCreateRequest,
     AgentRunDatasetPackageResponse,
     AgentRunGuidanceRequest,
+    AgentRunResumeRequest,
     AgentRunResponse,
 )
 
@@ -39,6 +42,84 @@ async def get_agent_run(request: Request, run_id: str) -> AgentRunResponse:
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return AgentRunResponse.model_validate(run)
+
+
+@router.get("/{run_id}/exec/{session_id}")
+async def get_agent_run_exec_session(
+    request: Request,
+    run_id: str,
+    session_id: str,
+    yield_time_ms: int | None = None,
+) -> dict[str, object]:
+    service = await _get_runtime_service(request.app)
+    payload = await service.get_agent_run_exec_session(
+        run_id,
+        session_id,
+        yield_time_ms=yield_time_ms,
+    )
+    if isinstance(payload, tuple):
+        if payload[0] == "run_not_found":
+            raise HTTPException(status_code=404, detail="Agent run not found")
+        raise HTTPException(status_code=404, detail="Exec session not associated with this agent run")
+    return payload
+
+
+@router.post("/{run_id}/exec/{session_id}/stop")
+async def stop_agent_run_exec_session(
+    request: Request,
+    run_id: str,
+    session_id: str,
+) -> dict[str, object]:
+    service = await _get_runtime_service(request.app)
+    payload = await service.stop_agent_run_exec_session(run_id, session_id)
+    if isinstance(payload, tuple):
+        if payload[0] == "run_not_found":
+            raise HTTPException(status_code=404, detail="Agent run not found")
+        raise HTTPException(status_code=404, detail="Exec session not associated with this agent run")
+    return payload
+
+
+@router.post("/{run_id}/reattach-exec/{session_id}")
+async def reattach_agent_run_exec_session(
+    request: Request,
+    run_id: str,
+    session_id: str,
+    yield_time_ms: int | None = None,
+) -> dict[str, object]:
+    service = await _get_runtime_service(request.app)
+    payload = await service.reattach_agent_run_exec_session(
+        run_id,
+        session_id,
+        yield_time_ms=yield_time_ms,
+    )
+    if isinstance(payload, tuple):
+        if payload[0] == "run_not_found":
+            raise HTTPException(status_code=404, detail="Agent run not found")
+        raise HTTPException(status_code=404, detail="Exec session not associated with this agent run")
+    return payload
+
+
+@router.post("/{run_id}/finalize-partial", response_model=AgentRunResponse)
+async def finalize_agent_run_partial(request: Request, run_id: str) -> AgentRunResponse:
+    service = await _get_runtime_service(request.app)
+    payload = await service.finalize_agent_run_partial(run_id)
+    if isinstance(payload, tuple):
+        if payload[0] == "run_not_found":
+            raise HTTPException(status_code=404, detail="Agent run not found")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent run status '{payload[1] or 'unknown'}' cannot be finalized as partial",
+        )
+    return AgentRunResponse.model_validate(payload)
+
+
+@router.get("/{run_id}/health")
+async def get_agent_run_health(request: Request, run_id: str) -> dict[str, object]:
+    service = await _get_runtime_service(request.app)
+    payload = await service.get_agent_run_health(run_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    return payload
 
 
 @router.get(
@@ -93,9 +174,22 @@ async def pause_agent_run(request: Request, run_id: str) -> AgentRunResponse:
 
 
 @router.post("/{run_id}/resume", response_model=AgentRunResponse)
-async def resume_agent_run(request: Request, run_id: str) -> AgentRunResponse:
+async def resume_agent_run(
+    request: Request,
+    run_id: str,
+    payload: AgentRunResumeRequest | None = None,
+) -> AgentRunResponse:
     service = await _get_runtime_service(request.app)
-    run = await service.resume_agent_run(run_id)
+    strategy = payload.strategy if payload is not None else "continue_from_checkpoint"
+    resume_agent_run = service.resume_agent_run
+    try:
+        supports_strategy = "strategy" in inspect.signature(resume_agent_run).parameters
+    except (TypeError, ValueError):
+        supports_strategy = False
+    if supports_strategy:
+        run = await resume_agent_run(run_id, strategy=strategy)
+    else:
+        run = await resume_agent_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return AgentRunResponse.model_validate(run)
