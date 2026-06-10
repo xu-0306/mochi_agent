@@ -2062,6 +2062,10 @@ interface BackendOpenAICodexAuthStatusResponse {
   profiles?: BackendOpenAICodexAuthProfile[]
   last_refresh_error?: string | null
   auth_mode?: string
+  cli_auth_state?: string
+  cli_auth_mode?: string | null
+  cli_auth_can_import?: boolean
+  cli_auth_message?: string | null
 }
 
 interface BackendOpenAICodexImportResponse {
@@ -2110,6 +2114,10 @@ export interface OpenAICodexAuthStatus {
   profiles: OpenAICodexAuthProfile[]
   lastRefreshError: string | null
   authMode: string
+  cliAuthState: string
+  cliAuthMode: string | null
+  cliAuthCanImport: boolean
+  cliAuthMessage: string | null
 }
 
 export interface OpenAICodexImportResult {
@@ -2343,6 +2351,10 @@ export async function fetchOpenAICodexAuthStatus(): Promise<OpenAICodexAuthStatu
     ).filter((profile): profile is OpenAICodexAuthProfile => profile !== null),
     lastRefreshError: getString(payload.last_refresh_error),
     authMode: payload.auth_mode ?? 'oauth',
+    cliAuthState: getString(payload.cli_auth_state) ?? 'missing',
+    cliAuthMode: getString(payload.cli_auth_mode),
+    cliAuthCanImport: Boolean(payload.cli_auth_can_import),
+    cliAuthMessage: getString(payload.cli_auth_message),
   }
 }
 

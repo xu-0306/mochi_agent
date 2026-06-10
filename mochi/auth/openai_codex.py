@@ -22,6 +22,7 @@ from pydantic import SecretStr
 from .models import (
     AuthStoreData,
     OpenAICodexAuthProfile,
+    OpenAICodexCliAuthDiagnostics,
     OpenAICodexPendingOAuthFlow,
     OpenAICodexProfileSummary,
 )
@@ -35,8 +36,11 @@ OPENAI_CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
 OPENAI_CODEX_OAUTH_AUTHORIZE_ENDPOINT = "https://auth.openai.com/oauth/authorize"
 OPENAI_CODEX_OAUTH_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 OPENAI_CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-OPENAI_CODEX_OAUTH_SCOPE = "openid profile email offline_access"
-OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_HOST = "127.0.0.1"
+OPENAI_CODEX_OAUTH_SCOPE = (
+    "openid profile email offline_access api.connectors.read api.connectors.invoke"
+)
+OPENAI_CODEX_OAUTH_LOCAL_BIND_HOST = "127.0.0.1"
+OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_HOST = "localhost"
 OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_PORT = 1455
 OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_PATH = "/auth/callback"
 OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_URL = (
@@ -371,7 +375,7 @@ def _ensure_local_callback_server(workspace_dir: str) -> bool:
             _CALLBACK_SERVER_THREAD = None
         try:
             server = ThreadingHTTPServer(
-                (OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_HOST, OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_PORT),
+                (OPENAI_CODEX_OAUTH_LOCAL_BIND_HOST, OPENAI_CODEX_OAUTH_LOCAL_CALLBACK_PORT),
                 _OpenAICodexOAuthCallbackHandler,
             )
         except OSError:
@@ -441,6 +445,88 @@ class OpenAICodexAuthService:
         profile = self._read_codex_cli_profile()
         self._store.upsert_openai_codex_profile(profile)
         return self._to_summary(profile)
+
+    def inspect_codex_cli_login(self) -> OpenAICodexCliAuthDiagnostics:
+        auth_path = _resolve_codex_home(self._env) / "auth.json"
+        try:
+            payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return OpenAICodexCliAuthDiagnostics(
+                state="missing",
+                message=(
+                    "No Codex CLI auth file was found. Use Connect ChatGPT in Mochi, "
+                    "or sign in to Codex CLI with ChatGPT OAuth before importing."
+                ),
+            )
+        except json.JSONDecodeError:
+            return OpenAICodexCliAuthDiagnostics(
+                state="invalid_json",
+                message=(
+                    "The local Codex CLI auth file is not valid JSON. Sign in again, "
+                    "or use Connect ChatGPT in Mochi instead of importing."
+                ),
+            )
+
+        if not isinstance(payload, dict):
+            return OpenAICodexCliAuthDiagnostics(
+                state="invalid_payload",
+                message=(
+                    "The local Codex CLI auth file has an invalid structure. "
+                    "Mochi can only import ChatGPT OAuth credentials from Codex CLI."
+                ),
+            )
+
+        auth_mode = _normalize_non_empty_string(payload.get("auth_mode"))
+        if auth_mode == "apikey":
+            return OpenAICodexCliAuthDiagnostics(
+                state="apikey",
+                auth_mode=auth_mode,
+                message=(
+                    "The local Codex CLI is using API key mode. Mochi cannot import "
+                    "API-key credentials for OpenAI Codex from .codex/auth.json. "
+                    "Use Connect ChatGPT in Mochi, or sign in to Codex CLI with "
+                    "ChatGPT OAuth and retry import."
+                ),
+            )
+        if auth_mode != "chatgpt":
+            return OpenAICodexCliAuthDiagnostics(
+                state="unsupported_auth_mode",
+                auth_mode=auth_mode,
+                message=(
+                    "The local Codex CLI auth file is not using ChatGPT OAuth. "
+                    "Mochi can only import chatgpt OAuth credentials for OpenAI Codex."
+                ),
+            )
+
+        tokens = payload.get("tokens")
+        if not isinstance(tokens, dict):
+            return OpenAICodexCliAuthDiagnostics(
+                state="missing_tokens",
+                auth_mode=auth_mode,
+                message=(
+                    "The local Codex CLI auth file is in chatgpt mode but does not "
+                    "contain OAuth tokens. Sign in again, or use Connect ChatGPT in Mochi."
+                ),
+            )
+
+        access_token = _normalize_non_empty_string(tokens.get("access_token"))
+        refresh_token = _normalize_non_empty_string(tokens.get("refresh_token"))
+        if access_token is None or refresh_token is None:
+            return OpenAICodexCliAuthDiagnostics(
+                state="missing_tokens",
+                auth_mode=auth_mode,
+                message=(
+                    "The local Codex CLI auth file is in chatgpt mode but does not "
+                    "contain usable OAuth tokens. Sign in again, or use Connect ChatGPT in Mochi."
+                ),
+            )
+
+        return OpenAICodexCliAuthDiagnostics(
+            state="ready",
+            auth_mode=auth_mode,
+            can_import=True,
+            message="The local Codex CLI has ChatGPT OAuth tokens and can be imported into Mochi.",
+        )
 
     def refresh_from_codex_cli_login(self) -> OpenAICodexProfileSummary:
         return self.import_codex_cli_login()
@@ -610,26 +696,42 @@ class OpenAICodexAuthService:
             payload = json.loads(auth_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Codex CLI auth file was not found at {auth_path}."
+                f"Codex CLI auth file was not found at {auth_path}. "
+                "Use Connect ChatGPT in Mochi, or sign in to Codex CLI with ChatGPT OAuth first."
             ) from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f"Codex CLI auth file at {auth_path} is not valid JSON."
+                f"Codex CLI auth file at {auth_path} is not valid JSON. "
+                "Sign in again, or use Connect ChatGPT in Mochi instead of importing."
             ) from exc
 
         if not isinstance(payload, dict):
             raise RuntimeError("Codex CLI auth file payload is invalid.")
-        if payload.get("auth_mode") != "chatgpt":
-            raise RuntimeError("Codex CLI auth file is not using chatgpt auth_mode.")
+        auth_mode = _normalize_non_empty_string(payload.get("auth_mode"))
+        if auth_mode == "apikey":
+            raise RuntimeError(
+                "Found Codex CLI credentials in API key mode. Mochi cannot import "
+                "API-key credentials for OpenAI Codex from .codex/auth.json. "
+                "Use Connect ChatGPT in Mochi, or sign in to Codex CLI with ChatGPT OAuth and retry import."
+            )
+        if auth_mode != "chatgpt":
+            raise RuntimeError(
+                f"Codex CLI auth file is using unsupported auth_mode {auth_mode!r}. "
+                "Mochi can only import ChatGPT OAuth credentials."
+            )
 
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
-            raise RuntimeError("Codex CLI auth file does not contain tokens.")
+            raise RuntimeError(
+                "Codex CLI auth file is in chatgpt mode but does not contain OAuth tokens."
+            )
 
         access_token = _normalize_non_empty_string(tokens.get("access_token"))
         refresh_token = _normalize_non_empty_string(tokens.get("refresh_token"))
         if access_token is None or refresh_token is None:
-            raise RuntimeError("Codex CLI auth file does not contain usable OAuth tokens.")
+            raise RuntimeError(
+                "Codex CLI auth file is in chatgpt mode but does not contain usable OAuth tokens."
+            )
 
         id_token = _normalize_non_empty_string(tokens.get("id_token"))
         account_id = _normalize_non_empty_string(tokens.get("account_id"))
@@ -678,6 +780,8 @@ class OpenAICodexAuthService:
             "state": state,
             "code_challenge": _build_pkce_code_challenge(code_verifier),
             "code_challenge_method": "S256",
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
         }
         return f"{OPENAI_CODEX_OAUTH_AUTHORIZE_ENDPOINT}?{urlencode(params)}"
 

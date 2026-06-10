@@ -7,6 +7,15 @@ from typing import Literal
 from pydantic import BaseModel, Field, SecretStr
 
 OpenAICodexAuthProfileStatus = Literal["ready", "expiring", "expired", "refresh_failed"]
+OpenAICodexCliAuthState = Literal[
+    "missing",
+    "invalid_json",
+    "invalid_payload",
+    "unsupported_auth_mode",
+    "apikey",
+    "missing_tokens",
+    "ready",
+]
 
 
 class OpenAICodexAuthProfile(BaseModel):
@@ -68,3 +77,12 @@ class OpenAICodexProfileSummary(BaseModel):
     last_refresh_at: int | None = None
     last_refresh_error: str | None = None
     status: OpenAICodexAuthProfileStatus = "ready"
+
+
+class OpenAICodexCliAuthDiagnostics(BaseModel):
+    """Safe diagnostics for the local Codex CLI auth state."""
+
+    state: OpenAICodexCliAuthState
+    auth_mode: str | None = None
+    can_import: bool = False
+    message: str

@@ -1787,6 +1787,41 @@ function openAICodexStatusLabel(status: string | null | undefined, configured: b
   return 'Connected'
 }
 
+function openAICodexCliAuthVariant(state: string | null | undefined): 'success' | 'warning' | 'error' | 'neutral' {
+  if (state === 'ready') {
+    return 'success'
+  }
+  if (state === 'apikey' || state === 'unsupported_auth_mode' || state === 'missing_tokens') {
+    return 'warning'
+  }
+  if (state === 'invalid_json' || state === 'invalid_payload') {
+    return 'error'
+  }
+  return 'neutral'
+}
+
+function openAICodexCliAuthLabel(state: string | null | undefined): string {
+  if (state === 'ready') {
+    return 'Ready to import'
+  }
+  if (state === 'apikey') {
+    return 'API key mode'
+  }
+  if (state === 'unsupported_auth_mode') {
+    return 'Unsupported auth mode'
+  }
+  if (state === 'missing_tokens') {
+    return 'Missing OAuth tokens'
+  }
+  if (state === 'invalid_json') {
+    return 'Invalid JSON'
+  }
+  if (state === 'invalid_payload') {
+    return 'Invalid auth payload'
+  }
+  return 'No CLI login found'
+}
+
 function configuredProvider(modelConfig: Record<string, unknown>, configuredModel: string | null): ProviderChoice {
   const provider = modelConfig.provider
   if (isProviderChoice(provider)) {
@@ -3413,7 +3448,7 @@ function ModelConnectionForm({
               <div>
                 <p className="text-xs font-semibold text-foreground">OpenAI Codex Login</p>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  Sign in with ChatGPT in your browser, or import the existing `codex` login from `.codex/auth.json`.
+                  Connect ChatGPT in Mochi, or import an existing Codex CLI ChatGPT OAuth login. API key mode in `.codex/auth.json` cannot be imported.
                 </p>
               </div>
               <Badge variant={openAICodexStatusVariant(openAICodexStatus?.status, openAICodexStatus?.configured)}>
@@ -3424,7 +3459,7 @@ function ModelConnectionForm({
             <div className="rounded-md border border-border bg-surface-layer px-3 py-2 text-xs text-muted-foreground">
               {openAICodexStatus?.activeProfileId
                 ? `Active profile: ${openAICodexStatus.activeProfileId}`
-                : 'No imported OpenAI Codex login'}
+                : 'No saved OpenAI Codex login in Mochi'}
             </div>
 
             {openAICodexStatus?.profiles?.[0]?.email ? (
@@ -3442,14 +3477,35 @@ function ModelConnectionForm({
               </div>
             ) : null}
 
+            {openAICodexStatus?.cliAuthMessage ? (
+              <div
+                className={[
+                  'rounded-md border px-3 py-2 text-xs',
+                  openAICodexCliAuthVariant(openAICodexStatus.cliAuthState) === 'success'
+                    ? 'border-success/30 bg-success/10 text-success'
+                    : openAICodexCliAuthVariant(openAICodexStatus.cliAuthState) === 'warning'
+                      ? 'border-warning/30 bg-warning/10 text-warning'
+                      : openAICodexCliAuthVariant(openAICodexStatus.cliAuthState) === 'error'
+                        ? 'border-destructive/30 bg-destructive/10 text-destructive'
+                        : 'border-border bg-surface-layer text-muted-foreground',
+                ].join(' ')}
+              >
+                <p className="font-medium">
+                  Local Codex CLI: {openAICodexCliAuthLabel(openAICodexStatus.cliAuthState)}
+                  {openAICodexStatus.cliAuthMode ? ` (${openAICodexStatus.cliAuthMode})` : ''}
+                </p>
+                <p className="mt-1">{openAICodexStatus.cliAuthMessage}</p>
+              </div>
+            ) : null}
+
             <div className="flex flex-wrap gap-2">
-              <Button type="button" variant="secondary" loading={openAICodexAuthBusy} onClick={() => void importOpenAICodexCliLogin()}>
-                <Download className="h-3.5 w-3.5" />
-                Import Codex CLI Login
-              </Button>
-              <Button type="button" variant="outline" loading={openAICodexAuthBusy} onClick={() => void connectOpenAICodexLogin()}>
+              <Button type="button" variant="secondary" loading={openAICodexAuthBusy} onClick={() => void connectOpenAICodexLogin()}>
                 <Globe className="h-3.5 w-3.5" />
                 Connect ChatGPT
+              </Button>
+              <Button type="button" variant="outline" loading={openAICodexAuthBusy} onClick={() => void importOpenAICodexCliLogin()}>
+                <Download className="h-3.5 w-3.5" />
+                Import Existing Codex CLI OAuth
               </Button>
               <Button type="button" variant="secondary" loading={openAICodexAuthBusy} onClick={() => void refreshOpenAICodexLogin()}>
                 <RefreshCw className="h-3.5 w-3.5" />

@@ -48,6 +48,10 @@ class OpenAICodexAuthStatusResponse(BaseModel):
     profiles: list[dict[str, Any]] = Field(default_factory=list)
     last_refresh_error: str | None = None
     auth_mode: str = "oauth"
+    cli_auth_state: str = "missing"
+    cli_auth_mode: str | None = None
+    cli_auth_can_import: bool = False
+    cli_auth_message: str | None = None
 
 
 class OpenAICodexImportResponse(BaseModel):
@@ -223,6 +227,7 @@ def _popup_html(
 def _status_payload(config: MochiConfig) -> OpenAICodexAuthStatusResponse:
     service = _auth_service(config)
     profiles = [profile.model_dump(exclude_none=True) for profile in service.list_profiles()]
+    cli_auth = service.inspect_codex_cli_login()
     active_profile_id = service.resolve_profile_id(config.openai_codex.auth_profile_id)
     active_profile = service.get_profile_summary(active_profile_id) if active_profile_id is not None else None
     default_profile_id = (
@@ -237,6 +242,10 @@ def _status_payload(config: MochiConfig) -> OpenAICodexAuthStatusResponse:
         default_profile_id=default_profile_id,
         profiles=profiles,
         last_refresh_error=active_profile.last_refresh_error if active_profile is not None else None,
+        cli_auth_state=cli_auth.state,
+        cli_auth_mode=cli_auth.auth_mode,
+        cli_auth_can_import=cli_auth.can_import,
+        cli_auth_message=cli_auth.message,
     )
 
 
