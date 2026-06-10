@@ -41,6 +41,7 @@ import type { ChatAttachment } from '@/lib/chat'
 export interface ChatInputModelOption {
   id: string
   label: string
+  detail?: string | null
   status?: 'connected' | 'configured' | 'disconnected'
 }
 
@@ -89,6 +90,13 @@ function buildSkillAction(skill: Skill): CommandPaletteAction {
 
 function formatTokenCount(value: number | null | undefined): string {
   return new Intl.NumberFormat().format(value ?? 0)
+}
+
+function formatSelectedModelText(model: ChatInputModelOption | null, fallback: string): string {
+  if (!model) {
+    return fallback
+  }
+  return model.detail ? `${model.label} · ${model.detail}` : model.label
 }
 
 function formatMountedModelName(modelSpec: string | null | undefined, fallback: string | null | undefined): string {
@@ -772,8 +780,8 @@ export function ChatInput({
                       selectedModel?.status === 'connected' ? 'bg-success' : 'bg-muted-foreground'
                     )}
                   />
-                  <span className="truncate">
-                    {selectedModel?.label ?? t('chat.input.currentModel')}
+                  <span className="min-w-0 flex-1 truncate">
+                    {formatSelectedModelText(selectedModel, t('chat.input.currentModel'))}
                   </span>
                   <ChevronDown className="h-3 w-3 shrink-0" />
                 </button>
@@ -810,8 +818,15 @@ export function ChatInput({
                             model.status === 'connected' ? 'bg-success' : 'bg-muted-foreground/40'
                           )}
                         />
-                        <span className="min-w-0 flex-1 truncate text-left">
-                          {model.label}
+                        <span className="min-w-0 flex-1 text-left">
+                          <span className="block truncate">
+                            {model.label}
+                          </span>
+                          {model.detail ? (
+                            <span className="mt-0.5 block truncate text-[11px] text-muted-foreground/80">
+                              {model.detail}
+                            </span>
+                          ) : null}
                         </span>
                         {selectedModel?.id === model.id ? (
                           <Check className="h-3.5 w-3.5 shrink-0 text-primary-400" />

@@ -22,6 +22,7 @@ interface SubagentDraft {
 
 type RunTemplate = 'standard' | 'research_debate'
 type RunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
+type WorkflowReasoningEffort = api.ReasoningEffort | 'auto'
 
 const PROTOCOL_OPTIONS: Array<{
   id: api.AgentRunProtocolId
@@ -43,6 +44,20 @@ const PROTOCOL_OPTIONS: Array<{
     label: 'Dr.Zero Self-Evolve',
     description: 'Proposer generates hard-but-solvable tasks; solver creates evidence-aware rollouts.',
   },
+]
+
+const WORKFLOW_REASONING_EFFORT_OPTIONS: Array<{
+  value: WorkflowReasoningEffort
+  label: string
+  description: string
+}> = [
+  { value: 'auto', label: 'Auto', description: 'Let each model use its default behavior.' },
+  { value: 'none', label: 'None', description: 'Disable explicit reasoning effort.' },
+  { value: 'minimal', label: 'Minimal', description: 'Keep reasoning very short.' },
+  { value: 'low', label: 'Low', description: 'Prefer a lighter reasoning pass.' },
+  { value: 'medium', label: 'Medium', description: 'Balanced depth and latency.' },
+  { value: 'high', label: 'High', description: 'Spend more effort on reasoning.' },
+  { value: 'xhigh', label: 'X-High', description: 'Use the highest supported effort.' },
 ]
 
 const TERMINAL_RUN_STATUSES = new Set([
@@ -183,6 +198,16 @@ function sourceModeToEvidenceMode(mode: string): string {
   return 'hybrid'
 }
 
+function formatReasoningEffortLabel(value: api.ReasoningEffort | null): string {
+  if (!value) {
+    return 'Auto'
+  }
+  if (value === 'xhigh') {
+    return 'X-High'
+  }
+  return value.charAt(0).toUpperCase() + value.slice(1)
+}
+
 function statusVariant(status: string): BadgeProps['variant'] {
   const normalized = status.toLowerCase()
   if (
@@ -263,6 +288,7 @@ export default function AgentRunsPage() {
   const [protocolId, setProtocolId] = React.useState<api.AgentRunProtocolId>('teacher_student_distill')
   const [title, setTitle] = React.useState('')
   const [topic, setTopic] = React.useState('')
+  const [reasoningEffort, setReasoningEffort] = React.useState<WorkflowReasoningEffort>('auto')
   const [subagents, setSubagents] = React.useState<SubagentDraft[]>([])
   const [evidenceQueriesText, setEvidenceQueriesText] = React.useState('')
   const [evidenceCollectionEnabled, setEvidenceCollectionEnabled] = React.useState(true)
@@ -583,6 +609,7 @@ export default function AgentRunsPage() {
         protocol_id: runTemplate === 'research_debate' ? 'multi_agent_debate' : protocolId,
         title: title.trim() || null,
         topic: topic.trim() || null,
+        reasoning_effort: reasoningEffort === 'auto' ? null : reasoningEffort,
         subagents: runTemplate === 'research_debate' ? [] : normalizedSubagents,
         selected_models_roles: selectedModelsRoles,
         run_policy: {
@@ -671,6 +698,7 @@ export default function AgentRunsPage() {
       await loadRuns()
       setTitle('')
       setTopic('')
+      setReasoningEffort('auto')
       setSubagents(createProtocolSubagentDrafts(protocolId, defaultModelId))
       setEvidenceQueriesText('')
       setRagMcpServersText('')
@@ -740,6 +768,7 @@ export default function AgentRunsPage() {
     protocolId,
     ragMcpServersText,
     ragProvider,
+    reasoningEffort,
     researchOutputTargets,
     researchSourceMode,
     router,
@@ -842,6 +871,28 @@ export default function AgentRunsPage() {
                   onChange={(event) => setTopic(event.target.value)}
                   placeholder="What should agents work on?"
                 />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-foreground">Thinking Level</label>
+                <Select value={reasoningEffort} onValueChange={(value) => setReasoningEffort(value as WorkflowReasoningEffort)}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select thinking level" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {WORKFLOW_REASONING_EFFORT_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {
+                    WORKFLOW_REASONING_EFFORT_OPTIONS.find((option) => option.value === reasoningEffort)
+                      ?.description
+                  } Applies globally to the workflow. Models that do not support it ignore the setting.
+                </p>
               </div>
 
               {runTemplate === 'research_debate' ? (
@@ -1482,6 +1533,9 @@ export default function AgentRunsPage() {
                           </div>
                           <div className="flex flex-wrap items-center gap-2">
                             <Badge variant={statusVariant(run.status)}>{translateRunStatus(run.status, t)}</Badge>
+                            <Badge variant="outline">
+                              Thinking: {formatReasoningEffortLabel(run.reasoning_effort)}
+                            </Badge>
                             {run.degraded ? <Badge variant="warning">{t('agentRuns.badge.degraded')}</Badge> : null}
                           </div>
                         </div>

@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 try:
@@ -22,11 +22,12 @@ from mochi.agents.events import (
     ErrorEvent,
     FinalAnswerEvent,
     ThinkingEvent,
+    TextChunkEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
 from mochi.backends.base import BackendRequestError
-from mochi.backends.types import Message, ToolCall
+from mochi.backends.types import Message, StreamChunk, ToolCall
 from mochi.tools.base import ToolResult
 from mochi.tools.transport_guard import ToolResultTransportGuard
 
@@ -136,6 +137,11 @@ class AsyncReActLoop:
             "failure_streak": 0,
             "blocked_urls": {},
         }
+        web_search_guard_state: dict[str, Any] = {
+            "last_failed_query": None,
+            "failure_streak": 0,
+            "blocked_queries": {},
+        }
         literature_state: dict[str, Any] = {
             "research_mode": False,
             "paper_hits": 0,
@@ -149,25 +155,76 @@ class AsyncReActLoop:
         try:
             for iteration in range(self._max_iterations):
                 logger.debug(f"ReAct iteration {iteration + 1}/{self._max_iterations}")
+                progress_event = self._build_iteration_progress_event(iteration=iteration + 1)
+                if progress_event is not None:
+                    yield progress_event
 
                 started_at = time.perf_counter()
                 try:
-                    generate_kwargs: dict[str, Any] = {
-                        "messages": messages,
-                        "tools": tools if tools else None,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        "top_p": top_p,
-                        "min_p": min_p,
-                        "top_k": top_k,
-                        "frequency_penalty": frequency_penalty,
-                        "presence_penalty": presence_penalty,
-                        "repeat_penalty": repeat_penalty,
-                        "stream": False,
-                    }
-                    if reasoning_effort is not None:
-                        generate_kwargs["reasoning_effort"] = reasoning_effort
-                    result = await self._backend.generate(**generate_kwargs)
+                    streamed_generation = False
+                    if self._should_use_streaming_generate():
+                        streamed_generation = True
+                        stream_iter = await self._backend.generate(
+                            **self._build_generate_kwargs(
+                                messages=messages,
+                                tools=tools,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                top_p=top_p,
+                                min_p=min_p,
+                                top_k=top_k,
+                                frequency_penalty=frequency_penalty,
+                                presence_penalty=presence_penalty,
+                                repeat_penalty=repeat_penalty,
+                                reasoning_effort=reasoning_effort,
+                                stream=True,
+                            )
+                        )
+                        content_parts: list[str] = []
+                        streamed_tool_calls: dict[str, ToolCall] = {}
+                        streamed_finish_reason = "stop"
+
+                        async for chunk in cast(AsyncIterator[StreamChunk], stream_iter):
+                            if chunk.delta:
+                                content_parts.append(chunk.delta)
+                                yield TextChunkEvent(content=chunk.delta)
+                            if chunk.tool_call_delta is not None:
+                                self._merge_stream_tool_call(
+                                    streamed_tool_calls,
+                                    chunk.tool_call_delta,
+                                )
+                            if chunk.finish_reason:
+                                streamed_finish_reason = chunk.finish_reason
+
+                        streamed_tool_call_list = self._ordered_stream_tool_calls(streamed_tool_calls)
+                        if streamed_tool_call_list:
+                            streamed_finish_reason = "tool_calls"
+
+                        backend_info = self._backend.get_model_info()
+                        result = GenerationResult(
+                            content="".join(content_parts),
+                            tool_calls=streamed_tool_call_list,
+                            model=backend_info.name,
+                            finish_reason=streamed_finish_reason
+                            or ("tool_calls" if streamed_tool_call_list else "stop"),
+                        )
+                    else:
+                        result = await self._backend.generate(
+                            **self._build_generate_kwargs(
+                                messages=messages,
+                                tools=tools,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                top_p=top_p,
+                                min_p=min_p,
+                                top_k=top_k,
+                                frequency_penalty=frequency_penalty,
+                                presence_penalty=presence_penalty,
+                                repeat_penalty=repeat_penalty,
+                                reasoning_effort=reasoning_effort,
+                                stream=False,
+                            )
+                        )
                 except Exception as exc:
                     logger.exception(f"ReAct loop backend error: {exc}")
                     yield ErrorEvent(
@@ -197,8 +254,12 @@ class AsyncReActLoop:
                             "ReAct loop detected repeated tool-call pattern "
                             f"({repeated_tool_rounds} consecutive rounds)"
                         )
+                        repeated_loop_message = "Model repeated the same tool-call pattern without making progress."
+                        backend_detail = self._build_backend_runtime_detail()
+                        if backend_detail:
+                            repeated_loop_message = f"{repeated_loop_message} ({backend_detail})"
                         yield ErrorEvent(
-                            message="Model repeated the same tool-call pattern without making progress.",
+                            message=repeated_loop_message,
                             code="REPEATED_TOOL_LOOP",
                             metadata=self._build_repeated_tool_loop_metadata(
                                 finish_reason=finish_reason,
@@ -209,7 +270,7 @@ class AsyncReActLoop:
                         return
 
                     thought_content = result.thinking or result.content
-                    if thought_content:
+                    if thought_content and not streamed_generation:
                         yield ThinkingEvent(content=thought_content)
 
                     messages.append(
@@ -237,6 +298,7 @@ class AsyncReActLoop:
                             tool_call=tool_call,
                             literature_state=literature_state,
                             web_fetch_guard_state=web_fetch_guard_state,
+                            web_search_guard_state=web_search_guard_state,
                         )
                         if guarded_tool_result is not None:
                             tool_output = guarded_tool_result.output
@@ -291,6 +353,11 @@ class AsyncReActLoop:
                             tool_call=tool_call,
                             tool_result=tool_result_payload,
                             web_fetch_guard_state=web_fetch_guard_state,
+                        )
+                        self._update_web_search_guard_state(
+                            tool_call=tool_call,
+                            tool_result=tool_result_payload,
+                            web_search_guard_state=web_search_guard_state,
                         )
                         self._update_literature_state(
                             tool_call=tool_call,
@@ -355,8 +422,14 @@ class AsyncReActLoop:
                 break
             else:
                 logger.warning(f"ReAct loop reached max iterations ({self._max_iterations})")
+                max_iterations_message = (
+                    "Model reached the maximum tool-call iterations without producing a final answer."
+                )
+                backend_detail = self._build_backend_runtime_detail()
+                if backend_detail:
+                    max_iterations_message = f"{max_iterations_message} ({backend_detail})"
                 yield ErrorEvent(
-                    message="Model reached the maximum tool-call iterations without producing a final answer.",
+                    message=max_iterations_message,
                     code="MAX_ITERATIONS_REACHED",
                     metadata=self._build_max_iterations_metadata(finish_reason=finish_reason),
                 )
@@ -445,10 +518,7 @@ class AsyncReActLoop:
             "backend_type": backend_info.backend_type,
             "model": backend_info.name,
         }
-        if isinstance(backend_info.metadata, dict):
-            api_mode = backend_info.metadata.get("api_mode")
-            if isinstance(api_mode, str):
-                backend_metadata["api_mode"] = api_mode
+        self._append_backend_runtime_metadata(backend_metadata, backend_info.metadata)
         if isinstance(exc, BackendRequestError):
             backend_metadata.update(exc.metadata)
 
@@ -464,10 +534,7 @@ class AsyncReActLoop:
             "model": backend_info.name,
             "finish_reason": finish_reason,
         }
-        if isinstance(backend_info.metadata, dict):
-            api_mode = backend_info.metadata.get("api_mode")
-            if isinstance(api_mode, str):
-                backend_metadata["api_mode"] = api_mode
+        self._append_backend_runtime_metadata(backend_metadata, backend_info.metadata)
 
         metadata: dict[str, Any] = {
             "backend": backend_metadata,
@@ -492,10 +559,7 @@ class AsyncReActLoop:
             "model": backend_info.name,
             "finish_reason": finish_reason,
         }
-        if isinstance(backend_info.metadata, dict):
-            api_mode = backend_info.metadata.get("api_mode")
-            if isinstance(api_mode, str):
-                backend_metadata["api_mode"] = api_mode
+        self._append_backend_runtime_metadata(backend_metadata, backend_info.metadata)
 
         metadata: dict[str, Any] = {
             "backend": backend_metadata,
@@ -513,6 +577,147 @@ class AsyncReActLoop:
         if self._last_transport_diagnostics is not None:
             metadata["transport"] = dict(self._last_transport_diagnostics)
         return metadata
+
+    def _build_iteration_progress_event(self, *, iteration: int) -> ThinkingEvent | None:
+        backend_info = self._backend.get_model_info()
+        backend_type = backend_info.backend_type.strip().lower()
+        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        tool_mode = metadata.get("tool_call_mode")
+        if backend_type in {"gguf", "safetensors", "llama_cpp_server"} and tool_mode != "simulated_fallback":
+            return None
+
+        backend_detail = self._build_backend_runtime_detail()
+        content = f"Mochi progress: ReAct iteration {iteration}/{self._max_iterations}"
+        if backend_detail:
+            content = f"{content} ({backend_detail})"
+        return ThinkingEvent(content=content)
+
+    def _build_backend_runtime_detail(self) -> str:
+        backend_info = self._backend.get_model_info()
+        details: list[str] = []
+        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        has_interesting_metadata = False
+
+        api_mode = metadata.get("api_mode")
+        if isinstance(api_mode, str) and api_mode:
+            has_interesting_metadata = True
+            details.append(f"api={api_mode}")
+
+        tool_mode = metadata.get("tool_call_mode")
+        if isinstance(tool_mode, str) and tool_mode:
+            has_interesting_metadata = True
+            details.append(f"tools={tool_mode}")
+
+        native_status = metadata.get("native_tool_calling_status")
+        if isinstance(native_status, str) and native_status and native_status != "unknown":
+            has_interesting_metadata = True
+            details.append(f"native_status={native_status}")
+
+        request_shape = metadata.get("request_shape")
+        if isinstance(request_shape, str) and request_shape:
+            has_interesting_metadata = True
+            details.append(f"request_shape={request_shape}")
+
+        if backend_info.backend_type != "test" or has_interesting_metadata:
+            details.insert(0, f"model={backend_info.name}")
+            details.insert(0, f"backend={backend_info.backend_type}")
+
+        return ", ".join(details)
+
+    def _should_use_streaming_generate(self) -> bool:
+        backend_info = self._backend.get_model_info()
+        backend_type = backend_info.backend_type.strip().lower()
+        if backend_type not in {"openai_compat", "openai_codex"}:
+            return False
+
+        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        tool_mode = metadata.get("tool_call_mode")
+        if tool_mode == "simulated_fallback":
+            return False
+        return True
+
+    @staticmethod
+    def _build_generate_kwargs(
+        *,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        min_p: float,
+        top_k: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        repeat_penalty: float,
+        reasoning_effort: str | None,
+        stream: bool,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "messages": messages,
+            "tools": tools if tools else None,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "min_p": min_p,
+            "top_k": top_k,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "repeat_penalty": repeat_penalty,
+            "stream": stream,
+        }
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        return kwargs
+
+    @staticmethod
+    def _merge_stream_tool_call(
+        streamed_tool_calls: dict[str, ToolCall],
+        next_tool_call: ToolCall,
+    ) -> None:
+        key = (
+            str(next_tool_call.index)
+            if next_tool_call.index is not None
+            else next_tool_call.id or next_tool_call.name
+        )
+        current = streamed_tool_calls.get(key)
+        if current is None:
+            streamed_tool_calls[key] = ToolCall(
+                id=next_tool_call.id,
+                name=next_tool_call.name,
+                arguments=dict(next_tool_call.arguments),
+                index=next_tool_call.index,
+            )
+            return
+
+        current.id = next_tool_call.id or current.id
+        current.name = next_tool_call.name or current.name
+        if next_tool_call.arguments:
+            current.arguments = dict(next_tool_call.arguments)
+        if next_tool_call.index is not None:
+            current.index = next_tool_call.index
+
+    @staticmethod
+    def _ordered_stream_tool_calls(streamed_tool_calls: dict[str, ToolCall]) -> list[ToolCall]:
+        return sorted(
+            streamed_tool_calls.values(),
+            key=lambda tool_call: (
+                tool_call.index is None,
+                tool_call.index if tool_call.index is not None else 0,
+                tool_call.id,
+            ),
+        )
+
+    @staticmethod
+    def _append_backend_runtime_metadata(
+        backend_metadata: dict[str, Any],
+        metadata: Any,
+    ) -> None:
+        if not isinstance(metadata, dict):
+            return
+        for key in ("api_mode", "tool_call_mode", "native_tool_calling_status", "request_shape"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                backend_metadata[key] = value
 
     @staticmethod
     def _build_tool_call_signature(tool_calls: list[ToolCall]) -> tuple[str, ...]:
@@ -567,6 +772,7 @@ class AsyncReActLoop:
         tool_call: ToolCall,
         literature_state: dict[str, Any],
         web_fetch_guard_state: dict[str, Any],
+        web_search_guard_state: dict[str, Any],
     ) -> ToolResult | None:
         if tool_call.name == "web_fetch":
             normalized_url = self._normalize_url(str(tool_call.arguments.get("url", "")))
@@ -588,6 +794,30 @@ class AsyncReActLoop:
                     },
                     retryable=False,
                     suggestion="Use another source or summarize from the evidence already collected.",
+                )
+        if tool_call.name == "web_search":
+            normalized_query = self._normalize_text(str(tool_call.arguments.get("query", "")))
+            blocked_queries = web_search_guard_state.get("blocked_queries", {})
+            if isinstance(blocked_queries, dict) and normalized_query in blocked_queries:
+                blocked_info = blocked_queries[normalized_query]
+                failure_count = blocked_info.get("failure_count", 2) if isinstance(blocked_info, dict) else 2
+                provider = blocked_info.get("provider") if isinstance(blocked_info, dict) else None
+                return ToolResult(
+                    error=(
+                        "Skipping repeated search because this query already failed multiple times: "
+                        f"{tool_call.arguments.get('query', '')}"
+                    ),
+                    metadata={
+                        "query": tool_call.arguments.get("query", ""),
+                        "provider": provider,
+                        "guard": "repeated_web_search_failure",
+                        "failure_count": failure_count,
+                    },
+                    retryable=False,
+                    suggestion=(
+                        "Try a different query, switch to another search provider, "
+                        "or answer from the evidence already collected."
+                    ),
                 )
 
         if literature_state["summary_ready"] and self._is_research_retrieval_tool_call(tool_call):
@@ -643,6 +873,44 @@ class AsyncReActLoop:
             web_fetch_guard_state["last_failed_url"] = None
             web_fetch_guard_state["failure_streak"] = 0
         blocked_urls.pop(normalized_url, None)
+
+    def _update_web_search_guard_state(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        web_search_guard_state: dict[str, Any],
+    ) -> None:
+        if tool_call.name != "web_search":
+            return
+
+        normalized_query = self._normalize_text(str(tool_call.arguments.get("query", "")))
+        if not normalized_query:
+            return
+
+        blocked_queries = web_search_guard_state.setdefault("blocked_queries", {})
+        if not isinstance(blocked_queries, dict):
+            blocked_queries = {}
+            web_search_guard_state["blocked_queries"] = blocked_queries
+
+        if tool_result.error:
+            last_failed_query = web_search_guard_state.get("last_failed_query")
+            failure_streak = int(web_search_guard_state.get("failure_streak", 0))
+            failure_streak = failure_streak + 1 if last_failed_query == normalized_query else 1
+            web_search_guard_state["last_failed_query"] = normalized_query
+            web_search_guard_state["failure_streak"] = failure_streak
+            if failure_streak >= 2:
+                provider = tool_result.metadata.get("engine") or tool_result.metadata.get("provider")
+                blocked_queries[normalized_query] = {
+                    "failure_count": failure_streak,
+                    "provider": provider,
+                }
+            return
+
+        if web_search_guard_state.get("last_failed_query") == normalized_query:
+            web_search_guard_state["last_failed_query"] = None
+            web_search_guard_state["failure_streak"] = 0
+        blocked_queries.pop(normalized_query, None)
 
     def _mark_literature_research_mode(self, tool_call: ToolCall, literature_state: dict[str, Any]) -> None:
         if self._is_literature_tool_name(tool_call.name) or self._tool_call_mentions_literature(tool_call):

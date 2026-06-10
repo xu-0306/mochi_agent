@@ -197,12 +197,6 @@ class BackendRouter:
         backend: BaseLLMBackend,
         model_spec: str,
     ) -> BaseLLMBackend:
-        try:
-            await self._ensure_backend_ready(backend, model_spec)
-        except Exception:
-            await backend.close()
-            raise
-
         previous = self._active
         self._cancel_idle_unload_task()
         self._active = backend

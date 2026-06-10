@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 
+from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 from mochi.tools._http import (
     DEFAULT_USER_AGENT,
     ToolHttpError,
@@ -339,11 +340,13 @@ class WebSearchTool(BaseTool):
         attempted_providers: list[str] = []
         provider_attempts: list[dict[str, Any]] = []
         warnings: list[dict[str, str]] = []
+        fallback_diagnostics: list[dict[str, Any]] = []
 
-        for engine in engines_to_try:
+        for index, engine in enumerate(engines_to_try):
             if engine not in _SUPPORTED_ENGINES:
                 continue
             provider_state = self._provider_state(engine)
+            next_engine = _next_provider_in_chain(engines_to_try, start=index + 1)
             if not provider_state["configured"]:
                 warning = {
                     "provider": engine,
@@ -352,6 +355,17 @@ class WebSearchTool(BaseTool):
                 }
                 provider_attempts.append(dict(warning))
                 warnings.append(warning)
+                append_fallback_diagnostic(
+                    fallback_diagnostics,
+                    category="provider_chain",
+                    name="search_provider_skipped",
+                    reason=str(provider_state["status"]),
+                    kind="skip",
+                    severity="info",
+                    from_state=engine,
+                    to_state=next_engine,
+                    metadata={"detail": str(provider_state["reason"])},
+                )
                 continue
             attempted_providers.append(engine)
 
@@ -378,24 +392,34 @@ class WebSearchTool(BaseTool):
                     attempted_providers=attempted_providers,
                     warnings=warnings,
                     provider_attempts=provider_attempts,
+                    fallback_diagnostics=fallback_diagnostics,
                 )
             provider_attempts.append({
                 "provider": engine,
                 "status": "request_failed",
                 "reason": result.error or "request failed",
             })
+            append_fallback_diagnostic(
+                fallback_diagnostics,
+                category="provider_chain",
+                name="search_provider_fallback",
+                reason="request_failed",
+                kind="fallback",
+                severity="warning",
+                from_state=engine,
+                to_state=next_engine,
+                metadata={
+                    "error": result.error or "request failed",
+                    "retryable": result.retryable,
+                },
+            )
             last_error = result
-            # \u82e5\u932f\u8aa4\u662f non-retryable \u4e14\u975e\u670d\u52d9\u5668\u7aef\u554f\u984c\uff0c\u4e0d fallback
-            if not result.retryable and not result.metadata.get("blocked"):
-                result.metadata.setdefault("provider_attempts", provider_attempts)
-                result.metadata.setdefault("warnings", warnings)
-                result.metadata.setdefault("attempted_providers", attempted_providers)
-                return result
 
         if last_error is not None:
             last_error.metadata.setdefault("provider_attempts", provider_attempts)
             last_error.metadata.setdefault("warnings", warnings)
             last_error.metadata.setdefault("attempted_providers", attempted_providers)
+            last_error.metadata.setdefault("fallback_diagnostics", fallback_diagnostics)
             return last_error
 
         return ToolResult(
@@ -404,6 +428,7 @@ class WebSearchTool(BaseTool):
                 "attempted_providers": attempted_providers,
                 "provider_attempts": provider_attempts,
                 "warnings": warnings,
+                "fallback_diagnostics": fallback_diagnostics,
             },
             suggestion=(
                 "Configure at least one search engine API key in settings. "
@@ -1158,6 +1183,7 @@ def _normalize_search_tool_result(
     attempted_providers: list[str],
     warnings: list[dict[str, str]],
     provider_attempts: list[dict[str, Any]],
+    fallback_diagnostics: list[dict[str, Any]],
 ) -> ToolResult:
     raw_results = result.output if isinstance(result.output, list) else []
     normalized_results: list[dict[str, Any]] = []
@@ -1186,4 +1212,12 @@ def _normalize_search_tool_result(
     result.metadata["attempted_providers"] = attempted_providers
     result.metadata["provider_attempts"] = provider_attempts
     result.metadata["warnings"] = warnings
+    result.metadata["fallback_diagnostics"] = fallback_diagnostics
     return result
+
+
+def _next_provider_in_chain(engines: list[str], *, start: int) -> str | None:
+    for engine in engines[start:]:
+        if engine in _SUPPORTED_ENGINES:
+            return engine
+    return None

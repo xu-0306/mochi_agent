@@ -247,6 +247,7 @@ class MultiAgentRunRequest:
     task_input: str
     protocol: Mapping[str, Any] | ProtocolConfig | None = None
     run_id: str | None = None
+    reasoning_effort: str | None = None
     guidance_messages: list[str] = field(default_factory=list)
     run_policy: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -380,6 +381,7 @@ class MultiAgentOrchestrator:
         self._role_task_states: dict[str, dict[str, Any]] = {}
         self._task_states: dict[str, dict[str, Any]] = {}
         self._role_resume_plan: dict[str, Any] = {}
+        self._default_reasoning_effort: str | None = None
 
     def _configure_run_policy(self, run_policy: Mapping[str, Any] | None) -> None:
         self._run_policy = dict(run_policy or {})
@@ -1190,12 +1192,14 @@ class MultiAgentOrchestrator:
         )
 
         self._configure_run_policy(request.run_policy)
+        self._default_reasoning_effort = request.reasoning_effort
         requested_guidance_messages = [item.strip() for item in request.guidance_messages if item.strip()]
         resume_payload = _resolve_resume_execution_payload(request.metadata)
         selected_models_roles = _resolve_selected_model_roles(request.metadata)
         effective_metadata = dict(request.metadata)
         effective_metadata["summary"] = _sanitize_resume_summary(request.metadata.get("summary"))
         effective_metadata["execution_policy"] = execution_policy_to_dict(execution_policy)
+        effective_metadata["reasoning_effort"] = request.reasoning_effort
         candidates: list[CandidateOutput] = []
         precomputed_artifacts: dict[str, Any] = {}
         protocol_artifacts: dict[str, Any] = {}
@@ -2434,6 +2438,7 @@ class MultiAgentOrchestrator:
                 user_prompt=prompt,
                 temperature=0.2,
                 max_tokens=1024,
+                reasoning_effort=self._default_reasoning_effort,
                 execution_profile="subagent_readonly",
                 tool_mode="auto",
                 system_prompt_addendum=(
@@ -2473,6 +2478,7 @@ class MultiAgentOrchestrator:
         execution_profile: str,
         tool_mode: str = "auto",
         session_scope: str,
+        default_reasoning_effort: str | None = None,
     ) -> Any | None:
         if not callable(getattr(self._engine, "invoke", None)) and not callable(
             getattr(self._engine, "generate_with_configured_model", None)
@@ -2488,6 +2494,9 @@ class MultiAgentOrchestrator:
             reasoning_effort: str | None = None,
             **_: Any,
         ) -> GenerationResult:
+            effective_reasoning_effort = (
+                reasoning_effort if reasoning_effort is not None else default_reasoning_effort
+            )
             fallback_generate = getattr(self._engine, "generate_with_configured_model", None)
             system_prompt = "\n\n".join(
                 message.content
@@ -2505,7 +2514,7 @@ class MultiAgentOrchestrator:
                 user_prompt=user_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=effective_reasoning_effort,
                 execution_profile=execution_profile,
                 tool_mode=tool_mode,
                 system_prompt_addendum=system_prompt,
@@ -2515,6 +2524,16 @@ class MultiAgentOrchestrator:
             return GenerationResult(content=content, model=model_id)
 
         return generate
+
+    @staticmethod
+    def _metadata_reasoning_effort(metadata: Mapping[str, Any] | None) -> str | None:
+        if not isinstance(metadata, Mapping):
+            return None
+        value = metadata.get("reasoning_effort")
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        return normalized or None
 
     async def _invoke_configured_text(
         self,
@@ -2767,6 +2786,7 @@ class MultiAgentOrchestrator:
             execution_profile="subagent_research",
             tool_mode="auto",
             session_scope="research",
+            default_reasoning_effort=self._metadata_reasoning_effort(metadata),
         )
         planner_model_id = (
             selected_models_roles.get("planner")
@@ -3015,6 +3035,7 @@ class MultiAgentOrchestrator:
             execution_profile="subagent_research",
             tool_mode="auto",
             session_scope="research-synthesizer",
+            default_reasoning_effort=self._metadata_reasoning_effort(metadata),
         )
         artifacts: dict[str, Any] = {"claim_evidence_map": claim_evidence_map}
         if isinstance(updated_debate_state, dict):
@@ -3316,6 +3337,7 @@ class MultiAgentOrchestrator:
             execution_profile="verifier",
             tool_mode="auto",
             session_scope="verifier",
+            default_reasoning_effort=self._metadata_reasoning_effort(metadata),
         )
         if not verifier_model_id or not callable(generate):
             if not evidence_packets:
@@ -3614,6 +3636,7 @@ class MultiAgentOrchestrator:
             execution_profile="judge",
             tool_mode="auto",
             session_scope="judge",
+            default_reasoning_effort=self._metadata_reasoning_effort(metadata),
         )
         if not candidates or not callable(generate):
             return None

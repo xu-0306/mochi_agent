@@ -85,6 +85,16 @@ function translateExecStatus(status: string | null | undefined, t: TranslateFn):
   return translated === key ? status ?? t('common.unknown') : translated
 }
 
+function formatReasoningEffortLabel(value: api.ReasoningEffort | null): string {
+  if (!value) {
+    return 'Auto'
+  }
+  if (value === 'xhigh') {
+    return 'X-High'
+  }
+  return value.charAt(0).toUpperCase() + value.slice(1)
+}
+
 function jsonPreview(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2)
@@ -1499,6 +1509,10 @@ export default function AgentRunDetailPage() {
 
                   <div className="grid gap-2 text-sm text-muted-foreground sm:grid-cols-2">
                     <p><span className="text-foreground">Topic:</span> {run.topic || 'N/A'}</p>
+                    <p>
+                      <span className="text-foreground">Thinking Level:</span>{' '}
+                      {formatReasoningEffortLabel(run.reasoning_effort)}
+                    </p>
                     <p><span className="text-foreground">Created:</span> {formatDateTime(run.created_at)}</p>
                     <p><span className="text-foreground">Started:</span> {formatDateTime(run.started_at)}</p>
                     <p><span className="text-foreground">Finished:</span> {formatDateTime(run.finished_at)}</p>

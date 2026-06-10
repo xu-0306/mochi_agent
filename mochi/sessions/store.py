@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 
@@ -45,6 +46,16 @@ class SessionStore:
         path = self._session_path(session_id)
         return await asyncio.to_thread(self._delete_file, path)
 
+    async def replace_session(self, session_id: str, events: list[dict]) -> None:
+        """Atomically replace one session file with the provided ordered events."""
+        if not isinstance(events, list):
+            raise TypeError("events must be a list.")
+        if any(not isinstance(event, dict) for event in events):
+            raise TypeError("every event must be a dict.")
+
+        path = self._session_path(session_id)
+        await asyncio.to_thread(self._write_lines, path, events)
+
     def _session_path(self, session_id: str) -> Path:
         """根據 session_id 生成對應的 JSONL 檔案路徑。"""
         sid = session_id.strip()
@@ -66,6 +77,16 @@ class SessionStore:
             return False
         path.unlink()
         return True
+
+    def _write_lines(self, path: Path, events: list[dict]) -> None:
+        """Atomically replace the session file contents."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            for event in events:
+                fh.write(json.dumps(event, ensure_ascii=False))
+                fh.write("\n")
+        os.replace(tmp_path, path)
 
     def _load_lines(self, path: Path) -> list[dict]:
         """同步讀取 JSONL 檔案，並跳過無法解析或格式不符的行。"""

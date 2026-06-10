@@ -39,6 +39,12 @@ class UpdateSessionProjectRequest(BaseModel):
     project_id: str | None = None
 
 
+class RewriteSessionFromTurnRequest(BaseModel):
+    """Rewrite a session by removing conversation events from one turn onward."""
+
+    from_turn_id: str
+
+
 def _get_session_store(app: object, *, config: object | None = None) -> SessionStore:
     """從 app state 或 config 取得 SessionStore。"""
     existing = getattr(app.state, "session_store", None)
@@ -167,6 +173,35 @@ def _cloneable_session_events(
     raise HTTPException(status_code=404, detail="Fork turn not found")
 
 
+def _rewriteable_session_events_before_turn(
+    events: list[dict],
+    *,
+    from_turn_id: str,
+) -> list[dict]:
+    """Keep session metadata and conversation events strictly before the target turn."""
+    rewritten: list[dict] = []
+    found_target = False
+
+    for event in events:
+        if event.get("type") == "session_meta":
+            rewritten.append(dict(event))
+            continue
+
+        if event.get("turn_id") == from_turn_id:
+            found_target = True
+            continue
+
+        if found_target:
+            continue
+
+        rewritten.append(dict(event))
+
+    if not found_target:
+        raise HTTPException(status_code=404, detail="Target turn not found")
+
+    return rewritten
+
+
 async def _clear_project_from_sessions(
     app: object,
     project_id: str,
@@ -282,6 +317,36 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "events": events,
+    }
+
+
+@router.post("/sessions/{session_id}/rewrite-from-turn")
+async def rewrite_session_from_turn(
+    session_id: str,
+    payload: RewriteSessionFromTurnRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    """Rewrite one existing session by removing conversation turns from the target turn onward."""
+    target_turn_id = payload.from_turn_id.strip()
+    if not target_turn_id:
+        raise HTTPException(status_code=422, detail="from_turn_id must not be empty")
+
+    app = http_request.app
+    config = await _get_config(app)
+    store = _get_session_store(app, config=config)
+    events = await store.load_session(session_id)
+    if not events:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    rewritten = _rewriteable_session_events_before_turn(events, from_turn_id=target_turn_id)
+    await store.replace_session(session_id, rewritten)
+
+    return {
+        "type": "session",
+        "session_id": session_id,
+        "title": _session_title(session_id, rewritten),
+        "project_id": _session_project_id(rewritten),
+        "events": rewritten,
     }
 
 

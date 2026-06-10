@@ -861,6 +861,42 @@ class AgentEngine:
                 return ModelInfo(name=model_spec, backend_type="gguf", provider="local")
             return ModelInfo(name=model_spec, backend_type="safetensors", provider="local")
 
+    async def probe_active_tool_calling(self) -> dict[str, Any] | None:
+        """Probe native tool-calling support for the active backend when available."""
+        if self._initialized:
+            probe = getattr(self._router.active, "probe_tool_calling", None)
+            if callable(probe):
+                return await _maybe_await(probe())
+            return None
+
+        active_remote_provider = _active_remote_provider(self._config)
+        backend = await self._router.acquire_temporary_backend(
+            model_spec=self._config.model,
+            model_name=_active_remote_model_name(self._config),
+            provider=active_remote_provider or self._config.openai_compat.provider,
+            base_url=(
+                self._config.openai_codex.base_url
+                if active_remote_provider == "openai_codex"
+                else self._config.openai_compat.base_url
+            ),
+            api_key=(
+                self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
+                if active_remote_provider == "openai_codex"
+                else (
+                    self._config.openai_compat.api_key.get_secret_value()
+                    if self._config.openai_compat.api_key is not None
+                    else ""
+                )
+            ),
+        )
+        try:
+            probe = getattr(backend, "probe_tool_calling", None)
+            if callable(probe):
+                return await _maybe_await(probe())
+            return None
+        finally:
+            await backend.close()
+
     async def switch_ollama_backend(
         self,
         *,

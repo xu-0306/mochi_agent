@@ -157,18 +157,26 @@ function normalizeApiOrigin(origin: string): string {
   return origin.replace(/\/+$/, '')
 }
 
-function resolveApiUrl(path: string, target: RequestTarget = 'proxy'): string {
-  if (target === 'direct' && typeof window !== 'undefined') {
-    const configuredOrigin = process.env.NEXT_PUBLIC_MOCHI_API_BASE_URL?.trim()
-    if (configuredOrigin) {
-      return `${normalizeApiOrigin(configuredOrigin)}${API_BASE}${path}`
-    }
+function resolveDirectApiOrigin(): string {
+  const configuredOrigin = process.env.NEXT_PUBLIC_MOCHI_API_BASE_URL?.trim()
+  if (configuredOrigin) {
+    return normalizeApiOrigin(configuredOrigin)
+  }
 
-    const { hostname, port, protocol } = window.location
+  if (typeof window !== 'undefined') {
+    const { hostname, port, protocol, origin } = window.location
     if ((hostname === 'localhost' || hostname === '127.0.0.1') && port === '3000') {
-      return `${protocol}//127.0.0.1:8000${API_BASE}${path}`
+      return `${protocol}//127.0.0.1:8000`
     }
-    return `${LOCAL_DEV_API_ORIGIN}${API_BASE}${path}`
+    return normalizeApiOrigin(origin)
+  }
+
+  return LOCAL_DEV_API_ORIGIN
+}
+
+function resolveApiUrl(path: string, target: RequestTarget = 'proxy'): string {
+  if (target === 'direct') {
+    return `${resolveDirectApiOrigin()}${API_BASE}${path}`
   }
 
   return `${API_BASE}${path}`
@@ -182,7 +190,10 @@ function isLocalModelSpec(model?: string | null): boolean {
 }
 
 export function resolveChatStreamTarget(options: SendMessageOptions = {}): RequestTarget {
-  return isLocalModelSpec(options.model) ? 'direct' : 'proxy'
+  void options
+  // Next.js dev rewrites can buffer SSE until completion, which hides live
+  // reasoning/tool events. Chat streams should go straight to the backend.
+  return 'direct'
 }
 
 export function resolveChatTarget(options: Pick<SendMessageOptions, 'model'> = {}): RequestTarget {
@@ -1707,6 +1718,10 @@ export async function fetchSession(sessionId: string): Promise<SessionDetail> {
     `/sessions/${encodeURIComponent(sessionId)}`
   )
 
+  return normalizeSessionDetail(payload)
+}
+
+function normalizeSessionDetail(payload: BackendSessionResponse): SessionDetail {
   const events = getRecordArray(payload.events).map(normalizeSessionEvent)
   const updatedAt =
     [...events]
@@ -1723,6 +1738,21 @@ export async function fetchSession(sessionId: string): Promise<SessionDetail> {
     projectId: getString(payload.project_id) ?? null,
     events,
   }
+}
+
+export async function rewriteSessionFromTurn(
+  sessionId: string,
+  fromTurnId: string
+): Promise<SessionDetail> {
+  const payload = await requestJson<BackendSessionResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}/rewrite-from-turn`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ from_turn_id: fromTurnId }),
+    }
+  )
+
+  return normalizeSessionDetail(payload)
 }
 
 interface BackendCreateSessionResponse {
@@ -1943,6 +1973,12 @@ interface BackendModelsStatus {
   configured_remote_provider?: string | null
 }
 
+interface BackendToolCallingProbeResponse {
+  type: 'tool_calling_probe'
+  active_model: BackendModelInfo | null
+  probe?: Record<string, ApiValue> | null
+}
+
 export interface ModelInfo {
   id: string
   name: string
@@ -2036,6 +2072,12 @@ export interface DeleteModelEntryResult {
   configuredModel: string
   persisted: boolean
   configPath: string | null
+}
+
+export interface ToolCallingProbeResult {
+  type: 'tool_calling_probe'
+  activeModel: ModelInfo | null
+  probe: Record<string, ApiValue> | null
 }
 
 interface BackendOpenAICodexAuthProfile {
@@ -2237,6 +2279,18 @@ export async function fetchModels(): Promise<ModelInfo[]> {
     return status.availableModels
   }
   return status.activeModel ? [status.activeModel] : []
+}
+
+export async function probeToolCalling(): Promise<ToolCallingProbeResult> {
+  const payload = await requestJson<BackendToolCallingProbeResponse>('/models/probe-tool-calling', {
+    method: 'POST',
+  })
+
+  return {
+    type: payload.type,
+    activeModel: normalizeModelInfo(payload.active_model),
+    probe: isRecord(payload.probe) ? payload.probe as Record<string, ApiValue> : null,
+  }
 }
 
 interface BackendModelSwitchResponse {
@@ -4613,6 +4667,7 @@ export interface AgentRunSummary {
   protocol_id: string
   title: string | null
   topic: string | null
+  reasoning_effort: ReasoningEffort | null
   status: string
   selected_models_roles: Record<string, unknown>
   evaluation_policy: Record<string, unknown>
@@ -4683,6 +4738,7 @@ export interface CreateAgentRunInput {
   protocol_id: AgentRunProtocolId
   title?: string | null
   topic?: string | null
+  reasoning_effort?: ReasoningEffort | null
   subagents?: AgentRunSubagentInput[]
   selected_models_roles?: Record<string, unknown>
   evaluation_policy?: Record<string, unknown>
@@ -4772,11 +4828,13 @@ function normalizeAgentRunArtifact(payload: unknown): AgentRunArtifact | null {
 
 function normalizeAgentRunSummary(payload: unknown): AgentRunSummary {
   const record = isRecord(payload) ? payload : {}
+  const reasoningEffort = getString(record.reasoning_effort)
   return {
     run_id: getString(record.run_id) ?? '',
     protocol_id: getString(record.protocol_id) ?? '',
     title: getNullableString(record.title),
     topic: getNullableString(record.topic),
+    reasoning_effort: isReasoningEffort(reasoningEffort) ? reasoningEffort : null,
     status: getString(record.status) ?? 'unknown',
     selected_models_roles: isRecord(record.selected_models_roles)
       ? record.selected_models_roles
@@ -5005,6 +5063,7 @@ export async function createAgentRun(input: CreateAgentRunInput): Promise<AgentR
       protocol_id: input.protocol_id,
       title: input.title ?? null,
       topic: input.topic ?? null,
+      reasoning_effort: input.reasoning_effort ?? null,
       selected_models_roles: builtSelectedModelsRoles,
       evaluation_policy: input.evaluation_policy ?? {},
       run_policy: input.run_policy ?? {},

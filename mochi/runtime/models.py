@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from mochi.backends.inference_capabilities import ReasoningEffort
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -47,6 +48,7 @@ class AgentRunCreateRequest(BaseModel):
     protocol_id: str = Field(min_length=1)
     title: str | None = None
     topic: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
     selected_models_roles: dict[str, Any] = Field(default_factory=dict)
     evaluation_policy: dict[str, Any] = Field(default_factory=dict)
     run_policy: dict[str, Any] = Field(default_factory=dict)
@@ -80,6 +82,7 @@ class AgentRunResponse(BaseModel):
     protocol_id: str
     title: str | None = None
     topic: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
     status: str
     selected_models_roles: dict[str, Any] = Field(default_factory=dict)
     evaluation_policy: dict[str, Any] = Field(default_factory=dict)

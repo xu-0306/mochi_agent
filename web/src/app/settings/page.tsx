@@ -575,6 +575,31 @@ function inferProviderChoice(value: string | null | undefined): ProviderChoice |
   return isProviderChoice(prefix) ? prefix : null
 }
 
+function toolCallModeLabel(mode: string | null | undefined): string {
+  if (mode === 'simulated_fallback') {
+    return 'Simulated Fallback'
+  }
+  if (mode === 'native') {
+    return 'Native'
+  }
+  return 'Unknown'
+}
+
+function modelToolCallingMetadata(modelInfo: api.ModelInfo | null | undefined): {
+  mode: string | null
+  status: string | null
+  message: string | null
+  checkedAt: string | null
+} {
+  const metadata = modelInfo?.metadata
+  return {
+    mode: typeof metadata?.tool_call_mode === 'string' ? metadata.tool_call_mode : null,
+    status: typeof metadata?.native_tool_calling_status === 'string' ? metadata.native_tool_calling_status : null,
+    message: typeof metadata?.native_tool_calling_message === 'string' ? metadata.native_tool_calling_message : null,
+    checkedAt: typeof metadata?.native_tool_calling_checked_at === 'string' ? metadata.native_tool_calling_checked_at : null,
+  }
+}
+
 function modelInfoId(modelInfo: api.ModelInfo): string {
   return modelInfo.id || modelInfo.modelSpec || modelInfo.name
 }
@@ -753,9 +778,9 @@ function configuredModelRecordFromModelInfo(modelInfo: api.ModelInfo): Record<st
   }
 }
 
-function updateSettingsModelEntries(
+function updateSavedModelsInSettings(
   current: api.Settings | null,
-  availableModels: api.ModelInfo[],
+  savedModels: api.ModelInfo[],
   configuredModel: string
 ): api.Settings | null {
   if (!current) {
@@ -767,7 +792,7 @@ function updateSettingsModelEntries(
     model: configuredModel,
     model_setup: {
       ...(current.model_setup ?? {}),
-      configured_models: availableModels.map(configuredModelRecordFromModelInfo),
+      configured_models: savedModels.map(configuredModelRecordFromModelInfo),
     },
   }
 }
@@ -2330,6 +2355,14 @@ function ModelConnectionForm({
   const initialProvider = configuredProvider(modelConfig, configuredModel)
   const [provider, setProvider] = React.useState<ProviderChoice>(initialProvider)
   const currentProvider = providerOption(provider)
+  const activeModelInfo = React.useMemo(
+    () => activeConfiguredModel(settings, models),
+    [settings, models]
+  )
+  const activeToolCallingInfo = React.useMemo(
+    () => modelToolCallingMetadata(activeModelInfo),
+    [activeModelInfo]
+  )
   const contextLengthTarget = React.useMemo(
     () => resolveContextLengthSettingsTarget(settings),
     [settings]
@@ -2382,6 +2415,10 @@ function ModelConnectionForm({
   const [editingApiKey, setEditingApiKey] = React.useState('')
   const [entrySubmitting, setEntrySubmitting] = React.useState(false)
   const [entryMessage, setEntryMessage] = React.useState<FormMessage>(null)
+  const [toolProbeBusy, setToolProbeBusy] = React.useState(false)
+  const [toolProbeMessage, setToolProbeMessage] = React.useState<FormMessage>(null)
+  const [toolProbeResult, setToolProbeResult] = React.useState<Record<string, unknown> | null>(null)
+  const savedModels = React.useMemo(() => configuredModelsFromSettings(settings), [settings])
   const discoveryKeyRef = React.useRef(`${initialProvider}:${baseUrl}`)
   const openAICodexPopupRef = React.useRef<Window | null>(null)
   const localModelOptions = React.useMemo(
@@ -3096,6 +3133,46 @@ function ModelConnectionForm({
     }
   }
 
+  const handleProbeToolCalling = async () => {
+    setToolProbeBusy(true)
+    setToolProbeMessage(null)
+    try {
+      if (typeof api.probeToolCalling !== 'function') {
+        throw new Error('Tool-calling probe API client is unavailable.')
+      }
+      const result = await api.probeToolCalling()
+      setToolProbeResult(asRecord(result.probe))
+      const probedActiveModel = result.activeModel
+      if (probedActiveModel) {
+        setModels((current) => {
+          const next = [...current]
+          const activeId = modelInfoId(probedActiveModel)
+          const index = next.findIndex((entry) => modelInfoId(entry) === activeId)
+          if (index >= 0) {
+            next[index] = probedActiveModel
+            return next
+          }
+          return [probedActiveModel, ...next]
+        })
+      }
+
+      const status = typeof result.probe?.status === 'string' ? result.probe.status : 'unknown'
+      const detail = typeof result.probe?.message === 'string' ? result.probe.message : 'Probe finished.'
+      setToolProbeMessage({
+        type: status === 'supported' ? 'success' : 'error',
+        text: `${status}: ${detail}`,
+      })
+    } catch (probeError) {
+      setToolProbeResult(null)
+      setToolProbeMessage({
+        type: 'error',
+        text: messageWithDetail('Failed to probe native tool calling', probeError),
+      })
+    } finally {
+      setToolProbeBusy(false)
+    }
+  }
+
   const handleSaveLocalMountPolicy = async () => {
     setLocalMountBusy(true)
     setLocalMountMessage(null)
@@ -3327,7 +3404,7 @@ function ModelConnectionForm({
       })
       const availableModels = result.availableModels
       setModels(availableModels)
-      setSettings((current) => updateSettingsModelEntries(current, availableModels, result.configuredModel))
+      setSettings((current) => updateSavedModelsInSettings(current, availableModels, result.configuredModel))
       notifyModelsUpdated()
       setEntryMessage({ type: 'success', text: t('settings.savedModels.successUpdate') })
       setEditingModelId(null)
@@ -3352,7 +3429,7 @@ function ModelConnectionForm({
       const result = await settingsApi.deleteModelEntry(modelId, true)
       const availableModels = result.availableModels
       setModels(availableModels)
-      setSettings((current) => updateSettingsModelEntries(current, availableModels, result.configuredModel))
+      setSettings((current) => updateSavedModelsInSettings(current, availableModels, result.configuredModel))
       notifyModelsUpdated()
       if (editingModelId === modelId) {
         setEditingModelId(null)
@@ -3627,6 +3704,59 @@ function ModelConnectionForm({
           {providerNote(currentProvider.value, t)}
         </div>
 
+        {activeModelInfo && activeModelInfo.backendType === 'openai_compat' ? (
+          <div className="space-y-3 rounded-md border border-border bg-canvas px-3 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold text-foreground">Tool Calling</p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Diagnose whether the active remote endpoint is using native structured tools or Mochi fallback simulation.
+                </p>
+              </div>
+              <Badge variant={activeToolCallingInfo.mode === 'native' ? 'success' : 'neutral'}>
+                {toolCallModeLabel(activeToolCallingInfo.mode)}
+              </Badge>
+            </div>
+
+            <div className="space-y-1 text-xs text-muted-foreground">
+              <p>
+                <span className="font-medium text-foreground">Native status:</span>{' '}
+                {typeof toolProbeResult?.status === 'string'
+                  ? toolProbeResult.status
+                  : (activeToolCallingInfo.status ?? 'unknown')}
+              </p>
+              {(typeof toolProbeResult?.message === 'string' || activeToolCallingInfo.message) ? (
+                <p>
+                  {typeof toolProbeResult?.message === 'string'
+                    ? toolProbeResult.message
+                    : activeToolCallingInfo.message}
+                </p>
+              ) : null}
+              {(typeof toolProbeResult?.checked_at === 'string' || activeToolCallingInfo.checkedAt) ? (
+                <p className="font-mono text-[11px]">
+                  checked: {typeof toolProbeResult?.checked_at === 'string'
+                    ? toolProbeResult.checked_at
+                    : activeToolCallingInfo.checkedAt}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                loading={toolProbeBusy}
+                onClick={() => void handleProbeToolCalling()}
+              >
+                Probe Native Tool Calling
+              </Button>
+            </div>
+
+            <SettingMessage message={toolProbeMessage} />
+          </div>
+        ) : null}
+
         {contextLengthTarget.kind ? (
           <div className="space-y-3 rounded-md border border-border bg-canvas px-3 py-3">
             <div className="flex items-start justify-between gap-3">
@@ -3781,10 +3911,10 @@ function ModelConnectionForm({
 
         <div className="space-y-2 rounded-md border border-border bg-canvas px-3 py-3">
           <p className="text-xs font-semibold text-foreground">{t('settings.savedModels.title')}</p>
-          {models.length === 0 ? (
+          {savedModels.length === 0 ? (
             <p className="text-xs text-muted-foreground">{t('settings.savedModels.none')}</p>
           ) : (
-            models.map((entry) => {
+            savedModels.map((entry) => {
               const id = modelInfoId(entry)
               const isEditing = editingModelId === id
               const entryProvider = (entry.provider && isProviderChoice(entry.provider))

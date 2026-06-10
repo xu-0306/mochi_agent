@@ -15,6 +15,7 @@ from mochi.agents.multi_agent.execution_policy import (
 )
 from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunRequest
 from mochi.api.routes.chat import _serialize_event
+from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config.schema import SecurityConfig
 from mochi.learning.dataset_exporter import export_run_to_dataset_records
 from mochi.runtime.agent_run_packages import (
@@ -260,6 +261,9 @@ class RuntimeService:
             payload.run_policy,
             defaults=_default_agent_run_policy_from_security(self._security_config),
         )
+        summary = dict(payload.summary)
+        if payload.reasoning_effort is not None:
+            summary["reasoning_effort"] = payload.reasoning_effort
         run = await self._store.create_agent_run(
             run_id=run_id,
             protocol_id=payload.protocol_id,
@@ -269,7 +273,7 @@ class RuntimeService:
             evaluation_policy=payload.evaluation_policy,
             run_policy=run_policy,
             schedule=schedule,
-            summary=payload.summary,
+            summary=summary,
             latest_error=payload.latest_error,
             evidence_status=payload.evidence_status,
             artifacts=[artifact.model_dump() for artifact in payload.artifacts],
@@ -886,11 +890,13 @@ class RuntimeService:
                 run_id=run_id,
                 task_input=_agent_run_task_input(run),
                 protocol=protocol_payload,
+                reasoning_effort=_agent_run_reasoning_effort(run),
                 guidance_messages=await self._collect_guidance_messages(run_id),
                 run_policy=run.get("run_policy") if isinstance(run.get("run_policy"), dict) else {},
                 metadata={
                     "title": run.get("title"),
                     "topic": run.get("topic"),
+                    "reasoning_effort": _agent_run_reasoning_effort(run),
                     "selected_models_roles": run.get("selected_models_roles") or {},
                     "evaluation_policy": run.get("evaluation_policy") or {},
                     "schedule": run.get("schedule") or {},
@@ -1767,8 +1773,10 @@ class RuntimeService:
                 run_id=task_id,
                 task_input=str(task.get("input") or ""),
                 protocol={"protocol": protocol_id, **protocol_config, "execution_policy": execution_policy},
+                reasoning_effort=_coerce_reasoning_effort(metadata.get("reasoning_effort")),
                 guidance_messages=[],
                 metadata={
+                    "reasoning_effort": _coerce_reasoning_effort(metadata.get("reasoning_effort")),
                     "selected_models_roles": selected_models_roles,
                     "summary": metadata,
                     "execution_policy": execution_policy,
@@ -2553,11 +2561,13 @@ def _build_agent_run_partial_summary(
 
 def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
     summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    reasoning_effort = _coerce_reasoning_effort(summary.get("reasoning_effort"))
     return {
         "run_id": run["id"],
         "protocol_id": run["protocol_id"],
         "title": run.get("title"),
         "topic": run.get("topic"),
+        "reasoning_effort": reasoning_effort,
         "status": run.get("status", "created"),
         "selected_models_roles": run.get("selected_models_roles") or {},
         "evaluation_policy": run.get("evaluation_policy") or {},
@@ -2574,6 +2584,30 @@ def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
         "started_at": run.get("started_at"),
         "finished_at": run.get("finished_at"),
     }
+
+
+def _coerce_reasoning_effort(value: Any) -> ReasoningEffort | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized == "none":
+        return "none"
+    if normalized == "minimal":
+        return "minimal"
+    if normalized == "low":
+        return "low"
+    if normalized == "medium":
+        return "medium"
+    if normalized == "high":
+        return "high"
+    if normalized == "xhigh":
+        return "xhigh"
+    return None
+
+
+def _agent_run_reasoning_effort(run: dict[str, Any]) -> ReasoningEffort | None:
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    return _coerce_reasoning_effort(summary.get("reasoning_effort"))
 
 
 def _resolve_protocol_payload(run: dict[str, Any]) -> dict[str, Any]:

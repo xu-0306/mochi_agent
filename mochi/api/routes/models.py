@@ -59,6 +59,7 @@ from mochi.backends.vllm_utils import (
 )
 from mochi.config.manager import save_config
 from mochi.config.schema import ConfiguredModelConfig, MochiConfig
+from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 
 router = APIRouter(prefix="/v1")
 
@@ -198,6 +199,7 @@ class DeleteConfiguredModelResponse(BaseModel):
     deleted_model_id: str
     available_models: list[dict[str, Any]] = Field(default_factory=list)
     configured_model: str
+    diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     persisted: bool = False
     config_path: str | None = None
 
@@ -358,6 +360,14 @@ class VLLMRuntimeControlResponse(BaseModel):
     runtime_status: VLLMRuntimeStatusResponse
 
 
+class ToolCallingProbeResponse(BaseModel):
+    """`POST /v1/models/probe-tool-calling` response payload."""
+
+    type: str = "tool_calling_probe"
+    active_model: dict[str, Any] | None = None
+    probe: dict[str, Any] | None = None
+
+
 @router.get("/models", response_model=ModelsResponse)
 async def get_models(request: Request) -> ModelsResponse:
     """?豯止齒 configured model?蹓澗??皝僱???獢???????????"""
@@ -373,6 +383,23 @@ async def get_models(request: Request) -> ModelsResponse:
         active_model=active_model,
         available_models=_serialize_configured_models(config),
         configured_remote_provider=_active_remote_provider_from_config(config),
+    )
+
+
+@router.post("/models/probe-tool-calling", response_model=ToolCallingProbeResponse)
+async def probe_tool_calling(request: Request) -> ToolCallingProbeResponse:
+    """Run an on-demand native tool-calling probe for the active backend when supported."""
+    config = await _get_config(request.app)
+    engine = await _get_or_create_engine(request.app)
+    probe_method = getattr(engine, "probe_active_tool_calling", None)
+    probe_result = await _maybe_await(probe_method()) if callable(probe_method) else None
+    active_model = await _load_active_model_info(
+        request,
+        configured_model=_find_active_configured_model(config),
+    )
+    return ToolCallingProbeResponse(
+        active_model=active_model,
+        probe=probe_result,
     )
 
 
@@ -1023,6 +1050,7 @@ async def delete_configured_model(
 ) -> DeleteConfiguredModelResponse:
     """??畸?????殉朵??????朝?"""
     config = await _get_config(request.app)
+    diagnostics: list[dict[str, Any]] = []
     target_id = model_id.strip()
     if not target_id:
         raise HTTPException(status_code=400, detail="model_id is required.")
@@ -1043,17 +1071,47 @@ async def delete_configured_model(
         if remaining:
             fallback = remaining[0]
             updated = _apply_configured_model_to_config(updated, fallback)
+            append_fallback_diagnostic(
+                diagnostics,
+                category="model_selection",
+                name="active_configured_model_deleted",
+                reason="deleted_active_model_switched_to_saved_model",
+                kind="fallback",
+                severity="warning",
+                from_state=existing.id,
+                to_state=fallback.id,
+                metadata={
+                    "from_model_spec": existing.model_spec,
+                    "to_model_spec": fallback.model_spec,
+                },
+            )
         else:
-            fallback_configured = _configured_model_from_config(updated)
-            updated.model = fallback_configured.model_spec
+            updated.model = updated.model_setup.default_model_spec
+            append_fallback_diagnostic(
+                diagnostics,
+                category="model_selection",
+                name="active_configured_model_deleted",
+                reason="deleted_active_model_switched_to_default_model",
+                kind="fallback",
+                severity="warning",
+                from_state=existing.id,
+                to_state=updated.model_setup.default_model_spec,
+                metadata={"from_model_spec": existing.model_spec},
+            )
 
     request.app.state.config = updated
+    engine = await _get_or_create_engine(request.app)
+    apply_config = getattr(engine, "apply_config", None)
+    if callable(apply_config):
+        await _maybe_await(apply_config(updated, reload_voice=False))
+
     should_persist = True if payload is None else payload.persist
     persisted_path = _persist_config_if_enabled(request, updated, should_persist)
     return DeleteConfiguredModelResponse(
         deleted_model_id=existing.id,
         available_models=_dump_saved_configured_models(updated),
         configured_model=str(updated.model),
+        diagnostics=diagnostics,
         persisted=persisted_path is not None,
         config_path=str(persisted_path) if persisted_path is not None else None,
     )

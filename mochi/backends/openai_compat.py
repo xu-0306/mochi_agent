@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -26,6 +27,7 @@ from mochi.backends.types import (
     ToolCall,
     ToolSchema,
 )
+from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,9 @@ class OpenAICompatBackend(BaseLLMBackend):
         self.provider = provider
         self._tool_calling_enabled = True
         self._tool_call_simulator = ToolCallSimulator()
+        self._native_tool_probe: dict[str, Any] | None = None
+        self._responses_chat_completions_alias = False
+        self._fallback_diagnostics: list[dict[str, Any]] = []
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def generate(
@@ -102,39 +107,51 @@ class OpenAICompatBackend(BaseLLMBackend):
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
         prepared_messages = self._prepare_messages(messages, tools)
-        payload = (
-            self._build_responses_payload(
-                prepared_messages,
-                tools,
-                temperature,
-                max_tokens,
-                top_p,
-                frequency_penalty,
-                presence_penalty,
-                reasoning_effort,
-                stream,
-            )
-            if self._api_mode == "responses"
-            else self._build_chat_completions_payload(
-                prepared_messages,
-                tools,
-                temperature,
-                max_tokens,
-                top_p,
-                frequency_penalty,
-                presence_penalty,
-                reasoning_effort,
-                stream,
-            )
+        chat_payload = self._build_chat_completions_payload(
+            prepared_messages,
+            tools,
+            temperature,
+            max_tokens,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
+            reasoning_effort,
+            stream,
+        )
+
+        if self._uses_chat_completions_transport():
+            if stream:
+                return self._stream_generate(chat_payload)
+            return await self._blocking_generate(chat_payload)
+
+        responses_payload = self._build_responses_payload(
+            prepared_messages,
+            tools,
+            temperature,
+            max_tokens,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
+            reasoning_effort,
+            stream,
         )
 
         if stream:
-            return self._stream_generate(payload)
-        return await self._blocking_generate(payload)
+            return self._stream_generate(responses_payload)
+        return await self._blocking_generate_with_responses_alias_fallback(
+            responses_payload,
+            chat_payload,
+        )
 
     def supports_tool_calling(self) -> bool:
         """OpenAI-compatible 端點通常支援 tool calling。"""
         return self._tool_calling_enabled
+
+    def _tool_call_mode(self) -> str:
+        return "native" if self._tool_calling_enabled else "simulated_fallback"
+
+    def _uses_chat_completions_transport(self) -> bool:
+        return self._api_mode == "chat_completions" or self._responses_chat_completions_alias
 
     def get_model_info(self) -> ModelInfo:
         """回傳目前模型資訊。"""
@@ -157,6 +174,21 @@ class OpenAICompatBackend(BaseLLMBackend):
                 "api_url": self._request_url,
                 "api_mode": self._api_mode,
                 "provider": self.provider,
+                "request_shape": "chat_completions"
+                if self._uses_chat_completions_transport()
+                else "responses",
+                "responses_alias_detected": self._responses_chat_completions_alias,
+                "tool_call_mode": self._tool_call_mode(),
+                "native_tool_calling_status": self._native_tool_probe.get("status")
+                if isinstance(self._native_tool_probe, dict)
+                else "unknown",
+                "native_tool_calling_message": self._native_tool_probe.get("message")
+                if isinstance(self._native_tool_probe, dict)
+                else None,
+                "native_tool_calling_checked_at": self._native_tool_probe.get("checked_at")
+                if isinstance(self._native_tool_probe, dict)
+                else None,
+                "fallback_diagnostics": list(self._fallback_diagnostics),
                 **capabilities.to_metadata(),
             },
         )
@@ -170,7 +202,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                     headers=self._build_headers(),
                     timeout=5.0,
                 )
-                if resp.status_code == 200:
+                if 200 <= resp.status_code < 500:
                     return True
             except Exception as exc:
                 logger.debug(f"OpenAI-compatible health check failed on {url}: {exc}")
@@ -190,10 +222,72 @@ class OpenAICompatBackend(BaseLLMBackend):
             raise self._wrap_request_error(exc, stage="generate") from exc
 
         data = resp.json()
-        if self._api_mode == "responses":
+        if not self._uses_chat_completions_transport() and self._api_mode == "responses":
             return self._parse_responses_result(data)
 
         return self._parse_chat_completions_result(data)
+
+    async def _blocking_generate_with_responses_alias_fallback(
+        self,
+        responses_payload: dict[str, Any],
+        chat_payload: dict[str, Any],
+    ) -> GenerationResult:
+        try:
+            resp = await self._post_json(responses_payload)
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                f"OpenAI-compatible API error {exc.response.status_code}: {exc.response.text}"
+            )
+            raise self._wrap_request_error(exc, stage="generate") from exc
+        except httpx.RequestError as exc:
+            logger.error(f"OpenAI-compatible connection error: {exc}")
+            raise self._wrap_request_error(exc, stage="generate") from exc
+
+        data = resp.json()
+        if _looks_like_chat_completions_response(data):
+            result = self._parse_chat_completions_result(data)
+            if self._has_generation_output(result):
+                logger.info(
+                    "Detected chat-completions-compatible payloads on responses endpoint %s; switching transport.",
+                    self._request_url,
+                )
+                self._enable_responses_alias(
+                    reason="responses_endpoint_returned_chat_completions_response",
+                    metadata={"stage": "blocking_generate"},
+                )
+                return result
+
+        result = self._parse_responses_result(data)
+        if self._has_generation_output(result):
+            return result
+
+        logger.warning(
+            "Responses endpoint %s returned an empty result; retrying with chat-completions payload.",
+            self._request_url,
+        )
+        try:
+            retry_resp = await self._post_json(chat_payload)
+            retry_result = self._parse_chat_completions_result(retry_resp.json())
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Chat-completions alias retry failed for responses endpoint %s: %s",
+                self._request_url,
+                exc,
+            )
+            return result
+
+        if self._has_generation_output(retry_result):
+            logger.info(
+                "Responses endpoint %s accepted chat-completions payloads; caching alias transport.",
+                self._request_url,
+            )
+            self._enable_responses_alias(
+                reason="responses_endpoint_required_chat_completions_retry",
+                metadata={"stage": "blocking_generate"},
+            )
+            return retry_result
+
+        return result
 
     async def _post_json(self, payload: dict[str, Any]) -> httpx.Response:
         try:
@@ -205,12 +299,20 @@ class OpenAICompatBackend(BaseLLMBackend):
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if self._should_retry_without_tools(exc, payload):
+                self._record_native_tool_probe(
+                    status="rejected_missing_parser",
+                    message="vLLM rejected native auto tool choice. Enable --enable-auto-tool-choice and --tool-call-parser.",
+                    extra={
+                        "http_status": exc.response.status_code,
+                        "response_text": exc.response.text,
+                    },
+                    enable_native=False,
+                )
                 logger.warning(
                     "Disabling tool calling for provider=%s model=%s after automatic tool choice was rejected.",
                     self.provider,
                     self.model,
                 )
-                self._tool_calling_enabled = False
                 retry_payload = dict(payload)
                 retry_payload.pop("tools", None)
                 retry_payload.pop("tool_choice", None)
@@ -224,13 +326,186 @@ class OpenAICompatBackend(BaseLLMBackend):
             raise
         return resp
 
+    def _record_native_tool_probe(
+        self,
+        *,
+        status: str,
+        message: str,
+        extra: dict[str, Any] | None = None,
+        enable_native: bool | None = None,
+    ) -> dict[str, Any]:
+        previous_tool_calling_enabled = self._tool_calling_enabled
+        payload: dict[str, Any] = {
+            "status": status,
+            "message": message,
+            "checked_at": datetime.now(UTC).isoformat(),
+        }
+        if extra:
+            payload.update(extra)
+        if enable_native is not None:
+            self._tool_calling_enabled = enable_native
+        if enable_native is not None and enable_native != previous_tool_calling_enabled:
+            append_fallback_diagnostic(
+                self._fallback_diagnostics,
+                category="tool_calling",
+                name=(
+                    "native_tool_calling_recovered"
+                    if enable_native
+                    else "native_tool_calling_disabled"
+                ),
+                reason=status,
+                kind="recovery" if enable_native else "fallback",
+                severity="info" if enable_native else "warning",
+                from_state="simulated_fallback" if enable_native else "native",
+                to_state="native" if enable_native else "simulated_fallback",
+                metadata={
+                    "provider": self.provider,
+                    "model": self.model,
+                    **(extra or {}),
+                },
+            )
+        self._native_tool_probe = payload
+        return payload
+
+    def _enable_responses_alias(
+        self,
+        *,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self._responses_chat_completions_alias:
+            return
+        self._responses_chat_completions_alias = True
+        append_fallback_diagnostic(
+            self._fallback_diagnostics,
+            category="transport",
+            name="responses_alias_transport",
+            reason=reason,
+            kind="fallback",
+            severity="warning",
+            from_state="responses",
+            to_state="chat_completions",
+            metadata={
+                "request_url": self._request_url,
+                **(metadata or {}),
+            },
+        )
+
+    async def probe_tool_calling(self) -> dict[str, Any] | None:
+        if not self._uses_chat_completions_transport() and self._api_mode != "responses":
+            return self._record_native_tool_probe(
+                status="unsupported_api_mode",
+                message=f"Native tool-calling probe only supports chat_completions mode, got {self._api_mode}.",
+            )
+
+        probe_tool = ToolSchema(
+            name="mochi_tool_probe",
+            description="Diagnostic probe tool. Echo the requested value.",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+        capabilities = resolve_model_inference_capabilities(self.get_model_info())
+        supported = set(capabilities.supported_inference_parameters)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are running a native tool-calling diagnostics probe. "
+                        "Call the mochi_tool_probe tool exactly once with {\"value\":\"ok\"}. "
+                        "Do not answer in plain text."
+                    ),
+                },
+                {"role": "user", "content": "Run the diagnostic tool probe now."},
+            ],
+            "tools": [probe_tool.to_dict()],
+            "tool_choice": "auto",
+            "stream": False,
+        }
+        if "temperature" in supported:
+            payload["temperature"] = 0.0
+        if "max_tokens" in supported:
+            payload["max_tokens"] = 96
+
+        try:
+            response = await self._client.post(
+                self._request_url,
+                json=payload,
+                headers=self._build_headers(),
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if self._should_retry_without_tools(exc, payload):
+                return self._record_native_tool_probe(
+                    status="rejected_missing_parser",
+                    message="vLLM rejected native auto tool choice. Enable --enable-auto-tool-choice and --tool-call-parser.",
+                    extra={
+                        "http_status": exc.response.status_code,
+                        "response_text": exc.response.text,
+                    },
+                    enable_native=False,
+                )
+            return self._record_native_tool_probe(
+                status="http_error",
+                message=f"Native tool-calling probe failed with HTTP {exc.response.status_code}.",
+                extra={
+                    "http_status": exc.response.status_code,
+                    "response_text": exc.response.text,
+                },
+            )
+        except httpx.RequestError as exc:
+            return self._record_native_tool_probe(
+                status="request_error",
+                message=str(exc),
+            )
+
+        data = response.json()
+        choices = data.get("choices", [])
+        choice0 = choices[0] if isinstance(choices, list) and choices else {}
+        message = choice0.get("message", {}) if isinstance(choice0, dict) else {}
+        if not isinstance(message, dict):
+            message = {}
+        tool_calls = self._parse_tool_calls(message.get("tool_calls", []))
+        if tool_calls:
+            if self._api_mode == "responses":
+                self._enable_responses_alias(
+                    reason="responses_probe_returned_native_chat_tool_calls",
+                    metadata={"stage": "probe_tool_calling"},
+                )
+            return self._record_native_tool_probe(
+                status="supported",
+                message="Native structured tool calling succeeded.",
+                extra={"tool_calls": len(tool_calls)},
+                enable_native=True,
+            )
+
+        content = self._normalize_chat_message_content(message)
+        if "<tool_call>" in content:
+            return self._record_native_tool_probe(
+                status="text_tool_call_only",
+                message="Model emitted text-form tool calls, but the endpoint did not return native tool_calls.",
+                enable_native=False,
+            )
+
+        return self._record_native_tool_probe(
+            status="no_tool_calls",
+            message="Probe completed without any native tool_calls in the response.",
+            extra={"response_preview": content[:240]},
+            enable_native=False,
+        )
+
     def _prepare_messages(
         self,
         messages: list[Message],
         tools: list[ToolSchema] | None,
     ) -> list[Message]:
         prepared = [Message(**message.__dict__) for message in messages]
-        if self._tool_calling_enabled or not tools or self._api_mode != "chat_completions":
+        if self._tool_calling_enabled or not tools or not self._uses_chat_completions_transport():
             return prepared
 
         prepared = self._flatten_simulated_tool_messages(prepared)
@@ -316,12 +591,13 @@ class OpenAICompatBackend(BaseLLMBackend):
 
     async def _stream_generate(self, payload: dict[str, Any]) -> AsyncIterator[StreamChunk]:
         """執行串流生成（SSE / JSON lines）。"""
-        if self._api_mode == "responses":
+        if not self._uses_chat_completions_transport():
             async for chunk in self._stream_responses_generate(payload):
                 yield chunk
             return
 
         emitted_final = False
+        reasoning_stream_open = False
         tool_call_buffers: dict[int, dict[str, str]] = {}
 
         try:
@@ -440,6 +716,8 @@ class OpenAICompatBackend(BaseLLMBackend):
     async def _stream_responses_generate(self, payload: dict[str, Any]) -> AsyncIterator[StreamChunk]:
         """執行 Responses API 串流生成。"""
         emitted_final = False
+        reasoning_stream_open = False
+        tool_call_buffers: dict[int, dict[str, str]] = {}
         try:
             async with self._client.stream(
                 "POST",
@@ -461,6 +739,45 @@ class OpenAICompatBackend(BaseLLMBackend):
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+
+                    if _looks_like_chat_completions_response(data):
+                        self._enable_responses_alias(
+                            reason="responses_stream_returned_chat_completions_delta",
+                            metadata={"stage": "stream_generate"},
+                        )
+                        choices: list[dict[str, Any]] = data.get("choices", [])
+                        if not choices:
+                            continue
+
+                        choice0 = choices[0]
+                        delta_obj = choice0.get("delta", {})
+
+                        text_delta, reasoning_stream_open = self._normalize_chat_delta(
+                            delta_obj,
+                            reasoning_stream_open=reasoning_stream_open,
+                        )
+
+                        tool_call_delta = self._parse_tool_call_delta(
+                            delta_obj.get("tool_calls"),
+                            tool_call_buffers,
+                        )
+
+                        finish_reason = choice0.get("finish_reason")
+                        is_final = finish_reason is not None
+                        if is_final and reasoning_stream_open:
+                            text_delta += "</think>"
+                            reasoning_stream_open = False
+                        if is_final:
+                            emitted_final = True
+
+                        if text_delta or tool_call_delta is not None or is_final:
+                            yield StreamChunk(
+                                delta=text_delta,
+                                tool_call_delta=tool_call_delta,
+                                is_final=is_final,
+                                finish_reason=finish_reason,
+                            )
                         continue
 
                     event_type = str(data.get("type", ""))
@@ -519,6 +836,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             payload["presence_penalty"] = presence_penalty
         if tools and self._tool_calling_enabled:
             payload["tools"] = [t.to_dict() for t in tools]
+            payload["tool_choice"] = "auto"
         if (
             "reasoning_effort" in supported
             and reasoning_effort in capabilities.supported_reasoning_efforts
@@ -642,13 +960,21 @@ class OpenAICompatBackend(BaseLLMBackend):
         usage = data.get("usage", {})
         finish_reason = data.get("finish_reason")
         if not isinstance(finish_reason, str) or not finish_reason:
-            finish_reason = "tool_calls" if tool_calls else "stop"
+            choices = data.get("choices", [])
+            if isinstance(choices, list) and choices:
+                choice0 = choices[0]
+                if isinstance(choice0, dict):
+                    raw_finish_reason = choice0.get("finish_reason")
+                    if isinstance(raw_finish_reason, str) and raw_finish_reason:
+                        finish_reason = raw_finish_reason
+            if not isinstance(finish_reason, str) or not finish_reason:
+                finish_reason = "tool_calls" if tool_calls else "stop"
 
         return GenerationResult(
             content=content,
             tool_calls=tool_calls,
-            input_tokens=self._as_int(usage.get("input_tokens")),
-            output_tokens=self._as_int(usage.get("output_tokens")),
+            input_tokens=self._as_int(usage.get("input_tokens") or usage.get("prompt_tokens")),
+            output_tokens=self._as_int(usage.get("output_tokens") or usage.get("completion_tokens")),
             model=data.get("model", self.model),
             finish_reason=finish_reason,
         )
@@ -770,6 +1096,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             id=buf["id"] or str(uuid.uuid4()),
             name=buf["name"],
             arguments=parsed_args,
+            index=index,
         )
 
     def _parse_responses_tool_calls(self, output: Any) -> list[ToolCall]:
@@ -814,6 +1141,9 @@ class OpenAICompatBackend(BaseLLMBackend):
             )
 
         return tool_calls
+
+    def _has_generation_output(self, result: GenerationResult) -> bool:
+        return bool(result.tool_calls or result.content.strip() or result.thinking.strip())
 
     def _as_int(self, value: Any) -> int:
         """將任意值轉成 int，失敗則回傳 0。"""
@@ -905,3 +1235,9 @@ def _coerce_text(value: Any) -> str:
                 if text:
                     return text
     return ""
+
+
+def _looks_like_chat_completions_response(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return isinstance(value.get("choices"), list)

@@ -15,7 +15,6 @@ import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import * as api from '@/lib/api'
 import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
 import {
-  findEditForkTurnId,
   findRegeneratePrompt,
   isConversationEffectivelyEmpty,
   type FileChangeSummary,
@@ -202,6 +201,62 @@ function formatModelLabel(modelId: string): string {
   return modelId
 }
 
+function summarizeBaseUrl(baseUrl: string | null): string | null {
+  if (!baseUrl) {
+    return null
+  }
+  try {
+    const url = new URL(baseUrl)
+    return url.host || baseUrl
+  } catch {
+    return baseUrl
+  }
+}
+
+function formatToolModeDetail(model: Record<string, unknown>): string | null {
+  const metadata = isRecord(model.metadata) ? model.metadata : null
+  const mode = getString(metadata?.tool_call_mode)
+  const nativeStatus = getString(metadata?.native_tool_calling_status)
+  if (mode === 'simulated_fallback') {
+    if (nativeStatus === 'rejected_missing_parser') {
+      return 'tools: simulated (native probe rejected by vLLM parser config)'
+    }
+    return 'tools: simulated fallback'
+  }
+  if (mode === 'native') {
+    return 'tools: native'
+  }
+  return null
+}
+
+function formatModelSource(model: Record<string, unknown>): string | null {
+  const provider = getString(model.provider)
+  const backendType = getString(model.backend_type)
+  const baseUrl = summarizeBaseUrl(getString(model.base_url))
+  const toolMode = formatToolModeDetail(model)
+
+  if (provider === 'openai_codex' || backendType === 'openai_codex') {
+    return toolMode ? `OpenAI Codex · ${toolMode}` : 'OpenAI Codex'
+  }
+
+  if (provider === 'openai_compat' || backendType === 'openai_compat') {
+    const source = baseUrl ?? 'OpenAI-Compatible'
+    return toolMode ? `${source} · ${toolMode}` : source
+  }
+
+  if (provider === 'ollama' || backendType === 'ollama') {
+    return toolMode ? `Ollama · ${toolMode}` : 'Ollama'
+  }
+
+  if (provider === 'local') {
+    const source = backendType ? `Local ${backendType}` : 'Local'
+    return toolMode ? `${source} · ${toolMode}` : source
+  }
+
+  const source = provider ?? backendType ?? baseUrl
+  return toolMode && source ? `${source} · ${toolMode}` : source
+}
+
 function displaySessionTitle(title: string | undefined, fallback: string): string {
   if (!title || title === '\u65b0\u5c0d\u8a71' || title === 'New chat') {
     return fallback
@@ -216,7 +271,8 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
   const pushModel = (
     modelId: string | null,
     status: ChatInputModelOption['status'],
-    label?: string | null
+    label?: string | null,
+    detail?: string | null
   ) => {
     if (!modelId || seen.has(modelId)) {
       return
@@ -225,6 +281,7 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
     candidates.push({
       id: modelId,
       label: label ?? formatModelLabel(modelId),
+      detail: detail ?? null,
       status,
     })
   }
@@ -235,7 +292,12 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
         continue
       }
       const modelId = resolveModelOptionId(entry)
-      pushModel(modelId, 'connected', modelId ? resolveModelLabel(entry, modelId) : null)
+      pushModel(
+        modelId,
+        'connected',
+        modelId ? resolveModelLabel(entry, modelId) : null,
+        formatModelSource(entry)
+      )
     }
   }
 
@@ -245,13 +307,37 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
         continue
       }
       const modelId = resolveModelOptionId(entry)
-      pushModel(modelId, 'connected', modelId ? resolveModelLabel(entry, modelId) : null)
+      pushModel(
+        modelId,
+        'connected',
+        modelId ? resolveModelLabel(entry, modelId) : null,
+        formatModelSource(entry)
+      )
     }
   }
 
   if (candidates.length === 0) {
     pushModel(resolveModelOptionId(payload.active_model ?? undefined), 'connected')
     pushModel(getString(payload.configured_model), 'configured')
+  }
+
+  if (isRecord(payload.active_model)) {
+    const activeId = resolveModelOptionId(payload.active_model)
+    const activeDetail = formatModelSource(payload.active_model)
+    const activeLabel = activeId ? resolveModelLabel(payload.active_model, activeId) : null
+    if (activeId) {
+      const index = candidates.findIndex((candidate) => candidate.id === activeId)
+      if (index >= 0) {
+        candidates[index] = {
+          ...candidates[index],
+          label: activeLabel ?? candidates[index].label,
+          detail: activeDetail ?? candidates[index].detail,
+          status: 'connected',
+        }
+      } else {
+        pushModel(activeId, 'connected', activeLabel, activeDetail)
+      }
+    }
   }
 
   return candidates
@@ -473,7 +559,6 @@ export default function ChatPage() {
     currentSessionDetail,
     isLoadingDetail,
     createDraftSession,
-    forkSessionFromTurn,
     materializeDraftSession,
     selectSession,
     updateLastMessage,
@@ -645,10 +730,34 @@ export default function ChatPage() {
       return
     }
     const replayMessages = api.buildMessagesFromSessionEvents(currentSessionDetail.events)
-    if (replayMessages.length > 0) {
-      hydrateSessionMessages(currentSessionId, replayMessages)
+    if (replayMessages.length === 0) {
+      return
     }
-  }, [currentSessionDetail, currentSessionId, hydrateSessionMessages])
+
+    const runtimeMessages = currentSessionMessages ?? []
+    const needsCanonicalTurnIds =
+      runtimeMessages.length > 0 &&
+      !hasActiveStream &&
+      runtimeMessages.some(
+        (message) =>
+          (message.type === 'user' || message.type === 'assistant') &&
+          !message.turnId
+      )
+
+    if (needsCanonicalTurnIds) {
+      setSessionMessages(currentSessionId, replayMessages)
+      return
+    }
+
+    hydrateSessionMessages(currentSessionId, replayMessages)
+  }, [
+    currentSessionDetail,
+    currentSessionId,
+    currentSessionMessages,
+    hasActiveStream,
+    hydrateSessionMessages,
+    setSessionMessages,
+  ])
 
   const resolveMessagesForSession = React.useCallback((sessionId: string): Message[] => {
     const runtimeMessages = useChatRuntimeStore.getState().messagesBySessionId[sessionId]
@@ -666,6 +775,44 @@ export default function ChatPage() {
 
     return createInitialMessages(t)
   }, [t])
+
+  const syncSessionFromServer = React.useCallback(async (sessionId: string) => {
+    try {
+      const detail = await api.fetchSession(sessionId)
+      const replayMessages = api.buildMessagesFromSessionEvents(detail.events)
+      const lastRetainedMessage = [...replayMessages]
+        .reverse()
+        .find((message) => message.type === 'user' || message.type === 'assistant')
+
+      if (replayMessages.length > 0) {
+        setSessionMessages(sessionId, replayMessages)
+      }
+      if (lastRetainedMessage) {
+        updateLastMessage(sessionId, lastRetainedMessage.content)
+      }
+
+      useSessionStore.setState((state) => ({
+        sessions: state.sessions.map((session) =>
+          session.id === sessionId
+            ? {
+                ...session,
+                title: detail.title || session.title,
+                lastMessageAt: new Date(detail.updatedAt),
+                messageCount: detail.eventCount,
+                projectId: detail.projectId,
+                isDraft: false,
+              }
+            : session
+        ),
+        currentSessionDetail:
+          state.currentSessionDetail?.id === sessionId || state.currentSessionId === sessionId
+            ? detail
+            : state.currentSessionDetail,
+      }))
+    } catch {
+      // Keep the optimistic transcript if canonical session refresh fails.
+    }
+  }, [setSessionMessages, updateLastMessage])
 
   const appendVoiceMessages = React.useCallback(
     (result: VoiceTurnResult) => {
@@ -1100,6 +1247,8 @@ export default function ChatPage() {
             updateLastMessage(sessionId, latestAssistantContent)
           }
         }
+
+        await syncSessionFromServer(sessionId)
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
           updateSessionMessages(sessionId, (prev) => prev.map((message) =>
@@ -1139,6 +1288,7 @@ export default function ChatPage() {
       sessions,
       startStreaming,
       t,
+      syncSessionFromServer,
       updateSessionMessages,
       updateLastMessage,
     ]
@@ -1329,22 +1479,21 @@ export default function ChatPage() {
       return
     }
 
-    const currentSession = sessions.find((session) => session.id === currentSessionId)
-    const projectId = currentSession?.projectId ?? null
-    const forkTurnId = findEditForkTurnId(messages, message.id)
-    const replacementSessionId = forkTurnId
-      ? await forkSessionFromTurn(
-          currentSessionId,
-          forkTurnId,
-          projectId
-        )
-      : createDraftSession(projectId)
+    const rewrittenSession = await api.rewriteSessionFromTurn(currentSessionId, message.turnId)
+    const rewrittenMessages = api.buildMessagesFromSessionEvents(rewrittenSession.events)
+    const baseMessages = rewrittenMessages.length > 0 ? rewrittenMessages : createInitialMessages(t)
+    const lastRetainedMessage = [...baseMessages]
+      .reverse()
+      .find((entry) => entry.type === 'user' || entry.type === 'assistant')
 
+    setSessionMessages(currentSessionId, baseMessages)
+    updateLastMessage(currentSessionId, lastRetainedMessage?.content ?? '')
+    void selectSession(currentSessionId)
     await handleSend(nextContent, {
-      forceSessionId: replacementSessionId,
+      forceSessionId: currentSessionId,
       attachments: message.attachments ?? [],
     })
-  }, [createDraftSession, currentSessionId, forkSessionFromTurn, handleSend, messages, sessions])
+  }, [currentSessionId, handleSend, selectSession, setSessionMessages, t, updateLastMessage])
 
   const handleStarterPrompt = React.useCallback((prompt: string) => {
     void handleSend(prompt)
