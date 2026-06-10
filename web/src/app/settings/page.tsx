@@ -1320,6 +1320,13 @@ const providerOptions: Array<{
     needsApiKey: true,
   },
   {
+    value: 'vllm',
+    label: 'vLLM',
+    defaultBaseUrl: 'http://localhost:8000/v1',
+    defaultModel: 'Qwen/Qwen2.5-7B-Instruct',
+    needsApiKey: false,
+  },
+  {
     value: 'openai_codex',
     label: 'OpenAI Codex',
     defaultBaseUrl: 'https://chatgpt.com/backend-api',
@@ -1733,6 +1740,9 @@ function providerOption(provider: ProviderChoice) {
 }
 
 function providerDescription(provider: ProviderChoice, t: Translator): string {
+  if (provider === 'vllm') {
+    return 'Dedicated vLLM endpoint with explicit served model selection.'
+  }
   const keys: Record<ProviderChoice, string> = {
     ollama: 'settings.provider.ollama.description',
     openai_compat: 'settings.provider.openaiCompat.description',
@@ -1746,6 +1756,9 @@ function providerDescription(provider: ProviderChoice, t: Translator): string {
 }
 
 function providerNote(provider: ProviderChoice, t: Translator): string {
+  if (provider === 'vllm') {
+    return 'Use the exact served model id returned by the remote /v1/models endpoint.'
+  }
   const keys: Record<ProviderChoice, string> = {
     ollama: 'settings.provider.ollama.note',
     openai_compat: 'settings.provider.openaiCompat.note',
@@ -6178,7 +6191,11 @@ export default function SettingsPage() {
                     const availableModels = result.availableModels.length > 0
                       ? result.availableModels
                       : [modelInfo]
-                    const savedModelInfo = result.availableModels[0] ?? modelInfo
+                    const savedModelInfo = result.availableModels.find(
+                      (entry) => modelInfoId(entry) === modelInfoId(modelInfo)
+                    )
+                      ?? result.availableModels[0]
+                      ?? modelInfo
                     const remoteBaseUrl = baseUrlFromModelInfo(savedModelInfo)
                     const savedModelName = savedModelInfo.name || modelInfo.name
                     const savedBackendType = savedModelInfo.backendType || modelInfo.backendType
@@ -6186,10 +6203,11 @@ export default function SettingsPage() {
                     setModels(availableModels)
                     setSettings((current) => current ? ({
                       ...current,
-                      model: savedModelInfo.modelSpec ??
-                        (savedBackendType === 'ollama'
+                      model: isLocalModel
+                        ? (savedModelInfo.modelSpec ?? savedModelName)
+                        : (savedBackendType === 'ollama'
                           ? `ollama:${savedModelName}`
-                          : remoteBaseUrl ?? rawRootModel ?? savedModelName),
+                          : remoteBaseUrl ?? savedModelInfo.modelSpec ?? rawRootModel ?? savedModelName),
                       model_config: {
                         ...omitConfiguredModels(current.model_config ?? {}),
                         provider: result.provider,

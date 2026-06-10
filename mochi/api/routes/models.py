@@ -362,7 +362,10 @@ class VLLMRuntimeControlResponse(BaseModel):
 async def get_models(request: Request) -> ModelsResponse:
     """?豯止齒 configured model?蹓澗??皝僱???獢???????????"""
     config = await _get_config(request.app)
-    active_model = await _load_active_model_info(request)
+    active_model = await _load_active_model_info(
+        request,
+        configured_model=_find_active_configured_model(config),
+    )
 
     return ModelsResponse(
         configured_model=str(getattr(config, "model", "")),
@@ -777,7 +780,13 @@ async def _local_model_conversion_guard(
 async def switch_model(request: Request, payload: SwitchModelRequest) -> SwitchModelResponse:
     """???????????"""
     model_info = await switch_model_runtime(request, payload.model)
-    return SwitchModelResponse(active_model=_serialize_model_info(model_info))
+    config = await _get_config(request.app)
+    return SwitchModelResponse(
+        active_model=_serialize_active_model_info(
+            model_info,
+            configured_model=_find_active_configured_model(config),
+        )
+    )
 
 
 @router.patch("/models/configured/{model_id:path}", response_model=UpdateConfiguredModelResponse)
@@ -1120,7 +1129,10 @@ async def configure_model(
         persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
-            active_model=_serialize_model_info(model_info),
+            active_model=_serialize_active_model_info(
+                model_info,
+                configured_model=_find_active_configured_model(updated),
+            ),
             available_models=_serialize_configured_models(updated),
             api_key_configured=False,
             persisted=persisted_path is not None,
@@ -1157,7 +1169,10 @@ async def configure_model(
         persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
-            active_model=_serialize_model_info(model_info),
+            active_model=_serialize_active_model_info(
+                model_info,
+                configured_model=_find_active_configured_model(updated),
+            ),
             available_models=_serialize_configured_models(updated),
             api_key_configured=False,
             persisted=persisted_path is not None,
@@ -1218,7 +1233,10 @@ async def configure_model(
         persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
-            active_model=_serialize_model_info(model_info),
+            active_model=_serialize_active_model_info(
+                model_info,
+                configured_model=_find_active_configured_model(updated),
+            ),
             available_models=_serialize_configured_models(updated),
             api_key_configured=False,
             persisted=persisted_path is not None,
@@ -1284,7 +1302,10 @@ async def configure_model(
         persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
-            active_model=_serialize_model_info(model_info),
+            active_model=_serialize_active_model_info(
+                model_info,
+                configured_model=_find_active_configured_model(updated),
+            ),
             available_models=_serialize_configured_models(updated),
             api_key_configured=bool(effective_api_key),
             persisted=persisted_path is not None,
@@ -1342,7 +1363,10 @@ async def configure_model(
 
     return ConfigureModelResponse(
         provider=payload.provider,
-        active_model=_serialize_model_info(model_info),
+        active_model=_serialize_active_model_info(
+            model_info,
+            configured_model=_find_active_configured_model(updated),
+        ),
         available_models=_serialize_configured_models(updated),
         api_key_configured=bool(effective_api_key),
         persisted=persisted_path is not None,
@@ -1376,7 +1400,11 @@ async def list_ollama_models(
     return OllamaModelsResponse(base_url=normalized_base_url, models=sorted(models))
 
 
-async def _load_active_model_info(request: Request) -> dict[str, Any] | None:
+async def _load_active_model_info(
+    request: Request,
+    *,
+    configured_model: ConfiguredModelConfig | None = None,
+) -> dict[str, Any] | None:
     """?????engine ?謘????????????????????None??"""
     try:
         engine = await _get_or_create_engine(request.app)
@@ -1389,7 +1417,7 @@ async def _load_active_model_info(request: Request) -> dict[str, Any] | None:
             info = await _maybe_await(get_model_info())
         except Exception:
             return None
-        return _serialize_model_info(info)
+        return _serialize_active_model_info(info, configured_model=configured_model)
 
     return None
 
@@ -1744,6 +1772,28 @@ def _serialize_model_info(info: Any) -> dict[str, Any]:
             "metadata": getattr(info, "metadata", {}),
         }
     )
+
+
+def _serialize_active_model_info(
+    info: Any,
+    *,
+    configured_model: ConfiguredModelConfig | None = None,
+) -> dict[str, Any]:
+    """Attach configured model identity to active backend snapshots when available."""
+    payload = _serialize_model_info(info)
+    if configured_model is None:
+        return payload
+
+    payload["id"] = configured_model.id
+    payload["provider"] = configured_model.provider
+    payload["model_spec"] = configured_model.model_spec
+    payload["base_url"] = configured_model.base_url
+    payload["auth_profile_id"] = configured_model.auth_profile_id
+    payload["auth_mode"] = configured_model.auth_mode
+    payload["label"] = configured_model.label
+    payload.setdefault("name", configured_model.model)
+    payload.setdefault("backend_type", configured_model.backend_type)
+    return payload
 
 
 def _persist_config_if_enabled(
