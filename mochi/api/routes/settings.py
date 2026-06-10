@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, SecretStr
 from mochi.api.server import _get_config, _maybe_await, _rebuild_channel_manager
 from mochi.auth.openai_codex import OpenAICodexAuthService, normalize_openai_codex_base_url
 from mochi.backends.inference_capabilities import ReasoningEffort
+from mochi.backends.vllm_utils import configured_vllm_launch_mode
 from mochi.config.defaults import DEFAULT_EDGE_TTS_VOICE_PRESETS
 from mochi.config.manager import save_config
 from mochi.config.schema import (
@@ -474,6 +475,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "openai_compat_base_url": config.openai_compat.base_url,
             "openai_compat_model": config.openai_compat.model,
             "openai_compat_api_key_configured": config.openai_compat.api_key is not None,
+            "vllm_launch_mode": _configured_vllm_launch_mode(config),
             "openai_codex_base_url": config.openai_codex.base_url,
             "openai_codex_model": config.openai_codex.model,
             "openai_codex_auth_profile_id": active_openai_codex_profile_id,
@@ -839,6 +841,25 @@ def _configured_provider(config: MochiConfig) -> str:
     if _looks_like_local_model_path(config.model):
         return "local"
     return "ollama"
+
+
+def _configured_vllm_launch_mode(config: MochiConfig) -> str | None:
+    if _configured_provider(config) != "vllm":
+        return None
+
+    current_base_url = (config.openai_compat.base_url or "").strip().rstrip("/")
+    current_model = config.openai_compat.model.strip()
+    for model in config.model_setup.configured_models:
+        if model.provider != "vllm":
+            continue
+        model_base_url = (model.base_url or "").strip().rstrip("/")
+        if model_base_url != current_base_url:
+            continue
+        if model.model.strip() != current_model:
+            continue
+        return configured_vllm_launch_mode(model)
+
+    return "external"
 
 
 def _looks_like_local_model_path(value: str) -> bool:

@@ -17,6 +17,7 @@ from mochi.backends.inference_capabilities import (
     resolve_model_inference_capabilities,
 )
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
+from mochi.backends.tool_call_simulator import ToolCallSimulator
 from mochi.backends.types import (
     GenerationResult,
     Message,
@@ -69,6 +70,8 @@ class OpenAICompatBackend(BaseLLMBackend):
         self.model = model
         self.api_key = api_key
         self.provider = provider
+        self._tool_calling_enabled = True
+        self._tool_call_simulator = ToolCallSimulator()
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def generate(
@@ -98,9 +101,10 @@ class OpenAICompatBackend(BaseLLMBackend):
         Returns:
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
+        prepared_messages = self._prepare_messages(messages, tools)
         payload = (
             self._build_responses_payload(
-                messages,
+                prepared_messages,
                 tools,
                 temperature,
                 max_tokens,
@@ -112,7 +116,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             )
             if self._api_mode == "responses"
             else self._build_chat_completions_payload(
-                messages,
+                prepared_messages,
                 tools,
                 temperature,
                 max_tokens,
@@ -130,7 +134,7 @@ class OpenAICompatBackend(BaseLLMBackend):
 
     def supports_tool_calling(self) -> bool:
         """OpenAI-compatible 端點通常支援 tool calling。"""
-        return True
+        return self._tool_calling_enabled
 
     def get_model_info(self) -> ModelInfo:
         """回傳目前模型資訊。"""
@@ -139,7 +143,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                 name=self.model,
                 provider=self.provider,
                 backend_type="openai_compat",
-                supports_tool_calling=True,
+                supports_tool_calling=self._tool_calling_enabled,
                 metadata={"api_mode": self._api_mode},
             )
         )
@@ -147,7 +151,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             name=self.model,
             provider=self.provider,
             backend_type="openai_compat",
-            supports_tool_calling=True,
+            supports_tool_calling=self._tool_calling_enabled,
             metadata={
                 "base_url": self.base_url,
                 "api_url": self._request_url,
@@ -175,12 +179,7 @@ class OpenAICompatBackend(BaseLLMBackend):
     async def _blocking_generate(self, payload: dict[str, Any]) -> GenerationResult:
         """執行非串流生成。"""
         try:
-            resp = await self._client.post(
-                self._request_url,
-                json=payload,
-                headers=self._build_headers(),
-            )
-            resp.raise_for_status()
+            resp = await self._post_json(payload)
         except httpx.HTTPStatusError as exc:
             logger.error(
                 f"OpenAI-compatible API error {exc.response.status_code}: {exc.response.text}"
@@ -196,6 +195,96 @@ class OpenAICompatBackend(BaseLLMBackend):
 
         return self._parse_chat_completions_result(data)
 
+    async def _post_json(self, payload: dict[str, Any]) -> httpx.Response:
+        try:
+            resp = await self._client.post(
+                self._request_url,
+                json=payload,
+                headers=self._build_headers(),
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if self._should_retry_without_tools(exc, payload):
+                logger.warning(
+                    "Disabling tool calling for provider=%s model=%s after automatic tool choice was rejected.",
+                    self.provider,
+                    self.model,
+                )
+                self._tool_calling_enabled = False
+                retry_payload = dict(payload)
+                retry_payload.pop("tools", None)
+                retry_payload.pop("tool_choice", None)
+                retry_resp = await self._client.post(
+                    self._request_url,
+                    json=retry_payload,
+                    headers=self._build_headers(),
+                )
+                retry_resp.raise_for_status()
+                return retry_resp
+            raise
+        return resp
+
+    def _prepare_messages(
+        self,
+        messages: list[Message],
+        tools: list[ToolSchema] | None,
+    ) -> list[Message]:
+        prepared = [Message(**message.__dict__) for message in messages]
+        if self._tool_calling_enabled or not tools or self._api_mode != "chat_completions":
+            return prepared
+
+        prepared = self._flatten_simulated_tool_messages(prepared)
+        injected = False
+        for message in prepared:
+            if message.role == "system":
+                message.content = self._tool_call_simulator.inject_tools_into_prompt(
+                    message.content,
+                    tools,
+                )
+                injected = True
+                break
+
+        if not injected:
+            prepared.insert(
+                0,
+                Message(
+                    role="system",
+                    content=self._tool_call_simulator.inject_tools_into_prompt("", tools).strip(),
+                ),
+            )
+        return prepared
+
+    def _flatten_simulated_tool_messages(self, messages: list[Message]) -> list[Message]:
+        flattened: list[Message] = []
+        for message in messages:
+            if message.role == "assistant" and message.tool_calls:
+                if message.content:
+                    flattened.append(Message(role="assistant", content=message.content))
+                for tool_call in message.tool_calls:
+                    flattened.append(
+                        Message(
+                            role="assistant",
+                            content=(
+                                f"Tool request: {tool_call.name}\n"
+                                f"Arguments: {tool_call.arguments}"
+                            ),
+                        )
+                    )
+                continue
+
+            if message.role == "tool":
+                tool_name = message.name or "tool"
+                tool_text = message.content
+                if not tool_text.startswith(f"Tool {tool_name} result:") and not tool_text.startswith(
+                    f"Tool {tool_name} error:"
+                ):
+                    tool_text = f"Tool {tool_name} result:\n{tool_text}"
+                flattened.append(Message(role="user", content=tool_text))
+                continue
+
+            flattened.append(Message(**message.__dict__))
+        return flattened
+
     def _parse_chat_completions_result(self, data: dict[str, Any]) -> GenerationResult:
         """解析 Chat Completions 回應。"""
         choices: list[dict[str, Any]] = data.get("choices", [])
@@ -205,8 +294,14 @@ class OpenAICompatBackend(BaseLLMBackend):
         content = self._normalize_chat_message_content(message)
 
         tool_calls = self._parse_tool_calls(message.get("tool_calls", []))
+        if not tool_calls and not self._tool_calling_enabled and content:
+            tool_calls = self._tool_call_simulator.parse_tool_calls(content)
+            if tool_calls:
+                content = self._tool_call_simulator.extract_text_response(content)
         usage = data.get("usage", {})
         finish_reason = choice0.get("finish_reason")
+        if tool_calls:
+            finish_reason = "tool_calls"
         if not finish_reason:
             finish_reason = "tool_calls" if tool_calls else "stop"
 
@@ -422,7 +517,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             payload["frequency_penalty"] = frequency_penalty
         if "presence_penalty" in supported:
             payload["presence_penalty"] = presence_penalty
-        if tools:
+        if tools and self._tool_calling_enabled:
             payload["tools"] = [t.to_dict() for t in tools]
         if (
             "reasoning_effort" in supported
@@ -464,7 +559,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             payload["presence_penalty"] = presence_penalty
         if instructions:
             payload["instructions"] = instructions
-        if tools:
+        if tools and self._tool_calling_enabled:
             payload["tools"] = [
                 {
                     "type": "function",
@@ -730,6 +825,21 @@ class OpenAICompatBackend(BaseLLMBackend):
     async def close(self) -> None:
         """關閉 HTTP client 連線。"""
         await self._client.aclose()
+
+    def _should_retry_without_tools(
+        self,
+        exc: httpx.HTTPStatusError,
+        payload: dict[str, Any],
+    ) -> bool:
+        if not payload.get("tools") or self.provider != "vllm":
+            return False
+        if exc.response.status_code != 400:
+            return False
+        message = exc.response.text.lower()
+        return (
+            "tool choice requires --enable-auto-tool-choice" in message
+            or "--tool-call-parser" in message
+        )
 
 
 def _normalize_openai_compat_endpoint(raw_url: str) -> _OpenAICompatEndpoint:

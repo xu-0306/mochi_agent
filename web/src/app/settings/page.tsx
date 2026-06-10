@@ -561,7 +561,18 @@ function providerLabel(provider: string | null | undefined): string | null {
   if (!provider) {
     return null
   }
+  if (provider === 'vllm') {
+    return 'vLLM'
+  }
   return provider
+}
+
+function inferProviderChoice(value: string | null | undefined): ProviderChoice | null {
+  if (!value) {
+    return null
+  }
+  const prefix = value.split(':', 1)[0]
+  return isProviderChoice(prefix) ? prefix : null
 }
 
 function modelInfoId(modelInfo: api.ModelInfo): string {
@@ -687,7 +698,7 @@ function modelInfoFromRecord(record: Record<string, unknown>): api.ModelInfo | n
     id,
     name,
     label: stringField(record, 'label') ?? name,
-    provider: stringField(record, 'provider'),
+    provider: stringField(record, 'provider') ?? inferProviderChoice(id),
     modelSpec: stringField(record, 'model_spec'),
     baseUrl: stringField(record, 'base_url'),
     backendType: stringField(record, 'backend_type') ?? '',
@@ -1837,9 +1848,6 @@ function openAICodexCliAuthLabel(state: string | null | undefined): string {
 
 function configuredProvider(modelConfig: Record<string, unknown>, configuredModel: string | null): ProviderChoice {
   const provider = modelConfig.provider
-  if (isProviderChoice(provider)) {
-    return provider
-  }
   const ollamaModel = getStringSetting(modelConfig, 'ollama_model').trim()
   if (ollamaModel.length > 0) {
     return 'ollama'
@@ -1853,9 +1861,20 @@ function configuredProvider(modelConfig: Record<string, unknown>, configuredMode
       return 'openai_codex'
     }
     const remoteProvider = modelConfig.openai_compat_provider
-    return isProviderChoice(remoteProvider) && remoteProvider !== 'ollama'
-      ? remoteProvider
-      : 'openai_compat'
+    if (isProviderChoice(remoteProvider) && remoteProvider !== 'ollama') {
+      return remoteProvider
+    }
+    if (isProviderChoice(provider) && provider !== 'ollama' && provider !== 'local') {
+      return provider
+    }
+    const inferred = inferProviderChoice(getStringSetting(modelConfig, 'openai_compat_model'))
+    if (inferred && inferred !== 'ollama' && inferred !== 'local') {
+      return inferred
+    }
+    return 'openai_compat'
+  }
+  if (isProviderChoice(provider)) {
+    return provider
   }
   return 'ollama'
 }
@@ -3262,9 +3281,10 @@ function ModelConnectionForm({
     setEditingModelId(modelInfoId(entry))
     const nextProvider = (entry.provider && isProviderChoice(entry.provider))
       ? entry.provider
-      : (entry.backendType === 'openai_codex'
-        ? 'openai_codex'
-        : (entry.backendType === 'openai_compat' ? 'openai_compat' : 'local'))
+      : inferProviderChoice(modelInfoId(entry))
+        ?? (entry.backendType === 'openai_codex'
+          ? 'openai_codex'
+          : (entry.backendType === 'openai_compat' ? 'openai_compat' : 'local'))
     setEditingProvider(nextProvider)
     setEditingModelName(entry.name || '')
     setEditingModelSpec(entry.modelSpec || modelInfoId(entry))
@@ -3617,7 +3637,7 @@ function ModelConnectionForm({
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   {contextLengthTarget.kind === 'gguf'
                     ? 'Adjusts `gguf.n_ctx` for the active GGUF model.'
-                    : 'Adjusts `vllm.max_model_len` for the active vLLM model. Leave blank to use vLLM auto sizing.'}
+                    : 'Sets the managed vLLM startup override for `vllm.max_model_len`. Leave blank to use vLLM auto sizing.'}
                 </p>
               </div>
               <Badge variant="neutral">
@@ -3769,7 +3789,7 @@ function ModelConnectionForm({
               const isEditing = editingModelId === id
               const entryProvider = (entry.provider && isProviderChoice(entry.provider))
                 ? entry.provider
-                : 'local'
+                : inferProviderChoice(id) ?? 'local'
               return (
                 <div key={id} className="rounded-md border border-border bg-surface-layer px-2.5 py-2">
                   {!isEditing ? (

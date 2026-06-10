@@ -230,7 +230,7 @@ function PanelBody({
               description={
                 contextLengthTarget.kind === 'gguf'
                   ? 'Writes to `gguf.n_ctx` for the active GGUF model.'
-                  : 'Writes to `vllm.max_model_len` for the active vLLM model. Leave blank to use auto sizing.'
+                  : 'Writes the managed vLLM startup override for `vllm.max_model_len`. Leave blank to use auto sizing.'
               }
             >
               <div className="space-y-3">

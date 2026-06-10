@@ -31,9 +31,10 @@ export function resolveContextLengthSettingsTarget(
   const modelConfig = asRecord(settings.model_config)
   const configuredProvider = getString(modelConfig?.provider)
   const openaiCompatProvider = getString(modelConfig?.openai_compat_provider)
+  const vllmLaunchMode = getString(modelConfig?.vllm_launch_mode)
   const localModelPath = getString(modelConfig?.local_model_path) ?? settings.model
 
-  if (configuredProvider === 'vllm' || openaiCompatProvider === 'vllm') {
+  if ((configuredProvider === 'vllm' || openaiCompatProvider === 'vllm') && vllmLaunchMode === 'managed') {
     return {
       kind: 'vllm',
       value: settings.vllm?.max_model_len ?? null,
