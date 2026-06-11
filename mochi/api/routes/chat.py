@@ -18,6 +18,7 @@ from mochi.backends.types import AttachmentRef
 from mochi.agents.events import (
     ErrorEvent,
     FinalAnswerEvent,
+    StatusEvent,
     ThinkingEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
@@ -278,7 +279,21 @@ def _serialize_event(
     if isinstance(event, ThinkingEvent):
         return _attach_turn_id(
             event,
-            {"type": event.type, "content": event.content},
+            {
+                "type": event.type,
+                "content": event.content,
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
+    if isinstance(event, StatusEvent):
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "content": event.content,
+                "metadata": jsonable_encoder(event.metadata),
+            },
             fallback_turn_id=fallback_turn_id,
         )
     if isinstance(event, ToolCallRequestEvent):

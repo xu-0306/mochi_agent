@@ -94,6 +94,18 @@ class BaseTool(ABC):
     def search_hint(self) -> str | None:
         return None
 
+    @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        """Internal planner/search metadata for capability-aware routing."""
+        return {
+            "domains": [],
+            "retrieval_modes": [],
+            "preference_tags": [],
+            "read_only": self.is_read_only,
+            "destructive": self.is_destructive,
+            "open_world": self.is_open_world,
+        }
+
     def validate_input(
         self,
         arguments: dict[str, Any],

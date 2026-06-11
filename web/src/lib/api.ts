@@ -18,6 +18,7 @@ import {
   extractInlineReasoning,
   finalizeInlineReasoningBuffer,
 } from '@/lib/reasoning'
+import { getReasoningStepSource } from '@/lib/reasoning-trace'
 import { buildReasoningStepId, mergeReasoningStep } from '@/lib/reasoning-steps'
 
 const API_BASE = '/v1'
@@ -258,6 +259,7 @@ export interface SendMessageOptions {
 
 export type TurnEventPhase =
   | 'thinking'
+  | 'status'
   | 'tool_call_request'
   | 'tool_call_result'
   | 'error'
@@ -266,6 +268,7 @@ export type TurnEventPhase =
 export interface LegacyChatEvent {
   type:
     | 'thinking'
+    | 'status'
     | 'tool_call_request'
     | 'tool_call_result'
     | 'error'
@@ -573,6 +576,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
 
     if (
       phase !== 'thinking' &&
+      phase !== 'status' &&
       phase !== 'tool_call_request' &&
       phase !== 'tool_call_result' &&
       phase !== 'error' &&
@@ -620,6 +624,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
 
   if (
     type === 'thinking' ||
+    type === 'status' ||
     type === 'tool_call_request' ||
     type === 'tool_call_result' ||
     type === 'error' ||
@@ -680,6 +685,7 @@ function buildReasoningStep(
     content: event.toolError ?? event.content,
   })
   const timestamp = toMessageTimestamp(event.timestamp)
+  const source = getReasoningStepSource(event.toolMeta)
 
   switch (event.phase) {
     case 'thinking':
@@ -688,6 +694,15 @@ function buildReasoningStep(
         type: 'thinking',
         content: event.content,
         timestamp,
+        source,
+      }
+    case 'status':
+      return {
+        id,
+        type: 'status',
+        content: event.content,
+        timestamp,
+        source,
       }
     case 'tool_call_request':
       return {
@@ -1249,6 +1264,7 @@ function toStreamMessages(event: StreamChatEvent): Message[] {
 
   if (
     event.type === 'thinking' ||
+    event.type === 'status' ||
     event.type === 'tool_call_request' ||
     event.type === 'tool_call_result' ||
     event.type === 'error' ||

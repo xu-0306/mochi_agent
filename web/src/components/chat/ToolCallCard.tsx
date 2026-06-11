@@ -15,25 +15,51 @@ interface ToolCallCardProps {
   toolName: string
   args?: Record<string, unknown>
   result?: unknown
+  metadata?: Record<string, unknown>
   callId?: string
   errorMessage?: string
   status?: 'calling' | 'success' | 'error'
   type: 'tool_call' | 'tool_result' | 'tool_call_request' | 'tool_call_result'
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function getEvidenceNotice(metadata?: Record<string, unknown>): string | null {
+  const evidenceQuality = metadata?.evidence_quality
+  if (!isRecord(evidenceQuality)) {
+    return null
+  }
+  if (evidenceQuality.status !== 'insufficient_evidence') {
+    return null
+  }
+  const url = typeof evidenceQuality.url === 'string' && evidenceQuality.url.trim()
+    ? evidenceQuality.url.trim()
+    : 'the fetched page'
+  const chars = typeof evidenceQuality.chars === 'number' ? evidenceQuality.chars : null
+  const lines = typeof evidenceQuality.lines === 'number' ? evidenceQuality.lines : null
+  const size = chars !== null && lines !== null
+    ? ` (${chars} chars, ${lines} non-empty lines)`
+    : ''
+  return `Insufficient extracted evidence from ${url}${size}. A follow-up retrieval is required before answering.`
+}
+
 export function ToolCallCard({
   toolName,
   args,
   result,
+  metadata,
   callId,
   errorMessage,
   status = 'success',
   type,
 }: ToolCallCardProps) {
   const { t } = useI18n()
-  const [open, setOpen] = React.useState(false)
   const isResult = type === 'tool_result' || type === 'tool_call_result'
   const isError = status === 'error'
+  const evidenceNotice = getEvidenceNotice(metadata)
+  const [open, setOpen] = React.useState(!isResult || isError || Boolean(evidenceNotice))
 
   return (
     <div
@@ -65,6 +91,9 @@ export function ToolCallCard({
           )}
           {isError ? (
             <span className="ml-2 text-error">{t('chat.tool.failed')}</span>
+          ) : null}
+          {evidenceNotice ? (
+            <span className="ml-2 text-amber-300">insufficient evidence</span>
           ) : null}
         </span>
         {open ? (
@@ -100,11 +129,27 @@ export function ToolCallCard({
               </pre>
             </div>
           ) : null}
+          {evidenceNotice ? (
+            <div className={(!isResult && args) || errorMessage ? 'mt-2' : ''}>
+              <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Evidence</p>
+              <p className="rounded border border-amber-400/30 bg-amber-400/10 p-2 text-xs text-amber-100">
+                {evidenceNotice}
+              </p>
+            </div>
+          ) : null}
           {result !== undefined && (
-            <div className={!isResult && args || errorMessage ? 'mt-2' : ''}>
+            <div className={(!isResult && args) || errorMessage || evidenceNotice ? 'mt-2' : ''}>
               <p className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">{t('chat.tool.result')}</p>
               <pre className="text-xs text-foreground/80 whitespace-pre-wrap break-all overflow-auto max-h-48 bg-canvas rounded p-2">
                 {typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
+              </pre>
+            </div>
+          )}
+          {metadata && (
+            <div className={(result !== undefined) || errorMessage || evidenceNotice ? 'mt-2' : ''}>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">Metadata</p>
+              <pre className="text-xs text-foreground/70 whitespace-pre-wrap break-all overflow-auto max-h-48 bg-canvas rounded p-2">
+                {JSON.stringify(metadata, null, 2)}
               </pre>
             </div>
           )}

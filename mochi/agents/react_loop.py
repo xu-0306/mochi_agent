@@ -21,6 +21,7 @@ from mochi.agents.events import (
     AgentEvent,
     ErrorEvent,
     FinalAnswerEvent,
+    StatusEvent,
     ThinkingEvent,
     TextChunkEvent,
     ToolCallRequestEvent,
@@ -57,6 +58,7 @@ class AsyncReActLoop:
         self._max_repeated_tool_rounds = 3
         self._transport_guard = ToolResultTransportGuard()
         self._last_transport_diagnostics: dict[str, Any] | None = None
+        self._turn_messages: list[Message] = []
 
     async def run(
         self,
@@ -78,6 +80,7 @@ class AsyncReActLoop:
             *history,
             Message(role="user", content=user_message),
         ]
+        self._turn_messages = []
         tools = self._collect_tool_schemas()
         async for event in self._run_nonstream(
             messages,
@@ -93,6 +96,10 @@ class AsyncReActLoop:
             reasoning_effort=reasoning_effort,
         ):
             yield event
+
+    @property
+    def turn_messages(self) -> list[Message]:
+        return [Message(**message.__dict__) for message in self._turn_messages]
 
     def _collect_tool_schemas(self) -> list[ToolSchema]:
         from mochi.backends.types import ToolSchema as _ToolSchema
@@ -151,6 +158,14 @@ class AsyncReActLoop:
             "summary_ready": False,
             "prompt_injected": False,
         }
+        evidence_guard_state: dict[str, Any] = {
+            "requires_more_retrieval": False,
+            "nudge_count": 0,
+            "followup_attempts": 0,
+            "last_low_info_url": None,
+            "last_low_info_chars": None,
+            "last_low_info_lines": None,
+        }
 
         try:
             for iteration in range(self._max_iterations):
@@ -162,9 +177,14 @@ class AsyncReActLoop:
                 started_at = time.perf_counter()
                 try:
                     streamed_generation = False
+                    held_stream_text = ""
                     if self._should_use_streaming_generate():
                         streamed_generation = True
-                        stream_iter = await self._backend.generate(
+                        hold_visible_stream = self._should_hold_visible_stream(
+                            evidence_guard_state,
+                            tools,
+                        )
+                        stream_result = await self._backend.generate(
                             **self._build_generate_kwargs(
                                 messages=messages,
                                 tools=tools,
@@ -180,34 +200,68 @@ class AsyncReActLoop:
                                 stream=True,
                             )
                         )
-                        content_parts: list[str] = []
-                        streamed_tool_calls: dict[str, ToolCall] = {}
-                        streamed_finish_reason = "stop"
+                        if isinstance(stream_result, GenerationResult):
+                            streamed_generation = False
+                            result = stream_result
+                        else:
+                            content_parts: list[str] = []
+                            thinking_parts: list[str] = []
+                            think_filter_state: dict[str, Any] = {
+                                "in_think": False,
+                                "buffer": "",
+                            }
+                            streamed_tool_calls: dict[str, ToolCall] = {}
+                            streamed_finish_reason = "stop"
 
-                        async for chunk in cast(AsyncIterator[StreamChunk], stream_iter):
-                            if chunk.delta:
-                                content_parts.append(chunk.delta)
-                                yield TextChunkEvent(content=chunk.delta)
-                            if chunk.tool_call_delta is not None:
-                                self._merge_stream_tool_call(
-                                    streamed_tool_calls,
-                                    chunk.tool_call_delta,
-                                )
-                            if chunk.finish_reason:
-                                streamed_finish_reason = chunk.finish_reason
+                            async for chunk in cast(AsyncIterator[StreamChunk], stream_result):
+                                if chunk.thinking_delta:
+                                    thinking_parts.append(chunk.thinking_delta)
+                                if chunk.delta:
+                                    visible_delta, thinking_delta = self._split_stream_thinking_delta(
+                                        chunk.delta,
+                                        think_filter_state,
+                                    )
+                                    if thinking_delta:
+                                        thinking_parts.append(thinking_delta)
+                                    if visible_delta:
+                                        content_parts.append(visible_delta)
+                                        if hold_visible_stream:
+                                            held_stream_text += visible_delta
+                                        else:
+                                            yield TextChunkEvent(content=visible_delta)
+                                if chunk.tool_call_delta is not None:
+                                    self._merge_stream_tool_call(
+                                        streamed_tool_calls,
+                                        chunk.tool_call_delta,
+                                    )
+                                if chunk.finish_reason:
+                                    streamed_finish_reason = chunk.finish_reason
 
-                        streamed_tool_call_list = self._ordered_stream_tool_calls(streamed_tool_calls)
-                        if streamed_tool_call_list:
-                            streamed_finish_reason = "tool_calls"
+                            visible_tail, thinking_tail = self._finalize_stream_thinking_delta(
+                                think_filter_state,
+                            )
+                            if thinking_tail:
+                                thinking_parts.append(thinking_tail)
+                            if visible_tail:
+                                content_parts.append(visible_tail)
+                                if hold_visible_stream:
+                                    held_stream_text += visible_tail
+                                else:
+                                    yield TextChunkEvent(content=visible_tail)
+                            streamed_thinking = "".join(thinking_parts).strip()
+                            streamed_tool_call_list = self._ordered_stream_tool_calls(streamed_tool_calls)
+                            if streamed_tool_call_list:
+                                streamed_finish_reason = "tool_calls"
 
-                        backend_info = self._backend.get_model_info()
-                        result = GenerationResult(
-                            content="".join(content_parts),
-                            tool_calls=streamed_tool_call_list,
-                            model=backend_info.name,
-                            finish_reason=streamed_finish_reason
-                            or ("tool_calls" if streamed_tool_call_list else "stop"),
-                        )
+                            backend_info = self._backend.get_model_info()
+                            result = GenerationResult(
+                                content="".join(content_parts),
+                                thinking=streamed_thinking,
+                                tool_calls=streamed_tool_call_list,
+                                model=backend_info.name,
+                                finish_reason=streamed_finish_reason
+                                or ("tool_calls" if streamed_tool_call_list else "stop"),
+                            )
                     else:
                         result = await self._backend.generate(
                             **self._build_generate_kwargs(
@@ -269,18 +323,34 @@ class AsyncReActLoop:
                         )
                         return
 
-                    thought_content = result.thinking or result.content
-                    if thought_content and not streamed_generation:
-                        yield ThinkingEvent(content=thought_content)
-
-                    messages.append(
-                        Message(
-                            role="assistant",
-                            content=result.content,
-                            thinking=result.thinking,
-                            tool_calls=result.tool_calls,
-                        )
+                    visible_content, thinking_content = self._split_thinking_blocks(
+                        result.content,
+                        result.thinking,
                     )
+                    if streamed_generation and visible_content:
+                        thinking_content = self._combine_reasoning_segments(
+                            thinking_content,
+                            visible_content,
+                        )
+                        visible_content = ""
+                    result.content = visible_content
+                    result.thinking = thinking_content
+                    thought_content = thinking_content or visible_content
+                    if thought_content:
+                        yield ThinkingEvent(
+                            content=thought_content,
+                            metadata={"source": "model_summary"},
+                        )
+
+                    assistant_message = Message(
+                        role="assistant",
+                        content=visible_content,
+                        thinking=thinking_content,
+                        tool_calls=result.tool_calls,
+                        responses_replay=result.responses_replay,
+                    )
+                    messages.append(assistant_message)
+                    self._remember_turn_message(assistant_message)
 
                     for tool_call in result.tool_calls:
                         yield ToolCallRequestEvent(
@@ -294,6 +364,10 @@ class AsyncReActLoop:
                         tool_metadata: dict[str, Any] = {}
                         tool_result_payload = ToolResult(output=None, error=None)
                         self._mark_literature_research_mode(tool_call, literature_state)
+                        followup_retrieval_attempt = self._is_followup_retrieval_attempt(
+                            tool_call=tool_call,
+                            evidence_guard_state=evidence_guard_state,
+                        )
                         guarded_tool_result = self._build_guarded_tool_result(
                             tool_call=tool_call,
                             literature_state=literature_state,
@@ -370,11 +444,36 @@ class AsyncReActLoop:
                             result=tool_result_payload,
                             formatted_content=formatted_content,
                         )
+                        tool_content, evidence_diagnostics = self._augment_low_information_web_fetch(
+                            tool_call=tool_call,
+                            tool_result=tool_result_payload,
+                            tool_content=tool_content,
+                        )
+                        if followup_retrieval_attempt:
+                            evidence_guard_state["followup_attempts"] = (
+                                int(evidence_guard_state.get("followup_attempts") or 0) + 1
+                            )
+                            if evidence_diagnostics is None:
+                                tool_content, evidence_diagnostics = self._augment_insufficient_followup_retrieval(
+                                    tool_call=tool_call,
+                                    tool_result=tool_result_payload,
+                                    tool_content=tool_content,
+                                    evidence_guard_state=evidence_guard_state,
+                                )
                         self._last_transport_diagnostics = transport_diagnostics
                         tool_metadata = {
                             **tool_metadata,
                             "transport": transport_diagnostics,
                         }
+                        if evidence_diagnostics:
+                            tool_metadata["evidence_quality"] = evidence_diagnostics
+                            if evidence_diagnostics.get("reason") == "low_information_web_fetch":
+                                self._mark_low_information_fetch(
+                                    evidence_guard_state=evidence_guard_state,
+                                    diagnostics=evidence_diagnostics,
+                                )
+                        elif followup_retrieval_attempt and not tool_error:
+                            self._clear_low_information_fetch_guard(evidence_guard_state)
 
                         yield ToolCallResultEvent(
                             call_id=tool_call.id,
@@ -384,14 +483,14 @@ class AsyncReActLoop:
                             metadata=tool_metadata,
                         )
 
-                        messages.append(
-                            Message(
-                                role="tool",
-                                content=tool_content,
-                                tool_call_id=tool_call.id,
-                                name=tool_call.name,
-                            )
+                        tool_message = Message(
+                            role="tool",
+                            content=tool_content,
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
                         )
+                        messages.append(tool_message)
+                        self._remember_turn_message(tool_message)
                     if literature_state["summary_ready"] and not literature_state["prompt_injected"]:
                         messages.append(
                             Message(
@@ -402,7 +501,21 @@ class AsyncReActLoop:
                         literature_state["prompt_injected"] = True
                     continue
 
-                final_text = result.content
+                final_text, final_thinking = self._split_thinking_blocks(result.content, result.thinking)
+                if self._should_force_followup_retrieval(evidence_guard_state):
+                    messages.append(
+                        Message(
+                            role="user",
+                            content=self._build_followup_retrieval_prompt(evidence_guard_state),
+                        )
+                    )
+                    evidence_guard_state["nudge_count"] = int(evidence_guard_state.get("nudge_count") or 0) + 1
+                    continue
+                if final_thinking:
+                    yield ThinkingEvent(
+                        content=final_thinking,
+                        metadata={"source": "model_summary"},
+                    )
                 if not final_text.strip():
                     backend_info = self._backend.get_model_info()
                     logger.warning("ReAct loop received an empty final response from the backend.")
@@ -417,6 +530,16 @@ class AsyncReActLoop:
                         },
                     )
                     return
+                if streamed_generation and held_stream_text:
+                    yield TextChunkEvent(content=held_stream_text)
+                final_assistant_message = Message(
+                    role="assistant",
+                    content=final_text,
+                    thinking=final_thinking,
+                    responses_replay=result.responses_replay,
+                )
+                messages.append(final_assistant_message)
+                self._remember_turn_message(final_assistant_message)
                 last_tool_signature = None
                 repeated_tool_rounds = 0
                 break
@@ -449,6 +572,71 @@ class AsyncReActLoop:
             generation_time_ms=total_generation_time_ms,
             finish_reason=finish_reason,
         )
+
+    def _split_thinking_blocks(self, content: str, thinking: str = "") -> tuple[str, str]:
+        state: dict[str, Any] = {"in_think": False, "buffer": ""}
+        visible, extracted_thinking = self._split_stream_thinking_delta(content, state)
+        visible_tail, thinking_tail = self._finalize_stream_thinking_delta(state)
+        combined_thinking = "".join(
+            part
+            for part in (thinking, extracted_thinking, thinking_tail)
+            if part
+        ).strip()
+        return (visible + visible_tail).strip(), combined_thinking
+
+    @staticmethod
+    def _split_stream_thinking_delta(
+        delta: str,
+        state: dict[str, Any],
+    ) -> tuple[str, str]:
+        visible_parts: list[str] = []
+        thinking_parts: list[str] = []
+        buffer = str(state.get("buffer") or "")
+        in_think = bool(state.get("in_think"))
+
+        for char in delta:
+            if buffer:
+                buffer += char
+                target = "</think>" if in_think else "<think>"
+                lowered_buffer = buffer.lower()
+                if target.startswith(lowered_buffer):
+                    if lowered_buffer == target:
+                        buffer = ""
+                        in_think = not in_think
+                    continue
+                if in_think:
+                    thinking_parts.append(buffer)
+                else:
+                    visible_parts.append(buffer)
+                buffer = ""
+                continue
+
+            if char == "<":
+                buffer = char
+                continue
+
+            if in_think:
+                thinking_parts.append(char)
+            else:
+                visible_parts.append(char)
+
+        state["buffer"] = buffer
+        state["in_think"] = in_think
+        return "".join(visible_parts), "".join(thinking_parts)
+
+    @staticmethod
+    def _finalize_stream_thinking_delta(state: dict[str, Any]) -> tuple[str, str]:
+        buffer = str(state.get("buffer") or "")
+        in_think = bool(state.get("in_think"))
+        state["buffer"] = ""
+        if not buffer:
+            return "", ""
+        if in_think:
+            return "", buffer
+        return buffer, ""
+
+    def _remember_turn_message(self, message: Message) -> None:
+        self._turn_messages.append(Message(**message.__dict__))
 
     def _format_tool_message_content(self, *, output: Any, error: str | None) -> str:
         if error:
@@ -511,6 +699,273 @@ class AsyncReActLoop:
         diagnostics = dict(outcome.diagnostics)
         diagnostics["last_tool_name"] = tool_name
         return outcome.content, diagnostics
+
+    @staticmethod
+    def _is_followup_retrieval_attempt(
+        *,
+        tool_call: ToolCall,
+        evidence_guard_state: dict[str, Any],
+    ) -> bool:
+        if not evidence_guard_state.get("requires_more_retrieval"):
+            return False
+        return tool_call.name in {"web_search", "web_fetch"}
+
+    @staticmethod
+    def _should_hold_visible_stream(
+        evidence_guard_state: dict[str, Any],
+        tools: list[ToolSchema],
+    ) -> bool:
+        if evidence_guard_state.get("requires_more_retrieval"):
+            return True
+        return bool(tools)
+
+    @staticmethod
+    def _combine_reasoning_segments(*segments: str) -> str:
+        cleaned = [segment.strip() for segment in segments if segment and segment.strip()]
+        return "\n\n".join(cleaned)
+
+    @staticmethod
+    def _mark_low_information_fetch(
+        *,
+        evidence_guard_state: dict[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> None:
+        evidence_guard_state["requires_more_retrieval"] = True
+        evidence_guard_state["last_low_info_url"] = diagnostics.get("url")
+        evidence_guard_state["last_low_info_chars"] = diagnostics.get("chars")
+        evidence_guard_state["last_low_info_lines"] = diagnostics.get("lines")
+
+    @staticmethod
+    def _clear_low_information_fetch_guard(evidence_guard_state: dict[str, Any]) -> None:
+        evidence_guard_state["requires_more_retrieval"] = False
+        evidence_guard_state["nudge_count"] = 0
+        evidence_guard_state["followup_attempts"] = 0
+        evidence_guard_state["last_low_info_url"] = None
+        evidence_guard_state["last_low_info_chars"] = None
+        evidence_guard_state["last_low_info_lines"] = None
+
+    @staticmethod
+    def _should_force_followup_retrieval(evidence_guard_state: dict[str, Any]) -> bool:
+        if not evidence_guard_state.get("requires_more_retrieval"):
+            return False
+        if int(evidence_guard_state.get("followup_attempts") or 0) < 2:
+            return True
+        return int(evidence_guard_state.get("nudge_count") or 0) < 1
+
+    @staticmethod
+    def _build_followup_retrieval_prompt(evidence_guard_state: dict[str, Any]) -> str:
+        url = evidence_guard_state.get("last_low_info_url") or "the previous URL"
+        chars = evidence_guard_state.get("last_low_info_chars")
+        lines = evidence_guard_state.get("last_low_info_lines")
+        detail = ""
+        if chars is not None and lines is not None:
+            detail = f" ({chars} chars across {lines} non-empty lines)"
+        return (
+            "The previous web_fetch result from "
+            f"{url}{detail} is insufficient evidence for a factual answer. "
+            "Do not answer from that incomplete page alone. Call another retrieval tool now, "
+            "such as web_search with a different query, web_search targeting another source, "
+            "or web_fetch for a more specific result URL. "
+            "Only provide a final answer after that follow-up retrieval attempt."
+        )
+
+    def _augment_insufficient_followup_retrieval(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        tool_content: str,
+        evidence_guard_state: dict[str, Any],
+    ) -> tuple[str, dict[str, Any] | None]:
+        if not evidence_guard_state.get("requires_more_retrieval"):
+            return tool_content, None
+        diagnostics = self._diagnose_followup_retrieval_evidence(
+            tool_call=tool_call,
+            tool_result=tool_result,
+            evidence_guard_state=evidence_guard_state,
+        )
+        if diagnostics is None:
+            return tool_content, None
+
+        guidance = (
+            "\n\nEvidence quality note: this follow-up retrieval still does not provide "
+            "enough evidence to answer factually. Use a different search query, another "
+            "source, or a more specific result URL before answering. Only explain the "
+            "limitation after multiple follow-up retrieval attempts fail."
+        )
+        return tool_content + guidance, diagnostics
+
+    def _diagnose_followup_retrieval_evidence(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        evidence_guard_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if tool_result.error:
+            return {
+                "status": "insufficient_evidence",
+                "reason": "followup_retrieval_error",
+                "tool": tool_call.name,
+                "attempts": int(evidence_guard_state.get("followup_attempts") or 0),
+            }
+        if tool_call.name == "web_search":
+            return self._diagnose_web_search_evidence(
+                tool_call=tool_call,
+                tool_result=tool_result,
+                evidence_guard_state=evidence_guard_state,
+            )
+        if tool_call.name == "web_fetch":
+            return None
+        return None
+
+    def _diagnose_web_search_evidence(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        evidence_guard_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if isinstance(tool_result.output, str) and len(tool_result.output.strip()) >= 24:
+            return None
+        results = self._extract_web_search_results(tool_result.output)
+        if not results:
+            return {
+                "status": "insufficient_evidence",
+                "reason": "web_search_no_results",
+                "tool": "web_search",
+                "query": tool_call.arguments.get("query"),
+                "attempts": int(evidence_guard_state.get("followup_attempts") or 0),
+            }
+
+        last_low_info_url = self._normalize_url(str(evidence_guard_state.get("last_low_info_url") or ""))
+        normalized_urls = [
+            self._normalize_url(str(item.get("url") or ""))
+            for item in results
+            if isinstance(item, dict)
+        ]
+        distinct_urls = {url for url in normalized_urls if url}
+        different_urls = {
+            url for url in distinct_urls
+            if not last_low_info_url or url != last_low_info_url
+        }
+        text_chars = 0
+        content_chars = 0
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            snippet = str(item.get("snippet") or "").strip()
+            content = str(item.get("content") or "").strip()
+            text_chars += len(title) + len(snippet) + len(content)
+            content_chars += len(content)
+
+        if different_urls and (text_chars >= 180 or len(different_urls) >= 2 or content_chars >= 120):
+            return None
+
+        reason = "web_search_repeated_low_information_source"
+        if different_urls:
+            reason = "web_search_low_information_results"
+        return {
+            "status": "insufficient_evidence",
+            "reason": reason,
+            "tool": "web_search",
+            "query": tool_call.arguments.get("query"),
+            "result_count": len(results),
+            "distinct_url_count": len(distinct_urls),
+            "different_url_count": len(different_urls),
+            "text_chars": text_chars,
+            "attempts": int(evidence_guard_state.get("followup_attempts") or 0),
+        }
+
+    @staticmethod
+    def _extract_web_search_results(output: Any) -> list[dict[str, Any]]:
+        if isinstance(output, dict):
+            results = output.get("results")
+            if isinstance(results, list):
+                return [item for item in results if isinstance(item, dict)]
+            return []
+        if isinstance(output, list):
+            return [item for item in output if isinstance(item, dict)]
+        if isinstance(output, str) and output.strip():
+            return [{"title": "", "url": "", "snippet": output.strip()}]
+        return []
+
+    def _augment_low_information_web_fetch(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        tool_content: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        if tool_call.name != "web_fetch" or tool_result.error:
+            return tool_content, None
+        output = tool_result.output
+        if not isinstance(output, str):
+            return tool_content, None
+        normalized = re.sub(r"\s+", " ", output).strip()
+        if not normalized:
+            return tool_content, None
+        non_empty_lines = [line.strip() for line in output.splitlines() if line.strip()]
+        metadata = tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        if (
+            len(normalized) >= 600
+            and len(non_empty_lines) >= 6
+            and not self._looks_like_structural_web_fetch_content(
+                normalized=normalized,
+                non_empty_lines=non_empty_lines,
+                metadata=metadata,
+            )
+        ):
+            return tool_content, None
+
+        diagnostics = {
+            "status": "insufficient_evidence",
+            "reason": "low_information_web_fetch",
+            "chars": len(normalized),
+            "lines": len(non_empty_lines),
+            "url": tool_call.arguments.get("url"),
+        }
+        guidance = (
+            "\n\nEvidence quality note: this web_fetch result contains very little extracted "
+            f"page content ({len(normalized)} chars across {len(non_empty_lines)} non-empty lines). "
+            "Treat it as insufficient evidence for a factual answer. Use another web_search query, "
+            "fetch a more specific result URL, or corroborate with another source before answering. "
+            "Only explain the limitation after additional retrieval attempts fail."
+        )
+        return tool_content + guidance, diagnostics
+
+    @staticmethod
+    def _looks_like_structural_web_fetch_content(
+        *,
+        normalized: str,
+        non_empty_lines: list[str],
+        metadata: dict[str, Any],
+    ) -> bool:
+        extractor = str(metadata.get("extractor") or "").strip().lower()
+        if extractor != "htmlparser":
+            return False
+        if len(non_empty_lines) < 6:
+            return False
+
+        lower_lines = [line.lower() for line in non_empty_lines]
+        unique_lines = {line for line in lower_lines if line}
+        if unique_lines and len(unique_lines) <= max(3, len(non_empty_lines) // 3):
+            return True
+
+        label_like_lines = sum(
+            1
+            for line in non_empty_lines
+            if len(line) <= 24 and re.fullmatch(r"[\w\u4e00-\u9fff\s:/\-()%.,]+", line)
+        )
+        if label_like_lines >= max(4, len(non_empty_lines) // 2):
+            return True
+
+        punctuation_light = sum(1 for char in normalized if char in ":：|/»›>")
+        if punctuation_light >= 6 and len(unique_lines) <= max(4, len(non_empty_lines) // 2):
+            return True
+
+        return False
 
     def _build_backend_error_metadata(self, exc: Exception) -> dict[str, Any]:
         backend_info = self._backend.get_model_info()
@@ -578,7 +1033,7 @@ class AsyncReActLoop:
             metadata["transport"] = dict(self._last_transport_diagnostics)
         return metadata
 
-    def _build_iteration_progress_event(self, *, iteration: int) -> ThinkingEvent | None:
+    def _build_iteration_progress_event(self, *, iteration: int) -> StatusEvent | None:
         backend_info = self._backend.get_model_info()
         backend_type = backend_info.backend_type.strip().lower()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
@@ -590,7 +1045,14 @@ class AsyncReActLoop:
         content = f"Mochi progress: ReAct iteration {iteration}/{self._max_iterations}"
         if backend_detail:
             content = f"{content} ({backend_detail})"
-        return ThinkingEvent(content=content)
+        return StatusEvent(
+            content=content,
+            metadata={
+                "kind": "react_iteration_progress",
+                "iteration": iteration,
+                "source": "runtime_progress",
+            },
+        )
 
     def _build_backend_runtime_detail(self) -> str:
         backend_info = self._backend.get_model_info()
@@ -631,6 +1093,8 @@ class AsyncReActLoop:
             return False
 
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        if metadata.get("request_shape") == "responses":
+            return False
         tool_mode = metadata.get("tool_call_mode")
         if tool_mode == "simulated_fallback":
             return False

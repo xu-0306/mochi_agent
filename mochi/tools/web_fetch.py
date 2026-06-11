@@ -181,6 +181,21 @@ class WebFetchTool(BaseTool):
         return True
 
     @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            "domains": ["web"],
+            "retrieval_modes": ["fetch"],
+            "preference_tags": [
+                "open_web",
+                "page_content",
+                "source_reading",
+            ],
+            "read_only": self.is_read_only,
+            "destructive": self.is_destructive,
+            "open_world": self.is_open_world,
+        }
+
+    @property
     def is_concurrency_safe(self) -> bool:
         return True
 

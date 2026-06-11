@@ -21,7 +21,17 @@ class ThinkingEvent:
 
     type: Literal["thinking"] = field(default="thinking", init=False)
     content: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
     """思考內容。"""
+
+
+@dataclass
+class StatusEvent:
+    """Runtime progress/status diagnostics that should not be shown as model reasoning."""
+
+    type: Literal["status"] = field(default="status", init=False)
+    content: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,6 +111,7 @@ class ErrorEvent:
 AgentEvent = (
     TextChunkEvent
     | ThinkingEvent
+    | StatusEvent
     | ToolCallRequestEvent
     | ToolCallResultEvent
     | FinalAnswerEvent

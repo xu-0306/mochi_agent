@@ -14,6 +14,10 @@ from mochi.tools.base import ToolExecutionContext, ToolResult
 
 
 _SUSPICIOUS_FILE_RE = re.compile(r"\b\d+\.txt\b", re.IGNORECASE)
+_WEB_EVIDENCE_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
+_WEB_EVIDENCE_ALLOWED_JSON_FLAGS = frozenset(
+    {"json_envelope", "large_payload", "structured_payload"}
+)
 
 
 @dataclass
@@ -74,6 +78,18 @@ class ToolResultTransportGuard:
             self._collect_diagnostics(context, diagnostics)
             return ToolResultTransportOutcome(content=formatted_text, diagnostics=diagnostics)
 
+        if self._is_safe_web_evidence_text(
+            tool_name=tool_name,
+            formatted_text=formatted_text,
+            max_chars=max_chars,
+            risk_flags=risk_flags,
+            backend_name=backend_name,
+        ):
+            diagnostics["guarded_length"] = len(formatted_text)
+            diagnostics["transport_type"] = "web_evidence_json"
+            self._collect_diagnostics(context, diagnostics)
+            return ToolResultTransportOutcome(content=formatted_text, diagnostics=diagnostics)
+
         candidate = self._summarize_result(tool_name=tool_name, result=result, max_chars=max_chars)
         diagnostics["summary_applied"] = True
 
@@ -121,6 +137,28 @@ class ToolResultTransportGuard:
             and not formatted_text.lstrip().startswith("{")
             and not formatted_text.lstrip().startswith("[")
         )
+
+    def _is_safe_web_evidence_text(
+        self,
+        *,
+        tool_name: str,
+        formatted_text: str,
+        max_chars: int,
+        risk_flags: list[str],
+        backend_name: str,
+    ) -> bool:
+        stripped = formatted_text.lstrip()
+        if backend_name != "openai_compat":
+            return False
+        if tool_name not in _WEB_EVIDENCE_TOOL_NAMES:
+            return False
+        if not stripped or len(formatted_text) > max_chars:
+            return False
+        if not (stripped.startswith("{") or stripped.startswith("[")):
+            return False
+        if not set(risk_flags).issubset(_WEB_EVIDENCE_ALLOWED_JSON_FLAGS):
+            return False
+        return self._try_parse_json(formatted_text) is not None
 
     def _detect_risks(
         self,

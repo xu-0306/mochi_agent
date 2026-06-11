@@ -2,19 +2,21 @@ export type MessageType = 'user' | 'assistant' | 'system' | 'error'
 
 export type MessageEventType =
   | 'thinking'
+  | 'status'
   | 'tool_call_request'
   | 'tool_call_result'
   | 'final_answer'
   | 'error'
   | 'text_chunk'
 
-export type ReasoningStepType = 'thinking' | 'tool_call' | 'tool_result' | 'error'
+export type ReasoningStepType = 'thinking' | 'status' | 'tool_call' | 'tool_result' | 'error'
 
 export interface ReasoningStep {
   id: string
   type: ReasoningStepType
   content: string
   timestamp: Date
+  source?: 'model_summary' | 'runtime_progress' | string
   toolName?: string
   toolArgs?: Record<string, unknown>
   toolResult?: unknown

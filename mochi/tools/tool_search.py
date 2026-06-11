@@ -82,11 +82,13 @@ class ToolSearchTool(BaseTool):
 
         for tool in self._catalog_provider():
             payload = self._tool_payload(tool)
+            capabilities_text = self._capabilities_text(tool.tool_capabilities).lower()
             haystacks = [
                 tool.name.lower(),
                 tool.description.lower(),
                 (tool.search_hint or "").lower(),
                 self._schema_text(tool.parameters_schema).lower(),
+                capabilities_text,
             ]
             score = 0
             for token in tokens:
@@ -114,6 +116,17 @@ class ToolSearchTool(BaseTool):
         return " ".join(parts)
 
     @staticmethod
+    def _capabilities_text(capabilities: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for value in capabilities.values():
+            if isinstance(value, list):
+                parts.extend(str(item) for item in value)
+                continue
+            if isinstance(value, (str, bool)):
+                parts.append(str(value))
+        return " ".join(parts)
+
+    @staticmethod
     def _tool_payload(tool: BaseTool) -> dict[str, Any]:
         return {
             "name": tool.name,
@@ -122,4 +135,5 @@ class ToolSearchTool(BaseTool):
             "read_only": tool.is_read_only,
             "destructive": tool.is_destructive,
             "open_world": tool.is_open_world,
+            "capabilities": tool.tool_capabilities,
         }

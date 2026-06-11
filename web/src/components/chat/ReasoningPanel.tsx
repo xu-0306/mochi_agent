@@ -7,6 +7,8 @@ import { extractFileChangeFromReasoningStep } from '@/lib/chat-p2'
 import { cn } from '@/lib/utils'
 import type { ReasoningStep, TokenStats } from '@/lib/chat'
 import { FileChangeCard } from './FileChangeCard'
+import { getReasoningStepBadge } from './reasoning-badges'
+import { ToolCallCard } from './ToolCallCard'
 import {
   deriveReasoningPanelSummary,
   getNextReasoningPanelOpen,
@@ -28,6 +30,9 @@ function StepIcon({ type, status }: { type: ReasoningStep['type']; status?: Reas
       <Brain className="h-3.5 w-3.5 text-primary-400" />
     )
   }
+  if (type === 'status') {
+    return <Loader2 className="h-3.5 w-3.5 animate-spin text-primary-400" />
+  }
   if (type === 'tool_call') {
     return <Search className="h-3.5 w-3.5 text-primary-400" />
   }
@@ -40,6 +45,9 @@ function StepIcon({ type, status }: { type: ReasoningStep['type']; status?: Reas
 function stepLabel(step: ReasoningStep): string {
   if (step.type === 'thinking') {
     return 'Reasoning'
+  }
+  if (step.type === 'status') {
+    return 'Progress'
   }
   if (step.type === 'tool_call') {
     return step.toolName ? `Using ${step.toolName}` : 'Using tool'
@@ -139,40 +147,63 @@ export function ReasoningPanel({
 
       {open ? (
         <div className="space-y-3 border-t border-border/60 bg-black/[0.08] px-3 py-3">
-          {steps.map((step, index) => (
-            <div key={step.id} className="flex items-start gap-3">
-              <div className="flex flex-col items-center pt-0.5">
-                <div className="flex h-6 w-6 items-center justify-center rounded-full border border-border/80 bg-canvas/90">
-                  <StepIcon type={step.type} status={step.status} />
+          {steps.map((step, index) => {
+            const badge = getReasoningStepBadge(step)
+            return (
+              <div key={step.id} className="flex items-start gap-3">
+                <div className="flex flex-col items-center pt-0.5">
+                  <div className="flex h-6 w-6 items-center justify-center rounded-full border border-border/80 bg-canvas/90">
+                    <StepIcon type={step.type} status={step.status} />
+                  </div>
+                  {index < steps.length - 1 ? <div className="mt-1 h-6 w-px bg-border" /> : null}
                 </div>
-                {index < steps.length - 1 ? <div className="mt-1 h-6 w-px bg-border" /> : null}
-              </div>
-              <div className="min-w-0 flex-1 pb-1">
-                <p className="text-xs font-medium text-muted-foreground">{stepLabel(step)}</p>
-                {step.content ? (
-                  <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/90">
-                    {step.content}
-                  </p>
-                ) : null}
-                {step.errorCode ? (
-                  <p className="mt-1 break-all text-xs text-error/90">
-                    {step.errorCode}
-                  </p>
-                ) : null}
-                {(() => {
-                  const fileChange = extractFileChangeFromReasoningStep(step)
-                  if (!fileChange) {
-                    return null
-                  }
-                  return (
-                    <div className="mt-3">
-                      <FileChangeCard change={fileChange} onUndo={onUndoFileChange} />
+                <div className="min-w-0 flex-1 pb-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-xs font-medium text-muted-foreground">{stepLabel(step)}</p>
+                    {badge ? (
+                      <span className="rounded-full border border-border/80 bg-canvas/80 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                        {badge}
+                      </span>
+                    ) : null}
+                  </div>
+                  {step.type === 'tool_call' || step.type === 'tool_result' ? (
+                    <div className="mt-2">
+                      <ToolCallCard
+                        toolName={step.toolName ?? 'tool'}
+                        args={step.toolArgs}
+                        result={step.toolResult}
+                        metadata={step.toolMeta}
+                        callId={step.toolCallId}
+                        errorMessage={step.toolError}
+                        status={step.status === 'running' ? 'calling' : step.status}
+                        type={step.type}
+                      />
                     </div>
-                  )
-                })()}
+                  ) : step.content ? (
+                    <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/90">
+                      {step.content}
+                    </p>
+                  ) : null}
+                  {step.errorCode ? (
+                    <p className="mt-1 break-all text-xs text-error/90">
+                      {step.errorCode}
+                    </p>
+                  ) : null}
+                  {(() => {
+                    const fileChange = extractFileChangeFromReasoningStep(step)
+                    if (!fileChange) {
+                      return null
+                    }
+                    return (
+                      <div className="mt-3">
+                        <FileChangeCard change={fileChange} onUndo={onUndoFileChange} />
+                      </div>
+                    )
+                  })()}
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       ) : null}
     </div>

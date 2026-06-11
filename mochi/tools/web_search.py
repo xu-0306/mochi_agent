@@ -258,6 +258,21 @@ class WebSearchTool(BaseTool):
         return True
 
     @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            "domains": ["web"],
+            "retrieval_modes": ["search"],
+            "preference_tags": [
+                "open_web",
+                "current_information",
+                "source_discovery",
+            ],
+            "read_only": self.is_read_only,
+            "destructive": self.is_destructive,
+            "open_world": self.is_open_world,
+        }
+
+    @property
     def search_hint(self) -> str | None:
         return "Use this tool for current information or to discover sources before fetching a page."
 

@@ -52,7 +52,14 @@ from mochi.backends.inference_capabilities import (
     sanitize_inference_params_for_capabilities,
 )
 from mochi.backends.router import BackendRouter
-from mochi.backends.types import AttachmentRef, GenerationResult, Message, ModelInfo
+from mochi.backends.types import (
+    AttachmentRef,
+    GenerationResult,
+    Message,
+    ModelInfo,
+    ResponsesReplayState,
+    ToolCall,
+)
 from mochi.backends.vllm_runtime import ManagedVLLMRuntimeManager
 from mochi.backends.vllm_utils import (
     configured_vllm_launch_mode,
@@ -312,6 +319,7 @@ class AgentEngine:
         workspace_registry = self._tool_registry
         if effective_workspace_dir != self._config.workspace_dir:
             workspace_registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
+        available_tools = workspace_registry.list_tools()
 
         active_backend = self._router.active
         capabilities = self._inference_capabilities_for_backend(active_backend)
@@ -320,7 +328,7 @@ class AgentEngine:
         planner_message = self._build_tool_planner_message(message, attachments)
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
-            available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
+            available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=(
                 scope.project_id is not None
@@ -332,6 +340,7 @@ class AgentEngine:
                 else self._config.security.autonomy_mode
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
+            tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
         )
         tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
         tool_schemas = tool_registry.get_schemas()
@@ -534,6 +543,7 @@ class AgentEngine:
         if effective_workspace_dir != self._config.workspace_dir:
             workspace_registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
             owns_workspace_registry = True
+        available_tools = workspace_registry.list_tools()
 
         configured_model_id = (
             str(resolved.get("model")).strip()
@@ -553,7 +563,7 @@ class AgentEngine:
         reasoning_effort = sanitized.get("reasoning_effort")
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
-            available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
+            available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=session_bound_workspace,
             autonomy_mode=(
@@ -562,16 +572,21 @@ class AgentEngine:
                 else self._config.security.autonomy_mode
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
+            tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
             tool_mode=request.tool_mode,
         )
         exposure_plan = self._apply_invocation_tool_overrides(
             exposure_plan,
-            available_tool_names=[tool.name for tool in workspace_registry.list_tools()],
+            available_tool_names=[tool.name for tool in available_tools],
             tool_names_override=request.tool_names_override,
             tool_allowlist=request.tool_allowlist,
             tool_denylist=request.tool_denylist,
         )
         exposure_plan = self._apply_execution_profile(exposure_plan, request.execution_profile)
+        exposure_plan = await self._probe_tool_calling_before_exposure(
+            active_backend,
+            exposure_plan,
+        )
         attachment_context = self._build_attachment_prompt_context(
             attachments=request.attachments,
             available_tool_names=exposure_plan.tool_names,
@@ -624,6 +639,14 @@ class AgentEngine:
             tool_mode=request.tool_mode,
             exposed_tools=list(exposure_plan.tool_names),
             matched_tool_groups=list(exposure_plan.matched_groups),
+        )
+        logger.debug(
+            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}",
+            active_backend.get_model_info().backend_type,
+            request.tool_mode,
+            request.execution_profile,
+            exposure_plan.matched_groups,
+            exposure_plan.tool_names,
         )
         if request.tool_mode == "required" and not exposure_plan.tool_names:
             diagnostics.fallback_reason = "tool_mode_required_but_no_tools_exposed"
@@ -684,16 +707,59 @@ class AgentEngine:
             await self._finish_learning_cycle(trajectory_id)
 
         if request.persist_session:
-            assistant_msg = Message(role="assistant", content=final_text)
             context.add_message(user_msg)
-            context.add_message(assistant_msg)
-            await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
+            for replay_message in react_loop.turn_messages:
+                context.add_message(replay_message)
+                await self._persist_session_message(session_key, replay_message, turn_id=turn_id)
+            if not react_loop.turn_messages:
+                assistant_msg = Message(role="assistant", content=final_text)
+                context.add_message(assistant_msg)
+                await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
 
         return AgentInvocationResult(
             content=final_text,
             events=events,
             diagnostics=diagnostics,
         )
+
+    async def _probe_tool_calling_before_exposure(
+        self,
+        backend: BaseLLMBackend,
+        exposure_plan: ToolExposurePlan,
+    ) -> ToolExposurePlan:
+        if not exposure_plan.tool_names:
+            return exposure_plan
+        backend_info = backend.get_model_info()
+        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
+            return ToolExposurePlan(tool_names=[], matched_groups=exposure_plan.matched_groups, limit=0)
+        if backend_info.backend_type != "openai_compat":
+            return exposure_plan
+        if metadata.get("native_tool_calling_status") not in {None, "unknown"}:
+            return exposure_plan
+        probe = getattr(backend, "probe_tool_calling", None)
+        if not callable(probe):
+            return exposure_plan
+        try:
+            probe_result = probe()
+            if inspect.isawaitable(probe_result):
+                await cast(Awaitable[Any], probe_result)
+        except Exception as exc:
+            logger.warning("Tool-calling preflight probe failed: %s", exc)
+            return exposure_plan
+        refreshed = backend.get_model_info()
+        refreshed_metadata = refreshed.metadata if isinstance(refreshed.metadata, dict) else {}
+        if (
+            refreshed_metadata.get("tool_calling_blocked") is True
+            or refreshed_metadata.get("tool_call_mode") == "unavailable"
+        ):
+            logger.warning(
+                "Tool exposure disabled because backend reports tool calling unavailable: provider=%s, model=%s",
+                refreshed.provider,
+                refreshed.name,
+            )
+            return ToolExposurePlan(tool_names=[], matched_groups=exposure_plan.matched_groups, limit=0)
+        return exposure_plan
 
     def _apply_execution_profile(
         self,
@@ -1011,9 +1077,23 @@ class AgentEngine:
         self._skill_loader = self._make_skill_loader()
         self._skill_selector = self._make_skill_selector()
         self._trajectory_logger = TrajectoryLogger(storage_path=self._trajectories_jsonl_path())
+        self._project_store = ProjectStore(Path(config.workspace_dir).expanduser() / "projects.json")
         self._contexts.clear()
         self._tool_execution_contexts.clear()
-        self._register_builtin_tools()
+        self._execution_scope_resolver = ExecutionScopeResolver(
+            default_workspace_dir=config.workspace_dir,
+            session_store=self._session_store,
+            project_store=self._project_store,
+        )
+        self._tool_registry_factory = ToolRegistryFactory(
+            config,
+            memory_store=self._memory_store,
+            mcp_runtime_manager=self._mcp_runtime_manager,
+        )
+        self._tool_registry = self._tool_registry_factory.create_registry(config.workspace_dir)
+        self._tool_exposure_planner = ToolExposurePlanner(
+            tool_groups=self._tool_registry_factory.tool_groups,
+        )
         next_remote_provider = _active_remote_provider(config)
         self._router.apply_settings(
             ollama_base_url=config.ollama.base_url,
@@ -1767,7 +1847,16 @@ class AgentEngine:
                     Message(
                         role=role,
                         content=content,
+                        thinking=event.get("thinking") if isinstance(event.get("thinking"), str) else "",
+                        tool_calls=self._deserialize_message_tool_calls(event.get("tool_calls")),
+                        tool_call_id=(
+                            event.get("tool_call_id")
+                            if isinstance(event.get("tool_call_id"), str)
+                            else None
+                        ),
+                        name=event.get("name") if isinstance(event.get("name"), str) else None,
                         attachments=self._deserialize_message_attachments(event.get("attachments")),
+                        responses_replay=ResponsesReplayState.from_dict(event.get("responses_replay")),
                     )
                 )
 
@@ -1799,7 +1888,16 @@ class AgentEngine:
                 "turn_id": turn_id,
                 "role": message.role,
                 "content": message.content,
+                "thinking": message.thinking,
+                "tool_calls": self._serialize_message_tool_calls(message.tool_calls),
+                "tool_call_id": message.tool_call_id,
+                "name": message.name,
                 "attachments": [attachment.to_dict() for attachment in message.attachments],
+                "responses_replay": (
+                    message.responses_replay.to_dict()
+                    if message.responses_replay is not None
+                    else None
+                ),
                 "timestamp": timestamp,
             },
         )
@@ -1835,7 +1933,10 @@ class AgentEngine:
     def _turn_event_payload(self, event: AgentEvent) -> tuple[str | None, dict[str, Any]]:
         """將 AgentEvent 轉成 session replay payload。"""
         if isinstance(event, ThinkingEvent):
-            return "thinking", {"content": event.content}
+            return "thinking", {
+                "content": event.content,
+                "metadata": copy.deepcopy(event.metadata),
+            }
         if isinstance(event, ToolCallRequestEvent):
             return "tool_call_request", {
                 "call_id": event.call_id,
@@ -1972,6 +2073,45 @@ class AgentEngine:
                 )
             )
         return attachments
+
+    def _serialize_message_tool_calls(self, tool_calls: list[ToolCall]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": copy.deepcopy(tool_call.arguments),
+                "index": tool_call.index,
+            }
+            for tool_call in tool_calls
+        ]
+
+    def _deserialize_message_tool_calls(self, value: Any) -> list[ToolCall]:
+        if not isinstance(value, list):
+            return []
+
+        tool_calls: list[ToolCall] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            call_id = item.get("id")
+            name = item.get("name")
+            arguments = item.get("arguments")
+            index = item.get("index")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            if not isinstance(name, str) or not name:
+                continue
+            if not isinstance(arguments, dict):
+                arguments = {}
+            tool_calls.append(
+                ToolCall(
+                    id=call_id,
+                    name=name,
+                    arguments=copy.deepcopy(cast(dict[str, Any], arguments)),
+                    index=index if isinstance(index, int) else None,
+                )
+            )
+        return tool_calls
 
     async def _create_voice_session(self) -> VoiceSession:
         """建立語音會話協調器（lazy）。"""

@@ -600,6 +600,43 @@ function modelToolCallingMetadata(modelInfo: api.ModelInfo | null | undefined): 
   }
 }
 
+function modelReasoningMetadata(modelInfo: api.ModelInfo | null | undefined): {
+  transportPreference: string | null
+  continuityMode: string | null
+  summaryRequested: boolean | null
+  summarySupported: boolean | null
+  summaryReceived: boolean | null
+  replayedItems: number | null
+} {
+  const metadata = modelInfo?.metadata
+  return {
+    transportPreference:
+      typeof metadata?.reasoning_transport_preference === 'string'
+        ? metadata.reasoning_transport_preference
+        : null,
+    continuityMode:
+      typeof metadata?.responses_continuity_mode === 'string'
+        ? metadata.responses_continuity_mode
+        : null,
+    summaryRequested:
+      typeof metadata?.reasoning_summary_requested === 'boolean'
+        ? metadata.reasoning_summary_requested
+        : null,
+    summarySupported:
+      typeof metadata?.reasoning_summary_supported === 'boolean'
+        ? metadata.reasoning_summary_supported
+        : null,
+    summaryReceived:
+      typeof metadata?.reasoning_summary_received === 'boolean'
+        ? metadata.reasoning_summary_received
+        : null,
+    replayedItems:
+      typeof metadata?.reasoning_items_replayed === 'number'
+        ? metadata.reasoning_items_replayed
+        : null,
+  }
+}
+
 function modelInfoId(modelInfo: api.ModelInfo): string {
   return modelInfo.id || modelInfo.modelSpec || modelInfo.name
 }
@@ -2363,6 +2400,10 @@ function ModelConnectionForm({
     () => modelToolCallingMetadata(activeModelInfo),
     [activeModelInfo]
   )
+  const activeReasoningInfo = React.useMemo(
+    () => modelReasoningMetadata(activeModelInfo),
+    [activeModelInfo]
+  )
   const contextLengthTarget = React.useMemo(
     () => resolveContextLengthSettingsTarget(settings),
     [settings]
@@ -3754,6 +3795,39 @@ function ModelConnectionForm({
             </div>
 
             <SettingMessage message={toolProbeMessage} />
+          </div>
+        ) : null}
+
+        {activeModelInfo && activeModelInfo.backendType === 'openai_compat' ? (
+          <div className="space-y-3 rounded-md border border-border bg-canvas px-3 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold text-foreground">Reasoning Continuity</p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Surface Responses transport preference, summary support, and replay continuity diagnostics.
+                </p>
+              </div>
+              <Badge variant={activeReasoningInfo.continuityMode === 'previous_response_id' ? 'success' : 'neutral'}>
+                {activeReasoningInfo.continuityMode ?? 'unknown'}
+              </Badge>
+            </div>
+
+            <div className="space-y-1 text-xs text-muted-foreground">
+              <p>
+                <span className="font-medium text-foreground">Transport preference:</span>{' '}
+                {activeReasoningInfo.transportPreference ?? 'unknown'}
+              </p>
+              <p>
+                <span className="font-medium text-foreground">Reasoning summary:</span>{' '}
+                requested={String(activeReasoningInfo.summaryRequested ?? false)} supported=
+                {String(activeReasoningInfo.summarySupported ?? 'unknown')} received=
+                {String(activeReasoningInfo.summaryReceived ?? false)}
+              </p>
+              <p>
+                <span className="font-medium text-foreground">Replay items:</span>{' '}
+                {activeReasoningInfo.replayedItems ?? 0}
+              </p>
+            </div>
           </div>
         ) : null}
 

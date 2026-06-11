@@ -176,8 +176,7 @@ class OllamaBackend(BaseLLMBackend):
             )
 
         if not tool_calls:
-            content = self._combine_reasoning_and_content(reasoning=thinking, content=content)
-            if not content.strip():
+            if not content.strip() and not thinking.strip():
                 logger.warning("Ollama returned an empty non-tool response.")
                 raise BackendRequestError(
                     "Ollama returned an empty response with no content or tool calls.",
@@ -219,11 +218,10 @@ class OllamaBackend(BaseLLMBackend):
                     msg = data.get("message", {})
                     delta: str = msg.get("content", "")
                     thinking_delta = msg.get("thinking", "")
-                    if isinstance(thinking_delta, str) and thinking_delta:
-                        delta = f"<think>{thinking_delta}</think>" if not delta else f"<think>{thinking_delta}</think>{delta}"
 
                     yield StreamChunk(
                         delta=delta,
+                        thinking_delta=thinking_delta if isinstance(thinking_delta, str) else "",
                         is_final=done,
                         finish_reason=data.get("done_reason") if done else None,
                     )
@@ -392,14 +390,6 @@ class OllamaBackend(BaseLLMBackend):
         if len(value) <= max_chars:
             return value
         return value[: max_chars - 14] + "...[truncated]"
-
-    @staticmethod
-    def _combine_reasoning_and_content(*, reasoning: str, content: str) -> str:
-        if reasoning and content:
-            return f"<think>{reasoning}</think>\n\n{content}"
-        if reasoning:
-            return f"<think>{reasoning}</think>"
-        return content
 
     @staticmethod
     def _supports_reasoning_effort_model(model: str) -> bool:

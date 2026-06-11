@@ -86,6 +86,30 @@ class ArxivSearchTool(BaseTool):
         )
 
     @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def is_open_world(self) -> bool:
+        return True
+
+    @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            "domains": ["literature"],
+            "retrieval_modes": ["search"],
+            "preference_tags": [
+                "scholarly_index",
+                "paper_metadata",
+                "abstracts",
+                "recent_papers",
+            ],
+            "read_only": True,
+            "destructive": False,
+            "open_world": True,
+        }
+
+    @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
@@ -247,6 +271,31 @@ class SemanticScholarSearchTool(BaseTool):
         )
 
     @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def is_open_world(self) -> bool:
+        return True
+
+    @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            "domains": ["literature"],
+            "retrieval_modes": ["search"],
+            "preference_tags": [
+                "scholarly_index",
+                "paper_metadata",
+                "abstracts",
+                "citations",
+                "recent_papers",
+            ],
+            "read_only": True,
+            "destructive": False,
+            "open_world": True,
+        }
+
+    @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
@@ -374,6 +423,29 @@ class CrossrefSearchTool(BaseTool):
             "Search scholarly metadata using the Crossref REST API. Use for DOI, journal, "
             "publisher, author, date, and reference metadata."
         )
+
+    @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def is_open_world(self) -> bool:
+        return True
+
+    @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            "domains": ["literature"],
+            "retrieval_modes": ["search"],
+            "preference_tags": [
+                "citation_lookup",
+                "doi_lookup",
+                "bibliographic_metadata",
+            ],
+            "read_only": True,
+            "destructive": False,
+            "open_world": True,
+        }
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -508,6 +580,31 @@ class PubMedSearchTool(BaseTool):
             "Search PubMed using NCBI E-utilities. Use for biomedical literature and return "
             "PMID, title, journal, authors, publication date, DOI, and PubMed URL."
         )
+
+    @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def is_open_world(self) -> bool:
+        return True
+
+    @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            "domains": ["literature"],
+            "retrieval_modes": ["search"],
+            "preference_tags": [
+                "scholarly_index",
+                "paper_metadata",
+                "abstracts",
+                "citations",
+                "biomedical",
+            ],
+            "read_only": True,
+            "destructive": False,
+            "open_world": True,
+        }
 
     @property
     def parameters_schema(self) -> dict[str, Any]:

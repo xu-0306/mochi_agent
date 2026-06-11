@@ -23,6 +23,7 @@
     "test:settings-inference-tab": "node ./scripts/test-settings-inference-tab.mjs",
     "test:inline-reasoning": "node --experimental-strip-types ./scripts/test-inline-reasoning.mjs",
     "test:reasoning-step-merge": "node --experimental-strip-types ./scripts/test-reasoning-step-merge.mjs",
+    "test:reasoning-continuity-badges": "node --experimental-strip-types ./scripts/test-reasoning-continuity-badges.mjs",
     "test:voice-capture": "node --experimental-strip-types ./scripts/test-voice-capture.mjs",
     "test:voice-overlay-phase": "node --experimental-strip-types ./scripts/test-voice-overlay-phase.mjs",
     "test:voice-settings-modes": "node --experimental-strip-types ./scripts/test-voice-settings-modes.mjs",

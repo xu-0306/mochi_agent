@@ -61,11 +61,15 @@ export function deriveReasoningPanelSummary({
   const toolCount = countUniqueTools(steps)
   const latestIssue = summarizeIssue(steps)
   const hasError = latestIssue !== null
+  const visibleStepCount = steps.filter((step) => step.type !== 'status').length
+  const progressCount = steps.length - visibleStepCount
 
   if (isStreaming) {
     return {
-      title: 'Thinking…',
-      detail: latestTool ? `${steps.length} steps, latest: ${latestTool}` : `${steps.length} steps`,
+      title: 'Thinking',
+      detail: latestTool
+        ? `${visibleStepCount} steps, latest: ${latestTool}`
+        : `${visibleStepCount} steps${progressCount > 0 ? `, ${progressCount} progress` : ''}`,
       hasError,
       latestIssue,
     }
@@ -75,9 +79,12 @@ export function deriveReasoningPanelSummary({
     ? `Thought for ${(generationTimeMs / 1000).toFixed(1)}s`
     : 'Reasoning trace'
 
-  const detailParts = [`${steps.length} steps`]
+  const detailParts = [`${visibleStepCount} steps`]
   if (toolCount > 0) {
     detailParts.push(`${toolCount} tool${toolCount === 1 ? '' : 's'}`)
+  }
+  if (progressCount > 0) {
+    detailParts.push(`${progressCount} progress`)
   }
   if (latestIssue) {
     detailParts.push(`issue: ${latestIssue}`)

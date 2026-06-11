@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from mochi.backends.base import BaseLLMBackend
 
@@ -87,6 +88,10 @@ class ToolExposurePlanner:
         "shell": 120,
         "memory_search": 130,
         "memory_save": 140,
+        "arxiv_search": 142,
+        "semantic_scholar_search": 144,
+        "crossref_search": 146,
+        "pubmed_search": 148,
         "web_search": 150,
         "web_fetch": 160,
         "web_crawl": 165,
@@ -110,8 +115,6 @@ class ToolExposurePlanner:
             "code",
             "file",
             "files",
-            "find",
-            "search",
             "grep",
             "glob",
             "todo",
@@ -121,6 +124,10 @@ class ToolExposurePlanner:
             "repo",
             "project",
             "workspace",
+            "folder",
+            "directory",
+            "path",
+            "local file",
             "shell",
             "exec",
             "session",
@@ -129,18 +136,28 @@ class ToolExposurePlanner:
             "delegate",
             "background task",
             "controlled execution",
-            "子代理",
-            "子agent",
-            "背景任務",
-            "受控執行",
         ),
         "literature": (
             "paper",
+            "papers",
+            "research",
+            "academic",
+            "scholarly",
             "arxiv",
             "pubmed",
             "doi",
             "citation",
+            "citations",
+            "journal",
+            "abstract",
             "literature",
+            "\u8ad6\u6587",
+            "\u7814\u7a76",
+            "\u6587\u737b",
+            "\u5b78\u8853",
+            "\u5f15\u7528",
+            "\u671f\u520a",
+            "\u6458\u8981",
         ),
         "memory": (
             "remember",
@@ -216,7 +233,61 @@ class ToolExposurePlanner:
             "controlled execution",
         ),
         "web_crawl": ("crawl", "site", "url", "http", "https"),
+        "calculator": (
+            "calculate",
+            "calculator",
+            "math",
+            "sum",
+            "average",
+            "percent",
+            "percentage",
+        ),
     }
+    _RESEARCH_KEYWORDS: tuple[str, ...] = (
+        *_GROUP_KEYWORDS["literature"],
+        "preprint",
+        "manuscript",
+        "publication",
+        "publications",
+        "survey paper",
+        "survey papers",
+        "related work",
+        "bibliography",
+        "reference",
+        "references",
+    )
+    _CITATION_KEYWORDS: tuple[str, ...] = (
+        "doi",
+        "citation",
+        "citations",
+        "cite",
+        "cited",
+        "reference",
+        "references",
+        "\u5f15\u7528",
+    )
+    _BIOMEDICAL_KEYWORDS: tuple[str, ...] = (
+        "biomedical",
+        "bioinformatics",
+        "clinical",
+        "medicine",
+        "medical",
+        "medline",
+        "pubmed",
+        "\u91ab\u5b78",
+        "\u751f\u91ab",
+        "\u81e8\u5e8a",
+    )
+    _RECENT_RESEARCH_KEYWORDS: tuple[str, ...] = (
+        "recent",
+        "recent years",
+        "latest papers",
+        "new papers",
+        "\u8fd1\u5e7e\u5e74",
+        "\u8fd1\u5e74",
+        "\u6700\u65b0\u8ad6\u6587",
+    )
+    _DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:a-z0-9]+\b", re.IGNORECASE)
 
     def __init__(self, *, tool_groups: dict[str, list[str]]) -> None:
         self._tool_groups = tool_groups
@@ -230,50 +301,98 @@ class ToolExposurePlanner:
         session_bound_workspace: bool,
         autonomy_mode: str | None = None,
         preferred_tool_names: list[str] | None = None,
+        tool_capabilities: dict[str, dict[str, Any]] | None = None,
         tool_mode: Literal["disabled", "auto", "required"] = "auto",
     ) -> ToolExposurePlan:
         if tool_mode == "disabled":
-            return ToolExposurePlan(
-                tool_names=[],
-                matched_groups=[],
-                limit=0,
-            )
+            return ToolExposurePlan(tool_names=[], matched_groups=[], limit=0)
+
+        backend_info = backend.get_model_info()
+        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
+            return ToolExposurePlan(tool_names=[], matched_groups=[], limit=0)
+
         lowered = message.lower()
         attached_workspace_files = any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
-        read_only_file_request = attached_workspace_files and any(
-            keyword in lowered for keyword in self._READ_ONLY_FILE_INTENT_KEYWORDS
+        read_only_file_request = attached_workspace_files and self._matches_any_keyword(
+            lowered,
+            self._READ_ONLY_FILE_INTENT_KEYWORDS,
         )
+
+        normalized_capabilities = {
+            tool_name: self._normalize_tool_capabilities(
+                (tool_capabilities or {}).get(tool_name),
+            )
+            for tool_name in available_tool_names
+        }
+        tools_by_group = self._build_tools_by_group(
+            available_tool_names,
+            normalized_capabilities,
+        )
+
+        research_request = self._is_research_request(lowered)
+        citation_request = self._is_citation_request(lowered)
+        biomedical_request = self._matches_any_keyword(lowered, self._BIOMEDICAL_KEYWORDS)
+        recent_research_request = self._matches_any_keyword(lowered, self._RECENT_RESEARCH_KEYWORDS)
+        workspace_request = self._matches_any_keyword(lowered, self._GROUP_KEYWORDS["workspace"])
+        web_request = self._matches_any_keyword(lowered, self._GROUP_KEYWORDS["web"])
+
         matched_groups: list[str] = []
-        for group_name in ("web", "workspace", "literature", "memory", "mcp"):
-            if any(keyword in lowered for keyword in self._GROUP_KEYWORDS[group_name]):
+        for group_name in ("memory", "mcp"):
+            if (
+                tools_by_group[group_name]
+                and self._matches_any_keyword(lowered, self._GROUP_KEYWORDS[group_name])
+            ):
                 matched_groups.append(group_name)
 
+        if research_request and tools_by_group["literature"]:
+            matched_groups.append("literature")
+            if tools_by_group["web"]:
+                matched_groups.append("web")
+        elif web_request and tools_by_group["web"]:
+            matched_groups.append("web")
+        elif workspace_request and tools_by_group["workspace"]:
+            matched_groups.append("workspace")
+
         if not matched_groups:
-            matched_groups.append("workspace" if session_bound_workspace else "web")
+            default_group = "workspace" if session_bound_workspace else "web"
+            fallback_group = "web" if default_group == "workspace" else "workspace"
+            if tools_by_group[default_group]:
+                matched_groups.append(default_group)
+            elif tools_by_group[fallback_group]:
+                matched_groups.append(fallback_group)
 
         available_order = {name: index for index, name in enumerate(available_tool_names)}
         grouped_tool_names = {
             tool_name
-            for tool_names in self._tool_groups.values()
+            for tool_names in tools_by_group.values()
             for tool_name in tool_names
         }
+
         preferred = [
             tool_name
             for tool_name in (preferred_tool_names or [])
             if tool_name in available_order
         ]
-        if "tool_search" in available_order and any(
-            keyword in lowered for keyword in self._TOOL_DISCOVERY_KEYWORDS
+        if "tool_search" in available_order and self._matches_any_keyword(
+            lowered,
+            self._TOOL_DISCOVERY_KEYWORDS,
         ):
-            preferred = ["tool_search", *[tool_name for tool_name in preferred if tool_name != "tool_search"]]
+            preferred = [
+                "tool_search",
+                *[tool_name for tool_name in preferred if tool_name != "tool_search"],
+            ]
         if attached_workspace_files and "file_read" in available_order:
-            preferred = ["file_read", *[tool_name for tool_name in preferred if tool_name != "file_read"]]
+            preferred = [
+                "file_read",
+                *[tool_name for tool_name in preferred if tool_name != "file_read"],
+            ]
         for tool_name, keywords in self._FILETYPE_TOOL_KEYWORDS.items():
             if tool_name not in available_order:
                 continue
-            if any(keyword in lowered for keyword in keywords):
+            if self._matches_any_keyword(lowered, keywords):
                 preferred.append(tool_name)
         preferred = list(dict.fromkeys(preferred))
 
@@ -283,7 +402,7 @@ class ToolExposurePlanner:
             if tool_name not in selected:
                 selected.append(tool_name)
         for group_name in matched_groups:
-            for tool_name in self._tool_groups.get(group_name, []):
+            for tool_name in tools_by_group[group_name]:
                 if tool_name in available and tool_name not in selected:
                     selected.append(tool_name)
         for tool_name in available_tool_names:
@@ -295,12 +414,23 @@ class ToolExposurePlanner:
         selected.sort(
             key=lambda name: (
                 0 if name in preferred_set else 1,
+                self._matched_group_rank(name, matched_groups, tools_by_group),
+                -self._capability_affinity_score(
+                    capabilities=normalized_capabilities.get(name, {}),
+                    matched_groups=matched_groups,
+                    research_request=research_request,
+                    citation_request=citation_request,
+                    biomedical_request=biomedical_request,
+                    recent_research_request=recent_research_request,
+                    web_request=web_request,
+                    workspace_request=workspace_request,
+                ),
                 self._TOOL_PRIORITY.get(name, 1000),
                 available_order.get(name, 10_000),
             )
         )
 
-        base_limit = 6 if backend.get_model_info().backend_type in {"gguf", "safetensors"} else 10
+        base_limit = 6 if backend_info.backend_type in {"gguf", "safetensors"} else 10
         effective_mode = autonomy_mode or "trusted_workspace"
         mode_limit, risky_limit = self._AUTONOMY_LIMITS.get(effective_mode, (base_limit, 1))
         limit = min(base_limit, mode_limit)
@@ -309,8 +439,9 @@ class ToolExposurePlanner:
         for tool_name in selected:
             if not self._tool_matches_message(tool_name, lowered):
                 continue
-            if tool_name in self._CONTEXTUAL_TOOLS and not any(
-                keyword in lowered for keyword in self._CONTEXT_KEYWORDS
+            if tool_name in self._CONTEXTUAL_TOOLS and not self._matches_any_keyword(
+                lowered,
+                self._CONTEXT_KEYWORDS,
             ):
                 continue
             if read_only_file_request and tool_name in self._RISKY_TOOLS:
@@ -329,8 +460,155 @@ class ToolExposurePlanner:
             limit=limit,
         )
 
+    def _build_tools_by_group(
+        self,
+        available_tool_names: list[str],
+        tool_capabilities: dict[str, dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        groups = {
+            "web": [],
+            "workspace": [],
+            "literature": [],
+            "memory": [],
+            "mcp": [],
+        }
+        for tool_name in available_tool_names:
+            domains = set(tool_capabilities.get(tool_name, {}).get("domains", ()))
+            for group_name in groups:
+                if group_name in domains or tool_name in self._tool_groups.get(group_name, []):
+                    groups[group_name].append(tool_name)
+        return groups
+
+    def _matched_group_rank(
+        self,
+        tool_name: str,
+        matched_groups: list[str],
+        tools_by_group: dict[str, list[str]],
+    ) -> int:
+        for index, group_name in enumerate(matched_groups):
+            if tool_name in tools_by_group[group_name]:
+                return index
+        return len(matched_groups)
+
+    def _capability_affinity_score(
+        self,
+        *,
+        capabilities: dict[str, Any],
+        matched_groups: list[str],
+        research_request: bool,
+        citation_request: bool,
+        biomedical_request: bool,
+        recent_research_request: bool,
+        web_request: bool,
+        workspace_request: bool,
+    ) -> int:
+        domains = set(capabilities.get("domains", ()))
+        retrieval_modes = set(capabilities.get("retrieval_modes", ()))
+        preference_tags = set(capabilities.get("preference_tags", ()))
+
+        score = 0
+        if research_request:
+            if "literature" in domains:
+                score += 120
+            if "web" in domains:
+                score += 30
+            if "scholarly_index" in preference_tags:
+                score += 25
+            if "paper_metadata" in preference_tags:
+                score += 10
+            if "search" in retrieval_modes:
+                score += 10
+            if "fetch" in retrieval_modes:
+                score += 1
+            if "crawl" in retrieval_modes:
+                score -= 10
+            if citation_request:
+                if "citation_lookup" in preference_tags or "doi_lookup" in preference_tags:
+                    score += 40
+                if "bibliographic_metadata" in preference_tags:
+                    score += 15
+            if biomedical_request and "biomedical" in preference_tags:
+                score += 40
+            if recent_research_request and "recent_papers" in preference_tags:
+                score += 15
+            return score
+
+        if "web" in matched_groups or web_request:
+            if "web" in domains:
+                score += 50
+            if "search" in retrieval_modes:
+                score += 15
+            if "fetch" in retrieval_modes:
+                score += 5
+            if "crawl" in retrieval_modes:
+                score += 3
+
+        if "workspace" in matched_groups or workspace_request:
+            if "workspace" in domains:
+                score += 40
+
+        if "memory" in matched_groups and "memory" in domains:
+            score += 35
+        if "mcp" in matched_groups and "mcp" in domains:
+            score += 35
+        return score
+
+    def _is_research_request(self, lowered_message: str) -> bool:
+        return (
+            self._matches_any_keyword(lowered_message, self._RESEARCH_KEYWORDS)
+            or self._matches_any_keyword(lowered_message, self._CITATION_KEYWORDS)
+            or self._matches_any_keyword(lowered_message, self._BIOMEDICAL_KEYWORDS)
+            or self._DOI_PATTERN.search(lowered_message) is not None
+        )
+
+    def _is_citation_request(self, lowered_message: str) -> bool:
+        return (
+            self._matches_any_keyword(lowered_message, self._CITATION_KEYWORDS)
+            or self._DOI_PATTERN.search(lowered_message) is not None
+        )
+
     def _tool_matches_message(self, tool_name: str, lowered_message: str) -> bool:
         keywords = self._INTENT_REQUIRED_TOOL_KEYWORDS.get(tool_name)
         if not keywords:
             return True
-        return any(keyword in lowered_message for keyword in keywords)
+        return self._matches_any_keyword(lowered_message, keywords)
+
+    @classmethod
+    def _matches_any_keyword(cls, lowered_message: str, keywords: tuple[str, ...]) -> bool:
+        return any(cls._matches_keyword(lowered_message, keyword) for keyword in keywords)
+
+    @staticmethod
+    def _matches_keyword(lowered_message: str, keyword: str) -> bool:
+        if not keyword:
+            return False
+        if keyword[0].isalnum() and keyword[-1].isalnum():
+            pattern = rf"(?<![a-z0-9_]){re.escape(keyword)}(?![a-z0-9_])"
+            return re.search(pattern, lowered_message) is not None
+        return keyword in lowered_message
+
+    @staticmethod
+    def _normalize_tool_capabilities(raw: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {
+                "domains": (),
+                "retrieval_modes": (),
+                "preference_tags": (),
+                "read_only": False,
+                "destructive": False,
+                "open_world": False,
+            }
+        return {
+            "domains": ToolExposurePlanner._coerce_string_tuple(raw.get("domains")),
+            "retrieval_modes": ToolExposurePlanner._coerce_string_tuple(raw.get("retrieval_modes")),
+            "preference_tags": ToolExposurePlanner._coerce_string_tuple(raw.get("preference_tags")),
+            "read_only": bool(raw.get("read_only", False)),
+            "destructive": bool(raw.get("destructive", False)),
+            "open_world": bool(raw.get("open_world", False)),
+        }
+
+    @staticmethod
+    def _coerce_string_tuple(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, (list, tuple)):
+            return ()
+        items = [str(item).strip() for item in value]
+        return tuple(item for item in items if item)
