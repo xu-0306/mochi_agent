@@ -92,6 +92,8 @@ class RuntimeStore:
                     protocol_id TEXT NOT NULL,
                     title TEXT,
                     topic TEXT,
+                    project_id TEXT,
+                    workspace_dir TEXT,
                     status TEXT NOT NULL,
                     selected_models_roles_json TEXT NOT NULL,
                     evaluation_policy_json TEXT NOT NULL,
@@ -168,6 +170,8 @@ class RuntimeStore:
             _ensure_column(conn, "approval_requests", "metadata_json", "TEXT")
             _ensure_column(conn, "agent_runs", "title", "TEXT")
             _ensure_column(conn, "agent_runs", "topic", "TEXT")
+            _ensure_column(conn, "agent_runs", "project_id", "TEXT")
+            _ensure_column(conn, "agent_runs", "workspace_dir", "TEXT")
             _ensure_column(conn, "agent_runs", "latest_error", "TEXT")
             _ensure_column(conn, "agent_runs", "evidence_status_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "agent_runs", "run_policy_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -495,6 +499,8 @@ class RuntimeStore:
         protocol_id: str,
         title: str | None,
         topic: str | None,
+        project_id: str | None = None,
+        workspace_dir: str | None = None,
         selected_models_roles: dict[str, Any] | None = None,
         evaluation_policy: dict[str, Any] | None = None,
         run_policy: dict[str, Any] | None = None,
@@ -512,16 +518,18 @@ class RuntimeStore:
                 conn.execute(
                     """
                     INSERT INTO agent_runs (
-                        id, protocol_id, title, topic, status, selected_models_roles_json,
+                        id, protocol_id, title, topic, project_id, workspace_dir, status, selected_models_roles_json,
                         evaluation_policy_json, run_policy_json, schedule_json, summary_json, latest_error,
                         evidence_status_json, started_at, finished_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
                         protocol_id,
                         title,
                         topic,
+                        project_id,
+                        workspace_dir,
                         "created",
                         json.dumps(selected_models_roles or {}, ensure_ascii=False),
                         json.dumps(evaluation_policy or {}, ensure_ascii=False),
@@ -647,6 +655,8 @@ class RuntimeStore:
         *,
         summary: dict[str, Any] | None = None,
         evidence_status: dict[str, Any] | None = None,
+        project_id: str | None | object = _UNSET,
+        workspace_dir: str | None | object = _UNSET,
         latest_error: str | None | object = _UNSET,
     ) -> None:
         await self.initialize()
@@ -656,7 +666,7 @@ class RuntimeStore:
             with sqlite3.connect(self._db_path) as conn:
                 existing = conn.execute(
                     """
-                    SELECT summary_json, evidence_status_json, latest_error
+                    SELECT summary_json, evidence_status_json, latest_error, project_id, workspace_dir
                     FROM agent_runs
                     WHERE id=?
                     """,
@@ -667,16 +677,22 @@ class RuntimeStore:
                 current_summary = json.loads(str(existing[0] or "{}"))
                 current_evidence_status = json.loads(str(existing[1] or "{}"))
                 current_latest_error = existing[2]
+                current_project_id = existing[3]
+                current_workspace_dir = existing[4]
                 next_summary = current_summary if summary is None else summary
                 next_evidence_status = (
                     current_evidence_status if evidence_status is None else evidence_status
                 )
                 next_latest_error = current_latest_error if latest_error is _UNSET else latest_error
+                next_project_id = current_project_id if project_id is _UNSET else project_id
+                next_workspace_dir = current_workspace_dir if workspace_dir is _UNSET else workspace_dir
                 conn.execute(
                     """
                     UPDATE agent_runs
                     SET summary_json=?,
                         evidence_status_json=?,
+                        project_id=?,
+                        workspace_dir=?,
                         latest_error=?,
                         updated_at=?
                     WHERE id=?
@@ -684,6 +700,8 @@ class RuntimeStore:
                     (
                         json.dumps(next_summary, ensure_ascii=False),
                         json.dumps(next_evidence_status, ensure_ascii=False),
+                        next_project_id,
+                        next_workspace_dir,
                         next_latest_error,
                         now,
                         run_id,

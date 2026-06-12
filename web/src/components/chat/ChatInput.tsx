@@ -45,14 +45,22 @@ export interface ChatInputModelOption {
   status?: 'connected' | 'configured' | 'disconnected'
 }
 
+export interface ChatComposerSeed {
+  text: string
+  attachments: ChatAttachment[]
+  selectedSkills?: Array<{ id: string; name: string }>
+}
+
 interface ChatInputProps {
   sessionId?: string | null
   projectId?: string | null
   uploadTargetDir?: string
   onSend: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[] }) => void
+  onSubmitEdit?: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[] }) => void
+  onCancelEdit?: () => void
   onStop?: () => void
   onVoice?: () => void
-  onBuiltinCommand?: (command: 'clear' | 'settings' | 'voice' | 'model' | 'export') => void
+  onBuiltinCommand?: (command: 'clear' | 'settings' | 'voice' | 'model' | 'export' | 'workflow' | 'chat') => void
   disabled?: boolean
   isStreaming?: boolean
   models?: ChatInputModelOption[]
@@ -65,6 +73,9 @@ interface ChatInputProps {
   inference: InferenceParams
   reasoningOptions?: api.ReasoningEffort[]
   onReasoningEffortChange?: (value: api.ReasoningEffort | null) => void
+  composerMode?: 'compose' | 'edit'
+  composerSeed?: ChatComposerSeed | null
+  composerResetKey?: string
 }
 
 interface AttachedFile extends ChatAttachment {}
@@ -122,6 +133,8 @@ export function ChatInput({
   projectId,
   uploadTargetDir,
   onSend,
+  onSubmitEdit,
+  onCancelEdit,
   onStop,
   onVoice,
   onBuiltinCommand,
@@ -137,6 +150,9 @@ export function ChatInput({
   inference,
   reasoningOptions,
   onReasoningEffortChange,
+  composerMode = 'compose',
+  composerSeed = null,
+  composerResetKey,
 }: ChatInputProps) {
   const { t } = useI18n()
   const [value, setValue] = React.useState('')
@@ -338,6 +354,17 @@ export function ChatInput({
     attachedFiles,
   ])
 
+  React.useEffect(() => {
+    if (composerResetKey === undefined) {
+      return
+    }
+    setValue(composerSeed?.text ?? '')
+    setAttachedFiles([...(composerSeed?.attachments ?? [])])
+    setSelectedSkills([...(composerSeed?.selectedSkills ?? [])])
+    setUploadError(null)
+    setPaletteDismissed(false)
+  }, [composerResetKey, composerSeed])
+
   const handleAttachFiles = React.useCallback(async (incomingFiles: FileList | File[]) => {
     const files = Array.from(incomingFiles)
     if (files.length === 0) {
@@ -381,7 +408,8 @@ export function ChatInput({
     if ((trimmed.length === 0 && attachedFiles.length === 0) || disabled || isStreaming || isUploadingFiles) {
       return
     }
-    onSend(trimmed, {
+    const submit = composerMode === 'edit' && onSubmitEdit ? onSubmitEdit : onSend
+    submit(trimmed, {
       selectedSkillIds: selectedSkills.map((skill) => skill.id),
       attachments: attachedFiles,
     })
@@ -512,6 +540,21 @@ export function ChatInput({
             }
           }}
         >
+          {composerMode === 'edit' ? (
+            <div className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+              <span>Editing message. Attachments stay until you remove them.</span>
+              {onCancelEdit ? (
+                <button
+                  type="button"
+                  onClick={onCancelEdit}
+                  className="shrink-0 text-foreground transition-colors hover:text-primary-300"
+                >
+                  Cancel edit
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
           {selectedSkills.length > 0 ? (
             <div className="flex flex-wrap gap-1.5 px-3 pt-2">
               {selectedSkills.map((skill) => (
@@ -900,8 +943,8 @@ export function ChatInput({
               size="icon-sm"
               onClick={isStreaming ? onStop : handleSend}
               disabled={disabled || isUploadingFiles || (isStreaming ? !onStop : (!value.trim() && attachedFiles.length === 0))}
-              title={isStreaming ? 'Stop generation' : t('chat.input.send')}
-              aria-label={isStreaming ? 'Stop generation' : t('chat.input.send')}
+              title={isStreaming ? 'Stop generation' : composerMode === 'edit' ? 'Resend edited message' : t('chat.input.send')}
+              aria-label={isStreaming ? 'Stop generation' : composerMode === 'edit' ? 'Resend edited message' : t('chat.input.send')}
               className="h-7 w-7 shrink-0"
             >
               {isStreaming ? (

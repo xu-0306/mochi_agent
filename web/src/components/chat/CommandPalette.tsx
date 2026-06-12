@@ -5,7 +5,7 @@ import { Brain, Command, Mic, Search, Settings, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export type CommandPaletteAction =
-  | { kind: 'builtin'; id: 'clear' | 'settings' | 'voice' | 'model' | 'export'; label: string; description: string }
+  | { kind: 'builtin'; id: 'clear' | 'settings' | 'voice' | 'model' | 'export' | 'workflow' | 'chat'; label: string; description: string }
   | { kind: 'skill'; id: string; label: string; description: string }
 
 interface CommandPaletteProps {
@@ -25,6 +25,8 @@ export function buildBuiltinActions(): CommandPaletteAction[] {
     { kind: 'builtin', id: 'voice', label: '/voice', description: 'Open voice overlay' },
     { kind: 'builtin', id: 'model', label: '/model', description: 'Focus model selector' },
     { kind: 'builtin', id: 'export', label: '/export', description: 'Export current conversation' },
+    { kind: 'builtin', id: 'workflow', label: '/workflow', description: 'Enable workflow mode for this conversation' },
+    { kind: 'builtin', id: 'chat', label: '/chat', description: 'Return this conversation to normal chat mode' },
   ]
 }
 
@@ -38,7 +40,7 @@ function iconForAction(action: CommandPaletteAction) {
   if (action.id === 'voice') {
     return <Mic className="h-3.5 w-3.5 text-primary-400" />
   }
-  if (action.id === 'model' || action.id === 'export') {
+  if (action.id === 'model' || action.id === 'export' || action.id === 'workflow' || action.id === 'chat') {
     return <Sparkles className="h-3.5 w-3.5 text-primary-400" />
   }
   return <Command className="h-3.5 w-3.5 text-primary-400" />

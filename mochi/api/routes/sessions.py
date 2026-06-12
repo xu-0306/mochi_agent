@@ -30,7 +30,8 @@ class CreateSessionRequest(BaseModel):
 class UpdateSessionRequest(BaseModel):
     """更新 session metadata request。"""
 
-    title: str
+    title: str | None = None
+    workflow: dict[str, object] | None = None
 
 
 class UpdateSessionProjectRequest(BaseModel):
@@ -43,6 +44,12 @@ class RewriteSessionFromTurnRequest(BaseModel):
     """Rewrite a session by removing conversation events from one turn onward."""
 
     from_turn_id: str
+
+
+class AppendSessionEventsRequest(BaseModel):
+    """Append one or more replayable session events."""
+
+    events: list[dict[str, object]]
 
 
 def _get_session_store(app: object, *, config: object | None = None) -> SessionStore:
@@ -77,6 +84,7 @@ async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]
                 "event_count": len(events),
                 "updated_at": updated_at,
                 "project_id": _session_project_id(events),
+                "workflow": _session_workflow_state(events),
             }
         )
 
@@ -130,6 +138,19 @@ def _session_project_id(events: list[dict]) -> str | None:
             return None
         if isinstance(project_id, str) and project_id.strip():
             return project_id.strip()
+    return None
+
+
+def _session_workflow_state(events: list[dict]) -> dict[str, object] | None:
+    """Resolve latest workflow state from metadata events."""
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "workflow_state_updated":
+            continue
+        workflow = event.get("workflow")
+        if isinstance(workflow, dict):
+            return dict(workflow)
     return None
 
 
@@ -316,6 +337,7 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "session_id": session_id,
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
+        "workflow": _session_workflow_state(events),
         "events": events,
     }
 
@@ -346,7 +368,35 @@ async def rewrite_session_from_turn(
         "session_id": session_id,
         "title": _session_title(session_id, rewritten),
         "project_id": _session_project_id(rewritten),
+        "workflow": _session_workflow_state(rewritten),
         "events": rewritten,
+    }
+
+
+@router.post("/sessions/{session_id}/events")
+async def append_session_events(
+    session_id: str,
+    payload: AppendSessionEventsRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    """Append replayable events to one session."""
+    app = http_request.app
+    config = await _get_config(app)
+    store = _get_session_store(app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    for event in payload.events:
+        await store.save_event(session_id, dict(event))
+
+    events = await store.load_session(session_id)
+    return {
+        "type": "session",
+        "session_id": session_id,
+        "title": _session_title(session_id, events),
+        "project_id": _session_project_id(events),
+        "workflow": _session_workflow_state(events),
+        "events": events,
     }
 
 
@@ -357,8 +407,11 @@ async def update_session(
     http_request: Request,
 ) -> dict[str, object]:
     """更新 session 顯示 metadata。"""
-    title = payload.title.strip()
-    if not title:
+    title = payload.title.strip() if isinstance(payload.title, str) else None
+    workflow = dict(payload.workflow) if isinstance(payload.workflow, dict) else None
+    if title is None and workflow is None:
+        raise HTTPException(status_code=422, detail="title or workflow is required")
+    if title is not None and not title:
         raise HTTPException(status_code=422, detail="title must not be empty")
 
     app = http_request.app
@@ -368,17 +421,37 @@ async def update_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     now = datetime.now(tz=UTC).isoformat()
-    await store.save_event(
-        session_id,
-        {
-            "type": "session_meta",
-            "event": "renamed",
-            "session_id": session_id,
-            "title": title,
-            "timestamp": now,
-        },
-    )
-    return {"type": "session", "session_id": session_id, "title": title}
+    if title is not None:
+        await store.save_event(
+            session_id,
+            {
+                "type": "session_meta",
+                "event": "renamed",
+                "session_id": session_id,
+                "title": title,
+                "timestamp": now,
+            },
+        )
+    if workflow is not None:
+        await store.save_event(
+            session_id,
+            {
+                "type": "session_meta",
+                "event": "workflow_state_updated",
+                "session_id": session_id,
+                "workflow": workflow,
+                "timestamp": now,
+            },
+        )
+    events = await store.load_session(session_id)
+    return {
+        "type": "session",
+        "session_id": session_id,
+        "title": _session_title(session_id, events),
+        "project_id": _session_project_id(events),
+        "workflow": _session_workflow_state(events),
+        "events": events,
+    }
 
 
 @router.patch("/sessions/{session_id}/project")

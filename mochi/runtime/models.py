@@ -48,6 +48,8 @@ class AgentRunCreateRequest(BaseModel):
     protocol_id: str = Field(min_length=1)
     title: str | None = None
     topic: str | None = None
+    project_id: str | None = None
+    workspace_dir: str | None = None
     reasoning_effort: ReasoningEffort | None = None
     selected_models_roles: dict[str, Any] = Field(default_factory=dict)
     evaluation_policy: dict[str, Any] = Field(default_factory=dict)
@@ -67,6 +69,17 @@ class AgentRunGuidanceRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentRunMessageRequest(BaseModel):
+    """Request payload for appending a workflow conversation message to an Agent Run."""
+
+    role: Literal["user", "operator"] = "user"
+    content: str = Field(min_length=1)
+    project_id: str | None = None
+    workspace_dir: str | None = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentRunResumeRequest(BaseModel):
     """Request payload for resuming an Agent Run."""
 
@@ -82,6 +95,8 @@ class AgentRunResponse(BaseModel):
     protocol_id: str
     title: str | None = None
     topic: str | None = None
+    project_id: str | None = None
+    workspace_dir: str | None = None
     reasoning_effort: ReasoningEffort | None = None
     status: str
     selected_models_roles: dict[str, Any] = Field(default_factory=dict)

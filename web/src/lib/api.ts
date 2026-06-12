@@ -264,6 +264,9 @@ export type TurnEventPhase =
   | 'tool_call_result'
   | 'error'
   | 'final_answer'
+  | 'workflow_status'
+  | 'workflow_artifact'
+  | 'workflow_exec_update'
 
 export interface LegacyChatEvent {
   type:
@@ -569,6 +572,20 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
   if (type === 'turn_event') {
     const phase = getString(event.phase)
     const payload = isRecord(event.payload) ? event.payload : {}
+    if (
+      phase === 'workflow_status' ||
+      phase === 'workflow_artifact' ||
+      phase === 'workflow_exec_update'
+    ) {
+      return {
+        kind: 'message',
+        role: phase === 'workflow_status' ? 'assistant' : 'system',
+        content: getPayloadContent(payload) || getString(event.content) || '',
+        attachments: [],
+        timestamp,
+        turnKey,
+      }
+    }
     const finishReason =
       getNonEmptyString(payload.finish_reason) ??
       getNonEmptyString(payload.finishReason) ??
@@ -1626,6 +1643,7 @@ interface BackendSessionListItem {
   event_count: number
   updated_at: string
   project_id?: string | null
+  workflow?: SessionWorkflowState | null
 }
 
 interface BackendSessionListResponse {
@@ -1640,6 +1658,7 @@ export interface SessionSummary {
   updatedAt: string
   eventCount: number
   projectId: string | null
+  workflow: SessionWorkflowState | null
 }
 
 export type SessionEvent = SessionMessageEvent | SessionTurnEvent | UnknownSessionEvent
@@ -1649,11 +1668,63 @@ interface BackendSessionResponse {
   session_id: string
   title?: string
   project_id?: string | null
+  workflow?: SessionWorkflowState | null
   events: Record<string, unknown>[]
 }
 
 export interface SessionDetail extends SessionSummary {
   events: SessionEvent[]
+}
+
+export interface SessionWorkflowConfig {
+  title?: string | null
+  protocol_id?: AgentRunProtocolId | null
+  workspace_dir_override?: string | null
+  reasoning_effort?: ReasoningEffort | null
+  selected_models_roles?: Record<string, string>
+  run_policy?: Record<string, unknown>
+  execution_policy?: Record<string, unknown>
+  schedule?: Record<string, unknown>
+  evidence?: Record<string, unknown>
+}
+
+export interface SessionWorkflowState {
+  enabled?: boolean
+  bound_run_id?: string | null
+  synced_run_event_count?: number
+  workspace_dir_override?: string | null
+  config?: SessionWorkflowConfig
+}
+
+function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  return {
+    enabled: getBoolean(value.enabled) ?? false,
+    bound_run_id: getNullableString(value.bound_run_id),
+    synced_run_event_count: getNumber(value.synced_run_event_count) ?? 0,
+    workspace_dir_override: getNullableString(value.workspace_dir_override),
+    config: isRecord(value.config)
+      ? {
+          title: getNullableString(value.config.title),
+          protocol_id: (getString(value.config.protocol_id) as AgentRunProtocolId | null) ?? null,
+          workspace_dir_override: getNullableString(value.config.workspace_dir_override),
+          reasoning_effort: (getString(value.config.reasoning_effort) as ReasoningEffort | null) ?? null,
+          selected_models_roles: isRecord(value.config.selected_models_roles)
+            ? Object.fromEntries(
+                Object.entries(value.config.selected_models_roles)
+                  .filter(([, item]) => typeof item === 'string')
+                  .map(([key, item]) => [key, item as string])
+              )
+            : {},
+          run_policy: isRecord(value.config.run_policy) ? value.config.run_policy : {},
+          execution_policy: isRecord(value.config.execution_policy) ? value.config.execution_policy : {},
+          schedule: isRecord(value.config.schedule) ? value.config.schedule : {},
+          evidence: isRecord(value.config.evidence) ? value.config.evidence : {},
+        }
+      : {},
+  }
 }
 
 function normalizeSessionSummary(item: BackendSessionListItem): SessionSummary {
@@ -1664,6 +1735,7 @@ function normalizeSessionSummary(item: BackendSessionListItem): SessionSummary {
     updatedAt: item.updated_at,
     eventCount: item.event_count,
     projectId: getString(item.project_id) ?? null,
+    workflow: normalizeSessionWorkflowState(item.workflow),
   }
 }
 
@@ -1752,6 +1824,7 @@ function normalizeSessionDetail(payload: BackendSessionResponse): SessionDetail 
     updatedAt,
     eventCount: events.length,
     projectId: getString(payload.project_id) ?? null,
+    workflow: normalizeSessionWorkflowState(payload.workflow),
     events,
   }
 }
@@ -1802,6 +1875,7 @@ export async function createSession(
     updatedAt: now,
     eventCount: 1,
     projectId: projectId ?? null,
+    workflow: null,
   }
 }
 
@@ -1823,13 +1897,17 @@ export async function forkSession(input: ForkSessionInput): Promise<SessionSumma
     updatedAt: now,
     eventCount: 1,
     projectId: input.projectId ?? null,
+    workflow: null,
   }
 }
 
 interface BackendUpdateSessionResponse {
   type: 'session'
   session_id: string
-  title: string
+  title?: string
+  project_id?: string | null
+  workflow?: SessionWorkflowState | null
+  events?: Record<string, unknown>[]
 }
 
 export async function renameSession(sessionId: string, title: string): Promise<SessionSummary> {
@@ -1844,12 +1922,41 @@ export async function renameSession(sessionId: string, title: string): Promise<S
   const now = new Date().toISOString()
   return {
     id: payload.session_id,
-    title: payload.title,
+    title: payload.title ?? title,
     createdAt: now,
     updatedAt: now,
     eventCount: 0,
-    projectId: null,
+    projectId: getString(payload.project_id) ?? null,
+    workflow: normalizeSessionWorkflowState(payload.workflow),
   }
+}
+
+export async function updateSessionWorkflowState(
+  sessionId: string,
+  workflow: SessionWorkflowState
+): Promise<SessionDetail> {
+  const payload = await requestJson<BackendSessionResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ workflow }),
+    }
+  )
+  return normalizeSessionDetail(payload)
+}
+
+export async function appendSessionEvents(
+  sessionId: string,
+  events: Array<Record<string, unknown>>
+): Promise<SessionDetail> {
+  const payload = await requestJson<BackendSessionResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ events }),
+    }
+  )
+  return normalizeSessionDetail(payload)
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
@@ -4683,6 +4790,8 @@ export interface AgentRunSummary {
   protocol_id: string
   title: string | null
   topic: string | null
+  project_id: string | null
+  workspace_dir: string | null
   reasoning_effort: ReasoningEffort | null
   status: string
   selected_models_roles: Record<string, unknown>
@@ -4754,6 +4863,8 @@ export interface CreateAgentRunInput {
   protocol_id: AgentRunProtocolId
   title?: string | null
   topic?: string | null
+  projectId?: string | null
+  workspaceDir?: string | null
   reasoning_effort?: ReasoningEffort | null
   subagents?: AgentRunSubagentInput[]
   selected_models_roles?: Record<string, unknown>
@@ -4777,6 +4888,15 @@ export interface CreateAgentRunInput {
 export interface AppendAgentRunGuidanceInput {
   guidance: string
   author?: string | null
+  metadata?: Record<string, unknown>
+}
+
+export interface AgentRunConversationMessage {
+  role: 'operator' | 'assistant'
+  content: string
+  projectId?: string | null
+  workspaceDir?: string | null
+  attachments?: ChatAttachment[]
   metadata?: Record<string, unknown>
 }
 
@@ -4850,6 +4970,8 @@ function normalizeAgentRunSummary(payload: unknown): AgentRunSummary {
     protocol_id: getString(record.protocol_id) ?? '',
     title: getNullableString(record.title),
     topic: getNullableString(record.topic),
+    project_id: getNullableString(record.project_id),
+    workspace_dir: getNullableString(record.workspace_dir),
     reasoning_effort: isReasoningEffort(reasoningEffort) ? reasoningEffort : null,
     status: getString(record.status) ?? 'unknown',
     selected_models_roles: isRecord(record.selected_models_roles)
@@ -5079,6 +5201,8 @@ export async function createAgentRun(input: CreateAgentRunInput): Promise<AgentR
       protocol_id: input.protocol_id,
       title: input.title ?? null,
       topic: input.topic ?? null,
+      project_id: input.projectId ?? null,
+      workspace_dir: input.workspaceDir ?? null,
       reasoning_effort: input.reasoning_effort ?? null,
       selected_models_roles: builtSelectedModelsRoles,
       evaluation_policy: input.evaluation_policy ?? {},
@@ -5110,6 +5234,24 @@ export async function appendAgentRunGuidance(
     body: JSON.stringify({
       guidance: input.guidance,
       author: input.author ?? null,
+      metadata: input.metadata ?? {},
+    }),
+  })
+  return normalizeAgentRunDetail(payload)
+}
+
+export async function appendAgentRunMessage(
+  runId: string,
+  input: AgentRunConversationMessage
+): Promise<AgentRunDetail> {
+  const payload = await requestJson<unknown>(`/agent-runs/${encodeURIComponent(runId)}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({
+      role: input.role,
+      content: input.content,
+      project_id: input.projectId ?? null,
+      workspace_dir: input.workspaceDir ?? null,
+      attachments: input.attachments ?? [],
       metadata: input.metadata ?? {},
     }),
   })

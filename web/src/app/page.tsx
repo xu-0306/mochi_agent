@@ -2,15 +2,46 @@
 
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
-import { AlertCircle, ListTodo, Loader2, MoreHorizontal, Settings, SlidersHorizontal, Workflow } from 'lucide-react'
+import {
+  AlertCircle,
+  ExternalLink,
+  ListTodo,
+  Loader2,
+  MoreHorizontal,
+  RotateCcw,
+  Settings,
+  SlidersHorizontal,
+  Workflow,
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { ChatInput, type ChatInputModelOption } from '@/components/chat/ChatInput'
+import {
+  ChatInput,
+  type ChatComposerSeed,
+  type ChatInputModelOption,
+} from '@/components/chat/ChatInput'
 import { ChatMessage } from '@/components/chat/ChatMessage'
 import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
 import { InferencePanel } from '@/components/chat/InferencePanel'
 import { ScrollToBottom } from '@/components/chat/ScrollToBottom'
 import { TaskPanel } from '@/components/chat/TaskPanel'
+import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
+import { Switch } from '@/components/ui/switch'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import * as api from '@/lib/api'
 import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
@@ -39,6 +70,40 @@ import {
 } from '@/lib/voice-ws'
 
 const MODELS_UPDATED_EVENT = 'mochi:models-updated'
+const DEFAULT_WORKFLOW_PROTOCOL: api.AgentRunProtocolId = 'teacher_student_distill'
+const WORKFLOW_PROTOCOL_OPTIONS: Array<{
+  value: api.AgentRunProtocolId
+  label: string
+  description: string
+}> = [
+  {
+    value: 'teacher_student_distill',
+    label: 'Teacher / Student Distill',
+    description: 'General multi-agent execution with teacher and student roles.',
+  },
+  {
+    value: 'multi_agent_debate',
+    label: 'Multi-Agent Debate',
+    description: 'Parallel debate and judging workflow for harder decisions.',
+  },
+  {
+    value: 'dr_zero_self_evolve',
+    label: 'DR Zero Self-Evolve',
+    description: 'Iterative proposal, solve, and verification loops.',
+  },
+  {
+    value: 'controlled_subagent_execution',
+    label: 'Controlled Execution',
+    description: 'Subagents propose execution while the controller keeps runtime boundaries.',
+  },
+]
+
+interface ComposerEditState {
+  messageId: string
+  turnId: string | null
+  seed: ChatComposerSeed
+  resetKey: string
+}
 
 interface BackendChatResponse {
   session_id?: string
@@ -130,6 +195,231 @@ function getStringArray(value: unknown): string[] {
     return []
   }
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+function buildDefaultWorkflowState(
+  reasoningEffort: api.ReasoningEffort | null
+): api.SessionWorkflowState {
+  return {
+    enabled: false,
+    bound_run_id: null,
+    synced_run_event_count: 0,
+    workspace_dir_override: null,
+    config: {
+      title: null,
+      protocol_id: DEFAULT_WORKFLOW_PROTOCOL,
+      workspace_dir_override: null,
+      reasoning_effort: reasoningEffort,
+      selected_models_roles: {},
+      run_policy: {},
+      execution_policy: {},
+      schedule: {},
+      evidence: {},
+    },
+  }
+}
+
+function normalizeWorkflowState(
+  value: api.SessionWorkflowState | null | undefined,
+  reasoningEffort: api.ReasoningEffort | null
+): api.SessionWorkflowState {
+  const defaults = buildDefaultWorkflowState(reasoningEffort)
+  const config = value?.config ?? {}
+  return {
+    enabled: value?.enabled ?? defaults.enabled,
+    bound_run_id: value?.bound_run_id ?? defaults.bound_run_id,
+    synced_run_event_count: value?.synced_run_event_count ?? defaults.synced_run_event_count,
+    workspace_dir_override:
+      value?.workspace_dir_override ?? config.workspace_dir_override ?? defaults.workspace_dir_override,
+    config: {
+      ...defaults.config,
+      ...config,
+      protocol_id: config.protocol_id ?? defaults.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
+      reasoning_effort: config.reasoning_effort ?? reasoningEffort,
+      selected_models_roles: config.selected_models_roles ?? {},
+      run_policy: config.run_policy ?? {},
+      execution_policy: config.execution_policy ?? {},
+      schedule: normalizeWorkflowScheduleConfig(
+        isRecord(config.schedule) ? config.schedule : {}
+      ),
+      evidence: config.evidence ?? {},
+    },
+  }
+}
+
+function workflowScheduleEnabled(workflow: api.SessionWorkflowState): boolean {
+  return Boolean(
+    workflow.config?.schedule &&
+      typeof workflow.config.schedule === 'object' &&
+      workflow.config.schedule.enabled === true
+  )
+}
+
+type WorkflowScheduleType = 'interval' | 'once' | 'cron'
+
+function defaultScheduleTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}
+
+function resolveWorkflowScheduleType(schedule: Record<string, unknown>): WorkflowScheduleType {
+  if (typeof schedule.cron === 'string' && schedule.cron.trim()) {
+    return 'cron'
+  }
+  if (typeof schedule.run_at === 'string' && schedule.run_at.trim()) {
+    return 'once'
+  }
+  return 'interval'
+}
+
+function formatWorkflowScheduleRunAt(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    return ''
+  }
+  const trimmed = value.trim()
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(trimmed)) {
+    return trimmed
+  }
+  const parsed = new Date(trimmed)
+  if (Number.isNaN(parsed.getTime())) {
+    return trimmed
+  }
+  const local = new Date(parsed.getTime() - parsed.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 16)
+}
+
+function normalizeWorkflowScheduleConfig(
+  value: Record<string, unknown> | null | undefined
+): Record<string, unknown> {
+  if (!isRecord(value)) {
+    return {}
+  }
+  const normalized: Record<string, unknown> = { ...value }
+  const timezone = getString(normalized.timezone) ?? defaultScheduleTimezone()
+  if (Object.keys(normalized).length === 0) {
+    return normalized
+  }
+  const hasLegacyScheduleFields =
+    getString(normalized.run_at) !== null ||
+    getString(normalized.cron) !== null ||
+    normalized.interval_seconds !== undefined
+  normalized.enabled =
+    normalized.enabled === false ? false : normalized.enabled === true || hasLegacyScheduleFields
+  normalized.timezone = timezone
+
+  const type = resolveWorkflowScheduleType(normalized)
+  if (type === 'once') {
+    const runAt = getString(normalized.run_at)
+    if (runAt) {
+      const parsed = new Date(runAt)
+      normalized.run_at = Number.isNaN(parsed.getTime()) ? runAt : parsed.toISOString()
+    }
+    delete normalized.interval_seconds
+    delete normalized.cron
+    delete normalized.start_immediately
+    return normalized
+  }
+
+  if (type === 'cron') {
+    normalized.cron = getString(normalized.cron) ?? '0 9 * * 1'
+    normalized.start_immediately = normalized.start_immediately !== false
+    delete normalized.interval_seconds
+    delete normalized.run_at
+    return normalized
+  }
+
+  normalized.interval_seconds =
+    typeof normalized.interval_seconds === 'number' && Number.isFinite(normalized.interval_seconds)
+      ? normalized.interval_seconds
+      : Number.parseInt(String(normalized.interval_seconds ?? ''), 10) || 3600
+  normalized.start_immediately = normalized.start_immediately !== false
+  delete normalized.cron
+  delete normalized.run_at
+  return normalized
+}
+
+function buildWorkflowScheduleConfig(
+  schedule: Record<string, unknown>,
+  type: WorkflowScheduleType,
+  enabled: boolean
+): Record<string, unknown> {
+  const base = normalizeWorkflowScheduleConfig(schedule)
+  const timezone = getString(base.timezone) ?? defaultScheduleTimezone()
+  const autoPauseOnFailure = base.auto_pause_on_failure !== false
+  const maxRuns = typeof base.max_runs === 'number' && Number.isFinite(base.max_runs)
+    ? base.max_runs
+    : null
+
+  if (type === 'once') {
+    return {
+      enabled,
+      run_at: getString(base.run_at) ?? '',
+      timezone,
+      max_runs: maxRuns ?? 1,
+      auto_pause_on_failure: autoPauseOnFailure,
+    }
+  }
+
+  if (type === 'cron') {
+    return {
+      enabled,
+      cron: getString(base.cron) ?? '0 9 * * 1',
+      timezone,
+      start_immediately: base.start_immediately !== false,
+      max_runs: maxRuns,
+      auto_pause_on_failure: autoPauseOnFailure,
+    }
+  }
+
+  return {
+    enabled,
+    interval_seconds:
+      typeof base.interval_seconds === 'number' && Number.isFinite(base.interval_seconds)
+        ? base.interval_seconds
+        : 3600,
+    timezone,
+    start_immediately: base.start_immediately !== false,
+    max_runs: maxRuns,
+    auto_pause_on_failure: autoPauseOnFailure,
+  }
+}
+
+function formatWorkflowLifecycleMessage(event: Record<string, unknown>): string {
+  const type = getString(event.type) ?? 'workflow_event'
+  const status = getString(event.status)
+
+  if (type === 'run_created') {
+    return 'Workflow run created.'
+  }
+  if (type === 'run_started') {
+    return 'Workflow run started.'
+  }
+  if (type === 'run_completed') {
+    return 'Workflow run completed.'
+  }
+  if (type === 'run_failed') {
+    return `Workflow run failed${status ? `: ${status}.` : '.'}`
+  }
+  if (type === 'run_paused') {
+    return 'Workflow run paused.'
+  }
+  if (type === 'run_resumed') {
+    return 'Workflow run resumed.'
+  }
+  if (type === 'run_finalized_partial') {
+    return 'Workflow run finalized as partial.'
+  }
+  if (type === 'run_scheduled') {
+    return 'Workflow run scheduled.'
+  }
+  if (type === 'run_status') {
+    return status ? `Workflow status: ${status}.` : 'Workflow status updated.'
+  }
+
+  return type.replaceAll('_', ' ')
 }
 
 const INFERENCE_PARAM_KEY_MAP: Record<string, keyof ReturnType<typeof resolveEffectiveInferenceParams>> = {
@@ -531,8 +821,15 @@ export default function ChatPage() {
   const [settings, setSettings] = React.useState<api.Settings | null>(null)
   const [mobileInferenceOpen, setMobileInferenceOpen] = React.useState(false)
   const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
+  const [workflowPanelOpen, setWorkflowPanelOpen] = React.useState(false)
   const [selectedPresetName, setSelectedPresetName] = React.useState('default')
   const [savingPreset, setSavingPreset] = React.useState(false)
+  const [workflowBusy, setWorkflowBusy] = React.useState(false)
+  const [workflowError, setWorkflowError] = React.useState<string | null>(null)
+  const [workflowDraftBySessionId, setWorkflowDraftBySessionId] = React.useState<
+    Record<string, api.SessionWorkflowState>
+  >({})
+  const [editState, setEditState] = React.useState<ComposerEditState | null>(null)
   const [voiceOpen, setVoiceOpen] = React.useState(false)
   const [voicePhase, setVoicePhase] = React.useState<VoiceRuntimePhase>('idle')
   const [voiceRecording, setVoiceRecording] = React.useState(false)
@@ -560,6 +857,7 @@ export default function ChatPage() {
     isLoadingDetail,
     createDraftSession,
     materializeDraftSession,
+    moveSessionToProject,
     selectSession,
     updateLastMessage,
   } = useSessionStore()
@@ -625,10 +923,60 @@ export default function ChatPage() {
     () => resolveEffectiveInferenceParams(sessionOverride, activeAgentSettings),
     [activeAgentSettings, sessionOverride]
   )
+  const persistedWorkflowState = React.useMemo(
+    () =>
+      normalizeWorkflowState(
+        currentSessionDetail?.workflow ?? currentSession?.workflow ?? null,
+        effectiveInference.reasoningEffort
+      ),
+    [currentSession?.workflow, currentSessionDetail?.workflow, effectiveInference.reasoningEffort]
+  )
+  const workflowState = React.useMemo(() => {
+    if (!currentSessionId) {
+      return normalizeWorkflowState(null, effectiveInference.reasoningEffort)
+    }
+    return normalizeWorkflowState(
+      workflowDraftBySessionId[currentSessionId] ?? persistedWorkflowState,
+      effectiveInference.reasoningEffort
+    )
+  }, [currentSessionId, effectiveInference.reasoningEffort, persistedWorkflowState, workflowDraftBySessionId])
+  const workflowEnabled = Boolean(workflowState.enabled)
+  const workflowBoundRunId = workflowState.bound_run_id ?? null
+  const workflowConfig = workflowState.config ?? {}
+  const workflowProject = projects.find((project) => project.id === effectiveProjectId) ?? null
+  const workflowProtocolId = workflowConfig.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL
+  const workflowReasoningEffort =
+    workflowConfig.reasoning_effort ?? effectiveInference.reasoningEffort ?? null
+  const workflowRunPolicy = React.useMemo(
+    () => (workflowConfig.run_policy ?? {}) as api.AgentRunRunPolicy,
+    [workflowConfig.run_policy]
+  )
+  const workflowExecutionPolicy = React.useMemo(
+    () => (workflowConfig.execution_policy ?? {}) as Record<string, unknown>,
+    [workflowConfig.execution_policy]
+  )
+  const workflowEvidenceConfig = React.useMemo(
+    () => (workflowConfig.evidence ?? {}) as Record<string, unknown>,
+    [workflowConfig.evidence]
+  )
+  const workflowScheduleConfig = React.useMemo(
+    () => normalizeWorkflowScheduleConfig((workflowConfig.schedule ?? {}) as Record<string, unknown>),
+    [workflowConfig.schedule]
+  )
+  const workflowScheduleType = React.useMemo(
+    () => resolveWorkflowScheduleType(workflowScheduleConfig),
+    [workflowScheduleConfig]
+  )
   const uploadTargetDir =
     projects.find((project) => project.id === effectiveProjectId)?.workspaceDir ??
     getString(settings?.paths?.workspace_dir) ??
     undefined
+  const effectiveWorkflowWorkspace =
+    workflowState.workspace_dir_override ||
+    workflowConfig.workspace_dir_override ||
+    workflowProject?.workspaceDir ||
+    uploadTargetDir ||
+    ''
   const messages = React.useMemo<Message[]>(() => {
     if (currentSessionMessages && currentSessionMessages.length > 0) {
       return currentSessionMessages
@@ -669,6 +1017,28 @@ export default function ChatPage() {
       presetNames.includes(current) ? current : fallbackPreset
     ))
   }, [activeAgentSettings, activePreset, currentSessionId])
+
+  React.useEffect(() => {
+    if (!currentSessionId) {
+      setEditState(null)
+      return
+    }
+
+    setWorkflowDraftBySessionId((current) => {
+      const next = normalizeWorkflowState(
+        current[currentSessionId] ?? persistedWorkflowState,
+        effectiveInference.reasoningEffort
+      )
+      const existing = current[currentSessionId]
+      if (JSON.stringify(existing ?? null) === JSON.stringify(next)) {
+        return current
+      }
+      return {
+        ...current,
+        [currentSessionId]: next,
+      }
+    })
+  }, [currentSessionId, effectiveInference.reasoningEffort, persistedWorkflowState])
 
   const scrollToBottom = React.useCallback(() => {
     if (scrollRef.current) {
@@ -776,6 +1146,192 @@ export default function ChatPage() {
     return createInitialMessages(t)
   }, [t])
 
+  const upsertSessionDetail = React.useCallback(
+    (detail: api.SessionDetail) => {
+      useSessionStore.setState((state) => ({
+        sessions: state.sessions.map((session) =>
+          session.id === detail.id
+            ? {
+                ...session,
+                title: detail.title || session.title,
+                lastMessageAt: new Date(detail.updatedAt),
+                messageCount: detail.eventCount,
+                projectId: detail.projectId,
+                workflow: detail.workflow,
+                isDraft: false,
+              }
+            : session
+        ),
+        currentSessionDetail:
+          state.currentSessionDetail?.id === detail.id || state.currentSessionId === detail.id
+            ? detail
+            : state.currentSessionDetail,
+      }))
+    },
+    []
+  )
+
+  const persistWorkflowState = React.useCallback(
+    async (sessionId: string, nextWorkflow: api.SessionWorkflowState) => {
+      const normalized = normalizeWorkflowState(nextWorkflow, effectiveInference.reasoningEffort)
+      setWorkflowDraftBySessionId((current) => ({
+        ...current,
+        [sessionId]: normalized,
+      }))
+
+      const targetSession = useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+      if (targetSession?.isDraft || sessionId.startsWith('draft-')) {
+        useSessionStore.setState((state) => ({
+          sessions: state.sessions.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  workflow: normalized,
+                }
+              : session
+          ),
+          currentSessionDetail:
+            state.currentSessionDetail?.id === sessionId
+              ? {
+                  ...state.currentSessionDetail,
+                  workflow: normalized,
+                }
+              : state.currentSessionDetail,
+        }))
+        return null
+      }
+
+      const detail = await api.updateSessionWorkflowState(sessionId, normalized)
+      upsertSessionDetail(detail)
+      setWorkflowDraftBySessionId((current) => ({
+        ...current,
+        [sessionId]: normalizeWorkflowState(detail.workflow, effectiveInference.reasoningEffort),
+      }))
+      return detail
+    },
+    [effectiveInference.reasoningEffort, upsertSessionDetail]
+  )
+
+  const syncWorkflowRunEventsToSession = React.useCallback(
+    async (
+      sessionId: string,
+      runDetail: api.AgentRunDetail,
+      baseWorkflowState: api.SessionWorkflowState
+    ) => {
+      const normalizedWorkflow = normalizeWorkflowState(baseWorkflowState, effectiveInference.reasoningEffort)
+      const syncedCount = normalizedWorkflow.synced_run_event_count ?? 0
+      const events = Array.isArray(runDetail.events) ? runDetail.events : []
+      const nextEvents = events.slice(Math.max(0, syncedCount))
+
+      if (nextEvents.length === 0) {
+        const unchanged = normalizeWorkflowState(
+          {
+            ...normalizedWorkflow,
+            bound_run_id: runDetail.run_id,
+            synced_run_event_count: events.length,
+          },
+          effectiveInference.reasoningEffort
+        )
+        await persistWorkflowState(sessionId, unchanged)
+        return unchanged
+      }
+
+      const mappedEvents = nextEvents
+        .map((event) => {
+          const type = getString(event.type)
+          const timestamp = getString(event.timestamp) ?? new Date().toISOString()
+          if (type === 'operator_message') {
+            return {
+              type: 'message',
+              role: 'user',
+              content: getString(event.content) ?? '',
+              attachments: Array.isArray(event.attachments) ? event.attachments : [],
+              timestamp,
+              turn_id: `${runDetail.run_id}:${syncedCount}`,
+              metadata: {
+                channel: 'workflow',
+                workflow_run_id: runDetail.run_id,
+              },
+            }
+          }
+          if (type === 'assistant_message') {
+            return {
+              type: 'message',
+              role: 'assistant',
+              content: getString(event.content) ?? '',
+              timestamp,
+              turn_id: `${runDetail.run_id}:${syncedCount}`,
+              metadata: {
+                channel: 'workflow',
+                workflow_run_id: runDetail.run_id,
+              },
+            }
+          }
+          if (type === 'artifact') {
+            return {
+              type: 'turn_event',
+              phase: 'workflow_artifact',
+              timestamp,
+              payload: {
+                content:
+                  getString(event.title) ??
+                  getString(event.artifact_type) ??
+                  'Workflow artifact recorded.',
+                artifact_type: getString(event.artifact_type),
+                workflow_run_id: runDetail.run_id,
+              },
+            }
+          }
+          if (type === 'exec_update' || type === 'detached_exec_reattached' || type === 'detached_exec_stop') {
+            return {
+              type: 'turn_event',
+              phase: 'workflow_exec_update',
+              timestamp,
+              payload: {
+                content:
+                  getString(event.content) ??
+                  getString(event.status) ??
+                  'Workflow execution updated.',
+                workflow_run_id: runDetail.run_id,
+              },
+            }
+          }
+          return {
+            type: 'turn_event',
+            phase: 'workflow_status',
+            timestamp,
+            payload: {
+              content: formatWorkflowLifecycleMessage(event),
+              status: getString(event.status),
+              event_type: type,
+              workflow_run_id: runDetail.run_id,
+            },
+          }
+        })
+        .filter((event) => {
+          if (event.type === 'message') {
+            return Boolean(event.content) || (Array.isArray(event.attachments) && event.attachments.length > 0)
+          }
+          return true
+        })
+
+      const detail = await api.appendSessionEvents(sessionId, mappedEvents)
+      upsertSessionDetail(detail)
+
+      const nextWorkflow = normalizeWorkflowState(
+        {
+          ...normalizedWorkflow,
+          bound_run_id: runDetail.run_id,
+          synced_run_event_count: events.length,
+        },
+        effectiveInference.reasoningEffort
+      )
+      await persistWorkflowState(sessionId, nextWorkflow)
+      return nextWorkflow
+    },
+    [effectiveInference.reasoningEffort, persistWorkflowState, upsertSessionDetail]
+  )
+
   const syncSessionFromServer = React.useCallback(async (sessionId: string) => {
     try {
       const detail = await api.fetchSession(sessionId)
@@ -791,28 +1347,11 @@ export default function ChatPage() {
         updateLastMessage(sessionId, lastRetainedMessage.content)
       }
 
-      useSessionStore.setState((state) => ({
-        sessions: state.sessions.map((session) =>
-          session.id === sessionId
-            ? {
-                ...session,
-                title: detail.title || session.title,
-                lastMessageAt: new Date(detail.updatedAt),
-                messageCount: detail.eventCount,
-                projectId: detail.projectId,
-                isDraft: false,
-              }
-            : session
-        ),
-        currentSessionDetail:
-          state.currentSessionDetail?.id === sessionId || state.currentSessionId === sessionId
-            ? detail
-            : state.currentSessionDetail,
-      }))
+      upsertSessionDetail(detail)
     } catch {
       // Keep the optimistic transcript if canonical session refresh fails.
     }
-  }, [setSessionMessages, updateLastMessage])
+  }, [setSessionMessages, updateLastMessage, upsertSessionDetail])
 
   const appendVoiceMessages = React.useCallback(
     (result: VoiceTurnResult) => {
@@ -1128,6 +1667,16 @@ export default function ChatPage() {
       ) || initialSessionId.startsWith('draft-')
         ? await materializeDraftSession(initialSessionId)
         : initialSessionId
+      const latestSessionState = useSessionStore.getState()
+      const sessionAfterMaterialize = latestSessionState.sessions.find((session) => session.id === sessionId)
+      const normalizedWorkflow = normalizeWorkflowState(
+        workflowDraftBySessionId[sessionId] ??
+          sessionAfterMaterialize?.workflow ??
+          (latestSessionState.currentSessionDetail?.id === sessionId
+            ? latestSessionState.currentSessionDetail.workflow
+            : null),
+        effectiveInference.reasoningEffort
+      )
       const turnKey = `turn-${Date.now()}`
       const userMessage: Message = {
         id: `user-${Date.now()}`,
@@ -1156,6 +1705,116 @@ export default function ChatPage() {
       startStreaming(sessionId, abortController)
 
       try {
+        if (normalizedWorkflow.enabled) {
+          setWorkflowBusy(true)
+          setWorkflowError(null)
+          const workflowSessionProjectId =
+            sessionAfterMaterialize?.projectId ?? activeProjectId ?? null
+          const effectiveWorkspaceDir =
+            normalizedWorkflow.workspace_dir_override ||
+            normalizedWorkflow.config?.workspace_dir_override ||
+            projects.find((project) => project.id === workflowSessionProjectId)?.workspaceDir ||
+            uploadTargetDir ||
+            null
+
+          let runId = normalizedWorkflow.bound_run_id ?? null
+          let appendedDetail: api.AgentRunDetail
+          if (!runId) {
+            const workflowSchedule = normalizeWorkflowScheduleConfig(
+              (normalizedWorkflow.config?.schedule ?? {}) as Record<string, unknown>
+            )
+            const createdRun = await api.createAgentRun({
+              protocol_id: normalizedWorkflow.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
+              title: normalizedWorkflow.config?.title ?? null,
+              topic: text.trim() || null,
+              projectId: workflowSessionProjectId,
+              workspaceDir: effectiveWorkspaceDir,
+              reasoning_effort:
+                normalizedWorkflow.config?.reasoning_effort ?? effectiveInference.reasoningEffort ?? null,
+              selected_models_roles:
+                normalizedWorkflow.config?.selected_models_roles &&
+                Object.keys(normalizedWorkflow.config.selected_models_roles).length > 0
+                  ? {
+                      by_role: normalizedWorkflow.config.selected_models_roles,
+                      entries: Object.entries(normalizedWorkflow.config.selected_models_roles).map(
+                        ([role, model_id]) => ({ role, model_id })
+                      ),
+                    }
+                  : {},
+              run_policy: normalizedWorkflow.config?.run_policy ?? {},
+              evaluation_policy: {
+                evidence_collection: normalizedWorkflow.config?.evidence ?? {},
+              },
+              summary: {
+                operator_message: text,
+                selected_skill_ids: selectedSkillIds,
+                execution_policy: normalizedWorkflow.config?.execution_policy ?? {},
+              },
+              schedule: workflowSchedule,
+            })
+            runId = createdRun.run_id
+          }
+
+          appendedDetail = await api.appendAgentRunMessage(runId, {
+            role: 'operator',
+            content: text,
+            projectId: workflowSessionProjectId,
+            workspaceDir: effectiveWorkspaceDir,
+            attachments,
+            metadata: {
+              channel: 'workflow-chat',
+              selected_skill_ids: selectedSkillIds,
+            },
+          })
+
+          let nextWorkflowState = normalizeWorkflowState(
+            {
+              ...normalizedWorkflow,
+              enabled: true,
+              bound_run_id: runId,
+              workspace_dir_override: normalizedWorkflow.workspace_dir_override ?? effectiveWorkspaceDir,
+              config: {
+                ...normalizedWorkflow.config,
+                reasoning_effort:
+                  normalizedWorkflow.config?.reasoning_effort ?? effectiveInference.reasoningEffort ?? null,
+              },
+            },
+            effectiveInference.reasoningEffort
+          )
+
+          if (!workflowScheduleEnabled(nextWorkflowState)) {
+            await api.startAgentRun(runId)
+          }
+
+          const refreshedRun = await api.fetchAgentRun(runId)
+          nextWorkflowState = await syncWorkflowRunEventsToSession(sessionId, refreshedRun, nextWorkflowState)
+
+          const replayMessages = api.buildMessagesFromSessionEvents(
+            (useSessionStore.getState().currentSessionDetail?.id === sessionId
+              ? useSessionStore.getState().currentSessionDetail?.events
+              : latestSessionState.currentSessionDetail?.events) ?? []
+          )
+          if (replayMessages.length > 0) {
+            setSessionMessages(sessionId, replayMessages)
+          } else {
+            await syncSessionFromServer(sessionId)
+          }
+
+          const finalAssistantMessage = [...resolveMessagesForSession(sessionId)]
+            .reverse()
+            .find((message) => message.type === 'assistant')
+
+          if (finalAssistantMessage) {
+            updateLastMessage(sessionId, finalAssistantMessage.content)
+          }
+
+          setWorkflowDraftBySessionId((current) => ({
+            ...current,
+            [sessionId]: nextWorkflowState,
+          }))
+          return
+        }
+
         let streamed = false
         let latestAssistantContent = ''
         try {
@@ -1257,6 +1916,9 @@ export default function ChatPage() {
           return
         }
         const detail = error instanceof Error ? error.message : null
+        if (normalizedWorkflow.enabled) {
+          setWorkflowError(detail ?? 'Workflow request failed.')
+        }
         updateSessionMessages(sessionId, (prev) => [
           ...prev.filter((message) => message.turnKey !== turnKey),
           {
@@ -1269,6 +1931,7 @@ export default function ChatPage() {
           },
         ])
       } finally {
+        setWorkflowBusy(false)
         finishStreaming(sessionId)
       }
     },
@@ -1282,15 +1945,20 @@ export default function ChatPage() {
       finishStreaming,
       hasActiveStream,
       materializeDraftSession,
+      persistWorkflowState,
+      projects,
       resolveMessagesForSession,
       selectSession,
       setSessionMessages,
       sessions,
       startStreaming,
+      syncWorkflowRunEventsToSession,
       t,
       syncSessionFromServer,
+      uploadTargetDir,
       updateSessionMessages,
       updateLastMessage,
+      workflowDraftBySessionId,
     ]
   )
 
@@ -1425,7 +2093,9 @@ export default function ChatPage() {
     abortStreaming()
   }, [abortStreaming])
 
-  const handleBuiltinCommand = React.useCallback((command: 'clear' | 'settings' | 'voice' | 'model' | 'export') => {
+  const handleBuiltinCommand = React.useCallback(async (
+    command: 'clear' | 'settings' | 'voice' | 'model' | 'export' | 'workflow' | 'chat'
+  ) => {
     if (command === 'clear') {
       if (currentSessionId) {
         setSessionMessages(currentSessionId, createInitialMessages(t))
@@ -1448,8 +2118,33 @@ export default function ChatPage() {
     }
     if (command === 'export') {
       setExportOpen(true)
+      return
     }
-  }, [currentSessionId, handleVoiceEntry, router, setSessionMessages, t])
+    if (command === 'workflow' || command === 'chat') {
+      const initialSessionId = currentSessionId ?? createDraftSession(activeProjectId)
+      const targetSession = sessions.find((session) => session.id === initialSessionId)
+      const sessionId = targetSession?.isDraft ? initialSessionId : initialSessionId
+      const nextWorkflow = normalizeWorkflowState(
+        workflowDraftBySessionId[sessionId] ?? targetSession?.workflow ?? null,
+        effectiveInference.reasoningEffort
+      )
+      nextWorkflow.enabled = command === 'workflow'
+      setWorkflowPanelOpen(command === 'workflow')
+      await persistWorkflowState(sessionId, nextWorkflow)
+    }
+  }, [
+    activeProjectId,
+    createDraftSession,
+    currentSessionId,
+    effectiveInference.reasoningEffort,
+    handleVoiceEntry,
+    persistWorkflowState,
+    router,
+    sessions,
+    setSessionMessages,
+    t,
+    workflowDraftBySessionId,
+  ])
 
   const handleUndoFileChange = React.useCallback(async (change: FileChangeSummary) => {
     if (!change.undoAvailable || !change.undoAction) {
@@ -1473,13 +2168,57 @@ export default function ChatPage() {
     void handleSend(prompt)
   }, [handleSend, messages])
 
-  const handleEditAndResend = React.useCallback(async (message: Message, nextContent: string) => {
-    if (!currentSessionId || !message.turnId) {
-      await handleSend(nextContent, { attachments: message.attachments ?? [] })
+  const handleEditAndResend = React.useCallback((message: Message) => {
+    const selectedSkillIds = (() => {
+      if (!currentSessionDetail || !message.turnId) {
+        return []
+      }
+      const matched = currentSessionDetail.events.find(
+        (event) =>
+          event.type === 'message' &&
+          event.role === 'user' &&
+          String(
+            ('turn_id' in event ? event.turn_id : undefined) ??
+            ('turnId' in event ? event.turnId : undefined) ??
+            ''
+          ) === message.turnId
+      ) as Record<string, unknown> | undefined
+      return getStringArray(matched?.selected_skill_ids)
+    })()
+
+    setEditState({
+      messageId: message.id,
+      turnId: message.turnId ?? null,
+      resetKey: `${message.id}-${message.turnId ?? 'no-turn'}-${Date.now()}`,
+      seed: {
+        text: message.content,
+        attachments: [...(message.attachments ?? [])],
+        selectedSkills: selectedSkillIds.map((id) => ({ id, name: id })),
+      },
+    })
+  }, [currentSessionDetail])
+
+  const handleCancelEdit = React.useCallback(() => {
+    setEditState(null)
+  }, [])
+
+  const handleSubmitEdit = React.useCallback(async (
+    nextContent: string,
+    options?: {
+      selectedSkillIds?: string[]
+      attachments?: ChatAttachment[]
+    }
+  ) => {
+    const attachments = options?.attachments ?? []
+    const selectedSkillIds = options?.selectedSkillIds ?? []
+
+    if (!editState?.turnId || !currentSessionId) {
+      setEditState(null)
+      await handleSend(nextContent, { attachments, selectedSkillIds })
       return
     }
 
-    const rewrittenSession = await api.rewriteSessionFromTurn(currentSessionId, message.turnId)
+    const rewrittenSession = await api.rewriteSessionFromTurn(currentSessionId, editState.turnId)
     const rewrittenMessages = api.buildMessagesFromSessionEvents(rewrittenSession.events)
     const baseMessages = rewrittenMessages.length > 0 ? rewrittenMessages : createInitialMessages(t)
     const lastRetainedMessage = [...baseMessages]
@@ -1488,16 +2227,141 @@ export default function ChatPage() {
 
     setSessionMessages(currentSessionId, baseMessages)
     updateLastMessage(currentSessionId, lastRetainedMessage?.content ?? '')
+    upsertSessionDetail(rewrittenSession)
+    setEditState(null)
     void selectSession(currentSessionId)
     await handleSend(nextContent, {
       forceSessionId: currentSessionId,
-      attachments: message.attachments ?? [],
+      attachments,
+      selectedSkillIds,
     })
-  }, [currentSessionId, handleSend, selectSession, setSessionMessages, t, updateLastMessage])
+  }, [
+    currentSessionId,
+    editState,
+    handleSend,
+    selectSession,
+    setSessionMessages,
+    t,
+    updateLastMessage,
+    upsertSessionDetail,
+  ])
 
   const handleStarterPrompt = React.useCallback((prompt: string) => {
     void handleSend(prompt)
   }, [handleSend])
+
+  const handleWorkflowToggle = React.useCallback(async (enabled: boolean) => {
+    const initialSessionId = currentSessionId ?? createDraftSession(activeProjectId)
+    const targetSession = sessions.find((session) => session.id === initialSessionId)
+    const sessionId = initialSessionId
+    const nextWorkflow = normalizeWorkflowState(
+      workflowDraftBySessionId[sessionId] ?? targetSession?.workflow ?? null,
+      effectiveInference.reasoningEffort
+    )
+    nextWorkflow.enabled = enabled
+    setWorkflowPanelOpen(enabled)
+    await persistWorkflowState(sessionId, nextWorkflow)
+  }, [
+    activeProjectId,
+    createDraftSession,
+    currentSessionId,
+    effectiveInference.reasoningEffort,
+    persistWorkflowState,
+    sessions,
+    workflowDraftBySessionId,
+  ])
+
+  const handleWorkflowFieldChange = React.useCallback((
+    patch: Partial<api.SessionWorkflowState>
+  ) => {
+    if (!currentSessionId) {
+      return
+    }
+    const nextWorkflow = normalizeWorkflowState(
+      {
+        ...workflowState,
+        ...patch,
+        config: {
+          ...(workflowState.config ?? {}),
+          ...(patch.config ?? {}),
+        },
+      },
+      effectiveInference.reasoningEffort
+    )
+    setWorkflowDraftBySessionId((current) => ({
+      ...current,
+      [currentSessionId]: nextWorkflow,
+    }))
+  }, [currentSessionId, effectiveInference.reasoningEffort, workflowState])
+
+  const handleWorkflowConfigPatch = React.useCallback((
+    patch: Partial<api.SessionWorkflowConfig>
+  ) => {
+    handleWorkflowFieldChange({
+      config: {
+        ...(workflowState.config ?? {}),
+        ...patch,
+      },
+    })
+  }, [handleWorkflowFieldChange, workflowState.config])
+
+  const handleWorkflowSave = React.useCallback(async () => {
+    if (!currentSessionId) {
+      return
+    }
+    setWorkflowError(null)
+    try {
+      await persistWorkflowState(currentSessionId, workflowState)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unable to save workflow settings.'
+      setWorkflowError(detail)
+    }
+  }, [currentSessionId, persistWorkflowState, workflowState])
+
+  const handleWorkflowProjectChange = React.useCallback(async (projectId: string | null) => {
+    const initialSessionId = currentSessionId ?? createDraftSession(projectId)
+    const targetSession = sessions.find((session) => session.id === initialSessionId)
+    const sessionId = targetSession?.isDraft
+      ? initialSessionId
+      : initialSessionId
+    try {
+      await moveSessionToProject(sessionId, projectId)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unable to update workflow project.'
+      setWorkflowError(detail)
+      return
+    }
+
+    handleWorkflowFieldChange({
+      workspace_dir_override: null,
+      config: {
+        ...(workflowState.config ?? {}),
+        workspace_dir_override: null,
+      },
+    })
+  }, [
+    createDraftSession,
+    currentSessionId,
+    handleWorkflowFieldChange,
+    moveSessionToProject,
+    sessions,
+    workflowState.config,
+  ])
+
+  const handleWorkflowNewRun = React.useCallback(async () => {
+    if (!currentSessionId) {
+      return
+    }
+    const nextWorkflow = normalizeWorkflowState(
+      {
+        ...workflowState,
+        bound_run_id: null,
+        synced_run_event_count: 0,
+      },
+      effectiveInference.reasoningEffort
+    )
+    await persistWorkflowState(currentSessionId, nextWorkflow)
+  }, [currentSessionId, effectiveInference.reasoningEffort, persistWorkflowState, workflowState])
 
   const handleSessionInferenceChange = React.useCallback(<K extends keyof typeof effectiveInference>(
     key: K,
@@ -1615,10 +2479,10 @@ export default function ChatPage() {
               <span className="truncate">{headerModelLabel}</span>
             </div>
             <Button
-              variant="ghost"
+              variant={workflowEnabled || workflowPanelOpen ? 'secondary' : 'ghost'}
               size="sm"
               title={t('sidebar.workflows')}
-              onClick={() => router.push('/agent-runs')}
+              onClick={() => setWorkflowPanelOpen(true)}
               className="max-sm:w-8 max-sm:px-0"
             >
               <Workflow className="h-4 w-4" />
@@ -1694,7 +2558,7 @@ export default function ChatPage() {
                           : message
                       }
                       onRegenerate={message.type === 'assistant' ? handleRegenerate : undefined}
-                      onEditAndResend={message.type === 'user' ? handleEditAndResend : undefined}
+                      onEditAndResend={message.type === 'user' ? (message) => handleEditAndResend(message) : undefined}
                       onUndoFileChange={handleUndoFileChange}
                     />
                   ))}
@@ -1740,11 +2604,24 @@ export default function ChatPage() {
         </div>
       ) : null}
 
+      {workflowError ? (
+        <div className="border-t border-border bg-canvas/95 py-2 backdrop-blur">
+          <div className="mx-auto max-w-4xl px-4 sm:px-6">
+            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="min-w-0 break-words">{workflowError}</span>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <ChatInput
         sessionId={currentSessionId}
         projectId={effectiveProjectId}
         uploadTargetDir={uploadTargetDir}
         onSend={handleSend}
+        onSubmitEdit={handleSubmitEdit}
+        onCancelEdit={handleCancelEdit}
         onStop={handleStopGeneration}
         onVoice={handleVoiceEntry}
         onBuiltinCommand={handleBuiltinCommand}
@@ -1760,6 +2637,9 @@ export default function ChatPage() {
         isUnloadingCurrentModel={isUnloadingCurrentModel}
         reasoningOptions={supportedReasoningEfforts}
         onReasoningEffortChange={(value) => handleSessionInferenceChange('reasoningEffort', value)}
+        composerMode={editState ? 'edit' : 'compose'}
+        composerSeed={editState?.seed ?? null}
+        composerResetKey={editState?.resetKey}
       />
 
       <ExportDialog
@@ -1767,6 +2647,731 @@ export default function ChatPage() {
         onOpenChange={setExportOpen}
         messages={messages}
       />
+
+      <Sheet open={workflowPanelOpen} onOpenChange={setWorkflowPanelOpen}>
+        <SheetContent side="right" className="w-[420px] max-w-[92vw] overflow-y-auto">
+          <SheetHeader>
+            <SheetTitle>Workflow</SheetTitle>
+            <SheetDescription>
+              Chat-first workflow mode keeps this conversation bound to one main run.
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="space-y-5 pr-1">
+            <section className="space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-foreground">Workflow mode</p>
+                  <p className="text-xs text-muted-foreground">
+                    Route new messages through the workflow runtime for this session.
+                  </p>
+                </div>
+                <Switch
+                  checked={workflowEnabled}
+                  onCheckedChange={(checked) => {
+                    void handleWorkflowToggle(checked)
+                  }}
+                />
+              </div>
+              <div className="rounded-lg border border-border bg-surface-layer px-3 py-2 text-xs text-muted-foreground">
+                {workflowEnabled
+                  ? 'Workflow mode is active for this chat session.'
+                  : 'Workflow mode is off. Use /workflow or this switch to enable it.'}
+              </div>
+            </section>
+
+            <Separator />
+
+            <section className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-medium text-foreground">Bound run</p>
+                  <p className="text-xs text-muted-foreground">
+                    This chat keeps appending to the same workflow run unless you start a new one.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleWorkflowNewRun()}
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  New run
+                </Button>
+              </div>
+              <div className="rounded-lg border border-border bg-surface-layer px-3 py-3">
+                <p className="text-sm text-foreground">
+                  {workflowBoundRunId ?? 'No run bound yet'}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {workflowBoundRunId
+                    ? `Synced events: ${workflowState.synced_run_event_count ?? 0}`
+                    : 'The first workflow message will create and bind a run.'}
+                </p>
+                {workflowBoundRunId ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="mt-2 px-0"
+                    onClick={() => router.push(`/agent-runs/${workflowBoundRunId}`)}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    Open run detail
+                  </Button>
+                ) : null}
+              </div>
+            </section>
+
+            <Separator />
+
+            <section className="space-y-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">Project / workspace</p>
+                <p className="text-xs text-muted-foreground">
+                  Files and execution resolve from the selected project unless you override the path.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <span className="text-xs font-medium text-muted-foreground">Project</span>
+                <Select
+                  value={effectiveProjectId ?? '__none__'}
+                  onValueChange={(value) => {
+                    void handleWorkflowProjectChange(value === '__none__' ? null : value)
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="No project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">No project</SelectItem>
+                    {projects.map((project) => (
+                      <SelectItem key={project.id} value={project.id}>
+                        {project.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <span className="text-xs font-medium text-muted-foreground">Workspace override</span>
+                <Input
+                  value={workflowState.workspace_dir_override ?? ''}
+                  placeholder={workflowProject?.workspaceDir ?? uploadTargetDir ?? 'Use project workspace'}
+                  onChange={(event) =>
+                    handleWorkflowFieldChange({
+                      workspace_dir_override: event.target.value || null,
+                      config: {
+                        ...(workflowState.config ?? {}),
+                        workspace_dir_override: event.target.value || null,
+                      },
+                    })
+                  }
+                />
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Effective workspace: <span className="break-all text-foreground">{effectiveWorkflowWorkspace || 'Not set'}</span>
+              </div>
+            </section>
+
+            <Separator />
+
+            <section className="space-y-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">Protocol / reasoning</p>
+                <p className="text-xs text-muted-foreground">
+                  Session-scoped workflow defaults used when creating a new bound run.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <span className="text-xs font-medium text-muted-foreground">Title</span>
+                <Input
+                  value={workflowConfig.title ?? ''}
+                  placeholder="Optional workflow title"
+                  onChange={(event) =>
+                    handleWorkflowFieldChange({
+                      config: {
+                        ...(workflowState.config ?? {}),
+                        title: event.target.value || null,
+                      },
+                    })
+                  }
+                />
+              </div>
+              <div className="space-y-2">
+                <span className="text-xs font-medium text-muted-foreground">Protocol</span>
+                <Select
+                  value={workflowProtocolId}
+                  onValueChange={(value) =>
+                    handleWorkflowFieldChange({
+                      config: {
+                        ...(workflowState.config ?? {}),
+                        protocol_id: value as api.AgentRunProtocolId,
+                      },
+                    })
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {WORKFLOW_PROTOCOL_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {WORKFLOW_PROTOCOL_OPTIONS.find((option) => option.value === workflowProtocolId)?.description}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <span className="text-xs font-medium text-muted-foreground">Reasoning effort</span>
+                <Select
+                  value={workflowReasoningEffort ?? '__inherit__'}
+                  onValueChange={(value) =>
+                    handleWorkflowFieldChange({
+                      config: {
+                        ...(workflowState.config ?? {}),
+                        reasoning_effort:
+                          value === '__inherit__' ? effectiveInference.reasoningEffort : value as api.ReasoningEffort,
+                      },
+                    })
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__inherit__">Inherit chat setting</SelectItem>
+                    {supportedReasoningEfforts.map((option) => (
+                      <SelectItem key={option} value={option}>
+                        {option}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </section>
+
+            <Separator />
+
+            <section className="space-y-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">Execution / schedule</p>
+                <p className="text-xs text-muted-foreground">
+                  Existing controlled execution boundaries stay in the runtime. This panel stores defaults only.
+                </p>
+              </div>
+              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Max wall clock (sec)</span>
+                    <Input
+                      value={String(workflowRunPolicy.max_wall_clock_sec ?? '')}
+                      placeholder="1800"
+                      onChange={(event) =>
+                        handleWorkflowConfigPatch({
+                          run_policy: {
+                            ...workflowRunPolicy,
+                            max_wall_clock_sec: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : null,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Heartbeat timeout (sec)</span>
+                    <Input
+                      value={String(workflowRunPolicy.heartbeat_timeout_sec ?? '')}
+                      placeholder="90"
+                      onChange={(event) =>
+                        handleWorkflowConfigPatch({
+                          run_policy: {
+                            ...workflowRunPolicy,
+                            heartbeat_timeout_sec: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : null,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Checkpoint steps</span>
+                    <Input
+                      value={String(workflowRunPolicy.checkpoint_interval_steps ?? '')}
+                      placeholder="1"
+                      onChange={(event) =>
+                        handleWorkflowConfigPatch({
+                          run_policy: {
+                            ...workflowRunPolicy,
+                            checkpoint_interval_steps: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : undefined,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Max subagent failures</span>
+                    <Input
+                      value={String(workflowRunPolicy.max_subagent_failures_per_role ?? '')}
+                      placeholder="2"
+                      onChange={(event) =>
+                        handleWorkflowConfigPatch({
+                          run_policy: {
+                            ...workflowRunPolicy,
+                            max_subagent_failures_per_role: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : undefined,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">On budget exhausted</span>
+                    <Select
+                      value={workflowRunPolicy.on_budget_exhausted ?? 'finalize_partial'}
+                      onValueChange={(value) =>
+                        handleWorkflowConfigPatch({
+                          run_policy: {
+                            ...workflowRunPolicy,
+                            on_budget_exhausted: value as 'pause' | 'finalize_partial',
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="finalize_partial">Finalize partial</SelectItem>
+                        <SelectItem value="pause">Pause</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">On subagent disconnect</span>
+                    <Select
+                      value={workflowRunPolicy.on_subagent_disconnect ?? 'pause'}
+                      onValueChange={(value) =>
+                        handleWorkflowConfigPatch({
+                          run_policy: {
+                            ...workflowRunPolicy,
+                            on_subagent_disconnect: value as 'retry_then_degrade' | 'pause' | 'fail',
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="pause">Pause</SelectItem>
+                        <SelectItem value="retry_then_degrade">Retry then degrade</SelectItem>
+                        <SelectItem value="fail">Fail</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-medium text-foreground">Controlled execution</p>
+                    <p className="text-xs text-muted-foreground">
+                      Keep subagents proposal-only while the controller owns runtime execution.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={workflowExecutionPolicy.mode === 'controlled'}
+                    onCheckedChange={(checked) =>
+                      handleWorkflowConfigPatch({
+                        execution_policy: checked
+                          ? {
+                              ...workflowExecutionPolicy,
+                              mode: 'controlled',
+                              max_execution_requests:
+                                Number(workflowExecutionPolicy.max_execution_requests) || 1,
+                              max_commands_per_request:
+                                Number(workflowExecutionPolicy.max_commands_per_request) || 1,
+                              default_timeout_sec:
+                                Number(workflowExecutionPolicy.default_timeout_sec) || 300,
+                              background_allowed:
+                                workflowExecutionPolicy.background_allowed !== false,
+                            }
+                          : {},
+                      })
+                    }
+                  />
+                </div>
+                {workflowExecutionPolicy.mode === 'controlled' ? (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <span className="text-xs font-medium text-muted-foreground">Max exec requests</span>
+                      <Input
+                        value={String(workflowExecutionPolicy.max_execution_requests ?? '')}
+                        placeholder="1"
+                        onChange={(event) =>
+                          handleWorkflowConfigPatch({
+                            execution_policy: {
+                              ...workflowExecutionPolicy,
+                              mode: 'controlled',
+                              max_execution_requests: event.target.value
+                                ? Number.parseInt(event.target.value, 10)
+                                : 1,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <span className="text-xs font-medium text-muted-foreground">Max commands / request</span>
+                      <Input
+                        value={String(workflowExecutionPolicy.max_commands_per_request ?? '')}
+                        placeholder="1"
+                        onChange={(event) =>
+                          handleWorkflowConfigPatch({
+                            execution_policy: {
+                              ...workflowExecutionPolicy,
+                              mode: 'controlled',
+                              max_commands_per_request: event.target.value
+                                ? Number.parseInt(event.target.value, 10)
+                                : 1,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <span className="text-xs font-medium text-muted-foreground">Default exec timeout</span>
+                      <Input
+                        value={String(workflowExecutionPolicy.default_timeout_sec ?? '')}
+                        placeholder="300"
+                        onChange={(event) =>
+                          handleWorkflowConfigPatch({
+                            execution_policy: {
+                              ...workflowExecutionPolicy,
+                              mode: 'controlled',
+                              default_timeout_sec: event.target.value
+                                ? Number.parseInt(event.target.value, 10)
+                                : 300,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
+                      <span className="text-xs text-muted-foreground">Allow background execution</span>
+                      <Switch
+                        checked={workflowExecutionPolicy.background_allowed !== false}
+                        onCheckedChange={(checked) =>
+                          handleWorkflowConfigPatch({
+                            execution_policy: {
+                              ...workflowExecutionPolicy,
+                              mode: 'controlled',
+                              background_allowed: checked,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-medium text-foreground">Evidence collection</p>
+                    <p className="text-xs text-muted-foreground">
+                      Configure retrieval defaults for new workflow runs.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={workflowEvidenceConfig.enabled !== false}
+                    onCheckedChange={(checked) =>
+                      handleWorkflowConfigPatch({
+                        evidence: {
+                          ...workflowEvidenceConfig,
+                          enabled: checked,
+                          mode: String(workflowEvidenceConfig.mode ?? 'hybrid'),
+                        },
+                      })
+                    }
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Mode</span>
+                    <Select
+                      value={String(workflowEvidenceConfig.mode ?? 'hybrid')}
+                      onValueChange={(value) =>
+                        handleWorkflowConfigPatch({
+                          evidence: {
+                            ...workflowEvidenceConfig,
+                            enabled: workflowEvidenceConfig.enabled !== false,
+                            mode: value,
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="hybrid">Hybrid</SelectItem>
+                        <SelectItem value="web_only">Web only</SelectItem>
+                        <SelectItem value="local_only">Local only</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Max results / query</span>
+                    <Input
+                      value={String(workflowEvidenceConfig.max_results_per_query ?? '')}
+                      placeholder="3"
+                      onChange={(event) =>
+                        handleWorkflowConfigPatch({
+                          evidence: {
+                            ...workflowEvidenceConfig,
+                            enabled: workflowEvidenceConfig.enabled !== false,
+                            max_results_per_query: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : 3,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-medium text-foreground">Schedule</p>
+                    <p className="text-xs text-muted-foreground">
+                      Let this workflow execute via backend scheduling instead of immediate start.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={workflowScheduleEnabled(workflowState)}
+                    onCheckedChange={(checked) =>
+                      handleWorkflowConfigPatch({
+                        schedule: buildWorkflowScheduleConfig(
+                          workflowScheduleConfig,
+                          workflowScheduleType,
+                          checked
+                        ),
+                      })
+                    }
+                  />
+                </div>
+                {workflowScheduleEnabled(workflowState) ? (
+                  <>
+                    <div className="space-y-2">
+                      <span className="text-xs font-medium text-muted-foreground">Schedule type</span>
+                      <Select
+                        value={workflowScheduleType}
+                        onValueChange={(value) =>
+                          handleWorkflowConfigPatch({
+                            schedule: buildWorkflowScheduleConfig(
+                              workflowScheduleConfig,
+                              value as WorkflowScheduleType,
+                              true
+                            ),
+                          })
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="interval">Interval</SelectItem>
+                          <SelectItem value="once">One-shot</SelectItem>
+                          <SelectItem value="cron">Cron</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    {workflowScheduleType === 'interval' ? (
+                      <div className="space-y-2">
+                        <span className="text-xs font-medium text-muted-foreground">Interval seconds</span>
+                        <Input
+                          value={String(workflowScheduleConfig.interval_seconds ?? '')}
+                          placeholder="3600"
+                          onChange={(event) =>
+                            handleWorkflowConfigPatch({
+                              schedule: {
+                                ...workflowScheduleConfig,
+                                enabled: true,
+                                interval_seconds: event.target.value
+                                  ? Number.parseInt(event.target.value, 10)
+                                  : 3600,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    {workflowScheduleType === 'once' ? (
+                      <div className="space-y-2">
+                        <span className="text-xs font-medium text-muted-foreground">Run at</span>
+                        <Input
+                          type="datetime-local"
+                          value={formatWorkflowScheduleRunAt(workflowScheduleConfig.run_at)}
+                          onChange={(event) =>
+                            handleWorkflowConfigPatch({
+                              schedule: {
+                                ...workflowScheduleConfig,
+                                enabled: true,
+                                run_at: event.target.value,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    {workflowScheduleType === 'cron' ? (
+                      <div className="space-y-2">
+                        <span className="text-xs font-medium text-muted-foreground">Cron</span>
+                        <Input
+                          value={String(workflowScheduleConfig.cron ?? '')}
+                          placeholder="0 9 * * 1"
+                          onChange={(event) =>
+                            handleWorkflowConfigPatch({
+                              schedule: {
+                                ...workflowScheduleConfig,
+                                enabled: true,
+                                cron: event.target.value,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-2">
+                        <span className="text-xs font-medium text-muted-foreground">Timezone</span>
+                        <Input
+                          value={String(workflowScheduleConfig.timezone ?? '')}
+                          placeholder={defaultScheduleTimezone()}
+                          onChange={(event) =>
+                            handleWorkflowConfigPatch({
+                              schedule: {
+                                ...workflowScheduleConfig,
+                                enabled: true,
+                                timezone: event.target.value,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <span className="text-xs font-medium text-muted-foreground">Max runs</span>
+                        <Input
+                          value={
+                            workflowScheduleConfig.max_runs === null || workflowScheduleConfig.max_runs === undefined
+                              ? ''
+                              : String(workflowScheduleConfig.max_runs)
+                          }
+                          placeholder="Optional"
+                          onChange={(event) =>
+                            handleWorkflowConfigPatch({
+                              schedule: {
+                                ...workflowScheduleConfig,
+                                enabled: true,
+                                max_runs: event.target.value
+                                  ? Number.parseInt(event.target.value, 10)
+                                  : null,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                    {workflowScheduleType !== 'once' ? (
+                      <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
+                        <span className="text-xs text-muted-foreground">Start immediately</span>
+                        <Switch
+                          checked={workflowScheduleConfig.start_immediately !== false}
+                          onCheckedChange={(checked) =>
+                            handleWorkflowConfigPatch({
+                              schedule: {
+                                ...workflowScheduleConfig,
+                                enabled: true,
+                                start_immediately: checked,
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
+                      <span className="text-xs text-muted-foreground">Auto-pause on failure</span>
+                      <Switch
+                        checked={workflowScheduleConfig.auto_pause_on_failure !== false}
+                        onCheckedChange={(checked) =>
+                          handleWorkflowConfigPatch({
+                            schedule: {
+                              ...workflowScheduleConfig,
+                              enabled: true,
+                              auto_pause_on_failure: checked,
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            </section>
+
+            <Separator />
+
+            <section className="space-y-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">Status / recovery</p>
+                <p className="text-xs text-muted-foreground">
+                  Full artifacts, logs, and recovery actions stay available from the run detail page.
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-surface-layer px-3 py-3 text-xs text-muted-foreground">
+                <p>Workflow busy: {workflowBusy ? 'Yes' : 'No'}</p>
+                <p>Last error: {workflowError ?? 'None'}</p>
+              </div>
+            </section>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setWorkflowPanelOpen(false)}
+              >
+                Close
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void handleWorkflowSave()}
+              >
+                Save settings
+              </Button>
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
 
       <VoiceOverlay
         open={voiceOpen}

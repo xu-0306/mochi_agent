@@ -2,22 +2,44 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
-import { Plus, RefreshCw, Rocket, Trash2 } from 'lucide-react'
+import {
+  Clock3,
+  FolderKanban,
+  MessageSquare,
+  PanelRight,
+  Plus,
+  RefreshCw,
+  Rocket,
+  Settings2,
+  Trash2,
+} from 'lucide-react'
 import * as api from '@/lib/api'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/lib/i18n'
+import { useProjectStore } from '@/lib/stores/project-store'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { cn } from '@/lib/utils'
 
 interface SubagentDraft {
   id: string
   role: string
   modelId: string
+}
+
+interface WorkflowTimelineItem {
+  id: string
+  role: 'system' | 'assistant' | 'operator'
+  title: string
+  body: string
+  timestamp: string
+  status?: 'ready' | 'pending' | 'success' | 'error'
+  meta?: string
 }
 
 type RunTemplate = 'standard' | 'research_debate'
@@ -68,6 +90,213 @@ const TERMINAL_RUN_STATUSES = new Set([
   'done',
   'error',
 ])
+
+const TIMELINE_ROLE_STYLES: Record<
+  WorkflowTimelineItem['role'],
+  { badge: string; bubble: string; label: string }
+> = {
+  system: {
+    badge: 'bg-primary-500/15 text-primary-200 ring-1 ring-primary-500/30',
+    bubble: 'border-primary-500/20 bg-primary-500/8',
+    label: 'System',
+  },
+  assistant: {
+    badge: 'bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-500/30',
+    bubble: 'border-emerald-500/20 bg-emerald-500/8',
+    label: 'Workflow',
+  },
+  operator: {
+    badge: 'bg-neutral-700/80 text-foreground ring-1 ring-border',
+    bubble: 'border-border bg-surface-layer',
+    label: 'Operator',
+  },
+}
+
+function createTimelineItem(
+  item: Omit<WorkflowTimelineItem, 'id' | 'timestamp'> & { timestamp?: string }
+): WorkflowTimelineItem {
+  return {
+    id:
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`,
+    timestamp: item.timestamp ?? new Date().toISOString(),
+    ...item,
+  }
+}
+
+function createInitialTimeline(): WorkflowTimelineItem[] {
+  return [
+    createTimelineItem({
+      role: 'system',
+      title: 'Workflow console ready',
+      body: 'Configure the workspace, then brief the operator console with the task you want this run to execute.',
+      status: 'ready',
+      meta: 'Local UI timeline',
+    }),
+    createTimelineItem({
+      role: 'assistant',
+      title: 'Standing by',
+      body: 'I will turn your next operator message into a workflow run and keep the detailed protocol settings compact unless you need them.',
+      status: 'ready',
+    }),
+  ]
+}
+
+function readEventString(event: Record<string, unknown>, key: string): string | null {
+  const value = event[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
+function readEventRecord(event: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const value = event[key]
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+  return value as Record<string, unknown>
+}
+
+function eventTimestamp(event: Record<string, unknown>, fallback: string): string {
+  return (
+    readEventString(event, 'created_at') ??
+    readEventString(event, 'timestamp') ??
+    readEventString(event, 'occurred_at') ??
+    fallback
+  )
+}
+
+function buildTimelineItemFromEvent(
+  event: Record<string, unknown>,
+  fallbackTimestamp: string
+): WorkflowTimelineItem | null {
+  const type = readEventString(event, 'type') ?? 'event'
+  const timestamp = eventTimestamp(event, fallbackTimestamp)
+
+  if (type === 'operator_message' || type === 'guidance') {
+    const payload = readEventRecord(event, 'payload')
+    const content =
+      readEventString(event, 'content') ??
+      readEventString(event, 'guidance') ??
+      readEventString(payload ?? {}, 'content')
+    if (!content) {
+      return null
+    }
+    return createTimelineItem({
+      role: 'operator',
+      title: type === 'guidance' ? 'Legacy guidance' : 'Operator message',
+      body: content,
+      timestamp,
+      status: 'ready',
+      meta:
+        readEventString(event, 'workspace_dir') ??
+        readEventString(readEventRecord(event, 'metadata') ?? {}, 'workspace_dir') ??
+        undefined,
+    })
+  }
+
+  if (type === 'assistant_message') {
+    const content = readEventString(event, 'content')
+    if (!content) {
+      return null
+    }
+    return createTimelineItem({
+      role: 'assistant',
+      title: 'Workflow assistant',
+      body: content,
+      timestamp,
+      status: 'success',
+      meta: readEventString(readEventRecord(event, 'metadata') ?? {}, 'source') ?? undefined,
+    })
+  }
+
+  if (type === 'artifact') {
+    const artifactType = readEventString(event, 'artifact_type') ?? 'artifact'
+    return createTimelineItem({
+      role: 'system',
+      title: 'Artifact recorded',
+      body: readEventString(event, 'title') ?? `Artifact type: ${artifactType}`,
+      timestamp,
+      status: 'success',
+      meta: artifactType,
+    })
+  }
+
+  if (type === 'exec_update') {
+    return createTimelineItem({
+      role: 'system',
+      title: 'Execution update',
+      body:
+        readEventString(event, 'content') ??
+        readEventString(event, 'status') ??
+        'Shared runtime execution state changed.',
+      timestamp,
+      status: 'pending',
+      meta: readEventString(event, 'request_id') ?? undefined,
+    })
+  }
+
+  const runLifecycleTypes = new Set([
+    'run_created',
+    'run_started',
+    'run_status',
+    'run_scheduled',
+    'run_completed',
+    'run_failed',
+    'run_paused',
+    'run_resumed',
+    'run_finalized_partial',
+  ])
+
+  if (runLifecycleTypes.has(type)) {
+    const status = readEventString(event, 'status')
+    return createTimelineItem({
+      role: 'system',
+      title: type.replaceAll('_', ' '),
+      body: status ? `Run status: ${status}.` : 'Workflow runtime emitted a status update.',
+      timestamp,
+      status:
+        status === 'failed' || status === 'error'
+          ? 'error'
+          : status === 'completed' || status === 'succeeded'
+            ? 'success'
+            : 'pending',
+      meta: readEventString(event, 'protocol_id') ?? undefined,
+    })
+  }
+
+  return createTimelineItem({
+    role: 'system',
+    title: type.replaceAll('_', ' '),
+    body: readEventString(event, 'content') ?? 'Workflow event captured.',
+    timestamp,
+    status: 'ready',
+  })
+}
+
+function buildTimelineFromRun(run: api.AgentRunDetail | null): WorkflowTimelineItem[] {
+  if (!run) {
+    return createInitialTimeline()
+  }
+
+  const items = run.events
+    .map((event) => buildTimelineItemFromEvent(event, run.updated_at || run.created_at))
+    .filter((item): item is WorkflowTimelineItem => item !== null)
+
+  if (items.length > 0) {
+    return items
+  }
+
+  return [
+    createTimelineItem({
+      role: 'system',
+      title: 'Run loaded',
+      body: run.topic || run.title || 'Workflow run loaded.',
+      timestamp: run.updated_at || run.created_at,
+      status: 'ready',
+      meta: run.run_id,
+    }),
+  ]
+}
 
 function createSubagentDraft(defaultModelId: string | null): SubagentDraft {
   return {
@@ -198,16 +427,6 @@ function sourceModeToEvidenceMode(mode: string): string {
   return 'hybrid'
 }
 
-function formatReasoningEffortLabel(value: api.ReasoningEffort | null): string {
-  if (!value) {
-    return 'Auto'
-  }
-  if (value === 'xhigh') {
-    return 'X-High'
-  }
-  return value.charAt(0).toUpperCase() + value.slice(1)
-}
-
 function statusVariant(status: string): BadgeProps['variant'] {
   const normalized = status.toLowerCase()
   if (
@@ -272,8 +491,14 @@ function runPolicyPresetValues(preset: RunPolicyPreset): Required<api.AgentRunRu
 }
 
 export default function AgentRunsPage() {
-  const router = useRouter()
   const { t } = useI18n()
+  const projects = useProjectStore((state) => state.projects)
+  const activeProjectId = useProjectStore((state) => state.activeProjectId)
+  const setActiveProjectId = useProjectStore((state) => state.setActiveProjectId)
+  const loadProjects = useProjectStore((state) => state.loadProjects)
+  const hasLoadedProjects = useProjectStore((state) => state.hasLoadedProjects)
+  const isLoadingProjects = useProjectStore((state) => state.isLoadingProjects)
+  const projectStoreError = useProjectStore((state) => state.error)
   const [runs, setRuns] = React.useState<api.AgentRunSummary[]>([])
   const [models, setModels] = React.useState<api.ModelInfo[]>([])
   const [loadingRuns, setLoadingRuns] = React.useState(true)
@@ -288,6 +513,13 @@ export default function AgentRunsPage() {
   const [protocolId, setProtocolId] = React.useState<api.AgentRunProtocolId>('teacher_student_distill')
   const [title, setTitle] = React.useState('')
   const [topic, setTopic] = React.useState('')
+  const [operatorMessage, setOperatorMessage] = React.useState('')
+  const [workspaceOverride, setWorkspaceOverride] = React.useState('')
+  const [showAdvancedConfig, setShowAdvancedConfig] = React.useState(false)
+  const [timeline, setTimeline] = React.useState<WorkflowTimelineItem[]>(() => createInitialTimeline())
+  const [activeRunId, setActiveRunId] = React.useState<string | null>(null)
+  const [activeRunDetail, setActiveRunDetail] = React.useState<api.AgentRunDetail | null>(null)
+  const [messagePending, setMessagePending] = React.useState(false)
   const [reasoningEffort, setReasoningEffort] = React.useState<WorkflowReasoningEffort>('auto')
   const [subagents, setSubagents] = React.useState<SubagentDraft[]>([])
   const [evidenceQueriesText, setEvidenceQueriesText] = React.useState('')
@@ -331,6 +563,30 @@ export default function AgentRunsPage() {
   const [scheduleAutoPauseOnFailure, setScheduleAutoPauseOnFailure] = React.useState(true)
 
   const defaultModelId = models[0]?.id ?? null
+  const activeProject = React.useMemo(
+    () => projects.find((project) => project.id === activeProjectId) ?? null,
+    [activeProjectId, projects]
+  )
+  const activeRunSummary = React.useMemo(
+    () => runs.find((run) => run.run_id === activeRunId) ?? null,
+    [activeRunId, runs]
+  )
+  const effectiveWorkspacePath = workspaceOverride.trim() || activeProject?.workspaceDir || ''
+  const derivedTopic = React.useMemo(() => {
+    const firstLine = operatorMessage
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => line.length > 0)
+    if (!firstLine) {
+      return topic.trim()
+    }
+    return firstLine.slice(0, 160)
+  }, [operatorMessage, topic])
+  const sidebarRuns = React.useMemo(() => runs.slice(0, 8), [runs])
+  const activeRunsCount = React.useMemo(
+    () => runs.filter((run) => !TERMINAL_RUN_STATUSES.has(run.status.toLowerCase())).length,
+    [runs]
+  )
 
   const loadRuns = React.useCallback(async (showRefreshing = false) => {
     if (showRefreshing) {
@@ -384,6 +640,56 @@ export default function AgentRunsPage() {
   }, [loadModels, loadRuns])
 
   React.useEffect(() => {
+    if (!hasLoadedProjects) {
+      void loadProjects()
+    }
+  }, [hasLoadedProjects, loadProjects])
+
+  React.useEffect(() => {
+    if (runs.length === 0) {
+      if (!activeRunId) {
+        setActiveRunDetail(null)
+        setTimeline(createInitialTimeline())
+      }
+      return
+    }
+
+    if (!activeRunId || !runs.some((run) => run.run_id === activeRunId)) {
+      setActiveRunId(runs[0]?.run_id ?? null)
+    }
+  }, [activeRunId, runs])
+
+  React.useEffect(() => {
+    if (!activeRunId) {
+      setActiveRunDetail(null)
+      setTimeline(createInitialTimeline())
+      return
+    }
+
+    let cancelled = false
+    const loadActiveRun = async () => {
+      try {
+        const detail = await api.fetchAgentRun(activeRunId)
+        if (cancelled) {
+          return
+        }
+        setActiveRunDetail(detail)
+        setTimeline(buildTimelineFromRun(detail))
+      } catch {
+        if (cancelled) {
+          return
+        }
+        setActiveRunDetail(null)
+      }
+    }
+
+    void loadActiveRun()
+    return () => {
+      cancelled = true
+    }
+  }, [activeRunId])
+
+  React.useEffect(() => {
     if (!defaultModelId) {
       return
     }
@@ -412,6 +718,7 @@ export default function AgentRunsPage() {
 
   const canCreate =
     models.length > 0 &&
+    operatorMessage.trim().length > 0 &&
     (runTemplate === 'research_debate'
       ? smartModelId.trim().length > 0 && localWorkerModelId.trim().length > 0
       : subagents.some((item) => item.role.trim() && item.modelId.trim()))
@@ -509,11 +816,36 @@ export default function AgentRunsPage() {
   const handleCreate = React.useCallback(async () => {
     setCreateError(null)
     const normalizedSubagents = normalizeSubagentInputs(subagents)
+    const normalizedOperatorMessage = operatorMessage.trim()
+    const normalizedTopic = topic.trim() || derivedTopic
 
+    if (!normalizedOperatorMessage) {
+      setCreateError('Write an operator message before creating a run.')
+      return
+    }
     if (normalizedSubagents.length === 0) {
       setCreateError('Add at least one subagent with role and model.')
       return
     }
+
+    const operatorTimelineEntry = createTimelineItem({
+      role: 'operator',
+      title: title.trim() || normalizedTopic || 'New workflow request',
+      body: normalizedOperatorMessage,
+      status: 'ready',
+      meta: effectiveWorkspacePath ? `Workspace: ${effectiveWorkspacePath}` : undefined,
+    })
+    const pendingAssistantEntry = createTimelineItem({
+      role: 'assistant',
+      title: 'Creating run',
+      body: scheduleEnabled
+        ? 'Saving the workflow and handing execution off to the scheduler.'
+        : 'Creating the workflow run and preparing an optimistic start.',
+      status: 'pending',
+      meta: normalizedTopic || undefined,
+    })
+    const pendingAssistantId = pendingAssistantEntry.id
+    setTimeline((current) => [...current, operatorTimelineEntry, pendingAssistantEntry])
 
     setCreatePending(true)
     try {
@@ -608,7 +940,9 @@ export default function AgentRunsPage() {
       const created = await api.createAgentRun({
         protocol_id: runTemplate === 'research_debate' ? 'multi_agent_debate' : protocolId,
         title: title.trim() || null,
-        topic: topic.trim() || null,
+        topic: normalizedTopic || null,
+        projectId: activeProject?.id ?? null,
+        workspaceDir: effectiveWorkspacePath || null,
         reasoning_effort: reasoningEffort === 'auto' ? null : reasoningEffort,
         subagents: runTemplate === 'research_debate' ? [] : normalizedSubagents,
         selected_models_roles: selectedModelsRoles,
@@ -622,6 +956,17 @@ export default function AgentRunsPage() {
         },
         schedule,
         summary: {
+          operator_message: normalizedOperatorMessage,
+          ...(activeProject
+            ? {
+                project: {
+                  id: activeProject.id,
+                  name: activeProject.name,
+                  workspace_dir: activeProject.workspaceDir,
+                },
+              }
+            : {}),
+          ...(effectiveWorkspacePath ? { workspace_dir: effectiveWorkspacePath } : {}),
           ...(evidenceQueries.length > 0 ? { evidence_queries: evidenceQueries } : {}),
           ...(protocolId === 'dr_zero_self_evolve' && runTemplate !== 'research_debate'
             ? {
@@ -679,9 +1024,51 @@ export default function AgentRunsPage() {
       })
       if (created.run_id) {
         try {
+          const appendedDetail = await api.appendAgentRunMessage(created.run_id, {
+            role: 'operator',
+            content: normalizedOperatorMessage,
+            projectId: activeProject?.id ?? null,
+            workspaceDir: effectiveWorkspacePath || null,
+            metadata: {
+              channel: 'workflow-chat',
+              topic: normalizedTopic || null,
+            },
+          })
+          setActiveRunId(created.run_id)
+          setActiveRunDetail(appendedDetail)
+          setTimeline(buildTimelineFromRun(appendedDetail))
           if (!scheduleEnabled) {
-            await api.startAgentRun(created.run_id)
+            const started = await api.startAgentRun(created.run_id)
+            setRuns((current) =>
+              [started, ...current.filter((run) => run.run_id !== started.run_id)].sort(
+                (left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at)
+              )
+            )
+          } else {
+            setRuns((current) =>
+              [created, ...current.filter((run) => run.run_id !== created.run_id)].sort(
+                (left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at)
+              )
+            )
           }
+          const refreshedDetail = await api.fetchAgentRun(created.run_id)
+          setActiveRunDetail(refreshedDetail)
+          setTimeline(buildTimelineFromRun(refreshedDetail))
+          setTimeline((current) =>
+            current.map((item) =>
+              item.id === pendingAssistantId
+                ? {
+                    ...item,
+                    title: scheduleEnabled ? 'Run scheduled' : 'Run started',
+                    body: scheduleEnabled
+                      ? 'The workflow was created and queued with the selected automation schedule.'
+                      : 'The workflow was created successfully and an optimistic start signal was sent.',
+                    status: 'success',
+                    meta: created.run_id,
+                  }
+                : item
+            )
+          )
         } catch (startError) {
           if (!isUnavailableError(startError)) {
             const detail = startError instanceof Error
@@ -690,14 +1077,32 @@ export default function AgentRunsPage() {
                 ? 'Run was created but scheduler could not be initialized.'
                 : 'Run was created but could not be auto-started.'
             setCreateError(detail)
+            setTimeline((current) =>
+              current.map((item) =>
+                item.id === pendingAssistantId
+                  ? {
+                      ...item,
+                      title: 'Run created with warnings',
+                      body: detail,
+                      status: 'error',
+                      meta: created.run_id,
+                    }
+                  : item
+              )
+            )
           }
         }
-        router.push(`/agent-runs/${encodeURIComponent(created.run_id)}`)
+        setOperatorMessage('')
+        setTopic('')
+        setTitle('')
+        setWorkspaceOverride('')
         return
       }
       await loadRuns()
       setTitle('')
       setTopic('')
+      setOperatorMessage('')
+      setWorkspaceOverride('')
       setReasoningEffort('auto')
       setSubagents(createProtocolSubagentDrafts(protocolId, defaultModelId))
       setEvidenceQueriesText('')
@@ -731,26 +1136,53 @@ export default function AgentRunsPage() {
       setScheduleStartImmediately(true)
       setScheduleMaxRuns('')
       setScheduleAutoPauseOnFailure(true)
+      setTimeline((current) =>
+        current.map((item) =>
+          item.id === pendingAssistantId
+            ? {
+                ...item,
+                title: 'Run created',
+                body: 'The workflow was created successfully.',
+                status: 'success',
+              }
+            : item
+        )
+      )
     } catch (error) {
       if (isUnavailableError(error)) {
         setCreateError(t('workflows.apiUnavailable'))
       } else {
         const detail = error instanceof Error ? error.message : t('workflows.createError')
         setCreateError(detail)
+        setTimeline((current) =>
+          current.map((item) =>
+            item.id === pendingAssistantId
+              ? {
+                  ...item,
+                  title: 'Run creation failed',
+                  body: detail,
+                  status: 'error',
+                }
+              : item
+          )
+        )
       }
     } finally {
       setCreatePending(false)
     }
   }, [
+    activeProject,
     citationPolicy,
     controlledExecutionBackgroundAllowed,
     controlledExecutionEnabled,
     defaultModelId,
     defaultExecutionTimeoutSec,
     debateRounds,
+    derivedTopic,
     evidenceCollectionEnabled,
     evidenceCollectionMode,
     evidenceQueriesText,
+    effectiveWorkspacePath,
     localWorkerCount,
     localWorkerModelId,
     loadRuns,
@@ -771,7 +1203,7 @@ export default function AgentRunsPage() {
     reasoningEffort,
     researchOutputTargets,
     researchSourceMode,
-    router,
+    operatorMessage,
     runTemplate,
     scheduleCron,
     scheduleEnabled,
@@ -789,33 +1221,317 @@ export default function AgentRunsPage() {
     topic,
   ])
 
+  const handleSendMessage = React.useCallback(async () => {
+    if (!activeRunId) {
+      await handleCreate()
+      return
+    }
+
+    const content = operatorMessage.trim()
+    if (!content) {
+      setCreateError('Write an operator message before sending.')
+      return
+    }
+
+    setCreateError(null)
+    setMessagePending(true)
+    try {
+      const detail = await api.appendAgentRunMessage(activeRunId, {
+        role: 'operator',
+        content,
+        projectId: activeProject?.id ?? activeRunSummary?.project_id ?? null,
+        workspaceDir: effectiveWorkspacePath || activeRunSummary?.workspace_dir || null,
+        metadata: {
+          channel: 'workflow-chat',
+          topic: derivedTopic || activeRunSummary?.topic || null,
+        },
+      })
+      setActiveRunDetail(detail)
+      setTimeline(buildTimelineFromRun(detail))
+      setRuns((current) =>
+        [detail, ...current.filter((run) => run.run_id !== detail.run_id)].sort(
+          (left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at)
+        )
+      )
+      setOperatorMessage('')
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unable to append workflow message.'
+      setCreateError(detail)
+    } finally {
+      setMessagePending(false)
+    }
+  }, [
+    activeProject,
+    activeRunId,
+    activeRunSummary?.project_id,
+    activeRunSummary?.topic,
+    activeRunSummary?.workspace_dir,
+    derivedTopic,
+    effectiveWorkspacePath,
+    handleCreate,
+    operatorMessage,
+  ])
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <header className="shrink-0 border-b border-border px-6 pb-4 pt-5">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-bold text-foreground">{t('workflows.title')}</h1>
-            <p className="mt-0.5 text-sm text-muted-foreground">
-              {t('workflows.description')}
-            </p>
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="outline">Chat-first workflow</Badge>
+              <Badge variant={activeRunSummary ? statusVariant(activeRunSummary.status) : 'neutral'}>
+                {activeRunSummary ? translateRunStatus(activeRunSummary.status, t) : 'No active run'}
+              </Badge>
+              <Badge variant="outline">{activeRunsCount} active</Badge>
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-foreground">{t('workflows.title')}</h1>
+              <p className="mt-0.5 text-sm text-muted-foreground">{t('workflows.description')}</p>
+            </div>
           </div>
-          <Button variant="secondary" size="sm" onClick={() => void loadRuns(true)} loading={refreshingRuns}>
-            <RefreshCw className="h-3.5 w-3.5" />
-            Refresh
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowAdvancedConfig((current) => !current)}
+            >
+              <Settings2 className="h-3.5 w-3.5" />
+              {showAdvancedConfig ? 'Hide advanced config' : 'Show advanced config'}
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => void loadRuns(true)} loading={refreshingRuns}>
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh
+            </Button>
+          </div>
         </div>
       </header>
 
       <div className="flex-1 overflow-y-auto px-6 py-5">
-        <div className="grid gap-6 xl:grid-cols-[420px_minmax(0,1fr)]">
-          <Card>
-            <CardHeader>
-              <CardTitle>{t('workflows.create')}</CardTitle>
-              <CardDescription>
-                {t('workflows.createDescription')}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="space-y-6">
+            <Card className="overflow-hidden">
+              <CardHeader className="border-b border-border/80">
+                <CardTitle className="flex items-center gap-2">
+                  <MessageSquare className="h-4 w-4" />
+                  Workflow Conversation
+                </CardTitle>
+                <CardDescription>
+                  Talk to the workflow main agent here. The right sidebar keeps the run machinery visible without making it the primary surface.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5 p-5">
+                <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(220px,280px)]">
+                  <div className="space-y-4">
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Operator message
+                      </label>
+                      <Textarea
+                        value={operatorMessage}
+                        onChange={(event) => setOperatorMessage(event.target.value)}
+                        placeholder="Describe the task, constraints, and what the workflow should do next."
+                        rows={5}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Your first message creates the workflow shell and the first run. Later messages continue the active run conversation.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Title
+                      </label>
+                      <Input
+                        value={title}
+                        onChange={(event) => setTitle(event.target.value)}
+                        placeholder="Optional workflow title"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Topic summary
+                      </label>
+                      <Input
+                        value={topic}
+                        onChange={(event) => setTopic(event.target.value)}
+                        placeholder="Optional summary. Leave blank to derive it from the first operator message."
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Derived topic: <span className="text-foreground">{derivedTopic || 'Not derived yet'}</span>
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4 rounded-xl border border-border bg-surface-layer p-4">
+                    <div className="flex items-center gap-2">
+                      <FolderKanban className="h-4 w-4 text-primary-300" />
+                      <div>
+                        <h3 className="text-sm font-semibold text-foreground">Workspace Control</h3>
+                        <p className="text-xs text-muted-foreground">
+                          Project + path determine where the workflow will read, write, and execute.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Project
+                      </label>
+                      <Select
+                        value={activeProjectId ?? '__none__'}
+                        onValueChange={(value) => setActiveProjectId(value === '__none__' ? null : value)}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Choose a project" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">No project binding</SelectItem>
+                          {projects.map((project) => (
+                            <SelectItem key={project.id} value={project.id}>
+                              {project.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-muted-foreground">
+                        {isLoadingProjects
+                          ? 'Loading projects...'
+                          : activeProject
+                            ? `Bound project workspace: ${activeProject.workspaceDir}`
+                            : 'No project selected. You can still use a direct workspace path override.'}
+                      </p>
+                      {projectStoreError ? (
+                        <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                          {projectStoreError}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Workspace path override
+                      </label>
+                      <Input
+                        value={workspaceOverride}
+                        onChange={(event) => setWorkspaceOverride(event.target.value)}
+                        placeholder="Optional absolute path"
+                      />
+                      <p className="rounded-md border border-border/80 bg-background px-3 py-2 text-xs text-muted-foreground">
+                        Effective workspace:
+                        <span className="ml-1 font-medium text-foreground">
+                          {effectiveWorkspacePath || 'Not set'}
+                        </span>
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Active run target
+                      </label>
+                      <p className="rounded-md border border-border/80 bg-background px-3 py-2 text-xs text-muted-foreground">
+                        {activeRunSummary
+                          ? `${activeRunSummary.title || activeRunSummary.topic || activeRunSummary.run_id} (${activeRunSummary.run_id})`
+                          : 'No active run selected. Sending a message will create one.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button
+                    variant="primary"
+                    size="md"
+                    onClick={() => void handleSendMessage()}
+                    loading={createPending || messagePending}
+                    disabled={!operatorMessage.trim() || (!activeRunId && !canCreate)}
+                  >
+                    <Rocket className="h-4 w-4" />
+                    {activeRunId ? 'Send to active run' : 'Create run from message'}
+                  </Button>
+                  {activeRunSummary ? (
+                    <Link
+                      href={`/agent-runs/${encodeURIComponent(activeRunSummary.run_id)}`}
+                      className="text-sm text-primary-300 underline-offset-4 hover:underline"
+                    >
+                      Open operator console
+                    </Link>
+                  ) : null}
+                </div>
+
+                {createError ? (
+                  <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                    {createError}
+                  </div>
+                ) : null}
+
+                <Separator />
+
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-foreground">Conversation timeline</h3>
+                      <p className="text-xs text-muted-foreground">
+                        Operator and assistant messages are reconstructed from agent run events.
+                      </p>
+                    </div>
+                    {activeRunDetail ? (
+                      <Badge variant="outline">
+                        Events: {activeRunDetail.events.length}
+                      </Badge>
+                    ) : null}
+                  </div>
+
+                  <div className="space-y-3">
+                    {timeline.map((item) => {
+                      const style = TIMELINE_ROLE_STYLES[item.role]
+                      return (
+                        <div
+                          key={item.id}
+                          className={cn(
+                            'rounded-xl border p-4 shadow-sm',
+                            style.bubble,
+                            item.status === 'error' && 'border-destructive/40 bg-destructive/10',
+                            item.status === 'pending' && 'border-warning/40 bg-warning/10'
+                          )}
+                        >
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className={cn('rounded-full px-2 py-0.5 text-[11px] font-medium', style.badge)}>
+                                {style.label}
+                              </span>
+                              <span className="text-sm font-semibold text-foreground">{item.title}</span>
+                            </div>
+                            <span className="text-[11px] text-muted-foreground">
+                              {formatDateTime(item.timestamp)}
+                            </span>
+                          </div>
+                          <p className="whitespace-pre-wrap text-sm text-muted-foreground">{item.body}</p>
+                          {item.meta ? (
+                            <p className="mt-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                              {item.meta}
+                            </p>
+                          ) : null}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {showAdvancedConfig ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Settings2 className="h-4 w-4" />
+                    Advanced Workflow Configuration
+                  </CardTitle>
+                  <CardDescription>
+                    Protocol, subagents, evidence, execution policy, and automation settings stay available here but no longer dominate the main operator flow.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
               <div className="space-y-2">
                 <label className="text-sm font-medium text-foreground">Template</label>
                 <Select value={runTemplate} onValueChange={(value) => handleTemplateChange(value as RunTemplate)}>
@@ -1484,75 +2200,178 @@ export default function AgentRunsPage() {
                   {createError}
                 </div>
               ) : null}
-            </CardContent>
-            <CardFooter className="justify-end">
-              <Button variant="primary" size="md" onClick={() => void handleCreate()} loading={createPending} disabled={!canCreate}>
-                <Rocket className="h-4 w-4" />
-                Create Run
-              </Button>
-            </CardFooter>
-          </Card>
+                </CardContent>
+              </Card>
+            ) : null}
+          </div>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>{t('agentRuns.recentRuns.title')}</CardTitle>
-              <CardDescription>{t('agentRuns.recentRuns.description')}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {runError ? (
-                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  {runError}
+          <div className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <PanelRight className="h-4 w-4" />
+                  Run Sidebar
+                </CardTitle>
+                <CardDescription>
+                  Recent runs, active status, artifacts, recovery signals, and operator drill-down links.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+                  <div className="rounded-lg border border-border bg-surface-layer p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Active run
+                    </p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">
+                      {activeRunSummary?.title || activeRunSummary?.topic || activeRunSummary?.run_id || 'None'}
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <Badge variant={activeRunSummary ? statusVariant(activeRunSummary.status) : 'neutral'}>
+                        {activeRunSummary ? translateRunStatus(activeRunSummary.status, t) : 'Idle'}
+                      </Badge>
+                      {activeRunSummary?.degraded ? <Badge variant="warning">Degraded</Badge> : null}
+                    </div>
+                    <p className="mt-3 text-xs text-muted-foreground">
+                      Workspace: {activeRunSummary?.workspace_dir || effectiveWorkspacePath || 'Not set'}
+                    </p>
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-surface-layer p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Recovery
+                    </p>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      {activeRunSummary?.recovery_state?.status
+                        ? `Recovery state: ${String(activeRunSummary.recovery_state.status)}`
+                        : 'No active recovery state.'}
+                    </p>
+                    {activeRunSummary?.latest_error ? (
+                      <p className="mt-2 text-xs text-destructive">{activeRunSummary.latest_error}</p>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-surface-layer p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Artifacts
+                    </p>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      {activeRunSummary ? `${activeRunSummary.artifacts.length} attached` : 'No run selected'}
+                    </p>
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-surface-layer p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Last update
+                    </p>
+                    <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                      <Clock3 className="h-4 w-4" />
+                      <span>{formatDateTime(activeRunSummary?.updated_at ?? null)}</span>
+                    </div>
+                  </div>
                 </div>
-              ) : loadingRuns ? (
+
+                <Separator />
+
                 <div className="space-y-3">
-                  {Array.from({ length: 4 }).map((_, index) => (
-                    <div key={index} className="h-20 animate-pulse rounded-lg border border-border bg-surface-layer" />
-                  ))}
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-sm font-semibold text-foreground">{t('agentRuns.recentRuns.title')}</h3>
+                    <Badge variant="outline">{sidebarRuns.length}</Badge>
+                  </div>
+                  {runError ? (
+                    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                      {runError}
+                    </div>
+                  ) : loadingRuns ? (
+                    <div className="space-y-3">
+                      {Array.from({ length: 4 }).map((_, index) => (
+                        <div key={index} className="h-20 animate-pulse rounded-lg border border-border bg-surface-layer" />
+                      ))}
+                    </div>
+                  ) : sidebarRuns.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-border bg-surface-layer px-4 py-8 text-center text-sm text-muted-foreground">
+                      {t('agentRuns.recentRuns.empty')}
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {sidebarRuns.map((run) => {
+                        const runState = run.status.toLowerCase()
+                        const isTerminal = TERMINAL_RUN_STATUSES.has(runState)
+                        const isSelected = run.run_id === activeRunId
+                        return (
+                          <button
+                            key={run.run_id || `${run.created_at}-${run.title}`}
+                            type="button"
+                            onClick={() => setActiveRunId(run.run_id)}
+                            className={cn(
+                              'block w-full rounded-lg border bg-surface-layer p-4 text-left transition-colors hover:border-primary-500/50',
+                              isSelected ? 'border-primary-500/60' : 'border-border'
+                            )}
+                          >
+                            <div className="mb-2 flex items-start justify-between gap-3">
+                              <div>
+                                <h3 className="text-sm font-semibold text-foreground">
+                                  {run.title || run.topic || run.run_id || t('agentRuns.run.untitled')}
+                                </h3>
+                                <p className="mt-0.5 text-xs text-muted-foreground">{run.protocol_id}</p>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge variant={statusVariant(run.status)}>{translateRunStatus(run.status, t)}</Badge>
+                                {run.degraded ? <Badge variant="warning">{t('agentRuns.badge.degraded')}</Badge> : null}
+                              </div>
+                            </div>
+                            <p className="line-clamp-2 text-sm text-muted-foreground">
+                              {run.topic || t('agentRuns.run.noTopic')}
+                            </p>
+                            <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                              <span>{formatDateTime(run.updated_at)}</span>
+                              <span>{isTerminal ? 'Finished' : 'Active'}</span>
+                            </div>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
-              ) : runs.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-border bg-surface-layer px-4 py-8 text-center text-sm text-muted-foreground">
-                  {t('agentRuns.recentRuns.empty')}
+
+                {activeRunSummary ? (
+                  <div className="rounded-lg border border-border bg-surface-layer p-3">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Open full run detail
+                    </p>
+                    <Link
+                      href={`/agent-runs/${encodeURIComponent(activeRunSummary.run_id)}`}
+                      className="mt-2 inline-flex text-sm text-primary-300 underline-offset-4 hover:underline"
+                    >
+                      Inspect run detail, logs, and recovery console
+                    </Link>
+                  </div>
+                ) : null}
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Current Workflow Target</CardTitle>
+                <CardDescription>
+                  The workflow should operate against this project and workspace unless the active run carries a newer override.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm text-muted-foreground">
+                <div>
+                  <span className="font-medium text-foreground">Project:</span>{' '}
+                  {activeProject ? `${activeProject.name} (${activeProject.id})` : 'None'}
                 </div>
-              ) : (
-                <div className="space-y-3">
-                  {runs.map((run) => {
-                    const runState = run.status.toLowerCase()
-                    const isTerminal = TERMINAL_RUN_STATUSES.has(runState)
-                    return (
-                      <Link
-                        key={run.run_id || `${run.created_at}-${run.title}`}
-                        href={`/agent-runs/${encodeURIComponent(run.run_id)}`}
-                        className="block rounded-lg border border-border bg-surface-layer p-4 transition-colors hover:border-primary-500/50"
-                      >
-                        <div className="mb-2 flex items-start justify-between gap-3">
-                          <div>
-                            <h3 className="text-sm font-semibold text-foreground">
-                              {run.title || run.topic || run.run_id || t('agentRuns.run.untitled')}
-                            </h3>
-                            <p className="mt-0.5 text-xs text-muted-foreground">{run.protocol_id}</p>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <Badge variant={statusVariant(run.status)}>{translateRunStatus(run.status, t)}</Badge>
-                            <Badge variant="outline">
-                              Thinking: {formatReasoningEffortLabel(run.reasoning_effort)}
-                            </Badge>
-                            {run.degraded ? <Badge variant="warning">{t('agentRuns.badge.degraded')}</Badge> : null}
-                          </div>
-                        </div>
-                        <p className="line-clamp-2 text-sm text-muted-foreground">
-                          {run.topic || t('agentRuns.run.noTopic')}
-                        </p>
-                        <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
-                          <span>{t('agentRuns.run.updated', { value: formatDateTime(run.updated_at) })}</span>
-                          <span>{isTerminal ? t('agentRuns.run.state.finished') : t('agentRuns.run.state.active')}</span>
-                        </div>
-                      </Link>
-                    )
-                  })}
+                <div>
+                  <span className="font-medium text-foreground">Workspace:</span>{' '}
+                  {effectiveWorkspacePath || activeRunSummary?.workspace_dir || 'Not set'}
                 </div>
-              )}
-            </CardContent>
-          </Card>
+                <div>
+                  <span className="font-medium text-foreground">Protocol:</span>{' '}
+                  {runTemplate === 'research_debate' ? 'multi_agent_debate' : protocolId}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
         </div>
       </div>
     </div>

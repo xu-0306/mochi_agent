@@ -9,6 +9,7 @@ import {
   forkSession as forkSessionApi,
   renameSession as renameSessionApi,
   updateSessionProject as updateSessionProjectApi,
+  type SessionWorkflowState,
   type SessionDetail,
   type SessionSummary,
 } from '@/lib/api'
@@ -26,6 +27,7 @@ export interface Session {
   isPinned: boolean
   messageCount: number
   projectId: string | null
+  workflow: SessionWorkflowState | null
   isDraft: boolean
 }
 
@@ -115,6 +117,7 @@ function normalizeSummary(summary: SessionSummary): Session {
     isPinned: false,
     messageCount: summary.eventCount,
     projectId: summary.projectId,
+    workflow: summary.workflow,
     isDraft: false,
   }
 }
@@ -128,6 +131,7 @@ function mergeSession(target: Session, detail: SessionDetail): Session {
     source: inferSource(detail.id),
     messageCount: detail.eventCount,
     projectId: detail.projectId,
+    workflow: detail.workflow,
     isDraft: false,
   }
 }
@@ -143,6 +147,7 @@ function buildDraftSession(projectId: string | null): Session {
     isPinned: false,
     messageCount: 0,
     projectId,
+    workflow: null,
     isDraft: true,
   }
 }
@@ -222,6 +227,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
               updatedAt: target.lastMessageAt.toISOString(),
               eventCount: 0,
               projectId: target.projectId,
+              workflow: target.workflow,
               events: [],
             }
           : get().currentSessionDetail,
@@ -273,6 +279,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
         updatedAt: draft.lastMessageAt.toISOString(),
         eventCount: 0,
         projectId: draft.projectId,
+        workflow: draft.workflow,
         events: [],
       },
       error: null,
@@ -306,6 +313,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
                   lastMessageAt: session.lastMessageAt,
                   isPinned: session.isPinned,
                   projectId: draft.projectId,
+                  workflow: session.workflow,
                   isDraft: false,
                 },
                 detail

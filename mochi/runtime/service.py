@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 
 from mochi.agents.multi_agent.execution_policy import (
@@ -27,7 +27,12 @@ from mochi.runtime.agent_run_packages import (
 from mochi.runtime.approvals import ApprovalStatus, InMemoryApprovalStore
 from mochi.runtime.delegate import set_delegate_subagent_task_launcher
 from mochi.runtime.exec_runtime import ExecRuntime
-from mochi.runtime.models import AgentRunCreateRequest, AgentRunGuidanceRequest, TaskCreateRequest
+from mochi.runtime.models import (
+    AgentRunCreateRequest,
+    AgentRunGuidanceRequest,
+    AgentRunMessageRequest,
+    TaskCreateRequest,
+)
 from mochi.runtime.recovery import (
     build_resource_exhaustion_report,
     classify_agent_run_recovery_issue,
@@ -264,11 +269,17 @@ class RuntimeService:
         summary = dict(payload.summary)
         if payload.reasoning_effort is not None:
             summary["reasoning_effort"] = payload.reasoning_effort
+        if payload.project_id is not None:
+            summary["project_id"] = payload.project_id
+        if payload.workspace_dir is not None:
+            summary["workspace_dir"] = payload.workspace_dir
         run = await self._store.create_agent_run(
             run_id=run_id,
             protocol_id=payload.protocol_id,
             title=payload.title,
             topic=payload.topic,
+            project_id=payload.project_id,
+            workspace_dir=payload.workspace_dir,
             selected_models_roles=payload.selected_models_roles,
             evaluation_policy=payload.evaluation_policy,
             run_policy=run_policy,
@@ -283,6 +294,8 @@ class RuntimeService:
             {
                 "type": "run_created",
                 "protocol_id": payload.protocol_id,
+                "project_id": payload.project_id,
+                "workspace_dir": payload.workspace_dir,
             },
         )
         return _agent_run_summary(run)
@@ -558,6 +571,81 @@ class RuntimeService:
                 "metadata": payload.metadata,
             },
         )
+        updated = await self._store.get_agent_run(run_id)
+        if updated is None:
+            return None
+        response = _agent_run_summary(updated)
+        response["events"] = await self._store.get_agent_run_events(run_id)
+        return response
+
+    async def append_agent_run_message(
+        self,
+        run_id: str,
+        payload: AgentRunMessageRequest,
+    ) -> dict[str, Any] | None:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return None
+
+        content = payload.content.strip()
+        metadata = dict(payload.metadata or {})
+        attachments = [dict(item) for item in payload.attachments if isinstance(item, dict)]
+        if payload.project_id is not None:
+            metadata["project_id"] = payload.project_id
+        if payload.workspace_dir is not None:
+            metadata["workspace_dir"] = payload.workspace_dir
+        if attachments:
+            metadata["attachments"] = attachments
+        normalized_role = "operator" if payload.role in {"user", "operator"} else "operator"
+        event_type = "operator_message"
+        await self._store.append_agent_run_event(
+            run_id,
+            {
+                "type": event_type,
+                "role": normalized_role,
+                "source_role": payload.role,
+                "content": content,
+                "project_id": payload.project_id,
+                "workspace_dir": payload.workspace_dir,
+                "attachments": attachments,
+                "metadata": metadata,
+            },
+        )
+
+        summary = dict(run.get("summary") or {})
+        update_kwargs: dict[str, Any] = {}
+        if payload.project_id is not None:
+            summary["project_id"] = payload.project_id
+            update_kwargs["project_id"] = payload.project_id
+        if payload.workspace_dir is not None:
+            summary["workspace_dir"] = payload.workspace_dir
+            update_kwargs["workspace_dir"] = payload.workspace_dir
+        if not str(summary.get("task_input") or "").strip():
+            summary["task_input"] = content
+        if update_kwargs or summary != (run.get("summary") or {}):
+            await self._store.update_agent_run_metadata(
+                run_id,
+                summary=summary,
+                **update_kwargs,
+            )
+
+        refreshed = await self._store.get_agent_run(run_id)
+        ack = _build_workflow_assistant_acknowledgement(refreshed or run, content)
+        await self._store.append_agent_run_event(
+            run_id,
+            {
+                "type": "assistant_message",
+                "role": "assistant",
+                "content": ack,
+                "project_id": _agent_run_project_id(refreshed or run),
+                "workspace_dir": _agent_run_workspace_dir(refreshed or run),
+                "metadata": {
+                    "source": "workflow_runtime",
+                    "acknowledgement": True,
+                },
+            },
+        )
+
         updated = await self._store.get_agent_run(run_id)
         if updated is None:
             return None
@@ -901,7 +989,8 @@ class RuntimeService:
                     "evaluation_policy": run.get("evaluation_policy") or {},
                     "schedule": run.get("schedule") or {},
                     "summary": run.get("summary") or {},
-                    "workspace_dir": run.get("summary", {}).get("workspace_dir") if isinstance(run.get("summary"), dict) else None,
+                    "project_id": _agent_run_project_id(run),
+                    "workspace_dir": _agent_run_workspace_dir(run),
                     "task_workspace_dir": str(task_workspace_dir) if task_workspace_dir is not None else None,
                     "resume_strategy": active_resume_strategy,
                     "resume_payload": dict(active_resume_payload or {}),
@@ -1326,17 +1415,22 @@ class RuntimeService:
         messages: list[str] = []
         for event in events:
             event_type = str(event.get("type", ""))
-            if event_type != "guidance":
+            if event_type == "guidance":
+                text = event.get("guidance")
+                if isinstance(text, str) and text.strip():
+                    messages.append(text.strip())
+                    continue
+                payload = event.get("payload")
+                if isinstance(payload, dict):
+                    payload_text = payload.get("content")
+                    if isinstance(payload_text, str) and payload_text.strip():
+                        messages.append(payload_text.strip())
                 continue
-            text = event.get("guidance")
+            if event_type != "operator_message":
+                continue
+            text = event.get("content")
             if isinstance(text, str) and text.strip():
                 messages.append(text.strip())
-                continue
-            payload = event.get("payload")
-            if isinstance(payload, dict):
-                payload_text = payload.get("content")
-                if isinstance(payload_text, str) and payload_text.strip():
-                    messages.append(payload_text.strip())
         return messages
 
     async def list_tasks(self) -> list[dict[str, Any]]:
@@ -2567,6 +2661,8 @@ def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
         "protocol_id": run["protocol_id"],
         "title": run.get("title"),
         "topic": run.get("topic"),
+        "project_id": _agent_run_project_id(run),
+        "workspace_dir": _agent_run_workspace_dir(run),
         "reasoning_effort": reasoning_effort,
         "status": run.get("status", "created"),
         "selected_models_roles": run.get("selected_models_roles") or {},
@@ -2584,6 +2680,43 @@ def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
         "started_at": run.get("started_at"),
         "finished_at": run.get("finished_at"),
     }
+
+
+def _agent_run_project_id(run: dict[str, Any]) -> str | None:
+    project_id = run.get("project_id")
+    if isinstance(project_id, str) and project_id.strip():
+        return project_id
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    summary_project_id = summary.get("project_id")
+    if isinstance(summary_project_id, str) and summary_project_id.strip():
+        return summary_project_id
+    return None
+
+
+def _agent_run_workspace_dir(run: dict[str, Any]) -> str | None:
+    workspace_dir = run.get("workspace_dir")
+    if isinstance(workspace_dir, str) and workspace_dir.strip():
+        return workspace_dir
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    summary_workspace_dir = summary.get("workspace_dir")
+    if isinstance(summary_workspace_dir, str) and summary_workspace_dir.strip():
+        return summary_workspace_dir
+    return None
+
+
+def _build_workflow_assistant_acknowledgement(run: dict[str, Any], message: str) -> str:
+    preview = _truncate_preview(message, max_chars=160) or "message received"
+    status = str(run.get("status") or "created")
+    project_id = _agent_run_project_id(run)
+    workspace_dir = _agent_run_workspace_dir(run)
+    parts = [f"Recorded your workflow message: {preview}."]
+    if project_id:
+        parts.append(f"Project: {project_id}.")
+    if workspace_dir:
+        parts.append(f"Workspace: {workspace_dir}.")
+    parts.append(f"Current run status: {status}.")
+    parts.append("The workflow run will continue within the existing orchestrator boundaries.")
+    return " ".join(parts)
 
 
 def _coerce_reasoning_effort(value: Any) -> ReasoningEffort | None:

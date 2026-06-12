@@ -613,7 +613,12 @@ class AgentEngine:
             attachments=list(request.attachments or []),
         )
         if request.persist_session:
-            await self._persist_session_message(session_key, user_msg, turn_id=turn_id)
+            await self._persist_session_message(
+                session_key,
+                user_msg,
+                turn_id=turn_id,
+                selected_skill_ids=list(request.selected_skill_ids or []),
+            )
         tool_execution_context = self._get_tool_execution_context(
             session_id=session_key,
             workspace_dir=effective_workspace_dir,
@@ -1877,6 +1882,7 @@ class AgentEngine:
         message: Message,
         *,
         turn_id: str,
+        selected_skill_ids: list[str] | None = None,
     ) -> None:
         """將 canonical message 持久化到 session store。"""
         timestamp = datetime.now(UTC).isoformat(timespec="seconds")
@@ -1893,6 +1899,7 @@ class AgentEngine:
                 "tool_call_id": message.tool_call_id,
                 "name": message.name,
                 "attachments": [attachment.to_dict() for attachment in message.attachments],
+                "selected_skill_ids": list(selected_skill_ids or []),
                 "responses_replay": (
                     message.responses_replay.to_dict()
                     if message.responses_replay is not None

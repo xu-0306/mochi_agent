@@ -12,6 +12,7 @@ from mochi.runtime.models import (
     AgentRunCreateRequest,
     AgentRunDatasetPackageResponse,
     AgentRunGuidanceRequest,
+    AgentRunMessageRequest,
     AgentRunResumeRequest,
     AgentRunResponse,
 )
@@ -212,6 +213,19 @@ async def append_agent_run_guidance(
 ) -> AgentRunResponse:
     service = await _get_runtime_service(request.app)
     run = await service.append_agent_run_guidance(run_id, payload)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    return AgentRunResponse.model_validate(run)
+
+
+@router.post("/{run_id}/messages", response_model=AgentRunResponse)
+async def append_agent_run_message(
+    request: Request,
+    run_id: str,
+    payload: AgentRunMessageRequest,
+) -> AgentRunResponse:
+    service = await _get_runtime_service(request.app)
+    run = await service.append_agent_run_message(run_id, payload)
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return AgentRunResponse.model_validate(run)

@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { AlertCircle, Bot, Check, Pencil, RefreshCcw, X } from 'lucide-react'
+import { AlertCircle, Bot, Pencil, RefreshCcw } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -11,7 +11,6 @@ import { ReasoningPanel } from './ReasoningPanel'
 import { CopyButton } from './CopyButton'
 import type { FileChangeSummary } from '@/lib/chat-p2'
 import { Button } from '@/components/ui/button'
-import { Textarea } from '@/components/ui/textarea'
 import { createMarkdownCodeComponents } from '@/components/code/markdown-code'
 import { ChatAttachments } from './ChatAttachments'
 
@@ -73,9 +72,6 @@ export function ChatMessage({
   onUndoFileChange,
 }: ChatMessageProps) {
   const { type, content, errorCode, isStreaming, reasoningSteps } = message
-  const [isEditing, setIsEditing] = React.useState(false)
-  const [draftContent, setDraftContent] = React.useState(content)
-  const [isSubmittingEdit, setIsSubmittingEdit] = React.useState(false)
   const tokenStatsLabel = type === 'assistant' ? formatTokenStats(message) : null
   const timestampLabel = formatRelativeTime(message.timestamp)
   const timestampTitle = formatDate(message.timestamp, {
@@ -93,27 +89,6 @@ export function ChatMessage({
     []
   )
   const prefersWideAssistantLayout = type === 'assistant' && hasWideMarkdownContent(content)
-
-  React.useEffect(() => {
-    setDraftContent(content)
-    setIsEditing(false)
-    setIsSubmittingEdit(false)
-  }, [content, message.id])
-
-  const handleSubmitEdit = React.useCallback(async () => {
-    const nextContent = draftContent.trim()
-    if (!nextContent || !onEditAndResend || isSubmittingEdit) {
-      return
-    }
-
-    setIsSubmittingEdit(true)
-    try {
-      await onEditAndResend(message, nextContent)
-      setIsEditing(false)
-    } finally {
-      setIsSubmittingEdit(false)
-    }
-  }, [draftContent, isSubmittingEdit, message, onEditAndResend])
 
   if (type === 'system') {
     return (
@@ -151,111 +126,52 @@ export function ChatMessage({
         <div
           className={cn(
             'flex max-w-[720px] flex-col gap-1',
-            isEditing ? 'w-full items-stretch' : 'items-end'
+            'items-end'
           )}
         >
           <div className="relative w-full">
-            {!isEditing ? (
-              <div className="pointer-events-none absolute top-2 right-2 z-10 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
-                <div className="pointer-events-auto flex items-center gap-1 rounded-full border border-white/15 bg-black/30 p-1 shadow-sm backdrop-blur-sm">
-                  {onEditAndResend ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      className="h-6 w-6 rounded-full text-white/75 hover:bg-white/12 hover:text-white"
-                      title="Edit and resend"
-                      aria-label="Edit and resend"
-                      onClick={() => setIsEditing(true)}
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </Button>
-                  ) : null}
-                  <CopyButton
-                    text={content}
-                    label="Copy message"
+            <div className="pointer-events-none absolute top-2 right-2 z-10 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+              <div className="pointer-events-auto flex items-center gap-1 rounded-full border border-white/15 bg-black/30 p-1 shadow-sm backdrop-blur-sm">
+                {onEditAndResend ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
                     className="h-6 w-6 rounded-full text-white/75 hover:bg-white/12 hover:text-white"
-                  />
-                </div>
+                    title="Edit and resend"
+                    aria-label="Edit and resend"
+                    onClick={() => void onEditAndResend(message, content)}
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                ) : null}
+                <CopyButton
+                  text={content}
+                  label="Copy message"
+                  className="h-6 w-6 rounded-full text-white/75 hover:bg-white/12 hover:text-white"
+                />
               </div>
-            ) : null}
+            </div>
 
             <div
               className={cn(
                 'bg-primary-500 px-4 py-3 text-white',
                 'rounded-[18px_18px_6px_18px]',
                 'whitespace-pre-wrap break-words text-sm leading-relaxed shadow-sm',
-                isEditing ? 'w-full' : null,
-                !isEditing && onEditAndResend ? 'pr-16' : null
+                onEditAndResend ? 'pr-16' : null
               )}
             >
-              {isEditing ? (
-                <div className="space-y-3">
-                  <Textarea
-                    value={draftContent}
-                    onChange={(event) => setDraftContent(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Escape') {
-                        event.preventDefault()
-                        setDraftContent(content)
-                        setIsEditing(false)
-                        return
-                      }
-
-                      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                        event.preventDefault()
-                        void handleSubmitEdit()
-                      }
-                    }}
-                    autoResize
-                    minRows={2}
-                    maxRows={10}
-                    className={cn(
-                      'min-h-[84px] border-white/20 bg-white/10 px-3 py-2 text-sm text-white',
-                      'placeholder:text-white/55 focus-visible:border-white/40 focus-visible:ring-white/20'
-                    )}
-                  />
-                  <div className="flex items-center justify-end gap-2">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 rounded-full px-3 text-white/80 hover:bg-white/12 hover:text-white"
-                      onClick={() => {
-                        setDraftContent(content)
-                        setIsEditing(false)
-                      }}
-                    >
-                      <X className="h-3.5 w-3.5" />
-                      Cancel
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      className="h-7 rounded-full border-white/20 bg-white/14 px-3 text-white hover:bg-white/20"
-                      loading={isSubmittingEdit}
-                      onClick={() => void handleSubmitEdit()}
-                    >
-                      {!isSubmittingEdit ? <Check className="h-3.5 w-3.5" /> : null}
-                      Resend
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {content ? <div>{content}</div> : null}
-                  {message.attachments && message.attachments.length > 0 ? (
-                    <ChatAttachments attachments={message.attachments} variant="message" />
-                  ) : null}
-                </div>
-              )}
+              <div className="space-y-3">
+                {content ? <div>{content}</div> : null}
+                {message.attachments && message.attachments.length > 0 ? (
+                  <ChatAttachments attachments={message.attachments} variant="message" />
+                ) : null}
+              </div>
             </div>
           </div>
           <span
             className={cn(
-              'px-1 text-[11px] text-muted-foreground',
-              isEditing ? 'self-end' : null
+              'px-1 text-[11px] text-muted-foreground'
             )}
             title={timestampTitle}
           >
