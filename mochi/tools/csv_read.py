@@ -37,7 +37,7 @@ class CsvReadTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read a CSV file from the workspace and return a structured preview with "
+            "Read a local CSV file and return a structured preview with "
             "column names and rows."
         )
 
@@ -46,7 +46,7 @@ class CsvReadTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "CSV file path inside the workspace."},
+                "path": {"type": "string", "description": "Local CSV file path."},
                 "encoding": {"type": "string", "default": "utf-8"},
                 "delimiter": {
                     "type": "string",
@@ -100,6 +100,7 @@ class CsvReadTool(BaseTool):
             path,
             workspace_dir=workspace_root,
             scope=self._path_scope,
+            access="read",
         )
         if security_decision is not None or target is None:
             return ToolResult(

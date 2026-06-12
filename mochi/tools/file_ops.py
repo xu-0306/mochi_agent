@@ -24,7 +24,7 @@ FileWriter = Callable[[Path, str, bool, str], Awaitable[int]]
 
 
 class FileReadTool(BaseTool):
-    """Read a text file inside the allowed workspace scope."""
+    """Read a text file from the local filesystem."""
 
     def __init__(
         self,
@@ -48,9 +48,9 @@ class FileReadTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read the contents of a text file from the workspace. Returns full text "
-            "content. Use when you need to inspect code, configuration, or notes. "
-            "Cannot read binary files, and the path must stay inside the workspace."
+            "Read the contents of a local text file. Returns full text content. "
+            "Use when you need to inspect code, configuration, or notes. "
+            "Cannot read binary files."
         )
 
     @property
@@ -58,7 +58,7 @@ class FileReadTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path. Must be inside the workspace."},
+                "path": {"type": "string", "description": "Local file path to read."},
                 "encoding": {"type": "string", "default": "utf-8"},
                 "max_bytes": {
                     "type": "integer",
@@ -128,6 +128,7 @@ class FileReadTool(BaseTool):
             path,
             workspace_dir=workspace_root,
             scope=self._path_scope,
+            access="read",
         )
         if security_decision is not None or target is None:
             return ToolResult(

@@ -1,4 +1,4 @@
-"""Read DOCX text from the workspace."""
+"""Read DOCX text from the local filesystem."""
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ class DocxReadTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read text from a DOCX Word document in the workspace and return extracted paragraphs."
+            "Read text from a local DOCX Word document and return extracted paragraphs."
         )
 
     @property
@@ -88,7 +88,7 @@ class DocxReadTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "DOCX file path inside the workspace."},
+                "path": {"type": "string", "description": "Local DOCX file path."},
                 "max_chars": {
                     "type": "integer",
                     "minimum": 1,
@@ -128,6 +128,7 @@ class DocxReadTool(BaseTool):
             path,
             workspace_dir=workspace_root,
             scope=self._path_scope,
+            access="read",
         )
         if security_decision is not None or target is None:
             return ToolResult(

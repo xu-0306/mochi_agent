@@ -203,6 +203,7 @@ def check_file_tool_path(
     *,
     workspace_dir: str | Path,
     scope: str,
+    access: str = "write",
 ) -> tuple[Path | None, SecurityDecision | None]:
     """Resolve a tool path and reject suspicious or protected locations."""
     raw_path = str(path)
@@ -217,7 +218,8 @@ def check_file_tool_path(
         )
 
     try:
-        resolved = resolve_path_with_scope(raw_path, workspace_dir, scope)
+        effective_scope = "any" if access == "read" else scope
+        resolved = resolve_path_with_scope(raw_path, workspace_dir, effective_scope)
     except ValueError as exc:
         return (
             None,
@@ -228,7 +230,9 @@ def check_file_tool_path(
             ),
         )
 
-    if _is_protected_path(Path(raw_path).expanduser()) or _is_protected_path(resolved):
+    if access != "read" and (
+        _is_protected_path(Path(raw_path).expanduser()) or _is_protected_path(resolved)
+    ):
         return (
             None,
             deny_security_decision(

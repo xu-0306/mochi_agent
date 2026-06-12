@@ -1,4 +1,4 @@
-"""Read Jupyter notebooks from the workspace."""
+"""Read Jupyter notebooks from the local filesystem."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ class NotebookReadTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read a Jupyter notebook from the workspace and return selected cells with "
+            "Read a local Jupyter notebook and return selected cells with "
             "their source and optional outputs."
         )
 
@@ -40,7 +40,7 @@ class NotebookReadTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Notebook path inside the workspace."},
+                "path": {"type": "string", "description": "Local notebook path."},
                 "offset": {
                     "type": "integer",
                     "minimum": 1,
@@ -95,6 +95,7 @@ class NotebookReadTool(BaseTool):
             path,
             workspace_dir=workspace_root,
             scope=self._path_scope,
+            access="read",
         )
         if security_decision is not None or target is None:
             return ToolResult(

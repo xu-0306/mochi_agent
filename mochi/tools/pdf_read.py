@@ -1,4 +1,4 @@
-"""Read PDF text from the workspace."""
+"""Read PDF text from the local filesystem."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ class PdfReadTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read text from a PDF file in the workspace and return extracted text by page."
+            "Read text from a local PDF file and return extracted text by page."
         )
 
     @property
@@ -82,7 +82,7 @@ class PdfReadTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "PDF file path inside the workspace."},
+                "path": {"type": "string", "description": "Local PDF file path."},
                 "page_range": {
                     "type": "string",
                     "description": "Optional page selection such as '1-3' or '2,4-5'. Defaults to all pages.",
@@ -127,6 +127,7 @@ class PdfReadTool(BaseTool):
             path,
             workspace_dir=workspace_root,
             scope=self._path_scope,
+            access="read",
         )
         if security_decision is not None or target is None:
             return ToolResult(
