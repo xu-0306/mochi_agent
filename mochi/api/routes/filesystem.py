@@ -14,10 +14,10 @@ from typing import Annotated, Any
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config  # pyright: ignore[reportPrivateUsage]
 from mochi.tools.docx_read import extract_docx_paragraphs
 from mochi.tools.pdf_read import extract_pdf_pages
+from mochi.utils.security import check_file_tool_path, normalize_workspace_dir
 
 router = APIRouter(prefix="/v1/filesystem", tags=["filesystem"])
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
@@ -201,7 +201,7 @@ async def import_local_files(
         import_root = _path_from_client(target_dir)
     else:
         config = await _get_config(request.app)
-        import_root = Path(config.voice.stt_model_cache_dir).expanduser()
+        import_root = normalize_workspace_dir(config.workspace_dir)
 
     upload_root = import_root / "browser-imports"
     package_root = upload_root / f"{int(time.time())}-{_safe_package_name(package_name)}"
@@ -276,24 +276,21 @@ async def preview_workspace_text(
 
 
 async def _resolve_preview_target(request: Request, path: str) -> Path:
-    requested = _path_from_client(path)
-    if not requested.exists() or not requested.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-
     config = await _get_config(request.app)
-    allowed_roots = {Path(config.workspace_dir).expanduser().resolve()}
-    project_store = _get_project_store(request.app, config=config)
-    for project in await project_store.list_projects():
-        workspace_dir = project.get("workspace_dir")
-        if isinstance(workspace_dir, str) and workspace_dir.strip():
-            allowed_roots.add(Path(workspace_dir).expanduser().resolve())
-
-    resolved = requested.expanduser().resolve()
-    for root in allowed_roots:
-        if resolved == root or resolved.is_relative_to(root):
-            return resolved
-
-    raise HTTPException(status_code=403, detail="Path is outside allowed preview roots")
+    resolved, security_decision = check_file_tool_path(
+        path,
+        workspace_dir=normalize_workspace_dir(config.workspace_dir),
+        scope="any",
+        access="read",
+    )
+    if security_decision is not None or resolved is None:
+        raise HTTPException(
+            status_code=403,
+            detail=security_decision.reason if security_decision is not None else "Path denied",
+        )
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return resolved
 
 
 async def _preview_docx(path: Path, max_chars: int) -> dict[str, Any]:
