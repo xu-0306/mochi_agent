@@ -98,6 +98,7 @@ documents/
 implementation_plan.md
 scripts/
 tests/
+web/scripts/
 web/README.md
 web/next-env.d.ts
 web/tsconfig.tsbuildinfo

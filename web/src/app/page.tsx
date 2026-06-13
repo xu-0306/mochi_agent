@@ -23,7 +23,6 @@ import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
 import { InferencePanel } from '@/components/chat/InferencePanel'
 import { ScrollToBottom } from '@/components/chat/ScrollToBottom'
-import { ChatActivityStrip } from '@/components/chat/ChatActivityStrip'
 import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
 import { TaskPanel } from '@/components/chat/TaskPanel'
 import { WorkflowPanel } from '@/components/chat/WorkflowPanel'
@@ -46,8 +45,10 @@ import {
 import { useChatRuntimeStore } from '@/lib/stores/chat-runtime-store'
 import { useProjectStore } from '@/lib/stores/project-store'
 import { useSessionStore } from '@/lib/stores/session-store'
+import { useTaskStore } from '@/lib/stores/task-store'
 import { useUIStore } from '@/lib/stores/ui-store'
 import { useWorkspaceStore } from '@/lib/stores/workspace-store'
+import { cn } from '@/lib/utils'
 import { resolveVoiceOverlayPhase, resolveVoicePhaseFromRuntime } from '@/lib/voice-phase'
 import {
   VoiceWsClient,
@@ -796,6 +797,75 @@ function applyStreamChunk(
   return prev.map((message, index) => (index === targetIndex ? merged : message))
 }
 
+function matchesTaskRuntimeContext(
+  task: api.TaskSummary,
+  currentSessionId: string | null | undefined,
+  projectId: string | null | undefined
+): boolean {
+  if (currentSessionId) {
+    return task.session_id === currentSessionId
+  }
+  if (projectId) {
+    return task.project_id === projectId
+  }
+  return false
+}
+
+function isActiveTaskStatus(status: string): boolean {
+  return ['queued', 'running', 'resumed', 'awaiting_approval'].includes(status)
+}
+
+function isFailedTaskStatus(status: string): boolean {
+  return ['failed', 'error', 'cancelled'].includes(status)
+}
+
+function formatRuntimeBadgeCount(count: number): string {
+  return count > 9 ? '9+' : String(count)
+}
+
+function HeaderRuntimeIndicator({
+  tone,
+  count,
+  pulse = false,
+}: {
+  tone: 'info' | 'warning' | 'error'
+  count?: number | null
+  pulse?: boolean
+}) {
+  const palette =
+    tone === 'error'
+      ? 'bg-rose-500 text-white'
+      : tone === 'warning'
+        ? 'bg-amber-400 text-slate-950'
+        : 'bg-primary-500 text-white'
+
+  if (typeof count === 'number' && count > 0) {
+    return (
+      <span
+        aria-hidden="true"
+        className={cn(
+          'pointer-events-none absolute -right-1 -top-0.5 inline-flex min-h-[1.125rem] min-w-[1.125rem] items-center justify-center rounded-full border border-canvas/80 px-1 text-[9px] font-semibold leading-none shadow-[0_0_0_1px_rgba(9,10,16,0.35)] opacity-95',
+          palette,
+          pulse ? 'animate-pulse' : null
+        )}
+      >
+        {formatRuntimeBadgeCount(count)}
+      </span>
+    )
+  }
+
+  return (
+    <span
+      aria-hidden="true"
+      className={cn(
+        'pointer-events-none absolute right-1 top-1 inline-flex h-2 w-2 rounded-full border border-canvas/80 shadow-[0_0_0_1px_rgba(9,10,16,0.35)] opacity-90',
+        palette,
+        pulse ? 'animate-pulse' : null
+      )}
+    />
+  )
+}
+
 export default function ChatPage() {
   const router = useRouter()
   const { t } = useI18n()
@@ -854,6 +924,8 @@ export default function ChatPage() {
   } = useSessionStore()
   const activeProjectId = useProjectStore((state) => state.activeProjectId)
   const projects = useProjectStore((state) => state.projects)
+  const runtimeTasks = useTaskStore((state) => state.tasks)
+  const runtimeApprovals = useTaskStore((state) => state.approvals)
   const workspacePanelOpen = useUIStore((state) => state.workspacePanelOpen)
   const setWorkspacePanelOpen = useUIStore((state) => state.setWorkspacePanelOpen)
   const {
@@ -963,6 +1035,54 @@ export default function ChatPage() {
     () => resolveWorkflowScheduleType(workflowScheduleConfig),
     [workflowScheduleConfig]
   )
+  const contextualRuntimeTasks = React.useMemo(
+    () =>
+      runtimeTasks.filter((task) =>
+        matchesTaskRuntimeContext(task, currentSessionId, effectiveProjectId)
+      ),
+    [currentSessionId, effectiveProjectId, runtimeTasks]
+  )
+  const pendingApprovalCount = React.useMemo(() => {
+    const taskIds = new Set(contextualRuntimeTasks.map((task) => task.task_id))
+    if (taskIds.size === 0) {
+      return 0
+    }
+    return runtimeApprovals.filter(
+      (approval) => approval.status === 'pending' && taskIds.has(approval.task_id)
+    ).length
+  }, [contextualRuntimeTasks, runtimeApprovals])
+  const activeTaskCount = React.useMemo(
+    () => contextualRuntimeTasks.filter((task) => isActiveTaskStatus(task.status)).length,
+    [contextualRuntimeTasks]
+  )
+  const failedTaskCount = React.useMemo(
+    () => contextualRuntimeTasks.filter((task) => isFailedTaskStatus(task.status)).length,
+    [contextualRuntimeTasks]
+  )
+  const taskShortcutTitle = React.useMemo(() => {
+    if (pendingApprovalCount > 0) {
+      return `Tasks (${pendingApprovalCount} approval${pendingApprovalCount > 1 ? 's' : ''} waiting)`
+    }
+    if (failedTaskCount > 0) {
+      return `Tasks (${failedTaskCount} issue${failedTaskCount > 1 ? 's' : ''})`
+    }
+    if (activeTaskCount > 0) {
+      return `Tasks (${activeTaskCount} active)`
+    }
+    return 'Tasks'
+  }, [activeTaskCount, failedTaskCount, pendingApprovalCount])
+  const workflowShortcutTitle = React.useMemo(() => {
+    if (workflowError) {
+      return `${t('sidebar.workflows')} (attention needed)`
+    }
+    if (workflowBoundRunId) {
+      return `${t('sidebar.workflows')} (run active)`
+    }
+    if (workflowEnabled) {
+      return `${t('sidebar.workflows')} (enabled)`
+    }
+    return t('sidebar.workflows')
+  }, [t, workflowBoundRunId, workflowEnabled, workflowError])
   const uploadTargetDir =
     projects.find((project) => project.id === effectiveProjectId)?.workspaceDir ??
     getString(settings?.paths?.workspace_dir) ??
@@ -2534,6 +2654,16 @@ export default function ChatPage() {
     setTaskPanelOpen(nextOpen)
   }, [closeRightPanels, taskPanelOpen])
 
+  const handleOpenTaskPanel = React.useCallback(() => {
+    closeRightPanels('tasks')
+    setTaskPanelOpen(true)
+  }, [closeRightPanels])
+
+  const handleOpenWorkflowPanel = React.useCallback(() => {
+    closeRightPanels('workflow')
+    setWorkflowPanelOpen(true)
+  }, [closeRightPanels])
+
   const handleWorkspacePanelToggle = React.useCallback(() => {
     if (window.innerWidth < 1024) {
       closeRightPanels()
@@ -2544,6 +2674,23 @@ export default function ChatPage() {
     setWorkspaceMobileOpen(false)
     setWorkspacePanelOpen(!workspacePanelOpen)
   }, [closeRightPanels, setWorkspacePanelOpen, workspacePanelOpen])
+
+  const blockingRuntimeNotice =
+    pendingApprovalCount > 0
+      ? {
+          tone: 'warning' as const,
+          message: `${pendingApprovalCount} approval${pendingApprovalCount > 1 ? 's are' : ' is'} waiting before background work can continue.`,
+          actionLabel: 'Review approvals',
+          onAction: handleOpenTaskPanel,
+        }
+      : workflowError
+        ? {
+            tone: 'error' as const,
+            message: workflowError,
+            actionLabel: 'Open workflow',
+            onAction: handleOpenWorkflowPanel,
+          }
+        : null
 
   const showEmptyState = isConversationEffectivelyEmpty(messages)
 
@@ -2563,16 +2710,26 @@ export default function ChatPage() {
               )}
               <span className="truncate">{headerModelLabel}</span>
             </div>
-            <Button
-              variant={workflowEnabled || workflowPanelOpen ? 'secondary' : 'ghost'}
-              size="sm"
-              title={t('sidebar.workflows')}
-              onClick={handleWorkflowPanelToggle}
-              className="max-sm:w-8 max-sm:px-0"
-            >
-              <Workflow className="h-4 w-4" />
-              <span className="hidden sm:inline">{t('sidebar.workflows')}</span>
-            </Button>
+            <div className="relative shrink-0">
+              <Button
+                variant={workflowEnabled || workflowPanelOpen ? 'secondary' : 'ghost'}
+                size="sm"
+                title={workflowShortcutTitle}
+                aria-label={workflowShortcutTitle}
+                onClick={handleWorkflowPanelToggle}
+                className="max-sm:w-8 max-sm:px-0"
+              >
+                <Workflow className="h-4 w-4" />
+                <span className="hidden sm:inline">{t('sidebar.workflows')}</span>
+              </Button>
+              {workflowError ? (
+                <HeaderRuntimeIndicator tone="error" pulse />
+              ) : workflowBoundRunId ? (
+                <HeaderRuntimeIndicator tone="warning" />
+              ) : workflowEnabled ? (
+                <HeaderRuntimeIndicator tone="info" />
+              ) : null}
+            </div>
             <Button
               variant="ghost"
               size="icon-sm"
@@ -2597,14 +2754,24 @@ export default function ChatPage() {
             >
               <SlidersHorizontal className="h-4 w-4" />
             </Button>
-            <Button
-              variant={taskPanelOpen ? 'secondary' : 'ghost'}
-              size="icon-sm"
-              title="Tasks"
-              onClick={handleTaskPanelToggle}
-            >
-              <ListTodo className="h-4 w-4" />
-            </Button>
+            <div className="relative shrink-0">
+              <Button
+                variant={taskPanelOpen ? 'secondary' : 'ghost'}
+                size="icon-sm"
+                title={taskShortcutTitle}
+                aria-label={taskShortcutTitle}
+                onClick={handleTaskPanelToggle}
+              >
+                <ListTodo className="h-4 w-4" />
+              </Button>
+              {pendingApprovalCount > 0 ? (
+                <HeaderRuntimeIndicator tone="error" count={pendingApprovalCount} pulse />
+              ) : failedTaskCount > 0 ? (
+                <HeaderRuntimeIndicator tone="error" count={failedTaskCount} />
+              ) : activeTaskCount > 0 ? (
+                <HeaderRuntimeIndicator tone="warning" count={activeTaskCount} />
+              ) : null}
+            </div>
             <Button
               variant="ghost"
               size="icon-sm"
@@ -2707,28 +2874,39 @@ export default function ChatPage() {
         </div>
       ) : null}
 
-      {workflowError ? (
+      {blockingRuntimeNotice ? (
         <div className="border-t border-border bg-canvas/95 py-2 backdrop-blur">
           <div className="mx-auto max-w-4xl px-4 sm:px-6">
-            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+            <div
+              className={cn(
+                'flex items-center justify-between gap-3 rounded-md px-3 py-2 text-xs',
+                blockingRuntimeNotice.tone === 'error'
+                  ? 'border border-destructive/30 bg-destructive/10 text-destructive'
+                  : 'border border-warning/30 bg-warning/10 text-warning-foreground'
+              )}
+            >
+              <div className="flex min-w-0 items-start gap-2">
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="min-w-0 break-words">{workflowError}</span>
+                <span className="min-w-0 break-words">{blockingRuntimeNotice.message}</span>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={blockingRuntimeNotice.onAction}
+                className={cn(
+                  'h-6 shrink-0 rounded-full px-2.5 text-[11px]',
+                  blockingRuntimeNotice.tone === 'error'
+                    ? 'text-destructive hover:bg-destructive/10'
+                    : 'text-warning-foreground hover:bg-warning/10'
+                )}
+              >
+                {blockingRuntimeNotice.actionLabel}
+              </Button>
             </div>
           </div>
         </div>
       ) : null}
-
-      <ChatActivityStrip
-        currentSessionId={currentSessionId}
-        projectId={effectiveProjectId}
-        workflowRunId={workflowBoundRunId}
-        onOpenTaskPanel={() => {
-          closeRightPanels('tasks')
-          setWorkspaceMobileOpen(false)
-          setTaskPanelOpen(true)
-        }}
-        onOpenWorkflowRun={(runId) => router.push(`/agent-runs/${runId}`)}
-      />
 
       <ChatInput
         sessionId={currentSessionId}
