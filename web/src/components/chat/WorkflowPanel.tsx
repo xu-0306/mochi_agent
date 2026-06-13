@@ -94,6 +94,110 @@ interface WorkflowRoleDraft {
   modelId: string
 }
 
+type WorkflowRoleDefaultModel = 'lead' | 'worker' | 'neutral'
+
+interface WorkflowRoleOption {
+  value: string
+  label: string
+  description: string
+  defaultModel: WorkflowRoleDefaultModel
+}
+
+const KNOWN_WORKFLOW_ROLE_OPTIONS: Record<string, WorkflowRoleOption> = {
+  teacher: {
+    value: 'teacher',
+    label: 'Teacher',
+    description: 'Creates the strongest reference answer for the rest of the workflow.',
+    defaultModel: 'neutral',
+  },
+  student: {
+    value: 'student',
+    label: 'Student',
+    description: 'Distills the reference answer into a shorter, easier-to-use final response.',
+    defaultModel: 'neutral',
+  },
+  proposer: {
+    value: 'proposer',
+    label: 'Proposer',
+    description: 'Generates candidate tasks or directions for the run to explore.',
+    defaultModel: 'neutral',
+  },
+  solver: {
+    value: 'solver',
+    label: 'Solver',
+    description: 'Works through the task and produces the main solution.',
+    defaultModel: 'neutral',
+  },
+  verifier: {
+    value: 'verifier',
+    label: 'Verifier',
+    description: 'Checks whether the main answer is correct, complete, and well-supported.',
+    defaultModel: 'lead',
+  },
+  planner: {
+    value: 'planner',
+    label: 'Planner',
+    description: 'Breaks the task into steps and decides how the team should approach it.',
+    defaultModel: 'lead',
+  },
+  executor: {
+    value: 'executor',
+    label: 'Executor',
+    description: 'Prepares code or execution requests when the workflow needs runtime actions.',
+    defaultModel: 'worker',
+  },
+  controller: {
+    value: 'controller',
+    label: 'Controller',
+    description: 'Reviews and approves execution requests before they reach the shared runtime.',
+    defaultModel: 'lead',
+  },
+  evaluator: {
+    value: 'evaluator',
+    label: 'Evaluator',
+    description: 'Summarizes execution results, artifacts, and the next recommended step.',
+    defaultModel: 'lead',
+  },
+  debater_a: {
+    value: 'debater_a',
+    label: 'Debater A',
+    description: 'Argues for the strongest first candidate answer.',
+    defaultModel: 'worker',
+  },
+  debater_b: {
+    value: 'debater_b',
+    label: 'Debater B',
+    description: 'Challenges assumptions and proposes a competing alternative.',
+    defaultModel: 'worker',
+  },
+  judge: {
+    value: 'judge',
+    label: 'Judge',
+    description: 'Chooses the most reliable answer after comparing the evidence and arguments.',
+    defaultModel: 'lead',
+  },
+  synthesizer: {
+    value: 'synthesizer',
+    label: 'Synthesizer',
+    description: 'Combines the best findings into the final research output.',
+    defaultModel: 'lead',
+  },
+  local_worker: {
+    value: 'local_worker',
+    label: 'Research worker',
+    description: 'Handles evidence gathering and local research passes in parallel.',
+    defaultModel: 'worker',
+  },
+  skeptic: {
+    value: 'skeptic',
+    label: 'Skeptic',
+    description: 'Looks for weak evidence, missing citations, and overconfident claims.',
+    defaultModel: 'worker',
+  },
+}
+
+const CUSTOM_ROLE_VALUE = '__custom__'
+
 function createWorkflowRoleDraft(role = '', modelId = ''): WorkflowRoleDraft {
   return {
     id:
@@ -103,6 +207,10 @@ function createWorkflowRoleDraft(role = '', modelId = ''): WorkflowRoleDraft {
     role,
     modelId,
   }
+}
+
+function getWorkflowRoleOption(role: string): WorkflowRoleOption | null {
+  return KNOWN_WORKFLOW_ROLE_OPTIONS[role] ?? null
 }
 
 function defaultRolesForProtocol(protocolId: AgentRunProtocolId): string[] {
@@ -116,6 +224,62 @@ function defaultRolesForProtocol(protocolId: AgentRunProtocolId): string[] {
     return ['planner', 'executor', 'controller', 'evaluator']
   }
   return ['teacher', 'student']
+}
+
+function buildWorkflowRoleOptions(
+  template: WorkflowTemplate,
+  protocolId: AgentRunProtocolId,
+  controlledExecutionEnabled: boolean
+): WorkflowRoleOption[] {
+  if (template === 'research_debate') {
+    const researchRoles = [
+      'planner',
+      'judge',
+      'verifier',
+      'synthesizer',
+      'debater_a',
+      'debater_b',
+      'local_worker',
+      'skeptic',
+      ...(controlledExecutionEnabled ? ['executor', 'controller', 'evaluator'] : []),
+    ]
+    return researchRoles.map((role) => KNOWN_WORKFLOW_ROLE_OPTIONS[role]).filter(Boolean)
+  }
+
+  const seen = new Set<string>()
+  const options: WorkflowRoleOption[] = []
+  const pushRole = (role: string) => {
+    if (seen.has(role)) {
+      return
+    }
+    const option = KNOWN_WORKFLOW_ROLE_OPTIONS[role]
+    if (!option) {
+      return
+    }
+    seen.add(role)
+    options.push(option)
+  }
+
+  defaultRolesForProtocol(protocolId).forEach(pushRole)
+  if (controlledExecutionEnabled) {
+    ;['planner', 'executor', 'controller', 'evaluator'].forEach(pushRole)
+  }
+  ;['teacher', 'student', 'proposer', 'solver', 'verifier', 'judge'].forEach(pushRole)
+  return options
+}
+
+function getRoleSelectValue(role: string, options: WorkflowRoleOption[]): string {
+  return options.some((option) => option.value === role) ? role : CUSTOM_ROLE_VALUE
+}
+
+function getRoleDefaultModelLabel(defaultModel: WorkflowRoleDefaultModel): string {
+  if (defaultModel === 'lead') {
+    return 'Lead model by default'
+  }
+  if (defaultModel === 'worker') {
+    return 'Worker model by default'
+  }
+  return 'No recommended default'
 }
 
 function normalizeSelectedModelRoles(
@@ -244,6 +408,7 @@ function WorkflowPanelBody({
   const citationPolicy = typeof workflowResearchConfig.citation_policy === 'string'
     ? workflowResearchConfig.citation_policy
     : 'claim_level_required'
+  const controlledExecutionEnabled = workflowExecutionPolicy.mode === 'controlled'
   const smartModelId = typeof workflowResearchConfig.smart_model_id === 'string'
     ? workflowResearchConfig.smart_model_id
     : ''
@@ -252,6 +417,24 @@ function WorkflowPanelBody({
     : ''
   const localWorkerCount = String(workflowResearchConfig.local_worker_count ?? 3)
   const debateRounds = String(workflowResearchConfig.debate_rounds ?? 2)
+  const roleOptions = React.useMemo(
+    () => buildWorkflowRoleOptions(workflowTemplate, workflowProtocolId, controlledExecutionEnabled),
+    [controlledExecutionEnabled, workflowProtocolId, workflowTemplate]
+  )
+  const researchLeadRoles = React.useMemo(
+    () =>
+      roleOptions.filter((option) =>
+        ['planner', 'judge', 'verifier', 'synthesizer', 'controller', 'evaluator'].includes(option.value)
+      ),
+    [roleOptions]
+  )
+  const researchWorkerRoles = React.useMemo(
+    () =>
+      roleOptions.filter((option) =>
+        ['debater_a', 'debater_b', 'local_worker', 'skeptic', 'executor'].includes(option.value)
+      ),
+    [roleOptions]
+  )
 
   React.useEffect(() => {
     if (selectedRolesSyncRef.current === roleDraftScopeKey) {
@@ -262,26 +445,40 @@ function WorkflowPanelBody({
   }, [roleDraftScopeKey, workflowConfig.selected_models_roles])
 
   const updateRoleDrafts = React.useCallback((updater: (current: WorkflowRoleDraft[]) => WorkflowRoleDraft[]) => {
-    setRoleDrafts((current) => {
-      const next = updater(current)
-      const selectedModelsRoles = buildSelectedModelRolesFromDrafts(next)
-      selectedRolesSyncRef.current = `${sessionId ?? '__no_session__'}:${serializeSelectedModelRoles(selectedModelsRoles)}`
-      onWorkflowConfigPatch({
-        selected_models_roles: selectedModelsRoles,
-      })
-      return next
+    const nextDrafts = updater(roleDrafts)
+    const selectedModelsRoles = buildSelectedModelRolesFromDrafts(nextDrafts)
+    selectedRolesSyncRef.current = `${sessionId ?? '__no_session__'}:${serializeSelectedModelRoles(selectedModelsRoles)}`
+    setRoleDrafts(nextDrafts)
+    onWorkflowConfigPatch({
+      selected_models_roles: selectedModelsRoles,
     })
-  }, [onWorkflowConfigPatch, sessionId])
+  }, [onWorkflowConfigPatch, roleDrafts, sessionId])
 
   const handleSeedProtocolRoles = React.useCallback(() => {
-    updateRoleDrafts(() =>
-      defaultRolesForProtocol(workflowProtocolId).map((role) => createWorkflowRoleDraft(role, ''))
-    )
-  }, [updateRoleDrafts, workflowProtocolId])
+    updateRoleDrafts(() => {
+      if (workflowTemplate === 'research_debate') {
+        return roleOptions.map((option) =>
+          createWorkflowRoleDraft(
+            option.value,
+            option.defaultModel === 'lead'
+              ? smartModelId
+              : option.defaultModel === 'worker'
+                ? localWorkerModelId
+                : ''
+          )
+        )
+      }
+      return defaultRolesForProtocol(workflowProtocolId).map((role) => createWorkflowRoleDraft(role, ''))
+    })
+  }, [localWorkerModelId, roleOptions, smartModelId, updateRoleDrafts, workflowProtocolId, workflowTemplate])
 
   const handleAddRole = React.useCallback(() => {
-    updateRoleDrafts((current) => [...current, createWorkflowRoleDraft()])
-  }, [updateRoleDrafts])
+    updateRoleDrafts((current) => {
+      const nextSuggestedRole =
+        roleOptions.find((option) => current.every((draft) => draft.role !== option.value))?.value ?? ''
+      return [...current, createWorkflowRoleDraft(nextSuggestedRole, '')]
+    })
+  }, [roleOptions, updateRoleDrafts])
 
   const handleRoleDraftChange = React.useCallback((
     id: string,
@@ -581,13 +778,21 @@ function WorkflowPanelBody({
 
           {workflowTemplate === 'research_debate' ? (
             <PanelSectionCard
-              title="Research debate"
-              description="Specialized role and retrieval defaults for Smart Judge style workflows."
+              title="Research team"
+              description="Set the default models for your research workflow, then override specific roles only when needed."
             >
-              <div className="space-y-3">
+              <div className="space-y-4">
+                <div className="rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-3">
+                  <p className="text-sm font-medium text-foreground">Default team assignment</p>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    Most users only need these two defaults. The lead model handles planning and final judgment,
+                    while the worker model handles parallel research, debate, and skeptical review.
+                  </p>
+                </div>
+
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Smart model</span>
+                    <span className="text-xs font-medium text-muted-foreground">Lead model</span>
                     <Select
                       value={smartModelId || '__unassigned__'}
                       onValueChange={(value) =>
@@ -612,11 +817,11 @@ function WorkflowPanelBody({
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-muted-foreground">
-                      Planner, judge, verifier, and synthesizer roles use this model by default.
+                      Used by the planner, judge, verifier, and synthesizer by default.
                     </p>
                   </div>
                   <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Local worker model</span>
+                    <span className="text-xs font-medium text-muted-foreground">Research worker model</span>
                     <Select
                       value={localWorkerModelId || '__unassigned__'}
                       onValueChange={(value) =>
@@ -641,11 +846,47 @@ function WorkflowPanelBody({
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-muted-foreground">
-                      Debate roles, local worker fan-out, and skeptic passes use this model by default.
+                      Used by the debate agents, research worker, and skeptic by default.
                     </p>
                   </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-xl border border-white/8 bg-surface-layer/50 px-3 py-3">
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-primary-300">
+                      Lead responsibilities
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {researchLeadRoles.map((role) => (
+                        <span
+                          key={role.value}
+                          className="inline-flex rounded-full border border-white/10 bg-canvas/50 px-2.5 py-1 text-[11px] text-muted-foreground"
+                        >
+                          {role.label}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-white/8 bg-surface-layer/50 px-3 py-3">
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-emerald-300">
+                      Worker responsibilities
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {researchWorkerRoles.map((role) => (
+                        <span
+                          key={role.value}
+                          className="inline-flex rounded-full border border-white/10 bg-canvas/50 px-2.5 py-1 text-[11px] text-muted-foreground"
+                        >
+                          {role.label}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Local worker count</span>
+                    <span className="text-xs font-medium text-muted-foreground">Parallel research workers</span>
                     <Input
                       value={localWorkerCount}
                       onChange={(event) =>
@@ -659,6 +900,9 @@ function WorkflowPanelBody({
                         })
                       }
                     />
+                    <p className="text-xs text-muted-foreground">
+                      Higher values let the worker model explore more sources in parallel.
+                    </p>
                   </div>
                   <div className="space-y-2">
                     <span className="text-xs font-medium text-muted-foreground">Debate rounds</span>
@@ -675,6 +919,9 @@ function WorkflowPanelBody({
                         })
                       }
                     />
+                    <p className="text-xs text-muted-foreground">
+                      Two rounds works well for most topics. Increase only when a topic needs more challenge and rebuttal.
+                    </p>
                   </div>
                 </div>
 
@@ -753,82 +1000,133 @@ function WorkflowPanelBody({
           ) : null}
 
           <PanelSectionCard
-            title="Agent roles"
-            description="Choose which model each workflow role should use when a new bound run starts."
+            title={workflowTemplate === 'research_debate' ? 'Role overrides' : 'Agent roles'}
+            description={
+              workflowTemplate === 'research_debate'
+                ? 'Override a specific role only when it should use a different model than your lead or worker default.'
+                : 'Choose which model each workflow role should use when a new bound run starts.'
+            }
           >
             <div className="space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-muted-foreground">
-                  These mappings feed `selected_models_roles` for newly created workflow runs.
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <p className="min-w-0 text-xs leading-relaxed text-muted-foreground sm:max-w-[14rem]">
+                  {workflowTemplate === 'research_debate'
+                    ? 'These overrides still feed `selected_models_roles`, but the default research team assignment above handles most roles for you.'
+                    : 'These mappings feed `selected_models_roles` for newly created workflow runs.'}
                 </p>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                   <Button type="button" variant="ghost" size="sm" onClick={handleSeedProtocolRoles}>
-                    Seed defaults
+                    {workflowTemplate === 'research_debate' ? 'Seed common roles' : 'Seed defaults'}
                   </Button>
                   <Button type="button" variant="outline" size="sm" onClick={handleAddRole}>
                     <Plus className="h-3.5 w-3.5" />
-                    Add role
+                    {workflowTemplate === 'research_debate' ? 'Add override' : 'Add role'}
                   </Button>
                 </div>
               </div>
               {roleDrafts.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-white/12 bg-surface-layer/40 px-3 py-3 text-xs text-muted-foreground">
-                  No roles assigned yet. Seed protocol defaults or add a custom role.
+                  {workflowTemplate === 'research_debate'
+                    ? 'No overrides yet. Your lead and worker defaults will be used automatically.'
+                    : 'No roles assigned yet. Seed protocol defaults or add a custom role.'}
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {roleDrafts.map((draft, index) => (
-                    <div key={draft.id} className="rounded-xl border border-white/8 bg-surface-layer/70 px-3 py-3">
-                      <div className="mb-3 flex items-center justify-between gap-2">
-                        <p className="text-xs font-medium text-muted-foreground">Role {index + 1}</p>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          onClick={() => handleRemoveRole(draft.id)}
-                          title="Remove role"
-                          aria-label="Remove role"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <div className="space-y-2">
-                          <span className="text-xs font-medium text-muted-foreground">Role name</span>
-                          <Input
-                            value={draft.role}
-                            placeholder="teacher, judge, verifier..."
-                            onChange={(event) => handleRoleDraftChange(draft.id, 'role', event.target.value)}
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <span className="text-xs font-medium text-muted-foreground">Model</span>
-                          <Select
-                            value={draft.modelId || '__unassigned__'}
-                            onValueChange={(value) =>
-                              handleRoleDraftChange(
-                                draft.id,
-                                'modelId',
-                                value === '__unassigned__' ? '' : value
-                              )
-                            }
+                  {roleDrafts.map((draft, index) => {
+                    const selectedRoleOption = getWorkflowRoleOption(draft.role)
+                    const roleSelectValue = getRoleSelectValue(draft.role, roleOptions)
+                    return (
+                      <div key={draft.id} className="rounded-xl border border-white/8 bg-surface-layer/70 px-3 py-3">
+                        <div className="mb-3 flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="text-xs font-medium text-muted-foreground">
+                              {workflowTemplate === 'research_debate' ? `Override ${index + 1}` : `Role ${index + 1}`}
+                            </p>
+                            {selectedRoleOption ? (
+                              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                                {selectedRoleOption.description}
+                              </p>
+                            ) : null}
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            onClick={() => handleRemoveRole(draft.id)}
+                            title="Remove role"
+                            aria-label="Remove role"
                           >
-                            <SelectTrigger>
-                              <SelectValue placeholder="Select model" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="__unassigned__">Unassigned</SelectItem>
-                              {modelOptions.map((model) => (
-                                <SelectItem key={model.id} value={model.id}>
-                                  {model.label}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="space-y-2">
+                            <span className="text-xs font-medium text-muted-foreground">
+                              {workflowTemplate === 'research_debate' ? 'Role' : 'Role name'}
+                            </span>
+                            <Select
+                              value={roleSelectValue}
+                              onValueChange={(value) => {
+                                if (value === CUSTOM_ROLE_VALUE) {
+                                  handleRoleDraftChange(draft.id, 'role', draft.role || '')
+                                  return
+                                }
+                                handleRoleDraftChange(draft.id, 'role', value)
+                              }}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select role" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {roleOptions.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                                <SelectItem value={CUSTOM_ROLE_VALUE}>Custom role</SelectItem>
+                              </SelectContent>
+                            </Select>
+                            {roleSelectValue === CUSTOM_ROLE_VALUE ? (
+                              <Input
+                                value={draft.role}
+                                placeholder="custom_role_id"
+                                onChange={(event) => handleRoleDraftChange(draft.id, 'role', event.target.value)}
+                              />
+                            ) : selectedRoleOption ? (
+                              <div className="rounded-md border border-white/8 bg-canvas/35 px-3 py-2 text-xs text-muted-foreground">
+                                {getRoleDefaultModelLabel(selectedRoleOption.defaultModel)}
+                              </div>
+                            ) : null}
+                          </div>
+                          <div className="space-y-2">
+                            <span className="text-xs font-medium text-muted-foreground">Model</span>
+                            <Select
+                              value={draft.modelId || '__unassigned__'}
+                              onValueChange={(value) =>
+                                handleRoleDraftChange(
+                                  draft.id,
+                                  'modelId',
+                                  value === '__unassigned__' ? '' : value
+                                )
+                              }
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select model" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                                {modelOptions.map((model) => (
+                                  <SelectItem key={model.id} value={model.id}>
+                                    {model.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
               {modelOptions.length === 0 ? (
