@@ -1704,14 +1704,17 @@ export interface SessionDetail extends SessionSummary {
 
 export interface SessionWorkflowConfig {
   title?: string | null
+  template?: string | null
   protocol_id?: AgentRunProtocolId | null
   workspace_dir_override?: string | null
   reasoning_effort?: ReasoningEffort | null
   selected_models_roles?: Record<string, string>
+  run_policy_preset?: string | null
   run_policy?: Record<string, unknown>
   execution_policy?: Record<string, unknown>
   schedule?: Record<string, unknown>
   evidence?: Record<string, unknown>
+  research?: Record<string, unknown>
 }
 
 export interface SessionWorkflowState {
@@ -1734,6 +1737,7 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
     config: isRecord(value.config)
       ? {
           title: getNullableString(value.config.title),
+          template: getNullableString(value.config.template),
           protocol_id: (getString(value.config.protocol_id) as AgentRunProtocolId | null) ?? null,
           workspace_dir_override: getNullableString(value.config.workspace_dir_override),
           reasoning_effort: (getString(value.config.reasoning_effort) as ReasoningEffort | null) ?? null,
@@ -1744,10 +1748,12 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
                   .map(([key, item]) => [key, item as string])
               )
             : {},
+          run_policy_preset: getNullableString(value.config.run_policy_preset),
           run_policy: isRecord(value.config.run_policy) ? value.config.run_policy : {},
           execution_policy: isRecord(value.config.execution_policy) ? value.config.execution_policy : {},
           schedule: isRecord(value.config.schedule) ? value.config.schedule : {},
           evidence: isRecord(value.config.evidence) ? value.config.evidence : {},
+          research: isRecord(value.config.research) ? value.config.research : {},
         }
       : {},
   }

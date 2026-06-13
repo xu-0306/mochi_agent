@@ -60,6 +60,8 @@ import {
 
 const MODELS_UPDATED_EVENT = 'mochi:models-updated'
 const DEFAULT_WORKFLOW_PROTOCOL: api.AgentRunProtocolId = 'teacher_student_distill'
+type WorkflowTemplate = 'standard' | 'research_debate'
+type WorkflowRunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
 const WORKFLOW_PROTOCOL_OPTIONS: Array<{
   value: api.AgentRunProtocolId
   label: string
@@ -86,6 +88,96 @@ const WORKFLOW_PROTOCOL_OPTIONS: Array<{
     description: 'Subagents propose execution while the controller keeps runtime boundaries.',
   },
 ]
+
+function parsePositiveInteger(value: unknown, fallback: number): number {
+  const source = typeof value === 'string' ? value : String(value ?? '')
+  const numeric = Number.parseInt(source, 10)
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback
+  }
+  return numeric
+}
+
+function sourceModeToEvidenceMode(mode: string): string {
+  if (mode === 'local_only') {
+    return 'rag'
+  }
+  if (mode === 'web_first') {
+    return 'web'
+  }
+  return 'hybrid'
+}
+
+function normalizeEvidenceCollectionMode(value: unknown): string {
+  if (value === 'local_only') {
+    return 'rag'
+  }
+  if (value === 'web_only') {
+    return 'web'
+  }
+  return typeof value === 'string' && value.trim().length > 0 ? value : 'hybrid'
+}
+
+function runPolicyPresetValues(preset: WorkflowRunPolicyPreset): Required<api.AgentRunRunPolicy> {
+  if (preset === 'short') {
+    return {
+      max_wall_clock_sec: 600,
+      heartbeat_timeout_sec: 45,
+      checkpoint_interval_steps: 1,
+      max_subagent_failures_per_role: 1,
+      on_budget_exhausted: 'pause',
+      on_subagent_disconnect: 'pause',
+    }
+  }
+  if (preset === 'long') {
+    return {
+      max_wall_clock_sec: 5400,
+      heartbeat_timeout_sec: 180,
+      checkpoint_interval_steps: 2,
+      max_subagent_failures_per_role: 3,
+      on_budget_exhausted: 'finalize_partial',
+      on_subagent_disconnect: 'retry_then_degrade',
+    }
+  }
+  return {
+    max_wall_clock_sec: 1800,
+    heartbeat_timeout_sec: 90,
+    checkpoint_interval_steps: 1,
+    max_subagent_failures_per_role: 2,
+    on_budget_exhausted: 'pause',
+    on_subagent_disconnect: 'retry_then_degrade',
+  }
+}
+
+function normalizeSelectedModelRoles(value: Record<string, string> | undefined): Record<string, string> {
+  const next: Record<string, string> = {}
+  for (const [role, modelId] of Object.entries(value ?? {})) {
+    const normalizedRole = role.trim()
+    const normalizedModelId = modelId.trim()
+    if (normalizedRole && normalizedModelId) {
+      next[normalizedRole] = normalizedModelId
+    }
+  }
+  return next
+}
+
+function mergeSelectedModelRoles(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
+  const next: Record<string, string> = {}
+  for (const source of sources) {
+    Object.assign(next, normalizeSelectedModelRoles(source))
+  }
+  return next
+}
+
+function buildSelectedModelsRolesPayload(byRole: Record<string, string>): Record<string, unknown> {
+  const normalized = normalizeSelectedModelRoles(byRole)
+  const entries = Object.entries(normalized).map(([role, model_id]) => ({ role, model_id }))
+  return {
+    by_role: normalized,
+    entries,
+    subagents: entries,
+  }
+}
 
 interface ComposerEditState {
   messageId: string
@@ -196,14 +288,17 @@ function buildDefaultWorkflowState(
     workspace_dir_override: null,
     config: {
       title: null,
+      template: 'standard',
       protocol_id: DEFAULT_WORKFLOW_PROTOCOL,
       workspace_dir_override: null,
       reasoning_effort: null,
       selected_models_roles: {},
+      run_policy_preset: 'balanced',
       run_policy: {},
       execution_policy: {},
       schedule: {},
       evidence: {},
+      research: {},
     },
   }
 }
@@ -223,15 +318,23 @@ function normalizeWorkflowState(
     config: {
       ...defaults.config,
       ...config,
+      template: config.template === 'research_debate' ? 'research_debate' : 'standard',
       protocol_id: config.protocol_id ?? defaults.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
       reasoning_effort: config.reasoning_effort ?? null,
       selected_models_roles: config.selected_models_roles ?? {},
+      run_policy_preset:
+        config.run_policy_preset === 'short' ||
+        config.run_policy_preset === 'long' ||
+        config.run_policy_preset === 'custom'
+          ? config.run_policy_preset
+          : 'balanced',
       run_policy: config.run_policy ?? {},
       execution_policy: config.execution_policy ?? {},
       schedule: normalizeWorkflowScheduleConfig(
         isRecord(config.schedule) ? config.schedule : {}
       ),
       evidence: config.evidence ?? {},
+      research: isRecord(config.research) ? config.research : {},
     },
   }
 }
@@ -887,6 +990,9 @@ export default function ChatPage() {
   const [savingPreset, setSavingPreset] = React.useState(false)
   const [workflowBusy, setWorkflowBusy] = React.useState(false)
   const [workflowError, setWorkflowError] = React.useState<string | null>(null)
+  const [workflowSaveState, setWorkflowSaveState] = React.useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [workflowLastSavedAt, setWorkflowLastSavedAt] = React.useState<string | null>(null)
+  const [workflowLastSaveScope, setWorkflowLastSaveScope] = React.useState<'persisted' | 'draft' | null>(null)
   const [workflowDraftBySessionId, setWorkflowDraftBySessionId] = React.useState<
     Record<string, api.SessionWorkflowState>
   >({})
@@ -1011,10 +1117,18 @@ export default function ChatPage() {
   const workflowEnabled = Boolean(workflowState.enabled)
   const workflowBoundRunId = workflowState.bound_run_id ?? null
   const workflowConfig = workflowState.config ?? {}
+  const workflowTemplate: WorkflowTemplate =
+    workflowConfig.template === 'research_debate' ? 'research_debate' : 'standard'
   const workflowProject = projects.find((project) => project.id === effectiveProjectId) ?? null
   const workflowProtocolId = workflowConfig.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL
   const workflowReasoningEffort =
     workflowConfig.reasoning_effort ?? null
+  const workflowRunPolicyPreset: WorkflowRunPolicyPreset =
+    workflowConfig.run_policy_preset === 'short' ||
+    workflowConfig.run_policy_preset === 'long' ||
+    workflowConfig.run_policy_preset === 'custom'
+      ? workflowConfig.run_policy_preset
+      : 'balanced'
   const workflowRunPolicy = React.useMemo(
     () => (workflowConfig.run_policy ?? {}) as api.AgentRunRunPolicy,
     [workflowConfig.run_policy]
@@ -1027,6 +1141,10 @@ export default function ChatPage() {
     () => (workflowConfig.evidence ?? {}) as Record<string, unknown>,
     [workflowConfig.evidence]
   )
+  const workflowResearchConfig = React.useMemo(
+    () => (workflowConfig.research ?? {}) as Record<string, unknown>,
+    [workflowConfig.research]
+  )
   const workflowScheduleConfig = React.useMemo(
     () => normalizeWorkflowScheduleConfig((workflowConfig.schedule ?? {}) as Record<string, unknown>),
     [workflowConfig.schedule]
@@ -1035,6 +1153,26 @@ export default function ChatPage() {
     () => resolveWorkflowScheduleType(workflowScheduleConfig),
     [workflowScheduleConfig]
   )
+  const workflowHasUnsavedChanges = React.useMemo(() => {
+    if (!currentSessionId) {
+      return false
+    }
+    return JSON.stringify(workflowState) !== JSON.stringify(persistedWorkflowState)
+  }, [currentSessionId, persistedWorkflowState, workflowState])
+  const workflowLastSavedLabel = React.useMemo(() => {
+    if (!workflowLastSavedAt) {
+      return null
+    }
+    const timestamp = Date.parse(workflowLastSavedAt)
+    if (Number.isNaN(timestamp)) {
+      return workflowLastSavedAt
+    }
+    return new Date(timestamp).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+  }, [workflowLastSavedAt])
   const contextualRuntimeTasks = React.useMemo(
     () =>
       runtimeTasks.filter((task) =>
@@ -1855,8 +1993,80 @@ export default function ChatPage() {
             const workflowSchedule = normalizeWorkflowScheduleConfig(
               (normalizedWorkflow.config?.schedule ?? {}) as Record<string, unknown>
             )
+            const workflowTemplate =
+              normalizedWorkflow.config?.template === 'research_debate'
+                ? 'research_debate'
+                : 'standard'
+            const workflowEvidenceConfig = isRecord(normalizedWorkflow.config?.evidence)
+              ? normalizedWorkflow.config?.evidence
+              : {}
+            const workflowResearchConfig = isRecord(normalizedWorkflow.config?.research)
+              ? normalizedWorkflow.config?.research
+              : {}
+            const workflowExecutionPolicy = isRecord(normalizedWorkflow.config?.execution_policy)
+              ? normalizedWorkflow.config?.execution_policy
+              : {}
+            const evidenceQueries = getStringArray(workflowEvidenceConfig.queries)
+            const ragMcpServers = getStringArray(workflowEvidenceConfig.rag_mcp_servers)
+            const controlledExecutionEnabled = getString(workflowExecutionPolicy.mode) === 'controlled'
+            const manualSelectedRoles = normalizeSelectedModelRoles(
+              normalizedWorkflow.config?.selected_models_roles
+            )
+            const fallbackControlledModelId =
+              Object.values(manualSelectedRoles).find((value) => value.trim().length > 0) ??
+              currentModel ??
+              modelOptions[0]?.id ??
+              ''
+            const researchDebateRounds = parsePositiveInteger(
+              workflowResearchConfig.debate_rounds,
+              2
+            )
+            const researchMaxResultsPerQuery = parsePositiveInteger(
+              workflowEvidenceConfig.max_results_per_query,
+              4
+            )
+            const researchBaseRoles =
+              workflowTemplate === 'research_debate'
+                ? {
+                    debater_a: getString(workflowResearchConfig.local_worker_model_id) ?? '',
+                    debater_b: getString(workflowResearchConfig.local_worker_model_id) ?? '',
+                    judge: getString(workflowResearchConfig.smart_model_id) ?? '',
+                    verifier: getString(workflowResearchConfig.smart_model_id) ?? '',
+                    planner: getString(workflowResearchConfig.smart_model_id) ?? '',
+                    synthesizer: getString(workflowResearchConfig.smart_model_id) ?? '',
+                    local_worker: getString(workflowResearchConfig.local_worker_model_id) ?? '',
+                    skeptic: getString(workflowResearchConfig.local_worker_model_id) ?? '',
+                    ...(controlledExecutionEnabled
+                      ? {
+                          executor:
+                            getString(workflowResearchConfig.local_worker_model_id) ??
+                            getString(workflowResearchConfig.smart_model_id) ??
+                            '',
+                          controller: getString(workflowResearchConfig.smart_model_id) ?? '',
+                          evaluator: getString(workflowResearchConfig.smart_model_id) ?? '',
+                        }
+                      : {}),
+                  }
+                : {}
+            const controlledExecutionRoles: Record<string, string> =
+              workflowTemplate === 'research_debate' || !controlledExecutionEnabled || !fallbackControlledModelId
+                ? {}
+                : {
+                    planner: fallbackControlledModelId,
+                    executor: fallbackControlledModelId,
+                    controller: fallbackControlledModelId,
+                    evaluator: fallbackControlledModelId,
+                  }
+            const selectedModelsRoles = mergeSelectedModelRoles(
+              researchBaseRoles,
+              controlledExecutionRoles,
+              manualSelectedRoles
+            )
             const createdRun = await api.createAgentRun({
-              protocol_id: normalizedWorkflow.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
+              protocol_id:
+                workflowTemplate === 'research_debate'
+                  ? 'multi_agent_debate'
+                  : normalizedWorkflow.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
               title: normalizedWorkflow.config?.title ?? null,
               topic: text.trim() || null,
               projectId: workflowSessionProjectId,
@@ -1864,23 +2074,85 @@ export default function ChatPage() {
               reasoning_effort:
                 normalizedWorkflow.config?.reasoning_effort ?? effectiveInference.reasoningEffort ?? null,
               selected_models_roles:
-                normalizedWorkflow.config?.selected_models_roles &&
-                Object.keys(normalizedWorkflow.config.selected_models_roles).length > 0
-                  ? {
-                      by_role: normalizedWorkflow.config.selected_models_roles,
-                      entries: Object.entries(normalizedWorkflow.config.selected_models_roles).map(
-                        ([role, model_id]) => ({ role, model_id })
-                      ),
-                    }
+                Object.keys(selectedModelsRoles).length > 0
+                  ? buildSelectedModelsRolesPayload(selectedModelsRoles)
                   : {},
               run_policy: normalizedWorkflow.config?.run_policy ?? {},
               evaluation_policy: {
-                evidence_collection: normalizedWorkflow.config?.evidence ?? {},
+                evidence_collection: {
+                  enabled: workflowEvidenceConfig.enabled !== false,
+                  mode:
+                    workflowTemplate === 'research_debate'
+                      ? sourceModeToEvidenceMode(
+                          getString(workflowResearchConfig.source_mode) ?? 'hybrid'
+                        )
+                      : normalizeEvidenceCollectionMode(workflowEvidenceConfig.mode),
+                  rag_provider: getString(workflowEvidenceConfig.rag_provider) ?? 'memory',
+                  rag_mcp_servers: ragMcpServers,
+                  max_results_per_query:
+                    workflowTemplate === 'research_debate'
+                      ? researchMaxResultsPerQuery
+                      : parsePositiveInteger(workflowEvidenceConfig.max_results_per_query, 3),
+                  max_fetch_per_query: parsePositiveInteger(
+                    workflowEvidenceConfig.max_fetch_per_query,
+                    2
+                  ),
+                  max_content_chars: parsePositiveInteger(
+                    workflowEvidenceConfig.max_content_chars,
+                    2000
+                  ),
+                },
+                ...(workflowTemplate === 'research_debate'
+                  ? {
+                      research: {
+                        enabled: true,
+                        preset: 'smart_judge_research_debate',
+                        output_targets: getStringArray(workflowResearchConfig.output_targets),
+                        source_mode: getString(workflowResearchConfig.source_mode) ?? 'hybrid',
+                        citation_policy:
+                          getString(workflowResearchConfig.citation_policy) ??
+                          'claim_level_required',
+                        local_worker_count: parsePositiveInteger(
+                          workflowResearchConfig.local_worker_count,
+                          3
+                        ),
+                        local_worker_count_max: 6,
+                        max_research_queries: Math.max(
+                          researchMaxResultsPerQuery,
+                          evidenceQueries.length || 1
+                        ),
+                        max_sources_per_query: researchMaxResultsPerQuery,
+                        debate_rounds: researchDebateRounds,
+                      },
+                    }
+                  : {}),
               },
               summary: {
                 operator_message: text,
                 selected_skill_ids: selectedSkillIds,
-                execution_policy: normalizedWorkflow.config?.execution_policy ?? {},
+                execution_policy: workflowExecutionPolicy,
+                ...(evidenceQueries.length > 0 ? { evidence_queries: evidenceQueries } : {}),
+                ...(normalizedWorkflow.config?.protocol_id === 'dr_zero_self_evolve' &&
+                workflowTemplate !== 'research_debate'
+                  ? {
+                      protocol_config: {
+                        iterations: 1,
+                        proposal_sample_size: 3,
+                        solver_rollouts_per_task: 1,
+                        proposer_role_id: 'proposer',
+                        solver_role_id: 'solver',
+                        verifier_role_id: 'verifier',
+                      },
+                    }
+                  : {}),
+                ...((normalizedWorkflow.config?.protocol_id === 'multi_agent_debate' ||
+                  workflowTemplate === 'research_debate')
+                  ? {
+                      protocol_config: {
+                        rounds: researchDebateRounds,
+                      },
+                    }
+                  : {}),
               },
               schedule: workflowSchedule,
             })
@@ -2077,6 +2349,7 @@ export default function ChatPage() {
       finishStreaming,
       hasActiveStream,
       materializeDraftSession,
+      modelOptions,
       persistWorkflowState,
       projects,
       resolveMessagesForSession,
@@ -2449,6 +2722,7 @@ export default function ChatPage() {
       ...current,
       [currentSessionId]: nextWorkflow,
     }))
+    setWorkflowSaveState((current) => (current === 'saving' ? current : 'idle'))
   }, [currentSessionId, effectiveInference.reasoningEffort, workflowState])
 
   const handleWorkflowConfigPatch = React.useCallback((
@@ -2462,18 +2736,64 @@ export default function ChatPage() {
     })
   }, [handleWorkflowFieldChange, workflowState.config])
 
+  const handleWorkflowTemplateChange = React.useCallback((template: WorkflowTemplate) => {
+    handleWorkflowConfigPatch({
+      template,
+      protocol_id: template === 'research_debate' ? 'multi_agent_debate' : workflowProtocolId,
+      research:
+        template === 'research_debate'
+          ? {
+              smart_model_id: currentModel ?? modelOptions[0]?.id ?? '',
+              local_worker_model_id: currentModel ?? modelOptions[0]?.id ?? '',
+              output_targets: ['research_brief', 'dataset_package'],
+              source_mode: 'hybrid',
+              citation_policy: 'claim_level_required',
+              local_worker_count: 3,
+              debate_rounds: 2,
+              ...(workflowConfig.research ?? {}),
+            }
+          : (workflowConfig.research ?? {}),
+    })
+  }, [
+    currentModel,
+    handleWorkflowConfigPatch,
+    modelOptions,
+    workflowConfig.research,
+    workflowProtocolId,
+  ])
+
+  const handleWorkflowRunPolicyPresetChange = React.useCallback((preset: WorkflowRunPolicyPreset) => {
+    if (preset === 'custom') {
+      handleWorkflowConfigPatch({
+        run_policy_preset: preset,
+      })
+      return
+    }
+    handleWorkflowConfigPatch({
+      run_policy_preset: preset,
+      run_policy: runPolicyPresetValues(preset),
+    })
+  }, [handleWorkflowConfigPatch])
+
   const handleWorkflowSave = React.useCallback(async () => {
     if (!currentSessionId) {
       return
     }
+    const targetSession = sessions.find((session) => session.id === currentSessionId)
+    const isDraftWorkflowSession = Boolean(targetSession?.isDraft || currentSessionId.startsWith('draft-'))
     setWorkflowError(null)
+    setWorkflowSaveState('saving')
     try {
       await persistWorkflowState(currentSessionId, workflowState)
+      setWorkflowSaveState('saved')
+      setWorkflowLastSavedAt(new Date().toISOString())
+      setWorkflowLastSaveScope(isDraftWorkflowSession ? 'draft' : 'persisted')
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'Unable to save workflow settings.'
       setWorkflowError(detail)
+      setWorkflowSaveState('error')
     }
-  }, [currentSessionId, persistWorkflowState, workflowState])
+  }, [currentSessionId, persistWorkflowState, sessions, workflowState])
 
   const handleWorkflowProjectChange = React.useCallback(async (projectId: string | null) => {
     const initialSessionId = currentSessionId ?? createDraftSession(projectId)
@@ -2504,6 +2824,18 @@ export default function ChatPage() {
     sessions,
     workflowState.config,
   ])
+
+  React.useEffect(() => {
+    setWorkflowSaveState('idle')
+    setWorkflowLastSavedAt(null)
+    setWorkflowLastSaveScope(null)
+  }, [currentSessionId])
+
+  React.useEffect(() => {
+    if (workflowSaveState !== 'saving' && workflowHasUnsavedChanges) {
+      setWorkflowSaveState('idle')
+    }
+  }, [workflowHasUnsavedChanges, workflowSaveState])
 
   const handleWorkflowNewRun = React.useCallback(async () => {
     if (!currentSessionId) {
@@ -2962,28 +3294,36 @@ export default function ChatPage() {
       <WorkflowPanel
         open={workflowPanelOpen}
         onOpenChange={setWorkflowPanelOpen}
+        sessionId={currentSessionId}
         workflowEnabled={workflowEnabled}
         workflowBusy={workflowBusy}
         workflowError={workflowError}
         workflowBoundRunId={workflowBoundRunId}
         workflowState={workflowState}
         workflowConfig={workflowConfig}
+        workflowTemplate={workflowTemplate}
         workflowProtocolId={workflowProtocolId}
         workflowReasoningEffort={workflowReasoningEffort}
+        workflowRunPolicyPreset={workflowRunPolicyPreset}
         workflowRunPolicy={workflowRunPolicy}
         workflowExecutionPolicy={workflowExecutionPolicy}
         workflowEvidenceConfig={workflowEvidenceConfig}
+        workflowResearchConfig={workflowResearchConfig}
         workflowScheduleConfig={workflowScheduleConfig}
         workflowScheduleType={workflowScheduleType}
         workflowScheduleEnabled={workflowScheduleEnabled(workflowState)}
         workflowProtocolOptions={WORKFLOW_PROTOCOL_OPTIONS}
+        modelOptions={modelOptions}
         supportedReasoningEfforts={supportedReasoningEfforts}
-        effectiveInferenceReasoningEffort={effectiveInference.reasoningEffort}
         effectiveProjectId={effectiveProjectId}
         projects={projects}
         workflowProjectWorkspace={workflowProject?.workspaceDir ?? null}
         uploadTargetDir={uploadTargetDir ?? null}
         effectiveWorkflowWorkspace={effectiveWorkflowWorkspace}
+        workflowHasUnsavedChanges={workflowHasUnsavedChanges}
+        workflowSaveState={workflowSaveState}
+        workflowLastSavedLabel={workflowLastSavedLabel}
+        workflowLastSaveScope={workflowLastSaveScope}
         onWorkflowToggle={(enabled) => {
           void handleWorkflowToggle(enabled)
         }}
@@ -2995,6 +3335,8 @@ export default function ChatPage() {
           void handleWorkflowProjectChange(projectId)
         }}
         onWorkflowFieldChange={handleWorkflowFieldChange}
+        onWorkflowTemplateChange={handleWorkflowTemplateChange}
+        onWorkflowRunPolicyPresetChange={handleWorkflowRunPolicyPresetChange}
         onWorkflowConfigPatch={handleWorkflowConfigPatch}
         onWorkflowSave={() => {
           void handleWorkflowSave()

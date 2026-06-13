@@ -1,9 +1,10 @@
 'use client'
 
 import * as React from 'react'
-import { ExternalLink, PanelRightClose, RotateCcw, Workflow } from 'lucide-react'
+import { CheckCircle2, ExternalLink, Loader2, PanelRightClose, Plus, RotateCcw, Trash2, Workflow } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -24,7 +25,11 @@ import type {
   SessionWorkflowConfig,
   SessionWorkflowState,
 } from '@/lib/api'
+import type { ChatInputModelOption } from '@/components/chat/ChatInput'
 type WorkflowScheduleType = 'interval' | 'once' | 'cron'
+type WorkflowSaveState = 'idle' | 'saving' | 'saved' | 'error'
+type WorkflowTemplate = 'standard' | 'research_debate'
+type WorkflowRunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
 
 interface WorkflowProtocolOption {
   value: AgentRunProtocolId
@@ -35,33 +40,43 @@ interface WorkflowProtocolOption {
 interface WorkflowPanelProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  sessionId: string | null
   workflowEnabled: boolean
   workflowBusy: boolean
   workflowError: string | null
   workflowBoundRunId: string | null
   workflowState: SessionWorkflowState
   workflowConfig: SessionWorkflowConfig
+  workflowTemplate: WorkflowTemplate
   workflowProtocolId: AgentRunProtocolId
   workflowReasoningEffort: ReasoningEffort | null
+  workflowRunPolicyPreset: WorkflowRunPolicyPreset
   workflowRunPolicy: AgentRunRunPolicy
   workflowExecutionPolicy: Record<string, unknown>
   workflowEvidenceConfig: Record<string, unknown>
+  workflowResearchConfig: Record<string, unknown>
   workflowScheduleConfig: Record<string, unknown>
   workflowScheduleType: WorkflowScheduleType
   workflowScheduleEnabled: boolean
   workflowProtocolOptions: WorkflowProtocolOption[]
+  modelOptions: ChatInputModelOption[]
   supportedReasoningEfforts: ReasoningEffort[]
-  effectiveInferenceReasoningEffort: ReasoningEffort | null
   effectiveProjectId: string | null
   projects: ProjectSummary[]
   workflowProjectWorkspace: string | null
   uploadTargetDir: string | null
   effectiveWorkflowWorkspace: string | null
+  workflowHasUnsavedChanges: boolean
+  workflowSaveState: WorkflowSaveState
+  workflowLastSavedLabel: string | null
+  workflowLastSaveScope: 'persisted' | 'draft' | null
   onWorkflowToggle: (enabled: boolean) => void
   onWorkflowNewRun: () => void
   onOpenRunDetail: (runId: string) => void
   onWorkflowProjectChange: (projectId: string | null) => void
   onWorkflowFieldChange: (patch: Partial<SessionWorkflowState>) => void
+  onWorkflowTemplateChange: (template: WorkflowTemplate) => void
+  onWorkflowRunPolicyPresetChange: (preset: WorkflowRunPolicyPreset) => void
   onWorkflowConfigPatch: (patch: Partial<SessionWorkflowConfig>) => void
   onWorkflowSave: () => void
   buildWorkflowScheduleConfig: (
@@ -73,34 +88,129 @@ interface WorkflowPanelProps {
   defaultScheduleTimezone: () => string
 }
 
+interface WorkflowRoleDraft {
+  id: string
+  role: string
+  modelId: string
+}
+
+function createWorkflowRoleDraft(role = '', modelId = ''): WorkflowRoleDraft {
+  return {
+    id:
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`,
+    role,
+    modelId,
+  }
+}
+
+function defaultRolesForProtocol(protocolId: AgentRunProtocolId): string[] {
+  if (protocolId === 'dr_zero_self_evolve') {
+    return ['proposer', 'solver', 'verifier']
+  }
+  if (protocolId === 'multi_agent_debate') {
+    return ['debater_a', 'debater_b', 'judge']
+  }
+  if (protocolId === 'controlled_subagent_execution') {
+    return ['planner', 'executor', 'controller', 'evaluator']
+  }
+  return ['teacher', 'student']
+}
+
+function normalizeSelectedModelRoles(
+  value: Record<string, string> | undefined
+): Record<string, string> {
+  const next: Record<string, string> = {}
+  for (const [role, modelId] of Object.entries(value ?? {})) {
+    const normalizedRole = role.trim()
+    const normalizedModelId = modelId.trim()
+    if (normalizedRole && normalizedModelId) {
+      next[normalizedRole] = normalizedModelId
+    }
+  }
+  return next
+}
+
+function serializeSelectedModelRoles(value: Record<string, string> | undefined): string {
+  return JSON.stringify(
+    Object.entries(normalizeSelectedModelRoles(value)).sort(([left], [right]) => left.localeCompare(right))
+  )
+}
+
+function buildRoleDraftsFromSelection(value: Record<string, string> | undefined): WorkflowRoleDraft[] {
+  return Object.entries(normalizeSelectedModelRoles(value))
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([role, modelId]) => createWorkflowRoleDraft(role, modelId))
+}
+
+function buildSelectedModelRolesFromDrafts(drafts: WorkflowRoleDraft[]): Record<string, string> {
+  const next: Record<string, string> = {}
+  for (const draft of drafts) {
+    const role = draft.role.trim()
+    const modelId = draft.modelId.trim()
+    if (role && modelId) {
+      next[role] = modelId
+    }
+  }
+  return next
+}
+
+function getStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+function normalizeEvidenceCollectionMode(value: unknown): string {
+  if (value === 'local_only') {
+    return 'rag'
+  }
+  if (value === 'web_only') {
+    return 'web'
+  }
+  return typeof value === 'string' && value.trim().length > 0 ? value : 'hybrid'
+}
+
 function WorkflowPanelBody({
+  sessionId,
   workflowEnabled,
   workflowBusy,
   workflowError,
   workflowBoundRunId,
   workflowState,
   workflowConfig,
+  workflowTemplate,
   workflowProtocolId,
   workflowReasoningEffort,
+  workflowRunPolicyPreset,
   workflowRunPolicy,
   workflowExecutionPolicy,
   workflowEvidenceConfig,
+  workflowResearchConfig,
   workflowScheduleConfig,
   workflowScheduleType,
   workflowScheduleEnabled,
   workflowProtocolOptions,
+  modelOptions,
   supportedReasoningEfforts,
-  effectiveInferenceReasoningEffort,
   effectiveProjectId,
   projects,
   workflowProjectWorkspace,
   uploadTargetDir,
   effectiveWorkflowWorkspace,
+  workflowHasUnsavedChanges,
+  workflowSaveState,
+  workflowLastSavedLabel,
+  workflowLastSaveScope,
   onWorkflowToggle,
   onWorkflowNewRun,
   onOpenRunDetail,
   onWorkflowProjectChange,
   onWorkflowFieldChange,
+  onWorkflowTemplateChange,
+  onWorkflowRunPolicyPresetChange,
   onWorkflowConfigPatch,
   onWorkflowSave,
   buildWorkflowScheduleConfig,
@@ -110,6 +220,127 @@ function WorkflowPanelBody({
 }: Omit<WorkflowPanelProps, 'open' | 'onOpenChange'> & {
   onClose?: () => void
 }) {
+  const selectedRolesKey = serializeSelectedModelRoles(workflowConfig.selected_models_roles)
+  const roleDraftScopeKey = `${sessionId ?? '__no_session__'}:${selectedRolesKey}`
+  const selectedRolesSyncRef = React.useRef(roleDraftScopeKey)
+  const [roleDrafts, setRoleDrafts] = React.useState<WorkflowRoleDraft[]>(() =>
+    buildRoleDraftsFromSelection(workflowConfig.selected_models_roles)
+  )
+  const evidenceQueriesText = React.useMemo(
+    () => getStringArray(workflowEvidenceConfig.queries).join('\n'),
+    [workflowEvidenceConfig]
+  )
+  const ragMcpServersText = React.useMemo(
+    () => getStringArray(workflowEvidenceConfig.rag_mcp_servers).join('\n'),
+    [workflowEvidenceConfig]
+  )
+  const researchOutputTargets = React.useMemo(
+    () => getStringArray(workflowResearchConfig.output_targets),
+    [workflowResearchConfig]
+  )
+  const researchSourceMode = typeof workflowResearchConfig.source_mode === 'string'
+    ? workflowResearchConfig.source_mode
+    : 'hybrid'
+  const citationPolicy = typeof workflowResearchConfig.citation_policy === 'string'
+    ? workflowResearchConfig.citation_policy
+    : 'claim_level_required'
+  const smartModelId = typeof workflowResearchConfig.smart_model_id === 'string'
+    ? workflowResearchConfig.smart_model_id
+    : ''
+  const localWorkerModelId = typeof workflowResearchConfig.local_worker_model_id === 'string'
+    ? workflowResearchConfig.local_worker_model_id
+    : ''
+  const localWorkerCount = String(workflowResearchConfig.local_worker_count ?? 3)
+  const debateRounds = String(workflowResearchConfig.debate_rounds ?? 2)
+
+  React.useEffect(() => {
+    if (selectedRolesSyncRef.current === roleDraftScopeKey) {
+      return
+    }
+    selectedRolesSyncRef.current = roleDraftScopeKey
+    setRoleDrafts(buildRoleDraftsFromSelection(workflowConfig.selected_models_roles))
+  }, [roleDraftScopeKey, workflowConfig.selected_models_roles])
+
+  const updateRoleDrafts = React.useCallback((updater: (current: WorkflowRoleDraft[]) => WorkflowRoleDraft[]) => {
+    setRoleDrafts((current) => {
+      const next = updater(current)
+      const selectedModelsRoles = buildSelectedModelRolesFromDrafts(next)
+      selectedRolesSyncRef.current = `${sessionId ?? '__no_session__'}:${serializeSelectedModelRoles(selectedModelsRoles)}`
+      onWorkflowConfigPatch({
+        selected_models_roles: selectedModelsRoles,
+      })
+      return next
+    })
+  }, [onWorkflowConfigPatch, sessionId])
+
+  const handleSeedProtocolRoles = React.useCallback(() => {
+    updateRoleDrafts(() =>
+      defaultRolesForProtocol(workflowProtocolId).map((role) => createWorkflowRoleDraft(role, ''))
+    )
+  }, [updateRoleDrafts, workflowProtocolId])
+
+  const handleAddRole = React.useCallback(() => {
+    updateRoleDrafts((current) => [...current, createWorkflowRoleDraft()])
+  }, [updateRoleDrafts])
+
+  const handleRoleDraftChange = React.useCallback((
+    id: string,
+    key: 'role' | 'modelId',
+    value: string
+  ) => {
+    updateRoleDrafts((current) =>
+      current.map((draft) => (draft.id === id ? { ...draft, [key]: value } : draft))
+    )
+  }, [updateRoleDrafts])
+
+  const handleRemoveRole = React.useCallback((id: string) => {
+    updateRoleDrafts((current) => current.filter((draft) => draft.id !== id))
+  }, [updateRoleDrafts])
+
+  const patchRunPolicy = React.useCallback((patch: Partial<AgentRunRunPolicy>) => {
+    onWorkflowConfigPatch({
+      run_policy_preset: 'custom',
+      run_policy: {
+        ...workflowRunPolicy,
+        ...patch,
+      },
+    })
+  }, [onWorkflowConfigPatch, workflowRunPolicy])
+
+  const toggleResearchOutputTarget = React.useCallback(
+    (target: 'research_brief' | 'dataset_package') => {
+      const nextTargets = researchOutputTargets.includes(target)
+        ? researchOutputTargets.filter((item) => item !== target)
+        : [...researchOutputTargets, target]
+      onWorkflowConfigPatch({
+        research: {
+          ...workflowResearchConfig,
+          output_targets: nextTargets.length > 0 ? nextTargets : [target],
+        },
+      })
+    },
+    [onWorkflowConfigPatch, researchOutputTargets, workflowResearchConfig]
+  )
+
+  const saveStatusMessage = (() => {
+    if (workflowSaveState === 'saving') {
+      return 'Saving workflow settings...'
+    }
+    if (workflowSaveState === 'error') {
+      return workflowError ?? 'Unable to save workflow settings.'
+    }
+    if (workflowHasUnsavedChanges) {
+      return 'Unsaved changes'
+    }
+    if (workflowSaveState === 'saved') {
+      if (workflowLastSaveScope === 'draft') {
+        return 'Saved in this draft only. Send a chat message to persist it.'
+      }
+      return workflowLastSavedLabel ? `Saved at ${workflowLastSavedLabel}` : 'Settings saved'
+    }
+    return 'Changes are stored per chat session.'
+  })()
+
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-[inherit] bg-[radial-gradient(circle_at_top_right,rgba(94,106,210,0.18),transparent_34%),linear-gradient(180deg,rgba(255,255,255,0.04),transparent_24%)]">
       <div className="border-b border-white/8 bg-canvas/40 px-4 py-4 backdrop-blur-xl">
@@ -253,6 +484,26 @@ function WorkflowPanelBody({
           >
             <div className="space-y-3">
               <div className="space-y-2">
+                <span className="text-xs font-medium text-muted-foreground">Template</span>
+                <Select
+                  value={workflowTemplate}
+                  onValueChange={(value) => onWorkflowTemplateChange(value as WorkflowTemplate)}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="standard">Standard workflow</SelectItem>
+                    <SelectItem value="research_debate">Research debate</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {workflowTemplate === 'research_debate'
+                    ? 'Uses the multi-agent debate flow with Smart Judge research defaults.'
+                    : 'General-purpose workflow configuration for chat-bound runs.'}
+                </p>
+              </div>
+              <div className="space-y-2">
                 <span className="text-xs font-medium text-muted-foreground">Title</span>
                 <Input
                   value={workflowConfig.title ?? ''}
@@ -271,6 +522,7 @@ function WorkflowPanelBody({
                 <span className="text-xs font-medium text-muted-foreground">Protocol</span>
                 <Select
                   value={workflowProtocolId}
+                  disabled={workflowTemplate === 'research_debate'}
                   onValueChange={(value) =>
                     onWorkflowFieldChange({
                       config: {
@@ -327,12 +579,289 @@ function WorkflowPanelBody({
             </div>
           </PanelSectionCard>
 
+          {workflowTemplate === 'research_debate' ? (
+            <PanelSectionCard
+              title="Research debate"
+              description="Specialized role and retrieval defaults for Smart Judge style workflows."
+            >
+              <div className="space-y-3">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Smart model</span>
+                    <Select
+                      value={smartModelId || '__unassigned__'}
+                      onValueChange={(value) =>
+                        onWorkflowConfigPatch({
+                          research: {
+                            ...workflowResearchConfig,
+                            smart_model_id: value === '__unassigned__' ? '' : value,
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select model" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                        {modelOptions.map((model) => (
+                          <SelectItem key={model.id} value={model.id}>
+                            {model.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Planner, judge, verifier, and synthesizer roles use this model by default.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Local worker model</span>
+                    <Select
+                      value={localWorkerModelId || '__unassigned__'}
+                      onValueChange={(value) =>
+                        onWorkflowConfigPatch({
+                          research: {
+                            ...workflowResearchConfig,
+                            local_worker_model_id: value === '__unassigned__' ? '' : value,
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select model" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                        {modelOptions.map((model) => (
+                          <SelectItem key={model.id} value={model.id}>
+                            {model.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Debate roles, local worker fan-out, and skeptic passes use this model by default.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Local worker count</span>
+                    <Input
+                      value={localWorkerCount}
+                      onChange={(event) =>
+                        onWorkflowConfigPatch({
+                          research: {
+                            ...workflowResearchConfig,
+                            local_worker_count: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : 3,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Debate rounds</span>
+                    <Input
+                      value={debateRounds}
+                      onChange={(event) =>
+                        onWorkflowConfigPatch({
+                          research: {
+                            ...workflowResearchConfig,
+                            debate_rounds: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : 2,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <span className="text-xs font-medium text-muted-foreground">Output targets</span>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant={researchOutputTargets.includes('research_brief') ? 'secondary' : 'ghost'}
+                      size="sm"
+                      onClick={() => toggleResearchOutputTarget('research_brief')}
+                    >
+                      Research brief
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={researchOutputTargets.includes('dataset_package') ? 'secondary' : 'ghost'}
+                      size="sm"
+                      onClick={() => toggleResearchOutputTarget('dataset_package')}
+                    >
+                      Dataset package
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Source mode</span>
+                    <Select
+                      value={researchSourceMode}
+                      onValueChange={(value) =>
+                        onWorkflowConfigPatch({
+                          research: {
+                            ...workflowResearchConfig,
+                            source_mode: value,
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="hybrid">Hybrid</SelectItem>
+                        <SelectItem value="local_only">Local only</SelectItem>
+                        <SelectItem value="web_first">Web first</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Citation policy</span>
+                    <Select
+                      value={citationPolicy}
+                      onValueChange={(value) =>
+                        onWorkflowConfigPatch({
+                          research: {
+                            ...workflowResearchConfig,
+                            citation_policy: value,
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="claim_level_required">Claim level required</SelectItem>
+                        <SelectItem value="best_effort">Best effort</SelectItem>
+                        <SelectItem value="strict_fail">Strict fail</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </div>
+            </PanelSectionCard>
+          ) : null}
+
+          <PanelSectionCard
+            title="Agent roles"
+            description="Choose which model each workflow role should use when a new bound run starts."
+          >
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-muted-foreground">
+                  These mappings feed `selected_models_roles` for newly created workflow runs.
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button type="button" variant="ghost" size="sm" onClick={handleSeedProtocolRoles}>
+                    Seed defaults
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" onClick={handleAddRole}>
+                    <Plus className="h-3.5 w-3.5" />
+                    Add role
+                  </Button>
+                </div>
+              </div>
+              {roleDrafts.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-white/12 bg-surface-layer/40 px-3 py-3 text-xs text-muted-foreground">
+                  No roles assigned yet. Seed protocol defaults or add a custom role.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {roleDrafts.map((draft, index) => (
+                    <div key={draft.id} className="rounded-xl border border-white/8 bg-surface-layer/70 px-3 py-3">
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium text-muted-foreground">Role {index + 1}</p>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => handleRemoveRole(draft.id)}
+                          title="Remove role"
+                          aria-label="Remove role"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="space-y-2">
+                          <span className="text-xs font-medium text-muted-foreground">Role name</span>
+                          <Input
+                            value={draft.role}
+                            placeholder="teacher, judge, verifier..."
+                            onChange={(event) => handleRoleDraftChange(draft.id, 'role', event.target.value)}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <span className="text-xs font-medium text-muted-foreground">Model</span>
+                          <Select
+                            value={draft.modelId || '__unassigned__'}
+                            onValueChange={(value) =>
+                              handleRoleDraftChange(
+                                draft.id,
+                                'modelId',
+                                value === '__unassigned__' ? '' : value
+                              )
+                            }
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select model" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                              {modelOptions.map((model) => (
+                                <SelectItem key={model.id} value={model.id}>
+                                  {model.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {modelOptions.length === 0 ? (
+                <p className="text-xs text-amber-300">
+                  No configured models are available yet. Add or refresh models in Settings before assigning roles.
+                </p>
+              ) : null}
+            </div>
+          </PanelSectionCard>
+
           <PanelSectionCard
             title="Execution / schedule"
             description="These are defaults only. Controlled execution boundaries remain enforced by runtime policy."
           >
             <div className="space-y-3">
               <div className="rounded-xl border border-white/8 bg-surface-layer/70 px-3 py-3">
+                <div className="mb-3 space-y-2">
+                  <span className="text-xs font-medium text-muted-foreground">Run policy preset</span>
+                  <Select
+                    value={workflowRunPolicyPreset}
+                    onValueChange={(value) => onWorkflowRunPolicyPresetChange(value as WorkflowRunPolicyPreset)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="short">Short</SelectItem>
+                      <SelectItem value="balanced">Balanced</SelectItem>
+                      <SelectItem value="long">Long</SelectItem>
+                      <SelectItem value="custom">Custom</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-2">
                     <span className="text-xs font-medium text-muted-foreground">Max wall clock (sec)</span>
@@ -340,13 +869,10 @@ function WorkflowPanelBody({
                       value={String(workflowRunPolicy.max_wall_clock_sec ?? '')}
                       placeholder="1800"
                       onChange={(event) =>
-                        onWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            max_wall_clock_sec: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : null,
-                          },
+                        patchRunPolicy({
+                          max_wall_clock_sec: event.target.value
+                            ? Number.parseInt(event.target.value, 10)
+                            : null,
                         })
                       }
                     />
@@ -357,13 +883,10 @@ function WorkflowPanelBody({
                       value={String(workflowRunPolicy.heartbeat_timeout_sec ?? '')}
                       placeholder="90"
                       onChange={(event) =>
-                        onWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            heartbeat_timeout_sec: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : null,
-                          },
+                        patchRunPolicy({
+                          heartbeat_timeout_sec: event.target.value
+                            ? Number.parseInt(event.target.value, 10)
+                            : null,
                         })
                       }
                     />
@@ -376,13 +899,10 @@ function WorkflowPanelBody({
                       value={String(workflowRunPolicy.checkpoint_interval_steps ?? '')}
                       placeholder="1"
                       onChange={(event) =>
-                        onWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            checkpoint_interval_steps: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : undefined,
-                          },
+                        patchRunPolicy({
+                          checkpoint_interval_steps: event.target.value
+                            ? Number.parseInt(event.target.value, 10)
+                            : undefined,
                         })
                       }
                     />
@@ -393,13 +913,10 @@ function WorkflowPanelBody({
                       value={String(workflowRunPolicy.max_subagent_failures_per_role ?? '')}
                       placeholder="2"
                       onChange={(event) =>
-                        onWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            max_subagent_failures_per_role: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : undefined,
-                          },
+                        patchRunPolicy({
+                          max_subagent_failures_per_role: event.target.value
+                            ? Number.parseInt(event.target.value, 10)
+                            : undefined,
                         })
                       }
                     />
@@ -411,11 +928,8 @@ function WorkflowPanelBody({
                     <Select
                       value={workflowRunPolicy.on_budget_exhausted ?? 'finalize_partial'}
                       onValueChange={(value) =>
-                        onWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            on_budget_exhausted: value as 'pause' | 'finalize_partial',
-                          },
+                        patchRunPolicy({
+                          on_budget_exhausted: value as 'pause' | 'finalize_partial',
                         })
                       }
                     >
@@ -433,11 +947,8 @@ function WorkflowPanelBody({
                     <Select
                       value={workflowRunPolicy.on_subagent_disconnect ?? 'pause'}
                       onValueChange={(value) =>
-                        onWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            on_subagent_disconnect: value as 'retry_then_degrade' | 'pause' | 'fail',
-                          },
+                        patchRunPolicy({
+                          on_subagent_disconnect: value as 'retry_then_degrade' | 'pause' | 'fail',
                         })
                       }
                     >
@@ -574,23 +1085,73 @@ function WorkflowPanelBody({
                         evidence: {
                           ...workflowEvidenceConfig,
                           enabled: checked,
-                          mode: String(workflowEvidenceConfig.mode ?? 'hybrid'),
+                          mode: normalizeEvidenceCollectionMode(workflowEvidenceConfig.mode),
+                        },
+                      })
+                    }
+                  />
+                </div>
+                <div className="mt-3 space-y-2">
+                  <span className="text-xs font-medium text-muted-foreground">Evidence queries</span>
+                  <Textarea
+                    value={evidenceQueriesText}
+                    rows={4}
+                    placeholder={'approved deployment note\nsecurity review checklist'}
+                    onChange={(event) =>
+                      onWorkflowConfigPatch({
+                        evidence: {
+                          ...workflowEvidenceConfig,
+                          enabled: workflowEvidenceConfig.enabled !== false,
+                          queries: event.target.value
+                            .split('\n')
+                            .map((item) => item.trim())
+                            .filter((item) => item.length > 0),
                         },
                       })
                     }
                   />
                 </div>
                 <div className="mt-3 grid grid-cols-2 gap-3">
+                  {workflowTemplate !== 'research_debate' ? (
+                    <div className="space-y-2">
+                      <span className="text-xs font-medium text-muted-foreground">Mode</span>
+                      <Select
+                        value={normalizeEvidenceCollectionMode(workflowEvidenceConfig.mode)}
+                        onValueChange={(value) =>
+                          onWorkflowConfigPatch({
+                            evidence: {
+                              ...workflowEvidenceConfig,
+                              enabled: workflowEvidenceConfig.enabled !== false,
+                              mode: value,
+                            },
+                          })
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="hybrid">Hybrid</SelectItem>
+                          <SelectItem value="web">Web</SelectItem>
+                          <SelectItem value="rag">RAG</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ) : (
+                    <div className="rounded-md border border-white/8 bg-surface-layer/50 px-3 py-2 text-xs text-muted-foreground sm:col-span-2">
+                      Research debate uses the source mode above to choose between hybrid, web-first, or local-first evidence gathering.
+                    </div>
+                  )}
                   <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Mode</span>
+                    <span className="text-xs font-medium text-muted-foreground">RAG provider</span>
                     <Select
-                      value={String(workflowEvidenceConfig.mode ?? 'hybrid')}
+                      value={String(workflowEvidenceConfig.rag_provider ?? 'memory')}
                       onValueChange={(value) =>
                         onWorkflowConfigPatch({
                           evidence: {
                             ...workflowEvidenceConfig,
                             enabled: workflowEvidenceConfig.enabled !== false,
-                            mode: value,
+                            rag_provider: value,
                           },
                         })
                       }
@@ -599,9 +1160,9 @@ function WorkflowPanelBody({
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="hybrid">Hybrid</SelectItem>
-                        <SelectItem value="web_only">Web only</SelectItem>
-                        <SelectItem value="local_only">Local only</SelectItem>
+                        <SelectItem value="memory">Memory</SelectItem>
+                        <SelectItem value="mcp_resource">MCP resource</SelectItem>
+                        <SelectItem value="auto">Auto</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -609,7 +1170,7 @@ function WorkflowPanelBody({
                     <span className="text-xs font-medium text-muted-foreground">Max results / query</span>
                     <Input
                       value={String(workflowEvidenceConfig.max_results_per_query ?? '')}
-                      placeholder="3"
+                      placeholder={workflowTemplate === 'research_debate' ? '4' : '3'}
                       onChange={(event) =>
                         onWorkflowConfigPatch({
                           evidence: {
@@ -617,12 +1178,73 @@ function WorkflowPanelBody({
                             enabled: workflowEvidenceConfig.enabled !== false,
                             max_results_per_query: event.target.value
                               ? Number.parseInt(event.target.value, 10)
-                              : 3,
+                              : workflowTemplate === 'research_debate'
+                                ? 4
+                                : 3,
                           },
                         })
                       }
                     />
                   </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Max fetch / query</span>
+                    <Input
+                      value={String(workflowEvidenceConfig.max_fetch_per_query ?? '')}
+                      placeholder="2"
+                      onChange={(event) =>
+                        onWorkflowConfigPatch({
+                          evidence: {
+                            ...workflowEvidenceConfig,
+                            enabled: workflowEvidenceConfig.enabled !== false,
+                            max_fetch_per_query: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : 2,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">Max content chars</span>
+                    <Input
+                      value={String(workflowEvidenceConfig.max_content_chars ?? '')}
+                      placeholder="2000"
+                      onChange={(event) =>
+                        onWorkflowConfigPatch({
+                          evidence: {
+                            ...workflowEvidenceConfig,
+                            enabled: workflowEvidenceConfig.enabled !== false,
+                            max_content_chars: event.target.value
+                              ? Number.parseInt(event.target.value, 10)
+                              : 2000,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="mt-3 space-y-2">
+                  <span className="text-xs font-medium text-muted-foreground">MCP servers</span>
+                  <Textarea
+                    value={ragMcpServersText}
+                    rows={2}
+                    placeholder={'docs\nknowledge-base'}
+                    onChange={(event) =>
+                      onWorkflowConfigPatch({
+                        evidence: {
+                          ...workflowEvidenceConfig,
+                          enabled: workflowEvidenceConfig.enabled !== false,
+                          rag_mcp_servers: event.target.value
+                            .split('\n')
+                            .map((item) => item.trim())
+                            .filter((item) => item.length > 0),
+                        },
+                      })
+                    }
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Used when the RAG provider is set to <code>mcp_resource</code> or <code>auto</code>.
+                  </p>
                 </div>
               </div>
 
@@ -818,13 +1440,31 @@ function WorkflowPanelBody({
           </PanelSectionCard>
 
           <div className="flex items-center justify-end gap-2 pt-1">
+            <div
+              aria-live="polite"
+              className="mr-auto inline-flex min-h-9 items-center gap-2 rounded-full border border-white/8 bg-surface-layer/60 px-3 text-xs text-muted-foreground"
+            >
+              {workflowSaveState === 'saving' ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-primary-300" />
+              ) : workflowSaveState === 'saved' && !workflowHasUnsavedChanges ? (
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-300" />
+              ) : null}
+              <span>{saveStatusMessage}</span>
+            </div>
             {onClose ? (
               <Button type="button" variant="outline" onClick={onClose}>
                 Close
               </Button>
             ) : null}
-            <Button type="button" onClick={onWorkflowSave}>
-              Save settings
+            <Button type="button" onClick={onWorkflowSave} disabled={workflowSaveState === 'saving'}>
+              {workflowSaveState === 'saving' ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                'Save settings'
+              )}
             </Button>
           </div>
         </div>
