@@ -589,7 +589,7 @@ class RuntimeService:
 
         content = payload.content.strip()
         metadata = dict(payload.metadata or {})
-        attachments = [dict(item) for item in payload.attachments if isinstance(item, dict)]
+        attachments = [attachment.to_attachment_dict() for attachment in payload.attachments]
         if payload.project_id is not None:
             metadata["project_id"] = payload.project_id
         if payload.workspace_dir is not None:

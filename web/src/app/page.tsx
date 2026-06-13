@@ -4,11 +4,10 @@ import * as React from 'react'
 import { useRouter } from 'next/navigation'
 import {
   AlertCircle,
-  ExternalLink,
+  FolderTree,
   ListTodo,
   Loader2,
   MoreHorizontal,
-  RotateCcw,
   Settings,
   SlidersHorizontal,
   Workflow,
@@ -24,24 +23,11 @@ import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
 import { InferencePanel } from '@/components/chat/InferencePanel'
 import { ScrollToBottom } from '@/components/chat/ScrollToBottom'
+import { ChatActivityStrip } from '@/components/chat/ChatActivityStrip'
+import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
 import { TaskPanel } from '@/components/chat/TaskPanel'
-import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { Separator } from '@/components/ui/separator'
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from '@/components/ui/sheet'
-import { Switch } from '@/components/ui/switch'
+import { WorkflowPanel } from '@/components/chat/WorkflowPanel'
+import { WorkspacePanel } from '@/components/chat/WorkspacePanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import * as api from '@/lib/api'
 import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
@@ -60,6 +46,8 @@ import {
 import { useChatRuntimeStore } from '@/lib/stores/chat-runtime-store'
 import { useProjectStore } from '@/lib/stores/project-store'
 import { useSessionStore } from '@/lib/stores/session-store'
+import { useUIStore } from '@/lib/stores/ui-store'
+import { useWorkspaceStore } from '@/lib/stores/workspace-store'
 import { resolveVoiceOverlayPhase, resolveVoicePhaseFromRuntime } from '@/lib/voice-phase'
 import {
   VoiceWsClient,
@@ -198,7 +186,7 @@ function getStringArray(value: unknown): string[] {
 }
 
 function buildDefaultWorkflowState(
-  reasoningEffort: api.ReasoningEffort | null
+  _reasoningEffort: api.ReasoningEffort | null
 ): api.SessionWorkflowState {
   return {
     enabled: false,
@@ -209,7 +197,7 @@ function buildDefaultWorkflowState(
       title: null,
       protocol_id: DEFAULT_WORKFLOW_PROTOCOL,
       workspace_dir_override: null,
-      reasoning_effort: reasoningEffort,
+      reasoning_effort: null,
       selected_models_roles: {},
       run_policy: {},
       execution_policy: {},
@@ -235,7 +223,7 @@ function normalizeWorkflowState(
       ...defaults.config,
       ...config,
       protocol_id: config.protocol_id ?? defaults.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
-      reasoning_effort: config.reasoning_effort ?? reasoningEffort,
+      reasoning_effort: config.reasoning_effort ?? null,
       selected_models_roles: config.selected_models_roles ?? {},
       run_policy: config.run_policy ?? {},
       execution_policy: config.execution_policy ?? {},
@@ -822,6 +810,9 @@ export default function ChatPage() {
   const [mobileInferenceOpen, setMobileInferenceOpen] = React.useState(false)
   const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
   const [workflowPanelOpen, setWorkflowPanelOpen] = React.useState(false)
+  const [workspaceMobileOpen, setWorkspaceMobileOpen] = React.useState(false)
+  const [queuedWorkspaceAttachments, setQueuedWorkspaceAttachments] = React.useState<ChatAttachment[]>([])
+  const [queuedWorkspaceAttachmentsKey, setQueuedWorkspaceAttachmentsKey] = React.useState<string | undefined>(undefined)
   const [selectedPresetName, setSelectedPresetName] = React.useState('default')
   const [savingPreset, setSavingPreset] = React.useState(false)
   const [workflowBusy, setWorkflowBusy] = React.useState(false)
@@ -863,6 +854,8 @@ export default function ChatPage() {
   } = useSessionStore()
   const activeProjectId = useProjectStore((state) => state.activeProjectId)
   const projects = useProjectStore((state) => state.projects)
+  const workspacePanelOpen = useUIStore((state) => state.workspacePanelOpen)
+  const setWorkspacePanelOpen = useUIStore((state) => state.setWorkspacePanelOpen)
   const {
     panelOpen,
     setPanelOpen,
@@ -879,6 +872,9 @@ export default function ChatPage() {
   const startStreaming = useChatRuntimeStore((state) => state.startStreaming)
   const finishStreaming = useChatRuntimeStore((state) => state.finishStreaming)
   const abortStreaming = useChatRuntimeStore((state) => state.abortStreaming)
+  const setWorkspaceContext = useWorkspaceStore((state) => state.setContext)
+  const loadWorkspaceTree = useWorkspaceStore((state) => state.loadTree)
+  const loadWorkspaceChanges = useWorkspaceStore((state) => state.loadChanges)
   const currentSession = sessions.find((session) => session.id === currentSessionId)
   const effectiveProjectId = currentSession?.projectId ?? activeProjectId
   const hasActiveStream = streamingSessionId !== null
@@ -946,7 +942,7 @@ export default function ChatPage() {
   const workflowProject = projects.find((project) => project.id === effectiveProjectId) ?? null
   const workflowProtocolId = workflowConfig.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL
   const workflowReasoningEffort =
-    workflowConfig.reasoning_effort ?? effectiveInference.reasoningEffort ?? null
+    workflowConfig.reasoning_effort ?? null
   const workflowRunPolicy = React.useMemo(
     () => (workflowConfig.run_policy ?? {}) as api.AgentRunRunPolicy,
     [workflowConfig.run_policy]
@@ -971,6 +967,22 @@ export default function ChatPage() {
     projects.find((project) => project.id === effectiveProjectId)?.workspaceDir ??
     getString(settings?.paths?.workspace_dir) ??
     undefined
+
+  React.useEffect(() => {
+    setWorkspaceContext({
+      sessionId: currentSessionId,
+      projectId: effectiveProjectId,
+    })
+    void loadWorkspaceTree()
+    void loadWorkspaceChanges()
+  }, [
+    currentSessionId,
+    effectiveProjectId,
+    loadWorkspaceChanges,
+    loadWorkspaceTree,
+    setWorkspaceContext,
+  ])
+
   const effectiveWorkflowWorkspace =
     workflowState.workspace_dir_override ||
     workflowConfig.workspace_dir_override ||
@@ -2129,6 +2141,11 @@ export default function ChatPage() {
         effectiveInference.reasoningEffort
       )
       nextWorkflow.enabled = command === 'workflow'
+      if (command === 'workflow') {
+        setTaskPanelOpen(false)
+        setPanelOpen(false)
+        setMobileInferenceOpen(false)
+      }
       setWorkflowPanelOpen(command === 'workflow')
       await persistWorkflowState(sessionId, nextWorkflow)
     }
@@ -2158,6 +2175,16 @@ export default function ChatPage() {
       action: change.undoAction,
       encoding: 'utf-8',
     })
+    const workspaceState = useWorkspaceStore.getState()
+    await workspaceState.loadChanges()
+    await workspaceState.loadTree(workspaceState.currentPath)
+    if (workspaceState.diff && workspaceState.selectedFilePath === change.filePath) {
+      await workspaceState.loadDiff(change.filePath)
+      return
+    }
+    if (workspaceState.preview && workspaceState.selectedFilePath === change.filePath) {
+      await workspaceState.previewFile(change.filePath)
+    }
   }, [currentSessionId])
 
   const handleRegenerate = React.useCallback((message: Message) => {
@@ -2167,6 +2194,11 @@ export default function ChatPage() {
     }
     void handleSend(prompt)
   }, [handleSend, messages])
+
+  const handleQueueWorkspaceAttachment = React.useCallback((attachment: ChatAttachment) => {
+    setQueuedWorkspaceAttachments([attachment])
+    setQueuedWorkspaceAttachmentsKey(`${attachment.id ?? attachment.path}-${Date.now()}`)
+  }, [])
 
   const handleEditAndResend = React.useCallback((message: Message) => {
     const selectedSkillIds = (() => {
@@ -2259,6 +2291,11 @@ export default function ChatPage() {
       effectiveInference.reasoningEffort
     )
     nextWorkflow.enabled = enabled
+    if (enabled) {
+      setTaskPanelOpen(false)
+      setPanelOpen(false)
+      setMobileInferenceOpen(false)
+    }
     setWorkflowPanelOpen(enabled)
     await persistWorkflowState(sessionId, nextWorkflow)
   }, [
@@ -2460,6 +2497,54 @@ export default function ChatPage() {
     }
   }, [activeAgentSettings, effectiveInference, selectedPresetName])
 
+  const closeRightPanels = React.useCallback((except?: 'inference' | 'tasks' | 'workflow') => {
+    setWorkspaceMobileOpen(false)
+    if (except !== 'inference') {
+      setPanelOpen(false)
+      setMobileInferenceOpen(false)
+    }
+    if (except !== 'tasks') {
+      setTaskPanelOpen(false)
+    }
+    if (except !== 'workflow') {
+      setWorkflowPanelOpen(false)
+    }
+  }, [setPanelOpen])
+
+  const handleWorkflowPanelToggle = React.useCallback(() => {
+    const nextOpen = !workflowPanelOpen
+    closeRightPanels('workflow')
+    setWorkflowPanelOpen(nextOpen)
+  }, [closeRightPanels, workflowPanelOpen])
+
+  const handleInferencePanelToggle = React.useCallback(() => {
+    closeRightPanels('inference')
+    if (window.innerWidth < 768) {
+      setPanelOpen(false)
+      setMobileInferenceOpen((open) => !open)
+      return
+    }
+    setMobileInferenceOpen(false)
+    setPanelOpen(!panelOpen)
+  }, [closeRightPanels, panelOpen, setPanelOpen])
+
+  const handleTaskPanelToggle = React.useCallback(() => {
+    const nextOpen = !taskPanelOpen
+    closeRightPanels('tasks')
+    setTaskPanelOpen(nextOpen)
+  }, [closeRightPanels, taskPanelOpen])
+
+  const handleWorkspacePanelToggle = React.useCallback(() => {
+    if (window.innerWidth < 1024) {
+      closeRightPanels()
+      setWorkspacePanelOpen(false)
+      setWorkspaceMobileOpen((open) => !open)
+      return
+    }
+    setWorkspaceMobileOpen(false)
+    setWorkspacePanelOpen(!workspacePanelOpen)
+  }, [closeRightPanels, setWorkspacePanelOpen, workspacePanelOpen])
+
   const showEmptyState = isConversationEffectivelyEmpty(messages)
 
   return (
@@ -2482,7 +2567,7 @@ export default function ChatPage() {
               variant={workflowEnabled || workflowPanelOpen ? 'secondary' : 'ghost'}
               size="sm"
               title={t('sidebar.workflows')}
-              onClick={() => setWorkflowPanelOpen(true)}
+              onClick={handleWorkflowPanelToggle}
               className="max-sm:w-8 max-sm:px-0"
             >
               <Workflow className="h-4 w-4" />
@@ -2497,18 +2582,18 @@ export default function ChatPage() {
               <MoreHorizontal className="h-4 w-4" />
             </Button>
             <Button
+              variant={workspacePanelOpen || workspaceMobileOpen ? 'secondary' : 'ghost'}
+              size="icon-sm"
+              title="Workspace"
+              onClick={handleWorkspacePanelToggle}
+            >
+              <FolderTree className="h-4 w-4" />
+            </Button>
+            <Button
               variant={panelOpen || mobileInferenceOpen ? 'secondary' : 'ghost'}
               size="icon-sm"
               title="Inference"
-              onClick={() => {
-                setTaskPanelOpen(false)
-                if (window.innerWidth < 768) {
-                  setMobileInferenceOpen(true)
-                } else {
-                  setMobileInferenceOpen(false)
-                  setPanelOpen(!panelOpen)
-                }
-              }}
+              onClick={handleInferencePanelToggle}
             >
               <SlidersHorizontal className="h-4 w-4" />
             </Button>
@@ -2516,11 +2601,7 @@ export default function ChatPage() {
               variant={taskPanelOpen ? 'secondary' : 'ghost'}
               size="icon-sm"
               title="Tasks"
-              onClick={() => {
-                setMobileInferenceOpen(false)
-                setPanelOpen(false)
-                setTaskPanelOpen((open) => !open)
-              }}
+              onClick={handleTaskPanelToggle}
             >
               <ListTodo className="h-4 w-4" />
             </Button>
@@ -2537,6 +2618,21 @@ export default function ChatPage() {
       </header>
 
       <div className="relative flex flex-1 overflow-hidden">
+        <FloatingPanelShell
+          open={workspacePanelOpen}
+          onOpenChange={setWorkspacePanelOpen}
+          desktopSide="left"
+          desktopWidthClass="w-[min(40vw,44rem)] min-w-[24rem] max-w-[48rem]"
+          desktopBreakpoint="lg"
+          mobileSide="left"
+          mobileClassName="w-[92vw] max-w-[92vw] p-0 sm:max-w-[92vw]"
+          renderMobile={false}
+        >
+          <WorkspacePanel
+            onAttachAttachment={handleQueueWorkspaceAttachment}
+            onClose={() => setWorkspacePanelOpen(false)}
+          />
+        </FloatingPanelShell>
         <div className="min-w-0 flex-1">
           <ScrollToBottom visible={showScrollToBottom} onClick={scrollToBottom} />
           <div ref={scrollRef} className="h-full overflow-y-auto">
@@ -2557,6 +2653,8 @@ export default function ChatPage() {
                           ? { ...message, tokenStats: undefined }
                           : message
                       }
+                      sessionId={currentSessionId}
+                      projectId={effectiveProjectId}
                       onRegenerate={message.type === 'assistant' ? handleRegenerate : undefined}
                       onEditAndResend={message.type === 'user' ? (message) => handleEditAndResend(message) : undefined}
                       onUndoFileChange={handleUndoFileChange}
@@ -2567,7 +2665,12 @@ export default function ChatPage() {
             </div>
           </div>
         </div>
-        <TaskPanel open={taskPanelOpen} onOpenChange={setTaskPanelOpen} />
+        <TaskPanel
+          open={taskPanelOpen}
+          onOpenChange={setTaskPanelOpen}
+          workflowRunId={workflowBoundRunId}
+          onOpenWorkflowRun={(runId) => router.push(`/agent-runs/${runId}`)}
+        />
         <InferencePanel
           open={panelOpen}
           mobileOpen={mobileInferenceOpen}
@@ -2615,6 +2718,18 @@ export default function ChatPage() {
         </div>
       ) : null}
 
+      <ChatActivityStrip
+        currentSessionId={currentSessionId}
+        projectId={effectiveProjectId}
+        workflowRunId={workflowBoundRunId}
+        onOpenTaskPanel={() => {
+          closeRightPanels('tasks')
+          setWorkspaceMobileOpen(false)
+          setTaskPanelOpen(true)
+        }}
+        onOpenWorkflowRun={(runId) => router.push(`/agent-runs/${runId}`)}
+      />
+
       <ChatInput
         sessionId={currentSessionId}
         projectId={effectiveProjectId}
@@ -2640,6 +2755,8 @@ export default function ChatPage() {
         composerMode={editState ? 'edit' : 'compose'}
         composerSeed={editState?.seed ?? null}
         composerResetKey={editState?.resetKey}
+        queuedAttachments={queuedWorkspaceAttachments}
+        queuedAttachmentsKey={queuedWorkspaceAttachmentsKey}
       />
 
       <ExportDialog
@@ -2648,730 +2765,66 @@ export default function ChatPage() {
         messages={messages}
       />
 
-      <Sheet open={workflowPanelOpen} onOpenChange={setWorkflowPanelOpen}>
-        <SheetContent side="right" className="w-[420px] max-w-[92vw] overflow-y-auto">
-          <SheetHeader>
-            <SheetTitle>Workflow</SheetTitle>
-            <SheetDescription>
-              Chat-first workflow mode keeps this conversation bound to one main run.
-            </SheetDescription>
-          </SheetHeader>
+      <FloatingPanelShell
+        open={workspaceMobileOpen}
+        onOpenChange={setWorkspaceMobileOpen}
+        desktopSide="left"
+        desktopWidthClass="w-[min(40vw,44rem)] min-w-[24rem] max-w-[48rem]"
+        desktopBreakpoint="lg"
+        mobileSide="left"
+        mobileClassName="w-[92vw] max-w-[92vw] p-0 sm:max-w-[92vw]"
+        renderDesktop={false}
+      >
+        <WorkspacePanel
+          onAttachAttachment={handleQueueWorkspaceAttachment}
+          onClose={() => setWorkspaceMobileOpen(false)}
+        />
+      </FloatingPanelShell>
 
-          <div className="space-y-5 pr-1">
-            <section className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-medium text-foreground">Workflow mode</p>
-                  <p className="text-xs text-muted-foreground">
-                    Route new messages through the workflow runtime for this session.
-                  </p>
-                </div>
-                <Switch
-                  checked={workflowEnabled}
-                  onCheckedChange={(checked) => {
-                    void handleWorkflowToggle(checked)
-                  }}
-                />
-              </div>
-              <div className="rounded-lg border border-border bg-surface-layer px-3 py-2 text-xs text-muted-foreground">
-                {workflowEnabled
-                  ? 'Workflow mode is active for this chat session.'
-                  : 'Workflow mode is off. Use /workflow or this switch to enable it.'}
-              </div>
-            </section>
-
-            <Separator />
-
-            <section className="space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-sm font-medium text-foreground">Bound run</p>
-                  <p className="text-xs text-muted-foreground">
-                    This chat keeps appending to the same workflow run unless you start a new one.
-                  </p>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void handleWorkflowNewRun()}
-                >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  New run
-                </Button>
-              </div>
-              <div className="rounded-lg border border-border bg-surface-layer px-3 py-3">
-                <p className="text-sm text-foreground">
-                  {workflowBoundRunId ?? 'No run bound yet'}
-                </p>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {workflowBoundRunId
-                    ? `Synced events: ${workflowState.synced_run_event_count ?? 0}`
-                    : 'The first workflow message will create and bind a run.'}
-                </p>
-                {workflowBoundRunId ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="mt-2 px-0"
-                    onClick={() => router.push(`/agent-runs/${workflowBoundRunId}`)}
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" />
-                    Open run detail
-                  </Button>
-                ) : null}
-              </div>
-            </section>
-
-            <Separator />
-
-            <section className="space-y-3">
-              <div>
-                <p className="text-sm font-medium text-foreground">Project / workspace</p>
-                <p className="text-xs text-muted-foreground">
-                  Files and execution resolve from the selected project unless you override the path.
-                </p>
-              </div>
-              <div className="space-y-2">
-                <span className="text-xs font-medium text-muted-foreground">Project</span>
-                <Select
-                  value={effectiveProjectId ?? '__none__'}
-                  onValueChange={(value) => {
-                    void handleWorkflowProjectChange(value === '__none__' ? null : value)
-                  }}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="No project" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__none__">No project</SelectItem>
-                    {projects.map((project) => (
-                      <SelectItem key={project.id} value={project.id}>
-                        {project.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <span className="text-xs font-medium text-muted-foreground">Workspace override</span>
-                <Input
-                  value={workflowState.workspace_dir_override ?? ''}
-                  placeholder={workflowProject?.workspaceDir ?? uploadTargetDir ?? 'Use project workspace'}
-                  onChange={(event) =>
-                    handleWorkflowFieldChange({
-                      workspace_dir_override: event.target.value || null,
-                      config: {
-                        ...(workflowState.config ?? {}),
-                        workspace_dir_override: event.target.value || null,
-                      },
-                    })
-                  }
-                />
-              </div>
-              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                Effective workspace: <span className="break-all text-foreground">{effectiveWorkflowWorkspace || 'Not set'}</span>
-              </div>
-            </section>
-
-            <Separator />
-
-            <section className="space-y-3">
-              <div>
-                <p className="text-sm font-medium text-foreground">Protocol / reasoning</p>
-                <p className="text-xs text-muted-foreground">
-                  Session-scoped workflow defaults used when creating a new bound run.
-                </p>
-              </div>
-              <div className="space-y-2">
-                <span className="text-xs font-medium text-muted-foreground">Title</span>
-                <Input
-                  value={workflowConfig.title ?? ''}
-                  placeholder="Optional workflow title"
-                  onChange={(event) =>
-                    handleWorkflowFieldChange({
-                      config: {
-                        ...(workflowState.config ?? {}),
-                        title: event.target.value || null,
-                      },
-                    })
-                  }
-                />
-              </div>
-              <div className="space-y-2">
-                <span className="text-xs font-medium text-muted-foreground">Protocol</span>
-                <Select
-                  value={workflowProtocolId}
-                  onValueChange={(value) =>
-                    handleWorkflowFieldChange({
-                      config: {
-                        ...(workflowState.config ?? {}),
-                        protocol_id: value as api.AgentRunProtocolId,
-                      },
-                    })
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {WORKFLOW_PROTOCOL_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <p className="text-xs text-muted-foreground">
-                  {WORKFLOW_PROTOCOL_OPTIONS.find((option) => option.value === workflowProtocolId)?.description}
-                </p>
-              </div>
-              <div className="space-y-2">
-                <span className="text-xs font-medium text-muted-foreground">Reasoning effort</span>
-                <Select
-                  value={workflowReasoningEffort ?? '__inherit__'}
-                  onValueChange={(value) =>
-                    handleWorkflowFieldChange({
-                      config: {
-                        ...(workflowState.config ?? {}),
-                        reasoning_effort:
-                          value === '__inherit__' ? effectiveInference.reasoningEffort : value as api.ReasoningEffort,
-                      },
-                    })
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__inherit__">Inherit chat setting</SelectItem>
-                    {supportedReasoningEfforts.map((option) => (
-                      <SelectItem key={option} value={option}>
-                        {option}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </section>
-
-            <Separator />
-
-            <section className="space-y-3">
-              <div>
-                <p className="text-sm font-medium text-foreground">Execution / schedule</p>
-                <p className="text-xs text-muted-foreground">
-                  Existing controlled execution boundaries stay in the runtime. This panel stores defaults only.
-                </p>
-              </div>
-              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Max wall clock (sec)</span>
-                    <Input
-                      value={String(workflowRunPolicy.max_wall_clock_sec ?? '')}
-                      placeholder="1800"
-                      onChange={(event) =>
-                        handleWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            max_wall_clock_sec: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : null,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Heartbeat timeout (sec)</span>
-                    <Input
-                      value={String(workflowRunPolicy.heartbeat_timeout_sec ?? '')}
-                      placeholder="90"
-                      onChange={(event) =>
-                        handleWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            heartbeat_timeout_sec: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : null,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Checkpoint steps</span>
-                    <Input
-                      value={String(workflowRunPolicy.checkpoint_interval_steps ?? '')}
-                      placeholder="1"
-                      onChange={(event) =>
-                        handleWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            checkpoint_interval_steps: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : undefined,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Max subagent failures</span>
-                    <Input
-                      value={String(workflowRunPolicy.max_subagent_failures_per_role ?? '')}
-                      placeholder="2"
-                      onChange={(event) =>
-                        handleWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            max_subagent_failures_per_role: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : undefined,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">On budget exhausted</span>
-                    <Select
-                      value={workflowRunPolicy.on_budget_exhausted ?? 'finalize_partial'}
-                      onValueChange={(value) =>
-                        handleWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            on_budget_exhausted: value as 'pause' | 'finalize_partial',
-                          },
-                        })
-                      }
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="finalize_partial">Finalize partial</SelectItem>
-                        <SelectItem value="pause">Pause</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">On subagent disconnect</span>
-                    <Select
-                      value={workflowRunPolicy.on_subagent_disconnect ?? 'pause'}
-                      onValueChange={(value) =>
-                        handleWorkflowConfigPatch({
-                          run_policy: {
-                            ...workflowRunPolicy,
-                            on_subagent_disconnect: value as 'retry_then_degrade' | 'pause' | 'fail',
-                          },
-                        })
-                      }
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="pause">Pause</SelectItem>
-                        <SelectItem value="retry_then_degrade">Retry then degrade</SelectItem>
-                        <SelectItem value="fail">Fail</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Controlled execution</p>
-                    <p className="text-xs text-muted-foreground">
-                      Keep subagents proposal-only while the controller owns runtime execution.
-                    </p>
-                  </div>
-                  <Switch
-                    checked={workflowExecutionPolicy.mode === 'controlled'}
-                    onCheckedChange={(checked) =>
-                      handleWorkflowConfigPatch({
-                        execution_policy: checked
-                          ? {
-                              ...workflowExecutionPolicy,
-                              mode: 'controlled',
-                              max_execution_requests:
-                                Number(workflowExecutionPolicy.max_execution_requests) || 1,
-                              max_commands_per_request:
-                                Number(workflowExecutionPolicy.max_commands_per_request) || 1,
-                              default_timeout_sec:
-                                Number(workflowExecutionPolicy.default_timeout_sec) || 300,
-                              background_allowed:
-                                workflowExecutionPolicy.background_allowed !== false,
-                            }
-                          : {},
-                      })
-                    }
-                  />
-                </div>
-                {workflowExecutionPolicy.mode === 'controlled' ? (
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-2">
-                      <span className="text-xs font-medium text-muted-foreground">Max exec requests</span>
-                      <Input
-                        value={String(workflowExecutionPolicy.max_execution_requests ?? '')}
-                        placeholder="1"
-                        onChange={(event) =>
-                          handleWorkflowConfigPatch({
-                            execution_policy: {
-                              ...workflowExecutionPolicy,
-                              mode: 'controlled',
-                              max_execution_requests: event.target.value
-                                ? Number.parseInt(event.target.value, 10)
-                                : 1,
-                            },
-                          })
-                        }
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <span className="text-xs font-medium text-muted-foreground">Max commands / request</span>
-                      <Input
-                        value={String(workflowExecutionPolicy.max_commands_per_request ?? '')}
-                        placeholder="1"
-                        onChange={(event) =>
-                          handleWorkflowConfigPatch({
-                            execution_policy: {
-                              ...workflowExecutionPolicy,
-                              mode: 'controlled',
-                              max_commands_per_request: event.target.value
-                                ? Number.parseInt(event.target.value, 10)
-                                : 1,
-                            },
-                          })
-                        }
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <span className="text-xs font-medium text-muted-foreground">Default exec timeout</span>
-                      <Input
-                        value={String(workflowExecutionPolicy.default_timeout_sec ?? '')}
-                        placeholder="300"
-                        onChange={(event) =>
-                          handleWorkflowConfigPatch({
-                            execution_policy: {
-                              ...workflowExecutionPolicy,
-                              mode: 'controlled',
-                              default_timeout_sec: event.target.value
-                                ? Number.parseInt(event.target.value, 10)
-                                : 300,
-                            },
-                          })
-                        }
-                      />
-                    </div>
-                    <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
-                      <span className="text-xs text-muted-foreground">Allow background execution</span>
-                      <Switch
-                        checked={workflowExecutionPolicy.background_allowed !== false}
-                        onCheckedChange={(checked) =>
-                          handleWorkflowConfigPatch({
-                            execution_policy: {
-                              ...workflowExecutionPolicy,
-                              mode: 'controlled',
-                              background_allowed: checked,
-                            },
-                          })
-                        }
-                      />
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-
-              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Evidence collection</p>
-                    <p className="text-xs text-muted-foreground">
-                      Configure retrieval defaults for new workflow runs.
-                    </p>
-                  </div>
-                  <Switch
-                    checked={workflowEvidenceConfig.enabled !== false}
-                    onCheckedChange={(checked) =>
-                      handleWorkflowConfigPatch({
-                        evidence: {
-                          ...workflowEvidenceConfig,
-                          enabled: checked,
-                          mode: String(workflowEvidenceConfig.mode ?? 'hybrid'),
-                        },
-                      })
-                    }
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Mode</span>
-                    <Select
-                      value={String(workflowEvidenceConfig.mode ?? 'hybrid')}
-                      onValueChange={(value) =>
-                        handleWorkflowConfigPatch({
-                          evidence: {
-                            ...workflowEvidenceConfig,
-                            enabled: workflowEvidenceConfig.enabled !== false,
-                            mode: value,
-                          },
-                        })
-                      }
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="hybrid">Hybrid</SelectItem>
-                        <SelectItem value="web_only">Web only</SelectItem>
-                        <SelectItem value="local_only">Local only</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Max results / query</span>
-                    <Input
-                      value={String(workflowEvidenceConfig.max_results_per_query ?? '')}
-                      placeholder="3"
-                      onChange={(event) =>
-                        handleWorkflowConfigPatch({
-                          evidence: {
-                            ...workflowEvidenceConfig,
-                            enabled: workflowEvidenceConfig.enabled !== false,
-                            max_results_per_query: event.target.value
-                              ? Number.parseInt(event.target.value, 10)
-                              : 3,
-                          },
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-3 rounded-lg border border-border bg-surface-layer px-3 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Schedule</p>
-                    <p className="text-xs text-muted-foreground">
-                      Let this workflow execute via backend scheduling instead of immediate start.
-                    </p>
-                  </div>
-                  <Switch
-                    checked={workflowScheduleEnabled(workflowState)}
-                    onCheckedChange={(checked) =>
-                      handleWorkflowConfigPatch({
-                        schedule: buildWorkflowScheduleConfig(
-                          workflowScheduleConfig,
-                          workflowScheduleType,
-                          checked
-                        ),
-                      })
-                    }
-                  />
-                </div>
-                {workflowScheduleEnabled(workflowState) ? (
-                  <>
-                    <div className="space-y-2">
-                      <span className="text-xs font-medium text-muted-foreground">Schedule type</span>
-                      <Select
-                        value={workflowScheduleType}
-                        onValueChange={(value) =>
-                          handleWorkflowConfigPatch({
-                            schedule: buildWorkflowScheduleConfig(
-                              workflowScheduleConfig,
-                              value as WorkflowScheduleType,
-                              true
-                            ),
-                          })
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="interval">Interval</SelectItem>
-                          <SelectItem value="once">One-shot</SelectItem>
-                          <SelectItem value="cron">Cron</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    {workflowScheduleType === 'interval' ? (
-                      <div className="space-y-2">
-                        <span className="text-xs font-medium text-muted-foreground">Interval seconds</span>
-                        <Input
-                          value={String(workflowScheduleConfig.interval_seconds ?? '')}
-                          placeholder="3600"
-                          onChange={(event) =>
-                            handleWorkflowConfigPatch({
-                              schedule: {
-                                ...workflowScheduleConfig,
-                                enabled: true,
-                                interval_seconds: event.target.value
-                                  ? Number.parseInt(event.target.value, 10)
-                                  : 3600,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    ) : null}
-                    {workflowScheduleType === 'once' ? (
-                      <div className="space-y-2">
-                        <span className="text-xs font-medium text-muted-foreground">Run at</span>
-                        <Input
-                          type="datetime-local"
-                          value={formatWorkflowScheduleRunAt(workflowScheduleConfig.run_at)}
-                          onChange={(event) =>
-                            handleWorkflowConfigPatch({
-                              schedule: {
-                                ...workflowScheduleConfig,
-                                enabled: true,
-                                run_at: event.target.value,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    ) : null}
-                    {workflowScheduleType === 'cron' ? (
-                      <div className="space-y-2">
-                        <span className="text-xs font-medium text-muted-foreground">Cron</span>
-                        <Input
-                          value={String(workflowScheduleConfig.cron ?? '')}
-                          placeholder="0 9 * * 1"
-                          onChange={(event) =>
-                            handleWorkflowConfigPatch({
-                              schedule: {
-                                ...workflowScheduleConfig,
-                                enabled: true,
-                                cron: event.target.value,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    ) : null}
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="space-y-2">
-                        <span className="text-xs font-medium text-muted-foreground">Timezone</span>
-                        <Input
-                          value={String(workflowScheduleConfig.timezone ?? '')}
-                          placeholder={defaultScheduleTimezone()}
-                          onChange={(event) =>
-                            handleWorkflowConfigPatch({
-                              schedule: {
-                                ...workflowScheduleConfig,
-                                enabled: true,
-                                timezone: event.target.value,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <span className="text-xs font-medium text-muted-foreground">Max runs</span>
-                        <Input
-                          value={
-                            workflowScheduleConfig.max_runs === null || workflowScheduleConfig.max_runs === undefined
-                              ? ''
-                              : String(workflowScheduleConfig.max_runs)
-                          }
-                          placeholder="Optional"
-                          onChange={(event) =>
-                            handleWorkflowConfigPatch({
-                              schedule: {
-                                ...workflowScheduleConfig,
-                                enabled: true,
-                                max_runs: event.target.value
-                                  ? Number.parseInt(event.target.value, 10)
-                                  : null,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    </div>
-                    {workflowScheduleType !== 'once' ? (
-                      <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
-                        <span className="text-xs text-muted-foreground">Start immediately</span>
-                        <Switch
-                          checked={workflowScheduleConfig.start_immediately !== false}
-                          onCheckedChange={(checked) =>
-                            handleWorkflowConfigPatch({
-                              schedule: {
-                                ...workflowScheduleConfig,
-                                enabled: true,
-                                start_immediately: checked,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    ) : null}
-                    <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
-                      <span className="text-xs text-muted-foreground">Auto-pause on failure</span>
-                      <Switch
-                        checked={workflowScheduleConfig.auto_pause_on_failure !== false}
-                        onCheckedChange={(checked) =>
-                          handleWorkflowConfigPatch({
-                            schedule: {
-                              ...workflowScheduleConfig,
-                              enabled: true,
-                              auto_pause_on_failure: checked,
-                            },
-                          })
-                        }
-                      />
-                    </div>
-                  </>
-                ) : null}
-              </div>
-            </section>
-
-            <Separator />
-
-            <section className="space-y-3">
-              <div>
-                <p className="text-sm font-medium text-foreground">Status / recovery</p>
-                <p className="text-xs text-muted-foreground">
-                  Full artifacts, logs, and recovery actions stay available from the run detail page.
-                </p>
-              </div>
-              <div className="rounded-lg border border-border bg-surface-layer px-3 py-3 text-xs text-muted-foreground">
-                <p>Workflow busy: {workflowBusy ? 'Yes' : 'No'}</p>
-                <p>Last error: {workflowError ?? 'None'}</p>
-              </div>
-            </section>
-
-            <div className="flex items-center justify-end gap-2 pt-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setWorkflowPanelOpen(false)}
-              >
-                Close
-              </Button>
-              <Button
-                type="button"
-                onClick={() => void handleWorkflowSave()}
-              >
-                Save settings
-              </Button>
-            </div>
-          </div>
-        </SheetContent>
-      </Sheet>
+      <WorkflowPanel
+        open={workflowPanelOpen}
+        onOpenChange={setWorkflowPanelOpen}
+        workflowEnabled={workflowEnabled}
+        workflowBusy={workflowBusy}
+        workflowError={workflowError}
+        workflowBoundRunId={workflowBoundRunId}
+        workflowState={workflowState}
+        workflowConfig={workflowConfig}
+        workflowProtocolId={workflowProtocolId}
+        workflowReasoningEffort={workflowReasoningEffort}
+        workflowRunPolicy={workflowRunPolicy}
+        workflowExecutionPolicy={workflowExecutionPolicy}
+        workflowEvidenceConfig={workflowEvidenceConfig}
+        workflowScheduleConfig={workflowScheduleConfig}
+        workflowScheduleType={workflowScheduleType}
+        workflowScheduleEnabled={workflowScheduleEnabled(workflowState)}
+        workflowProtocolOptions={WORKFLOW_PROTOCOL_OPTIONS}
+        supportedReasoningEfforts={supportedReasoningEfforts}
+        effectiveInferenceReasoningEffort={effectiveInference.reasoningEffort}
+        effectiveProjectId={effectiveProjectId}
+        projects={projects}
+        workflowProjectWorkspace={workflowProject?.workspaceDir ?? null}
+        uploadTargetDir={uploadTargetDir ?? null}
+        effectiveWorkflowWorkspace={effectiveWorkflowWorkspace}
+        onWorkflowToggle={(enabled) => {
+          void handleWorkflowToggle(enabled)
+        }}
+        onWorkflowNewRun={() => {
+          void handleWorkflowNewRun()
+        }}
+        onOpenRunDetail={(runId) => router.push(`/agent-runs/${runId}`)}
+        onWorkflowProjectChange={(projectId) => {
+          void handleWorkflowProjectChange(projectId)
+        }}
+        onWorkflowFieldChange={handleWorkflowFieldChange}
+        onWorkflowConfigPatch={handleWorkflowConfigPatch}
+        onWorkflowSave={() => {
+          void handleWorkflowSave()
+        }}
+        buildWorkflowScheduleConfig={buildWorkflowScheduleConfig}
+        formatWorkflowScheduleRunAt={formatWorkflowScheduleRunAt}
+        defaultScheduleTimezone={defaultScheduleTimezone}
+      />
 
       <VoiceOverlay
         open={voiceOpen}

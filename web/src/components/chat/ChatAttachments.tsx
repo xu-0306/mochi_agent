@@ -9,6 +9,7 @@ import {
   FileSpreadsheet,
   FileText,
   Loader2,
+  Quote,
   X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -26,6 +27,8 @@ import { cn } from '@/lib/utils'
 interface ChatAttachmentsProps {
   attachments: ChatAttachment[]
   variant?: 'composer' | 'message'
+  sessionId?: string | null
+  projectId?: string | null
   onRemove?: (attachment: ChatAttachment) => void
   className?: string
 }
@@ -69,6 +72,41 @@ function getPreviewMode(attachment: ChatAttachment): PreviewMode {
   return 'download'
 }
 
+function attachmentIdentity(attachment: ChatAttachment): string {
+  return [
+    attachment.id ?? '',
+    attachment.path,
+    attachment.source ?? '',
+    attachment.lineStart ?? '',
+    attachment.lineEnd ?? '',
+    attachment.quote ?? '',
+  ].join('::')
+}
+
+function getAttachmentSourceLabel(attachment: ChatAttachment): string {
+  const source = attachment.source?.toLowerCase()
+  if (source === 'workspace_file') {
+    return 'Workspace file'
+  }
+  if (source === 'workspace_selection') {
+    return 'Code selection'
+  }
+  if (source === 'image') {
+    return 'Image'
+  }
+  return 'Upload'
+}
+
+function getAttachmentRangeLabel(attachment: ChatAttachment): string | null {
+  if (attachment.lineStart == null) {
+    return null
+  }
+  if (attachment.lineEnd != null && attachment.lineEnd !== attachment.lineStart) {
+    return `Lines ${attachment.lineStart}-${attachment.lineEnd}`
+  }
+  return `Line ${attachment.lineStart}`
+}
+
 function formatFileSize(size?: number | null): string {
   if (!size || size <= 0) {
     return 'Attached file'
@@ -101,6 +139,8 @@ function AttachmentIcon({ attachment }: { attachment: ChatAttachment }) {
 export function ChatAttachments({
   attachments,
   variant = 'message',
+  sessionId,
+  projectId,
   onRemove,
   className,
 }: ChatAttachmentsProps) {
@@ -127,7 +167,10 @@ export function ChatAttachments({
 
     void (async () => {
       try {
-        const payload = await api.fetchFilesystemPreviewText(activeAttachment.path)
+        const payload = await api.fetchAttachmentPreviewText(activeAttachment, {
+          sessionId,
+          projectId,
+        })
         if (cancelled) {
           return
         }
@@ -147,21 +190,25 @@ export function ChatAttachments({
     return () => {
       cancelled = true
     }
-  }, [activeAttachment])
+  }, [activeAttachment, projectId, sessionId])
 
   if (attachments.length === 0) {
     return null
   }
 
-  const previewUrl = activeAttachment ? api.buildFilesystemFileUrl(activeAttachment.path) : null
+  const previewUrl = activeAttachment
+    ? api.buildAttachmentFileUrl(activeAttachment, { sessionId, projectId })
+    : null
   const previewMode = activeAttachment ? getPreviewMode(activeAttachment) : null
 
   return (
     <>
       <div className={cn('flex flex-wrap gap-2', className)}>
         {attachments.map((attachment) => {
-          const fileUrl = api.buildFilesystemFileUrl(attachment.path)
+          const fileUrl = api.buildAttachmentFileUrl(attachment, { sessionId, projectId })
           const isImage = isImageAttachment(attachment)
+          const sourceLabel = getAttachmentSourceLabel(attachment)
+          const rangeLabel = getAttachmentRangeLabel(attachment)
           const surfaceClass =
             variant === 'composer'
               ? 'border-border/80 bg-canvas/80 hover:border-primary-500/60 hover:bg-elevated-layer'
@@ -169,7 +216,7 @@ export function ChatAttachments({
 
           return (
             <div
-              key={attachment.id ?? attachment.path}
+              key={attachmentIdentity(attachment)}
               className={cn(
                 'group relative overflow-hidden rounded-2xl border shadow-[0_14px_35px_rgba(0,0,0,0.18)] transition-all duration-200',
                 'w-[180px]',
@@ -209,6 +256,30 @@ export function ChatAttachments({
                   <div className="pointer-events-none absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t from-black/55 to-transparent" />
                 </div>
                 <div className="space-y-1 px-3 py-3">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={cn(
+                        'rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-[0.12em] uppercase',
+                        variant === 'composer'
+                          ? 'border border-border bg-elevated-layer text-muted-foreground'
+                          : 'border border-white/14 bg-black/20 text-white/72'
+                      )}
+                    >
+                      {sourceLabel}
+                    </span>
+                    {rangeLabel ? (
+                      <span
+                        className={cn(
+                          'rounded-full px-2 py-0.5 text-[10px]',
+                          variant === 'composer'
+                            ? 'bg-primary-500/10 text-primary-300'
+                            : 'bg-white/10 text-white/80'
+                        )}
+                      >
+                        {rangeLabel}
+                      </span>
+                    ) : null}
+                  </div>
                   <p
                     className={cn(
                       'line-clamp-2 text-sm font-medium leading-5',
@@ -225,6 +296,32 @@ export function ChatAttachments({
                   >
                     {formatFileSize(attachment.size)}
                   </p>
+                  {attachment.quote ? (
+                    <div
+                      className={cn(
+                        'rounded-xl px-2.5 py-2 text-[11px] leading-5',
+                        variant === 'composer'
+                          ? 'bg-elevated-layer text-muted-foreground'
+                          : 'bg-black/20 text-white/72'
+                      )}
+                    >
+                      <div className="mb-1 flex items-center gap-1">
+                        <Quote className="h-3 w-3" />
+                        <span>Quoted context</span>
+                      </div>
+                      <p className="line-clamp-3 whitespace-pre-wrap break-words">{attachment.quote}</p>
+                    </div>
+                  ) : null}
+                  {attachment.note ? (
+                    <p
+                      className={cn(
+                        'text-[11px] leading-5',
+                        variant === 'composer' ? 'text-muted-foreground' : 'text-white/68'
+                      )}
+                    >
+                      {attachment.note}
+                    </p>
+                  ) : null}
                 </div>
               </button>
               {onRemove ? (
@@ -254,6 +351,12 @@ export function ChatAttachments({
               <DialogHeader className="border-b border-border/70 px-5 pt-5 pb-4">
                 <DialogTitle className="pr-10">{activeAttachment.name}</DialogTitle>
                 <DialogDescription className="break-all">{activeAttachment.path}</DialogDescription>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span>{getAttachmentSourceLabel(activeAttachment)}</span>
+                  {getAttachmentRangeLabel(activeAttachment) ? (
+                    <span>{getAttachmentRangeLabel(activeAttachment)}</span>
+                  ) : null}
+                </div>
               </DialogHeader>
 
               <div className="max-h-[75vh] overflow-auto bg-canvas/70 px-5 py-4">
@@ -284,6 +387,14 @@ export function ChatAttachments({
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[13px] leading-6">
                           {previewText || 'No preview text available.'}
                         </pre>
+                        {activeAttachment.quote ? (
+                          <div className="mt-4 rounded-xl border border-border/70 bg-slate-950/70 p-3 text-xs text-slate-300">
+                            <p className="mb-1 font-medium text-slate-200">Quoted selection</p>
+                            <pre className="whitespace-pre-wrap break-words font-mono leading-5">
+                              {activeAttachment.quote}
+                            </pre>
+                          </div>
+                        ) : null}
                         {previewTruncated ? (
                           <p className="mt-3 text-xs text-slate-400">
                             Preview truncated for readability.

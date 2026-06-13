@@ -10,12 +10,16 @@ import type { Message } from '@/lib/chat'
 import { ReasoningPanel } from './ReasoningPanel'
 import { CopyButton } from './CopyButton'
 import type { FileChangeSummary } from '@/lib/chat-p2'
+import { extractFileChangeFromReasoningStep } from '@/lib/chat-p2'
 import { Button } from '@/components/ui/button'
 import { createMarkdownCodeComponents } from '@/components/code/markdown-code'
 import { ChatAttachments } from './ChatAttachments'
+import { FileChangeCard } from './FileChangeCard'
 
 interface ChatMessageProps {
   message: Message
+  sessionId?: string | null
+  projectId?: string | null
   onRegenerate?: (message: Message) => void
   onEditAndResend?: (message: Message, nextContent: string) => Promise<void> | void
   onUndoFileChange?: (change: FileChangeSummary) => Promise<void> | void
@@ -67,6 +71,8 @@ function formatTokenStats(message: Message): string | null {
 
 export function ChatMessage({
   message,
+  sessionId,
+  projectId,
   onRegenerate,
   onEditAndResend,
   onUndoFileChange,
@@ -89,6 +95,13 @@ export function ChatMessage({
     []
   )
   const prefersWideAssistantLayout = type === 'assistant' && hasWideMarkdownContent(content)
+  const fileChanges = React.useMemo(
+    () =>
+      (reasoningSteps ?? [])
+        .map((step) => extractFileChangeFromReasoningStep(step))
+        .filter((change): change is FileChangeSummary => change !== null),
+    [reasoningSteps]
+  )
 
   if (type === 'system') {
     return (
@@ -164,7 +177,12 @@ export function ChatMessage({
               <div className="space-y-3">
                 {content ? <div>{content}</div> : null}
                 {message.attachments && message.attachments.length > 0 ? (
-                  <ChatAttachments attachments={message.attachments} variant="message" />
+                  <ChatAttachments
+                    attachments={message.attachments}
+                    variant="message"
+                    sessionId={sessionId}
+                    projectId={projectId}
+                  />
                 ) : null}
               </div>
             </div>
@@ -214,6 +232,17 @@ export function ChatMessage({
                 </ReactMarkdown>
                 {isStreaming ? <span className="ml-0.5 animate-blink text-primary-400">|</span> : null}
               </div>
+              {fileChanges.length > 0 ? (
+                <div className="mt-4 space-y-3">
+                  {fileChanges.map((change, index) => (
+                    <FileChangeCard
+                      key={`${change.filePath}:${index}`}
+                      change={change}
+                      onUndo={onUndoFileChange}
+                    />
+                  ))}
+                </div>
+              ) : null}
               <div className="mt-2 flex items-center justify-between gap-2 opacity-0 transition-opacity group-hover:opacity-100">
                 <span className="text-[11px] text-muted-foreground" title={timestampTitle}>
                   {timestampLabel}

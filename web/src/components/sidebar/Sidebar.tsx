@@ -3,6 +3,7 @@
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
 import {
+  Check,
   ChevronDown,
   ChevronRight,
   FolderPlus,
@@ -80,6 +81,10 @@ export function Sidebar() {
   const collapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed)
   const [search, setSearch] = React.useState('')
+  const [selectionMode, setSelectionMode] = React.useState(false)
+  const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([])
+  const [pendingBulkDeleteIds, setPendingBulkDeleteIds] = React.useState<string[]>([])
+  const [isBulkDeleting, setIsBulkDeleting] = React.useState(false)
   const [pendingDeleteSession, setPendingDeleteSession] = React.useState<Session | null>(null)
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = React.useState<string | null>(null)
   const [projectDialog, setProjectDialog] = React.useState<ProjectDialogState | null>(null)
@@ -133,6 +138,28 @@ export function Sidebar() {
     () => groupSessionsByProject(visibleSessions),
     [visibleSessions]
   )
+  const visibleSessionIds = React.useMemo(() => {
+    const ids: string[] = []
+    ids.push(...drafts.map((session) => session.id))
+    ids.push(...unassigned.map((session) => session.id))
+    for (const projectId of expandedProjectIds) {
+      ids.push(...(byProject[projectId] ?? []).map((session) => session.id))
+    }
+    return ids
+  }, [byProject, drafts, expandedProjectIds, unassigned])
+  const selectedVisibleCount = React.useMemo(
+    () => visibleSessionIds.filter((id) => selectedSessionIds.includes(id)).length,
+    [selectedSessionIds, visibleSessionIds]
+  )
+  const allVisibleSelected =
+    visibleSessionIds.length > 0 && selectedVisibleCount === visibleSessionIds.length
+
+  React.useEffect(() => {
+    if (collapsed && selectionMode) {
+      setSelectionMode(false)
+      setSelectedSessionIds([])
+    }
+  }, [collapsed, selectionMode])
 
   const handleNewSession = () => {
     const draftId = createDraftSession(activeProjectId)
@@ -145,6 +172,38 @@ export function Sidebar() {
     router.push('/')
   }
 
+  const handleToggleSelectionMode = () => {
+    setSelectionMode((current) => {
+      if (current) {
+        setSelectedSessionIds([])
+      }
+      return !current
+    })
+  }
+
+  const handleToggleSessionSelected = (id: string) => {
+    setSelectedSessionIds((current) =>
+      current.includes(id)
+        ? current.filter((item) => item !== id)
+        : [...current, id]
+    )
+  }
+
+  const handleToggleSelectAllVisible = () => {
+    if (allVisibleSelected) {
+      setSelectedSessionIds((current) => current.filter((id) => !visibleSessionIds.includes(id)))
+      return
+    }
+
+    setSelectedSessionIds((current) => {
+      const next = new Set(current)
+      for (const id of visibleSessionIds) {
+        next.add(id)
+      }
+      return [...next]
+    })
+  }
+
   const handleConfirmDeleteSession = () => {
     if (!pendingDeleteSession) {
       return
@@ -152,6 +211,26 @@ export function Sidebar() {
     const sessionId = pendingDeleteSession.id
     setPendingDeleteSession(null)
     void deleteSession(sessionId)
+  }
+
+  const handleConfirmBulkDelete = async () => {
+    if (pendingBulkDeleteIds.length === 0) {
+      return
+    }
+
+    const ids = [...pendingBulkDeleteIds]
+    setPendingBulkDeleteIds([])
+    setIsBulkDeleting(true)
+    try {
+      for (const id of ids) {
+        await deleteSession(id)
+      }
+      await loadSessions()
+      setSelectedSessionIds([])
+      setSelectionMode(false)
+    } finally {
+      setIsBulkDeleting(false)
+    }
   }
 
   const handleConfirmDeleteProject = () => {
@@ -210,8 +289,11 @@ export function Sidebar() {
       session={session}
       isActive={session.id === currentSessionId}
       isCollapsed={collapsed}
+      selectionMode={selectionMode}
+      selected={selectedSessionIds.includes(session.id)}
       projects={projects}
       onClick={() => handleSelectSession(session.id)}
+      onToggleSelected={() => handleToggleSessionSelected(session.id)}
       onRename={(title) => void renameSession(session.id, title)}
       onMoveToProject={(projectId) => void moveSessionToProject(session.id, projectId)}
       onDelete={() => setPendingDeleteSession(session)}
@@ -274,6 +356,23 @@ export function Sidebar() {
                   className="pl-8"
                 />
               </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant={selectionMode ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={handleToggleSelectionMode}
+                  title={t('sidebar.bulkDelete')}
+                  className="justify-start"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  <span>{selectionMode ? t('sidebar.bulkCancel') : t('sidebar.bulkDelete')}</span>
+                </Button>
+                {selectionMode ? (
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {t('sidebar.bulkSelectedCount', { count: selectedSessionIds.length })}
+                  </span>
+                ) : null}
+              </div>
             </>
           ) : null}
 
@@ -312,6 +411,35 @@ export function Sidebar() {
         </div>
 
         <nav className="flex-1 space-y-3 overflow-y-auto px-2 py-2">
+          {selectionMode && !collapsed ? (
+            <div className="mx-1 rounded-xl border border-primary-500/20 bg-primary-500/8 p-2.5">
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-primary-300">
+                {t('sidebar.bulkSelectedCount', { count: selectedSessionIds.length })}
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleToggleSelectAllVisible}
+                  disabled={visibleSessionIds.length === 0}
+                >
+                  <Check className="h-4 w-4" />
+                  <span>{allVisibleSelected ? t('sidebar.bulkClearAll') : t('sidebar.bulkSelectAll')}</span>
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => setPendingBulkDeleteIds(selectedSessionIds)}
+                  disabled={selectedSessionIds.length === 0 || isBulkDeleting}
+                  loading={isBulkDeleting}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  <span>{t('sidebar.bulkDeleteSelected')}</span>
+                </Button>
+              </div>
+            </div>
+          ) : null}
+
           {drafts.length > 0 && !collapsed ? (
             <SidebarSection title="Draft Chat">
               {sortSessions(drafts).map(renderSession)}
@@ -419,6 +547,43 @@ export function Sidebar() {
             </Button>
             <Button type="button" variant="destructive" size="md" onClick={handleConfirmDeleteSession}>
               {t('sidebar.deleteDialogAction')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={pendingBulkDeleteIds.length > 0}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingBulkDeleteIds([])
+          }
+        }}
+      >
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[430px] rounded-xl border-border/80 p-0 shadow-2xl">
+          <DialogHeader className="mb-0 px-5 pb-3 pt-5">
+            <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-error/12 text-error">
+              <Trash2 className="h-4 w-4" />
+            </div>
+            <DialogTitle className="text-lg">{t('sidebar.bulkDeleteDialogTitle')}</DialogTitle>
+            <DialogDescription className="leading-6">
+              {t('sidebar.bulkDeleteDialogDescription', {
+                count: pendingBulkDeleteIds.length,
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-0 gap-2 border-t border-border/70 px-5 py-4 sm:flex-row sm:justify-end">
+            <Button type="button" variant="ghost" size="md" onClick={() => setPendingBulkDeleteIds([])}>
+              {t('common.cancel')}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              size="md"
+              onClick={() => void handleConfirmBulkDelete()}
+              loading={isBulkDeleting}
+            >
+              {t('sidebar.bulkDeleteSelected')}
             </Button>
           </DialogFooter>
         </DialogContent>

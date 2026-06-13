@@ -35,6 +35,11 @@ class AttachmentRef:
     path: str
     size: int | None = None
     content_type: str | None = None
+    source: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    quote: str | None = None
+    note: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,7 +47,48 @@ class AttachmentRef:
             "path": self.path,
             "size": self.size,
             "content_type": self.content_type,
+            "source": self.source,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "quote": self.quote,
+            "note": self.note,
         }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> AttachmentRef | None:
+        if not isinstance(value, dict):
+            return None
+
+        name = value.get("name")
+        path = value.get("path")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if not isinstance(path, str) or not path.strip():
+            return None
+
+        size = value.get("size")
+        content_type = value.get("content_type", value.get("contentType"))
+        source = value.get("source")
+        line_start = value.get("line_start", value.get("lineStart"))
+        line_end = value.get("line_end", value.get("lineEnd"))
+        quote = value.get("quote")
+        note = value.get("note")
+
+        return cls(
+            name=name.strip(),
+            path=path.strip(),
+            size=size if isinstance(size, int) and size >= 0 else None,
+            content_type=(
+                content_type.strip()
+                if isinstance(content_type, str) and content_type.strip()
+                else None
+            ),
+            source=source.strip() if isinstance(source, str) and source.strip() else None,
+            line_start=line_start if isinstance(line_start, int) and line_start > 0 else None,
+            line_end=line_end if isinstance(line_end, int) and line_end > 0 else None,
+            quote=quote if isinstance(quote, str) and quote.strip() else None,
+            note=note if isinstance(note, str) and note.strip() else None,
+        )
 
 
 @dataclass

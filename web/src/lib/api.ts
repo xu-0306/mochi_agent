@@ -84,9 +84,35 @@ function normalizeAttachments(value: unknown): ChatAttachment[] {
       path,
       size: getNumber(item.size) ?? null,
       contentType: getNonEmptyString(item.content_type) ?? getNonEmptyString(item.contentType),
+      source: getNonEmptyString(item.source),
+      lineStart: getNumber(item.line_start) ?? getNumber(item.lineStart) ?? null,
+      lineEnd: getNumber(item.line_end) ?? getNumber(item.lineEnd) ?? null,
+      quote: getNonEmptyString(item.quote),
+      note: getNonEmptyString(item.note),
     })
   })
   return attachments
+}
+
+function serializeChatAttachment(attachment: ChatAttachment): Record<string, unknown> {
+  return {
+    ...(attachment.id ? { id: attachment.id } : {}),
+    name: attachment.name,
+    path: attachment.path,
+    size: attachment.size ?? null,
+    content_type: attachment.contentType ?? null,
+    source: attachment.source ?? null,
+    line_start: attachment.lineStart ?? null,
+    line_end: attachment.lineEnd ?? null,
+    quote: attachment.quote ?? null,
+    note: attachment.note ?? null,
+  }
+}
+
+function serializeChatAttachments(
+  attachments: ChatAttachment[] | undefined
+): Array<Record<string, unknown>> | undefined {
+  return attachments?.map((attachment) => serializeChatAttachment(attachment))
 }
 
 function toIsoString(value: unknown): string {
@@ -1134,7 +1160,7 @@ export async function sendMessage(
       project_id: options.projectId,
       model: options.model,
       selected_skill_ids: options.selectedSkillIds,
-      attachments: options.attachments,
+      attachments: serializeChatAttachments(options.attachments),
       system_prompt: options.systemPrompt,
       temperature: options.temperature,
       max_tokens: options.maxTokens,
@@ -1168,7 +1194,7 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       project_id: payload.project_id ?? payload.projectId,
       model: payload.model,
       selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
-      attachments: payload.attachments,
+      attachments: serializeChatAttachments(payload.attachments),
       system_prompt: payload.system_prompt,
       temperature: payload.temperature,
       max_tokens: payload.max_tokens,
@@ -1196,7 +1222,7 @@ export async function fetchChatContextPreview(
         project_id: payload.project_id ?? payload.projectId,
         model: payload.model,
         selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
-        attachments: payload.attachments,
+        attachments: serializeChatAttachments(payload.attachments),
         system_prompt: payload.system_prompt,
         temperature: payload.temperature,
         max_tokens: payload.max_tokens,
@@ -1407,7 +1433,7 @@ async function requestStreamResponse(
         project_id: options.projectId,
         model: options.model,
         selected_skill_ids: options.selectedSkillIds,
-        attachments: options.attachments,
+        attachments: serializeChatAttachments(options.attachments),
         system_prompt: options.systemPrompt,
         temperature: options.temperature,
         max_tokens: options.maxTokens,
@@ -3356,6 +3382,11 @@ export interface FilesystemPreviewTextResult {
   mediaType: string
 }
 
+export interface AttachmentRequestContext {
+  sessionId?: string | null
+  projectId?: string | null
+}
+
 export function buildFilesystemFileUrl(path: string): string {
   const query = new URLSearchParams({ path })
   return `${resolveApiUrl('/filesystem/file')}?${query.toString()}`
@@ -3377,6 +3408,205 @@ export async function fetchFilesystemPreviewText(
     text: getString(payload.text) ?? '',
     truncated: getBoolean(payload.truncated) ?? false,
     mediaType: getString(payload.media_type) ?? 'text/plain',
+  }
+}
+
+export function buildAttachmentFileUrl(
+  attachment: ChatAttachment,
+  context: AttachmentRequestContext = {}
+): string {
+  const source = attachment.source?.toLowerCase()
+  if (source === 'workspace_file' || source === 'workspace_selection') {
+    return buildWorkspaceFileUrl(attachment.path, context)
+  }
+  return buildFilesystemFileUrl(attachment.path)
+}
+
+export async function fetchAttachmentPreviewText(
+  attachment: ChatAttachment,
+  context: AttachmentRequestContext = {},
+  maxChars = 12000
+): Promise<FilesystemPreviewTextResult> {
+  const source = attachment.source?.toLowerCase()
+  if (source === 'workspace_file' || source === 'workspace_selection') {
+    const payload = await fetchWorkspacePreview(attachment.path, {
+      ...context,
+      maxChars,
+    })
+    return {
+      type: 'filesystem_preview_text',
+      path: payload.path,
+      name: payload.name,
+      text: payload.text,
+      truncated: payload.truncated,
+      mediaType: payload.mediaType,
+    }
+  }
+  return fetchFilesystemPreviewText(attachment.path, maxChars)
+}
+
+export interface WorkspaceTreeItem {
+  name: string
+  path: string
+  relativePath: string
+  isDir: boolean
+  isFile: boolean
+  size?: number | null
+}
+
+export interface WorkspaceTreeResult {
+  workspaceDir: string
+  projectId: string | null
+  path: string
+  relativePath: string
+  parent: string | null
+  selectedPath: string | null
+  items: WorkspaceTreeItem[]
+}
+
+export interface WorkspacePreviewResult {
+  type: 'workspace_preview'
+  workspaceDir: string
+  projectId: string | null
+  path: string
+  relativePath: string
+  name: string
+  text: string
+  truncated: boolean
+  mediaType: string
+}
+
+export interface WorkspaceChange {
+  path: string
+  relativePath: string
+  status: string
+  staged: boolean
+  addedLines: number
+  deletedLines: number
+  diffAvailable: boolean
+}
+
+export interface WorkspaceChangesResult {
+  workspaceDir: string
+  projectId: string | null
+  repoRoot: string | null
+  items: WorkspaceChange[]
+}
+
+export interface WorkspaceDiffResult extends WorkspaceChange {
+  repoRoot: string
+  diff: string | null
+}
+
+export interface WorkspaceQueryOptions {
+  sessionId?: string | null
+  projectId?: string | null
+  path?: string | null
+}
+
+function buildWorkspaceQuery(options: WorkspaceQueryOptions): URLSearchParams {
+  const query = new URLSearchParams()
+  if (options.sessionId) {
+    query.set('session_id', options.sessionId)
+  }
+  if (options.projectId) {
+    query.set('project_id', options.projectId)
+  }
+  if (options.path) {
+    query.set('path', options.path)
+  }
+  return query
+}
+
+export async function fetchWorkspaceTree(
+  options: WorkspaceQueryOptions = {}
+): Promise<WorkspaceTreeResult> {
+  const query = buildWorkspaceQuery(options)
+  const payload = await requestJson<Record<string, unknown>>(`/workspace/tree?${query.toString()}`)
+  return {
+    workspaceDir: getString(payload.workspace_dir) ?? '',
+    projectId: getNullableString(payload.project_id),
+    path: getString(payload.current_path) ?? getString(payload.path) ?? '',
+    relativePath: getString(payload.relative_path) ?? '.',
+    parent: getNullableString(payload.parent_path),
+    selectedPath: getNullableString(payload.selected_path),
+    items: getRecordArray(payload.items).map((item) => ({
+      name: getString(item.name) ?? getString(item.path) ?? '',
+      path: getString(item.path) ?? '',
+      relativePath: getString(item.relative_path) ?? getString(item.path) ?? '',
+      isDir: Boolean(item.is_dir),
+      isFile: Boolean(item.is_file),
+      size: getNumber(item.size) ?? null,
+    })),
+  }
+}
+
+export function buildWorkspaceFileUrl(
+  path: string,
+  options: Omit<WorkspaceQueryOptions, 'path'> = {}
+): string {
+  const query = buildWorkspaceQuery({ ...options, path })
+  return `${resolveApiUrl('/workspace/file')}?${query.toString()}`
+}
+
+export async function fetchWorkspacePreview(
+  path: string,
+  options: Omit<WorkspaceQueryOptions, 'path'> & { maxChars?: number } = {}
+): Promise<WorkspacePreviewResult> {
+  const query = buildWorkspaceQuery({ ...options, path })
+  query.set('max_chars', String(options.maxChars ?? 12000))
+  const payload = await requestJson<Record<string, unknown>>(`/workspace/preview?${query.toString()}`)
+  return {
+    type: 'workspace_preview',
+    workspaceDir: getString(payload.workspace_dir) ?? '',
+    projectId: getNullableString(payload.project_id),
+    path: getString(payload.path) ?? path,
+    relativePath: getString(payload.relative_path) ?? path,
+    name: getString(payload.name) ?? path.split(/[\\/]/).pop() ?? path,
+    text: getString(payload.text) ?? '',
+    truncated: getBoolean(payload.truncated) ?? false,
+    mediaType: getString(payload.media_type) ?? 'text/plain',
+  }
+}
+
+export async function fetchWorkspaceChanges(
+  options: WorkspaceQueryOptions = {}
+): Promise<WorkspaceChangesResult> {
+  const query = buildWorkspaceQuery(options)
+  const payload = await requestJson<Record<string, unknown>>(`/workspace/changes?${query.toString()}`)
+  return {
+    workspaceDir: getString(payload.workspace_dir) ?? '',
+    projectId: getNullableString(payload.project_id),
+    repoRoot: getNullableString(payload.repo_root),
+    items: getRecordArray(payload.items).map((item) => ({
+      path: getString(item.path) ?? '',
+      relativePath: getString(item.relative_path) ?? getString(item.path) ?? '',
+      status: getString(item.status) ?? 'changed',
+      staged: getBoolean(item.staged) ?? false,
+      addedLines: getNumber(item.added_lines) ?? 0,
+      deletedLines: getNumber(item.deleted_lines) ?? 0,
+      diffAvailable: getBoolean(item.diff_available) ?? false,
+    })),
+  }
+}
+
+export async function fetchWorkspaceDiff(
+  path: string,
+  options: Omit<WorkspaceQueryOptions, 'path'> & { contextLines?: number } = {}
+): Promise<WorkspaceDiffResult> {
+  const query = buildWorkspaceQuery({ ...options, path })
+  query.set('context_lines', String(options.contextLines ?? 3))
+  const payload = await requestJson<Record<string, unknown>>(`/workspace/diff?${query.toString()}`)
+  return {
+    path: getString(payload.path) ?? path,
+    relativePath: getString(payload.relative_path) ?? path,
+    status: getString(payload.status) ?? 'changed',
+    staged: getBoolean(payload.staged) ?? false,
+    addedLines: getNumber(payload.added_lines) ?? 0,
+    deletedLines: getNumber(payload.deleted_lines) ?? 0,
+    diffAvailable: getBoolean(payload.diff_available) ?? false,
+    repoRoot: getString(payload.repo_root) ?? '',
+    diff: getString(payload.diff),
   }
 }
 
@@ -5251,7 +5481,7 @@ export async function appendAgentRunMessage(
       content: input.content,
       project_id: input.projectId ?? null,
       workspace_dir: input.workspaceDir ?? null,
-      attachments: input.attachments ?? [],
+      attachments: serializeChatAttachments(input.attachments) ?? [],
       metadata: input.metadata ?? {},
     }),
   })

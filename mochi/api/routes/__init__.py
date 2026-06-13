@@ -13,6 +13,7 @@ from mochi.api.routes.projects import router as projects_router
 from mochi.api.routes.skills import router as skills_router
 from mochi.api.routes.tasks import router as tasks_router
 from mochi.api.routes.voice import router as voice_router
+from mochi.api.routes.workspace import router as workspace_router
 
 from .sessions import router as sessions_router
 from .settings import router as settings_router
@@ -31,4 +32,5 @@ __all__ = [
     "skills_router",
     "tasks_router",
     "voice_router",
+    "workspace_router",
 ]

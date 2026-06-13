@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.backends.types import AttachmentRef
+from mochi.api.attachment_schema import AttachmentPayload
 from mochi.agents.events import (
     ErrorEvent,
     FinalAnswerEvent,
@@ -23,30 +24,12 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
-from mochi.api.routes.projects import _get_project_store
+from mochi.api.routes.workspace import resolve_workspace_scope
 from mochi.api.server import _get_config, _get_or_create_engine, _maybe_await
-from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.sessions.store import SessionStore
 from mochi.utils.streaming import sse_stream
 
 router = APIRouter(prefix="/v1")
-
-
-class ChatAttachmentInput(BaseModel):
-    """Structured attachment metadata from the WebGUI."""
-
-    name: str = Field(min_length=1)
-    path: str = Field(min_length=1)
-    size: int | None = Field(default=None, ge=0)
-    content_type: str | None = None
-
-    def to_attachment_ref(self) -> AttachmentRef:
-        return AttachmentRef(
-            name=self.name,
-            path=self.path,
-            size=self.size,
-            content_type=self.content_type,
-        )
 
 
 class ChatRequest(BaseModel):
@@ -67,7 +50,7 @@ class ChatRequest(BaseModel):
     repeat_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
     reasoning_effort: ReasoningEffort | None = None
     selected_skill_ids: list[str] | None = None
-    attachments: list[ChatAttachmentInput] | None = None
+    attachments: list[AttachmentPayload] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -481,22 +464,12 @@ async def _resolve_chat_project_context(
     session_id: str,
 ) -> tuple[str | None, str]:
     """Resolve effective project assignment and workspace for one request."""
-    config = await _get_config(request.app)
-    resolver = ExecutionScopeResolver(
-        default_workspace_dir=str(getattr(config, "workspace_dir")),
-        session_store=await _get_session_store(request),
-        project_store=_get_project_store(request.app, config=config),
+    resolved_project_id, workspace_root = await resolve_workspace_scope(
+        request,
+        session_id=session_id,
+        project_id=payload.project_id,
     )
-    try:
-        scope = await resolver.resolve(
-            session_id=session_id,
-            project_id=payload.project_id,
-        )
-    except LookupError as exc:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return scope.project_id, scope.workspace_dir
+    return resolved_project_id, str(workspace_root)
 
 
 def _event_phase(event: dict[str, Any]) -> str | None:

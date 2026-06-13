@@ -1,17 +1,13 @@
 'use client'
 
 import * as React from 'react'
-import { Activity, PanelRightClose } from 'lucide-react'
+import { Activity, ExternalLink, PanelRightClose, Workflow } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from '@/components/ui/sheet'
-import type { ApprovalSummary, TaskDetail, TaskSummary } from '@/lib/api'
+import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
+import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
+import * as api from '@/lib/api'
+import type { AgentRunDetail, AgentRunHealthSummary, ApprovalSummary, TaskDetail, TaskSummary } from '@/lib/api'
 import { useTaskStore } from '@/lib/stores/task-store'
 import { cn } from '@/lib/utils'
 
@@ -59,28 +55,8 @@ function formatMetadataLabel(value: string): string {
 interface TaskPanelProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-}
-
-function SectionCard({
-  title,
-  description,
-  children,
-}: {
-  title: string
-  description?: string
-  children: React.ReactNode
-}) {
-  return (
-    <section className="rounded-2xl border border-white/8 bg-canvas/70 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] backdrop-blur-sm">
-      <div className="mb-3">
-        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-        {description ? (
-          <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{description}</p>
-        ) : null}
-      </div>
-      {children}
-    </section>
-  )
+  workflowRunId?: string | null
+  onOpenWorkflowRun?: (runId: string) => void
 }
 
 function TaskPanelBody({
@@ -99,6 +75,10 @@ function TaskPanelBody({
   reject,
   resume,
   cancel,
+  workflowRun,
+  workflowHealth,
+  workflowLoading,
+  onOpenWorkflowRun,
   onClose,
 }: {
   isLoading: boolean
@@ -116,6 +96,10 @@ function TaskPanelBody({
   reject: (approvalId: string) => Promise<void>
   resume: (taskId: string) => Promise<void>
   cancel: (taskId: string) => Promise<void>
+  workflowRun: AgentRunDetail | null
+  workflowHealth: AgentRunHealthSummary | null
+  workflowLoading: boolean
+  onOpenWorkflowRun?: (runId: string) => void
   onClose?: () => void
 }) {
   const pendingApprovals = approvals.filter((item) => item.status === 'pending')
@@ -163,7 +147,63 @@ function TaskPanelBody({
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
         <div className="space-y-4">
-          <SectionCard
+          <PanelSectionCard
+            title="Workflow run"
+            description="Bound workflow run state for this chat session, including recovery and detached exec visibility."
+          >
+            {workflowLoading ? (
+              <p className="rounded-xl border border-dashed border-white/10 bg-surface-layer/50 px-3 py-4 text-center text-xs text-muted-foreground">
+                Loading workflow run...
+              </p>
+            ) : workflowRun ? (
+              <div className="space-y-3 rounded-xl border border-white/8 bg-surface-layer/70 px-3 py-3 text-xs shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Workflow className="h-4 w-4 shrink-0 text-primary-300" />
+                    <span className="truncate font-semibold text-foreground">
+                      {workflowRun.title || workflowRun.run_id}
+                    </span>
+                  </div>
+                  <Badge variant={statusVariant(workflowRun.status)}>{workflowRun.status}</Badge>
+                </div>
+                <div className="grid gap-1 text-muted-foreground">
+                  <p>Run ID: {workflowRun.run_id}</p>
+                  <p>Updated: {formatTime(workflowRun.updated_at)}</p>
+                  <p>Events: {workflowRun.events.length}</p>
+                  {workflowHealth?.schedule_health_status ? (
+                    <p>Recovery: {workflowHealth.schedule_health_status}</p>
+                  ) : null}
+                  {workflowHealth?.detached_exec_jobs ? (
+                    <p>Detached exec jobs: {Object.keys(workflowHealth.detached_exec_jobs).length}</p>
+                  ) : null}
+                </div>
+                {workflowRun.latest_error ? (
+                  <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive">
+                    {workflowRun.latest_error}
+                  </p>
+                ) : null}
+                {onOpenWorkflowRun ? (
+                  <div className="flex gap-1.5 pt-1">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 rounded-full px-3 text-xs"
+                      onClick={() => onOpenWorkflowRun(workflowRun.run_id)}
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      Open workflow run
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <p className="rounded-xl border border-dashed border-white/10 bg-surface-layer/50 px-3 py-4 text-center text-xs text-muted-foreground">
+                No workflow run is currently bound to this chat.
+              </p>
+            )}
+          </PanelSectionCard>
+
+          <PanelSectionCard
             title="Pending approvals"
             description="Decisions that need confirmation before a task can continue."
           >
@@ -236,9 +276,9 @@ function TaskPanelBody({
                 ))
               )}
             </div>
-          </SectionCard>
+          </PanelSectionCard>
 
-          <SectionCard
+          <PanelSectionCard
             title="Recent tasks"
             description="Pick a run to inspect status, output summary, and control actions."
           >
@@ -272,9 +312,9 @@ function TaskPanelBody({
                 ))
               )}
             </div>
-          </SectionCard>
+          </PanelSectionCard>
 
-          <SectionCard
+          <PanelSectionCard
             title="Task detail"
             description="Expanded state, final answer preview, and mutation actions for the selected run."
           >
@@ -330,14 +370,14 @@ function TaskPanelBody({
               </p>
             )}
             {error ? <p className="mt-2 text-xs text-destructive">{error}</p> : null}
-          </SectionCard>
+          </PanelSectionCard>
         </div>
       </div>
     </div>
   )
 }
 
-export function TaskPanel({ open, onOpenChange }: TaskPanelProps) {
+export function TaskPanel({ open, onOpenChange, workflowRunId, onOpenWorkflowRun }: TaskPanelProps) {
   const {
     tasks,
     approvals,
@@ -355,25 +395,9 @@ export function TaskPanel({ open, onOpenChange }: TaskPanelProps) {
     resume,
     cancel,
   } = useTaskStore()
-  const [isDesktop, setIsDesktop] = React.useState(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-      return false
-    }
-    return window.matchMedia('(min-width: 1024px)').matches
-  })
-
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
-      return
-    }
-    const mediaQuery = window.matchMedia('(min-width: 1024px)')
-    const syncDesktopState = () => {
-      setIsDesktop(mediaQuery.matches)
-    }
-    syncDesktopState()
-    mediaQuery.addEventListener('change', syncDesktopState)
-    return () => mediaQuery.removeEventListener('change', syncDesktopState)
-  }, [])
+  const [workflowRun, setWorkflowRun] = React.useState<AgentRunDetail | null>(null)
+  const [workflowHealth, setWorkflowHealth] = React.useState<AgentRunHealthSummary | null>(null)
+  const [workflowLoading, setWorkflowLoading] = React.useState(false)
 
   React.useEffect(() => {
     void load()
@@ -383,66 +407,78 @@ export function TaskPanel({ open, onOpenChange }: TaskPanelProps) {
     return () => window.clearInterval(timer)
   }, [load])
 
-  return (
-    <>
-      <aside
-        className={cn(
-          'absolute right-3 top-3 bottom-3 z-30 hidden w-[23rem] overflow-hidden rounded-[28px] border border-white/10 bg-surface-layer/92 shadow-[0_28px_80px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-all duration-300 ease-out-smooth lg:flex lg:flex-col',
-          open
-            ? 'pointer-events-auto translate-x-0 opacity-100'
-            : 'pointer-events-none translate-x-8 opacity-0'
-        )}
-        aria-hidden={!open}
-      >
-        {open ? (
-          <TaskPanelBody
-            isLoading={isLoading}
-            approvals={approvals}
-            tasks={tasks}
-            selectedTaskId={selectedTaskId}
-            selectedTaskDetail={selectedTaskDetail}
-            isLoadingDetail={isLoadingDetail}
-            isResolvingApprovalId={isResolvingApprovalId}
-            isMutatingTaskId={isMutatingTaskId}
-            error={error}
-            load={load}
-            selectTask={selectTask}
-            approve={approve}
-            reject={reject}
-            resume={resume}
-            cancel={cancel}
-            onClose={() => onOpenChange(false)}
-          />
-        ) : null}
-      </aside>
+  React.useEffect(() => {
+    if (!workflowRunId) {
+      setWorkflowRun(null)
+      setWorkflowHealth(null)
+      setWorkflowLoading(false)
+      return
+    }
 
-      {!isDesktop ? (
-        <Sheet open={open} onOpenChange={onOpenChange}>
-          <SheetContent side="right" className="w-full max-w-md p-0 lg:hidden">
-            <SheetHeader className="sr-only">
-              <SheetTitle>Tasks</SheetTitle>
-              <SheetDescription>Background runs and pending approvals.</SheetDescription>
-            </SheetHeader>
-            <TaskPanelBody
-              isLoading={isLoading}
-              approvals={approvals}
-              tasks={tasks}
-              selectedTaskId={selectedTaskId}
-              selectedTaskDetail={selectedTaskDetail}
-              isLoadingDetail={isLoadingDetail}
-              isResolvingApprovalId={isResolvingApprovalId}
-              isMutatingTaskId={isMutatingTaskId}
-              error={error}
-              load={load}
-              selectTask={selectTask}
-              approve={approve}
-              reject={reject}
-              resume={resume}
-              cancel={cancel}
-            />
-          </SheetContent>
-        </Sheet>
-      ) : null}
-    </>
+    let cancelled = false
+    const loadWorkflow = async () => {
+      setWorkflowLoading(true)
+      try {
+        const [run, health] = await Promise.all([
+          api.fetchAgentRun(workflowRunId),
+          api.fetchAgentRunHealth(workflowRunId).catch(() => null),
+        ])
+        if (!cancelled) {
+          setWorkflowRun(run)
+          setWorkflowHealth(health)
+        }
+      } catch {
+        if (!cancelled) {
+          setWorkflowRun(null)
+          setWorkflowHealth(null)
+        }
+      } finally {
+        if (!cancelled) {
+          setWorkflowLoading(false)
+        }
+      }
+    }
+
+    void loadWorkflow()
+    const timer = window.setInterval(() => {
+      void loadWorkflow()
+    }, 8000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [workflowRunId])
+
+  return (
+    <FloatingPanelShell
+      open={open}
+      onOpenChange={onOpenChange}
+      desktopSide="right"
+      desktopWidthClass="w-[23rem]"
+      desktopBreakpoint="lg"
+    >
+      <TaskPanelBody
+        isLoading={isLoading}
+        approvals={approvals}
+        tasks={tasks}
+        selectedTaskId={selectedTaskId}
+        selectedTaskDetail={selectedTaskDetail}
+        isLoadingDetail={isLoadingDetail}
+        isResolvingApprovalId={isResolvingApprovalId}
+        isMutatingTaskId={isMutatingTaskId}
+        error={error}
+        load={load}
+        selectTask={selectTask}
+        approve={approve}
+        reject={reject}
+        resume={resume}
+        cancel={cancel}
+        workflowRun={workflowRun}
+        workflowHealth={workflowHealth}
+        workflowLoading={workflowLoading}
+        onOpenWorkflowRun={onOpenWorkflowRun}
+        onClose={() => onOpenChange(false)}
+      />
+    </FloatingPanelShell>
   )
 }

@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test:chat-stream-target": "node ./scripts/test-chat-stream-target.mjs",
+    "test:chat-paste-attachments": "node ./scripts/test-chat-paste-attachments.mjs",
     "test:context-tracker-reasoning-effort": "node ./scripts/test-context-tracker-reasoning-effort.mjs",
     "test:chat-quick-reasoning-selector": "node ./scripts/test-chat-quick-reasoning-selector.mjs",
     "test:chat-panel-toggle-coordination": "node ./scripts/test-chat-panel-toggle-coordination.mjs",
@@ -28,6 +29,7 @@
     "test:voice-overlay-phase": "node --experimental-strip-types ./scripts/test-voice-overlay-phase.mjs",
     "test:voice-settings-modes": "node --experimental-strip-types ./scripts/test-voice-settings-modes.mjs",
     "test:dialog-animation": "node ./scripts/test-dialog-animation.mjs",
+    "test:sidebar-bulk-delete": "node ./scripts/test-sidebar-bulk-delete.mjs",
     "test:workflows-labeling": "node ./scripts/test-workflows-labeling.mjs",
     "test:agent-run-package-flow": "node ./scripts/test-agent-run-package-flow.mjs",
     "test:research-debate-flow": "node ./scripts/test-research-debate-flow.mjs"

@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from mochi.backends.inference_capabilities import ReasoningEffort
-from pydantic import BaseModel, ConfigDict, Field
+from mochi.api.attachment_schema import AttachmentPayload
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TaskCreateRequest(BaseModel):
@@ -73,11 +74,17 @@ class AgentRunMessageRequest(BaseModel):
     """Request payload for appending a workflow conversation message to an Agent Run."""
 
     role: Literal["user", "operator"] = "user"
-    content: str = Field(min_length=1)
+    content: str = ""
     project_id: str | None = None
     workspace_dir: str | None = None
-    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[AttachmentPayload] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_content_or_attachments(self) -> AgentRunMessageRequest:
+        if not self.content.strip() and not self.attachments:
+            raise ValueError("content or attachments is required")
+        return self
 
 
 class AgentRunResumeRequest(BaseModel):

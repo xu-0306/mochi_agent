@@ -40,6 +40,11 @@ export interface ChatAttachment {
   path: string
   size?: number | null
   contentType?: string | null
+  source?: 'upload' | 'workspace_file' | 'workspace_selection' | 'image' | string | null
+  lineStart?: number | null
+  lineEnd?: number | null
+  quote?: string | null
+  note?: string | null
 }
 
 export interface Message {

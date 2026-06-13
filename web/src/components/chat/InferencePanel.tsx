@@ -3,18 +3,12 @@
 import * as React from 'react'
 import { PanelRightClose, RotateCcw, SlidersHorizontal, Sparkles } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from '@/components/ui/sheet'
 import * as api from '@/lib/api'
 import type { AgentSettings, InferencePreset } from '@/lib/api'
 import { InferenceControls } from '@/components/chat/InferenceControls'
+import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
+import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
 import type { InferenceParams } from '@/lib/stores/inference-store'
-import { cn } from '@/lib/utils'
 import {
   buildContextLengthSettingsUpdate,
   resolveContextLengthSettingsTarget,
@@ -43,28 +37,6 @@ interface InferencePanelProps {
   agent?: AgentSettings
   settings?: api.Settings | null
   onSettingsUpdated?: (settings: api.Settings) => void
-}
-
-function SectionCard({
-  title,
-  description,
-  children,
-}: {
-  title: string
-  description?: string
-  children: React.ReactNode
-}) {
-  return (
-    <section className="rounded-2xl border border-white/8 bg-canvas/70 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] backdrop-blur-sm">
-      <div className="mb-3">
-        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-        {description ? (
-          <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{description}</p>
-        ) : null}
-      </div>
-      {children}
-    </section>
-  )
 }
 
 function PanelBody({
@@ -182,7 +154,7 @@ function PanelBody({
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
         <div className="space-y-4">
-          <SectionCard
+          <PanelSectionCard
             title="Preset workspace"
             description="Choose a baseline preset, then apply, store, or reset session-specific tweaks."
           >
@@ -222,10 +194,10 @@ function PanelBody({
                 </Button>
               </div>
             </div>
-          </SectionCard>
+          </PanelSectionCard>
 
           {contextLengthTarget.kind ? (
-            <SectionCard
+            <PanelSectionCard
               title={contextLengthTarget.kind === 'gguf' ? 'Context window' : 'Max model length'}
               description={
                 contextLengthTarget.kind === 'gguf'
@@ -268,10 +240,10 @@ function PanelBody({
                   </p>
                 ) : null}
               </div>
-            </SectionCard>
+            </PanelSectionCard>
           ) : null}
 
-          <SectionCard
+          <PanelSectionCard
             title="Sampling & response behavior"
             description="Adjust creativity, repetition, reasoning effort, and display-level diagnostics."
           >
@@ -284,7 +256,7 @@ function PanelBody({
               disabledKeys={disabledKeys}
               disabledReason={disabledReason}
             />
-          </SectionCard>
+          </PanelSectionCard>
         </div>
       </div>
     </div>
@@ -302,27 +274,27 @@ export function InferencePanel(props: InferencePanelProps) {
 
   return (
     <>
-      <aside
-        className={cn(
-          'absolute right-3 top-3 bottom-3 z-30 hidden w-[23rem] overflow-hidden rounded-[28px] border border-white/10 bg-surface-layer/92 shadow-[0_28px_80px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-all duration-300 ease-out-smooth md:flex md:flex-col',
-          open
-            ? 'pointer-events-auto translate-x-0 opacity-100'
-            : 'pointer-events-none translate-x-8 opacity-0'
-        )}
-        aria-hidden={!open}
+      <FloatingPanelShell
+        open={open}
+        onOpenChange={onOpenChange}
+        desktopSide="right"
+        desktopWidthClass="w-[23rem]"
+        desktopBreakpoint="md"
+        renderMobile={false}
       >
-        {open ? <PanelBody {...bodyProps} onClose={() => onOpenChange(false)} /> : null}
-      </aside>
+        <PanelBody {...bodyProps} onClose={() => onOpenChange(false)} />
+      </FloatingPanelShell>
 
-      <Sheet open={mobileOpen} onOpenChange={onMobileOpenChange}>
-        <SheetContent side="right" className="w-full max-w-md p-0">
-          <SheetHeader className="border-b border-border px-4 py-4">
-            <SheetTitle>Inference</SheetTitle>
-            <SheetDescription>Adjust session-specific inference parameters.</SheetDescription>
-          </SheetHeader>
-          <PanelBody {...bodyProps} />
-        </SheetContent>
-      </Sheet>
+      <FloatingPanelShell
+        open={mobileOpen}
+        onOpenChange={onMobileOpenChange}
+        desktopSide="right"
+        desktopWidthClass="w-[23rem]"
+        desktopBreakpoint="md"
+        renderDesktop={false}
+      >
+        <PanelBody {...bodyProps} onClose={() => onMobileOpenChange(false)} />
+      </FloatingPanelShell>
     </>
   )
 }

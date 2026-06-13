@@ -21,8 +21,11 @@ interface SessionItemProps {
   session: Session
   isActive: boolean
   isCollapsed?: boolean
+  selectionMode?: boolean
+  selected?: boolean
   projects?: ProjectSummary[]
   onClick: () => void
+  onToggleSelected?: () => void
   onRename?: (title: string) => void
   onMoveToProject?: (projectId: string | null) => void
   onDelete?: () => void
@@ -50,8 +53,11 @@ export function SessionItem({
   session,
   isActive,
   isCollapsed = false,
+  selectionMode = false,
+  selected = false,
   projects = [],
   onClick,
+  onToggleSelected,
   onRename,
   onMoveToProject,
   onDelete,
@@ -78,7 +84,7 @@ export function SessionItem({
     setIsEditing(false)
   }
 
-  if (!isCollapsed && isEditing) {
+  if (!isCollapsed && isEditing && !selectionMode) {
     return (
       <div
         className={cn(
@@ -155,13 +161,27 @@ export function SessionItem({
 
       <button
         type="button"
-        onClick={onClick}
+        onClick={selectionMode ? onToggleSelected : onClick}
         aria-current={isActive ? 'true' : undefined}
+        aria-pressed={selectionMode ? selected : undefined}
         className={cn(
           'flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left',
           isCollapsed && 'h-9 justify-center px-0'
         )}
       >
+        {selectionMode && !isCollapsed ? (
+          <span
+            className={cn(
+              'flex h-4 w-4 shrink-0 items-center justify-center rounded-[5px] border transition-colors',
+              selected
+                ? 'border-primary-500 bg-primary-500 text-primary-foreground'
+                : 'border-border bg-surface-layer text-transparent'
+            )}
+            aria-hidden="true"
+          >
+            <Check className="h-3 w-3" />
+          </span>
+        ) : null}
         {isCollapsed ? (
         <span className="text-xs font-medium w-8 h-8 flex items-center justify-center rounded-md bg-muted/50">
           {visibleTitle.charAt(0).toUpperCase()}
@@ -191,7 +211,7 @@ export function SessionItem({
       )}
       </button>
 
-      {!isCollapsed ? (
+      {!isCollapsed && !selectionMode ? (
         <div className="mr-1 hidden shrink-0 items-center gap-0.5 group-hover:flex group-focus-within:flex">
           <Button
             type="button"

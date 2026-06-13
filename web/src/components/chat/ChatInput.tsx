@@ -55,6 +55,8 @@ interface ChatInputProps {
   sessionId?: string | null
   projectId?: string | null
   uploadTargetDir?: string
+  queuedAttachments?: ChatAttachment[]
+  queuedAttachmentsKey?: string
   onSend: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[] }) => void
   onSubmitEdit?: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[] }) => void
   onCancelEdit?: () => void
@@ -79,6 +81,44 @@ interface ChatInputProps {
 }
 
 interface AttachedFile extends ChatAttachment {}
+
+function extractClipboardFiles(data: DataTransfer | null): File[] {
+  if (!data) {
+    return []
+  }
+
+  const filesFromItems = Array.from(data.items ?? [])
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file instanceof File)
+
+  if (filesFromItems.length > 0) {
+    return filesFromItems
+  }
+
+  return Array.from(data.files ?? [])
+}
+
+function normalizeUploadFile(file: File, fallbackIndex: number): File {
+  if (file.name.trim().length > 0) {
+    return file
+  }
+
+  const extension = file.type === 'image/png'
+    ? 'png'
+    : file.type === 'image/jpeg'
+      ? 'jpg'
+      : file.type === 'image/webp'
+        ? 'webp'
+        : file.type === 'image/gif'
+          ? 'gif'
+          : 'bin'
+
+  return new File([file], `pasted-image-${Date.now()}-${fallbackIndex + 1}.${extension}`, {
+    type: file.type,
+    lastModified: file.lastModified,
+  })
+}
 
 function parseSlashQuery(nextValue: string, caret: number | null): string | null {
   const textBeforeCursor = caret === null ? nextValue : nextValue.slice(0, caret)
@@ -128,10 +168,23 @@ function formatReasoningEffortLabel(value: api.ReasoningEffort): string {
   return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
+function attachmentIdentity(attachment: ChatAttachment): string {
+  return [
+    attachment.id ?? '',
+    attachment.path,
+    attachment.source ?? '',
+    attachment.lineStart ?? '',
+    attachment.lineEnd ?? '',
+    attachment.quote ?? '',
+  ].join('::')
+}
+
 export function ChatInput({
   sessionId,
   projectId,
   uploadTargetDir,
+  queuedAttachments,
+  queuedAttachmentsKey,
   onSend,
   onSubmitEdit,
   onCancelEdit,
@@ -365,8 +418,27 @@ export function ChatInput({
     setPaletteDismissed(false)
   }, [composerResetKey, composerSeed])
 
+  React.useEffect(() => {
+    if (!queuedAttachmentsKey || !queuedAttachments || queuedAttachments.length === 0) {
+      return
+    }
+    setAttachedFiles((prev) => {
+      const known = new Set(prev.map((attachment) => attachmentIdentity(attachment)))
+      const next = [...prev]
+      for (const attachment of queuedAttachments) {
+        const key = attachmentIdentity(attachment)
+        if (!known.has(key)) {
+          known.add(key)
+          next.push(attachment)
+        }
+      }
+      return next
+    })
+    setUploadError(null)
+  }, [queuedAttachments, queuedAttachmentsKey])
+
   const handleAttachFiles = React.useCallback(async (incomingFiles: FileList | File[]) => {
-    const files = Array.from(incomingFiles)
+    const files = Array.from(incomingFiles).map((file, index) => normalizeUploadFile(file, index))
     if (files.length === 0) {
       return
     }
@@ -402,6 +474,16 @@ export function ChatInput({
       setIsUploadingFiles(false)
     }
   }, [uploadTargetDir])
+
+  const handlePaste = React.useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboardFiles = extractClipboardFiles(event.clipboardData)
+    if (clipboardFiles.length === 0) {
+      return
+    }
+
+    event.preventDefault()
+    void handleAttachFiles(clipboardFiles)
+  }, [handleAttachFiles])
 
   const handleSend = () => {
     const trimmed = value.trim()
@@ -578,8 +660,13 @@ export function ChatInput({
               <ChatAttachments
                 attachments={attachedFiles}
                 variant="composer"
+                sessionId={sessionId}
+                projectId={projectId}
                 onRemove={(attachment) => {
-                  setAttachedFiles((prev) => prev.filter((item) => item.id !== attachment.id))
+                  const targetKey = attachmentIdentity(attachment)
+                  setAttachedFiles((prev) =>
+                    prev.filter((item) => attachmentIdentity(item) !== targetKey)
+                  )
                 }}
               />
             </div>
@@ -594,6 +681,7 @@ export function ChatInput({
               setValue(nextValue)
               setPaletteDismissed(false)
             }}
+            onPaste={handlePaste}
             onKeyDown={handleKeyDown}
             placeholder={t('chat.input.placeholder')}
             disabled={disabled}
