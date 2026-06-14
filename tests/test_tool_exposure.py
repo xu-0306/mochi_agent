@@ -788,6 +788,33 @@ def test_tool_exposure_attached_docx_edit_intent_keeps_write_tools_available() -
     assert {"file_read", "docx_read", "file_write", "file_edit", "apply_patch"} <= set(plan.tool_names)
 
 
+def test_tool_exposure_write_summary_of_attached_pdf_stays_read_only() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "file_read",
+                "pdf_read",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+            ],
+        }
+    )
+
+    plan = planner.plan(
+        message="Write a summary of the attached PDF.",
+        available_tool_names=["file_read", "pdf_read", "file_write", "file_edit", "apply_patch"],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="trusted_workspace",
+        attachment_count=1,
+        workspace_attachment_count=1,
+    )
+
+    assert {"file_read", "pdf_read"} <= set(plan.tool_names)
+    assert not {"file_write", "file_edit", "apply_patch"} & set(plan.tool_names)
+
+
 def test_tool_exposure_file_browse_requests_skip_exec() -> None:
     planner = ToolExposurePlanner(
         tool_groups={

@@ -242,7 +242,6 @@ class ToolExposurePlanner:
         "revised",
         "patch",
         "save",
-        "write",
         "replace",
         "fix",
         "修改",
