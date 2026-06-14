@@ -457,10 +457,39 @@ def test_tool_exposure_keeps_repo_queries_on_workspace_tools_without_open_world_
     )
 
     assert plan.matched_groups == ["workspace"]
-    assert "glob_search" in plan.tool_names
-    assert "grep_search" in plan.tool_names
-    assert "web_search" not in plan.tool_names
-    assert "arxiv_search" not in plan.tool_names
+    assert {"glob_search", "grep_search", "file_read", "file_write"} <= set(plan.tool_names)
+    assert plan.tool_names.index("glob_search") < plan.tool_names.index("web_search")
+    assert plan.tool_names.index("grep_search") < plan.tool_names.index("arxiv_search")
+
+
+def test_tool_exposure_uses_group_signals_for_ranking_without_hiding_other_grouped_tools() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search"],
+            "web": ["web_search", "web_fetch"],
+            "literature": ["arxiv_search"],
+        }
+    )
+    available_tools = [
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "web_search",
+        "web_fetch",
+        "arxiv_search",
+    ]
+    plan = planner.plan(
+        message="請檢查目前工作區內容並整理重點",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(*available_tools),
+    )
+
+    assert set(plan.tool_names) == set(available_tools)
+    assert plan.tool_names.index("file_read") < plan.tool_names.index("web_search")
+    assert plan.tool_names.index("glob_search") < plan.tool_names.index("arxiv_search")
 
 
 def test_tool_exposure_prioritizes_tool_search_for_tool_selection_queries() -> None:

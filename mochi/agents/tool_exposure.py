@@ -480,12 +480,6 @@ class ToolExposurePlanner:
                 matched_groups.append(fallback_group)
 
         available_order = {name: index for index, name in enumerate(available_tool_names)}
-        grouped_tool_names = {
-            tool_name
-            for tool_names in tools_by_group.values()
-            for tool_name in tool_names
-        }
-
         preferred = [
             tool_name
             for tool_name in (preferred_tool_names or [])
@@ -516,12 +510,8 @@ class ToolExposurePlanner:
         for tool_name in preferred:
             if tool_name not in selected:
                 selected.append(tool_name)
-        for group_name in matched_groups:
-            for tool_name in tools_by_group[group_name]:
-                if tool_name in available and tool_name not in selected:
-                    selected.append(tool_name)
         for tool_name in available_tool_names:
-            if tool_name in selected or tool_name in grouped_tool_names:
+            if tool_name in selected:
                 continue
             selected.append(tool_name)
 
