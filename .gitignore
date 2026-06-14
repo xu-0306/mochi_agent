@@ -106,3 +106,4 @@ web/tsconfig.tsbuildinfo
 # Reference snapshots (large, not required for runtime)
 legacy/
 reference/
+browser-imports/
