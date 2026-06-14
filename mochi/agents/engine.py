@@ -633,9 +633,9 @@ class AgentEngine:
             tool_mode=request.tool_mode,
             exposed_tools=list(exposure_plan.tool_names),
             matched_tool_groups=list(exposure_plan.matched_groups),
+            tool_exposure=exposure_plan.exposure_metadata(),
         )
-        tool_exposure_metadata = exposure_plan.exposure_metadata()
-        setattr(diagnostics, "tool_exposure", tool_exposure_metadata)
+        tool_exposure_metadata = diagnostics.tool_exposure or exposure_plan.exposure_metadata()
         logger.debug(
             "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
             active_backend.get_model_info().backend_type,

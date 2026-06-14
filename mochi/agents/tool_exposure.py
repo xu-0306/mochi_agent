@@ -225,6 +225,35 @@ class ToolExposurePlanner:
         "extract",
         "file-reading",
     )
+    _ATTACHMENT_MUTATION_INTENT_KEYWORDS: tuple[str, ...] = (
+        "edit",
+        "edited",
+        "editing",
+        "update",
+        "updated",
+        "updating",
+        "modify",
+        "modified",
+        "modifying",
+        "change",
+        "changed",
+        "rewrite",
+        "rewritten",
+        "revise",
+        "revised",
+        "patch",
+        "save",
+        "write",
+        "replace",
+        "fix",
+        "修改",
+        "更新",
+        "編輯",
+        "编辑",
+        "改寫",
+        "改写",
+        "修正",
+    )
     _FILE_BROWSE_INTENT_KEYWORDS: tuple[str, ...] = (
         "browse",
         "directory",
@@ -393,9 +422,14 @@ class ToolExposurePlanner:
         attached_workspace_files = normalized_attachment_count > 0 or any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
-        read_only_file_request = attached_workspace_files and not self._matches_any_keyword(
+        attachment_mutation_request = self._matches_any_keyword(
             lowered,
-            self._EXECUTION_INTENT_KEYWORDS,
+            self._ATTACHMENT_MUTATION_INTENT_KEYWORDS,
+        )
+        read_only_file_request = (
+            attached_workspace_files
+            and not attachment_mutation_request
+            and not self._matches_any_keyword(lowered, self._EXECUTION_INTENT_KEYWORDS)
         )
         file_browse_request = (
             self._matches_any_keyword(lowered, self._FILE_BROWSE_INTENT_KEYWORDS)
