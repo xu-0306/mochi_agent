@@ -216,6 +216,54 @@ def test_tool_exposure_uses_web_tools_for_weather_in_workspace() -> None:
     )
 
 
+def test_tool_exposure_keeps_full_workspace_baseline_and_weather_tools() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "file_read",
+                "glob_search",
+                "grep_search",
+                "csv_read",
+                "pdf_read",
+                "docx_read",
+                "notebook_read",
+                "file_write",
+            ],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+        }
+    )
+    plan = planner.plan(
+        message="latest weather in Taichung",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "csv_read",
+            "pdf_read",
+            "docx_read",
+            "notebook_read",
+            "file_write",
+            "web_search",
+            "web_fetch",
+            "get_current_time",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+    )
+
+    assert {
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "csv_read",
+        "pdf_read",
+        "docx_read",
+        "notebook_read",
+    } <= set(plan.tool_names)
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+
+
 def test_tool_exposure_co_exposes_literature_and_web_for_multilingual_paper_queries() -> None:
     planner = ToolExposurePlanner(
         tool_groups={
@@ -458,15 +506,17 @@ def test_tool_exposure_keeps_repo_queries_on_workspace_tools_without_open_world_
 
     assert plan.matched_groups == ["workspace"]
     assert {"glob_search", "grep_search", "file_read", "file_write"} <= set(plan.tool_names)
-    assert plan.tool_names.index("glob_search") < plan.tool_names.index("web_search")
-    assert plan.tool_names.index("grep_search") < plan.tool_names.index("arxiv_search")
+    assert "web_search" not in plan.tool_names
+    assert "web_fetch" not in plan.tool_names
+    assert "arxiv_search" not in plan.tool_names
+    assert "semantic_scholar_search" not in plan.tool_names
 
 
 def test_tool_exposure_uses_group_signals_for_ranking_without_hiding_other_grouped_tools() -> None:
     planner = ToolExposurePlanner(
         tool_groups={
             "workspace": ["file_read", "glob_search", "grep_search"],
-            "web": ["web_search", "web_fetch"],
+            "web": ["web_search", "web_fetch", "get_current_time"],
             "literature": ["arxiv_search"],
         }
     )
@@ -476,10 +526,11 @@ def test_tool_exposure_uses_group_signals_for_ranking_without_hiding_other_group
         "grep_search",
         "web_search",
         "web_fetch",
+        "get_current_time",
         "arxiv_search",
     ]
     plan = planner.plan(
-        message="請檢查目前工作區內容並整理重點",
+        message="latest weather in Taipei",
         available_tool_names=available_tools,
         backend=_FakeBackend(),
         session_bound_workspace=True,
@@ -488,8 +539,53 @@ def test_tool_exposure_uses_group_signals_for_ranking_without_hiding_other_group
     )
 
     assert set(plan.tool_names) == set(available_tools)
-    assert plan.tool_names.index("file_read") < plan.tool_names.index("web_search")
-    assert plan.tool_names.index("glob_search") < plan.tool_names.index("arxiv_search")
+    assert plan.tool_names.index("web_search") < plan.tool_names.index("file_read")
+    assert plan.tool_names.index("web_fetch") < plan.tool_names.index("arxiv_search")
+
+
+def test_tool_exposure_non_workspace_attachments_do_not_bias_workspace_readers() -> None:
+    from mochi.agents.engine import AgentEngine
+    from mochi.backends.types import AttachmentRef
+    from mochi.config.schema import MochiConfig
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": ".",
+            "sessions_dir": "./.tmp-test-sessions",
+            "memory": {"db_path": "./.tmp-test-memory.db", "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "pdf_read", "docx_read"],
+            "web": ["web_search"],
+        }
+    )
+    planner_message = engine._build_tool_planner_message(  # noqa: SLF001
+        "Summarize the attached image.",
+        [
+            AttachmentRef(
+                name="error.png",
+                path="error.png",
+                source="image",
+            )
+        ],
+    )
+
+    plan = planner.plan(
+        message=planner_message,
+        available_tool_names=["file_read", "pdf_read", "docx_read", "web_search"],
+        backend=_FakeBackend(),
+        session_bound_workspace=False,
+        autonomy_mode="auto_review",
+        attachment_count=1,
+        workspace_attachment_count=0,
+    )
+
+    assert "Structured attachments:" in planner_message
+    assert "file_read" not in plan.tool_names
 
 
 def test_tool_exposure_prioritizes_tool_search_for_tool_selection_queries() -> None:
@@ -658,6 +754,7 @@ def test_tool_exposure_attachment_bias_works_with_engine_structured_attachment_h
         backend=_FakeBackend(),
         session_bound_workspace=True,
         autonomy_mode="trusted_workspace",
+        workspace_attachment_count=1,
     )
 
     assert "Structured attachments:" in planner_message
@@ -685,6 +782,7 @@ def test_tool_exposure_attached_docx_edit_intent_keeps_write_tools_available() -
         session_bound_workspace=True,
         autonomy_mode="trusted_workspace",
         attachment_count=1,
+        workspace_attachment_count=1,
     )
 
     assert {"file_read", "docx_read", "file_write", "file_edit", "apply_patch"} <= set(plan.tool_names)

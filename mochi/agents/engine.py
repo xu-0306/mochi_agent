@@ -329,6 +329,7 @@ class AgentEngine:
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
             attachment_count=self._attachment_count(attachments),
+            workspace_attachment_count=self._workspace_attachment_count(attachments),
         )
         tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
         tool_schemas = tool_registry.get_schemas()
@@ -562,6 +563,7 @@ class AgentEngine:
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
             attachment_count=self._attachment_count(request.attachments),
+            workspace_attachment_count=self._workspace_attachment_count(request.attachments),
             tool_mode=request.tool_mode,
         )
         exposure_plan = self._apply_invocation_tool_overrides(
@@ -1824,6 +1826,16 @@ class AgentEngine:
     @staticmethod
     def _attachment_count(attachments: list[AttachmentRef] | None) -> int:
         return len(attachments or [])
+
+    @staticmethod
+    def _workspace_attachment_count(attachments: list[AttachmentRef] | None) -> int:
+        if not attachments:
+            return 0
+        return sum(
+            1
+            for attachment in attachments
+            if (attachment.source or "").strip().lower() in {"workspace_file", "workspace_selection"}
+        )
 
     def _build_attachment_prompt_context(
         self,

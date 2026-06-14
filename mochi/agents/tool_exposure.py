@@ -210,7 +210,6 @@ class ToolExposurePlanner:
         "tool to use",
     )
     _ATTACHED_WORKSPACE_FILE_MARKERS: tuple[str, ...] = (
-        "structured attachments:",
         "attached workspace files:",
         "attached workspace file:",
     )
@@ -395,6 +394,7 @@ class ToolExposurePlanner:
         preferred_tool_names: list[str] | None = None,
         tool_capabilities: dict[str, dict[str, Any]] | None = None,
         attachment_count: int = 0,
+        workspace_attachment_count: int = 0,
         tool_mode: Literal["disabled", "auto", "required"] = "auto",
     ) -> ToolExposurePlan:
         if tool_mode == "disabled":
@@ -419,7 +419,8 @@ class ToolExposurePlanner:
 
         lowered = message.lower()
         normalized_attachment_count = max(0, attachment_count)
-        attached_workspace_files = normalized_attachment_count > 0 or any(
+        normalized_workspace_attachment_count = max(0, workspace_attachment_count)
+        attached_workspace_files = normalized_workspace_attachment_count > 0 or any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
         attachment_mutation_request = self._matches_any_keyword(
@@ -539,9 +540,31 @@ class ToolExposurePlanner:
         effective_mode = autonomy_mode or "trusted_workspace"
         mode_limit, risky_limit = self._AUTONOMY_LIMITS.get(effective_mode, (base_limit, 1))
         limit = min(base_limit, mode_limit)
+        workspace_focus_request = (
+            session_bound_workspace
+            and "workspace" in matched_groups
+            and not web_request
+            and not research_request
+        )
+        non_workspace_attachment_request = (
+            normalized_attachment_count > 0
+            and normalized_workspace_attachment_count == 0
+            and not session_bound_workspace
+            and not workspace_request
+        )
         filtered: list[str] = []
         risky_count = 0
         for tool_name in selected:
+            capabilities = normalized_capabilities.get(tool_name, {})
+            domains = set(capabilities.get("domains", ()))
+            if (
+                workspace_focus_request
+                and bool(capabilities.get("open_world", False))
+                and domains & {"web", "literature"}
+            ):
+                continue
+            if non_workspace_attachment_request and tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS:
+                continue
             if tool_name in self._CONTEXTUAL_TOOLS and not self._matches_any_keyword(
                 lowered,
                 self._CONTEXT_KEYWORDS,
@@ -564,17 +587,14 @@ class ToolExposurePlanner:
             for tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS
             if session_bound_workspace and tool_name in available
         ]
-        final_tool_names: list[str] = []
+        final_tool_names = list(filtered[:limit])
         for tool_name in workspace_baseline:
             if tool_name not in final_tool_names:
                 final_tool_names.append(tool_name)
-        for tool_name in filtered:
-            if tool_name not in final_tool_names:
-                final_tool_names.append(tool_name)
 
-        final_limit = max(limit, len(workspace_baseline))
+        final_limit = max(limit, len(final_tool_names))
         return ToolExposurePlan(
-            tool_names=final_tool_names[:final_limit],
+            tool_names=final_tool_names,
             matched_groups=matched_groups,
             limit=final_limit,
             workspace_bound=session_bound_workspace,
