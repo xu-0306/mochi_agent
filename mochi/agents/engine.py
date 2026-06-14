@@ -315,6 +315,7 @@ class AgentEngine:
         planner_message = self._build_tool_planner_message(message, attachments)
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
+            user_intent_message=message,
             available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=(
@@ -552,6 +553,7 @@ class AgentEngine:
         reasoning_effort = sanitized.get("reasoning_effort")
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
+            user_intent_message=request.message,
             available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=session_bound_workspace,

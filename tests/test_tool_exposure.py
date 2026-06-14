@@ -576,6 +576,7 @@ def test_tool_exposure_non_workspace_attachments_do_not_bias_workspace_readers()
 
     plan = planner.plan(
         message=planner_message,
+        user_intent_message="Summarize the attached image.",
         available_tool_names=["file_read", "pdf_read", "docx_read", "web_search"],
         backend=_FakeBackend(),
         session_bound_workspace=False,
@@ -742,6 +743,7 @@ def test_tool_exposure_attachment_bias_works_with_engine_structured_attachment_h
 
     plan = planner.plan(
         message=planner_message,
+        user_intent_message="請先檢查附件內容再回答",
         available_tool_names=[
             "exec_command",
             "file_read",
@@ -777,6 +779,7 @@ def test_tool_exposure_attached_docx_edit_intent_keeps_write_tools_available() -
 
     plan = planner.plan(
         message="Update the attached docx and save the revised version in the workspace.",
+        user_intent_message="Update the attached docx and save the revised version in the workspace.",
         available_tool_names=["file_read", "docx_read", "file_write", "file_edit", "apply_patch"],
         backend=_FakeBackend(),
         session_bound_workspace=True,
@@ -803,6 +806,58 @@ def test_tool_exposure_write_summary_of_attached_pdf_stays_read_only() -> None:
 
     plan = planner.plan(
         message="Write a summary of the attached PDF.",
+        user_intent_message="Write a summary of the attached PDF.",
+        available_tool_names=["file_read", "pdf_read", "file_write", "file_edit", "apply_patch"],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="trusted_workspace",
+        attachment_count=1,
+        workspace_attachment_count=1,
+    )
+
+    assert {"file_read", "pdf_read"} <= set(plan.tool_names)
+    assert not {"file_write", "file_edit", "apply_patch"} & set(plan.tool_names)
+
+
+def test_tool_exposure_attachment_filename_with_update_keyword_stays_read_only() -> None:
+    from mochi.agents.engine import AgentEngine
+    from mochi.backends.types import AttachmentRef
+    from mochi.config.schema import MochiConfig
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": ".",
+            "sessions_dir": "./.tmp-test-sessions",
+            "memory": {"db_path": "./.tmp-test-memory.db", "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "file_read",
+                "pdf_read",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+            ],
+        }
+    )
+    planner_message = engine._build_tool_planner_message(  # noqa: SLF001
+        "Summarize the attachment.",
+        [
+            AttachmentRef(
+                name="updated-report.pdf",
+                path=".mochi/workspace/browser-imports/updated-report.pdf",
+                source="workspace_file",
+            )
+        ],
+    )
+
+    plan = planner.plan(
+        message=planner_message,
+        user_intent_message="Summarize the attachment.",
         available_tool_names=["file_read", "pdf_read", "file_write", "file_edit", "apply_patch"],
         backend=_FakeBackend(),
         session_bound_workspace=True,

@@ -386,6 +386,7 @@ class ToolExposurePlanner:
         self,
         *,
         message: str,
+        user_intent_message: str | None = None,
         available_tool_names: list[str],
         backend: BaseLLMBackend,
         session_bound_workspace: bool,
@@ -417,13 +418,14 @@ class ToolExposurePlanner:
             )
 
         lowered = message.lower()
+        lowered_user_intent = (user_intent_message or message).lower()
         normalized_attachment_count = max(0, attachment_count)
         normalized_workspace_attachment_count = max(0, workspace_attachment_count)
         attached_workspace_files = normalized_workspace_attachment_count > 0 or any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
         attachment_mutation_request = self._matches_any_keyword(
-            lowered,
+            lowered_user_intent,
             self._ATTACHMENT_MUTATION_INTENT_KEYWORDS,
         )
         read_only_file_request = (
