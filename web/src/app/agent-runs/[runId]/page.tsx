@@ -23,6 +23,7 @@ import {
   buildTrainingReadyOnlyDatasetPackage,
 } from '@/lib/agent-run-packages'
 import { useI18n } from '@/lib/i18n'
+import { formatThinkingLevelSummary } from '@/lib/reasoning-presets'
 import { Textarea } from '@/components/ui/textarea'
 
 const TERMINAL_RUN_STATUSES = new Set([
@@ -83,16 +84,6 @@ function translateExecStatus(status: string | null | undefined, t: TranslateFn):
   const key = `agentRuns.exec.status.${normalized}`
   const translated = t(key)
   return translated === key ? status ?? t('common.unknown') : translated
-}
-
-function formatReasoningEffortLabel(value: api.ReasoningEffort | null): string {
-  if (!value) {
-    return 'Auto'
-  }
-  if (value === 'xhigh') {
-    return 'X-High'
-  }
-  return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
 function jsonPreview(value: unknown): string {
@@ -1511,7 +1502,7 @@ export default function AgentRunDetailPage() {
                     <p><span className="text-foreground">Topic:</span> {run.topic || 'N/A'}</p>
                     <p>
                       <span className="text-foreground">Thinking Level:</span>{' '}
-                      {formatReasoningEffortLabel(run.reasoning_effort)}
+                      {formatThinkingLevelSummary(run.reasoning_effort)}
                     </p>
                     <p><span className="text-foreground">Created:</span> {formatDateTime(run.created_at)}</p>
                     <p><span className="text-foreground">Started:</span> {formatDateTime(run.started_at)}</p>

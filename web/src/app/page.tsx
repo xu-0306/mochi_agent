@@ -14,13 +14,6 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import {
   ChatInput,
   type ChatComposerSeed,
   type ChatInputModelOption,
@@ -95,13 +88,6 @@ const WORKFLOW_PROTOCOL_OPTIONS: Array<{
     description: 'Subagents propose execution while the controller keeps runtime boundaries.',
   },
 ]
-
-const AUTONOMY_MODE_LABELS: Record<api.SessionSecurityOverride['autonomy_mode'], string> = {
-  strict: 'Strict',
-  trusted_workspace: 'Trusted workspace',
-  auto_review: 'Auto review',
-  high_autonomy: 'High autonomy',
-}
 
 function parsePositiveInteger(value: unknown, fallback: number): number {
   const source = typeof value === 'string' ? value : String(value ?? '')
@@ -1193,7 +1179,6 @@ export default function ChatPage() {
   )
   const effectiveAutonomyMode = sessionSecurityOverride?.autonomy_mode ?? settings?.security?.autonomy_mode ?? 'trusted_workspace'
   const hasSessionAutonomyOverride = Boolean(sessionSecurityOverride?.autonomy_mode)
-  const effectiveAutonomyModeLabel = AUTONOMY_MODE_LABELS[effectiveAutonomyMode]
   const autonomyModeSourceLabel = hasSessionAutonomyOverride ? 'Session override' : 'Workspace default'
   const autonomyModeSourceDescription = hasSessionAutonomyOverride
     ? 'This chat is overriding the workspace safety default.'
@@ -3114,32 +3099,6 @@ export default function ChatPage() {
               )}
               <span className="truncate">{headerModelLabel}</span>
             </div>
-            <div className="hidden items-start gap-2 md:flex">
-              <div className="pt-1 text-right">
-                <span className="block text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
-                  Safety
-                </span>
-                <span className="block text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80">
-                  {autonomyModeSourceLabel}
-                </span>
-              </div>
-              <div className="min-w-0">
-                <Select value={effectiveAutonomyMode} onValueChange={(value) => void handleSessionAutonomyModeChange(value as api.SessionSecurityOverride['autonomy_mode'])}>
-                  <SelectTrigger className="h-8 w-[168px] text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="strict">Strict</SelectItem>
-                    <SelectItem value="trusted_workspace">Trusted workspace</SelectItem>
-                    <SelectItem value="auto_review">Auto review</SelectItem>
-                    <SelectItem value="high_autonomy">High autonomy</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="mt-1 max-w-[210px] text-[11px] leading-4 text-muted-foreground">
-                  Effective now: {effectiveAutonomyModeLabel}. {autonomyModeSourceDescription}
-                </p>
-              </div>
-            </div>
             <div className="relative shrink-0">
               <Button
                 variant={workflowEnabled || workflowPanelOpen ? 'secondary' : 'ghost'}
@@ -3360,6 +3319,10 @@ export default function ChatPage() {
         isUnloadingCurrentModel={isUnloadingCurrentModel}
         reasoningOptions={supportedReasoningEfforts}
         onReasoningEffortChange={(value) => handleSessionInferenceChange('reasoningEffort', value)}
+        approvalMode={effectiveAutonomyMode}
+        approvalModeSourceLabel={autonomyModeSourceLabel}
+        approvalModeSourceDescription={autonomyModeSourceDescription}
+        onApprovalModeChange={(value) => void handleSessionAutonomyModeChange(value)}
         composerMode={editState ? 'edit' : 'compose'}
         composerSeed={editState?.seed ?? null}
         composerResetKey={editState?.resetKey}

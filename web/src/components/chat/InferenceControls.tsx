@@ -2,17 +2,11 @@
 
 import * as React from 'react'
 import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import type { ReasoningEffort } from '@/lib/api'
+import { ThinkingLevelPanelControl } from './ThinkingLevelControls'
 import type { InferenceParams } from '@/lib/stores/inference-store'
 
 interface InferenceControlsProps {
@@ -69,19 +63,6 @@ function NumberControl({
   )
 }
 
-function formatReasoningLabel(value: ReasoningEffort): string {
-  if (value === 'xhigh') {
-    return 'Extra High'
-  }
-  if (value === 'minimal') {
-    return 'Minimal'
-  }
-  if (value === 'none') {
-    return 'None'
-  }
-  return value.charAt(0).toUpperCase() + value.slice(1)
-}
-
 export function InferenceControls({
   value,
   onChange,
@@ -93,7 +74,6 @@ export function InferenceControls({
 }: InferenceControlsProps) {
   const disabledSet = React.useMemo(() => new Set(disabledKeys), [disabledKeys])
   const isDisabled = React.useCallback((key: keyof InferenceParams) => disabledSet.has(key), [disabledSet])
-  const resolvedReasoningOptions = reasoningEffortOptions ?? ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 
   return (
     <div className="space-y-4">
@@ -204,25 +184,13 @@ export function InferenceControls({
 
       {showReasoningEffort && supportsReasoningEffort ? (
         <div className="space-y-1.5">
-          <span className="text-xs font-medium text-muted-foreground">Reasoning Effort</span>
-          <Select
-            value={value.reasoningEffort ?? 'auto'}
-            onValueChange={(next) =>
-              onChange('reasoningEffort', next === 'auto' ? null : (next as InferenceParams['reasoningEffort']))
-            }
-          >
-            <SelectTrigger className="h-8 text-xs">
-              <SelectValue placeholder="Auto" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="auto">Auto</SelectItem>
-              {resolvedReasoningOptions.map((option) => (
-                <SelectItem key={option} value={option}>
-                  {formatReasoningLabel(option)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <span className="text-xs font-medium text-muted-foreground">Thinking Level</span>
+          <ThinkingLevelPanelControl
+            supportedEfforts={reasoningEffortOptions}
+            value={value.reasoningEffort}
+            disabled={isDisabled('reasoningEffort')}
+            onChange={(next) => onChange('reasoningEffort', next)}
+          />
         </div>
       ) : null}
 

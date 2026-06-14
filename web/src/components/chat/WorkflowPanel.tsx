@@ -16,6 +16,7 @@ import {
   FloatingPanelShell,
 } from '@/components/chat/FloatingPanelShell'
 import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
+import { ThinkingLevelPanelControl } from '@/components/chat/ThinkingLevelControls'
 import { Switch } from '@/components/ui/switch'
 import type {
   AgentRunProtocolId,
@@ -472,7 +473,6 @@ function WorkflowPanelBody({
     () => roleOptions.filter((option) => isExecutionLaneRole(option.value)),
     [roleOptions]
   )
-
   React.useEffect(() => {
     if (selectedRolesSyncRef.current === roleDraftScopeKey) {
       return
@@ -782,33 +782,28 @@ function WorkflowPanelBody({
                 </p>
               </div>
               <div className="space-y-2">
-                <span className="text-xs font-medium text-muted-foreground">Reasoning effort</span>
-                <Select
-                  value={workflowReasoningEffort ?? '__inherit__'}
-                  onValueChange={(value) =>
+                <span className="text-xs font-medium text-muted-foreground">Thinking Level</span>
+                <ThinkingLevelPanelControl
+                  supportedEfforts={supportedReasoningEfforts}
+                  value={workflowReasoningEffort}
+                  allowInherit
+                  onInherit={() =>
                     onWorkflowFieldChange({
                       config: {
                         ...(workflowState.config ?? {}),
-                        reasoning_effort:
-                          value === '__inherit__'
-                            ? null
-                            : value as ReasoningEffort,
+                        reasoning_effort: null,
                       },
                     })
                   }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__inherit__">Inherit chat setting</SelectItem>
-                    {supportedReasoningEfforts.map((option) => (
-                      <SelectItem key={option} value={option}>
-                        {option}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                  onChange={(next) =>
+                    onWorkflowFieldChange({
+                      config: {
+                        ...(workflowState.config ?? {}),
+                        reasoning_effort: next,
+                      },
+                    })
+                  }
+                />
               </div>
             </div>
           </PanelSectionCard>

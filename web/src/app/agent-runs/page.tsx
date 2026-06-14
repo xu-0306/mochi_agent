@@ -24,6 +24,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  buildThinkingLevelOptions,
+  findThinkingLevelOption,
+  type ThinkingLevel,
+} from '@/lib/reasoning-presets'
 import { cn } from '@/lib/utils'
 
 interface SubagentDraft {
@@ -44,7 +49,6 @@ interface WorkflowTimelineItem {
 
 type RunTemplate = 'standard' | 'research_debate'
 type RunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
-type WorkflowReasoningEffort = api.ReasoningEffort | 'auto'
 
 const PROTOCOL_OPTIONS: Array<{
   id: api.AgentRunProtocolId
@@ -68,19 +72,7 @@ const PROTOCOL_OPTIONS: Array<{
   },
 ]
 
-const WORKFLOW_REASONING_EFFORT_OPTIONS: Array<{
-  value: WorkflowReasoningEffort
-  label: string
-  description: string
-}> = [
-  { value: 'auto', label: 'Auto', description: 'Let each model use its default behavior.' },
-  { value: 'none', label: 'None', description: 'Disable explicit reasoning effort.' },
-  { value: 'minimal', label: 'Minimal', description: 'Keep reasoning very short.' },
-  { value: 'low', label: 'Low', description: 'Prefer a lighter reasoning pass.' },
-  { value: 'medium', label: 'Medium', description: 'Balanced depth and latency.' },
-  { value: 'high', label: 'High', description: 'Spend more effort on reasoning.' },
-  { value: 'xhigh', label: 'X-High', description: 'Use the highest supported effort.' },
-]
+const WORKFLOW_REASONING_EFFORT_OPTIONS = buildThinkingLevelOptions()
 
 const TERMINAL_RUN_STATUSES = new Set([
   'succeeded',
@@ -520,7 +512,13 @@ export default function AgentRunsPage() {
   const [activeRunId, setActiveRunId] = React.useState<string | null>(null)
   const [activeRunDetail, setActiveRunDetail] = React.useState<api.AgentRunDetail | null>(null)
   const [messagePending, setMessagePending] = React.useState(false)
-  const [reasoningEffort, setReasoningEffort] = React.useState<WorkflowReasoningEffort>('auto')
+  const [reasoningEffort, setReasoningEffort] = React.useState<ThinkingLevel>('auto')
+  const selectedThinkingLevel = React.useMemo(
+    () => findThinkingLevelOption(
+      WORKFLOW_REASONING_EFFORT_OPTIONS.find((option) => option.value === reasoningEffort)?.effort ?? null
+    ),
+    [reasoningEffort]
+  )
   const [subagents, setSubagents] = React.useState<SubagentDraft[]>([])
   const [evidenceQueriesText, setEvidenceQueriesText] = React.useState('')
   const [evidenceCollectionEnabled, setEvidenceCollectionEnabled] = React.useState(true)
@@ -943,7 +941,8 @@ export default function AgentRunsPage() {
         topic: normalizedTopic || null,
         projectId: activeProject?.id ?? null,
         workspaceDir: effectiveWorkspacePath || null,
-        reasoning_effort: reasoningEffort === 'auto' ? null : reasoningEffort,
+        reasoning_effort:
+          WORKFLOW_REASONING_EFFORT_OPTIONS.find((option) => option.value === reasoningEffort)?.effort ?? null,
         subagents: runTemplate === 'research_debate' ? [] : normalizedSubagents,
         selected_models_roles: selectedModelsRoles,
         run_policy: {
@@ -1595,7 +1594,7 @@ export default function AgentRunsPage() {
 
               <div className="space-y-2">
                 <label className="text-sm font-medium text-foreground">Thinking Level</label>
-                <Select value={reasoningEffort} onValueChange={(value) => setReasoningEffort(value as WorkflowReasoningEffort)}>
+                <Select value={reasoningEffort} onValueChange={(value) => setReasoningEffort(value as ThinkingLevel)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Select thinking level" />
                   </SelectTrigger>
@@ -1608,10 +1607,8 @@ export default function AgentRunsPage() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  {
-                    WORKFLOW_REASONING_EFFORT_OPTIONS.find((option) => option.value === reasoningEffort)
-                      ?.description
-                  } Applies globally to the workflow. Models that do not support it ignore the setting.
+                  {selectedThinkingLevel.description} Applies globally to the workflow. Models that do not
+                  support it ignore the setting.
                 </p>
               </div>
 
