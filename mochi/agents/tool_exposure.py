@@ -16,10 +16,29 @@ class ToolExposurePlan:
     tool_names: list[str]
     matched_groups: list[str]
     limit: int
+    workspace_bound: bool = False
+    attachment_count: int = 0
+
+    def exposure_metadata(self) -> dict[str, Any]:
+        return {
+            "exposed_tools": list(self.tool_names),
+            "workspace_bound": self.workspace_bound,
+            "attachment_count": self.attachment_count,
+        }
 
 
 class ToolExposurePlanner:
     """Select a smaller, intent-matched tool subset for one turn."""
+
+    _CORE_WORKSPACE_READ_ONLY_TOOLS: tuple[str, ...] = (
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "csv_read",
+        "pdf_read",
+        "docx_read",
+        "notebook_read",
+    )
 
     _RISKY_TOOLS: frozenset[str] = frozenset(
         {
@@ -97,6 +116,9 @@ class ToolExposurePlanner:
         "get_current_time": 170,
         "calculator": 180,
     }
+    # Legacy keyword routing only remains as a ranking hint layer.
+    # New work must not add more keyword-gating rules here.
+    # Future direction: dynamic discovery and capability-first exposure.
     _GROUP_KEYWORDS: dict[str, tuple[str, ...]] = {
         "web": (
             "today",
@@ -188,6 +210,7 @@ class ToolExposurePlanner:
         "tool to use",
     )
     _ATTACHED_WORKSPACE_FILE_MARKERS: tuple[str, ...] = (
+        "structured attachments:",
         "attached workspace files:",
         "attached workspace file:",
     )
@@ -342,23 +365,37 @@ class ToolExposurePlanner:
         autonomy_mode: str | None = None,
         preferred_tool_names: list[str] | None = None,
         tool_capabilities: dict[str, dict[str, Any]] | None = None,
+        attachment_count: int = 0,
         tool_mode: Literal["disabled", "auto", "required"] = "auto",
     ) -> ToolExposurePlan:
         if tool_mode == "disabled":
-            return ToolExposurePlan(tool_names=[], matched_groups=[], limit=0)
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=[],
+                limit=0,
+                workspace_bound=session_bound_workspace,
+                attachment_count=max(0, attachment_count),
+            )
 
         backend_info = backend.get_model_info()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
         if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
-            return ToolExposurePlan(tool_names=[], matched_groups=[], limit=0)
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=[],
+                limit=0,
+                workspace_bound=session_bound_workspace,
+                attachment_count=max(0, attachment_count),
+            )
 
         lowered = message.lower()
-        attached_workspace_files = any(
+        normalized_attachment_count = max(0, attachment_count)
+        attached_workspace_files = normalized_attachment_count > 0 or any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
-        read_only_file_request = attached_workspace_files and self._matches_any_keyword(
+        read_only_file_request = attached_workspace_files and not self._matches_any_keyword(
             lowered,
-            self._READ_ONLY_FILE_INTENT_KEYWORDS,
+            self._EXECUTION_INTENT_KEYWORDS,
         )
         file_browse_request = (
             self._matches_any_keyword(lowered, self._FILE_BROWSE_INTENT_KEYWORDS)
@@ -481,8 +518,6 @@ class ToolExposurePlanner:
         filtered: list[str] = []
         risky_count = 0
         for tool_name in selected:
-            if not self._tool_matches_message(tool_name, lowered):
-                continue
             if tool_name in self._CONTEXTUAL_TOOLS and not self._matches_any_keyword(
                 lowered,
                 self._CONTEXT_KEYWORDS,
@@ -500,10 +535,26 @@ class ToolExposurePlanner:
                 risky_count += 1
             filtered.append(tool_name)
 
+        workspace_baseline = [
+            tool_name
+            for tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS
+            if session_bound_workspace and tool_name in available
+        ]
+        final_tool_names: list[str] = []
+        for tool_name in workspace_baseline:
+            if tool_name not in final_tool_names:
+                final_tool_names.append(tool_name)
+        for tool_name in filtered:
+            if tool_name not in final_tool_names:
+                final_tool_names.append(tool_name)
+
+        final_limit = max(limit, len(workspace_baseline))
         return ToolExposurePlan(
-            tool_names=filtered[:limit],
+            tool_names=final_tool_names[:final_limit],
             matched_groups=matched_groups,
-            limit=limit,
+            limit=final_limit,
+            workspace_bound=session_bound_workspace,
+            attachment_count=normalized_attachment_count,
         )
 
     def _build_tools_by_group(
@@ -612,12 +663,6 @@ class ToolExposurePlanner:
             self._matches_any_keyword(lowered_message, self._CITATION_KEYWORDS)
             or self._DOI_PATTERN.search(lowered_message) is not None
         )
-
-    def _tool_matches_message(self, tool_name: str, lowered_message: str) -> bool:
-        keywords = self._INTENT_REQUIRED_TOOL_KEYWORDS.get(tool_name)
-        if not keywords:
-            return True
-        return self._matches_any_keyword(lowered_message, keywords)
 
     @classmethod
     def _matches_any_keyword(cls, lowered_message: str, keywords: tuple[str, ...]) -> bool:

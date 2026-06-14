@@ -328,6 +328,7 @@ class AgentEngine:
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
+            attachment_count=self._attachment_count(attachments),
         )
         tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
         tool_schemas = tool_registry.get_schemas()
@@ -560,6 +561,7 @@ class AgentEngine:
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
+            attachment_count=self._attachment_count(request.attachments),
             tool_mode=request.tool_mode,
         )
         exposure_plan = self._apply_invocation_tool_overrides(
@@ -632,13 +634,17 @@ class AgentEngine:
             exposed_tools=list(exposure_plan.tool_names),
             matched_tool_groups=list(exposure_plan.matched_groups),
         )
+        tool_exposure_metadata = exposure_plan.exposure_metadata()
+        setattr(diagnostics, "tool_exposure", tool_exposure_metadata)
         logger.debug(
-            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}",
+            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
             active_backend.get_model_info().backend_type,
             request.tool_mode,
             request.execution_profile,
             exposure_plan.matched_groups,
             exposure_plan.tool_names,
+            exposure_plan.workspace_bound,
+            exposure_plan.attachment_count,
         )
         if request.tool_mode == "required" and not exposure_plan.tool_names:
             diagnostics.fallback_reason = "tool_mode_required_but_no_tools_exposed"
@@ -674,6 +680,9 @@ class AgentEngine:
                 if isinstance(event, FinalAnswerEvent):
                     final_text = event.content
                     event.trajectory_id = trajectory_id
+                event_metadata = getattr(event, "metadata", None)
+                if isinstance(event_metadata, dict):
+                    event_metadata.setdefault("tool_exposure", copy.deepcopy(tool_exposure_metadata))
                 event.turn_id = turn_id  # type: ignore[attr-defined]
                 turn_event_seq += 1
                 if persist_turn_events:
@@ -724,7 +733,13 @@ class AgentEngine:
         backend_info = backend.get_model_info()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
         if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
-            return ToolExposurePlan(tool_names=[], matched_groups=exposure_plan.matched_groups, limit=0)
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=exposure_plan.matched_groups,
+                limit=0,
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
+            )
         if backend_info.backend_type != "openai_compat":
             return exposure_plan
         if metadata.get("native_tool_calling_status") not in {None, "unknown"}:
@@ -750,7 +765,13 @@ class AgentEngine:
                 refreshed.provider,
                 refreshed.name,
             )
-            return ToolExposurePlan(tool_names=[], matched_groups=exposure_plan.matched_groups, limit=0)
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=exposure_plan.matched_groups,
+                limit=0,
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
+            )
         return exposure_plan
 
     def _apply_execution_profile(
@@ -798,12 +819,16 @@ class AgentEngine:
                 tool_names=[name for name in exposure_plan.tool_names if name in readonly_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         if execution_profile == "subagent_execution_request":
             return ToolExposurePlan(
                 tool_names=[name for name in exposure_plan.tool_names if name in execution_request_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         if execution_profile == "controller_exec":
             controller_tools = list(exposure_plan.tool_names)
@@ -814,12 +839,16 @@ class AgentEngine:
                 tool_names=[name for name in controller_tools if name in controller_exec_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         if execution_profile in {"subagent_research", "judge", "verifier"}:
             return ToolExposurePlan(
                 tool_names=[name for name in exposure_plan.tool_names if name in evidence_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         return exposure_plan
 
@@ -853,6 +882,8 @@ class AgentEngine:
             tool_names=tool_names[: exposure_plan.limit] if exposure_plan.limit > 0 else [],
             matched_groups=exposure_plan.matched_groups,
             limit=exposure_plan.limit,
+            workspace_bound=exposure_plan.workspace_bound,
+            attachment_count=exposure_plan.attachment_count,
         )
 
     async def switch_model(self, model_spec: str) -> ModelInfo:
@@ -1789,6 +1820,10 @@ class AgentEngine:
         for attachment in attachments:
             lines.append(f"- {self._attachment_summary_label(attachment)}")
         return "\n".join(line for line in lines if line)
+
+    @staticmethod
+    def _attachment_count(attachments: list[AttachmentRef] | None) -> int:
+        return len(attachments or [])
 
     def _build_attachment_prompt_context(
         self,
