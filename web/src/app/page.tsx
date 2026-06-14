@@ -1388,16 +1388,24 @@ export default function ChatPage() {
     }
 
     const runtimeMessages = currentSessionMessages ?? []
-    const needsCanonicalTurnIds =
+    const countMessagesMissingTurnId = (messages: Message[]) =>
+      messages.reduce(
+        (count, message) => (
+          (message.type === 'user' || message.type === 'assistant') && !message.turnId
+            ? count + 1
+            : count
+        ),
+        0
+      )
+    const runtimeMissingTurnIds = countMessagesMissingTurnId(runtimeMessages)
+    const replayMissingTurnIds = countMessagesMissingTurnId(replayMessages)
+    const canImproveCanonicalTurnIds =
       runtimeMessages.length > 0 &&
       !hasActiveStream &&
-      runtimeMessages.some(
-        (message) =>
-          (message.type === 'user' || message.type === 'assistant') &&
-          !message.turnId
-      )
+      runtimeMissingTurnIds > 0 &&
+      replayMissingTurnIds < runtimeMissingTurnIds
 
-    if (needsCanonicalTurnIds) {
+    if (canImproveCanonicalTurnIds) {
       setSessionMessages(currentSessionId, replayMessages)
       return
     }
