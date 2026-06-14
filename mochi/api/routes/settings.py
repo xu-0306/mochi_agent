@@ -225,9 +225,11 @@ class SecuritySettingsPatch(BaseModel):
     """可由 WebGUI 更新的非敏感安全設定。"""
 
     autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] | None = None
-    require_approval_for_shell: bool | None = None
     require_approval_for_file_write: bool | None = None
     require_approval_for_exec: bool | None = None
+    command_rules: list[dict[str, Any]] | None = None
+    exec_allowed_env_vars: list[str] | None = None
+    exec_default_shell: Literal["auto", "bash", "sh", "pwsh", "powershell", "cmd"] | None = None
     agent_run_default_max_wall_clock_sec: int | None = Field(default=None, ge=1, le=86_400)
     agent_run_default_heartbeat_timeout_sec: int | None = Field(default=None, ge=1, le=86_400)
     agent_run_default_checkpoint_interval_steps: int | None = Field(default=None, ge=1, le=10_000)
@@ -646,9 +648,11 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
         },
         "security": {
             "autonomy_mode": config.security.autonomy_mode,
-            "require_approval_for_shell": config.security.require_approval_for_shell,
             "require_approval_for_file_write": config.security.require_approval_for_file_write,
             "require_approval_for_exec": config.security.require_approval_for_exec,
+            "command_rules": [rule.model_dump() for rule in config.security.command_rules],
+            "exec_allowed_env_vars": config.security.exec_allowed_env_vars,
+            "exec_default_shell": config.security.exec_default_shell,
             "agent_run_default_max_wall_clock_sec": config.security.agent_run_default_max_wall_clock_sec,
             "agent_run_default_heartbeat_timeout_sec": config.security.agent_run_default_heartbeat_timeout_sec,
             "agent_run_default_checkpoint_interval_steps": config.security.agent_run_default_checkpoint_interval_steps,
@@ -770,7 +774,6 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
         if isinstance(requested_mode, str):
             mode_defaults = autonomy_mode_defaults(requested_mode)
             for key in (
-                "require_approval_for_shell",
                 "require_approval_for_file_write",
                 "require_approval_for_exec",
                 "file_ops_scope",

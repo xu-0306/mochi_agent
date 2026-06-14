@@ -13,28 +13,24 @@ AutonomyMode = Literal["trusted_workspace", "strict", "high_autonomy", "auto_rev
 _AUTONOMY_DEFAULTS: dict[AutonomyMode, dict[str, Any]] = {
     "strict": {
         "autonomy_mode": "strict",
-        "require_approval_for_shell": True,
         "require_approval_for_file_write": True,
         "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
     },
     "trusted_workspace": {
         "autonomy_mode": "trusted_workspace",
-        "require_approval_for_shell": True,
         "require_approval_for_file_write": False,
         "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
     },
     "auto_review": {
         "autonomy_mode": "auto_review",
-        "require_approval_for_shell": False,
         "require_approval_for_file_write": False,
         "require_approval_for_exec": False,
         "file_ops_scope": "workspace",
     },
     "high_autonomy": {
         "autonomy_mode": "high_autonomy",
-        "require_approval_for_shell": False,
         "require_approval_for_file_write": False,
         "require_approval_for_exec": False,
         "file_ops_scope": "any",
@@ -47,7 +43,6 @@ class RuntimePermissionPolicy:
     """Resolved runtime permission flags for tool execution."""
 
     autonomy_mode: AutonomyMode
-    require_approval_for_shell: bool
     require_approval_for_file_write: bool
     require_approval_for_exec: bool
     file_ops_scope: str
@@ -55,7 +50,6 @@ class RuntimePermissionPolicy:
     def to_dict(self) -> dict[str, Any]:
         return {
             "autonomy_mode": self.autonomy_mode,
-            "require_approval_for_shell": self.require_approval_for_shell,
             "require_approval_for_file_write": self.require_approval_for_file_write,
             "require_approval_for_exec": self.require_approval_for_exec,
             "file_ops_scope": self.file_ops_scope,
@@ -69,25 +63,25 @@ def autonomy_mode_defaults(mode: AutonomyMode) -> dict[str, Any]:
 
 def infer_autonomy_mode(
     *,
-    require_approval_for_shell: bool,
+    require_approval_for_exec: bool,
     require_approval_for_file_write: bool,
     file_ops_scope: str,
 ) -> AutonomyMode:
     """Infer the closest autonomy preset for legacy configs without a mode."""
     if (
-        require_approval_for_shell is False
+        require_approval_for_exec is False
         and require_approval_for_file_write is False
         and file_ops_scope == "any"
     ):
         return "high_autonomy"
     if (
-        require_approval_for_shell is False
+        require_approval_for_exec is False
         and require_approval_for_file_write is False
         and file_ops_scope == "workspace"
     ):
         return "auto_review"
     if (
-        require_approval_for_shell is True
+        require_approval_for_exec is True
         and require_approval_for_file_write is False
         and file_ops_scope == "workspace"
     ):
@@ -102,7 +96,6 @@ def resolve_runtime_permission_policy(
 ) -> RuntimePermissionPolicy:
     """Resolve effective runtime permission policy from security config."""
     effective_mode = security.autonomy_mode
-    effective_shell = security.require_approval_for_shell
     effective_file_write = security.require_approval_for_file_write
     effective_exec = security.require_approval_for_exec
     effective_scope = security.file_ops_scope
@@ -110,8 +103,6 @@ def resolve_runtime_permission_policy(
     if isinstance(overrides, dict):
         if isinstance(overrides.get("autonomy_mode"), str):
             effective_mode = overrides["autonomy_mode"]
-        if isinstance(overrides.get("require_approval_for_shell"), bool):
-            effective_shell = overrides["require_approval_for_shell"]
         if isinstance(overrides.get("require_approval_for_file_write"), bool):
             effective_file_write = overrides["require_approval_for_file_write"]
         if isinstance(overrides.get("require_approval_for_exec"), bool):
@@ -121,7 +112,6 @@ def resolve_runtime_permission_policy(
 
     return RuntimePermissionPolicy(
         autonomy_mode=effective_mode,
-        require_approval_for_shell=effective_shell,
         require_approval_for_file_write=effective_file_write,
         require_approval_for_exec=effective_exec,
         file_ops_scope=effective_scope,

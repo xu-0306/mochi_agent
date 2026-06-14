@@ -85,26 +85,13 @@ from mochi.memory.conversation import ConversationMemory
 from mochi.memory.store import MemoryStore
 from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.projects.store import ProjectStore
-from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
+from mochi.security.policy import build_runtime_permission_policy_dict
 from mochi.sessions.store import SessionStore
 from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
 from mochi.tools.base import ToolExecutionContext
-from mochi.tools.execute_code import ExecuteCodeTool
-from mochi.tools.file_ops import FileEditTool, FileReadTool, FileWriteTool
-from mochi.tools.literature_search import (
-    ArxivSearchTool,
-    CrossrefSearchTool,
-    PubMedSearchTool,
-    SemanticScholarSearchTool,
-)
-from mochi.tools.mcp_client import MCPCallTool, McpListResourcesTool, McpReadResourceTool, McpRuntimeManager
-from mochi.tools.memory_save import MemorySaveTool
-from mochi.tools.memory_search import MemorySearchTool
+from mochi.tools.mcp_client import McpRuntimeManager
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.registry_factory import ToolRegistryFactory
-from mochi.tools.shell import ShellTool
-from mochi.tools.web_fetch import WebFetchTool
-from mochi.tools.web_search import WebSearchTool
 from mochi.voice.events import VoiceEvent
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS, VoiceRouter
 from mochi.voice.session_manager import VoiceSessionManager
@@ -1513,206 +1500,29 @@ class AgentEngine:
 
     def _register_builtin_tools(self) -> None:
         """以共享 runtime 物件覆蓋內建工具預設實例。"""
-        from mochi.tools.calculator import CalculatorTool
-        from mochi.tools.datetime_tool import DateTimeTool
+        self._tool_registry = self._tool_registry_factory.create_registry(
+            self._config.workspace_dir
+        )
 
-        tc = self._config.tools  # shortcut
-        runtime_policy = resolve_runtime_permission_policy(self._config.security)
 
-        self._tool_registry.register(
-            ShellTool(
-                allowlist=self._config.security.shell_command_allowlist,
-                workspace_dir=self._config.workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
-        self._tool_registry.register(
-            FileReadTool(
-                workspace_dir=self._config.workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-            )
-        )
-        self._tool_registry.register(
-            FileWriteTool(
-                workspace_dir=self._config.workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
-        self._tool_registry.register(
-            FileEditTool(
-                workspace_dir=self._config.workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
 
         # --- 搜尋工具 ---
-        def _secret(s: SecretStr | None) -> str | None:
-            return s.get_secret_value() if s is not None else None
-
-        self._tool_registry.register(
-            WebSearchTool(
-                engine=tc.web_search_engine,
-                timeout=tc.http_timeout,
-                fallback_engines=tc.web_search_fallback_engines,
-                searxng_base_url=tc.web_search_searxng_base_url,
-                brave_api_key=_secret(tc.web_search_brave_api_key),
-                tavily_api_key=_secret(tc.web_search_tavily_api_key),
-                serper_api_key=_secret(tc.web_search_serper_api_key),
-                jina_api_key=_secret(tc.web_search_jina_api_key),
-                exa_api_key=_secret(tc.web_search_exa_api_key),
-                language=tc.web_search_language,
-                region=tc.web_search_region,
-            )
-        )
 
         # --- 網頁擷取 ---
-        jina_key = _secret(tc.web_fetch_jina_api_key) or _secret(tc.web_search_jina_api_key)
-        self._tool_registry.register(
-            WebFetchTool(
-                timeout=tc.http_timeout,
-                jina_api_key=jina_key,
-                extractor=tc.web_fetch_extractor,
-            )
-        )
 
         # --- 文獻工具 ---
-        self._tool_registry.register(ArxivSearchTool(timeout=tc.http_timeout))
-        self._tool_registry.register(
-            SemanticScholarSearchTool(
-                timeout=tc.http_timeout,
-                api_key=_secret(tc.semantic_scholar_api_key),
-            )
-        )
-        self._tool_registry.register(
-            CrossrefSearchTool(
-                timeout=tc.http_timeout,
-                mailto=tc.crossref_mailto,
-            )
-        )
-        self._tool_registry.register(
-            PubMedSearchTool(
-                timeout=tc.http_timeout,
-                email=tc.pubmed_email,
-                api_key=_secret(tc.pubmed_api_key),
-            )
-        )
 
         # --- 程式碼執行 ---
-        self._tool_registry.register(
-            ExecuteCodeTool(
-                workspace_dir=self._config.workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
 
         # --- MCP ---
-        if self._mcp_runtime_manager is not None:
-            self._tool_registry.register(MCPCallTool(runtime=self._mcp_runtime_manager))
-            self._tool_registry.register(McpListResourcesTool(runtime=self._mcp_runtime_manager))
-            self._tool_registry.register(McpReadResourceTool(runtime=self._mcp_runtime_manager))
-            for tool in self._mcp_runtime_manager.materialize_tools():
-                self._tool_registry.register(tool)
-        else:
-            self._tool_registry.register(MCPCallTool())
 
         # --- 記憶 ---
-        self._tool_registry.register(
-            MemorySearchTool(
-                memory_store=self._memory_store,
-                workspace_dir=self._config.workspace_dir,
-                default_top_k=self._config.memory.fts_top_k,
-            )
-        )
-        self._tool_registry.register(
-            MemorySaveTool(
-                memory_store=self._memory_store,
-                workspace_dir=self._config.workspace_dir,
-            )
-        )
 
         # --- 實用工具 ---
-        self._tool_registry.register(CalculatorTool())
-        self._tool_registry.register(DateTimeTool())
 
     def _build_tool_registry_for_workspace(self, workspace_dir: str) -> ToolRegistry:
         """Build a tool registry for one effective workspace."""
-        runtime_policy = resolve_runtime_permission_policy(self._config.security)
-        registry = ToolRegistry(
-            extra_dirs=self._config.tools.extra_tools_dirs or None,
-            discover_builtin=False,
-        )
-
-        for tool in self._tool_registry.list_tools():
-            if tool.name in {
-                "shell",
-                "file_read",
-                "file_write",
-                "file_edit",
-                "execute_code",
-                "memory_search",
-                "memory_save",
-            }:
-                continue
-            registry.register(tool)
-
-        registry.register(
-            ShellTool(
-                allowlist=self._config.security.shell_command_allowlist,
-                workspace_dir=workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
-        registry.register(
-            FileReadTool(
-                workspace_dir=workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-            )
-        )
-        registry.register(
-            FileWriteTool(
-                workspace_dir=workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
-        registry.register(
-            FileEditTool(
-                workspace_dir=workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
-        registry.register(
-            ExecuteCodeTool(
-                workspace_dir=workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
-        registry.register(
-            MemorySearchTool(
-                memory_store=self._memory_store,
-                workspace_dir=workspace_dir,
-                default_top_k=self._config.memory.fts_top_k,
-            )
-        )
-        registry.register(
-            MemorySaveTool(
-                memory_store=self._memory_store,
-                workspace_dir=workspace_dir,
-            )
-        )
-
-        return registry
+        return self._tool_registry_factory.create_registry(workspace_dir)
 
     def _get_tool_execution_context(
         self,
@@ -2556,7 +2366,6 @@ def _resolve_agent_run_evidence_permission_policy(
 ) -> dict[str, Any] | None:
     permission_keys = {
         "autonomy_mode",
-        "require_approval_for_shell",
         "require_approval_for_file_write",
         "require_approval_for_exec",
         "file_ops_scope",

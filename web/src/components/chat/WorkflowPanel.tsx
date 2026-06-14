@@ -103,6 +103,8 @@ interface WorkflowRoleOption {
   defaultModel: WorkflowRoleDefaultModel
 }
 
+const EXECUTION_LANE_ROLES = new Set(['executor', 'controller', 'evaluator'])
+
 const KNOWN_WORKFLOW_ROLE_OPTIONS: Record<string, WorkflowRoleOption> = {
   teacher: {
     value: 'teacher',
@@ -274,12 +276,39 @@ function getRoleSelectValue(role: string, options: WorkflowRoleOption[]): string
 
 function getRoleDefaultModelLabel(defaultModel: WorkflowRoleDefaultModel): string {
   if (defaultModel === 'lead') {
-    return 'Lead model by default'
+    return 'Smart model by default'
   }
   if (defaultModel === 'worker') {
-    return 'Worker model by default'
+    return 'Research worker model by default'
   }
   return 'No recommended default'
+}
+
+function isExecutionLaneRole(role: string): boolean {
+  return EXECUTION_LANE_ROLES.has(role)
+}
+
+function getRoleCapabilityLabel(role: string): string {
+  return isExecutionLaneRole(role) ? 'Execution lane' : 'Research / verify only'
+}
+
+function getRoleCapabilityDescription(role: string): string {
+  if (role === 'executor') {
+    return 'Can prepare file, code, or command requests when controlled execution is enabled.'
+  }
+  if (role === 'controller') {
+    return 'Can approve or reject execution requests before anything writes files or runs commands.'
+  }
+  if (role === 'evaluator') {
+    return 'Can review execution output and decide what should happen next.'
+  }
+  return 'Stays in read, research, debate, planning, or verification work. No write/run access.'
+}
+
+function getRoleCapabilityClassName(role: string): string {
+  return isExecutionLaneRole(role)
+    ? 'border-amber-400/20 bg-amber-500/10 text-amber-200'
+    : 'border-emerald-400/20 bg-emerald-500/10 text-emerald-200'
 }
 
 function normalizeSelectedModelRoles(
@@ -433,6 +462,14 @@ function WorkflowPanelBody({
       roleOptions.filter((option) =>
         ['debater_a', 'debater_b', 'local_worker', 'skeptic', 'executor'].includes(option.value)
       ),
+    [roleOptions]
+  )
+  const researchOnlyRoles = React.useMemo(
+    () => roleOptions.filter((option) => !isExecutionLaneRole(option.value)),
+    [roleOptions]
+  )
+  const executionLaneRoles = React.useMemo(
+    () => roleOptions.filter((option) => isExecutionLaneRole(option.value)),
     [roleOptions]
   )
 
@@ -785,14 +822,15 @@ function WorkflowPanelBody({
                 <div className="rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-3">
                   <p className="text-sm font-medium text-foreground">Default team assignment</p>
                   <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                    Most users only need these two defaults. The lead model handles planning and final judgment,
-                    while the worker model handles parallel research, debate, and skeptical review.
+                    Most users only need these two defaults. The Smart model is the shared default for planner,
+                    judge, verifier, and synthesizer. The research worker model is the shared default for debate,
+                    evidence gathering, and skeptical review.
                   </p>
                 </div>
 
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <span className="text-xs font-medium text-muted-foreground">Lead model</span>
+                    <span className="text-xs font-medium text-muted-foreground">Smart model</span>
                     <Select
                       value={smartModelId || '__unassigned__'}
                       onValueChange={(value) =>
@@ -817,7 +855,7 @@ function WorkflowPanelBody({
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-muted-foreground">
-                      Used by the planner, judge, verifier, and synthesizer by default.
+                      Shared default for planner, judge, verifier, and synthesizer.
                     </p>
                   </div>
                   <div className="space-y-2">
@@ -881,6 +919,53 @@ function WorkflowPanelBody({
                         </span>
                       ))}
                     </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-xl border border-emerald-400/15 bg-emerald-500/5 px-3 py-3">
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-emerald-300">
+                      Research-only roles
+                    </p>
+                    <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                      These roles can read, compare, debate, and verify evidence, but they do not write files or run commands.
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {researchOnlyRoles.map((role) => (
+                        <span
+                          key={role.value}
+                          className="inline-flex rounded-full border border-white/10 bg-canvas/50 px-2.5 py-1 text-[11px] text-muted-foreground"
+                        >
+                          {role.label}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-amber-400/15 bg-amber-500/5 px-3 py-3">
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-amber-200">
+                      Execution lane
+                    </p>
+                    {executionLaneRoles.length > 0 ? (
+                      <>
+                        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                          Only this lane can prepare, approve, and assess write/run actions when controlled execution is enabled.
+                        </p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {executionLaneRoles.map((role) => (
+                            <span
+                              key={role.value}
+                              className="inline-flex rounded-full border border-white/10 bg-canvas/50 px-2.5 py-1 text-[11px] text-muted-foreground"
+                            >
+                              {role.label}
+                            </span>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                        Controlled execution is off, so this workflow stays research-only.
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -1003,16 +1088,16 @@ function WorkflowPanelBody({
             title={workflowTemplate === 'research_debate' ? 'Role overrides' : 'Agent roles'}
             description={
               workflowTemplate === 'research_debate'
-                ? 'Override a specific role only when it should use a different model than your lead or worker default.'
-                : 'Choose which model each workflow role should use when a new bound run starts.'
+                ? 'Pick a role preset, then override it only when that role should use a different model than the Smart or worker default.'
+                : 'Pick role presets and models for each workflow role before a new bound run starts.'
             }
           >
             <div className="space-y-3">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <p className="min-w-0 text-xs leading-relaxed text-muted-foreground sm:max-w-[14rem]">
                   {workflowTemplate === 'research_debate'
-                    ? 'These overrides still feed `selected_models_roles`, but the default research team assignment above handles most roles for you.'
-                    : 'These mappings feed `selected_models_roles` for newly created workflow runs.'}
+                    ? 'These preset overrides still feed `selected_models_roles`, but the shared Smart and worker defaults above cover most research roles automatically.'
+                    : 'These preset mappings feed `selected_models_roles` for newly created workflow runs.'}
                 </p>
                 <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                   <Button type="button" variant="ghost" size="sm" onClick={handleSeedProtocolRoles}>
@@ -1043,9 +1128,19 @@ function WorkflowPanelBody({
                               {workflowTemplate === 'research_debate' ? `Override ${index + 1}` : `Role ${index + 1}`}
                             </p>
                             {selectedRoleOption ? (
-                              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                                {selectedRoleOption.description}
-                              </p>
+                              <div className="mt-1 space-y-1">
+                                <span
+                                  className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] ${getRoleCapabilityClassName(selectedRoleOption.value)}`}
+                                >
+                                  {getRoleCapabilityLabel(selectedRoleOption.value)}
+                                </span>
+                                <p className="text-xs leading-relaxed text-muted-foreground">
+                                  {selectedRoleOption.description}
+                                </p>
+                                <p className="text-xs leading-relaxed text-muted-foreground">
+                                  {getRoleCapabilityDescription(selectedRoleOption.value)}
+                                </p>
+                              </div>
                             ) : null}
                           </div>
                           <Button
@@ -1061,40 +1156,61 @@ function WorkflowPanelBody({
                         </div>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <div className="space-y-2">
-                            <span className="text-xs font-medium text-muted-foreground">
-                              {workflowTemplate === 'research_debate' ? 'Role' : 'Role name'}
-                            </span>
+                            <span className="text-xs font-medium text-muted-foreground">Role preset</span>
                             <Select
                               value={roleSelectValue}
                               onValueChange={(value) => {
                                 if (value === CUSTOM_ROLE_VALUE) {
-                                  handleRoleDraftChange(draft.id, 'role', draft.role || '')
+                                  handleRoleDraftChange(draft.id, 'role', '')
                                   return
                                 }
                                 handleRoleDraftChange(draft.id, 'role', value)
                               }}
                             >
                               <SelectTrigger>
-                                <SelectValue placeholder="Select role" />
+                                <SelectValue placeholder="Choose role preset">
+                                  {roleSelectValue === CUSTOM_ROLE_VALUE
+                                    ? 'Custom role'
+                                    : selectedRoleOption?.label}
+                                </SelectValue>
                               </SelectTrigger>
                               <SelectContent>
                                 {roleOptions.map((option) => (
-                                  <SelectItem key={option.value} value={option.value}>
-                                    {option.label}
+                                  <SelectItem key={option.value} value={option.value} textValue={option.label}>
+                                    <div className="flex flex-col py-0.5">
+                                      <span>{option.label}</span>
+                                      <span className="text-xs text-muted-foreground">{option.description}</span>
+                                      <span className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground/80">
+                                        {getRoleCapabilityLabel(option.value)}
+                                      </span>
+                                    </div>
                                   </SelectItem>
                                 ))}
-                                <SelectItem value={CUSTOM_ROLE_VALUE}>Custom role</SelectItem>
+                                <SelectItem value={CUSTOM_ROLE_VALUE} textValue="Custom role">
+                                  <div className="flex flex-col py-0.5">
+                                    <span>Custom role</span>
+                                    <span className="text-xs text-muted-foreground">
+                                      Use only when the runtime expects a role ID outside the built-in presets.
+                                    </span>
+                                  </div>
+                                </SelectItem>
                               </SelectContent>
                             </Select>
                             {roleSelectValue === CUSTOM_ROLE_VALUE ? (
-                              <Input
-                                value={draft.role}
-                                placeholder="custom_role_id"
-                                onChange={(event) => handleRoleDraftChange(draft.id, 'role', event.target.value)}
-                              />
+                              <div className="space-y-2">
+                                <Input
+                                  value={draft.role}
+                                  placeholder="custom_role_id"
+                                  onChange={(event) => handleRoleDraftChange(draft.id, 'role', event.target.value)}
+                                />
+                                <p className="text-xs text-muted-foreground">
+                                  Custom roles are not labeled by the UI, so use them sparingly and name them exactly as the workflow expects.
+                                </p>
+                              </div>
                             ) : selectedRoleOption ? (
                               <div className="rounded-md border border-white/8 bg-canvas/35 px-3 py-2 text-xs text-muted-foreground">
-                                {getRoleDefaultModelLabel(selectedRoleOption.defaultModel)}
+                                <p>{getRoleDefaultModelLabel(selectedRoleOption.defaultModel)}</p>
+                                <p className="mt-1">{getRoleCapabilityDescription(selectedRoleOption.value)}</p>
                               </div>
                             ) : null}
                           </div>

@@ -10,15 +10,30 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from mochi.api.routes.filesystem import _preview_docx, _preview_pdf, _preview_text_file
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
 from mochi.projects.execution_scope import ExecutionScopeResolver
+from mochi.runtime.store import RuntimeStore
 from mochi.sessions.store import SessionStore
+from mochi.tools.file_mutations import PatchValidationError, prepare_apply_patch
 from mochi.utils.security import is_path_within_workspace, normalize_workspace_dir, resolve_path_in_workspace
 
 router = APIRouter(prefix="/v1/workspace", tags=["workspace"])
+
+
+class WorkspacePatchPreviewRequest(BaseModel):
+    """Patch preview request payload."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    patch: str = Field(min_length=1, alias="patch_text")
+    session_id: str | None = None
+    project_id: str | None = None
+    approval_id: str | None = None
+    encoding: str = "utf-8"
 
 
 @router.get("/tree")
@@ -218,13 +233,78 @@ async def get_workspace_diff(
     }
 
 
+@router.post("/patch/preview")
+async def preview_workspace_patch(
+    request: Request,
+    payload: WorkspacePatchPreviewRequest,
+) -> dict[str, Any]:
+    resolved_project_id, workspace_root = await resolve_workspace_scope(
+        request,
+        session_id=payload.session_id,
+        project_id=payload.project_id,
+        approval_id=payload.approval_id,
+    )
+    config = await _get_config(request.app)
+    try:
+        _, change_payload = await prepare_apply_patch(
+            patch=payload.patch,
+            workspace_dir=workspace_root,
+            path_scope=config.security.file_ops_scope,
+            encoding=payload.encoding,
+            undo_max_size_mb=config.security.file_undo_max_size_mb,
+        )
+    except PatchValidationError as exc:
+        return {
+            "type": "workspace_patch_preview",
+            "session_id": payload.session_id or "draft-session",
+            "project_id": resolved_project_id,
+            "workspace_dir": str(workspace_root),
+            "valid": False,
+            "summary": None,
+            "patch_text": payload.patch,
+            "editable_patch_text": payload.patch,
+            "file_changes": [],
+            "change_count": 0,
+            "paths": [],
+            "diff_available": False,
+            "errors": [str(exc)],
+            "validation_errors": [str(exc)],
+            "warnings": [],
+        }
+
+    return {
+        "type": "workspace_patch_preview",
+        "session_id": payload.session_id or "draft-session",
+        "project_id": resolved_project_id,
+        "workspace_dir": str(workspace_root),
+        "valid": True,
+        "summary": (
+            "1 file change prepared."
+            if int(change_payload.get("change_count") or 0) == 1
+            else f"{int(change_payload.get('change_count') or 0)} file changes prepared."
+        ),
+        "patch_text": payload.patch,
+        **change_payload,
+        "errors": [],
+        "validation_errors": [],
+        "warnings": [],
+    }
+
+
 async def resolve_workspace_scope(
     request: Request,
     *,
     session_id: str | None,
     project_id: str | None,
+    approval_id: str | None = None,
 ) -> tuple[str | None, Path]:
     """Resolve the effective session/project workspace for one request."""
+    if approval_id:
+        approval_scope = await _resolve_workspace_scope_from_approval(request, approval_id)
+        if approval_scope is not None:
+            return approval_scope
+        raise HTTPException(status_code=404, detail="Approval not found")
+
     config = await _get_config(request.app)
     resolver = ExecutionScopeResolver(
         default_workspace_dir=str(getattr(config, "workspace_dir")),
@@ -250,6 +330,43 @@ async def _get_session_store(request: Request) -> SessionStore:
     store = SessionStore(config.sessions_dir)
     request.app.state.session_store = store
     return store
+
+
+async def _get_runtime_store(request: Request) -> RuntimeStore:
+    existing = getattr(request.app.state, "runtime_store", None)
+    if isinstance(existing, RuntimeStore):
+        await existing.initialize()
+        return existing
+
+    config = await _get_config(request.app)
+    store = RuntimeStore(Path(config.sessions_dir) / "runtime.db")
+    await store.initialize()
+    request.app.state.runtime_store = store
+    return store
+
+
+async def _resolve_workspace_scope_from_approval(
+    request: Request,
+    approval_id: str,
+) -> tuple[str | None, Path] | None:
+    store = await _get_runtime_store(request)
+    approval = await store.get_approval_request(approval_id)
+    if approval is None:
+        return None
+    task_id = approval.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    task = await store.get_task_run(task_id)
+    if task is None:
+        return None
+    workspace_dir = (
+        task.get("task_workspace_dir")
+        or task.get("project_workspace_dir")
+        or task.get("workspace_dir")
+    )
+    if not isinstance(workspace_dir, str) or not workspace_dir.strip():
+        return None
+    return task.get("project_id"), normalize_workspace_dir(workspace_dir)
 
 
 def _coerce_workspace_browse_directory(
@@ -494,6 +611,8 @@ def _build_workspace_diff_payload(
         "deleted_lines": deleted_lines,
         "diff_available": diff_text is not None,
         "diff": diff_text if include_diff else None,
+        "original_content": before_text if include_diff else None,
+        "new_content": after_text if include_diff else None,
     }
 
 

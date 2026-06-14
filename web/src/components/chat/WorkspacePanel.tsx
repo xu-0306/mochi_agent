@@ -139,7 +139,11 @@ export function WorkspacePanel({ onAttachAttachment, onClose }: WorkspacePanelPr
                         key={`${change.path}:${change.status}`}
                         type="button"
                         onClick={() => void loadDiff(change.path)}
-                        className="w-full rounded-lg border border-transparent bg-surface-layer/60 px-3 py-2 text-left transition-colors hover:border-border hover:bg-surface-layer"
+                        className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
+                          selectedFilePath === change.path
+                            ? 'border-primary-500/30 bg-primary-500/10'
+                            : 'border-transparent bg-surface-layer/60 hover:border-border hover:bg-surface-layer'
+                        }`}
                       >
                         <div className="flex items-center justify-between gap-3">
                           <p className="truncate text-sm font-medium text-foreground">

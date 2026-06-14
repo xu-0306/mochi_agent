@@ -17,7 +17,7 @@ from mochi.tools.execute_code_v2 import ExecuteCodeV2Tool
 from mochi.tools.csv_read import CsvReadTool
 from mochi.tools.delegate_subagent_task import DelegateSubagentTaskTool
 from mochi.tools.docx_read import DocxReadTool
-from mochi.tools.file_ops import FileEditTool, FileReadTool, FileWriteTool
+from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileReadTool, FileWriteTool
 from mochi.tools.glob_search import GlobSearchTool
 from mochi.tools.grep_search import GrepSearchTool
 from mochi.tools.kill_session import KillSessionTool
@@ -40,7 +40,6 @@ from mochi.tools.process_control import ProcessPollTool, ProcessStopTool
 from mochi.tools.process_service import ProcessService
 from mochi.tools.read_session import ReadSessionTool
 from mochi.tools.registry import ToolRegistry
-from mochi.tools.shell import ShellTool
 from mochi.tools.tool_search import ToolSearchTool
 from mochi.tools.web_crawl import WebCrawlTool
 from mochi.tools.web_fetch import WebFetchTool
@@ -136,7 +135,6 @@ class ToolRegistryFactory:
             BuiltInToolSpec("write_stdin", "workspace", "workspace", self._build_write_stdin),
             BuiltInToolSpec("kill_session", "workspace", "workspace", self._build_kill_session),
             BuiltInToolSpec("list_sessions", "workspace", "workspace", self._build_list_sessions),
-            BuiltInToolSpec("shell", "workspace", "workspace", self._build_shell),
             BuiltInToolSpec("file_read", "workspace", "workspace", self._build_file_read),
             BuiltInToolSpec("glob_search", "workspace", "workspace", self._build_glob_search),
             BuiltInToolSpec("grep_search", "workspace", "workspace", self._build_grep_search),
@@ -146,6 +144,7 @@ class ToolRegistryFactory:
             BuiltInToolSpec("notebook_read", "workspace", "workspace", self._build_notebook_read),
             BuiltInToolSpec("file_write", "workspace", "workspace", self._build_file_write),
             BuiltInToolSpec("file_edit", "workspace", "workspace", self._build_file_edit),
+            BuiltInToolSpec("apply_patch", "workspace", "workspace", self._build_apply_patch),
             BuiltInToolSpec("execute_code", "workspace", "workspace", self._build_execute_code),
             BuiltInToolSpec("execute_code_v2", "workspace", "workspace", self._build_execute_code_v2),
             BuiltInToolSpec("process_poll", "workspace", "workspace", self._build_process_poll),
@@ -208,15 +207,6 @@ class ToolRegistryFactory:
         del workspace_dir, services
         return WebCrawlTool(timeout=config.tools.http_timeout)
 
-    def _build_shell(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
-        runtime_policy = resolve_runtime_permission_policy(config.security)
-        return ShellTool(
-            allowlist=config.security.shell_command_allowlist,
-            workspace_dir=workspace_dir,
-            require_approval=runtime_policy.require_approval_for_shell,
-            process_service=services.get("process_service"),
-        )
-
     def _build_exec_command(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services
         runtime_policy = resolve_runtime_permission_policy(config.security)
@@ -224,7 +214,7 @@ class ToolRegistryFactory:
             runtime=self._exec_runtime,
             approval_store=self._exec_approval_store,
             workspace_dir=workspace_dir,
-            allowlist=config.security.shell_command_allowlist,
+            command_rules=[rule.model_dump() for rule in config.security.command_rules],
             allowed_env_vars=config.security.exec_allowed_env_vars,
             require_approval=runtime_policy.require_approval_for_exec,
             default_timeout_sec=config.security.exec_default_timeout_sec,
@@ -316,11 +306,22 @@ class ToolRegistryFactory:
             undo_max_size_mb=config.security.file_undo_max_size_mb,
         )
 
+    def _build_apply_patch(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
+        del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
+        return ApplyPatchTool(
+            workspace_dir=workspace_dir,
+            path_scope=runtime_policy.file_ops_scope,
+            require_approval=runtime_policy.require_approval_for_file_write,
+            max_write_size_mb=config.security.max_file_write_size_mb,
+            undo_max_size_mb=config.security.file_undo_max_size_mb,
+        )
+
     def _build_execute_code(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return ExecuteCodeTool(
             workspace_dir=workspace_dir,
-            require_approval=runtime_policy.require_approval_for_shell,
+            require_approval=runtime_policy.require_approval_for_exec,
             process_service=services.get("process_service"),
         )
 
@@ -329,7 +330,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return ExecuteCodeV2Tool(
             workspace_dir=workspace_dir,
-            require_approval=runtime_policy.require_approval_for_shell,
+            require_approval=runtime_policy.require_approval_for_exec,
         )
 
     def _build_process_poll(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:

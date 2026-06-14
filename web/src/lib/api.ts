@@ -12,6 +12,13 @@ import type {
   TokenStats,
 } from '@/lib/chat'
 import {
+  extractFileChangeGroupFromToolData,
+  extractPatchPreviewResult,
+  normalizeFileChanges,
+  type FileChangeGroupSummary,
+  type PatchPreviewResult,
+} from '@/lib/file-change-preview'
+import {
   appendInlineReasoningChunk,
   buildInlineReasoningStep,
   createInlineReasoningBuffer,
@@ -23,6 +30,8 @@ import { buildReasoningStepId, mergeReasoningStep } from '@/lib/reasoning-steps'
 
 const API_BASE = '/v1'
 const LOCAL_DEV_API_ORIGIN = 'http://127.0.0.1:8000'
+
+export type { FileChangeGroupSummary, PatchPreviewResult } from '@/lib/file-change-preview'
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
@@ -1670,6 +1679,7 @@ interface BackendSessionListItem {
   updated_at: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  security_override?: SessionSecurityOverride | null
 }
 
 interface BackendSessionListResponse {
@@ -1685,6 +1695,7 @@ export interface SessionSummary {
   eventCount: number
   projectId: string | null
   workflow: SessionWorkflowState | null
+  security_override: SessionSecurityOverride | null
 }
 
 export type SessionEvent = SessionMessageEvent | SessionTurnEvent | UnknownSessionEvent
@@ -1695,11 +1706,16 @@ interface BackendSessionResponse {
   title?: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  security_override?: SessionSecurityOverride | null
   events: Record<string, unknown>[]
 }
 
 export interface SessionDetail extends SessionSummary {
   events: SessionEvent[]
+}
+
+export interface SessionSecurityOverride {
+  autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
 }
 
 export interface SessionWorkflowConfig {
@@ -1759,6 +1775,22 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
   }
 }
 
+function normalizeSessionSecurityOverride(value: unknown): SessionSecurityOverride | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  const autonomyMode = getString(value.autonomy_mode)
+  if (
+    autonomyMode !== 'trusted_workspace' &&
+    autonomyMode !== 'strict' &&
+    autonomyMode !== 'high_autonomy' &&
+    autonomyMode !== 'auto_review'
+  ) {
+    return null
+  }
+  return { autonomy_mode: autonomyMode }
+}
+
 function normalizeSessionSummary(item: BackendSessionListItem): SessionSummary {
   return {
     id: item.session_id,
@@ -1768,6 +1800,7 @@ function normalizeSessionSummary(item: BackendSessionListItem): SessionSummary {
     eventCount: item.event_count,
     projectId: getString(item.project_id) ?? null,
     workflow: normalizeSessionWorkflowState(item.workflow),
+    security_override: normalizeSessionSecurityOverride(item.security_override),
   }
 }
 
@@ -1857,6 +1890,7 @@ function normalizeSessionDetail(payload: BackendSessionResponse): SessionDetail 
     eventCount: events.length,
     projectId: getString(payload.project_id) ?? null,
     workflow: normalizeSessionWorkflowState(payload.workflow),
+    security_override: normalizeSessionSecurityOverride(payload.security_override),
     events,
   }
 }
@@ -1879,6 +1913,7 @@ export async function rewriteSessionFromTurn(
 interface BackendCreateSessionResponse {
   type: 'session'
   session_id: string
+  security_override?: SessionSecurityOverride | null
 }
 
 interface ForkSessionInput {
@@ -1908,6 +1943,7 @@ export async function createSession(
     eventCount: 1,
     projectId: projectId ?? null,
     workflow: null,
+    security_override: normalizeSessionSecurityOverride(payload.security_override),
   }
 }
 
@@ -1930,6 +1966,7 @@ export async function forkSession(input: ForkSessionInput): Promise<SessionSumma
     eventCount: 1,
     projectId: input.projectId ?? null,
     workflow: null,
+    security_override: normalizeSessionSecurityOverride(payload.security_override),
   }
 }
 
@@ -1939,6 +1976,7 @@ interface BackendUpdateSessionResponse {
   title?: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  security_override?: SessionSecurityOverride | null
   events?: Record<string, unknown>[]
 }
 
@@ -1960,6 +1998,7 @@ export async function renameSession(sessionId: string, title: string): Promise<S
     eventCount: 0,
     projectId: getString(payload.project_id) ?? null,
     workflow: normalizeSessionWorkflowState(payload.workflow),
+    security_override: normalizeSessionSecurityOverride(payload.security_override),
   }
 }
 
@@ -1972,6 +2011,20 @@ export async function updateSessionWorkflowState(
     {
       method: 'PATCH',
       body: JSON.stringify({ workflow }),
+    }
+  )
+  return normalizeSessionDetail(payload)
+}
+
+export async function updateSessionSecurityOverride(
+  sessionId: string,
+  securityOverride: SessionSecurityOverride
+): Promise<SessionDetail> {
+  const payload = await requestJson<BackendSessionResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ security_override: securityOverride }),
     }
   )
   return normalizeSessionDetail(payload)
@@ -3297,6 +3350,12 @@ interface BackendFilesystemImportResponse {
   imported_path: string
   file_count: number
   total_bytes: number
+  files?: Array<{
+    name?: string
+    path?: string
+    relative_path?: string
+    size?: number
+  }>
 }
 
 export interface FilesystemImportInput {
@@ -3312,6 +3371,12 @@ export interface FilesystemImportResult {
   importedPath: string
   fileCount: number
   totalBytes: number
+  files: Array<{
+    name: string
+    path: string
+    relativePath: string | null
+    size: number | null
+  }>
 }
 
 export async function fetchFilesystemRoots(): Promise<FilesystemRoot[]> {
@@ -3376,6 +3441,16 @@ export async function importFilesystemFiles(
     importedPath: payload.imported_path,
     fileCount: payload.file_count,
     totalBytes: payload.total_bytes,
+    files: Array.isArray(payload.files)
+      ? payload.files
+          .filter((item) => typeof item?.path === 'string' && item.path.length > 0)
+          .map((item) => ({
+            name: getString(item.name) ?? getString(item.path) ?? '',
+            path: item.path as string,
+            relativePath: getString(item.relative_path),
+            size: getNumber(item.size) ?? null,
+          }))
+      : [],
   }
 }
 
@@ -3502,6 +3577,13 @@ export interface WorkspaceChangesResult {
 export interface WorkspaceDiffResult extends WorkspaceChange {
   repoRoot: string
   diff: string | null
+  originalContent?: string | null
+  newContent?: string | null
+}
+
+export interface WorkspacePatchPreviewRequest extends Omit<WorkspaceQueryOptions, 'path'> {
+  approvalId?: string | null
+  patchText: string
 }
 
 export interface WorkspaceQueryOptions {
@@ -3613,7 +3695,24 @@ export async function fetchWorkspaceDiff(
     diffAvailable: getBoolean(payload.diff_available) ?? false,
     repoRoot: getString(payload.repo_root) ?? '',
     diff: getString(payload.diff),
+    originalContent: getNullableString(payload.original_content),
+    newContent: getNullableString(payload.new_content),
   }
+}
+
+export async function previewWorkspacePatch(
+  input: WorkspacePatchPreviewRequest
+): Promise<PatchPreviewResult> {
+  const payload = await requestJson<unknown>('/workspace/patch/preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      approval_id: input.approvalId ?? null,
+      session_id: input.sessionId ?? null,
+      project_id: input.projectId ?? null,
+      patch_text: input.patchText,
+    }),
+  })
+  return extractPatchPreviewResult(payload)
 }
 
 interface BackendSettings {
@@ -3669,9 +3768,11 @@ export interface AgentSettings {
 
 export interface SecuritySettings {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
-  require_approval_for_shell: boolean
   require_approval_for_file_write: boolean
   require_approval_for_exec: boolean
+  command_rules: CommandRule[]
+  exec_allowed_env_vars: string[]
+  exec_default_shell: 'auto' | 'bash' | 'sh' | 'pwsh' | 'powershell' | 'cmd'
   agent_run_default_max_wall_clock_sec: number | null
   agent_run_default_heartbeat_timeout_sec: number | null
   agent_run_default_checkpoint_interval_steps: number
@@ -3683,6 +3784,13 @@ export interface SecuritySettings {
   max_file_write_size_mb: number
   file_ops_scope: 'workspace' | 'any'
   file_undo_max_size_mb: number
+}
+
+export interface CommandRule {
+  tokens: string[]
+  decision: 'allow'
+  match: 'exact' | 'prefix'
+  shells: Array<'bash' | 'sh' | 'pwsh' | 'powershell' | 'cmd'>
 }
 
 export interface LocalModelSettings {
@@ -4545,9 +4653,11 @@ export interface AgentSettingsUpdate {
 
 export interface SecuritySettingsUpdate {
   autonomy_mode?: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
-  require_approval_for_shell?: boolean
   require_approval_for_file_write?: boolean
   require_approval_for_exec?: boolean
+  command_rules?: CommandRule[]
+  exec_allowed_env_vars?: string[]
+  exec_default_shell?: 'auto' | 'bash' | 'sh' | 'pwsh' | 'powershell' | 'cmd'
   agent_run_default_max_wall_clock_sec?: number | null
   agent_run_default_heartbeat_timeout_sec?: number | null
   agent_run_default_checkpoint_interval_steps?: number
@@ -4676,10 +4786,49 @@ function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined
 
   return {
     autonomy_mode: normalizedAutonomyMode,
-    require_approval_for_shell: getBoolean(value.require_approval_for_shell) ?? true,
     require_approval_for_file_write:
       getBoolean(value.require_approval_for_file_write) ?? false,
     require_approval_for_exec: getBoolean(value.require_approval_for_exec) ?? true,
+    command_rules: getRecordArray(value.command_rules)
+      .map((item) => {
+        const tokens = Array.isArray(item.tokens)
+          ? item.tokens.filter((token): token is string => typeof token === 'string' && token.length > 0)
+          : []
+        if (tokens.length === 0) {
+          return null
+        }
+        const match = getString(item.match) === 'exact' ? 'exact' : 'prefix'
+        const shells = Array.isArray(item.shells)
+          ? item.shells.filter(
+              (shell): shell is CommandRule['shells'][number] =>
+                shell === 'bash' ||
+                shell === 'sh' ||
+                shell === 'pwsh' ||
+                shell === 'powershell' ||
+                shell === 'cmd'
+            )
+          : []
+        return {
+          tokens,
+          decision: 'allow' as const,
+          match,
+          shells,
+        }
+      })
+      .filter((item): item is CommandRule => item !== null),
+    exec_allowed_env_vars: Array.isArray(value.exec_allowed_env_vars)
+      ? value.exec_allowed_env_vars.filter(
+          (entry): entry is string => typeof entry === 'string' && entry.length > 0
+        )
+      : [],
+    exec_default_shell:
+      getString(value.exec_default_shell) === 'bash' ||
+      getString(value.exec_default_shell) === 'sh' ||
+      getString(value.exec_default_shell) === 'pwsh' ||
+      getString(value.exec_default_shell) === 'powershell' ||
+      getString(value.exec_default_shell) === 'cmd'
+        ? (getString(value.exec_default_shell) as SecuritySettings['exec_default_shell'])
+        : 'auto',
     agent_run_default_max_wall_clock_sec: getNumber(value.agent_run_default_max_wall_clock_sec),
     agent_run_default_heartbeat_timeout_sec: getNumber(value.agent_run_default_heartbeat_timeout_sec),
     agent_run_default_checkpoint_interval_steps:
@@ -4827,10 +4976,14 @@ export interface TaskDetail extends TaskSummary {
 
 export interface ApprovalSummary {
   approval_id: string
-  task_id: string
+  task_id: string | null
   status: string
   tool_name: string
   arguments: Record<string, unknown>
+  source: string | null
+  command: string | null
+  shell: string | null
+  workdir: string | null
   created_at: string
   resolved_at: string | null
   decision: string | null
@@ -4842,6 +4995,15 @@ export interface ApprovalSummary {
   replay_safe: boolean
   security_decision: string | null
   policy_source: string | null
+  suggested_rule: CommandRule | null
+  exec_approval_id: string | null
+  exec_session_id: string | null
+  exec_status: string | null
+  execution_result: unknown
+  allowed_decisions: string[]
+  file_change_groups: FileChangeGroupSummary[]
+  editable_patch_text: string | null
+  patch_validation_supported: boolean
 }
 
 export interface CreateTaskInput {
@@ -4851,7 +5013,34 @@ export interface CreateTaskInput {
 }
 
 export interface ResolveApprovalInput {
-  decision: 'approve' | 'reject'
+  decision: 'approve_once' | 'approve_and_save_rule' | 'reject'
+  reason?: string
+  rule?: CommandRule
+  replayOverride?: {
+    patchText?: string | null
+  }
+}
+
+export interface ApprovalExecSessionSnapshot {
+  session_id: string
+  shell: string | null
+  status: string
+  exit_code: number | null
+  timed_out: boolean
+  approval_state: string | null
+  stdout: string
+  stderr: string
+}
+
+export interface ApprovalExecSessionPayload {
+  approval_id: string
+  exec_approval_id: string | null
+  exec_session_id: string | null
+  exec_status: string
+  execution_result: unknown
+  source: string | null
+  session: ApprovalExecSessionSnapshot | null
+  stop_status?: string
 }
 
 function getNullableString(value: unknown): string | null {
@@ -4890,12 +5079,74 @@ function normalizeTaskDetail(payload: unknown): TaskDetail {
 
 function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
   const record = isRecord(payload) ? payload : {}
+  const toolName = getString(record.tool_name) ?? ''
+  const argumentsRecord = isRecord(record.arguments) ? record.arguments : {}
+  const previewRecord = isRecord(record.preview) ? record.preview : null
+  const explicitGroups = getRecordArray(record.file_change_groups)
+    .map((item, index) => {
+      const files = normalizeFileChanges(item.files ?? item.file_changes)
+      if (files.length === 0) {
+        return null
+      }
+      return {
+        id:
+          getString(item.id) ??
+          `${getString(record.approval_id) ?? 'approval'}:group:${index}`,
+        sourceTool: getString(item.source_tool) ?? toolName ?? 'file_change',
+        title: getString(item.title) ?? 'Pending file review',
+        patchText:
+          getNullableString(item.patch_text) ??
+          getNullableString(item.editable_patch_text),
+        files,
+      }
+    })
+    .filter((item): item is FileChangeGroupSummary => item !== null)
+  const editablePatchText =
+    getNullableString(record.editable_patch_text) ??
+    getNullableString(record.patch_text) ??
+    getNullableString(argumentsRecord.patch) ??
+    getNullableString(argumentsRecord.patch_text)
+  const previewFiles = normalizeFileChanges(
+    record.file_changes ??
+    record.file_change_previews ??
+    record.preview_files ??
+    record.preview_changes ??
+    previewRecord?.file_changes ??
+    previewRecord?.files
+  )
+  const derivedGroup = extractFileChangeGroupFromToolData({
+    id: getString(record.approval_id) ?? '',
+    toolName,
+    toolArgs: argumentsRecord,
+    toolMeta: record,
+    toolResult: isRecord(record.execution_result) ? record.execution_result : undefined,
+  })
+  const fileChangeGroups = (() => {
+    if (explicitGroups.length > 0) {
+      return explicitGroups
+    }
+    if (previewFiles.length > 0) {
+      return [{
+        id: `${getString(record.approval_id) ?? 'approval'}:preview`,
+        sourceTool: toolName || 'file_change',
+        title: toolName === 'apply_patch' ? 'Patch review' : 'Pending file review',
+        patchText: editablePatchText,
+        files: previewFiles,
+      }]
+    }
+    return derivedGroup ? [derivedGroup] : []
+  })()
+
   return {
     approval_id: getString(record.approval_id) ?? '',
-    task_id: getString(record.task_id) ?? '',
+    task_id: getNullableString(record.task_id),
     status: getString(record.status) ?? 'pending',
-    tool_name: getString(record.tool_name) ?? '',
-    arguments: isRecord(record.arguments) ? record.arguments : {},
+    tool_name: toolName,
+    arguments: argumentsRecord,
+    source: getNullableString(record.source),
+    command: getNullableString(record.command),
+    shell: getNullableString(record.shell),
+    workdir: getNullableString(record.workdir),
     created_at: getString(record.created_at) ?? new Date(0).toISOString(),
     resolved_at: getNullableString(record.resolved_at),
     decision: getNullableString(record.decision),
@@ -4907,6 +5158,74 @@ function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
     replay_safe: getBoolean(record.replay_safe) ?? false,
     security_decision: getNullableString(record.security_decision),
     policy_source: getNullableString(record.policy_source),
+    suggested_rule: isRecord(record.suggested_rule)
+      ? {
+          tokens: Array.isArray(record.suggested_rule.tokens)
+            ? record.suggested_rule.tokens.filter(
+                (token): token is string => typeof token === 'string' && token.length > 0
+              )
+            : [],
+          decision: 'allow',
+          match: getString(record.suggested_rule.match) === 'exact' ? 'exact' : 'prefix',
+          shells: Array.isArray(record.suggested_rule.shells)
+            ? record.suggested_rule.shells.filter(
+                (shell): shell is CommandRule['shells'][number] =>
+                  shell === 'bash' ||
+                  shell === 'sh' ||
+                  shell === 'pwsh' ||
+                  shell === 'powershell' ||
+                  shell === 'cmd'
+              )
+            : [],
+        }
+      : null,
+    exec_approval_id: getNullableString(record.exec_approval_id),
+    exec_session_id: getNullableString(record.exec_session_id),
+    exec_status: getNullableString(record.exec_status),
+    execution_result: record.execution_result ?? null,
+    allowed_decisions: Array.isArray(record.allowed_decisions)
+      ? record.allowed_decisions.filter(
+          (item): item is string => typeof item === 'string' && item.length > 0
+        )
+      : ['approve_once', 'approve_and_save_rule', 'reject'],
+    file_change_groups: fileChangeGroups,
+    editable_patch_text: editablePatchText,
+    patch_validation_supported:
+      getBoolean(record.patch_validation_supported) ??
+      getBoolean(record.supports_patch_validation) ??
+      editablePatchText !== null,
+  }
+}
+
+function normalizeApprovalExecSessionPayload(payload: unknown): ApprovalExecSessionPayload {
+  const record = isRecord(payload) ? payload : {}
+  const session = isRecord(record.session) ? record.session : null
+
+  return {
+    approval_id: getString(record.approval_id) ?? '',
+    exec_approval_id: getNullableString(record.exec_approval_id),
+    exec_session_id:
+      getNullableString(record.exec_session_id) ??
+      getNullableString(session?.session_id),
+    exec_status:
+      getString(record.exec_status) ??
+      getString(session?.status) ??
+      'unknown',
+    execution_result: record.execution_result ?? null,
+    source: getNullableString(record.source),
+    session: session
+      ? {
+          session_id: getString(session.session_id) ?? '',
+          shell: getNullableString(session.shell),
+          status: getString(session.status) ?? 'unknown',
+          exit_code: getNumber(session.exit_code) ?? null,
+          timed_out: getBoolean(session.timed_out) ?? false,
+          approval_state: getNullableString(session.approval_state),
+          stdout: getString(session.stdout) ?? '',
+          stderr: getString(session.stderr) ?? '',
+        }
+      : null,
+    stop_status: getNullableString(record.stop_status) ?? undefined,
   }
 }
 
@@ -4934,7 +5253,7 @@ export async function fetchTask(taskId: string): Promise<TaskDetail> {
 export async function resumeTask(taskId: string): Promise<TaskSummary> {
   const payload = await requestJson<unknown>(`/tasks/${encodeURIComponent(taskId)}/resume`, {
     method: 'POST',
-    body: JSON.stringify({ approved: true }),
+    body: JSON.stringify({ decision: 'approve_once' }),
   })
   return normalizeTaskSummary(payload)
 }
@@ -4960,9 +5279,50 @@ export async function resolveApproval(
 ): Promise<ApprovalSummary> {
   const payload = await requestJson<unknown>(`/approvals/${encodeURIComponent(approvalId)}/resolve`, {
     method: 'POST',
-    body: JSON.stringify(input),
+    body: JSON.stringify({
+      decision: input.decision,
+      reason: input.reason,
+      rule: input.rule,
+      replay_override: input.replayOverride
+        ? {
+            tool_name: 'apply_patch',
+            arguments: {
+              patch: input.replayOverride.patchText ?? '',
+            },
+            patch_text: input.replayOverride.patchText ?? null,
+          }
+        : undefined,
+      edited_patch_text: input.replayOverride?.patchText ?? undefined,
+    }),
   })
   return normalizeApprovalSummary(payload)
+}
+
+export async function fetchApprovalExecSession(
+  approvalId: string,
+  options?: { yield_time_ms?: number }
+): Promise<ApprovalExecSessionPayload> {
+  const search = new URLSearchParams()
+  if (typeof options?.yield_time_ms === 'number') {
+    search.set('yield_time_ms', String(options.yield_time_ms))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/approvals/${encodeURIComponent(approvalId)}/exec-session${query}`
+  )
+  return normalizeApprovalExecSessionPayload(payload)
+}
+
+export async function stopApprovalExecSession(
+  approvalId: string
+): Promise<ApprovalExecSessionPayload> {
+  const payload = await requestJson<unknown>(
+    `/approvals/${encodeURIComponent(approvalId)}/exec-session/stop`,
+    {
+      method: 'POST',
+    }
+  )
+  return normalizeApprovalExecSessionPayload(payload)
 }
 
 export type AgentRunProtocolId =

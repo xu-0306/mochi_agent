@@ -5374,7 +5374,6 @@ function SecuritySettingsForm({
   const [autonomyMode, setAutonomyMode] = React.useState<api.SecuritySettings['autonomy_mode']>(
     security?.autonomy_mode ?? 'trusted_workspace'
   )
-  const [requireShellApproval, setRequireShellApproval] = React.useState(security?.require_approval_for_shell ?? true)
   const [requireFileWriteApproval, setRequireFileWriteApproval] = React.useState(security?.require_approval_for_file_write ?? false)
   const [requireExecApproval, setRequireExecApproval] = React.useState(security?.require_approval_for_exec ?? true)
   const [agentRunDefaultMaxWallClockSec, setAgentRunDefaultMaxWallClockSec] = React.useState(
@@ -5405,7 +5404,6 @@ function SecuritySettingsForm({
 
   React.useEffect(() => {
     setAutonomyMode(security?.autonomy_mode ?? 'trusted_workspace')
-    setRequireShellApproval(security?.require_approval_for_shell ?? true)
     setRequireFileWriteApproval(security?.require_approval_for_file_write ?? false)
     setRequireExecApproval(security?.require_approval_for_exec ?? true)
     setAgentRunDefaultMaxWallClockSec(
@@ -5428,27 +5426,23 @@ function SecuritySettingsForm({
   const handleAutonomyModeChange = (value: api.SecuritySettings['autonomy_mode']) => {
     setAutonomyMode(value)
     if (value === 'strict') {
-      setRequireShellApproval(true)
       setRequireFileWriteApproval(true)
       setRequireExecApproval(true)
       setFileOpsScope('workspace')
       return
     }
     if (value === 'trusted_workspace') {
-      setRequireShellApproval(true)
       setRequireFileWriteApproval(false)
       setRequireExecApproval(true)
       setFileOpsScope('workspace')
       return
     }
     if (value === 'high_autonomy') {
-      setRequireShellApproval(false)
       setRequireFileWriteApproval(false)
       setRequireExecApproval(false)
       setFileOpsScope('any')
       return
     }
-    setRequireShellApproval(false)
     setRequireFileWriteApproval(false)
     setRequireExecApproval(false)
     setFileOpsScope('workspace')
@@ -5466,7 +5460,6 @@ function SecuritySettingsForm({
       const settings = await settingsApi.updateSettings({
         security: {
           autonomy_mode: autonomyMode,
-          require_approval_for_shell: requireShellApproval,
           require_approval_for_file_write: requireFileWriteApproval,
           require_approval_for_exec: requireExecApproval,
           agent_run_default_max_wall_clock_sec:
@@ -5530,14 +5523,10 @@ function SecuritySettingsForm({
         </label>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
-            <span className="text-sm text-foreground">{t('settings.security.requireShellApproval')}</span>
-            <Switch checked={requireShellApproval} onCheckedChange={setRequireShellApproval} />
-          </div>
-          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
             <span className="text-sm text-foreground">{t('settings.security.requireFileWriteApproval')}</span>
             <Switch checked={requireFileWriteApproval} onCheckedChange={setRequireFileWriteApproval} />
           </div>
-          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2 md:col-span-2">
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
             <span className="text-sm text-foreground">{t('settings.security.requireExecApproval')}</span>
             <Switch checked={requireExecApproval} onCheckedChange={setRequireExecApproval} />
           </div>

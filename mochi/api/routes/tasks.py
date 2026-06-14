@@ -46,8 +46,9 @@ async def resume_task(
     service = await _get_runtime_service(request.app)
     result = await service.resume_task(
         task_id,
-        approved=True if payload is None else payload.approved,
+        decision="approve_once" if payload is None else payload.decision,
         reason=None if payload is None else payload.reason,
+        rule=None if payload is None else payload.rule,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Task not found")

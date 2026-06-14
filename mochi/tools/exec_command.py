@@ -14,11 +14,44 @@ from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.exec_sessions import SessionPollResult
 from mochi.security import deny_security_decision
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
-from mochi.utils.command_security import CommandSecurityPolicy
-from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
+from mochi.utils.command_security import CommandSecurityPolicy, CommandSecurityResult
+from mochi.utils.security import build_policy_metadata, normalize_workspace_dir, resolve_path_in_workspace
 
 _SHARED_RUNTIME: ExecRuntime | None = None
 _SHARED_APPROVAL_STORE: InMemoryApprovalStore | None = None
+
+
+def _build_suggested_rule(
+    classification: CommandSecurityResult,
+    *,
+    shell: str | None,
+) -> dict[str, Any] | None:
+    if not classification.parsed_tokens:
+        return None
+    return {
+        "tokens": list(classification.parsed_tokens),
+        "decision": "allow",
+        "match": "prefix",
+        "shells": [shell] if isinstance(shell, str) and shell else [],
+    }
+
+
+def _build_classification_metadata(
+    classification: CommandSecurityResult,
+    *,
+    shell: str | None,
+    decision: object | None = None,
+    policy_state: str | None = None,
+    policy_reason: str | None = None,
+) -> dict[str, Any]:
+    metadata = build_policy_metadata(
+        decision=decision,
+        policy_state=policy_state,
+        policy_reason=policy_reason or classification.reason,
+    )
+    metadata["rule_id"] = classification.rule_id
+    metadata["suggested_rule"] = _build_suggested_rule(classification, shell=shell)
+    return metadata
 
 
 def get_shared_exec_runtime() -> ExecRuntime:
@@ -62,7 +95,7 @@ class ExecCommandTool(BaseTool):
         runtime: ExecRuntime | None = None,
         approval_store: InMemoryApprovalStore | None = None,
         workspace_dir: str | Path | None = None,
-        allowlist: list[str] | None = None,
+        command_rules: list[dict[str, object]] | None = None,
         allowed_env_vars: list[str] | None = None,
         require_approval: bool = False,
         default_timeout_sec: int = 30,
@@ -70,7 +103,7 @@ class ExecCommandTool(BaseTool):
         self._runtime = runtime or get_shared_exec_runtime()
         self._approval_store = approval_store or get_shared_exec_approval_store()
         self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
-        self._allowlist = list(allowlist) if allowlist is not None else []
+        self._command_rules = [dict(item) for item in (command_rules or []) if isinstance(item, dict)]
         self._allowed_env_vars = [str(item) for item in (allowed_env_vars or [])]
         self._require_approval = bool(require_approval)
         self._default_timeout_sec = max(1, int(default_timeout_sec))
@@ -83,7 +116,8 @@ class ExecCommandTool(BaseTool):
     def description(self) -> str:
         return (
             "Run a shell command using the exec runtime with foreground or background "
-            "mode, command security checks, and approval-pending metadata when required."
+            "mode, explicit allow/ask/deny command policy checks, and approval-pending "
+            "metadata when required."
         )
 
     @property
@@ -194,7 +228,7 @@ class ExecCommandTool(BaseTool):
                 return ToolResult(error=str(exc))
 
         security = CommandSecurityPolicy(
-            allowlist=self._allowlist,
+            command_rules=self._command_rules,
             workspace_dir=resolved_cwd,
             allowed_env_vars=self._allowed_env_vars,
             allow_dangerous_interpreters=True,
@@ -203,14 +237,21 @@ class ExecCommandTool(BaseTool):
         if classification.action == "deny":
             decision = deny_security_decision(
                 reason=classification.reason,
-                approval_kind="shell",
+                approval_kind="exec",
                 approval_scope="dangerous_command",
                 replay_safe=False,
                 policy_source=f"exec_policy:{classification.rule_id}",
             )
             return ToolResult(
                 error=classification.reason,
-                metadata={"status": "denied", **decision.to_metadata()},
+                metadata={
+                    "status": "denied",
+                    **_build_classification_metadata(
+                        classification,
+                        shell=shell,
+                        decision=decision,
+                    ),
+                },
                 retryable=False,
             )
 
@@ -226,6 +267,7 @@ class ExecCommandTool(BaseTool):
                 or "Exec command requires approval before execution."
             )
             approval_id = f"exec-approval-{uuid4().hex[:12]}"
+            suggested_rule = _build_suggested_rule(classification, shell=shell)
             approval_payload = {
                 "command": command,
                 "shell": shell,
@@ -249,6 +291,12 @@ class ExecCommandTool(BaseTool):
                 shell=(shell or "auto"),
                 scope="dangerous_command",
                 reason=reason,
+                metadata={
+                    "policy_state": "ask",
+                    "policy_reason": classification.reason,
+                    "rule_id": classification.rule_id,
+                    "suggested_rule": suggested_rule,
+                },
                 command_payload=approval_payload,
             )
             return ToolResult(
@@ -260,9 +308,15 @@ class ExecCommandTool(BaseTool):
                     "timed_out": False,
                     "requires_approval": True,
                     "security_decision": "require_approval",
-                    "approval_kind": "shell",
+                    "approval_kind": "exec",
                     "approval_scope": request.scope,
                     "reason": request.reason,
+                    **_build_classification_metadata(
+                        classification,
+                        shell=shell,
+                        policy_state="ask",
+                        policy_reason=classification.reason,
+                    ),
                     **_build_exec_session_metadata(
                         payload=None,
                         detached_layout=resolved_layout,
@@ -316,6 +370,14 @@ class ExecCommandTool(BaseTool):
             background=background,
             tty=tty,
             approval_state=result.approval_state,
+        )
+        metadata.update(
+            _build_classification_metadata(
+                classification,
+                shell=shell,
+                policy_state="allow",
+                policy_reason=classification.reason,
+            )
         )
         metadata["approval_id"] = None
         if result.status.value in {"failed", "timed_out"}:

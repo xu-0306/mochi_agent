@@ -14,6 +14,13 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
   ChatInput,
   type ChatComposerSeed,
   type ChatInputModelOption,
@@ -88,6 +95,13 @@ const WORKFLOW_PROTOCOL_OPTIONS: Array<{
     description: 'Subagents propose execution while the controller keeps runtime boundaries.',
   },
 ]
+
+const AUTONOMY_MODE_LABELS: Record<api.SessionSecurityOverride['autonomy_mode'], string> = {
+  strict: 'Strict',
+  trusted_workspace: 'Trusted workspace',
+  auto_review: 'Auto review',
+  high_autonomy: 'High autonomy',
+}
 
 function parsePositiveInteger(value: unknown, fallback: number): number {
   const source = typeof value === 'string' ? value : String(value ?? '')
@@ -1173,6 +1187,17 @@ export default function ChatPage() {
       second: '2-digit',
     })
   }, [workflowLastSavedAt])
+  const sessionSecurityOverride = React.useMemo(
+    () => currentSessionDetail?.security_override ?? currentSession?.securityOverride ?? null,
+    [currentSession?.securityOverride, currentSessionDetail?.security_override]
+  )
+  const effectiveAutonomyMode = sessionSecurityOverride?.autonomy_mode ?? settings?.security?.autonomy_mode ?? 'trusted_workspace'
+  const hasSessionAutonomyOverride = Boolean(sessionSecurityOverride?.autonomy_mode)
+  const effectiveAutonomyModeLabel = AUTONOMY_MODE_LABELS[effectiveAutonomyMode]
+  const autonomyModeSourceLabel = hasSessionAutonomyOverride ? 'Session override' : 'Workspace default'
+  const autonomyModeSourceDescription = hasSessionAutonomyOverride
+    ? 'This chat is overriding the workspace safety default.'
+    : 'This chat is using the workspace safety default.'
   const contextualRuntimeTasks = React.useMemo(
     () =>
       runtimeTasks.filter((task) =>
@@ -1186,7 +1211,10 @@ export default function ChatPage() {
       return 0
     }
     return runtimeApprovals.filter(
-      (approval) => approval.status === 'pending' && taskIds.has(approval.task_id)
+      (approval) =>
+        approval.status === 'pending' &&
+        typeof approval.task_id === 'string' &&
+        taskIds.has(approval.task_id)
     ).length
   }, [contextualRuntimeTasks, runtimeApprovals])
   const activeTaskCount = React.useMemo(
@@ -1428,6 +1456,7 @@ export default function ChatPage() {
                 messageCount: detail.eventCount,
                 projectId: detail.projectId,
                 workflow: detail.workflow,
+                securityOverride: detail.security_override,
                 isDraft: false,
               }
             : session
@@ -1439,6 +1468,42 @@ export default function ChatPage() {
       }))
     },
     []
+  )
+
+  const persistSessionSecurityOverride = React.useCallback(
+    async (
+      sessionId: string,
+      autonomyMode: api.SessionSecurityOverride['autonomy_mode']
+    ) => {
+      const targetSession = useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+      if (targetSession?.isDraft || sessionId.startsWith('draft-')) {
+        useSessionStore.setState((state) => ({
+          sessions: state.sessions.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  securityOverride: { autonomy_mode: autonomyMode },
+                }
+              : session
+          ),
+          currentSessionDetail:
+            state.currentSessionDetail?.id === sessionId
+              ? {
+                  ...state.currentSessionDetail,
+                  security_override: { autonomy_mode: autonomyMode },
+                }
+              : state.currentSessionDetail,
+        }))
+        return null
+      }
+
+      const detail = await api.updateSessionSecurityOverride(sessionId, {
+        autonomy_mode: autonomyMode,
+      })
+      upsertSessionDetail(detail)
+      return detail
+    },
+    [upsertSessionDetail]
   )
 
   const persistWorkflowState = React.useCallback(
@@ -2986,6 +3051,13 @@ export default function ChatPage() {
     setTaskPanelOpen(nextOpen)
   }, [closeRightPanels, taskPanelOpen])
 
+  const handleSessionAutonomyModeChange = React.useCallback(async (
+    value: api.SessionSecurityOverride['autonomy_mode']
+  ) => {
+    const sessionId = currentSessionId ?? createDraftSession(activeProjectId)
+    await persistSessionSecurityOverride(sessionId, value)
+  }, [activeProjectId, createDraftSession, currentSessionId, persistSessionSecurityOverride])
+
   const handleOpenTaskPanel = React.useCallback(() => {
     closeRightPanels('tasks')
     setTaskPanelOpen(true)
@@ -3041,6 +3113,32 @@ export default function ChatPage() {
                 <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-success" />
               )}
               <span className="truncate">{headerModelLabel}</span>
+            </div>
+            <div className="hidden items-start gap-2 md:flex">
+              <div className="pt-1 text-right">
+                <span className="block text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                  Safety
+                </span>
+                <span className="block text-[10px] uppercase tracking-[0.12em] text-muted-foreground/80">
+                  {autonomyModeSourceLabel}
+                </span>
+              </div>
+              <div className="min-w-0">
+                <Select value={effectiveAutonomyMode} onValueChange={(value) => void handleSessionAutonomyModeChange(value as api.SessionSecurityOverride['autonomy_mode'])}>
+                  <SelectTrigger className="h-8 w-[168px] text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="strict">Strict</SelectItem>
+                    <SelectItem value="trusted_workspace">Trusted workspace</SelectItem>
+                    <SelectItem value="auto_review">Auto review</SelectItem>
+                    <SelectItem value="high_autonomy">High autonomy</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="mt-1 max-w-[210px] text-[11px] leading-4 text-muted-foreground">
+                  Effective now: {effectiveAutonomyModeLabel}. {autonomyModeSourceDescription}
+                </p>
+              </div>
             </div>
             <div className="relative shrink-0">
               <Button

@@ -29,14 +29,51 @@ async def resolve_approval(
     payload: ApprovalResolution,
 ) -> dict[str, Any]:
     service = await _get_runtime_service(request.app)
-    approval = await service.resolve_approval(
-        approval_id,
-        approved=payload.approved,
-        reason=payload.reason,
-    )
+    try:
+        approval = await service.resolve_approval(
+            approval_id,
+            decision=payload.decision,
+            reason=payload.reason,
+            rule=payload.rule,
+            replay_override=payload.replay_override.model_dump() if payload.replay_override is not None else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
     return approval
+
+
+@router.get("/approvals/{approval_id}/exec-session")
+async def get_approval_exec_session(
+    request: Request,
+    approval_id: str,
+    yield_time_ms: int | None = None,
+) -> dict[str, Any]:
+    service = await _get_runtime_service(request.app)
+    payload = await service.get_approval_exec_session(
+        approval_id,
+        yield_time_ms=yield_time_ms,
+    )
+    if isinstance(payload, tuple):
+        if payload[0] == "session_unavailable":
+            raise HTTPException(status_code=409, detail="No live exec session available for this approval")
+        raise HTTPException(status_code=404, detail="Exec session not available for this approval")
+    return payload
+
+
+@router.post("/approvals/{approval_id}/exec-session/stop")
+async def stop_approval_exec_session(
+    request: Request,
+    approval_id: str,
+) -> dict[str, Any]:
+    service = await _get_runtime_service(request.app)
+    payload = await service.stop_approval_exec_session(approval_id)
+    if isinstance(payload, tuple):
+        if payload[0] == "session_unavailable":
+            raise HTTPException(status_code=409, detail="No live exec session available for this approval")
+        raise HTTPException(status_code=404, detail="Exec session not available for this approval")
+    return payload
 
 
 async def _get_runtime_service(app: FastAPI) -> RuntimeService:
@@ -44,6 +81,7 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     config = await _get_config(app)
     if existing is not None:
         existing.update_security_config(config.security)
+        existing.bind_app_config(config=config, config_path=getattr(app.state, "config_path", None))
         await existing.start()
         return existing
 
@@ -52,6 +90,7 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     await store.initialize()
     service = RuntimeService(engine=engine, store=store)
     service.update_security_config(config.security)
+    service.bind_app_config(config=config, config_path=getattr(app.state, "config_path", None))
     service.set_runtime_tasks_root(Path(config.sessions_dir) / "runtime-tasks")
     await service.start()
     app.state.runtime_service = service

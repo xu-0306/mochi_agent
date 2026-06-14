@@ -3,7 +3,7 @@
 import * as React from 'react'
 import { Brain, ChevronDown, Loader2, Search, TerminalSquare, AlertCircle } from 'lucide-react'
 import type { FileChangeSummary } from '@/lib/chat-p2'
-import { extractFileChangeFromReasoningStep } from '@/lib/chat-p2'
+import { extractFileChangeGroupFromReasoningStep } from '@/lib/chat-p2'
 import { cn } from '@/lib/utils'
 import type { ReasoningStep, TokenStats } from '@/lib/chat'
 import { FileChangeCard } from './FileChangeCard'
@@ -190,13 +190,13 @@ export function ReasoningPanel({
                     </p>
                   ) : null}
                   {(() => {
-                    const fileChange = extractFileChangeFromReasoningStep(step)
-                    if (!fileChange) {
+                    const fileChangeGroup = extractFileChangeGroupFromReasoningStep(step)
+                    if (!fileChangeGroup) {
                       return null
                     }
                     return (
                       <div className="mt-3">
-                        <FileChangeCard change={fileChange} onUndo={onUndoFileChange} />
+                        <FileChangeCard group={fileChangeGroup} onUndo={onUndoFileChange} />
                       </div>
                     )
                   })()}

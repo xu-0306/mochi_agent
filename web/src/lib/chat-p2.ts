@@ -1,15 +1,12 @@
 import type { Message, ReasoningStep } from '@/lib/chat'
-
+import {
+  extractFileChangeGroupFromToolData,
+  summarizeDiffStats,
+  type FileChangeGroupSummary,
+  type FileChangeSummary,
+} from '@/lib/file-change-preview'
 export type ChatExportFormat = 'markdown' | 'json'
-
-export interface FileChangeSummary {
-  filePath: string
-  originalContent: string | null
-  newContent: string | null
-  diff: string | null
-  undoAvailable: boolean
-  undoAction: 'restore' | 'delete' | null
-}
+export type { FileChangeGroupSummary, FileChangeSummary } from '@/lib/file-change-preview'
 
 export function isConversationEffectivelyEmpty(messages: Message[]): boolean {
   return messages.every((message) => message.type === 'system')
@@ -79,18 +76,6 @@ export function findEditForkTurnId(
   return null
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
-}
-
-function getString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
-}
-
-function getBoolean(value: unknown): boolean | null {
-  return typeof value === 'boolean' ? value : null
-}
-
 export function buildChatExport(messages: Message[], format: ChatExportFormat): string {
   const filtered = messages.filter((message) => (
     message.type === 'user' || message.type === 'assistant'
@@ -117,57 +102,33 @@ export function buildChatExport(messages: Message[], format: ChatExportFormat): 
     .join('\n\n')
 }
 
-export function summarizeDiffStats(diff: string | null | undefined): {
-  additions: number
-  deletions: number
-} {
-  if (!diff) {
-    return { additions: 0, deletions: 0 }
+export { summarizeDiffStats }
+
+export function extractFileChangeGroupFromReasoningStep(
+  step: ReasoningStep,
+): FileChangeGroupSummary | null {
+  if (step.type !== 'tool_result') {
+    return null
   }
 
-  let additions = 0
-  let deletions = 0
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith('+++') || line.startsWith('---')) {
-      continue
-    }
-    if (line.startsWith('+')) {
-      additions += 1
-      continue
-    }
-    if (line.startsWith('-')) {
-      deletions += 1
-    }
-  }
-
-  return { additions, deletions }
+  return extractFileChangeGroupFromToolData({
+    id: step.id,
+    toolName: step.toolName,
+    toolArgs: step.toolArgs,
+    toolMeta: step.toolMeta,
+    toolResult:
+      typeof step.toolResult === 'object' && step.toolResult !== null
+        ? step.toolResult
+        : undefined,
+  })
 }
 
 export function extractFileChangeFromReasoningStep(
   step: ReasoningStep,
 ): FileChangeSummary | null {
-  if (step.type !== 'tool_result' || step.toolName !== 'file_write') {
+  const group = extractFileChangeGroupFromReasoningStep(step)
+  if (!group || group.files.length !== 1) {
     return null
   }
-
-  const meta = step.toolMeta
-  if (!isRecord(meta)) {
-    return null
-  }
-
-  const filePath = getString(meta.file_path)
-  if (!filePath) {
-    return null
-  }
-
-  const undoAction = getString(meta.undo_action)
-
-  return {
-    filePath,
-    originalContent: getString(meta.original_content),
-    newContent: getString(meta.new_content),
-    diff: getString(meta.diff),
-    undoAvailable: getBoolean(meta.undo_available) ?? false,
-    undoAction: undoAction === 'restore' || undoAction === 'delete' ? undoAction : null,
-  }
+  return group.files[0]
 }

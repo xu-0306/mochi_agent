@@ -190,15 +190,8 @@ channels:
 # 安全設定
 security:
   autonomy_mode: "trusted_workspace"
-  require_approval_for_shell: true
   require_approval_for_file_write: false
-  shell_command_allowlist:
-    - "ls"
-    - "cat"
-    - "pwd"
-    - "echo"
-    - "date"
-    - "which"
+  require_approval_for_exec: true
   max_file_write_size_mb: 10.0
   file_ops_scope: "workspace"
   file_undo_max_size_mb: 2.0

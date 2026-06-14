@@ -24,11 +24,40 @@ class TaskCreateRequest(BaseModel):
     inference_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApprovalReplayOverride(BaseModel):
+    """Optional approval replay payload used instead of the stored mutation call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str = Field(min_length=1)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_patch_text_only_payload(
+        cls,
+        value: Any,
+    ) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if "tool_name" in value or "arguments" in value:
+            return value
+        patch_text = value.get("patch_text")
+        if isinstance(patch_text, str) and patch_text.strip():
+            return {
+                "tool_name": "apply_patch",
+                "arguments": {"patch": patch_text},
+            }
+        return value
+
+
 class ApprovalResolution(BaseModel):
     """Resolution payload for one approval request."""
 
-    approved: bool
+    decision: Literal["approve_once", "approve_and_save_rule", "reject"]
     reason: str | None = None
+    rule: dict[str, Any] | None = None
+    replay_override: ApprovalReplayOverride | None = None
 
 
 class AgentRunArtifact(BaseModel):

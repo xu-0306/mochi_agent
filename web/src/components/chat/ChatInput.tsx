@@ -458,11 +458,12 @@ export function ChatInput({
           targetDir: uploadTargetDir,
           packageName: `${Date.now()}-${index + 1}-${file.name}`,
         })
+        const resolvedImportedFilePath = result.files[0]?.path ?? result.importedPath
         uploadedFiles.push({
           id: `${Date.now()}-${index}-${file.name}`,
           name: file.name,
-          path: result.importedPath,
-          size: file.size,
+          path: resolvedImportedFilePath,
+          size: result.files[0]?.size ?? file.size,
           contentType: file.type || null,
         })
       }

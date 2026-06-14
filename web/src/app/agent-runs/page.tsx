@@ -16,7 +16,7 @@ import {
 import * as api from '@/lib/api'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/lib/i18n'
 import { useProjectStore } from '@/lib/stores/project-store'
@@ -1221,6 +1221,10 @@ export default function AgentRunsPage() {
     topic,
   ])
 
+  const activeRunProjectId = activeRunSummary?.project_id ?? null
+  const activeRunTopic = activeRunSummary?.topic ?? null
+  const activeRunWorkspaceDir = activeRunSummary?.workspace_dir ?? null
+
   const handleSendMessage = React.useCallback(async () => {
     if (!activeRunId) {
       await handleCreate()
@@ -1239,11 +1243,11 @@ export default function AgentRunsPage() {
       const detail = await api.appendAgentRunMessage(activeRunId, {
         role: 'operator',
         content,
-        projectId: activeProject?.id ?? activeRunSummary?.project_id ?? null,
-        workspaceDir: effectiveWorkspacePath || activeRunSummary?.workspace_dir || null,
+        projectId: activeProject?.id ?? activeRunProjectId,
+        workspaceDir: effectiveWorkspacePath || activeRunWorkspaceDir,
         metadata: {
           channel: 'workflow-chat',
-          topic: derivedTopic || activeRunSummary?.topic || null,
+          topic: derivedTopic || activeRunTopic,
         },
       })
       setActiveRunDetail(detail)
@@ -1263,9 +1267,9 @@ export default function AgentRunsPage() {
   }, [
     activeProject,
     activeRunId,
-    activeRunSummary?.project_id,
-    activeRunSummary?.topic,
-    activeRunSummary?.workspace_dir,
+    activeRunProjectId,
+    activeRunTopic,
+    activeRunWorkspaceDir,
     derivedTopic,
     effectiveWorkspacePath,
     handleCreate,

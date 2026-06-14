@@ -24,13 +24,13 @@ class ToolExposurePlanner:
     _RISKY_TOOLS: frozenset[str] = frozenset(
         {
             "exec_command",
-            "shell",
             "execute_code",
             "execute_code_v2",
             "write_stdin",
             "kill_session",
             "file_write",
             "file_edit",
+            "apply_patch",
             "process_stop",
             "mcp_call",
             "delegate_subagent_task",
@@ -39,7 +39,6 @@ class ToolExposurePlanner:
     _STRICT_BLOCKED_TOOLS: frozenset[str] = frozenset(
         {
             "exec_command",
-            "shell",
             "execute_code",
             "execute_code_v2",
             "write_stdin",
@@ -76,6 +75,7 @@ class ToolExposurePlanner:
         "delegate_subagent_task": 18,
         "file_write": 20,
         "file_edit": 30,
+        "apply_patch": 35,
         "exec_command": 40,
         "execute_code": 50,
         "execute_code_v2": 55,
@@ -85,7 +85,6 @@ class ToolExposurePlanner:
         "kill_session": 90,
         "process_poll": 100,
         "process_stop": 110,
-        "shell": 120,
         "memory_search": 130,
         "memory_save": 140,
         "arxiv_search": 142,
@@ -128,7 +127,6 @@ class ToolExposurePlanner:
             "directory",
             "path",
             "local file",
-            "shell",
             "exec",
             "session",
             "stdin",
@@ -203,6 +201,48 @@ class ToolExposurePlanner:
         "analyse",
         "extract",
         "file-reading",
+    )
+    _FILE_BROWSE_INTENT_KEYWORDS: tuple[str, ...] = (
+        "browse",
+        "directory",
+        "directories",
+        "file",
+        "files",
+        "find",
+        "folder",
+        "folders",
+        "grep",
+        "inspect",
+        "list",
+        "match",
+        "path",
+        "paths",
+        "pdf",
+        "read",
+        "repo",
+        "review",
+        "search",
+        "todo",
+    )
+    _EXECUTION_INTENT_KEYWORDS: tuple[str, ...] = (
+        "background",
+        "benchmark",
+        "build",
+        "command",
+        "compile",
+        "debug",
+        "execute",
+        "install",
+        "launch",
+        "run",
+        "script",
+        "server",
+        "session",
+        "start",
+        "stdin",
+        "stop",
+        "test",
+        "tty",
     )
     _FILETYPE_TOOL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "pdf_read": ("pdf",),
@@ -319,6 +359,10 @@ class ToolExposurePlanner:
         read_only_file_request = attached_workspace_files and self._matches_any_keyword(
             lowered,
             self._READ_ONLY_FILE_INTENT_KEYWORDS,
+        )
+        file_browse_request = (
+            self._matches_any_keyword(lowered, self._FILE_BROWSE_INTENT_KEYWORDS)
+            and not self._matches_any_keyword(lowered, self._EXECUTION_INTENT_KEYWORDS)
         )
 
         normalized_capabilities = {
@@ -445,6 +489,8 @@ class ToolExposurePlanner:
             ):
                 continue
             if read_only_file_request and tool_name in self._RISKY_TOOLS:
+                continue
+            if file_browse_request and tool_name == "exec_command":
                 continue
             if effective_mode == "strict" and tool_name in self._STRICT_BLOCKED_TOOLS:
                 continue
