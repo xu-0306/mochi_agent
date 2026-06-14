@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 import tempfile
 from typing import Any
 from uuid import uuid4
@@ -13,7 +12,6 @@ from uuid import uuid4
 from mochi.tools.base import ToolExecutionContext, ToolResult
 
 
-_SUSPICIOUS_FILE_RE = re.compile(r"\b\d+\.txt\b", re.IGNORECASE)
 _WEB_EVIDENCE_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
 _WEB_EVIDENCE_ALLOWED_JSON_FLAGS = frozenset(
     {"json_envelope", "large_payload", "structured_payload"}
@@ -69,11 +67,17 @@ class ToolResultTransportGuard:
             "summary_applied": False,
             "overflow_persisted": False,
             "reference_id": None,
+            "artifact_path": None,
             "risk_flags": risk_flags,
             "transport_type": "tool_result_text",
         }
 
-        if self._is_plain_safe_text(formatted_text, max_chars, risk_flags):
+        if self._is_plain_safe_text(
+            tool_name=tool_name,
+            formatted_text=formatted_text,
+            max_chars=max_chars,
+            risk_flags=risk_flags,
+        ):
             diagnostics["guarded_length"] = len(formatted_text)
             self._collect_diagnostics(context, diagnostics)
             return ToolResultTransportOutcome(content=formatted_text, diagnostics=diagnostics)
@@ -103,11 +107,13 @@ class ToolResultTransportGuard:
                 tool_name=tool_name,
                 raw_payload=raw_payload,
                 context=context,
+                result=result,
             )
             if persisted is not None:
-                reference_id, persisted_path = persisted
+                reference_id, persisted_path, persisted_encoding = persisted
                 diagnostics["overflow_persisted"] = True
                 diagnostics["reference_id"] = reference_id
+                diagnostics["artifact_path"] = str(persisted_path)
                 candidate = self._build_reference_message(
                     tool_name=tool_name,
                     preview_text=self._truncate_text(
@@ -118,7 +124,12 @@ class ToolResultTransportGuard:
                     reference_id=reference_id,
                 )
                 if context is not None:
-                    context.tool_result_references[reference_id] = str(persisted_path)
+                    context.tool_result_references[reference_id] = {
+                        "reference_id": reference_id,
+                        "artifact_path": str(persisted_path),
+                        "tool_name": tool_name,
+                        "encoding": persisted_encoding,
+                    }
 
         diagnostics["guarded_length"] = len(candidate)
         self._collect_diagnostics(context, diagnostics)
@@ -126,10 +137,18 @@ class ToolResultTransportGuard:
 
     def _is_plain_safe_text(
         self,
+        *,
+        tool_name: str,
         formatted_text: str,
         max_chars: int,
         risk_flags: list[str],
     ) -> bool:
+        if tool_name == "file_read":
+            return (
+                bool(formatted_text.strip())
+                and len(formatted_text) <= max_chars
+                and not risk_flags
+            )
         return (
             bool(formatted_text.strip())
             and len(formatted_text) <= max_chars
@@ -176,8 +195,6 @@ class ToolResultTransportGuard:
                 flags.append("json_envelope")
         if len(raw_payload) > self._preview_chars * self._persistence_multiplier:
             flags.append("large_payload")
-        if _SUSPICIOUS_FILE_RE.search(formatted_text):
-            flags.append("suspicious_file_marker")
         if isinstance(result.output, (dict, list)):
             flags.append("structured_payload")
         return list(dict.fromkeys(flags))
@@ -231,14 +248,20 @@ class ToolResultTransportGuard:
         tool_name: str,
         raw_payload: str,
         context: ToolExecutionContext | None,
-    ) -> tuple[str, Path] | None:
+        result: ToolResult | None = None,
+    ) -> tuple[str, Path, str] | None:
         target_dir = self._resolve_store_dir(context)
         target_dir.mkdir(parents=True, exist_ok=True)
         reference_id = f"{tool_name}-{uuid4().hex[:10]}"
+        persisted_text = raw_payload
+        persisted_encoding = "utf-8"
         suffix = ".json" if raw_payload.lstrip().startswith(("{", "[")) else ".txt"
+        if result is not None and result.error is None and isinstance(result.output, str):
+            persisted_text = result.output
+            suffix = ".txt"
         target_path = target_dir / f"{reference_id}{suffix}"
-        target_path.write_text(raw_payload, encoding="utf-8")
-        return reference_id, target_path
+        target_path.write_text(persisted_text, encoding=persisted_encoding)
+        return reference_id, target_path, persisted_encoding
 
     def _resolve_store_dir(self, context: ToolExecutionContext | None) -> Path:
         if context is not None and context.tool_result_store_dir:
@@ -258,7 +281,11 @@ class ToolResultTransportGuard:
         message = f"Tool {tool_name} result preview (truncated from {raw_length} chars).\n"
         if preview_text:
             message += preview_text + "\n"
-        message += f"Reference: {reference_id}"
+        message += (
+            f"Reference: {reference_id}\n"
+            f'To continue reading, call: file_read(path="tool-result://{reference_id}", '
+            'offset=1, limit=200, line_numbers=True)'
+        )
         return message.strip()
 
     @staticmethod
@@ -291,6 +318,8 @@ class ToolResultTransportGuard:
 
     @staticmethod
     def _normalize_whitespace(value: str) -> str:
+        import re
+
         collapsed = re.sub(r"\r\n?", "\n", value)
         collapsed = re.sub(r"[ \t]+", " ", collapsed)
         collapsed = re.sub(r"\n{3,}", "\n\n", collapsed)

@@ -26,6 +26,7 @@ from mochi.utils.security import (
 
 FileReader = Callable[[Path, str], Awaitable[str]]
 FileWriter = Callable[[Path, str, bool, str], Awaitable[int]]
+_TOOL_RESULT_PATH_PREFIX = "tool-result://"
 
 
 class FileReadTool(BaseTool):
@@ -99,6 +100,10 @@ class FileReadTool(BaseTool):
     def is_concurrency_safe(self) -> bool:
         return True
 
+    @property
+    def allow_plain_text_result_for_model(self) -> bool:
+        return True
+
     def _resolve_workspace_root(self, context: ToolExecutionContext | None) -> Path:
         if context is not None:
             for candidate in (
@@ -128,18 +133,35 @@ class FileReadTool(BaseTool):
         if limit is not None and limit <= 0:
             return ToolResult(error="`limit` must be greater than 0.")
 
-        workspace_root = self._resolve_workspace_root(context)
-        target, security_decision = check_file_tool_path(
-            path,
-            workspace_dir=workspace_root,
-            scope=self._path_scope,
-            access="read",
-        )
-        if security_decision is not None or target is None:
-            return ToolResult(
-                error=security_decision.reason if security_decision is not None else "Path denied.",
-                metadata=security_decision.to_metadata() if security_decision is not None else {},
+        target: Path
+        metadata_path = path
+        reference_metadata: dict[str, Any] = {}
+        if path.startswith(_TOOL_RESULT_PATH_PREFIX):
+            target_result = self._resolve_tool_result_reference(path=path, context=context)
+            if target_result.error is not None:
+                return target_result
+            target = Path(str(target_result.output))
+            reference_metadata = dict(target_result.metadata)
+        else:
+            workspace_root = self._resolve_workspace_root(context)
+            target, security_decision = check_file_tool_path(
+                path,
+                workspace_dir=workspace_root,
+                scope=self._path_scope,
+                access="read",
             )
+            if security_decision is not None or target is None:
+                return ToolResult(
+                    error=security_decision.reason if security_decision is not None else "Path denied.",
+                    metadata=security_decision.to_metadata() if security_decision is not None else {},
+                )
+            metadata_path = str(target)
+
+        active_encoding = (
+            str(reference_metadata.get("encoding"))
+            if encoding is None and isinstance(reference_metadata.get("encoding"), str)
+            else (encoding or self._default_encoding)
+        )
 
         if not target.exists():
             return ToolResult(error=f"File not found: {target}")
@@ -152,15 +174,45 @@ class FileReadTool(BaseTool):
 
         file_size = await asyncio.to_thread(lambda: target.stat().st_size)
         if file_size > effective_max_bytes:
-            return ToolResult(
-                error=(
-                    f"File is too large to read: {file_size} bytes exceeds limit "
-                    f"{effective_max_bytes} bytes."
-                ),
-                metadata={"path": str(target), "size_bytes": file_size, "partial": False},
-            )
+            if limit is None:
+                retry_call = (
+                    f'file_read(path="{path}", offset=1, limit=200, line_numbers=True)'
+                )
+                message = (
+                    f"File is larger than the current read limit ({file_size} bytes exceeds "
+                    f"{effective_max_bytes} bytes). Retry with a bounded line chunk, for example: "
+                    f"{retry_call}"
+                )
+                return ToolResult(
+                    output=message,
+                    metadata={
+                        "path": metadata_path,
+                        "size_bytes": file_size,
+                        "partial": True,
+                        "line_numbers": True,
+                        **reference_metadata,
+                    },
+                    suggestion=retry_call,
+                )
 
-        active_encoding = encoding or self._default_encoding
+            chunk_result = await self._read_chunk_from_path(
+                target=target,
+                encoding=active_encoding,
+                offset=offset,
+                limit=limit,
+                line_numbers=line_numbers,
+            )
+            if chunk_result.error is not None:
+                return chunk_result
+            chunk_result.metadata.update(
+                {
+                    "path": metadata_path,
+                    "size_bytes": file_size,
+                    **reference_metadata,
+                }
+            )
+            return chunk_result
+
         text = await self._reader(target, active_encoding)
         lines = text.splitlines()
         if lines and offset > len(lines):
@@ -204,19 +256,107 @@ class FileReadTool(BaseTool):
         return ToolResult(
             output=rendered_text,
             metadata={
-                "path": str(target),
+                "path": metadata_path,
                 "size_bytes": file_size,
                 "partial": partial,
                 "start_line": start_line,
                 "end_line": end_line,
                 "total_lines": len(lines),
                 "line_numbers": line_numbers,
+                **reference_metadata,
             },
         )
 
     @staticmethod
     async def _default_reader(path: Path, encoding: str) -> str:
         return await asyncio.to_thread(path.read_text, encoding=encoding)
+
+    def _resolve_tool_result_reference(
+        self,
+        *,
+        path: str,
+        context: ToolExecutionContext | None,
+    ) -> ToolResult:
+        if context is None:
+            return ToolResult(error="`tool-result://` reads require an execution context.")
+
+        reference_id = path[len(_TOOL_RESULT_PATH_PREFIX) :].strip()
+        if not reference_id:
+            return ToolResult(error="`tool-result://` path must include a reference id.")
+
+        reference = context.tool_result_references.get(reference_id)
+        if not isinstance(reference, dict):
+            return ToolResult(error=f"Unknown tool result reference: {reference_id}")
+
+        artifact_path = reference.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path.strip():
+            return ToolResult(error=f"Tool result reference is missing artifact_path: {reference_id}")
+
+        return ToolResult(
+            output=artifact_path,
+            metadata={
+                "reference_id": reference_id,
+                "artifact_path": artifact_path,
+                "tool_name": reference.get("tool_name"),
+                "encoding": reference.get("encoding", self._default_encoding),
+            },
+        )
+
+    async def _read_chunk_from_path(
+        self,
+        *,
+        target: Path,
+        encoding: str,
+        offset: int,
+        limit: int,
+        line_numbers: bool,
+    ) -> ToolResult:
+        def _sync_read() -> tuple[str, int, int, int]:
+            selected_lines: list[str] = []
+            total_lines = 0
+            with target.open("r", encoding=encoding) as file:
+                for line_no, raw_line in enumerate(file, start=1):
+                    total_lines = line_no
+                    if line_no < offset:
+                        continue
+                    if len(selected_lines) >= limit:
+                        continue
+                    selected_lines.append(raw_line.rstrip("\r\n"))
+
+            if total_lines > 0 and offset > total_lines:
+                raise ValueError(
+                    f"File exists but is shorter than the provided offset ({offset}). "
+                    f"The file has {total_lines} lines."
+                )
+
+            start_line = offset
+            end_line = offset + len(selected_lines) - 1 if selected_lines else offset - 1
+            if line_numbers:
+                rendered = "\n".join(
+                    f"{line_no}: {line}"
+                    for line_no, line in enumerate(selected_lines, start=offset)
+                )
+            else:
+                rendered = "\n".join(selected_lines)
+            return rendered, start_line, end_line, total_lines
+
+        try:
+            rendered_text, start_line, end_line, total_lines = await asyncio.to_thread(_sync_read)
+        except UnicodeDecodeError:
+            return ToolResult(error=f"File is not valid {encoding} text: {target}")
+        except ValueError as exc:
+            return ToolResult(error=str(exc))
+
+        return ToolResult(
+            output=rendered_text,
+            metadata={
+                "partial": True,
+                "start_line": start_line,
+                "end_line": end_line,
+                "total_lines": total_lines,
+                "line_numbers": line_numbers,
+            },
+        )
 
 
 class FileWriteTool(BaseTool):
