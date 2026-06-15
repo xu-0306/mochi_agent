@@ -99,6 +99,12 @@ class ToolResultTransportGuard:
 
         persist_needed = (
             len(candidate) > max_chars
+            or (tool_name == "file_read" and len(formatted_text) > max_chars)
+            or (
+                tool_name == "file_read"
+                and isinstance(result.output, str)
+                and len(result.output) > max_chars
+            )
             or len(raw_payload) > max_chars * self._persistence_multiplier
             or "large_payload" in risk_flags
         )
@@ -144,10 +150,13 @@ class ToolResultTransportGuard:
         risk_flags: list[str],
     ) -> bool:
         if tool_name == "file_read":
+            blocking_flags = [
+                flag for flag in risk_flags if flag in {"large_payload", "json_envelope"}
+            ]
             return (
                 bool(formatted_text.strip())
                 and len(formatted_text) <= max_chars
-                and not risk_flags
+                and not blocking_flags
             )
         return (
             bool(formatted_text.strip())

@@ -54,6 +54,31 @@ def test_transport_guard_preserves_small_file_read_text_for_model(tmp_path: Path
     assert outcome.diagnostics["overflow_persisted"] is False
 
 
+def test_transport_guard_preserves_small_json_looking_file_read_text(tmp_path: Path) -> None:
+    context = ToolExecutionContext(
+        session_id="session-file-read-json",
+        tool_result_store_dir=str(tmp_path),
+    )
+    guard = ToolResultTransportGuard()
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=ToolResult(
+            output='{"name": "mochi"}',
+            metadata={"path": str(tmp_path / "sample.json"), "line_numbers": False},
+        ),
+        formatted_content='{"name": "mochi"}',
+        context=context,
+        max_chars=512,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+
+    assert outcome.content == '{"name": "mochi"}'
+    assert outcome.diagnostics["summary_applied"] is False
+    assert outcome.diagnostics["overflow_persisted"] is False
+
+
 def test_transport_guard_summarizes_structured_payload_to_backend_safe_text(
     tmp_path: Path,
 ) -> None:
@@ -190,3 +215,33 @@ def test_transport_guard_persists_large_file_read_with_resumable_followup_contra
     assert reference["tool_name"] == "file_read"
     assert reference["encoding"] == "utf-8"
     assert Path(reference["artifact_path"]).is_file()
+
+
+def test_transport_guard_persists_file_read_when_formatted_text_exceeds_backend_cap(
+    tmp_path: Path,
+) -> None:
+    context = ToolExecutionContext(
+        session_id="session-file-read-early-persist",
+        tool_result_store_dir=str(tmp_path),
+    )
+    guard = ToolResultTransportGuard(preview_chars=480, persistence_multiplier=4)
+    text = "\n".join(f"{idx}: line {idx}" for idx in range(1, 45))
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=ToolResult(
+            output=text,
+            metadata={"path": str(tmp_path / "medium.log"), "line_numbers": True},
+        ),
+        formatted_content=text,
+        context=context,
+        max_chars=220,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+
+    reference_id = outcome.diagnostics["reference_id"]
+    assert len(text) > 220
+    assert outcome.diagnostics["overflow_persisted"] is True
+    assert reference_id
+    assert f'tool-result://{reference_id}' in outcome.content

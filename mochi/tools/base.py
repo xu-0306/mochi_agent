@@ -215,5 +215,4 @@ class BaseTool(ABC):
             return False
         if not output.strip() or len(output) > max_chars:
             return False
-        stripped = output.lstrip()
-        return not (stripped.startswith("{") or stripped.startswith("["))
+        return True
