@@ -136,7 +136,7 @@ class ToolResultTransportGuard:
                         "reference_id": reference_id,
                         "artifact_path": str(persisted_path),
                         "tool_name": tool_name,
-                        "encoding": persisted_encoding,
+                        "artifact_encoding": persisted_encoding,
                         **reference_metadata,
                     }
 
@@ -314,15 +314,21 @@ class ToolResultTransportGuard:
         if tool_name != "file_read" or result is None or not isinstance(result.metadata, dict):
             return {}
 
+        metadata: dict[str, Any] = {}
+        encoding = result.metadata.get("encoding")
+        metadata["encoding"] = encoding if isinstance(encoding, str) and encoding.strip() else "utf-8"
+
         source_path = result.metadata.get("source_path")
         if isinstance(source_path, str) and source_path.strip():
-            return {"source_path": source_path}
+            metadata["source_path"] = source_path
+            return metadata
 
         path = result.metadata.get("path")
         if isinstance(path, str) and path.strip() and not path.startswith("tool-result://"):
-            return {"source_path": path}
+            metadata["source_path"] = path
+            return metadata
 
-        return {}
+        return metadata
 
     @staticmethod
     def _collect_diagnostics(

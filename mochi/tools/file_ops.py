@@ -190,6 +190,7 @@ class FileReadTool(BaseTool):
                         "size_bytes": file_size,
                         "partial": True,
                         "line_numbers": True,
+                        "encoding": active_encoding,
                         **reference_metadata,
                     },
                     suggestion=retry_call,
@@ -206,6 +207,7 @@ class FileReadTool(BaseTool):
                 {
                     "path": metadata_path,
                     "size_bytes": file_size,
+                    "encoding": active_encoding,
                     **reference_metadata,
                 }
             )
@@ -225,6 +227,7 @@ class FileReadTool(BaseTool):
                     "path": metadata_path,
                     "total_lines": len(lines),
                     "partial": False,
+                    "encoding": active_encoding,
                     **reference_metadata,
                 },
             )
@@ -268,6 +271,7 @@ class FileReadTool(BaseTool):
                 "end_line": end_line,
                 "total_lines": len(lines),
                 "line_numbers": line_numbers,
+                "encoding": active_encoding,
                 **reference_metadata,
             },
         )
@@ -298,18 +302,24 @@ class FileReadTool(BaseTool):
             return ToolResult(error=f"Tool result reference is missing artifact_path: {reference_id}")
 
         source_path = reference.get("source_path")
+        artifact_encoding = reference.get("artifact_encoding", self._default_encoding)
         continuation_target = artifact_path
+        continuation_encoding = artifact_encoding
         if isinstance(source_path, str) and source_path.strip():
-            continuation_target = source_path
+            source_candidate = Path(source_path)
+            if source_candidate.exists() and source_candidate.is_file():
+                continuation_target = source_path
+                continuation_encoding = reference.get("encoding", self._default_encoding)
 
         return ToolResult(
             output=continuation_target,
             metadata={
                 "reference_id": reference_id,
                 "artifact_path": artifact_path,
+                "artifact_encoding": artifact_encoding,
                 "source_path": source_path,
                 "tool_name": reference.get("tool_name"),
-                "encoding": reference.get("encoding", self._default_encoding),
+                "encoding": continuation_encoding,
             },
         )
 

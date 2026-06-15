@@ -131,3 +131,97 @@ async def test_file_read_tool_result_continues_from_original_source_after_overfl
     assert continued.output == "61: line 61\n62: line 62\n63: line 63"
     assert continued.metadata["path"] == f"tool-result://{reference_id}"
     assert continued.metadata["source_path"] == str(target.resolve(strict=False))
+
+
+@pytest.mark.asyncio
+async def test_file_read_tool_result_falls_back_to_artifact_when_source_missing(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "tool-results"
+    artifact_dir.mkdir()
+    artifact_path = artifact_dir / "file_read-fallback.txt"
+    artifact_path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    source_path = tmp_path / "deleted-source.txt"
+
+    tool = FileReadTool(workspace_dir=tmp_path)
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        tool_result_store_dir=str(artifact_dir),
+        tool_result_references={
+            "file_read-fallback": {
+                "reference_id": "file_read-fallback",
+                "artifact_path": str(artifact_path),
+                "artifact_encoding": "utf-8",
+                "source_path": str(source_path),
+                "tool_name": "file_read",
+                "encoding": "utf-16",
+            }
+        },
+    )
+
+    result = await tool.execute(
+        path="tool-result://file_read-fallback",
+        offset=2,
+        limit=1,
+        line_numbers=True,
+        context=context,
+    )
+
+    assert result.error is None
+    assert result.output == "2: beta"
+    assert result.metadata["source_path"] == str(source_path)
+    assert result.metadata["artifact_path"] == str(artifact_path)
+    assert result.metadata["encoding"] == "utf-8"
+
+
+@pytest.mark.asyncio
+async def test_file_read_tool_result_preserves_original_encoding_for_continuation(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "large-utf16.txt"
+    target.write_text("".join(f"line {idx}\n" for idx in range(1, 121)), encoding="utf-16")
+
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        session_id="session-continuation-utf16",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+    )
+    tool = FileReadTool(workspace_dir=tmp_path)
+    guard = ToolResultTransportGuard(preview_chars=120)
+
+    first_chunk = await tool.execute(
+        path="large-utf16.txt",
+        encoding="utf-16",
+        offset=1,
+        limit=60,
+        line_numbers=True,
+        context=context,
+    )
+    assert first_chunk.error is None
+    assert first_chunk.metadata["encoding"] == "utf-16"
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=first_chunk,
+        formatted_content=tool.format_result_for_model(first_chunk, max_chars=220),
+        context=context,
+        max_chars=220,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+
+    reference_id = outcome.diagnostics["reference_id"]
+    assert reference_id
+    assert context.tool_result_references[reference_id]["encoding"] == "utf-16"
+
+    continued = await tool.execute(
+        path=f"tool-result://{reference_id}",
+        offset=61,
+        limit=3,
+        line_numbers=True,
+        context=context,
+    )
+
+    assert continued.error is None
+    assert continued.output == "61: line 61\n62: line 62\n63: line 63"
+    assert continued.metadata["encoding"] == "utf-16"

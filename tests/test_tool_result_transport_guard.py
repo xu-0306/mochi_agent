@@ -214,8 +214,40 @@ def test_transport_guard_persists_large_file_read_with_resumable_followup_contra
     assert reference["reference_id"] == reference_id
     assert reference["tool_name"] == "file_read"
     assert reference["encoding"] == "utf-8"
+    assert reference["artifact_encoding"] == "utf-8"
     assert reference["source_path"] == str(tmp_path / "huge.log")
     assert Path(reference["artifact_path"]).is_file()
+
+
+def test_transport_guard_preserves_original_file_read_encoding_in_reference_metadata(
+    tmp_path: Path,
+) -> None:
+    context = ToolExecutionContext(
+        session_id="session-large-file-read-utf16",
+        tool_result_store_dir=str(tmp_path),
+    )
+    guard = ToolResultTransportGuard(preview_chars=120)
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=ToolResult(
+            output="\n".join(f"{idx}: line {idx}" for idx in range(1, 101)),
+            metadata={
+                "path": str(tmp_path / "huge-utf16.log"),
+                "line_numbers": True,
+                "encoding": "utf-16",
+            },
+        ),
+        formatted_content="\n".join(f"{idx}: line {idx}" for idx in range(1, 101)),
+        context=context,
+        max_chars=220,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+
+    reference = context.tool_result_references[outcome.diagnostics["reference_id"]]
+    assert reference["encoding"] == "utf-16"
+    assert reference["artifact_encoding"] == "utf-8"
 
 
 def test_transport_guard_persists_file_read_when_formatted_text_exceeds_backend_cap(
