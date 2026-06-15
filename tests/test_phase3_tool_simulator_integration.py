@@ -85,10 +85,23 @@ class _LargeFileReadBackend(BaseLLMBackend):
         del tools, temperature, max_tokens, top_p, min_p, top_k
         del frequency_penalty, presence_penalty, repeat_penalty, stream
         self.calls.append(messages)
-        tool_message = next((message for message in messages if message.role == "tool"), None)
+        tool_messages = [message for message in messages if message.role == "tool"]
+        tool_message = tool_messages[-1] if tool_messages else None
         if tool_message is not None:
-            assert "Tool file_read result preview" in tool_message.content
-            assert 'file_read(path="tool-result://' in tool_message.content
+            if 'tool-result://' in tool_message.content:
+                reference_id = tool_message.content.split('tool-result://', 1)[1].split('"', 1)[0]
+                return GenerationResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="call-file-read-continue",
+                            name="file_read",
+                            arguments={"path": f"tool-result://{reference_id}", "offset": 61, "limit": 3, "line_numbers": True},
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            assert tool_message.content == "61: line 61\n62: line 62\n63: line 63"
             return GenerationResult(content="done")
         return GenerationResult(
             content="",
@@ -188,5 +201,8 @@ async def test_react_loop_persists_oversized_file_read_before_dead_end_preview(
 
     assert reference_id
     assert transport["overflow_persisted"] is True
+    assert context.tool_result_references[reference_id]["source_path"] == str(
+        (tmp_path / "large.txt").resolve(strict=False)
+    )
     assert context.tool_result_references[reference_id]["reference_id"] == reference_id
     assert final_event.content == "done"

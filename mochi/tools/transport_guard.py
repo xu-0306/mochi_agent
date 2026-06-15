@@ -68,6 +68,7 @@ class ToolResultTransportGuard:
             "overflow_persisted": False,
             "reference_id": None,
             "artifact_path": None,
+            "source_path": None,
             "risk_flags": risk_flags,
             "transport_type": "tool_result_text",
         }
@@ -116,10 +117,11 @@ class ToolResultTransportGuard:
                 result=result,
             )
             if persisted is not None:
-                reference_id, persisted_path, persisted_encoding = persisted
+                reference_id, persisted_path, persisted_encoding, reference_metadata = persisted
                 diagnostics["overflow_persisted"] = True
                 diagnostics["reference_id"] = reference_id
                 diagnostics["artifact_path"] = str(persisted_path)
+                diagnostics["source_path"] = reference_metadata.get("source_path")
                 candidate = self._build_reference_message(
                     tool_name=tool_name,
                     preview_text=self._truncate_text(
@@ -135,6 +137,7 @@ class ToolResultTransportGuard:
                         "artifact_path": str(persisted_path),
                         "tool_name": tool_name,
                         "encoding": persisted_encoding,
+                        **reference_metadata,
                     }
 
         diagnostics["guarded_length"] = len(candidate)
@@ -258,7 +261,7 @@ class ToolResultTransportGuard:
         raw_payload: str,
         context: ToolExecutionContext | None,
         result: ToolResult | None = None,
-    ) -> tuple[str, Path, str] | None:
+    ) -> tuple[str, Path, str, dict[str, Any]] | None:
         target_dir = self._resolve_store_dir(context)
         target_dir.mkdir(parents=True, exist_ok=True)
         reference_id = f"{tool_name}-{uuid4().hex[:10]}"
@@ -270,7 +273,12 @@ class ToolResultTransportGuard:
             suffix = ".txt"
         target_path = target_dir / f"{reference_id}{suffix}"
         target_path.write_text(persisted_text, encoding=persisted_encoding)
-        return reference_id, target_path, persisted_encoding
+        return (
+            reference_id,
+            target_path,
+            persisted_encoding,
+            self._build_reference_metadata(tool_name=tool_name, result=result),
+        )
 
     def _resolve_store_dir(self, context: ToolExecutionContext | None) -> Path:
         if context is not None and context.tool_result_store_dir:
@@ -296,6 +304,25 @@ class ToolResultTransportGuard:
             'offset=1, limit=200, line_numbers=True)'
         )
         return message.strip()
+
+    @staticmethod
+    def _build_reference_metadata(
+        *,
+        tool_name: str,
+        result: ToolResult | None,
+    ) -> dict[str, Any]:
+        if tool_name != "file_read" or result is None or not isinstance(result.metadata, dict):
+            return {}
+
+        source_path = result.metadata.get("source_path")
+        if isinstance(source_path, str) and source_path.strip():
+            return {"source_path": source_path}
+
+        path = result.metadata.get("path")
+        if isinstance(path, str) and path.strip() and not path.startswith("tool-result://"):
+            return {"source_path": path}
+
+        return {}
 
     @staticmethod
     def _collect_diagnostics(

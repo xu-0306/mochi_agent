@@ -214,6 +214,7 @@ def test_transport_guard_persists_large_file_read_with_resumable_followup_contra
     assert reference["reference_id"] == reference_id
     assert reference["tool_name"] == "file_read"
     assert reference["encoding"] == "utf-8"
+    assert reference["source_path"] == str(tmp_path / "huge.log")
     assert Path(reference["artifact_path"]).is_file()
 
 

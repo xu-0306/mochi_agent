@@ -6,6 +6,7 @@ import pytest
 
 from mochi.tools.base import ToolExecutionContext, ToolResult
 from mochi.tools.file_ops import FileReadTool
+from mochi.tools.transport_guard import ToolResultTransportGuard
 
 
 def test_file_read_format_result_preserves_small_json_looking_text(tmp_path: Path) -> None:
@@ -78,3 +79,55 @@ async def test_file_read_resolves_tool_result_references_via_virtual_path(tmp_pa
     assert result.metadata["artifact_path"] == str(artifact_path)
     assert result.metadata["reference_id"] == "file_read-abc123"
     assert result.metadata["tool_name"] == "file_read"
+
+
+@pytest.mark.asyncio
+async def test_file_read_tool_result_continues_from_original_source_after_overflow(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "large.txt"
+    target.write_text("".join(f"line {idx}\n" for idx in range(1, 121)), encoding="utf-8")
+
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        session_id="session-continuation",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+    )
+    tool = FileReadTool(workspace_dir=tmp_path)
+    guard = ToolResultTransportGuard(preview_chars=120)
+
+    first_chunk = await tool.execute(
+        path="large.txt",
+        offset=1,
+        limit=60,
+        line_numbers=True,
+        context=context,
+    )
+    assert first_chunk.error is None
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=first_chunk,
+        formatted_content=tool.format_result_for_model(first_chunk, max_chars=220),
+        context=context,
+        max_chars=220,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+
+    reference_id = outcome.diagnostics["reference_id"]
+    assert reference_id
+    assert context.tool_result_references[reference_id]["source_path"] == str(target.resolve(strict=False))
+
+    continued = await tool.execute(
+        path=f"tool-result://{reference_id}",
+        offset=61,
+        limit=3,
+        line_numbers=True,
+        context=context,
+    )
+
+    assert continued.error is None
+    assert continued.output == "61: line 61\n62: line 62\n63: line 63"
+    assert continued.metadata["path"] == f"tool-result://{reference_id}"
+    assert continued.metadata["source_path"] == str(target.resolve(strict=False))

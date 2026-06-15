@@ -202,8 +202,6 @@ class FileReadTool(BaseTool):
                 limit=limit,
                 line_numbers=line_numbers,
             )
-            if chunk_result.error is not None:
-                return chunk_result
             chunk_result.metadata.update(
                 {
                     "path": metadata_path,
@@ -211,6 +209,8 @@ class FileReadTool(BaseTool):
                     **reference_metadata,
                 }
             )
+            if chunk_result.error is not None:
+                return chunk_result
             return chunk_result
 
         text = await self._reader(target, active_encoding)
@@ -221,7 +221,12 @@ class FileReadTool(BaseTool):
                     f"File exists but is shorter than the provided offset ({offset}). "
                     f"The file has {len(lines)} lines."
                 ),
-                metadata={"path": str(target), "total_lines": len(lines), "partial": False},
+                metadata={
+                    "path": metadata_path,
+                    "total_lines": len(lines),
+                    "partial": False,
+                    **reference_metadata,
+                },
             )
 
         rendered_text = text
@@ -292,11 +297,17 @@ class FileReadTool(BaseTool):
         if not isinstance(artifact_path, str) or not artifact_path.strip():
             return ToolResult(error=f"Tool result reference is missing artifact_path: {reference_id}")
 
+        source_path = reference.get("source_path")
+        continuation_target = artifact_path
+        if isinstance(source_path, str) and source_path.strip():
+            continuation_target = source_path
+
         return ToolResult(
-            output=artifact_path,
+            output=continuation_target,
             metadata={
                 "reference_id": reference_id,
                 "artifact_path": artifact_path,
+                "source_path": source_path,
                 "tool_name": reference.get("tool_name"),
                 "encoding": reference.get("encoding", self._default_encoding),
             },
