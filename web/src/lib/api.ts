@@ -9,6 +9,8 @@ import type {
   Message,
   MessageEventType,
   ReasoningStep,
+  ToolExposureDiagnostics,
+  ToolTransportDiagnostics,
   TokenStats,
 } from '@/lib/chat'
 import {
@@ -59,6 +61,18 @@ function getStringArray(value: unknown): string[] {
     return []
   }
   return value.filter((item): item is string => typeof item === 'string')
+}
+
+function getOptionalBoolean(value: unknown): boolean | undefined {
+  return getBoolean(value) ?? undefined
+}
+
+function getOptionalNumber(value: unknown): number | undefined {
+  return getNumber(value) ?? undefined
+}
+
+function getOptionalString(value: unknown): string | undefined {
+  return getString(value) ?? undefined
 }
 
 function isReasoningEffort(value: unknown): value is ReasoningEffort {
@@ -572,6 +586,82 @@ function getPayloadNumber(
   return getNumber(snakeCaseValue) ?? getNumber(camelCaseValue) ?? undefined
 }
 
+function normalizeToolExposure(
+  metadata?: Record<string, unknown>
+): ToolExposureDiagnostics | undefined {
+  if (!metadata) {
+    return undefined
+  }
+
+  const candidate = getPayloadRecord(metadata, 'tool_exposure', 'toolExposure')
+  if (!candidate) {
+    return undefined
+  }
+
+  const exposedTools = getStringArray(candidate.exposed_tools ?? candidate.exposedTools)
+  const workspaceBound = getOptionalBoolean(
+    candidate.workspace_bound ?? candidate.workspaceBound
+  )
+  const attachmentCount = getOptionalNumber(
+    candidate.attachment_count ?? candidate.attachmentCount
+  )
+
+  if (
+    exposedTools.length === 0 &&
+    workspaceBound === undefined &&
+    attachmentCount === undefined
+  ) {
+    return undefined
+  }
+
+  return {
+    exposedTools,
+    workspaceBound,
+    attachmentCount,
+  }
+}
+
+function normalizeTransportDiagnostics(
+  metadata?: Record<string, unknown>
+): ToolTransportDiagnostics | undefined {
+  if (!metadata) {
+    return undefined
+  }
+
+  const candidate = getPayloadRecord(metadata, 'transport', 'transport')
+  if (!candidate) {
+    return undefined
+  }
+
+  const summaryApplied = getOptionalBoolean(
+    candidate.summary_applied ?? candidate.summaryApplied
+  )
+  const overflowPersisted = getOptionalBoolean(
+    candidate.overflow_persisted ?? candidate.overflowPersisted
+  )
+  const referenceId = getOptionalString(candidate.reference_id ?? candidate.referenceId)
+  const artifactPath = getOptionalString(candidate.artifact_path ?? candidate.artifactPath)
+  const sourcePath = getOptionalString(candidate.source_path ?? candidate.sourcePath)
+
+  if (
+    summaryApplied === undefined &&
+    overflowPersisted === undefined &&
+    referenceId === undefined &&
+    artifactPath === undefined &&
+    sourcePath === undefined
+  ) {
+    return undefined
+  }
+
+  return {
+    summaryApplied,
+    overflowPersisted,
+    referenceId,
+    artifactPath,
+    sourcePath,
+  }
+}
+
 function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimelineEvent | null {
   const type = getString(event.type)
   const timestamp = getString(event.timestamp) ?? undefined
@@ -738,6 +828,8 @@ function buildReasoningStep(
   })
   const timestamp = toMessageTimestamp(event.timestamp)
   const source = getReasoningStepSource(event.toolMeta)
+  const toolExposure = normalizeToolExposure(event.toolMeta)
+  const transport = normalizeTransportDiagnostics(event.toolMeta)
 
   switch (event.phase) {
     case 'thinking':
@@ -747,6 +839,9 @@ function buildReasoningStep(
         content: event.content,
         timestamp,
         source,
+        toolMeta: event.toolMeta,
+        toolExposure,
+        transport,
       }
     case 'status':
       return {
@@ -755,6 +850,9 @@ function buildReasoningStep(
         content: event.content,
         timestamp,
         source,
+        toolMeta: event.toolMeta,
+        toolExposure,
+        transport,
       }
     case 'tool_call_request':
       return {
@@ -777,6 +875,8 @@ function buildReasoningStep(
         toolName: event.toolName,
         toolResult: event.toolResult,
         toolMeta: event.toolMeta,
+        toolExposure,
+        transport,
         toolError: event.toolError,
         status: event.toolError ? 'error' : 'success',
       }
@@ -786,6 +886,9 @@ function buildReasoningStep(
         type: 'error',
         content: event.toolError ?? event.content ?? 'Unknown error.',
         timestamp,
+        toolMeta: event.toolMeta,
+        toolExposure,
+        transport,
         errorCode: event.errorCode,
         status: 'error',
       }

@@ -332,7 +332,10 @@ class AgentEngine:
             attachment_count=self._attachment_count(attachments),
             workspace_attachment_count=self._workspace_attachment_count(attachments),
         )
-        tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
+        tool_registry = workspace_registry.create_view(
+            exposure_plan.tool_names,
+            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+        )
         tool_schemas = tool_registry.get_schemas()
         attachment_context = self._build_attachment_prompt_context(
             attachments=attachments,
@@ -618,7 +621,10 @@ class AgentEngine:
             task_workspace_dir=request.task_workspace_dir,
             permission_policy_override=request.permission_policy,
         )
-        tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
+        tool_registry = workspace_registry.create_view(
+            exposure_plan.tool_names,
+            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+        )
         react_loop = AsyncReActLoop(
             backend=active_backend,
             tool_registry=tool_registry,
@@ -741,6 +747,7 @@ class AgentEngine:
                 tool_names=[],
                 matched_groups=exposure_plan.matched_groups,
                 limit=0,
+                discoverable_tool_names=[],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
             )
@@ -773,6 +780,7 @@ class AgentEngine:
                 tool_names=[],
                 matched_groups=exposure_plan.matched_groups,
                 limit=0,
+                discoverable_tool_names=[],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
             )
@@ -787,6 +795,8 @@ class AgentEngine:
             "file_read",
             "glob_search",
             "grep_search",
+            "repo_map",
+            "read_symbol",
             "csv_read",
             "pdf_read",
             "docx_read",
@@ -823,6 +833,9 @@ class AgentEngine:
                 tool_names=[name for name in exposure_plan.tool_names if name in readonly_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in readonly_allowed
+                ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
             )
@@ -831,6 +844,9 @@ class AgentEngine:
                 tool_names=[name for name in exposure_plan.tool_names if name in execution_request_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in execution_request_allowed
+                ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
             )
@@ -843,6 +859,9 @@ class AgentEngine:
                 tool_names=[name for name in controller_tools if name in controller_exec_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in controller_exec_allowed
+                ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
             )
@@ -851,6 +870,9 @@ class AgentEngine:
                 tool_names=[name for name in exposure_plan.tool_names if name in evidence_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in evidence_allowed
+                ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
             )
@@ -872,20 +894,25 @@ class AgentEngine:
                 for name in dict.fromkeys(tool_names_override)
                 if isinstance(name, str) and name in available
             ]
+            discoverable_tool_names = list(tool_names)
         else:
             tool_names = list(exposure_plan.tool_names)
+            discoverable_tool_names = list(exposure_plan.discoverable_tool_names)
 
         if tool_allowlist is not None:
             allowed = {name for name in tool_allowlist if isinstance(name, str)}
             tool_names = [name for name in tool_names if name in allowed]
+            discoverable_tool_names = [name for name in discoverable_tool_names if name in allowed]
         if tool_denylist is not None:
             denied = {name for name in tool_denylist if isinstance(name, str)}
             tool_names = [name for name in tool_names if name not in denied]
+            discoverable_tool_names = [name for name in discoverable_tool_names if name not in denied]
 
         return ToolExposurePlan(
             tool_names=tool_names[: exposure_plan.limit] if exposure_plan.limit > 0 else [],
             matched_groups=exposure_plan.matched_groups,
             limit=exposure_plan.limit,
+            discoverable_tool_names=discoverable_tool_names,
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
         )

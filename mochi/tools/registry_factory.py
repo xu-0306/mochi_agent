@@ -108,7 +108,10 @@ class ToolRegistryFactory:
                 and self._mcp_runtime_manager is None
             ):
                 continue
-            registry.register(spec.factory(self._config, workspace_dir, self._services()))
+            tool = spec.factory(self._config, workspace_dir, self._services())
+            if tool is None:
+                continue
+            registry.register(tool)
         if self._mcp_runtime_manager is not None:
             for tool in self._mcp_runtime_manager.materialize_tools():
                 registry.register(tool)
@@ -138,6 +141,8 @@ class ToolRegistryFactory:
             BuiltInToolSpec("file_read", "workspace", "workspace", self._build_file_read),
             BuiltInToolSpec("glob_search", "workspace", "workspace", self._build_glob_search),
             BuiltInToolSpec("grep_search", "workspace", "workspace", self._build_grep_search),
+            BuiltInToolSpec("repo_map", "workspace", "workspace", self._build_repo_map),
+            BuiltInToolSpec("read_symbol", "workspace", "workspace", self._build_read_symbol),
             BuiltInToolSpec("csv_read", "workspace", "workspace", self._build_csv_read),
             BuiltInToolSpec("docx_read", "workspace", "workspace", self._build_docx_read),
             BuiltInToolSpec("pdf_read", "workspace", "workspace", self._build_pdf_read),
@@ -251,6 +256,36 @@ class ToolRegistryFactory:
     def _build_grep_search(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del config, services
         return GrepSearchTool(workspace_dir=workspace_dir)
+
+    def _build_repo_map(
+        self,
+        config: MochiConfig,
+        workspace_dir: str,
+        services: dict[str, Any],
+    ) -> BaseTool | None:
+        del config, services
+        try:
+            from mochi.tools.repo_map import RepoMapTool
+        except ModuleNotFoundError as exc:
+            if exc.name != "mochi.tools.repo_map":
+                raise
+            return None
+        return RepoMapTool(workspace_dir=workspace_dir)
+
+    def _build_read_symbol(
+        self,
+        config: MochiConfig,
+        workspace_dir: str,
+        services: dict[str, Any],
+    ) -> BaseTool | None:
+        del config, services
+        try:
+            from mochi.tools.repo_map import ReadSymbolTool
+        except ModuleNotFoundError as exc:
+            if exc.name != "mochi.tools.repo_map":
+                raise
+            return None
+        return ReadSymbolTool(workspace_dir=workspace_dir)
 
     def _build_csv_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services

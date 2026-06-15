@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from mochi.backends.base import BaseLLMBackend
@@ -16,6 +16,7 @@ class ToolExposurePlan:
     tool_names: list[str]
     matched_groups: list[str]
     limit: int
+    discoverable_tool_names: list[str] = field(default_factory=list)
     workspace_bound: bool = False
     attachment_count: int = 0
 
@@ -29,7 +30,6 @@ class ToolExposurePlan:
 
 class ToolExposurePlanner:
     """Select a smaller, intent-matched tool subset for one turn."""
-
     _CORE_WORKSPACE_READ_ONLY_TOOLS: tuple[str, ...] = (
         "file_read",
         "glob_search",
@@ -85,7 +85,9 @@ class ToolExposurePlanner:
     _TOOL_PRIORITY: dict[str, int] = {
         "glob_search": 5,
         "grep_search": 8,
+        "repo_map": 9,
         "file_read": 10,
+        "read_symbol": 11,
         "csv_read": 11,
         "pdf_read": 12,
         "docx_read": 13,
@@ -300,6 +302,26 @@ class ToolExposurePlanner:
         "docx_read": ("docx", "word document", ".docx"),
         "notebook_read": ("notebook", "ipynb", "jupyter"),
     }
+    _REPO_NAVIGATION_INTENT_KEYWORDS: tuple[str, ...] = (
+        "repo map",
+        "repo structure",
+        "project structure",
+        "codebase overview",
+        "large repo",
+        "larger repo",
+        "orient",
+        "orientation",
+        "where to start",
+        "where should i start",
+    )
+    _SYMBOL_LOOKUP_INTENT_KEYWORDS: tuple[str, ...] = (
+        "symbol",
+        "definition",
+        "class",
+        "function",
+        "method",
+        "declaration",
+    )
     _INTENT_REQUIRED_TOOL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "glob_search": ("find", "search", "grep", "glob", "todo", "match"),
         "grep_search": ("find", "search", "grep", "todo", "match"),
@@ -402,6 +424,7 @@ class ToolExposurePlanner:
                 tool_names=[],
                 matched_groups=[],
                 limit=0,
+                discoverable_tool_names=[],
                 workspace_bound=session_bound_workspace,
                 attachment_count=max(0, attachment_count),
             )
@@ -413,12 +436,16 @@ class ToolExposurePlanner:
                 tool_names=[],
                 matched_groups=[],
                 limit=0,
+                discoverable_tool_names=[],
                 workspace_bound=session_bound_workspace,
                 attachment_count=max(0, attachment_count),
             )
 
         lowered = message.lower()
-        lowered_user_intent = (user_intent_message or message).lower()
+        # Only user-authored intent should drive attachment mutation detection.
+        # Falling back to the structured planner message would let attachment
+        # filenames/paths reintroduce false positives like `updated-report.pdf`.
+        lowered_user_intent = (user_intent_message or "").lower()
         normalized_attachment_count = max(0, attachment_count)
         normalized_workspace_attachment_count = max(0, workspace_attachment_count)
         attached_workspace_files = normalized_workspace_attachment_count > 0 or any(
@@ -481,6 +508,11 @@ class ToolExposurePlanner:
             elif tools_by_group[fallback_group]:
                 matched_groups.append(fallback_group)
 
+        base_limit = 6 if backend_info.backend_type in {"gguf", "safetensors"} else 10
+        effective_mode = autonomy_mode or "trusted_workspace"
+        mode_limit, risky_limit = self._AUTONOMY_LIMITS.get(effective_mode, (base_limit, 1))
+        limit = min(base_limit, mode_limit)
+
         available_order = {name: index for index, name in enumerate(available_tool_names)}
         preferred = [
             tool_name
@@ -505,6 +537,16 @@ class ToolExposurePlanner:
                 continue
             if self._matches_any_keyword(lowered, keywords):
                 preferred.append(tool_name)
+        if "repo_map" in available_order and self._matches_any_keyword(
+            lowered,
+            self._REPO_NAVIGATION_INTENT_KEYWORDS,
+        ):
+            preferred.append("repo_map")
+        if "read_symbol" in available_order and self._matches_any_keyword(
+            lowered,
+            self._SYMBOL_LOOKUP_INTENT_KEYWORDS,
+        ):
+            preferred.append("read_symbol")
         preferred = list(dict.fromkeys(preferred))
 
         selected: list[str] = []
@@ -537,10 +579,6 @@ class ToolExposurePlanner:
             )
         )
 
-        base_limit = 6 if backend_info.backend_type in {"gguf", "safetensors"} else 10
-        effective_mode = autonomy_mode or "trusted_workspace"
-        mode_limit, risky_limit = self._AUTONOMY_LIMITS.get(effective_mode, (base_limit, 1))
-        limit = min(base_limit, mode_limit)
         workspace_focus_request = (
             session_bound_workspace
             and "workspace" in matched_groups
@@ -592,14 +630,40 @@ class ToolExposurePlanner:
         for tool_name in workspace_baseline:
             if tool_name not in final_tool_names:
                 final_tool_names.append(tool_name)
+        if self._should_expose_tool_search(
+            available_tool_names=available_tool_names,
+            discoverable_tool_names=filtered,
+            visible_tool_names=final_tool_names,
+        ) and "tool_search" not in final_tool_names:
+            if not session_bound_workspace and limit > 0 and len(final_tool_names) >= limit:
+                final_tool_names = [*final_tool_names[: limit - 1], "tool_search"]
+            else:
+                final_tool_names.append("tool_search")
 
         final_limit = max(limit, len(final_tool_names))
         return ToolExposurePlan(
             tool_names=final_tool_names,
             matched_groups=matched_groups,
             limit=final_limit,
+            discoverable_tool_names=list(filtered),
             workspace_bound=session_bound_workspace,
             attachment_count=normalized_attachment_count,
+        )
+
+    @classmethod
+    def _should_expose_tool_search(
+        cls,
+        *,
+        available_tool_names: list[str],
+        discoverable_tool_names: list[str],
+        visible_tool_names: list[str],
+    ) -> bool:
+        if "tool_search" not in available_tool_names:
+            return False
+        visible = set(visible_tool_names)
+        return any(
+            tool_name != "tool_search" and tool_name not in visible
+            for tool_name in discoverable_tool_names
         )
 
     def _build_tools_by_group(

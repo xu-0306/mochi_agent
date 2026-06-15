@@ -59,7 +59,7 @@ class ToolSearchTool(BaseTool):
 
     @property
     def search_hint(self) -> str | None:
-        return "Use this when many tools are available and you need the best local match."
+        return "Use this when the tool you need is not already visible, especially in large local tool sets."
 
     async def execute(self, *, query: str, top_k: int | None = None) -> ToolResult:
         if not query.strip():
@@ -100,6 +100,13 @@ class ToolSearchTool(BaseTool):
 
         ranked.sort(key=lambda item: (-item[0], item[1]))
         return [payload for _, _, payload in ranked[:top_k]]
+
+    def scoped_to_catalog(self, catalog_provider: ToolCatalogProvider) -> ToolSearchTool:
+        return ToolSearchTool(
+            catalog_provider=catalog_provider,
+            default_top_k=self._default_top_k,
+            max_top_k=self._max_top_k,
+        )
 
     @staticmethod
     def _schema_text(schema: dict[str, Any]) -> str:
