@@ -13,6 +13,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from mochi.api.server import _get_config  # pyright: ignore[reportPrivateUsage]
 from mochi.tools.docx_read import extract_docx_paragraphs
@@ -22,6 +23,11 @@ from mochi.utils.security import check_file_tool_path, normalize_workspace_dir
 router = APIRouter(prefix="/v1/filesystem", tags=["filesystem"])
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
 _SAFE_PACKAGE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class DirectorySelectRequest(BaseModel):
+    initial_path: str | None = None
+    title: str | None = Field(default=None, max_length=120)
 
 
 def _path_from_client(value: str) -> Path:
@@ -97,6 +103,50 @@ def _safe_relative_path(value: str, fallback_name: str) -> Path:
     if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
         pure = PurePosixPath(Path(fallback_name).name)
     return Path(*pure.parts)
+
+
+def _existing_directory_for_dialog(path: str | None) -> Path | None:
+    if not path:
+        return None
+    try:
+        candidate = _path_from_client(path)
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+        parent = candidate.parent
+        if parent.exists() and parent.is_dir():
+            return parent
+    except OSError:
+        return None
+    return None
+
+
+def _select_native_directory(initial_dir: Path | None, title: str | None) -> str | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # pragma: no cover - depends on local GUI runtime.
+        raise RuntimeError("Native folder picker is unavailable") from exc
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        options: dict[str, Any] = {
+            "title": title or "Select Project Root",
+            "mustexist": True,
+            "parent": root,
+        }
+        if initial_dir is not None:
+            options["initialdir"] = str(initial_dir)
+
+        selected = filedialog.askdirectory(**options)
+        return selected or None
+    finally:
+        root.destroy()
 
 
 async def _write_upload_file(upload: UploadFile, target: Path) -> int:
@@ -183,6 +233,40 @@ async def list_directory(path: str = Query(..., min_length=1)) -> dict[str, Any]
         "parent_path": str(parent) if parent is not None else None,
         "selected_path": str(selected_path) if selected_path is not None else None,
         "items": items,
+    }
+
+
+@router.post("/select-directory")
+async def select_directory(payload: DirectorySelectRequest) -> dict[str, Any]:
+    initial_dir = _existing_directory_for_dialog(payload.initial_path) or Path.cwd()
+    try:
+        selected = await asyncio.to_thread(
+            _select_native_directory,
+            initial_dir,
+            payload.title,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Native folder picker failed: {exc}") from exc
+
+    if not selected:
+        return {
+            "type": "filesystem_directory_selection",
+            "selected": False,
+            "path": None,
+            "name": None,
+        }
+
+    selected_path = _path_from_client(selected)
+    if not selected_path.exists() or not selected_path.is_dir():
+        raise HTTPException(status_code=400, detail="Selected path is not a directory")
+
+    return {
+        "type": "filesystem_directory_selection",
+        "selected": True,
+        "path": str(selected_path),
+        "name": selected_path.name,
     }
 
 

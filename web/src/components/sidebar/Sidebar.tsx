@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   FolderPlus,
+  FolderOpen,
   Library,
   PanelLeftClose,
   PanelLeftOpen,
@@ -28,7 +29,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { PathPicker } from '@/components/settings/PathPicker'
+import * as api from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 import { useProjectStore } from '@/lib/stores/project-store'
 import {
@@ -88,6 +89,8 @@ export function Sidebar() {
   const [pendingDeleteSession, setPendingDeleteSession] = React.useState<Session | null>(null)
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = React.useState<string | null>(null)
   const [projectDialog, setProjectDialog] = React.useState<ProjectDialogState | null>(null)
+  const [projectDirectoryError, setProjectDirectoryError] = React.useState<string | null>(null)
+  const [isSelectingProjectDirectory, setIsSelectingProjectDirectory] = React.useState(false)
 
   const {
     sessions,
@@ -243,6 +246,7 @@ export function Sidebar() {
   }
 
   const openCreateProject = () => {
+    setProjectDirectoryError(null)
     setProjectDialog({
       mode: 'create',
       projectId: null,
@@ -256,12 +260,53 @@ export function Sidebar() {
     if (!project) {
       return
     }
+    setProjectDirectoryError(null)
     setProjectDialog({
       mode: 'edit',
       projectId,
       name: project.name,
       workspaceDir: project.workspaceDir,
     })
+  }
+
+  const updateProjectWorkspaceDir = (workspaceDir: string, options?: { inferName?: boolean }) => {
+    setProjectDirectoryError(null)
+    setProjectDialog((state) => {
+      if (!state) {
+        return state
+      }
+      const inferredName = options?.inferName && state.name.trim() === ''
+        ? basename(workspaceDir)
+        : state.name
+      return {
+        ...state,
+        name: inferredName,
+        workspaceDir,
+      }
+    })
+  }
+
+  const handleSelectProjectDirectory = async () => {
+    const initialPath = projectDialog?.workspaceDir.trim() || undefined
+    setProjectDirectoryError(null)
+    setIsSelectingProjectDirectory(true)
+    try {
+      const result = await api.selectFilesystemDirectory({
+        initialPath,
+        title: 'Select Project Root',
+      })
+      if (result.selected && result.path) {
+        updateProjectWorkspaceDir(result.path, { inferName: true })
+      }
+    } catch (error) {
+      setProjectDirectoryError(
+        error instanceof Error
+          ? error.message
+          : t('sidebar.projectDirectoryPickerFailed')
+      )
+    } finally {
+      setIsSelectingProjectDirectory(false)
+    }
   }
 
   const submitProjectDialog = async () => {
@@ -647,15 +692,29 @@ export function Sidebar() {
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium text-foreground">Workspace directory</label>
-              <PathPicker
-                value={projectDialog?.workspaceDir ?? ''}
-                onChange={(value) =>
-                  setProjectDialog((state) =>
-                    state ? { ...state, workspaceDir: value } : state
-                  )
-                }
-                mode="directory"
-              />
+              <div className="flex min-w-0 items-center gap-2">
+                <Input
+                  value={projectDialog?.workspaceDir ?? ''}
+                  onChange={(event) => updateProjectWorkspaceDir(event.target.value)}
+                  placeholder="G:\\_python\\STT&TTS"
+                />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  className="shrink-0"
+                  onClick={() => void handleSelectProjectDirectory()}
+                  loading={isSelectingProjectDirectory}
+                >
+                  <FolderOpen className="h-4 w-4" />
+                  {t('sidebar.browseFolder')}
+                </Button>
+              </div>
+              {projectDirectoryError ? (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  {projectDirectoryError}
+                </div>
+              ) : null}
             </div>
           </div>
           <DialogFooter className="mt-0 gap-2 border-t border-border/70 px-5 py-4 sm:flex-row sm:justify-end">

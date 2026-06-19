@@ -3474,6 +3474,13 @@ interface BackendFilesystemImportResponse {
   }>
 }
 
+interface BackendFilesystemDirectorySelectionResponse {
+  type: 'filesystem_directory_selection'
+  selected: boolean
+  path?: string | null
+  name?: string | null
+}
+
 export interface FilesystemImportInput {
   files: File[]
   relativePaths?: string[]
@@ -3493,6 +3500,13 @@ export interface FilesystemImportResult {
     relativePath: string | null
     size: number | null
   }>
+}
+
+export interface FilesystemDirectorySelectionResult {
+  type: 'filesystem_directory_selection'
+  selected: boolean
+  path: string | null
+  name: string | null
 }
 
 export async function fetchFilesystemRoots(): Promise<FilesystemRoot[]> {
@@ -3526,6 +3540,29 @@ export async function fetchFilesystemList(path: string): Promise<FilesystemListR
             isFile: Boolean(item.is_file),
           }))
       : [],
+  }
+}
+
+export async function selectFilesystemDirectory(input?: {
+  initialPath?: string
+  title?: string
+}): Promise<FilesystemDirectorySelectionResult> {
+  const payload = await requestJson<BackendFilesystemDirectorySelectionResponse>(
+    '/filesystem/select-directory',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        initial_path: input?.initialPath ?? null,
+        title: input?.title ?? null,
+      }),
+    }
+  )
+
+  return {
+    type: payload.type,
+    selected: Boolean(payload.selected),
+    path: getString(payload.path),
+    name: getString(payload.name),
   }
 }
 
