@@ -575,8 +575,12 @@ function formatModelLabel(modelId: string): string {
   }
   if (
     provider === 'openai_compat' ||
+    provider === 'openai_codex' ||
     provider === 'gemini' ||
-    provider === 'anthropic'
+    provider === 'anthropic' ||
+    provider === 'vllm' ||
+    provider === 'sglang' ||
+    provider === 'tensorrt_llm'
   ) {
     return rest[rest.length - 1] ?? modelId
   }

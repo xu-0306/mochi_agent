@@ -2305,7 +2305,16 @@ export interface ModelInfo {
   metadata: Record<string, ApiValue>
 }
 
-export type ModelProvider = 'ollama' | 'openai_compat' | 'openai_codex' | 'gemini' | 'anthropic' | 'vllm' | 'local'
+export type ModelProvider =
+  | 'ollama'
+  | 'openai_compat'
+  | 'openai_codex'
+  | 'gemini'
+  | 'anthropic'
+  | 'vllm'
+  | 'sglang'
+  | 'tensorrt_llm'
+  | 'local'
 
 export interface ConfigureModelInput {
   provider: ModelProvider
@@ -3358,8 +3367,12 @@ function normalizeProvider(value: unknown): ModelProvider | null {
   if (
     provider === 'ollama' ||
     provider === 'openai_compat' ||
+    provider === 'openai_codex' ||
     provider === 'gemini' ||
     provider === 'anthropic' ||
+    provider === 'vllm' ||
+    provider === 'sglang' ||
+    provider === 'tensorrt_llm' ||
     provider === 'local'
   ) {
     return provider

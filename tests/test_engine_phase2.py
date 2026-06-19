@@ -341,6 +341,74 @@ async def test_engine_switch_openai_compat_backend_accepts_vllm_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "base_url", "model_name", "api_key"),
+    [
+        ("sglang", "http://localhost:30000/v1", "Qwen/Qwen2.5-7B-Instruct", "sglang-key"),
+        ("tensorrt_llm", "http://localhost:8000/v1", "meta/llama-3.1-8b-instruct", "trtllm-key"),
+    ],
+)
+async def test_engine_switch_openai_compat_backend_accepts_external_provider_presets(
+    provider: str,
+    base_url: str,
+    model_name: str,
+    api_key: str,
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    class _SwitchedBackend:
+        def get_model_info(self) -> ModelInfo:
+            return ModelInfo(
+                name=model_name,
+                backend_type="openai_compat",
+                supports_tool_calling=True,
+            )
+
+    async def fake_switch_openai_compat(
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        provider: str,
+    ) -> _SwitchedBackend:
+        assert base_url == base_url_expected
+        assert model == model_name
+        assert api_key == api_key_expected
+        assert provider == provider_expected
+        return _SwitchedBackend()
+
+    provider_expected = provider
+    base_url_expected = base_url
+    api_key_expected = api_key
+    engine._router.switch_openai_compat = fake_switch_openai_compat  # type: ignore[method-assign]
+
+    model_info = await engine.switch_openai_compat_backend(
+        base_url=base_url,
+        model=model_name,
+        api_key=api_key,
+        provider=provider,  # type: ignore[arg-type]
+    )
+
+    assert model_info.name == model_name
+    assert model_info.backend_type == "openai_compat"
+    assert engine._config.model == base_url  # noqa: SLF001
+    assert engine._config.openai_compat.base_url == base_url  # noqa: SLF001
+    assert engine._config.openai_compat.model == model_name  # noqa: SLF001
+    assert engine._config.openai_compat.provider == provider  # noqa: SLF001
+    assert engine._config.openai_compat.api_key is not None  # noqa: SLF001
+    assert engine._config.openai_compat.api_key.get_secret_value() == api_key  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_engine_weather_prompt_exposes_only_web_subset_for_local_backend(
     tmp_path: Path,
 ) -> None:

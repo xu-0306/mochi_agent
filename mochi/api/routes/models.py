@@ -63,7 +63,25 @@ from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 
 router = APIRouter(prefix="/v1")
 
-ModelProvider = Literal["ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"]
+ModelProvider = Literal[
+    "ollama",
+    "openai_compat",
+    "openai_codex",
+    "gemini",
+    "anthropic",
+    "vllm",
+    "sglang",
+    "tensorrt_llm",
+    "local",
+]
+_OPENAI_COMPAT_EXTERNAL_PROVIDERS = {
+    "openai_compat",
+    "gemini",
+    "anthropic",
+    "vllm",
+    "sglang",
+    "tensorrt_llm",
+}
 
 _REMOTE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "openai_compat": {
@@ -83,6 +101,14 @@ _REMOTE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "model": "claude-sonnet-4-6",
     },
     "vllm": {
+        "base_url": "http://localhost:8000/v1",
+        "model": "model",
+    },
+    "sglang": {
+        "base_url": "http://localhost:30000/v1",
+        "model": "default",
+    },
+    "tensorrt_llm": {
         "base_url": "http://localhost:8000/v1",
         "model": "model",
     },
@@ -842,7 +868,7 @@ async def update_configured_model(
         raise HTTPException(status_code=404, detail=f"Configured model was not found: {target_id}")
 
     next_provider = payload.provider or existing.provider
-    if next_provider not in {"ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"}:
+    if next_provider not in {"ollama", "openai_codex", "local", *_OPENAI_COMPAT_EXTERNAL_PROVIDERS}:
         raise HTTPException(status_code=400, detail=f"Unsupported provider '{next_provider}'.")
 
     next_model = (payload.model if payload.model is not None else existing.model).strip()
@@ -939,7 +965,7 @@ async def update_configured_model(
         else "openai_codex"
         if next_provider == "openai_codex"
         else "openai_compat"
-        if next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}
+        if next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS
         else "gguf"
         if next_model_spec.lower().endswith(".gguf")
         else "safetensors"
@@ -973,7 +999,7 @@ async def update_configured_model(
         "oauth"
         if next_provider == "openai_codex"
         else "api_key"
-        if next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}
+        if next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS
         else None
     )
 
@@ -1009,7 +1035,7 @@ async def update_configured_model(
         updated.openai_codex.model = next_model
         updated.openai_codex.auth_profile_id = next_auth_profile_id
         api_key_configured = False
-    elif next_provider in {"openai_compat", "gemini", "anthropic", "vllm"}:
+    elif next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS:
         updated.openai_compat.provider = next_provider
         updated.openai_compat.base_url = (next_base_url or next_model_spec).rstrip("/")
         updated.openai_compat.model = next_model
@@ -1537,6 +1563,8 @@ def _configured_model_from_parts(
     resolved_launch_mode = launch_mode
     if provider == "vllm" and resolved_launch_mode is None:
         resolved_launch_mode = "external" if _is_http_endpoint(model_spec) else "managed"
+    if provider in {"sglang", "tensorrt_llm"} and resolved_launch_mode is None:
+        resolved_launch_mode = "external"
     return ConfiguredModelConfig(
         id=model_id,
         provider=provider,
@@ -1876,7 +1904,7 @@ def _should_use_managed_vllm_mode(payload: ConfigureModelRequest) -> bool:
 
 
 def _is_managed_vllm_configured_model(model: ConfiguredModelConfig) -> bool:
-    return shared_is_managed_vllm_configured_model(model)
+    return model.provider == "vllm" and shared_is_managed_vllm_configured_model(model)
 
 
 def _configured_vllm_launch_mode(model: ConfiguredModelConfig) -> str | None:

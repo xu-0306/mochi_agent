@@ -557,14 +557,23 @@ function localModelRootFromModelInfo(modelInfo: api.ModelInfo): string {
     : normalized.replace(/\/+$/, '')
 }
 
+const PROVIDER_DISPLAY_LABELS: Record<string, string> = {
+  ollama: 'Ollama',
+  openai_compat: 'OpenAI-compatible',
+  openai_codex: 'OpenAI Codex',
+  gemini: 'Gemini',
+  anthropic: 'Anthropic',
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  tensorrt_llm: 'TensorRT-LLM',
+  local: 'Local model',
+}
+
 function providerLabel(provider: string | null | undefined): string | null {
   if (!provider) {
     return null
   }
-  if (provider === 'vllm') {
-    return 'vLLM'
-  }
-  return provider
+  return PROVIDER_DISPLAY_LABELS[provider] ?? provider
 }
 
 function inferProviderChoice(value: string | null | undefined): ProviderChoice | null {
@@ -675,10 +684,11 @@ function activeConfiguredModel(settings: unknown, models: api.ModelInfo[]): api.
   }
 
   if (remoteModel) {
+    const providerName = providerLabel(provider)
     return {
       id: `${provider ?? 'openai_compat'}:${remoteBaseUrl ?? rootModel}:${remoteModel}`,
       name: remoteModel,
-      label: provider ? `${remoteModel} (${provider})` : remoteModel,
+      label: providerName ? `${remoteModel} (${providerName})` : remoteModel,
       provider,
       modelSpec: rootModel || remoteBaseUrl,
       baseUrl: remoteBaseUrl ?? (isUrlLike(rootModel) ? rootModel : null),
@@ -1376,6 +1386,7 @@ const providerOptions: Array<{
   label: string
   defaultBaseUrl: string
   defaultModel: string
+  modelPlaceholder?: string
   needsApiKey: boolean
 }> = [
   {
@@ -1398,6 +1409,22 @@ const providerOptions: Array<{
     defaultBaseUrl: 'http://localhost:8000/v1',
     defaultModel: 'Qwen/Qwen2.5-7B-Instruct',
     needsApiKey: false,
+  },
+  {
+    value: 'sglang',
+    label: 'SGLang',
+    defaultBaseUrl: 'http://localhost:30000/v1',
+    defaultModel: '',
+    modelPlaceholder: 'served model id (for example Qwen/Qwen2.5-7B-Instruct)',
+    needsApiKey: true,
+  },
+  {
+    value: 'tensorrt_llm',
+    label: 'TensorRT-LLM',
+    defaultBaseUrl: 'http://localhost:8000/v1',
+    defaultModel: '',
+    modelPlaceholder: 'served model id (for example llama-3.1-8b-instruct)',
+    needsApiKey: true,
   },
   {
     value: 'openai_codex',
@@ -1804,6 +1831,9 @@ function isProviderChoice(value: unknown): value is ProviderChoice {
     value === 'openai_codex' ||
     value === 'gemini' ||
     value === 'anthropic' ||
+    value === 'vllm' ||
+    value === 'sglang' ||
+    value === 'tensorrt_llm' ||
     value === 'local'
   )
 }
@@ -1823,6 +1853,8 @@ function providerDescription(provider: ProviderChoice, t: Translator): string {
     gemini: 'settings.provider.gemini.description',
     anthropic: 'settings.provider.anthropic.description',
     vllm: 'settings.provider.openaiCompat.description',
+    sglang: 'settings.provider.sglang.description',
+    tensorrt_llm: 'settings.provider.tensorrtLlm.description',
     local: 'settings.provider.local.description',
   }
   return t(keys[provider])
@@ -1839,6 +1871,8 @@ function providerNote(provider: ProviderChoice, t: Translator): string {
     gemini: 'settings.provider.gemini.note',
     anthropic: 'settings.provider.anthropic.note',
     vllm: 'settings.provider.openaiCompat.note',
+    sglang: 'settings.provider.sglang.note',
+    tensorrt_llm: 'settings.provider.tensorrtLlm.note',
     local: 'settings.provider.local.note',
   }
   return t(keys[provider])
@@ -3583,13 +3617,17 @@ function ModelConnectionForm({
                 className="font-mono text-xs"
               />
             ) : (
-              <Input
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                placeholder={provider === 'local' ? t('settings.modelConnection.localModelPlaceholder') : currentProvider.defaultModel}
-                className="min-w-0 font-mono text-xs"
-              />
-            )}
+                <Input
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder={
+                    provider === 'local'
+                      ? t('settings.modelConnection.localModelPlaceholder')
+                      : (currentProvider.modelPlaceholder ?? currentProvider.defaultModel)
+                  }
+                  className="min-w-0 font-mono text-xs"
+                />
+              )}
           </label>
         </div>
 

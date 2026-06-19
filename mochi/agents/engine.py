@@ -1070,7 +1070,14 @@ class AgentEngine:
         base_url: str,
         model: str,
         api_key: str = "",
-        provider: Literal["openai_compat", "gemini", "anthropic", "vllm"] = "openai_compat",
+        provider: Literal[
+            "openai_compat",
+            "gemini",
+            "anthropic",
+            "vllm",
+            "sglang",
+            "tensorrt_llm",
+        ] = "openai_compat",
     ) -> ModelInfo:
         """以 OpenAI-compatible API 設定切換活躍後端。"""
         backend = await self._router.switch_openai_compat(
@@ -1084,7 +1091,14 @@ class AgentEngine:
         self._config.openai_compat.base_url = normalized_base_url
         self._config.openai_compat.model = model.strip()
         self._config.openai_compat.provider = cast(
-            Literal["openai_compat", "gemini", "anthropic", "vllm"],
+            Literal[
+                "openai_compat",
+                "gemini",
+                "anthropic",
+                "vllm",
+                "sglang",
+                "tensorrt_llm",
+            ],
             provider,
         )
         self._config.openai_codex.auth_profile_id = None

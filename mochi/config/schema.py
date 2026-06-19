@@ -170,7 +170,14 @@ class OpenAICompatConfig(BaseModel):
     api_key: SecretStr | None = None
     """遠端 API key（敏感資料）。"""
 
-    provider: Literal["openai_compat", "gemini", "anthropic", "vllm"] = "openai_compat"
+    provider: Literal[
+        "openai_compat",
+        "gemini",
+        "anthropic",
+        "vllm",
+        "sglang",
+        "tensorrt_llm",
+    ] = "openai_compat"
     """UI/provider preset；底層目前皆走 OpenAI-compatible protocol。"""
 
     timeout: float = 120.0
@@ -261,7 +268,17 @@ class ConfiguredModelConfig(BaseModel):
     id: str = Field(min_length=1)
     """模型清單項目的穩定識別碼；可由 `/v1/models/switch` 使用。"""
 
-    provider: Literal["ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"]
+    provider: Literal[
+        "ollama",
+        "openai_compat",
+        "openai_codex",
+        "gemini",
+        "anthropic",
+        "vllm",
+        "sglang",
+        "tensorrt_llm",
+        "local",
+    ]
     """模型供應商 preset。"""
 
     model: str = Field(min_length=1)
