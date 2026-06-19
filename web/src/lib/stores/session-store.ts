@@ -9,6 +9,7 @@ import {
   forkSession as forkSessionApi,
   renameSession as renameSessionApi,
   updateSessionProject as updateSessionProjectApi,
+  type SessionSecurityOverride,
   type SessionWorkflowState,
   type SessionDetail,
   type SessionSummary,
@@ -28,6 +29,7 @@ export interface Session {
   messageCount: number
   projectId: string | null
   workflow: SessionWorkflowState | null
+  securityOverride: SessionSecurityOverride | null
   isDraft: boolean
 }
 
@@ -118,6 +120,7 @@ function normalizeSummary(summary: SessionSummary): Session {
     messageCount: summary.eventCount,
     projectId: summary.projectId,
     workflow: summary.workflow,
+    securityOverride: summary.security_override,
     isDraft: false,
   }
 }
@@ -132,6 +135,7 @@ function mergeSession(target: Session, detail: SessionDetail): Session {
     messageCount: detail.eventCount,
     projectId: detail.projectId,
     workflow: detail.workflow,
+    securityOverride: detail.security_override,
     isDraft: false,
   }
 }
@@ -148,6 +152,7 @@ function buildDraftSession(projectId: string | null): Session {
     messageCount: 0,
     projectId,
     workflow: null,
+    securityOverride: null,
     isDraft: true,
   }
 }
@@ -228,6 +233,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
               eventCount: 0,
               projectId: target.projectId,
               workflow: target.workflow,
+              security_override: target.securityOverride,
               events: [],
             }
           : get().currentSessionDetail,
@@ -280,6 +286,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
         eventCount: 0,
         projectId: draft.projectId,
         workflow: draft.workflow,
+        security_override: draft.securityOverride,
         events: [],
       },
       error: null,

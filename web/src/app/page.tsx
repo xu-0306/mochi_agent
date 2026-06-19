@@ -575,8 +575,12 @@ function formatModelLabel(modelId: string): string {
   }
   if (
     provider === 'openai_compat' ||
+    provider === 'openai_codex' ||
     provider === 'gemini' ||
-    provider === 'anthropic'
+    provider === 'anthropic' ||
+    provider === 'vllm' ||
+    provider === 'sglang' ||
+    provider === 'tensorrt_llm'
   ) {
     return rest[rest.length - 1] ?? modelId
   }
@@ -1173,6 +1177,16 @@ export default function ChatPage() {
       second: '2-digit',
     })
   }, [workflowLastSavedAt])
+  const sessionSecurityOverride = React.useMemo(
+    () => currentSessionDetail?.security_override ?? currentSession?.securityOverride ?? null,
+    [currentSession?.securityOverride, currentSessionDetail?.security_override]
+  )
+  const effectiveAutonomyMode = sessionSecurityOverride?.autonomy_mode ?? settings?.security?.autonomy_mode ?? 'trusted_workspace'
+  const hasSessionAutonomyOverride = Boolean(sessionSecurityOverride?.autonomy_mode)
+  const autonomyModeSourceLabel = hasSessionAutonomyOverride ? 'Session override' : 'Workspace default'
+  const autonomyModeSourceDescription = hasSessionAutonomyOverride
+    ? 'This chat is overriding the workspace safety default.'
+    : 'This chat is using the workspace safety default.'
   const contextualRuntimeTasks = React.useMemo(
     () =>
       runtimeTasks.filter((task) =>
@@ -1186,7 +1200,10 @@ export default function ChatPage() {
       return 0
     }
     return runtimeApprovals.filter(
-      (approval) => approval.status === 'pending' && taskIds.has(approval.task_id)
+      (approval) =>
+        approval.status === 'pending' &&
+        typeof approval.task_id === 'string' &&
+        taskIds.has(approval.task_id)
     ).length
   }, [contextualRuntimeTasks, runtimeApprovals])
   const activeTaskCount = React.useMemo(
@@ -1375,16 +1392,24 @@ export default function ChatPage() {
     }
 
     const runtimeMessages = currentSessionMessages ?? []
-    const needsCanonicalTurnIds =
+    const countMessagesMissingTurnId = (messages: Message[]) =>
+      messages.reduce(
+        (count, message) => (
+          (message.type === 'user' || message.type === 'assistant') && !message.turnId
+            ? count + 1
+            : count
+        ),
+        0
+      )
+    const runtimeMissingTurnIds = countMessagesMissingTurnId(runtimeMessages)
+    const replayMissingTurnIds = countMessagesMissingTurnId(replayMessages)
+    const canImproveCanonicalTurnIds =
       runtimeMessages.length > 0 &&
       !hasActiveStream &&
-      runtimeMessages.some(
-        (message) =>
-          (message.type === 'user' || message.type === 'assistant') &&
-          !message.turnId
-      )
+      runtimeMissingTurnIds > 0 &&
+      replayMissingTurnIds < runtimeMissingTurnIds
 
-    if (needsCanonicalTurnIds) {
+    if (canImproveCanonicalTurnIds) {
       setSessionMessages(currentSessionId, replayMessages)
       return
     }
@@ -1428,6 +1453,7 @@ export default function ChatPage() {
                 messageCount: detail.eventCount,
                 projectId: detail.projectId,
                 workflow: detail.workflow,
+                securityOverride: detail.security_override,
                 isDraft: false,
               }
             : session
@@ -1439,6 +1465,42 @@ export default function ChatPage() {
       }))
     },
     []
+  )
+
+  const persistSessionSecurityOverride = React.useCallback(
+    async (
+      sessionId: string,
+      autonomyMode: api.SessionSecurityOverride['autonomy_mode']
+    ) => {
+      const targetSession = useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+      if (targetSession?.isDraft || sessionId.startsWith('draft-')) {
+        useSessionStore.setState((state) => ({
+          sessions: state.sessions.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  securityOverride: { autonomy_mode: autonomyMode },
+                }
+              : session
+          ),
+          currentSessionDetail:
+            state.currentSessionDetail?.id === sessionId
+              ? {
+                  ...state.currentSessionDetail,
+                  security_override: { autonomy_mode: autonomyMode },
+                }
+              : state.currentSessionDetail,
+        }))
+        return null
+      }
+
+      const detail = await api.updateSessionSecurityOverride(sessionId, {
+        autonomy_mode: autonomyMode,
+      })
+      upsertSessionDetail(detail)
+      return detail
+    },
+    [upsertSessionDetail]
   )
 
   const persistWorkflowState = React.useCallback(
@@ -2986,6 +3048,13 @@ export default function ChatPage() {
     setTaskPanelOpen(nextOpen)
   }, [closeRightPanels, taskPanelOpen])
 
+  const handleSessionAutonomyModeChange = React.useCallback(async (
+    value: api.SessionSecurityOverride['autonomy_mode']
+  ) => {
+    const sessionId = currentSessionId ?? createDraftSession(activeProjectId)
+    await persistSessionSecurityOverride(sessionId, value)
+  }, [activeProjectId, createDraftSession, currentSessionId, persistSessionSecurityOverride])
+
   const handleOpenTaskPanel = React.useCallback(() => {
     closeRightPanels('tasks')
     setTaskPanelOpen(true)
@@ -3262,6 +3331,10 @@ export default function ChatPage() {
         isUnloadingCurrentModel={isUnloadingCurrentModel}
         reasoningOptions={supportedReasoningEfforts}
         onReasoningEffortChange={(value) => handleSessionInferenceChange('reasoningEffort', value)}
+        approvalMode={effectiveAutonomyMode}
+        approvalModeSourceLabel={autonomyModeSourceLabel}
+        approvalModeSourceDescription={autonomyModeSourceDescription}
+        onApprovalModeChange={(value) => void handleSessionAutonomyModeChange(value)}
         composerMode={editState ? 'edit' : 'compose'}
         composerSeed={editState?.seed ?? null}
         composerResetKey={editState?.resetKey}

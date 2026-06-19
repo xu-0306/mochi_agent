@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { WorkspaceDiffResult, WorkspacePreviewResult } from '@/lib/api'
 import type { ChatAttachment } from '@/lib/chat'
+import { DiffViewer } from './DiffViewer'
 
 interface WorkspacePreviewProps {
   preview: WorkspacePreviewResult | null
@@ -35,12 +36,8 @@ export function WorkspacePreview({
     setLineEnd('1')
   }, [preview?.path])
 
-  const lineCount = React.useMemo(() => {
-    if (!preview?.text) {
-      return 1
-    }
-    return Math.max(1, preview.text.split('\n').length)
-  }, [preview?.text])
+  const previewText = preview?.text ?? ''
+  const lineCount = previewText ? Math.max(1, previewText.split('\n').length) : 1
 
   const previewAttachment = React.useMemo<ChatAttachment | null>(() => {
     if (!preview) {
@@ -60,7 +57,7 @@ export function WorkspacePreview({
     }
     const start = Math.min(clampLineNumber(lineStart, 1), lineCount)
     const end = Math.min(Math.max(clampLineNumber(lineEnd, start), start), lineCount)
-    const lines = preview.text.split('\n')
+    const lines = previewText.split('\n')
     const quote = lines.slice(start - 1, end).join('\n').trim()
     return {
       id: `workspace-selection:${preview.path}:${start}:${end}`,
@@ -71,7 +68,7 @@ export function WorkspacePreview({
       lineEnd: end,
       quote: quote.length > 400 ? `${quote.slice(0, 397)}...` : quote,
     }
-  }, [lineCount, lineEnd, lineStart, preview])
+  }, [lineCount, lineEnd, lineStart, preview, previewText])
 
   return (
     <div className="flex h-full flex-col">
@@ -152,16 +149,25 @@ export function WorkspacePreview({
           </div>
         ) : diff ? (
           <div className="space-y-4">
-            <div className="flex items-center gap-2 text-sm text-foreground">
-              <GitCompareArrows className="h-4 w-4 text-primary-300" />
-              <span>{diff.addedLines} additions</span>
-              <span>{diff.deletedLines} deletions</span>
+            <div className="flex flex-wrap items-center gap-2 text-sm text-foreground">
+              <div className="flex items-center gap-2">
+                <GitCompareArrows className="h-4 w-4 text-primary-300" />
+                <span className="font-medium">{diff.relativePath}</span>
+              </div>
+              <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2 py-0.5 text-[11px] font-medium text-emerald-200">
+                +{diff.addedLines}
+              </span>
+              <span className="rounded-full border border-rose-400/20 bg-rose-400/10 px-2 py-0.5 text-[11px] font-medium text-rose-200">
+                -{diff.deletedLines}
+              </span>
             </div>
-            <div className="rounded-xl border border-border bg-[#0c1224] p-4 text-slate-100 shadow-inner">
-              <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[13px] leading-6">
-                {diff.diff || 'No diff text available.'}
-              </pre>
-            </div>
+            <DiffViewer
+              diff={diff.diff}
+              filePath={diff.relativePath}
+              oldValue={diff.originalContent}
+              newValue={diff.newContent}
+              maxHeightClassName="max-h-[36rem]"
+            />
           </div>
         ) : (
           <div className="flex h-full items-center justify-center rounded-xl border border-dashed border-border bg-surface-layer/40 px-6 text-center text-sm text-muted-foreground">

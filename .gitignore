@@ -94,10 +94,13 @@ Agent_Comparison.md
 CLAUDE.md
 Mochi_Spec.md
 Makefile
+docs/
 documents/
 implementation_plan.md
 scripts/
-tests/
+tests/*
+!tests/test_tool_exposure.py
+!tests/test_engine_phase2.py
 web/scripts/
 web/README.md
 web/next-env.d.ts
@@ -106,3 +109,4 @@ web/tsconfig.tsbuildinfo
 # Reference snapshots (large, not required for runtime)
 legacy/
 reference/
+browser-imports/

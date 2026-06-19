@@ -41,12 +41,18 @@ class SubagentExecutionCoordinator:
         exec_runtime: ExecRuntime | None = None,
         exec_approval_store: InMemoryApprovalStore | None = None,
         require_approval: bool = True,
+        command_rules: list[dict[str, Any]] | None = None,
+        allowed_env_vars: list[str] | None = None,
+        default_shell: str | None = None,
     ) -> None:
         self._generate_role_candidate = generate_role_candidate
         self._invoke_text = invoke_text
         self._exec_runtime = exec_runtime
         self._exec_approval_store = exec_approval_store
         self._require_approval = bool(require_approval)
+        self._command_rules = [dict(rule) for rule in (command_rules or []) if isinstance(rule, dict)]
+        self._allowed_env_vars = [str(item) for item in (allowed_env_vars or []) if str(item).strip()]
+        self._default_shell = str(default_shell or "auto").strip() or "auto"
 
     async def run(
         self,
@@ -527,7 +533,12 @@ class SubagentExecutionCoordinator:
                 "status": "failed",
                 "error": "Controller approved execution without a command.",
             }
-        resolved_shell = str(controller_decision.get("shell") or execution_request.get("shell") or "powershell")
+        resolved_shell = str(
+            controller_decision.get("shell")
+            or execution_request.get("shell")
+            or self._default_shell
+            or "auto"
+        )
         resolved_workdir = controller_decision.get("workdir") or execution_request.get("workdir")
         resolved_timeout = controller_decision.get("timeout") or execution_request.get("timeout") or default_timeout_sec
         resolved_background = bool(
@@ -545,6 +556,8 @@ class SubagentExecutionCoordinator:
             runtime=self._exec_runtime,
             approval_store=self._exec_approval_store,
             workspace_dir=workspace_dir,
+            command_rules=self._command_rules,
+            allowed_env_vars=self._allowed_env_vars,
             require_approval=self._require_approval,
             default_timeout_sec=default_timeout_sec,
         )

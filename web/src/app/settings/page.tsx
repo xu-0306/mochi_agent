@@ -557,14 +557,23 @@ function localModelRootFromModelInfo(modelInfo: api.ModelInfo): string {
     : normalized.replace(/\/+$/, '')
 }
 
+const PROVIDER_DISPLAY_LABELS: Record<string, string> = {
+  ollama: 'Ollama',
+  openai_compat: 'OpenAI-compatible',
+  openai_codex: 'OpenAI Codex',
+  gemini: 'Gemini',
+  anthropic: 'Anthropic',
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  tensorrt_llm: 'TensorRT-LLM',
+  local: 'Local model',
+}
+
 function providerLabel(provider: string | null | undefined): string | null {
   if (!provider) {
     return null
   }
-  if (provider === 'vllm') {
-    return 'vLLM'
-  }
-  return provider
+  return PROVIDER_DISPLAY_LABELS[provider] ?? provider
 }
 
 function inferProviderChoice(value: string | null | undefined): ProviderChoice | null {
@@ -675,10 +684,11 @@ function activeConfiguredModel(settings: unknown, models: api.ModelInfo[]): api.
   }
 
   if (remoteModel) {
+    const providerName = providerLabel(provider)
     return {
       id: `${provider ?? 'openai_compat'}:${remoteBaseUrl ?? rootModel}:${remoteModel}`,
       name: remoteModel,
-      label: provider ? `${remoteModel} (${provider})` : remoteModel,
+      label: providerName ? `${remoteModel} (${providerName})` : remoteModel,
       provider,
       modelSpec: rootModel || remoteBaseUrl,
       baseUrl: remoteBaseUrl ?? (isUrlLike(rootModel) ? rootModel : null),
@@ -1376,6 +1386,7 @@ const providerOptions: Array<{
   label: string
   defaultBaseUrl: string
   defaultModel: string
+  modelPlaceholder?: string
   needsApiKey: boolean
 }> = [
   {
@@ -1398,6 +1409,22 @@ const providerOptions: Array<{
     defaultBaseUrl: 'http://localhost:8000/v1',
     defaultModel: 'Qwen/Qwen2.5-7B-Instruct',
     needsApiKey: false,
+  },
+  {
+    value: 'sglang',
+    label: 'SGLang',
+    defaultBaseUrl: 'http://localhost:30000/v1',
+    defaultModel: '',
+    modelPlaceholder: 'served model id (for example Qwen/Qwen2.5-7B-Instruct)',
+    needsApiKey: true,
+  },
+  {
+    value: 'tensorrt_llm',
+    label: 'TensorRT-LLM',
+    defaultBaseUrl: 'http://localhost:8000/v1',
+    defaultModel: '',
+    modelPlaceholder: 'served model id (for example llama-3.1-8b-instruct)',
+    needsApiKey: true,
   },
   {
     value: 'openai_codex',
@@ -1804,6 +1831,9 @@ function isProviderChoice(value: unknown): value is ProviderChoice {
     value === 'openai_codex' ||
     value === 'gemini' ||
     value === 'anthropic' ||
+    value === 'vllm' ||
+    value === 'sglang' ||
+    value === 'tensorrt_llm' ||
     value === 'local'
   )
 }
@@ -1823,6 +1853,8 @@ function providerDescription(provider: ProviderChoice, t: Translator): string {
     gemini: 'settings.provider.gemini.description',
     anthropic: 'settings.provider.anthropic.description',
     vllm: 'settings.provider.openaiCompat.description',
+    sglang: 'settings.provider.sglang.description',
+    tensorrt_llm: 'settings.provider.tensorrtLlm.description',
     local: 'settings.provider.local.description',
   }
   return t(keys[provider])
@@ -1839,6 +1871,8 @@ function providerNote(provider: ProviderChoice, t: Translator): string {
     gemini: 'settings.provider.gemini.note',
     anthropic: 'settings.provider.anthropic.note',
     vllm: 'settings.provider.openaiCompat.note',
+    sglang: 'settings.provider.sglang.note',
+    tensorrt_llm: 'settings.provider.tensorrtLlm.note',
     local: 'settings.provider.local.note',
   }
   return t(keys[provider])
@@ -3583,13 +3617,17 @@ function ModelConnectionForm({
                 className="font-mono text-xs"
               />
             ) : (
-              <Input
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                placeholder={provider === 'local' ? t('settings.modelConnection.localModelPlaceholder') : currentProvider.defaultModel}
-                className="min-w-0 font-mono text-xs"
-              />
-            )}
+                <Input
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder={
+                    provider === 'local'
+                      ? t('settings.modelConnection.localModelPlaceholder')
+                      : (currentProvider.modelPlaceholder ?? currentProvider.defaultModel)
+                  }
+                  className="min-w-0 font-mono text-xs"
+                />
+              )}
           </label>
         </div>
 
@@ -5374,7 +5412,6 @@ function SecuritySettingsForm({
   const [autonomyMode, setAutonomyMode] = React.useState<api.SecuritySettings['autonomy_mode']>(
     security?.autonomy_mode ?? 'trusted_workspace'
   )
-  const [requireShellApproval, setRequireShellApproval] = React.useState(security?.require_approval_for_shell ?? true)
   const [requireFileWriteApproval, setRequireFileWriteApproval] = React.useState(security?.require_approval_for_file_write ?? false)
   const [requireExecApproval, setRequireExecApproval] = React.useState(security?.require_approval_for_exec ?? true)
   const [agentRunDefaultMaxWallClockSec, setAgentRunDefaultMaxWallClockSec] = React.useState(
@@ -5405,7 +5442,6 @@ function SecuritySettingsForm({
 
   React.useEffect(() => {
     setAutonomyMode(security?.autonomy_mode ?? 'trusted_workspace')
-    setRequireShellApproval(security?.require_approval_for_shell ?? true)
     setRequireFileWriteApproval(security?.require_approval_for_file_write ?? false)
     setRequireExecApproval(security?.require_approval_for_exec ?? true)
     setAgentRunDefaultMaxWallClockSec(
@@ -5428,27 +5464,23 @@ function SecuritySettingsForm({
   const handleAutonomyModeChange = (value: api.SecuritySettings['autonomy_mode']) => {
     setAutonomyMode(value)
     if (value === 'strict') {
-      setRequireShellApproval(true)
       setRequireFileWriteApproval(true)
       setRequireExecApproval(true)
       setFileOpsScope('workspace')
       return
     }
     if (value === 'trusted_workspace') {
-      setRequireShellApproval(true)
       setRequireFileWriteApproval(false)
       setRequireExecApproval(true)
       setFileOpsScope('workspace')
       return
     }
     if (value === 'high_autonomy') {
-      setRequireShellApproval(false)
       setRequireFileWriteApproval(false)
       setRequireExecApproval(false)
       setFileOpsScope('any')
       return
     }
-    setRequireShellApproval(false)
     setRequireFileWriteApproval(false)
     setRequireExecApproval(false)
     setFileOpsScope('workspace')
@@ -5466,7 +5498,6 @@ function SecuritySettingsForm({
       const settings = await settingsApi.updateSettings({
         security: {
           autonomy_mode: autonomyMode,
-          require_approval_for_shell: requireShellApproval,
           require_approval_for_file_write: requireFileWriteApproval,
           require_approval_for_exec: requireExecApproval,
           agent_run_default_max_wall_clock_sec:
@@ -5530,14 +5561,10 @@ function SecuritySettingsForm({
         </label>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
-            <span className="text-sm text-foreground">{t('settings.security.requireShellApproval')}</span>
-            <Switch checked={requireShellApproval} onCheckedChange={setRequireShellApproval} />
-          </div>
-          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
             <span className="text-sm text-foreground">{t('settings.security.requireFileWriteApproval')}</span>
             <Switch checked={requireFileWriteApproval} onCheckedChange={setRequireFileWriteApproval} />
           </div>
-          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2 md:col-span-2">
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
             <span className="text-sm text-foreground">{t('settings.security.requireExecApproval')}</span>
             <Switch checked={requireExecApproval} onCheckedChange={setRequireExecApproval} />
           </div>

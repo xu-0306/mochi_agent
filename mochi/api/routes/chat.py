@@ -477,6 +477,8 @@ def _event_phase(event: dict[str, Any]) -> str | None:
     event_type = event.get("type")
     if event_type == "thinking":
         return "thinking"
+    if event_type == "status":
+        return "status"
     if event_type == "tool_call_request":
         return "tool_call_request"
     if event_type == "tool_call_result":

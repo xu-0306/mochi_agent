@@ -1,16 +1,21 @@
-"""File tools with workspace boundaries and stale-write guards."""
+"""File tools with workspace boundaries, stale-write guards, and patch support."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-import difflib
 from pathlib import Path
 from typing import Any
 
 from mochi.config import defaults
 from mochi.security import require_approval_decision, with_task_isolation_scope
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
+from mochi.tools.file_mutations import (
+    PatchValidationError,
+    build_file_change_entry,
+    build_file_change_payload,
+    prepare_apply_patch,
+)
 from mochi.utils.security import (
     check_file_tool_path,
     content_size_bytes,
@@ -21,6 +26,7 @@ from mochi.utils.security import (
 
 FileReader = Callable[[Path, str], Awaitable[str]]
 FileWriter = Callable[[Path, str, bool, str], Awaitable[int]]
+_TOOL_RESULT_PATH_PREFIX = "tool-result://"
 
 
 class FileReadTool(BaseTool):
@@ -94,6 +100,10 @@ class FileReadTool(BaseTool):
     def is_concurrency_safe(self) -> bool:
         return True
 
+    @property
+    def allow_plain_text_result_for_model(self) -> bool:
+        return True
+
     def _resolve_workspace_root(self, context: ToolExecutionContext | None) -> Path:
         if context is not None:
             for candidate in (
@@ -123,18 +133,35 @@ class FileReadTool(BaseTool):
         if limit is not None and limit <= 0:
             return ToolResult(error="`limit` must be greater than 0.")
 
-        workspace_root = self._resolve_workspace_root(context)
-        target, security_decision = check_file_tool_path(
-            path,
-            workspace_dir=workspace_root,
-            scope=self._path_scope,
-            access="read",
-        )
-        if security_decision is not None or target is None:
-            return ToolResult(
-                error=security_decision.reason if security_decision is not None else "Path denied.",
-                metadata=security_decision.to_metadata() if security_decision is not None else {},
+        target: Path
+        metadata_path = path
+        reference_metadata: dict[str, Any] = {}
+        if path.startswith(_TOOL_RESULT_PATH_PREFIX):
+            target_result = self._resolve_tool_result_reference(path=path, context=context)
+            if target_result.error is not None:
+                return target_result
+            target = Path(str(target_result.output))
+            reference_metadata = dict(target_result.metadata)
+        else:
+            workspace_root = self._resolve_workspace_root(context)
+            target, security_decision = check_file_tool_path(
+                path,
+                workspace_dir=workspace_root,
+                scope=self._path_scope,
+                access="read",
             )
+            if security_decision is not None or target is None:
+                return ToolResult(
+                    error=security_decision.reason if security_decision is not None else "Path denied.",
+                    metadata=security_decision.to_metadata() if security_decision is not None else {},
+                )
+            metadata_path = str(target)
+
+        active_encoding = (
+            str(reference_metadata.get("encoding"))
+            if encoding is None and isinstance(reference_metadata.get("encoding"), str)
+            else (encoding or self._default_encoding)
+        )
 
         if not target.exists():
             return ToolResult(error=f"File not found: {target}")
@@ -147,15 +174,47 @@ class FileReadTool(BaseTool):
 
         file_size = await asyncio.to_thread(lambda: target.stat().st_size)
         if file_size > effective_max_bytes:
-            return ToolResult(
-                error=(
-                    f"File is too large to read: {file_size} bytes exceeds limit "
-                    f"{effective_max_bytes} bytes."
-                ),
-                metadata={"path": str(target), "size_bytes": file_size, "partial": False},
-            )
+            if limit is None:
+                retry_call = (
+                    f'file_read(path="{path}", offset=1, limit=200, line_numbers=True)'
+                )
+                message = (
+                    f"File is larger than the current read limit ({file_size} bytes exceeds "
+                    f"{effective_max_bytes} bytes). Retry with a bounded line chunk, for example: "
+                    f"{retry_call}"
+                )
+                return ToolResult(
+                    output=message,
+                    metadata={
+                        "path": metadata_path,
+                        "size_bytes": file_size,
+                        "partial": True,
+                        "line_numbers": True,
+                        "encoding": active_encoding,
+                        **reference_metadata,
+                    },
+                    suggestion=retry_call,
+                )
 
-        active_encoding = encoding or self._default_encoding
+            chunk_result = await self._read_chunk_from_path(
+                target=target,
+                encoding=active_encoding,
+                offset=offset,
+                limit=limit,
+                line_numbers=line_numbers,
+            )
+            chunk_result.metadata.update(
+                {
+                    "path": metadata_path,
+                    "size_bytes": file_size,
+                    "encoding": active_encoding,
+                    **reference_metadata,
+                }
+            )
+            if chunk_result.error is not None:
+                return chunk_result
+            return chunk_result
+
         text = await self._reader(target, active_encoding)
         lines = text.splitlines()
         if lines and offset > len(lines):
@@ -164,7 +223,13 @@ class FileReadTool(BaseTool):
                     f"File exists but is shorter than the provided offset ({offset}). "
                     f"The file has {len(lines)} lines."
                 ),
-                metadata={"path": str(target), "total_lines": len(lines), "partial": False},
+                metadata={
+                    "path": metadata_path,
+                    "total_lines": len(lines),
+                    "partial": False,
+                    "encoding": active_encoding,
+                    **reference_metadata,
+                },
             )
 
         rendered_text = text
@@ -199,19 +264,120 @@ class FileReadTool(BaseTool):
         return ToolResult(
             output=rendered_text,
             metadata={
-                "path": str(target),
+                "path": metadata_path,
                 "size_bytes": file_size,
                 "partial": partial,
                 "start_line": start_line,
                 "end_line": end_line,
                 "total_lines": len(lines),
                 "line_numbers": line_numbers,
+                "encoding": active_encoding,
+                **reference_metadata,
             },
         )
 
     @staticmethod
     async def _default_reader(path: Path, encoding: str) -> str:
         return await asyncio.to_thread(path.read_text, encoding=encoding)
+
+    def _resolve_tool_result_reference(
+        self,
+        *,
+        path: str,
+        context: ToolExecutionContext | None,
+    ) -> ToolResult:
+        if context is None:
+            return ToolResult(error="`tool-result://` reads require an execution context.")
+
+        reference_id = path[len(_TOOL_RESULT_PATH_PREFIX) :].strip()
+        if not reference_id:
+            return ToolResult(error="`tool-result://` path must include a reference id.")
+
+        reference = context.tool_result_references.get(reference_id)
+        if not isinstance(reference, dict):
+            return ToolResult(error=f"Unknown tool result reference: {reference_id}")
+
+        artifact_path = reference.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path.strip():
+            return ToolResult(error=f"Tool result reference is missing artifact_path: {reference_id}")
+
+        source_path = reference.get("source_path")
+        artifact_encoding = reference.get("artifact_encoding", self._default_encoding)
+        continuation_target = artifact_path
+        continuation_encoding = artifact_encoding
+        if isinstance(source_path, str) and source_path.strip():
+            source_candidate = Path(source_path)
+            if source_candidate.exists() and source_candidate.is_file():
+                continuation_target = source_path
+                continuation_encoding = reference.get("encoding", self._default_encoding)
+
+        return ToolResult(
+            output=continuation_target,
+            metadata={
+                "reference_id": reference_id,
+                "artifact_path": artifact_path,
+                "artifact_encoding": artifact_encoding,
+                "source_path": source_path,
+                "tool_name": reference.get("tool_name"),
+                "encoding": continuation_encoding,
+            },
+        )
+
+    async def _read_chunk_from_path(
+        self,
+        *,
+        target: Path,
+        encoding: str,
+        offset: int,
+        limit: int,
+        line_numbers: bool,
+    ) -> ToolResult:
+        def _sync_read() -> tuple[str, int, int, int]:
+            selected_lines: list[str] = []
+            total_lines = 0
+            with target.open("r", encoding=encoding) as file:
+                for line_no, raw_line in enumerate(file, start=1):
+                    total_lines = line_no
+                    if line_no < offset:
+                        continue
+                    if len(selected_lines) >= limit:
+                        continue
+                    selected_lines.append(raw_line.rstrip("\r\n"))
+
+            if total_lines > 0 and offset > total_lines:
+                raise ValueError(
+                    f"File exists but is shorter than the provided offset ({offset}). "
+                    f"The file has {total_lines} lines."
+                )
+
+            start_line = offset
+            end_line = offset + len(selected_lines) - 1 if selected_lines else offset - 1
+            if line_numbers:
+                rendered = "\n".join(
+                    f"{line_no}: {line}"
+                    for line_no, line in enumerate(selected_lines, start=offset)
+                )
+            else:
+                rendered = "\n".join(selected_lines)
+            return rendered, start_line, end_line, total_lines
+
+        try:
+            rendered_text, start_line, end_line, total_lines = await asyncio.to_thread(_sync_read)
+        except UnicodeDecodeError:
+            return ToolResult(error=f"File is not valid {encoding} text: {target}")
+        except ValueError as exc:
+            return ToolResult(error=str(exc))
+
+        return ToolResult(
+            output=rendered_text,
+            metadata={
+                "partial": True,
+                "start_line": start_line,
+                "end_line": end_line,
+                "total_lines": total_lines,
+                "line_numbers": line_numbers,
+            },
+        )
 
 
 class FileWriteTool(BaseTool):
@@ -296,23 +462,6 @@ class FileWriteTool(BaseTool):
             return ToolResult(error="`path` must not be empty.")
 
         workspace_root = self._resolve_workspace_root(context)
-        if self._require_approval and not approved:
-            decision = require_approval_decision(
-                reason="File writes require explicit approval in the current autonomy mode.",
-                approval_kind="file_write",
-                approval_scope="workspace",
-                replay_safe=True,
-                policy_source="runtime_policy",
-            )
-            decision = with_task_isolation_scope(
-                decision,
-                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
-            )
-            return ToolResult(
-                error="File write requires approval.",
-                metadata=decision.to_metadata(),
-            )
-
         active_encoding = encoding or self._default_encoding
         if not is_within_write_size_limit(
             content=content,
@@ -354,16 +503,37 @@ class FileWriteTool(BaseTool):
             return guard_error
 
         merged_content = existing_content + content if append else content
-        bytes_written = await self._writer(target, content if append else merged_content, append, active_encoding)
-        metadata = await _build_file_change_metadata(
+        file_change = build_file_change_entry(
             target=target,
+            workspace_root=workspace_root,
+            tool_name=self.name,
+            change_type="add" if not existed_before and not append else "update",
             original_content=existing_content,
             new_content=merged_content,
             encoding=active_encoding,
             undo_max_size_mb=self._undo_max_size_mb,
-            append=append,
-            existed_before=existed_before,
+            extra={"append": append},
         )
+        metadata = build_file_change_payload([file_change])
+        if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="File writes require explicit approval in the current autonomy mode.",
+                approval_kind="file_write",
+                approval_scope="workspace",
+                replay_safe=True,
+                policy_source="runtime_policy",
+            )
+            decision = with_task_isolation_scope(
+                decision,
+                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
+            )
+            metadata.update(decision.to_metadata())
+            return ToolResult(
+                error="File write requires approval.",
+                metadata=metadata,
+            )
+
+        bytes_written = await self._writer(target, content if append else merged_content, append, active_encoding)
 
         await _refresh_read_state_cache(
             context=context,
@@ -436,29 +606,14 @@ class FileEditTool(FileWriteTool):
         approved: bool = False,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
-        if self._require_approval and not approved:
-            decision = require_approval_decision(
-                reason="File edits require explicit approval in the current autonomy mode.",
-                approval_kind="file_edit",
-                approval_scope="workspace",
-                replay_safe=True,
-                policy_source="runtime_policy",
-            )
-            decision = with_task_isolation_scope(
-                decision,
-                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
-            )
-            return ToolResult(
-                error="File edit requires approval.",
-                metadata=decision.to_metadata(),
-            )
         if not old_string:
             return ToolResult(error="`old_string` must not be empty.")
 
+        workspace_root = self._resolve_workspace_root(context)
         active_encoding = encoding or self._default_encoding
         target, security_decision = check_file_tool_path(
             path,
-            workspace_dir=self._workspace_dir,
+            workspace_dir=workspace_root,
             scope=self._path_scope,
         )
         if security_decision is not None or target is None:
@@ -492,16 +647,37 @@ class FileEditTool(FileWriteTool):
         else:
             new_content = existing_content.replace(old_string, new_string, 1)
 
-        bytes_written = await self._writer(target, new_content, False, active_encoding)
-        metadata = await _build_file_change_metadata(
+        file_change = build_file_change_entry(
             target=target,
+            workspace_root=workspace_root,
+            tool_name=self.name,
+            change_type="update",
             original_content=existing_content,
             new_content=new_content,
             encoding=active_encoding,
             undo_max_size_mb=self._undo_max_size_mb,
-            append=False,
-            existed_before=True,
+            extra={"append": False, "edit_type": "replace_all" if replace_all else "replace_first"},
         )
+        metadata = build_file_change_payload([file_change])
+        if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="File edits require explicit approval in the current autonomy mode.",
+                approval_kind="file_edit",
+                approval_scope="workspace",
+                replay_safe=True,
+                policy_source="runtime_policy",
+            )
+            decision = with_task_isolation_scope(
+                decision,
+                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
+            )
+            metadata.update(decision.to_metadata())
+            return ToolResult(
+                error="File edit requires approval.",
+                metadata=metadata,
+            )
+
+        bytes_written = await self._writer(target, new_content, False, active_encoding)
         await _refresh_read_state_cache(
             context=context,
             target=target,
@@ -509,9 +685,128 @@ class FileEditTool(FileWriteTool):
             encoding=active_encoding,
         )
         metadata["bytes_written"] = bytes_written
-        metadata["append"] = False
-        metadata["edit_type"] = "replace_all" if replace_all else "replace_first"
         return ToolResult(output=str(target), metadata=metadata)
+
+
+class ApplyPatchTool(FileWriteTool):
+    """Apply a strict multi-file patch inside the workspace."""
+
+    @property
+    def name(self) -> str:
+        return "apply_patch"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Apply a strict patch using *** Begin Patch / *** Add File / "
+            "*** Update File / *** Delete File / *** End Patch blocks."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "patch": {"type": "string", "description": "Strict apply_patch payload."},
+                "encoding": {"type": "string", "default": "utf-8"},
+                "approved": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Whether user approval has been granted when required.",
+                },
+            },
+            "required": ["patch"],
+            "additionalProperties": False,
+        }
+
+    async def execute(
+        self,
+        *,
+        patch: str,
+        encoding: str | None = None,
+        approved: bool = False,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
+        workspace_root = self._resolve_workspace_root(context)
+        active_encoding = encoding or self._default_encoding
+        try:
+            prepared, metadata = await prepare_apply_patch(
+                patch=patch,
+                workspace_dir=workspace_root,
+                path_scope=self._path_scope,
+                encoding=active_encoding,
+                undo_max_size_mb=self._undo_max_size_mb,
+                tool_name=self.name,
+            )
+        except PatchValidationError as exc:
+            return ToolResult(error=str(exc))
+
+        for item in prepared:
+            if item.new_content is not None and not is_within_write_size_limit(
+                content=item.new_content,
+                max_size_mb=self._max_write_size_mb,
+                encoding=active_encoding,
+            ):
+                size_bytes = content_size_bytes(item.new_content, encoding=active_encoding)
+                return ToolResult(
+                    error=(
+                        f"Write content too large: {size_bytes} bytes exceeds limit "
+                        f"{size_limit_bytes(self._max_write_size_mb)} bytes."
+                    ),
+                    metadata={"size_bytes": size_bytes, **metadata},
+                )
+
+            if item.original_content is not None:
+                guard_error = await _check_stale_write_guard(
+                    target=item.target,
+                    current_content=item.original_content,
+                    context=context,
+                    require_prior_read=item.operation.kind != "add",
+                )
+                if guard_error is not None:
+                    return guard_error
+
+        if self._require_approval and not approved:
+            decision = require_approval_decision(
+                reason="Patch application requires explicit approval in the current autonomy mode.",
+                approval_kind="apply_patch",
+                approval_scope="workspace",
+                replay_safe=True,
+                policy_source="runtime_policy",
+            )
+            decision = with_task_isolation_scope(
+                decision,
+                task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
+            )
+            metadata.update(decision.to_metadata())
+            return ToolResult(
+                error="Patch application requires approval.",
+                metadata=metadata,
+            )
+
+        total_bytes_written = 0
+        for item in prepared:
+            if item.operation.kind == "delete":
+                if await asyncio.to_thread(item.target.exists):
+                    await asyncio.to_thread(item.target.unlink)
+                if context is not None:
+                    context.read_state_cache.pop(str(item.target), None)
+                continue
+
+            new_content = item.new_content or ""
+            total_bytes_written += await self._writer(item.target, new_content, False, active_encoding)
+            await _refresh_read_state_cache(
+                context=context,
+                target=item.target,
+                content=new_content,
+                encoding=active_encoding,
+            )
+
+        metadata["bytes_written"] = total_bytes_written
+        return ToolResult(
+            output={"paths": metadata.get("paths", []), "change_count": metadata.get("change_count", 0)},
+            metadata=metadata,
+        )
 
 
 async def _load_existing_content(target: Path, encoding: str) -> ToolResult:
@@ -534,6 +829,8 @@ async def _check_stale_write_guard(
     require_prior_read: bool | None = None,
 ) -> ToolResult | None:
     if context is None:
+        return None
+    if context.state.get("approval_replay") is True:
         return None
 
     if require_prior_read is None:
@@ -576,62 +873,6 @@ async def _check_stale_write_guard(
         )
 
     return None
-
-
-async def _build_file_change_metadata(
-    *,
-    target: Path,
-    original_content: str,
-    new_content: str,
-    encoding: str,
-    undo_max_size_mb: float,
-    append: bool,
-    existed_before: bool,
-) -> dict[str, Any]:
-    undo_limit_bytes = size_limit_bytes(undo_max_size_mb)
-    diff_text: str | None = None
-    undo_reason: str | None = None
-    undo_available = False
-    undo_action = "restore"
-    original_value: str | None = None
-    new_value: str | None = None
-
-    if undo_limit_bytes > 0:
-        original_size = content_size_bytes(original_content, encoding=encoding)
-        new_size = content_size_bytes(new_content, encoding=encoding)
-        if max(original_size, new_size) <= undo_limit_bytes:
-            undo_available = True
-            original_value = original_content
-            new_value = new_content
-            if not existed_before and not append:
-                undo_action = "delete"
-        else:
-            undo_reason = "file_too_large"
-
-    if undo_available:
-        diff_lines = difflib.unified_diff(
-            original_content.splitlines(),
-            new_content.splitlines(),
-            fromfile="before",
-            tofile="after",
-            lineterm="",
-        )
-        diff_text = "\n".join(diff_lines)
-        if content_size_bytes(diff_text, encoding=encoding) > undo_limit_bytes:
-            diff_text = None
-
-    return {
-        "path": str(target),
-        "file_path": str(target),
-        "original_content": original_value,
-        "new_content": new_value,
-        "undo_available": undo_available,
-        "undo_action": undo_action if undo_available else None,
-        "undo_reason": undo_reason,
-        "diff": diff_text,
-        "diff_available": diff_text is not None,
-        "undo_size_limit_bytes": undo_limit_bytes,
-    }
 
 
 async def _refresh_read_state_cache(

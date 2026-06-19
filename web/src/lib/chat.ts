@@ -11,6 +11,20 @@ export type MessageEventType =
 
 export type ReasoningStepType = 'thinking' | 'status' | 'tool_call' | 'tool_result' | 'error'
 
+export interface ToolExposureDiagnostics {
+  exposedTools: string[]
+  workspaceBound?: boolean
+  attachmentCount?: number
+}
+
+export interface ToolTransportDiagnostics {
+  summaryApplied?: boolean
+  overflowPersisted?: boolean
+  referenceId?: string
+  artifactPath?: string
+  sourcePath?: string
+}
+
 export interface ReasoningStep {
   id: string
   type: ReasoningStepType
@@ -24,6 +38,8 @@ export interface ReasoningStep {
   toolCallId?: string
   toolError?: string
   errorCode?: string
+  toolExposure?: ToolExposureDiagnostics
+  transport?: ToolTransportDiagnostics
   status?: 'running' | 'success' | 'error'
 }
 

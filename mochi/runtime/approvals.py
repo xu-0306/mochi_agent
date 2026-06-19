@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-ApprovalStatus = Literal["pending", "approved", "rejected"]
+ApprovalStatus = Literal["pending", "approved_once", "approved_and_saved_rule", "rejected"]
+ApprovalDecision = Literal["approve_once", "approve_and_save_rule", "reject"]
 
 
 def utc_now_iso() -> str:
@@ -25,6 +26,7 @@ class ExecApprovalRequest:
     shell: str
     scope: str
     created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
     command_payload: dict[str, Any] | None = None
     execution_result: dict[str, Any] | None = None
     resolved_at: str | None = None
@@ -44,6 +46,7 @@ class InMemoryApprovalStore:
         shell: str,
         scope: str,
         reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
         command_payload: dict[str, Any] | None = None,
     ) -> ExecApprovalRequest:
         request = ExecApprovalRequest(
@@ -54,6 +57,7 @@ class InMemoryApprovalStore:
             shell=shell,
             scope=scope,
             created_at=utc_now_iso(),
+            metadata=dict(metadata) if isinstance(metadata, dict) else {},
             command_payload=dict(command_payload) if isinstance(command_payload, dict) else None,
             execution_result=None,
             resolved_at=None,
@@ -75,14 +79,21 @@ class InMemoryApprovalStore:
         self,
         approval_id: str,
         *,
-        approved: bool,
+        decision: ApprovalDecision,
         reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
         execution_result: dict[str, Any] | None = None,
     ) -> ExecApprovalRequest | None:
         current = self._items.get(approval_id)
         if current is None:
             return None
-        next_status: ApprovalStatus = "approved" if approved else "rejected"
+        next_status: ApprovalStatus = (
+            "approved_once"
+            if decision == "approve_once"
+            else "approved_and_saved_rule"
+            if decision == "approve_and_save_rule"
+            else "rejected"
+        )
         resolved = ExecApprovalRequest(
             approval_id=current.approval_id,
             status=next_status,
@@ -91,6 +102,11 @@ class InMemoryApprovalStore:
             shell=current.shell,
             scope=current.scope,
             created_at=current.created_at,
+            metadata=(
+                {**current.metadata, **metadata}
+                if isinstance(metadata, dict)
+                else dict(current.metadata)
+            ),
             command_payload=current.command_payload,
             execution_result=(
                 dict(execution_result) if isinstance(execution_result, dict) else current.execution_result

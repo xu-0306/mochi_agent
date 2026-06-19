@@ -447,12 +447,18 @@ class RuntimeStore:
         self,
         approval_id: str,
         *,
-        approved: bool,
+        decision: str,
         reason: str | None = None,
     ) -> dict[str, Any] | None:
         await self.initialize()
         now = _now_iso()
-        status = "approved" if approved else "rejected"
+        status = (
+            "approved_once"
+            if decision == "approve_once"
+            else "approved_and_saved_rule"
+            if decision == "approve_and_save_rule"
+            else "rejected"
+        )
 
         def _op() -> None:
             with sqlite3.connect(self._db_path) as conn:

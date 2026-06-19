@@ -16,7 +16,8 @@ from mochi.agents.multi_agent.execution_policy import (
 from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunRequest
 from mochi.api.routes.chat import _serialize_event
 from mochi.backends.inference_capabilities import ReasoningEffort
-from mochi.config.schema import SecurityConfig
+from mochi.config.manager import save_config
+from mochi.config.schema import CommandRuleConfig, MochiConfig, SecurityConfig
 from mochi.learning.dataset_exporter import export_run_to_dataset_records
 from mochi.runtime.agent_run_packages import (
     attempt_id_exists,
@@ -24,7 +25,7 @@ from mochi.runtime.agent_run_packages import (
     build_dataset_package,
     summarize_package_materialization,
 )
-from mochi.runtime.approvals import ApprovalStatus, InMemoryApprovalStore
+from mochi.runtime.approvals import ApprovalDecision, ApprovalStatus, InMemoryApprovalStore
 from mochi.runtime.delegate import set_delegate_subagent_task_launcher
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.models import (
@@ -40,7 +41,10 @@ from mochi.runtime.recovery import (
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
 from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
+from mochi.tools.base import ToolExecutionContext, ToolResult
 from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_exec_runtime
+from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileWriteTool
+from mochi.tools.file_mutations import summarize_file_change_payload
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
@@ -74,6 +78,8 @@ SCHEDULE_RUNTIME_KEYS = {
     "last_package_error",
     "last_package_completed_at",
 }
+_FILE_MUTATION_TOOLS = {"file_write", "file_edit", "apply_patch"}
+_FILE_MUTATION_APPROVAL_KINDS = {"file_write", "file_edit", "apply_patch"}
 
 
 class RuntimeService:
@@ -97,6 +103,8 @@ class RuntimeService:
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._active_agent_run_jobs: dict[str, asyncio.Task[None]] = {}
         self._security_config = SecurityConfig()
+        self._bound_config: MochiConfig | None = None
+        self._bound_config_path: str | Path | None = None
         self._scheduler_poll_interval_seconds = self._DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
@@ -107,6 +115,32 @@ class RuntimeService:
 
     def update_security_config(self, security: SecurityConfig) -> None:
         self._security_config = security
+
+    def bind_app_config(
+        self,
+        *,
+        config: MochiConfig,
+        config_path: str | Path | None,
+    ) -> None:
+        self._bound_config = config
+        self._bound_config_path = config_path
+
+    async def _persist_command_rule(self, rule: dict[str, Any] | None) -> dict[str, Any] | None:
+        validated_rule = _validated_command_rule(rule)
+        if validated_rule is None:
+            return None
+        if self._bound_config is None:
+            raise RuntimeError("Runtime service is not bound to an app config.")
+        existing_rules = list(self._bound_config.security.command_rules)
+        if validated_rule not in existing_rules:
+            existing_rules.append(validated_rule)
+        updated_security = self._bound_config.security.model_copy(
+            update={"command_rules": existing_rules}
+        )
+        self._bound_config = self._bound_config.model_copy(update={"security": updated_security})
+        save_config(self._bound_config, self._bound_config_path)
+        self.update_security_config(self._bound_config.security)
+        return validated_rule.model_dump(mode="python")
 
     def set_scheduler_poll_interval(self, seconds: float) -> None:
         self._scheduler_poll_interval_seconds = max(0.05, float(seconds))
@@ -961,13 +995,19 @@ class RuntimeService:
         )
 
         try:
+            security_config = self._security_config
             orchestrator = MultiAgentOrchestrator(
                 engine=self._engine,
                 exec_runtime=self._exec_runtime,
                 exec_approval_store=self._exec_approval_store,
                 controlled_exec_require_approval=resolve_runtime_permission_policy(
-                    self._security_config
+                    security_config
                 ).require_approval_for_exec,
+                controlled_exec_command_rules=[
+                    rule.model_dump() for rule in security_config.command_rules
+                ],
+                controlled_exec_allowed_env_vars=security_config.exec_allowed_env_vars,
+                controlled_exec_default_shell=security_config.exec_default_shell,
             )
             protocol_payload = _resolve_protocol_payload(run)
             task_workspace_dir = None
@@ -1471,8 +1511,9 @@ class RuntimeService:
         self,
         task_id: str,
         *,
-        approved: bool,
+        decision: ApprovalDecision,
         reason: str | None = None,
+        rule: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         task = await self._store.get_task_run(task_id)
         if task is None:
@@ -1484,8 +1525,9 @@ class RuntimeService:
 
         resolved = await self.resolve_approval(
             approval["id"],
-            approved=approved,
+            decision=decision,
             reason=reason,
+            rule=rule,
         )
         if resolved is None:
             return None
@@ -1499,7 +1541,7 @@ class RuntimeService:
             if linked_id
         }
 
-        summaries = [_approval_summary(item) for item in approvals]
+        summaries = [self._enrich_approval_summary(_approval_summary(item)) for item in approvals]
         exec_status = _to_exec_approval_status(status)
         if status is None or exec_status is not None:
             for exec_approval in self._exec_approval_store.list(status=exec_status):
@@ -1514,55 +1556,93 @@ class RuntimeService:
         self,
         approval_id: str,
         *,
-        approved: bool,
+        decision: ApprovalDecision,
         reason: str | None = None,
+        rule: dict[str, Any] | None = None,
+        replay_override: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         current = await self._store.get_approval_request(approval_id)
         if current is None:
             existing_exec = self._exec_approval_store.get(approval_id)
             if existing_exec is None:
                 return None
+            if replay_override is not None:
+                raise ValueError("replay_override is only supported for task file-mutation approvals.")
+            effective_decision, saved_rule = await self._resolve_approval_decision_and_saved_rule(
+                decision=decision,
+                rule=rule,
+                suggested_rules=[existing_exec.metadata.get("suggested_rule")],
+            )
             execution_result: dict[str, Any] | None = None
-            if approved:
+            if effective_decision != "reject":
                 execution_result = await self._execute_approved_exec_request(existing_exec)
             resolved_exec = self._exec_approval_store.resolve(
                 approval_id,
-                approved=approved,
+                decision=effective_decision,
                 reason=reason,
+                metadata={"saved_rule": saved_rule} if isinstance(saved_rule, dict) else None,
                 execution_result=execution_result,
             )
             if resolved_exec is None:
                 return None
             return _exec_approval_summary(resolved_exec)
+        linked_exec_approval_id = _linked_exec_approval_id(current.get("metadata"))
+        linked_exec = (
+            self._exec_approval_store.get(linked_exec_approval_id)
+            if isinstance(linked_exec_approval_id, str) and linked_exec_approval_id
+            else None
+        )
+        if _is_file_mutation_approval(current):
+            effective_decision = "approve_once" if decision == "approve_and_save_rule" else decision
+            saved_rule = None
+        else:
+            effective_decision, saved_rule = await self._resolve_approval_decision_and_saved_rule(
+                decision=decision,
+                rule=rule,
+                suggested_rules=[
+                    (current.get("metadata") or {}).get("suggested_rule")
+                    if isinstance(current.get("metadata"), dict)
+                    else None,
+                    linked_exec.metadata.get("suggested_rule") if linked_exec is not None else None,
+                ],
+            )
         approval = await self._store.resolve_approval_request(
             approval_id,
-            approved=approved,
+            decision=effective_decision,
             reason=reason,
         )
         if approval is None:
             return None
-        linked_exec_approval_id = _linked_exec_approval_id(current.get("metadata"))
         if linked_exec_approval_id:
             self._exec_approval_store.resolve(
                 linked_exec_approval_id,
-                approved=approved,
+                decision=effective_decision,
                 reason=reason,
+                metadata={"saved_rule": saved_rule} if isinstance(saved_rule, dict) else None,
             )
-        if not approved:
+        if effective_decision == "reject":
             await self._store.update_task_status(
                 approval["task_id"],
                 "cancelled",
                 error="Approval rejected",
             )
             return self._task_approval_summary(approval)
+        if await self._try_complete_task_with_file_mutation(
+            approval,
+            current=current,
+            replay_override=replay_override,
+        ):
+            return self._task_approval_summary(approval)
         if await self._try_complete_task_with_linked_exec(
             approval,
             current=current,
             linked_exec_approval_id=linked_exec_approval_id,
             reason=reason,
+            decision=effective_decision,
+            saved_rule=saved_rule,
         ):
             return self._task_approval_summary(approval)
-        override = _approval_override(current)
+        override = _approval_override(current, replay_override=replay_override)
         await self._store.update_task_status(
             approval["task_id"],
             "resumed",
@@ -1574,6 +1654,118 @@ class RuntimeService:
             name=f"runtime-task-resume-{approval['task_id']}",
         )
         return self._task_approval_summary(approval)
+
+    async def get_approval_exec_session(
+        self,
+        approval_id: str,
+        *,
+        yield_time_ms: int | None = None,
+    ) -> dict[str, Any] | tuple[str, None]:
+        context = await self._get_approval_exec_session_context(approval_id)
+        if isinstance(context, tuple):
+            return context
+        session_id = context.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return ("session_unavailable", None)
+        poll = await self._exec_runtime.read_session(session_id, yield_time_ms=yield_time_ms)
+        if poll is None:
+            return ("session_unavailable", None)
+        return _build_approval_exec_session_payload(context=context, poll=poll)
+
+    async def stop_approval_exec_session(self, approval_id: str) -> dict[str, Any] | tuple[str, None]:
+        context = await self._get_approval_exec_session_context(approval_id)
+        if isinstance(context, tuple):
+            return context
+        session_id = context.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return ("session_unavailable", None)
+        poll = await self._exec_runtime.kill_session(session_id)
+        if poll is None:
+            return ("session_unavailable", None)
+        self._persist_exec_approval_poll_result(
+            exec_approval_id=str(context.get("exec_approval_id") or ""),
+            poll=poll,
+        )
+        payload = _build_approval_exec_session_payload(context=context, poll=poll)
+        payload["stop_status"] = poll.status.value
+        return payload
+
+    async def _execute_approved_file_mutation(
+        self,
+        *,
+        approval: dict[str, Any],
+        current: dict[str, Any],
+        replay_override: dict[str, Any] | None,
+    ) -> tuple[str, ToolResult] | tuple[None, None]:
+        task_id = approval.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return (None, None)
+        task = await self._store.get_task_run(task_id)
+        if task is None:
+            return (
+                str(current.get("tool_name") or approval.get("tool_name") or ""),
+                ToolResult(error="Associated task not found for file-mutation approval."),
+            )
+
+        approved_call = _approved_tool_call(current, replay_override=replay_override)
+        tool_name = str(approved_call.get("tool_name") or "")
+        tool = self._build_file_mutation_tool(tool_name=tool_name, task=task)
+        if tool is None:
+            return (tool_name, ToolResult(error=f"Unsupported file-mutation tool: {tool_name}"))
+
+        context = ToolExecutionContext(
+            workspace_dir=(
+                str(task.get("workspace_dir"))
+                if isinstance(task.get("workspace_dir"), str)
+                else None
+            ),
+            session_id=str(task.get("session_id")) if isinstance(task.get("session_id"), str) else None,
+            project_workspace=(
+                str(task.get("project_workspace_dir"))
+                if isinstance(task.get("project_workspace_dir"), str)
+                else None
+            ),
+            task_sandbox_dir=(
+                str(task.get("task_workspace_dir"))
+                if isinstance(task.get("task_workspace_dir"), str)
+                else None
+            ),
+        )
+        context.state["approval_replay"] = True
+        arguments = dict(approved_call.get("arguments") or {})
+        result = await tool.execute(**arguments, approved=True, context=context)
+        return tool_name, result
+
+    def _build_file_mutation_tool(
+        self,
+        *,
+        tool_name: str,
+        task: Mapping[str, Any],
+    ) -> FileWriteTool | FileEditTool | ApplyPatchTool | None:
+        runtime_policy = resolve_runtime_permission_policy(self._security_config)
+        workspace_dir = (
+            str(task.get("task_workspace_dir"))
+            if isinstance(task.get("task_workspace_dir"), str)
+            else str(task.get("project_workspace_dir"))
+            if isinstance(task.get("project_workspace_dir"), str)
+            else str(task.get("workspace_dir"))
+            if isinstance(task.get("workspace_dir"), str)
+            else "."
+        )
+        common: dict[str, Any] = {
+            "workspace_dir": workspace_dir,
+            "path_scope": runtime_policy.file_ops_scope,
+            "require_approval": False,
+            "max_write_size_mb": self._security_config.max_file_write_size_mb,
+            "undo_max_size_mb": self._security_config.file_undo_max_size_mb,
+        }
+        if tool_name == "file_write":
+            return FileWriteTool(**common)
+        if tool_name == "file_edit":
+            return FileEditTool(**common)
+        if tool_name == "apply_patch":
+            return ApplyPatchTool(**common)
+        return None
 
     async def _execute_approved_exec_request(self, approval: Any) -> dict[str, Any]:
         payload = getattr(approval, "command_payload", None)
@@ -1629,6 +1821,45 @@ class RuntimeService:
 
     def _task_approval_summary(self, approval: dict[str, Any]) -> dict[str, Any]:
         summary = _approval_summary(approval)
+        return self._enrich_approval_summary(summary)
+
+    async def _get_approval_exec_session_context(
+        self,
+        approval_id: str,
+    ) -> dict[str, Any] | tuple[str, None]:
+        current = await self._store.get_approval_request(approval_id)
+        if current is not None:
+            if str(current.get("tool_name") or "") != "exec_command":
+                return ("approval_not_found", None)
+            summary = self._enrich_approval_summary(_approval_summary(current))
+            exec_approval_id = summary.get("exec_approval_id")
+            if not isinstance(exec_approval_id, str) or not exec_approval_id:
+                return ("approval_not_found", None)
+            return {
+                "approval_id": approval_id,
+                "source": summary.get("source"),
+                "exec_approval_id": exec_approval_id,
+                "session_id": summary.get("exec_session_id"),
+                "status": summary.get("exec_status"),
+                "task_id": summary.get("task_id"),
+                "tool_name": summary.get("tool_name"),
+            }
+
+        standalone = self._exec_approval_store.get(approval_id)
+        if standalone is None:
+            return ("approval_not_found", None)
+        summary = _exec_approval_summary(standalone)
+        return {
+            "approval_id": approval_id,
+            "source": summary.get("source"),
+            "exec_approval_id": summary.get("exec_approval_id"),
+            "session_id": summary.get("exec_session_id"),
+            "status": summary.get("exec_status"),
+            "task_id": summary.get("task_id"),
+            "tool_name": summary.get("tool_name"),
+        }
+
+    def _enrich_approval_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
         linked_exec_approval_id = summary.get("exec_approval_id")
         if not isinstance(linked_exec_approval_id, str) or not linked_exec_approval_id:
             return summary
@@ -1640,6 +1871,44 @@ class RuntimeService:
         summary["execution_result"] = linked.execution_result
         return summary
 
+    async def _resolve_approval_decision_and_saved_rule(
+        self,
+        *,
+        decision: ApprovalDecision,
+        rule: dict[str, Any] | None,
+        suggested_rules: list[Any] | None = None,
+    ) -> tuple[ApprovalDecision, dict[str, Any] | None]:
+        if decision != "approve_and_save_rule":
+            return decision, None
+        candidates: list[dict[str, Any] | None] = [rule]
+        for candidate in suggested_rules or []:
+            candidates.append(candidate if isinstance(candidate, dict) else None)
+        for candidate in candidates:
+            saved_rule = await self._persist_command_rule(candidate)
+            if saved_rule is not None:
+                return "approve_and_save_rule", saved_rule
+        return "approve_once", None
+
+    def _persist_exec_approval_poll_result(self, *, exec_approval_id: str, poll: Any) -> None:
+        if not exec_approval_id:
+            return
+        existing = self._exec_approval_store.get(exec_approval_id)
+        if existing is None:
+            return
+        decision = _approval_decision_from_status(existing.status)
+        if decision is None:
+            return
+        execution_result = _poll_to_execution_result(
+            poll,
+            previous_result=existing.execution_result,
+        )
+        self._exec_approval_store.resolve(
+            exec_approval_id,
+            decision=decision,
+            reason=existing.reason,
+            execution_result=execution_result,
+        )
+
     async def _try_complete_task_with_linked_exec(
         self,
         approval: dict[str, Any],
@@ -1647,6 +1916,8 @@ class RuntimeService:
         current: dict[str, Any],
         linked_exec_approval_id: str | None,
         reason: str | None,
+        decision: ApprovalDecision,
+        saved_rule: dict[str, Any] | None,
     ) -> bool:
         if str(current.get("tool_name") or "") != "exec_command":
             return False
@@ -1666,8 +1937,9 @@ class RuntimeService:
         execution_result = await self._execute_approved_exec_request(linked)
         self._exec_approval_store.resolve(
             linked_exec_approval_id,
-            approved=True,
+            decision=decision,
             reason=reason,
+            metadata={"saved_rule": saved_rule} if isinstance(saved_rule, dict) else None,
             execution_result=execution_result,
         )
         await self._append_task_exec_result_event(
@@ -1721,6 +1993,78 @@ class RuntimeService:
         )
         return True
 
+    async def _try_complete_task_with_file_mutation(
+        self,
+        approval: dict[str, Any],
+        *,
+        current: dict[str, Any],
+        replay_override: dict[str, Any] | None,
+    ) -> bool:
+        if not _is_file_mutation_approval(current):
+            return False
+
+        tool_name, result = await self._execute_approved_file_mutation(
+            approval=approval,
+            current=current,
+            replay_override=replay_override,
+        )
+        if tool_name is None or result is None:
+            await self._store.update_task_status(
+                approval["task_id"],
+                "failed",
+                error="File-mutation approval could not be replayed.",
+            )
+            return True
+
+        await self._append_task_file_mutation_result_event(
+            approval=approval,
+            tool_name=tool_name,
+            result=result,
+        )
+        final_answer = _final_answer_from_file_mutation_result(result)
+        if result.error is None:
+            if final_answer is not None:
+                await self._store.append_task_event(
+                    approval["task_id"],
+                    {
+                        "type": "final_answer",
+                        "content": final_answer,
+                        "trajectory_id": None,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "generation_time_ms": 0.0,
+                        "finish_reason": "tool_completed",
+                    },
+                )
+            await self._store.update_task_status(
+                approval["task_id"],
+                "succeeded",
+                error=None,
+                final_answer=final_answer,
+            )
+            return True
+
+        await self._store.append_task_event(
+            approval["task_id"],
+            {
+                "type": "error",
+                "error": result.error,
+                "code": "FILE_APPROVAL_EXECUTION_FAILED",
+                "metadata": {
+                    "approval_id": approval.get("id"),
+                    "tool_name": tool_name,
+                    "result_metadata": result.metadata,
+                },
+            },
+        )
+        await self._store.update_task_status(
+            approval["task_id"],
+            "failed",
+            error=result.error,
+            final_answer=final_answer,
+        )
+        return True
+
     async def _append_task_exec_result_event(
         self,
         *,
@@ -1748,6 +2092,27 @@ class RuntimeService:
                     "timed_out": bool(execution_result.get("timed_out", False)),
                     "exit_code": execution_result.get("exit_code"),
                 },
+            },
+        )
+
+    async def _append_task_file_mutation_result_event(
+        self,
+        *,
+        approval: dict[str, Any],
+        tool_name: str,
+        result: ToolResult,
+    ) -> None:
+        metadata = dict(result.metadata)
+        metadata["approval_id"] = approval.get("id")
+        await self._store.append_task_event(
+            approval["task_id"],
+            {
+                "type": "tool_call_result",
+                "call_id": str(approval.get("call_id") or ""),
+                "tool_name": tool_name,
+                "result": result.output,
+                "error": result.error,
+                "metadata": metadata,
             },
         )
 
@@ -1854,13 +2219,19 @@ class RuntimeService:
             if isinstance(metadata.get("selected_models_roles"), dict)
             else {}
         )
+        security_config = self._security_config
         orchestrator = MultiAgentOrchestrator(
             engine=self._engine,
             exec_runtime=self._exec_runtime,
             exec_approval_store=self._exec_approval_store,
             controlled_exec_require_approval=resolve_runtime_permission_policy(
-                self._security_config
+                security_config
             ).require_approval_for_exec,
+            controlled_exec_command_rules=[
+                rule.model_dump() for rule in security_config.command_rules
+            ],
+            controlled_exec_allowed_env_vars=security_config.exec_allowed_env_vars,
+            controlled_exec_default_shell=security_config.exec_default_shell,
         )
         result = await orchestrator.run(
             MultiAgentRunRequest(
@@ -2350,58 +2721,72 @@ def _task_summary(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _approval_override(approval: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "approved_tool_calls": [
-            {
-                "tool_name": str(approval.get("tool_name", "")),
-                "arguments": dict(approval.get("arguments") or {}),
-            }
-        ]
-    }
+def _approval_override(
+    approval: dict[str, Any],
+    replay_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    approved_call = _approved_tool_call(approval, replay_override=replay_override)
+    return {"approved_tool_calls": [approved_call]}
 
 
 def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
     status = str(approval.get("status", "pending"))
     decision: str | None = None
-    if status == "approved":
-        decision = "approve"
+    if status == "approved_once":
+        decision = "approve_once"
+    elif status == "approved_and_saved_rule":
+        decision = "approve_and_save_rule"
     elif status == "rejected":
         decision = "reject"
     metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
     security_decision = SecurityDecision.from_metadata(metadata)
+    file_change_summary = summarize_file_change_payload(metadata)
     linked_exec_approval_id = _linked_exec_approval_id(metadata)
     exec_session_id = metadata.get("session_id") if isinstance(metadata.get("session_id"), str) else None
     exec_status = metadata.get("status") if isinstance(metadata.get("status"), str) else None
+    tool_name = approval["tool_name"]
+    approval_kind = (
+        security_decision.approval_kind
+        if security_decision is not None
+        else metadata.get("approval_kind", "other")
+    )
     return {
         "approval_id": approval["id"],
         "task_id": approval["task_id"],
         "status": status,
-        "tool_name": approval["tool_name"],
+        "tool_name": tool_name,
         "arguments": approval.get("arguments") or {},
+        "command": approval.get("arguments", {}).get("command") if isinstance(approval.get("arguments"), dict) else None,
+        "shell": approval.get("arguments", {}).get("shell") if isinstance(approval.get("arguments"), dict) else None,
+        "workdir": metadata.get("workdir") if isinstance(metadata.get("workdir"), str) else None,
         "created_at": approval["created_at"],
         "resolved_at": approval.get("resolved_at"),
         "decision": decision,
         "reason": approval.get("reason"),
         "requires_approval": security_decision.requires_approval if security_decision else bool(metadata.get("requires_approval", False)),
         "policy_reason": security_decision.reason if security_decision else metadata.get("reason"),
-        "approval_kind": security_decision.approval_kind if security_decision else metadata.get("approval_kind", "other"),
+        "approval_kind": approval_kind,
         "approval_scope": security_decision.approval_scope if security_decision else metadata.get("approval_scope", "workspace"),
         "replay_safe": security_decision.replay_safe if security_decision else bool(metadata.get("replay_safe", False)),
         "security_decision": security_decision.action if security_decision else None,
         "policy_source": security_decision.policy_source if security_decision else metadata.get("policy_source"),
+        "suggested_rule": metadata.get("suggested_rule") if isinstance(metadata.get("suggested_rule"), dict) else None,
+        "allowed_decisions": _allowed_approval_decisions(tool_name=tool_name, approval_kind=approval_kind),
         "source": "task_runtime",
         "exec_approval_id": linked_exec_approval_id,
         "exec_session_id": exec_session_id,
         "exec_status": exec_status,
+        **file_change_summary,
     }
 
 
 def _exec_approval_summary(approval: Any) -> dict[str, Any]:
     status = str(getattr(approval, "status", "pending"))
     decision: str | None = None
-    if status == "approved":
-        decision = "approve"
+    if status == "approved_once":
+        decision = "approve_once"
+    elif status == "approved_and_saved_rule":
+        decision = "approve_and_save_rule"
     elif status == "rejected":
         decision = "reject"
 
@@ -2410,6 +2795,8 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
     scope = str(getattr(approval, "scope", "dangerous_command"))
     reason = getattr(approval, "reason", None)
     reason_text = reason if isinstance(reason, str) else None
+    metadata = getattr(approval, "metadata", None)
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
 
     return {
         "approval_id": str(getattr(approval, "approval_id", "")),
@@ -2417,22 +2804,143 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
         "status": status,
         "tool_name": "exec_command",
         "arguments": {"command": command, "shell": shell},
+        "command": command,
+        "shell": shell,
+        "workdir": (
+            str(getattr(approval, "command_payload", {}).get("workdir"))
+            if isinstance(getattr(approval, "command_payload", None), dict)
+            and isinstance(getattr(approval, "command_payload", {}).get("workdir"), str)
+            else None
+        ),
         "created_at": str(getattr(approval, "created_at", "")),
         "resolved_at": getattr(approval, "resolved_at", None),
         "decision": decision,
         "reason": reason_text,
         "requires_approval": True,
         "policy_reason": reason_text,
-        "approval_kind": "shell",
+        "approval_kind": "exec",
         "approval_scope": scope,
         "replay_safe": False,
         "security_decision": "require_approval",
         "policy_source": "exec_runtime",
+        "suggested_rule": metadata_dict.get("suggested_rule"),
+        "allowed_decisions": ["approve_once", "approve_and_save_rule", "reject"],
         "source": "exec_runtime",
         "exec_approval_id": str(getattr(approval, "approval_id", "")),
         "exec_session_id": _exec_result_field(getattr(approval, "execution_result", None), "session_id"),
         "exec_status": status,
         "execution_result": getattr(approval, "execution_result", None),
+    }
+
+
+def _validated_command_rule(rule: Any) -> CommandRuleConfig | None:
+    if not isinstance(rule, dict):
+        return None
+    try:
+        return CommandRuleConfig.model_validate(rule)
+    except Exception:
+        return None
+
+
+def _approval_decision_from_status(status: str | None) -> ApprovalDecision | None:
+    if status == "approved_once":
+        return "approve_once"
+    if status == "approved_and_saved_rule":
+        return "approve_and_save_rule"
+    if status == "rejected":
+        return "reject"
+    return None
+
+
+def _allowed_approval_decisions(*, tool_name: str, approval_kind: Any) -> list[str]:
+    if tool_name in _FILE_MUTATION_TOOLS or approval_kind in _FILE_MUTATION_APPROVAL_KINDS:
+        return ["approve_once", "reject"]
+    return ["approve_once", "approve_and_save_rule", "reject"]
+
+
+def _is_file_mutation_approval(approval: dict[str, Any]) -> bool:
+    metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
+    return (
+        str(approval.get("tool_name") or "") in _FILE_MUTATION_TOOLS
+        or metadata.get("approval_kind") in _FILE_MUTATION_APPROVAL_KINDS
+    )
+
+
+def _approved_tool_call(
+    approval: dict[str, Any],
+    *,
+    replay_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if replay_override is None:
+        return {
+            "tool_name": str(approval.get("tool_name", "")),
+            "arguments": dict(approval.get("arguments") or {}),
+        }
+
+    if not _is_file_mutation_approval(approval):
+        raise ValueError("replay_override is only supported for file-mutation approvals.")
+    tool_name = replay_override.get("tool_name")
+    arguments = replay_override.get("arguments")
+    if tool_name not in _FILE_MUTATION_TOOLS or not isinstance(arguments, dict):
+        raise ValueError(
+            "replay_override must target a file-mutation tool with object arguments."
+        )
+    return {"tool_name": str(tool_name), "arguments": dict(arguments)}
+
+
+def _poll_to_execution_result(
+    poll: Any,
+    *,
+    previous_result: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
+        "status": poll.status.value,
+        "session_id": poll.session_id,
+        "shell": poll.shell,
+        "background": poll.background,
+        "tty": poll.tty,
+        "pid": poll.pid,
+        "exit_code": poll.exit_code,
+        "timed_out": poll.timed_out,
+        "approval_state": poll.approval_state,
+        "stdout": poll.stdout,
+        "stderr": poll.stderr,
+    }
+    if isinstance(previous_result, Mapping):
+        for key in ("log_path", "checkpoint_dir"):
+            value = previous_result.get(key)
+            if isinstance(value, str):
+                result[key] = value
+    return result
+
+
+def _build_approval_exec_session_payload(
+    *,
+    context: Mapping[str, Any],
+    poll: Any,
+) -> dict[str, Any]:
+    return {
+        "approval_id": context.get("approval_id"),
+        "source": context.get("source"),
+        "exec_approval_id": context.get("exec_approval_id"),
+        "task_id": context.get("task_id"),
+        "tool_name": context.get("tool_name"),
+        "session_id": poll.session_id,
+        "status": context.get("status"),
+        "live_status": "available",
+        "session": {
+            "session_id": poll.session_id,
+            "shell": poll.shell,
+            "status": poll.status.value,
+            "background": poll.background,
+            "tty": poll.tty,
+            "pid": poll.pid,
+            "exit_code": poll.exit_code,
+            "timed_out": poll.timed_out,
+            "approval_state": poll.approval_state,
+            "stdout": poll.stdout,
+            "stderr": poll.stderr,
+        },
     }
 
 
@@ -2449,7 +2957,7 @@ def _linked_exec_approval_id(metadata: Any) -> str | None:
 
 
 def _to_exec_approval_status(status: str | None) -> ApprovalStatus | None:
-    if status in {"pending", "approved", "rejected"}:
+    if status in {"pending", "approved_once", "approved_and_saved_rule", "rejected"}:
         return status
     return None
 
@@ -2471,6 +2979,32 @@ def _final_answer_from_exec_result(result: dict[str, Any]) -> str | None:
     if result.get("status") == "running" and isinstance(session_id, str) and session_id.strip():
         return f"Exec session started in background: {session_id.strip()}"
     return None
+
+
+def _final_answer_from_file_mutation_result(result: ToolResult) -> str | None:
+    if result.error is not None:
+        return result.error
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    file_changes = metadata.get("file_changes")
+    if not isinstance(file_changes, list) or not file_changes:
+        return "Approved file change applied."
+
+    labels: list[str] = []
+    for item in file_changes:
+        if not isinstance(item, dict):
+            continue
+        relative_path = item.get("relative_path")
+        path = item.get("path")
+        if isinstance(relative_path, str) and relative_path.strip():
+            labels.append(relative_path.strip())
+        elif isinstance(path, str) and path.strip():
+            labels.append(Path(path).name)
+
+    if not labels:
+        return "Approved file change applied."
+    if len(labels) == 1:
+        return f"Applied approved file change to {labels[0]}."
+    return f"Applied approved file changes to {len(labels)} files."
 
 
 def _exec_error_message(result: dict[str, Any]) -> str:

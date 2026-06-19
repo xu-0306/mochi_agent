@@ -9,8 +9,8 @@ const source = await fs.readFile(
 
 assert.match(
   source,
-  /title="Research team"[\s\S]*Lead model[\s\S]*Research worker model[\s\S]*Lead responsibilities[\s\S]*Worker responsibilities/,
-  'Research workflow UI should expose clear lead and worker team defaults.'
+  /title="Research team"[\s\S]*Smart model[\s\S]*Research worker model[\s\S]*Research-only roles[\s\S]*Execution lane/,
+  'Research workflow UI should expose clear Smart-model defaults plus research-only versus execution-lane guidance.'
 )
 
 assert.match(
@@ -21,14 +21,20 @@ assert.match(
 
 assert.match(
   source,
-  /SelectItem value=\{CUSTOM_ROLE_VALUE\}>Custom role<\/SelectItem>/,
-  'Role editor should expose a dropdown with a custom role fallback.'
+  /Role preset[\s\S]*Choose role preset[\s\S]*Custom role/,
+  'Role editor should expose preset-driven dropdown choices with a custom role fallback.'
 )
 
 assert.match(
   source,
-  /getRoleDefaultModelLabel\(selectedRoleOption\.defaultModel\)/,
-  'Known roles should surface their recommended default model guidance.'
+  /getRoleDefaultModelLabel\(selectedRoleOption\.defaultModel\)[\s\S]*getRoleCapabilityDescription\(selectedRoleOption\.value\)/,
+  'Known roles should surface both default-model guidance and capability descriptions.'
+)
+
+assert.match(
+  source,
+  /Shared default for planner, judge, verifier, and synthesizer\./,
+  'Smart model copy should explicitly call out the shared planner/judge/verifier/synthesizer default.'
 )
 
 console.log('ok')

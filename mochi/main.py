@@ -516,6 +516,7 @@ async def _chat_async(
         cfg.model = model
 
     engine = AgentEngine(cfg)
+    runtime_service = None
     try:
         await engine.initialize()
     except Exception as exc:
@@ -537,6 +538,8 @@ async def _chat_async(
                 console.print(f"\n[red]Error: {event.message}[/red]")
                 break
     finally:
+        if runtime_service is not None:
+            await runtime_service.close()
         await engine.close()
 
     console.print()
@@ -552,6 +555,14 @@ def _print_tui_help() -> None:
     console.print("  /model <spec>        Switch model for this session")
     console.print("  /session             Show current session id")
     console.print("  /session <id>        Switch session id")
+    console.print("  /approvals           Show approval requests")
+    console.print("  /approve <id>        Approve one request once")
+    console.print("  /approve-save <id>   Approve and save the suggested exec rule")
+    console.print("  /reject <id>         Reject one approval request")
+    console.print("  /exec-read <id>      Read the approval-bound exec session")
+    console.print("  /exec-stop <id>      Stop the approval-bound exec session")
+    console.print("  /safety              Show current safety mode")
+    console.print("  /safety <mode>       Set safety mode")
     console.print("  /tools               Show web search / fetch tool settings")
     console.print("  /tools search-engine <engine>")
     console.print("                       Set primary web search engine")
@@ -585,6 +596,33 @@ def _parse_tui_slash_command(text: str) -> tuple[str, list[str]]:
     return command, args
 
 
+async def _create_tui_runtime_service(
+    *,
+    engine: object,
+    config: object,
+    config_path: str | None,
+) -> object:
+    from mochi.config import defaults
+    from mochi.config.schema import SecurityConfig
+    from mochi.runtime.service import RuntimeService
+    from mochi.runtime.store import RuntimeStore
+
+    sessions_dir = str(getattr(config, "sessions_dir", defaults.default_sessions_dir()))
+    store = RuntimeStore(Path(sessions_dir) / "runtime.db")
+    await store.initialize()
+    service = RuntimeService(engine=engine, store=store)
+    security = getattr(config, "security", None)
+    if not isinstance(security, SecurityConfig):
+        payload = dict(security.__dict__) if security is not None and hasattr(security, "__dict__") else {}
+        security = SecurityConfig.model_validate(payload)
+        setattr(config, "security", security)
+    service.update_security_config(security)
+    service.bind_app_config(config=config, config_path=config_path)
+    service.set_runtime_tasks_root(Path(sessions_dir) / "runtime-tasks")
+    await service.start()
+    return service
+
+
 async def _chat_tui_async(
     *,
     model: str | None,
@@ -601,6 +639,8 @@ async def _chat_tui_async(
         ToolCallResultEvent,
     )
     from mochi.config.manager import load_config, save_config
+    from mochi.config.schema import SecurityConfig
+    from mochi.security.policy import autonomy_mode_defaults
     from mochi.sessions.store import SessionStore
     from mochi.tools.web_search_providers import (
         iter_web_search_provider_specs,
@@ -618,11 +658,26 @@ async def _chat_tui_async(
         cfg.model = model
 
     engine = AgentEngine(cfg)
+    runtime_service: object | None = None
     current_session = session_id.strip() or DEFAULT_TUI_SESSION_ID
     from mochi.config import defaults
 
+    def _sessions_dir() -> str:
+        return str(getattr(cfg, "sessions_dir", defaults.default_sessions_dir()))
+
+    def _ensure_security_config() -> SecurityConfig:
+        current = getattr(cfg, "security", None)
+        if isinstance(current, SecurityConfig):
+            return current
+        payload = {}
+        if current is not None and hasattr(current, "__dict__"):
+            payload = dict(current.__dict__)
+        normalized = SecurityConfig.model_validate(payload)
+        setattr(cfg, "security", normalized)
+        return normalized
+
     session_store = SessionStore(
-        sessions_dir=getattr(cfg, "sessions_dir", defaults.default_sessions_dir())
+        sessions_dir=_sessions_dir()
     )
     supported_search_engines = set(supported_web_search_provider_names(include_aliases=True))
     supported_fetch_extractors = {"trafilatura", "jina_reader", "htmlparser"}
@@ -632,11 +687,29 @@ async def _chat_tui_async(
         if spec.key_config_field is not None
     ]
 
+    async def _build_runtime_service() -> object:
+        _ensure_security_config()
+        return await _create_tui_runtime_service(
+            engine=engine,
+            config=cfg,
+            config_path=config_path,
+        )
+
+    async def _ensure_runtime_service() -> object:
+        nonlocal runtime_service
+        if runtime_service is None:
+            runtime_service = await _build_runtime_service()
+        return runtime_service
+
     async def _reset_engine() -> None:
-        nonlocal engine
+        nonlocal engine, runtime_service
+        if runtime_service is not None:
+            await runtime_service.close()
         await engine.close()
         engine = AgentEngine(cfg)
         await engine.initialize()
+        if runtime_service is not None:
+            runtime_service = await _build_runtime_service()
 
     def _show_tool_settings() -> None:
         fallback = ", ".join(cfg.tools.web_search_fallback_engines) or "(none)"
@@ -644,6 +717,113 @@ async def _chat_tui_async(
         console.print(f"[dim]Web search fallback: {fallback}[/dim]")
         console.print(f"[dim]Web fetch extractor: {cfg.tools.web_fetch_extractor}[/dim]")
         _show_tool_key_status()
+
+    def _show_safety_settings() -> None:
+        security = _ensure_security_config()
+        console.print(f"[dim]Safety mode: {security.autonomy_mode}[/dim]")
+        console.print(
+            f"[dim]Exec approval: {'on' if security.require_approval_for_exec else 'off'}[/dim]"
+        )
+        console.print(
+            "[dim]File write approval: "
+            f"{'on' if security.require_approval_for_file_write else 'off'}[/dim]"
+        )
+        console.print(f"[dim]File scope: {security.file_ops_scope}[/dim]")
+
+    def _print_approval_summary(item: dict[str, object]) -> None:
+        approval_id = str(item.get("approval_id") or "?")
+        status = str(item.get("status") or "unknown")
+        kind = str(item.get("approval_kind") or "other")
+        scope = str(item.get("approval_scope") or "workspace")
+        command = item.get("command")
+        tool_name = str(item.get("tool_name") or "")
+        summary = f"{approval_id} [{status}] {kind}/{scope}"
+        if isinstance(command, str) and command.strip():
+            summary += f" cmd={command.strip()}"
+        elif tool_name:
+            summary += f" tool={tool_name}"
+        console.print(summary, highlight=False, markup=False)
+        reason = item.get("policy_reason") or item.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            console.print(f"  {reason.strip()}", highlight=False)
+        exec_session_id = item.get("exec_session_id")
+        exec_status = item.get("exec_status")
+        if isinstance(exec_session_id, str) and exec_session_id.strip():
+            console.print(
+                f"  exec={exec_session_id.strip()} status={exec_status or 'unknown'}",
+                highlight=False,
+            )
+        file_changes = item.get("file_changes")
+        if isinstance(file_changes, list) and file_changes:
+            console.print(f"  file changes={len(file_changes)}", highlight=False)
+            for change in file_changes[:5]:
+                if not isinstance(change, dict):
+                    continue
+                label = change.get("relative_path") or change.get("path") or "unknown"
+                added = int(change.get("added_lines") or 0)
+                deleted = int(change.get("deleted_lines") or 0)
+                console.print(
+                    f"    {label} (+{added}/-{deleted})",
+                    highlight=False,
+                    markup=False,
+                )
+
+    def _print_exec_session_payload(payload: dict[str, object]) -> None:
+        session = payload.get("session")
+        if not isinstance(session, dict):
+            console.print("[yellow]No exec session payload available.[/yellow]")
+            return
+        console.print(
+            "[dim]Exec session: "
+            f"{session.get('session_id')} status={session.get('status')} "
+            f"shell={session.get('shell')}[/dim]"
+        )
+        exit_code = session.get("exit_code")
+        if exit_code is not None:
+            console.print(f"[dim]Exit code: {exit_code}[/dim]")
+        stdout = session.get("stdout")
+        stderr = session.get("stderr")
+        if isinstance(stdout, str) and stdout.strip():
+            console.print(stdout.rstrip(), highlight=False)
+        if isinstance(stderr, str) and stderr.strip():
+            console.print(f"[yellow]{stderr.rstrip()}[/yellow]", highlight=False)
+
+    def _print_tool_approval_hint(event: ToolCallResultEvent) -> None:
+        metadata = event.metadata
+        if not isinstance(metadata, dict):
+            return
+        approval_id = metadata.get("approval_id")
+        requires_approval = metadata.get("requires_approval") is True
+        if not requires_approval and not isinstance(approval_id, str):
+            return
+        normalized_id = str(approval_id or "").strip()
+        summary: list[str] = []
+        if normalized_id:
+            summary.append(f"id={normalized_id}")
+        approval_kind = metadata.get("approval_kind")
+        if isinstance(approval_kind, str) and approval_kind.strip():
+            summary.append(f"kind={approval_kind.strip()}")
+        approval_scope = metadata.get("approval_scope")
+        if isinstance(approval_scope, str) and approval_scope.strip():
+            summary.append(f"scope={approval_scope.strip()}")
+        if summary:
+            console.print(
+                f"[yellow]Approval pending:[/yellow] {' '.join(summary)}",
+                highlight=False,
+            )
+        if normalized_id:
+            console.print(f"[dim]/approve {normalized_id}[/dim]")
+            allowed_decisions = metadata.get("allowed_decisions")
+            approval_kind_value = str(metadata.get("approval_kind") or "").strip().lower()
+            if (
+                (
+                    not isinstance(allowed_decisions, list)
+                    and approval_kind_value not in {"file_write", "file_edit", "apply_patch"}
+                )
+                or (isinstance(allowed_decisions, list) and "approve_and_save_rule" in allowed_decisions)
+            ):
+                console.print(f"[dim]/approve-save {normalized_id}[/dim]")
+            console.print(f"[dim]/reject {normalized_id}[/dim]")
 
     def _show_tool_key_status() -> None:
         for spec in provider_specs:
@@ -680,6 +860,7 @@ async def _chat_tui_async(
                 full_reply += event.content
             elif isinstance(event, ToolCallResultEvent) and event.error:
                 console.print(f"\n[yellow]Tool {event.tool_name} failed: {event.error}[/yellow]")
+                _print_tool_approval_hint(event)
             elif isinstance(event, ErrorEvent):
                 saw_error = True
                 console.print(f"\n[red]Error: {event.message}[/red]")
@@ -712,6 +893,96 @@ async def _chat_tui_async(
                     continue
                 if command == "help":
                     _print_tui_help()
+                    continue
+                if command == "approvals":
+                    service = await _ensure_runtime_service()
+                    approvals = await service.list_approvals()
+                    if not approvals:
+                        console.print("[dim]No approvals found.[/dim]")
+                        continue
+                    for item in approvals:
+                        _print_approval_summary(item)
+                    continue
+                if command in {"approve", "approve-save", "reject"}:
+                    if len(args) != 1:
+                        usage = {
+                            "approve": "/approve <approval_id>",
+                            "approve-save": "/approve-save <approval_id>",
+                            "reject": "/reject <approval_id>",
+                        }[command]
+                        console.print(f"[red]Usage: {usage}[/red]")
+                        continue
+                    decision = {
+                        "approve": "approve_once",
+                        "approve-save": "approve_and_save_rule",
+                        "reject": "reject",
+                    }[command]
+                    service = await _ensure_runtime_service()
+                    resolved = await service.resolve_approval(args[0], decision=decision)
+                    if resolved is None:
+                        console.print(f"[red]Approval not found: {args[0]}[/red]")
+                        continue
+                    console.print(
+                        f"[green]Approval updated:[/green] "
+                        f"{resolved.get('approval_id')} -> {resolved.get('status')}"
+                    )
+                    execution_result = resolved.get("execution_result")
+                    if isinstance(execution_result, dict) and execution_result.get("session_id"):
+                        console.print(
+                            f"[dim]Exec session: {execution_result.get('session_id')}[/dim]"
+                        )
+                    continue
+                if command == "exec-read":
+                    if len(args) != 1:
+                        console.print("[red]Usage: /exec-read <approval_id>[/red]")
+                        continue
+                    service = await _ensure_runtime_service()
+                    payload = await service.get_approval_exec_session(args[0])
+                    if isinstance(payload, tuple):
+                        console.print(f"[yellow]{payload[0].replace('_', ' ')}[/yellow]")
+                        continue
+                    _print_exec_session_payload(payload)
+                    continue
+                if command == "exec-stop":
+                    if len(args) != 1:
+                        console.print("[red]Usage: /exec-stop <approval_id>[/red]")
+                        continue
+                    service = await _ensure_runtime_service()
+                    payload = await service.stop_approval_exec_session(args[0])
+                    if isinstance(payload, tuple):
+                        console.print(f"[yellow]{payload[0].replace('_', ' ')}[/yellow]")
+                        continue
+                    console.print(
+                        f"[green]Exec session stop requested:[/green] "
+                        f"{payload.get('stop_status') or 'unknown'}"
+                    )
+                    _print_exec_session_payload(payload)
+                    continue
+                if command == "safety":
+                    if not args:
+                        _show_safety_settings()
+                        continue
+                    if len(args) != 1:
+                        console.print("[red]Usage: /safety <mode>[/red]")
+                        continue
+                    next_mode = args[0].strip().lower()
+                    supported_modes = {
+                        "strict",
+                        "trusted_workspace",
+                        "auto_review",
+                        "high_autonomy",
+                    }
+                    if next_mode not in supported_modes:
+                        console.print(
+                            "[red]Unsupported safety mode.[/red] "
+                            f"Choose from: {', '.join(sorted(supported_modes))}"
+                        )
+                        continue
+                    cfg.security = _ensure_security_config().model_copy(
+                        update=autonomy_mode_defaults(next_mode)
+                    )
+                    await _persist_tool_settings()
+                    console.print(f"[green]Safety mode updated:[/green] {cfg.security.autonomy_mode}")
                     continue
                 if command == "model":
                     if not args:

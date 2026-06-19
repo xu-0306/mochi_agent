@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 SecurityDecisionAction = Literal["allow", "deny", "require_approval"]
-ApprovalKind = Literal["shell", "file_write", "file_edit", "other"]
+ApprovalKind = Literal["exec", "shell", "file_write", "file_edit", "apply_patch", "other"]
 ApprovalScope = Literal[
     "workspace",
     "protected_path",
@@ -69,7 +69,7 @@ class SecurityDecision:
             return None
 
         approval_kind = metadata.get("approval_kind")
-        if approval_kind not in {"shell", "file_write", "file_edit", "other"}:
+        if approval_kind not in {"exec", "shell", "file_write", "file_edit", "apply_patch", "other"}:
             approval_kind = "other"
 
         approval_scope = metadata.get("approval_scope")

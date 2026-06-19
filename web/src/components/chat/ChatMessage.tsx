@@ -10,11 +10,12 @@ import type { Message } from '@/lib/chat'
 import { ReasoningPanel } from './ReasoningPanel'
 import { CopyButton } from './CopyButton'
 import type { FileChangeSummary } from '@/lib/chat-p2'
-import { extractFileChangeFromReasoningStep } from '@/lib/chat-p2'
+import { extractFileChangeGroupFromReasoningStep } from '@/lib/chat-p2'
 import { Button } from '@/components/ui/button'
 import { createMarkdownCodeComponents } from '@/components/code/markdown-code'
 import { ChatAttachments } from './ChatAttachments'
 import { FileChangeCard } from './FileChangeCard'
+import type { FileChangeGroupSummary } from '@/lib/file-change-preview'
 
 interface ChatMessageProps {
   message: Message
@@ -98,8 +99,8 @@ export function ChatMessage({
   const fileChanges = React.useMemo(
     () =>
       (reasoningSteps ?? [])
-        .map((step) => extractFileChangeFromReasoningStep(step))
-        .filter((change): change is FileChangeSummary => change !== null),
+        .map((step) => extractFileChangeGroupFromReasoningStep(step))
+        .filter((change): change is FileChangeGroupSummary => change !== null),
     [reasoningSteps]
   )
 
@@ -236,8 +237,8 @@ export function ChatMessage({
                 <div className="mt-4 space-y-3">
                   {fileChanges.map((change, index) => (
                     <FileChangeCard
-                      key={`${change.filePath}:${index}`}
-                      change={change}
+                      key={`${change.id}:${index}`}
+                      group={change}
                       onUndo={onUndoFileChange}
                     />
                   ))}

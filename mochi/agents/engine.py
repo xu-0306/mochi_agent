@@ -85,26 +85,13 @@ from mochi.memory.conversation import ConversationMemory
 from mochi.memory.store import MemoryStore
 from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.projects.store import ProjectStore
-from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
+from mochi.security.policy import build_runtime_permission_policy_dict
 from mochi.sessions.store import SessionStore
 from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
 from mochi.tools.base import ToolExecutionContext
-from mochi.tools.execute_code import ExecuteCodeTool
-from mochi.tools.file_ops import FileEditTool, FileReadTool, FileWriteTool
-from mochi.tools.literature_search import (
-    ArxivSearchTool,
-    CrossrefSearchTool,
-    PubMedSearchTool,
-    SemanticScholarSearchTool,
-)
-from mochi.tools.mcp_client import MCPCallTool, McpListResourcesTool, McpReadResourceTool, McpRuntimeManager
-from mochi.tools.memory_save import MemorySaveTool
-from mochi.tools.memory_search import MemorySearchTool
+from mochi.tools.mcp_client import McpRuntimeManager
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.registry_factory import ToolRegistryFactory
-from mochi.tools.shell import ShellTool
-from mochi.tools.web_fetch import WebFetchTool
-from mochi.tools.web_search import WebSearchTool
 from mochi.voice.events import VoiceEvent
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS, VoiceRouter
 from mochi.voice.session_manager import VoiceSessionManager
@@ -328,6 +315,7 @@ class AgentEngine:
         planner_message = self._build_tool_planner_message(message, attachments)
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
+            user_intent_message=message,
             available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=(
@@ -341,8 +329,13 @@ class AgentEngine:
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
+            attachment_count=self._attachment_count(attachments),
+            workspace_attachment_count=self._workspace_attachment_count(attachments),
         )
-        tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
+        tool_registry = workspace_registry.create_view(
+            exposure_plan.tool_names,
+            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+        )
         tool_schemas = tool_registry.get_schemas()
         attachment_context = self._build_attachment_prompt_context(
             attachments=attachments,
@@ -563,6 +556,7 @@ class AgentEngine:
         reasoning_effort = sanitized.get("reasoning_effort")
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
+            user_intent_message=request.message,
             available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=session_bound_workspace,
@@ -573,6 +567,8 @@ class AgentEngine:
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
+            attachment_count=self._attachment_count(request.attachments),
+            workspace_attachment_count=self._workspace_attachment_count(request.attachments),
             tool_mode=request.tool_mode,
         )
         exposure_plan = self._apply_invocation_tool_overrides(
@@ -625,7 +621,10 @@ class AgentEngine:
             task_workspace_dir=request.task_workspace_dir,
             permission_policy_override=request.permission_policy,
         )
-        tool_registry = workspace_registry.create_view(exposure_plan.tool_names)
+        tool_registry = workspace_registry.create_view(
+            exposure_plan.tool_names,
+            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+        )
         react_loop = AsyncReActLoop(
             backend=active_backend,
             tool_registry=tool_registry,
@@ -644,14 +643,18 @@ class AgentEngine:
             tool_mode=request.tool_mode,
             exposed_tools=list(exposure_plan.tool_names),
             matched_tool_groups=list(exposure_plan.matched_groups),
+            tool_exposure=exposure_plan.exposure_metadata(),
         )
+        tool_exposure_metadata = diagnostics.tool_exposure or exposure_plan.exposure_metadata()
         logger.debug(
-            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}",
+            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
             active_backend.get_model_info().backend_type,
             request.tool_mode,
             request.execution_profile,
             exposure_plan.matched_groups,
             exposure_plan.tool_names,
+            exposure_plan.workspace_bound,
+            exposure_plan.attachment_count,
         )
         if request.tool_mode == "required" and not exposure_plan.tool_names:
             diagnostics.fallback_reason = "tool_mode_required_but_no_tools_exposed"
@@ -687,6 +690,9 @@ class AgentEngine:
                 if isinstance(event, FinalAnswerEvent):
                     final_text = event.content
                     event.trajectory_id = trajectory_id
+                event_metadata = getattr(event, "metadata", None)
+                if isinstance(event_metadata, dict):
+                    event_metadata.setdefault("tool_exposure", copy.deepcopy(tool_exposure_metadata))
                 event.turn_id = turn_id  # type: ignore[attr-defined]
                 turn_event_seq += 1
                 if persist_turn_events:
@@ -737,7 +743,14 @@ class AgentEngine:
         backend_info = backend.get_model_info()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
         if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
-            return ToolExposurePlan(tool_names=[], matched_groups=exposure_plan.matched_groups, limit=0)
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=exposure_plan.matched_groups,
+                limit=0,
+                discoverable_tool_names=[],
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
+            )
         if backend_info.backend_type != "openai_compat":
             return exposure_plan
         if metadata.get("native_tool_calling_status") not in {None, "unknown"}:
@@ -763,7 +776,14 @@ class AgentEngine:
                 refreshed.provider,
                 refreshed.name,
             )
-            return ToolExposurePlan(tool_names=[], matched_groups=exposure_plan.matched_groups, limit=0)
+            return ToolExposurePlan(
+                tool_names=[],
+                matched_groups=exposure_plan.matched_groups,
+                limit=0,
+                discoverable_tool_names=[],
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
+            )
         return exposure_plan
 
     def _apply_execution_profile(
@@ -775,6 +795,8 @@ class AgentEngine:
             "file_read",
             "glob_search",
             "grep_search",
+            "repo_map",
+            "read_symbol",
             "csv_read",
             "pdf_read",
             "docx_read",
@@ -811,12 +833,22 @@ class AgentEngine:
                 tool_names=[name for name in exposure_plan.tool_names if name in readonly_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in readonly_allowed
+                ],
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         if execution_profile == "subagent_execution_request":
             return ToolExposurePlan(
                 tool_names=[name for name in exposure_plan.tool_names if name in execution_request_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in execution_request_allowed
+                ],
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         if execution_profile == "controller_exec":
             controller_tools = list(exposure_plan.tool_names)
@@ -827,12 +859,22 @@ class AgentEngine:
                 tool_names=[name for name in controller_tools if name in controller_exec_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in controller_exec_allowed
+                ],
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         if execution_profile in {"subagent_research", "judge", "verifier"}:
             return ToolExposurePlan(
                 tool_names=[name for name in exposure_plan.tool_names if name in evidence_allowed],
                 matched_groups=exposure_plan.matched_groups,
                 limit=exposure_plan.limit,
+                discoverable_tool_names=[
+                    name for name in exposure_plan.discoverable_tool_names if name in evidence_allowed
+                ],
+                workspace_bound=exposure_plan.workspace_bound,
+                attachment_count=exposure_plan.attachment_count,
             )
         return exposure_plan
 
@@ -852,20 +894,27 @@ class AgentEngine:
                 for name in dict.fromkeys(tool_names_override)
                 if isinstance(name, str) and name in available
             ]
+            discoverable_tool_names = list(tool_names)
         else:
             tool_names = list(exposure_plan.tool_names)
+            discoverable_tool_names = list(exposure_plan.discoverable_tool_names)
 
         if tool_allowlist is not None:
             allowed = {name for name in tool_allowlist if isinstance(name, str)}
             tool_names = [name for name in tool_names if name in allowed]
+            discoverable_tool_names = [name for name in discoverable_tool_names if name in allowed]
         if tool_denylist is not None:
             denied = {name for name in tool_denylist if isinstance(name, str)}
             tool_names = [name for name in tool_names if name not in denied]
+            discoverable_tool_names = [name for name in discoverable_tool_names if name not in denied]
 
         return ToolExposurePlan(
             tool_names=tool_names[: exposure_plan.limit] if exposure_plan.limit > 0 else [],
             matched_groups=exposure_plan.matched_groups,
             limit=exposure_plan.limit,
+            discoverable_tool_names=discoverable_tool_names,
+            workspace_bound=exposure_plan.workspace_bound,
+            attachment_count=exposure_plan.attachment_count,
         )
 
     async def switch_model(self, model_spec: str) -> ModelInfo:
@@ -1021,7 +1070,14 @@ class AgentEngine:
         base_url: str,
         model: str,
         api_key: str = "",
-        provider: Literal["openai_compat", "gemini", "anthropic", "vllm"] = "openai_compat",
+        provider: Literal[
+            "openai_compat",
+            "gemini",
+            "anthropic",
+            "vllm",
+            "sglang",
+            "tensorrt_llm",
+        ] = "openai_compat",
     ) -> ModelInfo:
         """以 OpenAI-compatible API 設定切換活躍後端。"""
         backend = await self._router.switch_openai_compat(
@@ -1035,7 +1091,14 @@ class AgentEngine:
         self._config.openai_compat.base_url = normalized_base_url
         self._config.openai_compat.model = model.strip()
         self._config.openai_compat.provider = cast(
-            Literal["openai_compat", "gemini", "anthropic", "vllm"],
+            Literal[
+                "openai_compat",
+                "gemini",
+                "anthropic",
+                "vllm",
+                "sglang",
+                "tensorrt_llm",
+            ],
             provider,
         )
         self._config.openai_codex.auth_profile_id = None
@@ -1513,206 +1576,29 @@ class AgentEngine:
 
     def _register_builtin_tools(self) -> None:
         """以共享 runtime 物件覆蓋內建工具預設實例。"""
-        from mochi.tools.calculator import CalculatorTool
-        from mochi.tools.datetime_tool import DateTimeTool
+        self._tool_registry = self._tool_registry_factory.create_registry(
+            self._config.workspace_dir
+        )
 
-        tc = self._config.tools  # shortcut
-        runtime_policy = resolve_runtime_permission_policy(self._config.security)
 
-        self._tool_registry.register(
-            ShellTool(
-                allowlist=self._config.security.shell_command_allowlist,
-                workspace_dir=self._config.workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
-        self._tool_registry.register(
-            FileReadTool(
-                workspace_dir=self._config.workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-            )
-        )
-        self._tool_registry.register(
-            FileWriteTool(
-                workspace_dir=self._config.workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
-        self._tool_registry.register(
-            FileEditTool(
-                workspace_dir=self._config.workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
 
         # --- 搜尋工具 ---
-        def _secret(s: SecretStr | None) -> str | None:
-            return s.get_secret_value() if s is not None else None
-
-        self._tool_registry.register(
-            WebSearchTool(
-                engine=tc.web_search_engine,
-                timeout=tc.http_timeout,
-                fallback_engines=tc.web_search_fallback_engines,
-                searxng_base_url=tc.web_search_searxng_base_url,
-                brave_api_key=_secret(tc.web_search_brave_api_key),
-                tavily_api_key=_secret(tc.web_search_tavily_api_key),
-                serper_api_key=_secret(tc.web_search_serper_api_key),
-                jina_api_key=_secret(tc.web_search_jina_api_key),
-                exa_api_key=_secret(tc.web_search_exa_api_key),
-                language=tc.web_search_language,
-                region=tc.web_search_region,
-            )
-        )
 
         # --- 網頁擷取 ---
-        jina_key = _secret(tc.web_fetch_jina_api_key) or _secret(tc.web_search_jina_api_key)
-        self._tool_registry.register(
-            WebFetchTool(
-                timeout=tc.http_timeout,
-                jina_api_key=jina_key,
-                extractor=tc.web_fetch_extractor,
-            )
-        )
 
         # --- 文獻工具 ---
-        self._tool_registry.register(ArxivSearchTool(timeout=tc.http_timeout))
-        self._tool_registry.register(
-            SemanticScholarSearchTool(
-                timeout=tc.http_timeout,
-                api_key=_secret(tc.semantic_scholar_api_key),
-            )
-        )
-        self._tool_registry.register(
-            CrossrefSearchTool(
-                timeout=tc.http_timeout,
-                mailto=tc.crossref_mailto,
-            )
-        )
-        self._tool_registry.register(
-            PubMedSearchTool(
-                timeout=tc.http_timeout,
-                email=tc.pubmed_email,
-                api_key=_secret(tc.pubmed_api_key),
-            )
-        )
 
         # --- 程式碼執行 ---
-        self._tool_registry.register(
-            ExecuteCodeTool(
-                workspace_dir=self._config.workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
 
         # --- MCP ---
-        if self._mcp_runtime_manager is not None:
-            self._tool_registry.register(MCPCallTool(runtime=self._mcp_runtime_manager))
-            self._tool_registry.register(McpListResourcesTool(runtime=self._mcp_runtime_manager))
-            self._tool_registry.register(McpReadResourceTool(runtime=self._mcp_runtime_manager))
-            for tool in self._mcp_runtime_manager.materialize_tools():
-                self._tool_registry.register(tool)
-        else:
-            self._tool_registry.register(MCPCallTool())
 
         # --- 記憶 ---
-        self._tool_registry.register(
-            MemorySearchTool(
-                memory_store=self._memory_store,
-                workspace_dir=self._config.workspace_dir,
-                default_top_k=self._config.memory.fts_top_k,
-            )
-        )
-        self._tool_registry.register(
-            MemorySaveTool(
-                memory_store=self._memory_store,
-                workspace_dir=self._config.workspace_dir,
-            )
-        )
 
         # --- 實用工具 ---
-        self._tool_registry.register(CalculatorTool())
-        self._tool_registry.register(DateTimeTool())
 
     def _build_tool_registry_for_workspace(self, workspace_dir: str) -> ToolRegistry:
         """Build a tool registry for one effective workspace."""
-        runtime_policy = resolve_runtime_permission_policy(self._config.security)
-        registry = ToolRegistry(
-            extra_dirs=self._config.tools.extra_tools_dirs or None,
-            discover_builtin=False,
-        )
-
-        for tool in self._tool_registry.list_tools():
-            if tool.name in {
-                "shell",
-                "file_read",
-                "file_write",
-                "file_edit",
-                "execute_code",
-                "memory_search",
-                "memory_save",
-            }:
-                continue
-            registry.register(tool)
-
-        registry.register(
-            ShellTool(
-                allowlist=self._config.security.shell_command_allowlist,
-                workspace_dir=workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
-        registry.register(
-            FileReadTool(
-                workspace_dir=workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-            )
-        )
-        registry.register(
-            FileWriteTool(
-                workspace_dir=workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
-        registry.register(
-            FileEditTool(
-                workspace_dir=workspace_dir,
-                path_scope=runtime_policy.file_ops_scope,
-                require_approval=runtime_policy.require_approval_for_file_write,
-                max_write_size_mb=self._config.security.max_file_write_size_mb,
-                undo_max_size_mb=self._config.security.file_undo_max_size_mb,
-            )
-        )
-        registry.register(
-            ExecuteCodeTool(
-                workspace_dir=workspace_dir,
-                require_approval=runtime_policy.require_approval_for_shell,
-            )
-        )
-        registry.register(
-            MemorySearchTool(
-                memory_store=self._memory_store,
-                workspace_dir=workspace_dir,
-                default_top_k=self._config.memory.fts_top_k,
-            )
-        )
-        registry.register(
-            MemorySaveTool(
-                memory_store=self._memory_store,
-                workspace_dir=workspace_dir,
-            )
-        )
-
-        return registry
+        return self._tool_registry_factory.create_registry(workspace_dir)
 
     def _get_tool_execution_context(
         self,
@@ -1979,6 +1865,20 @@ class AgentEngine:
         for attachment in attachments:
             lines.append(f"- {self._attachment_summary_label(attachment)}")
         return "\n".join(line for line in lines if line)
+
+    @staticmethod
+    def _attachment_count(attachments: list[AttachmentRef] | None) -> int:
+        return len(attachments or [])
+
+    @staticmethod
+    def _workspace_attachment_count(attachments: list[AttachmentRef] | None) -> int:
+        if not attachments:
+            return 0
+        return sum(
+            1
+            for attachment in attachments
+            if (attachment.source or "").strip().lower() in {"workspace_file", "workspace_selection"}
+        )
 
     def _build_attachment_prompt_context(
         self,
@@ -2556,7 +2456,6 @@ def _resolve_agent_run_evidence_permission_policy(
 ) -> dict[str, Any] | None:
     permission_keys = {
         "autonomy_mode",
-        "require_approval_for_shell",
         "require_approval_for_file_write",
         "require_approval_for_exec",
         "file_ops_scope",

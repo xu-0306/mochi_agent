@@ -57,16 +57,20 @@ class AgentInvocationDiagnostics:
     exposed_tools: list[str] = field(default_factory=list)
     matched_tool_groups: list[str] = field(default_factory=list)
     fallback_reason: str | None = None
+    tool_exposure: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-safe dict."""
-        return {
+        payload = {
             "execution_profile": self.execution_profile,
             "tool_mode": self.tool_mode,
             "exposed_tools": list(self.exposed_tools),
             "matched_tool_groups": list(self.matched_tool_groups),
             "fallback_reason": self.fallback_reason,
         }
+        if self.tool_exposure is not None:
+            payload["tool_exposure"] = dict(self.tool_exposure)
+        return payload
 
 
 @dataclass

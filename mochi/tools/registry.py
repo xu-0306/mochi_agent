@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
 from mochi.security import deny_security_decision
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from mochi.tools.tool_search import ToolSearchTool
 
 ToolFactory = Any
 
@@ -74,12 +75,29 @@ class ToolRegistry:
     def get_schemas(self) -> list[dict[str, Any]]:
         return [tool.to_schema_dict() for tool in self.list_tools()]
 
-    def create_view(self, tool_names: list[str]) -> ToolRegistry:
+    def create_view(
+        self,
+        tool_names: list[str],
+        *,
+        tool_search_catalog_names: list[str] | None = None,
+    ) -> ToolRegistry:
         """Create a shallow registry view containing only the selected tools."""
         registry = ToolRegistry(discover_builtin=False)
+        scoped_catalog_names = list(tool_search_catalog_names or tool_names)
         for name in tool_names:
             tool = self.get(name)
             if tool is not None:
+                if isinstance(tool, ToolSearchTool):
+                    registry.register(
+                        tool.scoped_to_catalog(
+                            lambda: [
+                                candidate
+                                for candidate_name in scoped_catalog_names
+                                if (candidate := self.get(candidate_name)) is not None
+                            ]
+                        )
+                    )
+                    continue
                 registry.register(tool)
         return registry
 

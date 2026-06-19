@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 import shlex
 from pathlib import Path
+from typing import Literal
 
-from mochi.utils.command_security import classify_command
+from mochi.utils.command_security import CommandSecurityResult, classify_command
 from mochi.security.decision import SecurityDecision, deny_security_decision
 
 FORBIDDEN_SHELL_PATTERNS: tuple[str, ...] = (
@@ -94,11 +95,14 @@ def _matches_dangerous_shell_prefix(tokens: list[str]) -> bool:
 
 def is_safe_command(command: str, allowlist: list[str]) -> bool:
     """Return True only for allowlisted commands that also pass hard safety rules."""
-    return explain_unsafe_shell_command(command, allowlist) is None
+    return classify_legacy_shell_command(command, allowlist).action == "allow"
 
 
-def explain_unsafe_shell_command(command: str, allowlist: list[str]) -> str | None:
-    """Return a human-readable reason when a shell command is denied by policy."""
+def classify_legacy_shell_command(
+    command: str,
+    allowlist: list[str],
+) -> CommandSecurityResult:
+    """Classify a legacy shell command using the shared command policy."""
     allow_dangerous_interpreters = any(
         str(item).strip().lower() == "__allow_dangerous_shells__"
         for item in allowlist
@@ -109,14 +113,75 @@ def explain_unsafe_shell_command(command: str, allowlist: list[str]) -> str | No
         for item in allowlist
         if isinstance(item, str) and item.strip().lower() != "__allow_dangerous_shells__"
     ]
+    command_rules = [
+        {
+            "tokens": _tokenize_shell_command(item),
+            "decision": "allow",
+            "match": "exact",
+            "shells": [],
+        }
+        for item in effective_allowlist
+        if item.strip()
+    ]
     result = classify_command(
         command,
-        allowlist=effective_allowlist,
+        command_rules=command_rules,
         allow_dangerous_interpreters=allow_dangerous_interpreters,
     )
+    if result.rule_id == "unknown_requires_approval":
+        return CommandSecurityResult(
+            action="deny",
+            reason="Command denied by allowlist policy.",
+            rule_id="allowlist",
+            parsed_tokens=result.parsed_tokens,
+        )
+    return result
+
+
+def explain_unsafe_shell_command(command: str, allowlist: list[str]) -> str | None:
+    """Return a human-readable reason when a shell command is denied by policy."""
+    result = classify_legacy_shell_command(command, allowlist)
     if result.action == "allow":
         return None
     return result.reason
+
+
+PolicyState = Literal["allow", "ask", "deny"]
+
+
+def security_decision_policy_state(decision: SecurityDecision) -> PolicyState:
+    """Map legacy SecurityDecision actions onto the UI-facing allow/ask/deny states."""
+    if decision.action == "require_approval":
+        return "ask"
+    return decision.action
+
+
+def build_policy_metadata(
+    *,
+    decision: SecurityDecision | None = None,
+    policy_state: PolicyState | None = None,
+    policy_reason: str | None = None,
+    legacy_tool: bool | None = None,
+    preferred_tool: str | None = None,
+    preferred_tools: list[str] | None = None,
+) -> dict[str, object]:
+    """Attach stable allow/ask/deny metadata without dropping legacy decision fields."""
+    metadata: dict[str, object] = {}
+    if decision is not None:
+        metadata.update(decision.to_metadata())
+        policy_state = policy_state or security_decision_policy_state(decision)
+        policy_reason = policy_reason or decision.reason
+    if policy_state is not None:
+        metadata["policy_state"] = policy_state
+    if policy_reason:
+        metadata["policy_reason"] = policy_reason
+    if legacy_tool is not None:
+        metadata["legacy_tool"] = legacy_tool
+    if preferred_tool:
+        metadata["preferred_tool"] = preferred_tool
+    if preferred_tools:
+        metadata["preferred_tools"] = list(preferred_tools)
+    return metadata
 
 
 def normalize_workspace_dir(workspace_dir: str | Path) -> Path:

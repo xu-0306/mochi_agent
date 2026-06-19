@@ -2,25 +2,23 @@
 
 import * as React from 'react'
 import {
+  AlertCircle,
   BrainCircuit,
   Check,
+  CheckCircle2,
   ChevronDown,
   Loader2,
   Mic,
   Paperclip,
   Send,
+  Shield,
+  Sparkles,
   Square,
   X,
+  Zap,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/lib/i18n'
 import * as api from '@/lib/api'
@@ -31,6 +29,7 @@ import {
   type CommandPaletteAction,
 } from './CommandPalette'
 import { ChatAttachments } from './ChatAttachments'
+import { ThinkingLevelChipControl } from './ThinkingLevelControls'
 import type {
   ChatContextSnapshot,
   LocalActiveModelRuntimeStatus,
@@ -75,6 +74,10 @@ interface ChatInputProps {
   inference: InferenceParams
   reasoningOptions?: api.ReasoningEffort[]
   onReasoningEffortChange?: (value: api.ReasoningEffort | null) => void
+  approvalMode?: api.SessionSecurityOverride['autonomy_mode']
+  approvalModeSourceLabel?: string | null
+  approvalModeSourceDescription?: string | null
+  onApprovalModeChange?: (value: api.SessionSecurityOverride['autonomy_mode']) => void | Promise<void>
   composerMode?: 'compose' | 'edit'
   composerSeed?: ChatComposerSeed | null
   composerResetKey?: string
@@ -155,19 +158,6 @@ function formatMountedModelName(modelSpec: string | null | undefined, fallback: 
   return raw.split(/[\\/]/).pop() ?? raw
 }
 
-function formatReasoningEffortLabel(value: api.ReasoningEffort): string {
-  if (value === 'xhigh') {
-    return 'Extra High'
-  }
-  if (value === 'minimal') {
-    return 'Minimal'
-  }
-  if (value === 'none') {
-    return 'None'
-  }
-  return value.charAt(0).toUpperCase() + value.slice(1)
-}
-
 function attachmentIdentity(attachment: ChatAttachment): string {
   return [
     attachment.id ?? '',
@@ -177,6 +167,196 @@ function attachmentIdentity(attachment: ChatAttachment): string {
     attachment.lineEnd ?? '',
     attachment.quote ?? '',
   ].join('::')
+}
+
+type ApprovalMode = api.SessionSecurityOverride['autonomy_mode']
+
+const APPROVAL_MODE_OPTIONS: Array<{
+  value: ApprovalMode
+  label: string
+  description: string
+  icon: React.ComponentType<{ className?: string }>
+}> = [
+  {
+    value: 'strict',
+    label: 'Ask every time',
+    description: 'Pause before Mochi runs commands or applies file changes.',
+    icon: AlertCircle,
+  },
+  {
+    value: 'trusted_workspace',
+    label: 'Approve for me',
+    description: 'Auto-run clearly safe workspace actions and only ask for risky ones.',
+    icon: CheckCircle2,
+  },
+  {
+    value: 'auto_review',
+    label: 'Auto review',
+    description: 'Keep trusted-workspace thresholds while surfacing review metadata more explicitly.',
+    icon: Sparkles,
+  },
+  {
+    value: 'high_autonomy',
+    label: 'High autonomy',
+    description: 'Allow broader in-workspace execution before pausing for approval.',
+    icon: Zap,
+  },
+]
+
+const APPROVAL_MODE_BY_VALUE = Object.fromEntries(
+  APPROVAL_MODE_OPTIONS.map((option) => [option.value, option])
+) as Record<ApprovalMode, (typeof APPROVAL_MODE_OPTIONS)[number]>
+
+function ApprovalModeControl({
+  value,
+  sourceLabel,
+  sourceDescription,
+  disabled,
+  onChange,
+}: {
+  value: ApprovalMode
+  sourceLabel: string | null | undefined
+  sourceDescription: string | null | undefined
+  disabled?: boolean
+  onChange?: (value: ApprovalMode) => void | Promise<void>
+}) {
+  const [open, setOpen] = React.useState(false)
+  const [isSaving, setIsSaving] = React.useState(false)
+  const menuRef = React.useRef<HTMLDivElement>(null)
+  const activeOption = APPROVAL_MODE_BY_VALUE[value]
+
+  React.useEffect(() => {
+    if (!open) {
+      return
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    return () => document.removeEventListener('mousedown', handlePointerDown)
+  }, [open])
+
+  const handleSelect = React.useCallback(async (nextValue: ApprovalMode) => {
+    if (!onChange) {
+      setOpen(false)
+      return
+    }
+    if (nextValue === value) {
+      setOpen(false)
+      return
+    }
+
+    setIsSaving(true)
+    try {
+      await onChange(nextValue)
+      setOpen(false)
+    } finally {
+      setIsSaving(false)
+    }
+  }, [onChange, value])
+
+  return (
+    <div className="relative" ref={menuRef}>
+      <button
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        disabled={disabled || isSaving}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={activeOption.label}
+        className={cn(
+          'flex h-7 items-center gap-1.5 rounded-full border border-white/10 bg-canvas/85 pl-2 pr-2.5',
+          'text-[11px] text-foreground transition-all duration-150 hover:bg-elevated-layer',
+          'focus:outline-none focus:ring-2 focus:ring-primary-500/35',
+          'disabled:cursor-not-allowed disabled:opacity-50'
+        )}
+      >
+        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-primary-500/12 text-primary-300">
+          {isSaving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Shield className="h-3 w-3" />}
+        </span>
+        <span className="whitespace-nowrap">{activeOption.label}</span>
+        <ChevronDown className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')} />
+      </button>
+
+      {open ? (
+        <div
+          className={cn(
+            'absolute bottom-full left-0 z-50 mb-2 w-[22rem] max-w-[calc(100vw-2rem)] overflow-hidden rounded-[1.15rem]',
+            'border border-white/8 bg-[linear-gradient(180deg,rgba(28,28,31,0.98),rgba(18,18,21,0.98))] shadow-[0_24px_64px_rgba(0,0,0,0.42)]',
+            'animate-slide-up'
+          )}
+        >
+          <div className="border-b border-white/8 px-4 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[12px] font-medium text-slate-100">
+                  How should Mochi actions be approved?
+                </p>
+                <p className="mt-1 text-[11px] leading-4 text-slate-400">
+                  Pick the review posture for this chat without leaving the composer.
+                </p>
+              </div>
+              {sourceLabel ? (
+                <span className="shrink-0 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-slate-300">
+                  {sourceLabel}
+                </span>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="space-y-1.5 px-2 py-2">
+            {APPROVAL_MODE_OPTIONS.map((option) => {
+              const Icon = option.icon
+              const selected = option.value === value
+
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => void handleSelect(option.value)}
+                  disabled={isSaving}
+                  className={cn(
+                    'flex w-full items-start gap-3 rounded-[0.95rem] px-3 py-2.5 text-left transition-colors duration-150',
+                    selected
+                      ? 'bg-primary-500/12 text-slate-50'
+                      : 'text-slate-200 hover:bg-white/[0.04]'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border',
+                      selected
+                        ? 'border-primary-400/30 bg-primary-500/14 text-primary-200'
+                        : 'border-white/8 bg-white/[0.03] text-slate-400'
+                    )}
+                  >
+                    <Icon className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-2">
+                      <span className="text-sm font-medium">{option.label}</span>
+                      {selected ? <Check className="h-3.5 w-3.5 text-primary-300" /> : null}
+                    </span>
+                    <span className="mt-1 block text-[11px] leading-4 text-slate-400">
+                      {option.description}
+                    </span>
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="border-t border-white/8 px-4 py-3 text-[11px] leading-4 text-slate-400">
+            Effective now: <span className="text-slate-100">{activeOption.label}</span>. {sourceDescription ?? 'This chat follows the current workspace safety default.'}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
 }
 
 export function ChatInput({
@@ -203,6 +383,10 @@ export function ChatInput({
   inference,
   reasoningOptions,
   onReasoningEffortChange,
+  approvalMode,
+  approvalModeSourceLabel,
+  approvalModeSourceDescription,
+  onApprovalModeChange,
   composerMode = 'compose',
   composerSeed = null,
   composerResetKey,
@@ -458,11 +642,12 @@ export function ChatInput({
           targetDir: uploadTargetDir,
           packageName: `${Date.now()}-${index + 1}-${file.name}`,
         })
+        const resolvedImportedFilePath = result.files[0]?.path ?? result.importedPath
         uploadedFiles.push({
           id: `${Date.now()}-${index}-${file.name}`,
           name: file.name,
-          path: result.importedPath,
-          size: file.size,
+          path: resolvedImportedFilePath,
+          size: result.files[0]?.size ?? file.size,
           contentType: file.type || null,
         })
       }
@@ -709,8 +894,8 @@ export function ChatInput({
             }}
           />
 
-          <div className="flex items-center justify-between px-3 pb-2">
-            <div className="flex items-center gap-1">
+          <div className="flex items-center justify-between gap-2 px-3 pb-2">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -738,6 +923,16 @@ export function ChatInput({
               >
                 <Mic className="h-3.5 w-3.5" />
               </Button>
+
+              {approvalMode ? (
+                <ApprovalModeControl
+                  value={approvalMode}
+                  sourceLabel={approvalModeSourceLabel}
+                  sourceDescription={approvalModeSourceDescription}
+                  disabled={disabled}
+                  onChange={onApprovalModeChange}
+                />
+              ) : null}
 
               <div className="relative" ref={contextMenuRef}>
                 <button
@@ -851,43 +1046,12 @@ export function ChatInput({
               </div>
 
               {hasReasoningSelector ? (
-                <div
-                  className={cn(
-                    'flex h-7 items-center gap-1 rounded-md border border-border/70 bg-canvas/80 px-1.5',
-                    'transition-colors duration-150 hover:bg-elevated-layer'
-                  )}
-                >
-                  <span className="whitespace-nowrap px-1 text-[11px] text-muted-foreground">
-                    Reasoning
-                  </span>
-                  <Select
-                    value={inference.reasoningEffort ?? 'auto'}
-                    onValueChange={(next) =>
-                      onReasoningEffortChange?.(
-                        next === 'auto' ? null : (next as api.ReasoningEffort)
-                      )
-                    }
-                  >
-                    <SelectTrigger
-                      aria-label="Reasoning Effort"
-                      disabled={disabled}
-                      className={cn(
-                        'h-6 min-w-[92px] border-0 bg-transparent px-1.5 py-0 text-[11px] text-foreground shadow-none',
-                        'focus:border-0 focus:ring-0 focus:ring-transparent'
-                      )}
-                    >
-                      <SelectValue placeholder="Auto" />
-                    </SelectTrigger>
-                    <SelectContent className="min-w-[120px]">
-                      <SelectItem value="auto">Auto</SelectItem>
-                      {reasoningOptions?.map((option) => (
-                        <SelectItem key={option} value={option}>
-                          {formatReasoningEffortLabel(option)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+                <ThinkingLevelChipControl
+                  supportedEfforts={reasoningOptions}
+                  value={inference.reasoningEffort}
+                  disabled={disabled}
+                  onChange={onReasoningEffortChange}
+                />
               ) : null}
 
               <div className="relative" ref={modelMenuRef}>

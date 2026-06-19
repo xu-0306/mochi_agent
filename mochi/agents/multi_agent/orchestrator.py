@@ -364,6 +364,9 @@ class MultiAgentOrchestrator:
         exec_runtime: ExecRuntime | None = None,
         exec_approval_store: InMemoryApprovalStore | None = None,
         controlled_exec_require_approval: bool = True,
+        controlled_exec_command_rules: list[dict[str, Any]] | None = None,
+        controlled_exec_allowed_env_vars: list[str] | None = None,
+        controlled_exec_default_shell: str = "auto",
     ) -> None:
         self._engine = engine
         self._policy = scoring_policy or LLMFirstScoringPolicy()
@@ -371,6 +374,13 @@ class MultiAgentOrchestrator:
         self._exec_runtime = exec_runtime
         self._exec_approval_store = exec_approval_store
         self._controlled_exec_require_approval = bool(controlled_exec_require_approval)
+        self._controlled_exec_command_rules = [
+            dict(rule) for rule in (controlled_exec_command_rules or []) if isinstance(rule, dict)
+        ]
+        self._controlled_exec_allowed_env_vars = [
+            str(item) for item in (controlled_exec_allowed_env_vars or []) if str(item).strip()
+        ]
+        self._controlled_exec_default_shell = str(controlled_exec_default_shell or "auto").strip() or "auto"
         self._run_policy: dict[str, Any] = {}
         self._deadline_monotonic: float | None = None
         self._latest_checkpoint: dict[str, Any] = {}
@@ -2234,6 +2244,9 @@ class MultiAgentOrchestrator:
             exec_runtime=self._exec_runtime,
             exec_approval_store=self._exec_approval_store,
             require_approval=self._controlled_exec_require_approval,
+            command_rules=self._controlled_exec_command_rules,
+            allowed_env_vars=self._controlled_exec_allowed_env_vars,
+            default_shell=self._controlled_exec_default_shell,
         )
         _raw_candidates, artifacts = await coordinator.run(
             task_input=task_input,
@@ -2278,6 +2291,9 @@ class MultiAgentOrchestrator:
             exec_runtime=self._exec_runtime,
             exec_approval_store=self._exec_approval_store,
             require_approval=self._controlled_exec_require_approval,
+            command_rules=self._controlled_exec_command_rules,
+            allowed_env_vars=self._controlled_exec_allowed_env_vars,
+            default_shell=self._controlled_exec_default_shell,
         )
         raw_candidates, protocol_artifacts = await coordinator.run(
             task_input=task_input,
@@ -3838,11 +3854,11 @@ def _build_subagent_runtime_artifact(invocations: list[dict[str, Any]]) -> dict[
     ]
     risky_tool_names = {
         "exec_command",
-        "shell",
         "execute_code",
         "execute_code_v2",
         "file_write",
         "file_edit",
+        "apply_patch",
         "write_stdin",
         "kill_session",
         "process_stop",

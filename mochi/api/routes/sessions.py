@@ -32,6 +32,7 @@ class UpdateSessionRequest(BaseModel):
 
     title: str | None = None
     workflow: dict[str, object] | None = None
+    security_override: dict[str, object] | None = None
 
 
 class UpdateSessionProjectRequest(BaseModel):
@@ -85,6 +86,7 @@ async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]
                 "updated_at": updated_at,
                 "project_id": _session_project_id(events),
                 "workflow": _session_workflow_state(events),
+                "security_override": _session_security_override(events),
             }
         )
 
@@ -151,6 +153,30 @@ def _session_workflow_state(events: list[dict]) -> dict[str, object] | None:
         workflow = event.get("workflow")
         if isinstance(workflow, dict):
             return dict(workflow)
+    return None
+
+
+def _normalize_session_security_override(
+    value: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    autonomy_mode = value.get("autonomy_mode")
+    if autonomy_mode not in {"strict", "trusted_workspace", "auto_review", "high_autonomy"}:
+        return None
+    return {"autonomy_mode": str(autonomy_mode)}
+
+
+def _session_security_override(events: list[dict]) -> dict[str, object] | None:
+    """Resolve latest security override from metadata events."""
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "security_override_updated":
+            continue
+        override = event.get("security_override")
+        if isinstance(override, dict):
+            return _normalize_session_security_override(dict(override))
     return None
 
 
@@ -338,6 +364,7 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "workflow": _session_workflow_state(events),
+        "security_override": _session_security_override(events),
         "events": events,
     }
 
@@ -369,6 +396,7 @@ async def rewrite_session_from_turn(
         "title": _session_title(session_id, rewritten),
         "project_id": _session_project_id(rewritten),
         "workflow": _session_workflow_state(rewritten),
+        "security_override": _session_security_override(rewritten),
         "events": rewritten,
     }
 
@@ -396,6 +424,7 @@ async def append_session_events(
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "workflow": _session_workflow_state(events),
+        "security_override": _session_security_override(events),
         "events": events,
     }
 
@@ -409,8 +438,11 @@ async def update_session(
     """更新 session 顯示 metadata。"""
     title = payload.title.strip() if isinstance(payload.title, str) else None
     workflow = dict(payload.workflow) if isinstance(payload.workflow, dict) else None
-    if title is None and workflow is None:
-        raise HTTPException(status_code=422, detail="title or workflow is required")
+    security_override = _normalize_session_security_override(
+        dict(payload.security_override) if isinstance(payload.security_override, dict) else None
+    )
+    if title is None and workflow is None and security_override is None:
+        raise HTTPException(status_code=422, detail="title, workflow, or security_override is required")
     if title is not None and not title:
         raise HTTPException(status_code=422, detail="title must not be empty")
 
@@ -443,6 +475,17 @@ async def update_session(
                 "timestamp": now,
             },
         )
+    if security_override is not None:
+        await store.save_event(
+            session_id,
+            {
+                "type": "session_meta",
+                "event": "security_override_updated",
+                "session_id": session_id,
+                "security_override": security_override,
+                "timestamp": now,
+            },
+        )
     events = await store.load_session(session_id)
     return {
         "type": "session",
@@ -450,6 +493,7 @@ async def update_session(
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "workflow": _session_workflow_state(events),
+        "security_override": _session_security_override(events),
         "events": events,
     }
 

@@ -2,96 +2,34 @@
 
 from __future__ import annotations
 
-import re
-import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-CommandSecurityAction = Literal["allow", "ask", "deny"]
-
-_SHELL_CHAINING_RE = re.compile(r"(\|\||&&|[|;`])")
-_SHELL_REDIRECTION_RE = re.compile(r"(?:^|[\s])(?:>|>>|<|<<|<<<|\d>&\d|\d>|\d<)")
-_SUBSHELL_RE = re.compile(r"(\$\(|\$\{|\(\s*[^)]*\)\s*$)")
-_HEREDOC_RE = re.compile(r"(<<[-~]?\s*['\"]?[A-Za-z0-9_]+['\"]?)")
-_ENV_OVERRIDE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_POWERSHELL_ENV_ASSIGN_RE = re.compile(r"^\$env:([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
-_SENSITIVE_PATH_RE = re.compile(
-    r"(?i)(?:\b|[/\\])(?:\.git|\.ssh|\.aws|\.gnupg|\.kube|system32|etc/passwd|id_rsa|id_ed25519)(?:\b|[/\\])"
+from mochi.utils.command_path_policy import classify_path_risks
+from mochi.utils.command_policy_rules import (
+    DISALLOWED_INTERPRETERS,
+    ENV_OVERRIDE_RE,
+    HEREDOC_RE,
+    INTERPRETER_INLINE_EVAL,
+    PATH_ENV_KEYS,
+    POWERSHELL_BLOCKED_CMDLETS,
+    POWERSHELL_ENV_ASSIGN_RE,
+    POWERSHELL_READ_ONLY_CMDLETS,
+    SHELL_CHAINING_RE,
+    SHELL_REDIRECTION_RE,
+    SUBSHELL_RE,
+    WINDOWS_BLOCKED_CMD_PAYLOADS,
+    WINDOWS_READ_ONLY_COMMANDS,
+    contains_unquoted_operator,
+    command_rule_matches,
+    extract_powershell_payload,
+    normalize_command_name,
+    split_powershell_pipeline,
+    tokenize_command,
 )
-_ABS_PATH_RE = re.compile(r"(?i)^[A-Z]:[/\\]|^/|^~[/\\]|^\\\\")
-_INTERPRETER_INLINE_EVAL = {
-    "python": {"-c"},
-    "python3": {"-c"},
-    "py": {"-c"},
-    "node": {"-e", "--eval"},
-    "deno": {"eval"},
-    "ruby": {"-e"},
-    "perl": {"-e"},
-    "php": {"-r"},
-    "bash": {"-c"},
-    "sh": {"-c"},
-    "zsh": {"-c"},
-    "fish": {"-c"},
-}
-_DISALLOWED_INTERPRETERS = {
-    "python",
-    "python3",
-    "py",
-    "node",
-    "deno",
-    "bash",
-    "sh",
-    "pwsh",
-    "powershell",
-    "cmd",
-    "npx",
-    "npm",
-    "yarn",
-    "pnpm",
-    "curl",
-    "wget",
-    "ssh",
-    "perl",
-    "ruby",
-    "php",
-}
-_PATH_ENV_KEYS = {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "PATHEXT"}
 
-
-def _normalize_cmd_name(raw: str) -> str:
-    return Path(raw.strip()).name.lower()
-
-
-def _tokenize(command: str) -> list[str]:
-    return shlex.split(command, posix=True)
-
-
-def _allowlist_entry_matches_tokens(entry: str, tokens: list[str]) -> bool:
-    if not entry.strip():
-        return False
-    try:
-        entry_tokens = _tokenize(entry.strip())
-    except ValueError:
-        entry_tokens = entry.strip().split()
-    if not entry_tokens or len(tokens) < len(entry_tokens):
-        return False
-    normalized_entry = [_normalize_cmd_name(entry_tokens[0]), *[part.lower() for part in entry_tokens[1:]]]
-    normalized_tokens = [_normalize_cmd_name(tokens[0]), *[part.lower() for part in tokens[1: len(entry_tokens)]]]
-    return normalized_entry == normalized_tokens
-
-
-def _looks_like_path(token: str) -> bool:
-    normalized = token.strip().strip("\"'")
-    if not normalized:
-        return False
-    if normalized in {".", ".."}:
-        return False
-    if _ABS_PATH_RE.match(normalized):
-        return True
-    if "/" in normalized or "\\" in normalized:
-        return True
-    return False
+CommandSecurityAction = Literal["allow", "ask", "deny"]
 
 
 @dataclass(frozen=True)
@@ -104,18 +42,28 @@ class CommandSecurityResult:
     parsed_tokens: tuple[str, ...] = ()
 
 
+def _with_parsed_tokens(
+    result: CommandSecurityResult,
+    *,
+    tokens: list[str],
+) -> CommandSecurityResult:
+    if result.parsed_tokens:
+        return result
+    return replace(result, parsed_tokens=tuple(tokens))
+
+
 class CommandSecurityPolicy:
     """Classify command strings into allow/ask/deny decisions."""
 
     def __init__(
         self,
         *,
-        allowlist: list[str] | None = None,
+        command_rules: list[dict[str, object]] | None = None,
         workspace_dir: str | Path | None = None,
         allowed_env_vars: list[str] | None = None,
         allow_dangerous_interpreters: bool = False,
     ) -> None:
-        self._allowlist = allowlist or []
+        self._command_rules = [dict(item) for item in (command_rules or []) if isinstance(item, dict)]
         self._workspace = Path(workspace_dir).expanduser().resolve(strict=False) if workspace_dir else None
         self._allowed_env_vars = {item.upper() for item in (allowed_env_vars or []) if item}
         self._allow_dangerous_interpreters = allow_dangerous_interpreters
@@ -129,7 +77,7 @@ class CommandSecurityPolicy:
                 rule_id="empty_command",
             )
 
-        if _HEREDOC_RE.search(stripped):
+        if HEREDOC_RE.search(stripped):
             return CommandSecurityResult(
                 action="deny",
                 reason="Heredoc-like command input is not allowed.",
@@ -137,7 +85,7 @@ class CommandSecurityPolicy:
             )
 
         try:
-            tokens = _tokenize(stripped)
+            tokens = tokenize_command(stripped)
         except ValueError:
             return CommandSecurityResult(
                 action="deny",
@@ -151,66 +99,70 @@ class CommandSecurityPolicy:
                 rule_id="empty_command",
             )
 
-        program = _normalize_cmd_name(tokens[0])
-        cmd_result = self._classify_cmd(tokens=tokens, program=program)
-        if cmd_result is not None:
-            return cmd_result
+        program = normalize_command_name(tokens[0])
 
-        if _SHELL_CHAINING_RE.search(stripped) or _SHELL_REDIRECTION_RE.search(stripped):
+        cmd_result = self._classify_cmd(tokens=tokens, shell=shell, program=program)
+        if cmd_result is not None:
+            return _with_parsed_tokens(cmd_result, tokens=tokens)
+
+        env_result = self._classify_env_overrides(tokens=tokens, env=env)
+        if env_result is not None:
+            return _with_parsed_tokens(env_result, tokens=tokens)
+
+        interpreter_result = self._classify_interpreter_risks(tokens=tokens, program=program)
+        if interpreter_result is not None:
+            return _with_parsed_tokens(interpreter_result, tokens=tokens)
+
+        ps_result = self._classify_powershell(
+            command=stripped,
+            tokens=tokens,
+            shell=shell,
+            program=program,
+        )
+        if ps_result is not None:
+            return _with_parsed_tokens(ps_result, tokens=tokens)
+
+        if SHELL_CHAINING_RE.search(stripped) or SHELL_REDIRECTION_RE.search(stripped):
             return CommandSecurityResult(
                 action="deny",
                 reason="Shell chaining or redirection syntax is not allowed.",
                 rule_id="shell_chaining",
+                parsed_tokens=tuple(tokens),
             )
 
-        if _SUBSHELL_RE.search(stripped):
+        if SUBSHELL_RE.search(stripped):
             return CommandSecurityResult(
                 action="deny",
                 reason="Subshell or command-substitution syntax is not allowed.",
                 rule_id="subshell",
+                parsed_tokens=tuple(tokens),
             )
-
-        env_result = self._classify_env_overrides(tokens=tokens, env=env)
-        if env_result is not None:
-            return env_result
-
-        interpreter_result = self._classify_interpreter_risks(tokens=tokens, program=program)
-        if interpreter_result is not None:
-            return interpreter_result
-
-        ps_result = self._classify_powershell(tokens=tokens, shell=shell, program=program)
-        if ps_result is not None:
-            return ps_result
 
         path_result = self._classify_path_risks(tokens=tokens)
         if path_result is not None:
-            return path_result
+            return _with_parsed_tokens(path_result, tokens=tokens)
 
-        if self._allowlist and not any(
-            _allowlist_entry_matches_tokens(entry, tokens)
-            for entry in self._allowlist
-            if isinstance(entry, str)
-        ):
+        if self._matches_persisted_rule(tokens=tokens, shell=shell):
             return CommandSecurityResult(
-                action="deny",
-                reason="Command denied by allowlist policy.",
-                rule_id="allowlist",
+                action="allow",
+                reason="Command is allowed by a persisted command rule.",
+                rule_id="persisted_command_rule",
                 parsed_tokens=tuple(tokens),
             )
 
         return CommandSecurityResult(
-            action="allow",
-            reason="Command is allowed by security policy.",
-            rule_id="allow",
+            action="ask",
+            reason="Command requires approval because it is not covered by a read-only policy or persisted command rule.",
+            rule_id="unknown_requires_approval",
             parsed_tokens=tuple(tokens),
         )
 
     def _classify_env_overrides(self, *, tokens: list[str], env: dict[str, str] | None) -> CommandSecurityResult | None:
         for token in tokens:
-            if not _ENV_OVERRIDE_RE.match(token):
+            if not ENV_OVERRIDE_RE.match(token):
                 break
             key = token.split("=", 1)[0].upper()
-            if key in _PATH_ENV_KEYS:
+            if key in PATH_ENV_KEYS:
                 return CommandSecurityResult(
                     action="deny",
                     reason=f"{key} override is not allowed.",
@@ -224,10 +176,10 @@ class CommandSecurityPolicy:
                 )
 
         for token in tokens:
-            env_match = _POWERSHELL_ENV_ASSIGN_RE.match(token)
+            env_match = POWERSHELL_ENV_ASSIGN_RE.match(token)
             if env_match:
                 key = env_match.group(1).upper()
-                if key in _PATH_ENV_KEYS:
+                if key in PATH_ENV_KEYS:
                     return CommandSecurityResult(
                         action="deny",
                         reason=f"{key} override is not allowed.",
@@ -243,7 +195,7 @@ class CommandSecurityPolicy:
         if isinstance(env, dict):
             for key in env:
                 upper_key = str(key).upper()
-                if upper_key in _PATH_ENV_KEYS:
+                if upper_key in PATH_ENV_KEYS:
                     return CommandSecurityResult(
                         action="deny",
                         reason=f"{upper_key} override is not allowed.",
@@ -259,16 +211,16 @@ class CommandSecurityPolicy:
         return None
 
     def _classify_interpreter_risks(self, *, tokens: list[str], program: str) -> CommandSecurityResult | None:
-        if program in _INTERPRETER_INLINE_EVAL:
+        if program in INTERPRETER_INLINE_EVAL:
             for token in tokens[1:]:
-                if token in _INTERPRETER_INLINE_EVAL[program]:
+                if token in INTERPRETER_INLINE_EVAL[program]:
                     return CommandSecurityResult(
                         action="deny",
                         reason="Inline interpreter eval is not allowed.",
                         rule_id="interpreter_inline_eval",
                     )
 
-        if program in _DISALLOWED_INTERPRETERS and not self._allow_dangerous_interpreters:
+        if program in DISALLOWED_INTERPRETERS and not self._allow_dangerous_interpreters:
             return CommandSecurityResult(
                 action="deny",
                 reason="Command matched a protected shell policy.",
@@ -276,8 +228,8 @@ class CommandSecurityPolicy:
             )
         return None
 
-    def _classify_powershell(self, *, tokens: list[str], shell: str | None, program: str) -> CommandSecurityResult | None:
-        shell_name = _normalize_cmd_name(shell) if shell else ""
+    def _classify_powershell(self, *, command: str, tokens: list[str], shell: str | None, program: str) -> CommandSecurityResult | None:
+        shell_name = normalize_command_name(shell) if shell else ""
         is_powershell = program in {"pwsh", "powershell"} or shell_name in {"pwsh", "powershell"}
         if not is_powershell:
             return None
@@ -297,9 +249,102 @@ class CommandSecurityPolicy:
                     reason="PowerShell encoded command is not allowed.",
                     rule_id="powershell_encoded_command",
                 )
-        return None
 
-    def _classify_cmd(self, *, tokens: list[str], program: str) -> CommandSecurityResult | None:
+        payload_tokens, payload = extract_powershell_payload(command, tokens)
+        if not payload_tokens:
+            return CommandSecurityResult(
+                action="deny",
+                reason="Interactive PowerShell sessions are not allowed.",
+                rule_id="powershell_interactive_session",
+            )
+        if HEREDOC_RE.search(payload):
+            return CommandSecurityResult(
+                action="deny",
+                reason="Heredoc-like command input is not allowed.",
+                rule_id="heredoc",
+            )
+        if contains_unquoted_operator(payload, ("&&", "||", ";"), escape_char="`"):
+            return CommandSecurityResult(
+                action="deny",
+                reason="PowerShell chaining syntax is not allowed.",
+                rule_id="powershell_chaining",
+            )
+        if SHELL_REDIRECTION_RE.search(payload):
+            return CommandSecurityResult(
+                action="deny",
+                reason="PowerShell redirection syntax is not allowed.",
+                rule_id="powershell_redirection",
+            )
+        if SUBSHELL_RE.search(payload):
+            return CommandSecurityResult(
+                action="deny",
+                reason="Subshell or command-substitution syntax is not allowed.",
+                rule_id="subshell",
+            )
+
+        segments = split_powershell_pipeline(payload)
+        if not segments:
+            return CommandSecurityResult(
+                action="deny",
+                reason="Interactive PowerShell sessions are not allowed.",
+                rule_id="powershell_interactive_session",
+            )
+
+        requires_approval_for_segment: str | None = None
+        for segment in segments:
+            try:
+                segment_tokens = tokenize_command(segment)
+            except ValueError:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason="PowerShell command could not be parsed safely.",
+                    rule_id="parse_error",
+                )
+            if not segment_tokens:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason="PowerShell pipeline contains an empty segment.",
+                    rule_id="powershell_empty_segment",
+                )
+            segment_program = normalize_command_name(segment_tokens[0])
+            if segment_program in POWERSHELL_BLOCKED_CMDLETS:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason=f"PowerShell command is blocked by policy: {segment_tokens[0]}.",
+                    rule_id="powershell_blocked_cmdlet",
+                )
+            if segment_program in DISALLOWED_INTERPRETERS:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason=f"PowerShell command is blocked by policy: {segment_tokens[0]}.",
+                    rule_id="powershell_blocked_spawn",
+                )
+            path_result = self._classify_path_risks(tokens=segment_tokens)
+            if path_result is not None:
+                return path_result
+            if segment_program not in POWERSHELL_READ_ONLY_CMDLETS:
+                requires_approval_for_segment = requires_approval_for_segment or segment_tokens[0]
+
+        if self._matches_persisted_rule(tokens=tokens, shell=shell):
+            return CommandSecurityResult(
+                action="allow",
+                reason="Command is allowed by a persisted command rule.",
+                rule_id="persisted_command_rule",
+            )
+        if requires_approval_for_segment is not None:
+            return CommandSecurityResult(
+                action="ask",
+                reason=f"PowerShell command requires approval: {requires_approval_for_segment}.",
+                rule_id="powershell_requires_approval",
+            )
+
+        return CommandSecurityResult(
+            action="allow",
+            reason="Read-only PowerShell command is allowed by security policy.",
+            rule_id="powershell_read_only",
+        )
+
+    def _classify_cmd(self, *, tokens: list[str], shell: str | None, program: str) -> CommandSecurityResult | None:
         if program != "cmd":
             return None
         lowered = [token.lower() for token in tokens]
@@ -311,59 +356,73 @@ class CommandSecurityPolicy:
                     reason="cmd /c payload must not be empty.",
                     rule_id="cmd_empty_payload",
                 )
-            if _SHELL_CHAINING_RE.search(tail) or _SHELL_REDIRECTION_RE.search(tail):
+            if SHELL_CHAINING_RE.search(tail) or SHELL_REDIRECTION_RE.search(tail):
                 return CommandSecurityResult(
                     action="deny",
                     reason="cmd /c with chained or redirected payload is not allowed.",
                     rule_id="cmd_high_risk_chaining",
                 )
+            try:
+                payload_tokens = tokenize_command(tail)
+            except ValueError:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason="cmd /c payload could not be parsed safely.",
+                    rule_id="parse_error",
+                )
+            if not payload_tokens:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason="cmd /c payload must not be empty.",
+                    rule_id="cmd_empty_payload",
+                )
+            payload_program = normalize_command_name(payload_tokens[0])
+            if payload_program in WINDOWS_BLOCKED_CMD_PAYLOADS:
+                return CommandSecurityResult(
+                    action="deny",
+                    reason=f"cmd /c payload is blocked by policy: {payload_tokens[0]}.",
+                    rule_id="cmd_blocked_payload",
+                )
+            path_result = self._classify_path_risks(tokens=payload_tokens)
+            if path_result is not None:
+                return path_result
+            if self._matches_persisted_rule(tokens=tokens, shell=shell):
+                return CommandSecurityResult(
+                    action="allow",
+                    reason="Command is allowed by a persisted command rule.",
+                    rule_id="persisted_command_rule",
+                )
+            if payload_program in WINDOWS_READ_ONLY_COMMANDS:
+                return CommandSecurityResult(
+                    action="allow",
+                    reason="Read-only cmd /c command is allowed by security policy.",
+                    rule_id="cmd_read_only",
+                )
             return CommandSecurityResult(
                 action="ask",
-                reason="cmd /c execution requires approval.",
+                reason=f"cmd /c command requires approval: {payload_tokens[0]}.",
                 rule_id="cmd_c_requires_approval",
             )
         return None
 
     def _classify_path_risks(self, *, tokens: list[str]) -> CommandSecurityResult | None:
-        if any(_SENSITIVE_PATH_RE.search(token) for token in tokens):
-            return CommandSecurityResult(
-                action="deny",
-                reason="Command references a sensitive path.",
-                rule_id="sensitive_path",
-            )
-
-        if self._workspace is None:
+        path_result = classify_path_risks(tokens, workspace_dir=self._workspace)
+        if path_result is None:
             return None
+        return CommandSecurityResult(
+            action="deny",
+            reason=path_result.reason,
+            rule_id=path_result.rule_id,
+        )
 
-        for token in tokens[1:]:
-            if not _looks_like_path(token):
-                continue
-            normalized = token.strip().strip("\"'")
-            if normalized.startswith("..") or "/../" in normalized.replace("\\", "/"):
-                return CommandSecurityResult(
-                    action="deny",
-                    reason="Command attempts to escape workspace boundaries.",
-                    rule_id="workspace_escape",
-                )
-            candidate = Path(normalized).expanduser()
-            if not candidate.is_absolute():
-                candidate = self._workspace / candidate
-            resolved = candidate.resolve(strict=False)
-            try:
-                resolved.relative_to(self._workspace)
-            except ValueError:
-                return CommandSecurityResult(
-                    action="deny",
-                    reason="Command path is outside the workspace.",
-                    rule_id="workspace_escape",
-                )
-        return None
+    def _matches_persisted_rule(self, *, tokens: list[str], shell: str | None) -> bool:
+        return any(command_rule_matches(rule, tokens, shell) for rule in self._command_rules)
 
 
 def classify_command(
     command: str,
     *,
-    allowlist: list[str] | None = None,
+    command_rules: list[dict[str, object]] | None = None,
     shell: str | None = None,
     workspace_dir: str | Path | None = None,
     env: dict[str, str] | None = None,
@@ -372,7 +431,7 @@ def classify_command(
 ) -> CommandSecurityResult:
     """Convenience helper for one-shot command classification."""
     policy = CommandSecurityPolicy(
-        allowlist=allowlist,
+        command_rules=command_rules,
         workspace_dir=workspace_dir,
         allowed_env_vars=allowed_env_vars,
         allow_dangerous_interpreters=allow_dangerous_interpreters,

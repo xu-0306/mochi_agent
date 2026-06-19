@@ -170,7 +170,14 @@ class OpenAICompatConfig(BaseModel):
     api_key: SecretStr | None = None
     """遠端 API key（敏感資料）。"""
 
-    provider: Literal["openai_compat", "gemini", "anthropic", "vllm"] = "openai_compat"
+    provider: Literal[
+        "openai_compat",
+        "gemini",
+        "anthropic",
+        "vllm",
+        "sglang",
+        "tensorrt_llm",
+    ] = "openai_compat"
     """UI/provider preset；底層目前皆走 OpenAI-compatible protocol。"""
 
     timeout: float = 120.0
@@ -261,7 +268,17 @@ class ConfiguredModelConfig(BaseModel):
     id: str = Field(min_length=1)
     """模型清單項目的穩定識別碼；可由 `/v1/models/switch` 使用。"""
 
-    provider: Literal["ollama", "openai_compat", "openai_codex", "gemini", "anthropic", "vllm", "local"]
+    provider: Literal[
+        "ollama",
+        "openai_compat",
+        "openai_codex",
+        "gemini",
+        "anthropic",
+        "vllm",
+        "sglang",
+        "tensorrt_llm",
+        "local",
+    ]
     """模型供應商 preset。"""
 
     model: str = Field(min_length=1)
@@ -654,20 +671,33 @@ class InferencePreset(BaseModel):
     """Repeat penalty。"""
 
 
+class CommandRuleConfig(BaseModel):
+    """Persisted exec command rule."""
+
+    tokens: list[str] = Field(min_length=1)
+    decision: Literal["allow"] = "allow"
+    match: Literal["exact", "prefix"] = "prefix"
+    shells: list[Literal["bash", "sh", "pwsh", "powershell", "cmd"]] = Field(
+        default_factory=lambda: _empty_list_typed(str)
+    )
+
+
 class SecurityConfig(BaseModel):
     """安全設定。"""
 
     autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] = "trusted_workspace"
     """Autonomy preset mapped to runtime approval behavior."""
 
-    require_approval_for_shell: bool = True
-    """執行 Shell 命令前是否需要使用者確認。"""
-
     require_approval_for_file_write: bool = False
     """寫入檔案前是否需要使用者確認。"""
 
     require_approval_for_exec: bool = True
     """Exec runtime 命令是否預設需要顯式審批。"""
+
+    command_rules: list[CommandRuleConfig] = Field(
+        default_factory=lambda: _empty_list_typed(CommandRuleConfig)
+    )
+    """Persisted explicit exec command rules."""
 
     agent_run_default_max_wall_clock_sec: int | None = Field(default=None, ge=1, le=86_400)
     """Default agent-run wall-clock guard. `None` disables the default deadline."""
@@ -699,11 +729,6 @@ class SecurityConfig(BaseModel):
     exec_default_timeout_sec: int = Field(default=30, ge=1, le=86_400)
     """Exec runtime 預設 timeout（秒）。"""
 
-    shell_command_allowlist: list[str] = Field(
-        default_factory=lambda: ["ls", "cat", "pwd", "echo", "date", "which"]
-    )
-    """無需確認可直接執行的 Shell 命令白名單。"""
-
     max_file_write_size_mb: float = 10.0
     """允許寫入的最大檔案大小（MB）。"""
 
@@ -720,46 +745,51 @@ class SecurityConfig(BaseModel):
         """??舐?蝚砍??怠?autonomy mode??"""
         if not isinstance(value, dict):
             return value
-        if "autonomy_mode" in value:
-            autonomy_mode = value.get("autonomy_mode")
+        normalized = dict(value)
+        legacy_shell_approval = normalized.pop("require_approval_for_shell", None)
+        normalized.pop("shell_command_allowlist", None)
+        if "require_approval_for_exec" not in normalized and isinstance(legacy_shell_approval, bool):
+            normalized["require_approval_for_exec"] = legacy_shell_approval
+        if "autonomy_mode" in normalized:
+            autonomy_mode = normalized.get("autonomy_mode")
             if isinstance(autonomy_mode, str):
                 mode_defaults = autonomy_mode_defaults(autonomy_mode)
                 return {
                     **{key: default for key, default in mode_defaults.items() if key != "autonomy_mode"},
-                    **value,
+                    **normalized,
                 }
-            return value
+            return normalized
 
         relevant_keys = {
-            "require_approval_for_shell",
+            "require_approval_for_exec",
             "require_approval_for_file_write",
             "file_ops_scope",
         }
-        if not any(key in value for key in relevant_keys):
-            return value
+        if not any(key in normalized for key in relevant_keys):
+            return normalized
 
-        require_shell = bool(
-            value.get(
-                "require_approval_for_shell",
-                cls.model_fields["require_approval_for_shell"].default,
+        require_exec = bool(
+            normalized.get(
+                "require_approval_for_exec",
+                cls.model_fields["require_approval_for_exec"].default,
             )
         )
         require_file_write = bool(
-            value.get(
+            normalized.get(
                 "require_approval_for_file_write",
                 cls.model_fields["require_approval_for_file_write"].default,
             )
         )
         file_ops_scope = str(
-            value.get(
+            normalized.get(
                 "file_ops_scope",
                 cls.model_fields["file_ops_scope"].default,
             )
         )
         return {
-            **value,
+            **normalized,
             "autonomy_mode": infer_autonomy_mode(
-                require_approval_for_shell=require_shell,
+                require_approval_for_exec=require_exec,
                 require_approval_for_file_write=require_file_write,
                 file_ops_scope=file_ops_scope,
             ),

@@ -42,7 +42,7 @@ class ToolExecutionContext:
     permission_policy: dict[str, Any] = field(default_factory=dict)
     read_state_cache: dict[str, FileReadState] = field(default_factory=dict)
     tool_result_store_dir: str | None = None
-    tool_result_references: dict[str, str] = field(default_factory=dict)
+    tool_result_references: dict[str, dict[str, Any]] = field(default_factory=dict)
     transport_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     state: dict[str, Any] = field(default_factory=dict)
     progress_callback: Any | None = None
@@ -95,6 +95,10 @@ class BaseTool(ABC):
         return None
 
     @property
+    def allow_plain_text_result_for_model(self) -> bool:
+        return False
+
+    @property
     def tool_capabilities(self) -> dict[str, Any]:
         """Internal planner/search metadata for capability-aware routing."""
         return {
@@ -134,6 +138,9 @@ class BaseTool(ABC):
         max_chars: int = 2000,
     ) -> str:
         """Serialize tool output for model reinjection."""
+        if self._should_preserve_plain_text_result(result=result, max_chars=max_chars):
+            return str(result.output)
+
         if result.error:
             payload: dict[str, Any] = {"ok": False, "error": result.error}
         else:
@@ -194,3 +201,18 @@ class BaseTool(ABC):
         if max_chars <= len(suffix):
             return suffix[:max_chars]
         return value[: max_chars - len(suffix)] + suffix
+
+    def _should_preserve_plain_text_result(
+        self,
+        *,
+        result: ToolResult,
+        max_chars: int,
+    ) -> bool:
+        output = result.output
+        if result.error is not None or not isinstance(output, str):
+            return False
+        if not self.is_read_only or not self.allow_plain_text_result_for_model:
+            return False
+        if not output.strip() or len(output) > max_chars:
+            return False
+        return True
