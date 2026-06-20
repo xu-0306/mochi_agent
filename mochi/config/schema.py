@@ -306,6 +306,9 @@ class ConfiguredModelConfig(BaseModel):
     auth_mode: Literal["none", "api_key", "oauth"] | None = None
     """Auth mode metadata for the configured model entry."""
 
+    api_key: SecretStr | None = None
+    """Per-model API key for remote providers. Never expose this through API payloads."""
+
 
 class ModelSetupConfig(BaseModel):
     """模型首次啟動與 provider-aware setup metadata。"""

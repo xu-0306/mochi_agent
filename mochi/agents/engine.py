@@ -151,11 +151,7 @@ class AgentEngine:
         self._router = BackendRouter(
             ollama_base_url=config.ollama.base_url,
             openai_default_model=config.openai_compat.model,
-            openai_api_key=(
-                config.openai_compat.api_key.get_secret_value()
-                if config.openai_compat.api_key is not None
-                else ""
-            ),
+            openai_api_key=self._resolve_active_openai_compat_api_key(config),
             openai_codex_default_model=config.openai_codex.model,
             openai_codex_access_token=(
                 self._resolve_openai_codex_access_token(config.openai_codex.auth_profile_id)
@@ -950,11 +946,7 @@ class AgentEngine:
                 api_key=(
                     self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
                     if active_remote_provider == "openai_codex"
-                    else (
-                        self._config.openai_compat.api_key.get_secret_value()
-                        if self._config.openai_compat.api_key is not None
-                        else ""
-                    )
+                    else self._resolve_active_openai_compat_api_key(self._config)
                 ),
             ).get_model_info()
         except (RuntimeError, ValueError):
@@ -1002,11 +994,7 @@ class AgentEngine:
             api_key=(
                 self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
                 if active_remote_provider == "openai_codex"
-                else (
-                    self._config.openai_compat.api_key.get_secret_value()
-                    if self._config.openai_compat.api_key is not None
-                    else ""
-                )
+                else self._resolve_active_openai_compat_api_key(self._config)
             ),
         )
         try:
@@ -1109,6 +1097,75 @@ class AgentEngine:
         self._initialized = True
         return backend.get_model_info()
 
+    async def test_model_connection(
+        self,
+        *,
+        provider: Literal[
+            "ollama",
+            "openai_compat",
+            "openai_codex",
+            "gemini",
+            "anthropic",
+            "vllm",
+            "sglang",
+            "tensorrt_llm",
+            "local",
+        ],
+        model: str,
+        base_url: str | None = None,
+        api_key: str = "",
+        auth_profile_id: str | None = None,
+    ) -> ModelInfo:
+        """Validate a model connection without switching the active backend."""
+        normalized_model = model.strip()
+        if not normalized_model:
+            raise RuntimeError("Model must not be empty.")
+
+        if provider == "local":
+            backend = await self._router.acquire_temporary_backend(
+                model_spec=normalized_model,
+            )
+        elif provider == "ollama":
+            normalized_base_url = (base_url or self._config.ollama.base_url).strip().rstrip("/")
+            backend = await self._router.acquire_temporary_backend(
+                model_spec=f"ollama:{normalized_model}",
+                model_name=normalized_model,
+                base_url=normalized_base_url,
+            )
+        elif provider == "openai_codex":
+            auth_service = self._openai_codex_auth_service()
+            resolved_profile_id = auth_service.resolve_profile_id(auth_profile_id)
+            if resolved_profile_id is None:
+                raise RuntimeError("No OpenAI Codex auth profile is available.")
+            normalized_base_url = normalize_openai_codex_base_url(
+                base_url or self._config.openai_codex.base_url or OPENAI_CODEX_DEFAULT_BASE_URL
+            )
+            access_token = self._resolve_openai_codex_access_token(resolved_profile_id)
+            backend = await self._router.acquire_temporary_backend(
+                model_spec=normalized_base_url,
+                model_name=normalized_model,
+                provider="openai_codex",
+                base_url=normalized_base_url,
+                api_key=access_token,
+                auth_profile_id=resolved_profile_id,
+            )
+        else:
+            normalized_base_url = (base_url or self._config.openai_compat.base_url).strip().rstrip("/")
+            if not normalized_base_url:
+                raise RuntimeError("OpenAI-compatible base_url must not be empty.")
+            backend = await self._router.acquire_temporary_backend(
+                model_spec=normalized_base_url,
+                model_name=normalized_model,
+                provider=provider,
+                base_url=normalized_base_url,
+                api_key=api_key,
+            )
+
+        try:
+            return backend.get_model_info()
+        finally:
+            await backend.close()
+
     async def list_skills(self) -> list:
         """列出目前技能庫中的技能。"""
         await self._sync_filesystem_skills()
@@ -1166,11 +1223,7 @@ class AgentEngine:
         self._router.apply_settings(
             ollama_base_url=config.ollama.base_url,
             openai_default_model=config.openai_compat.model,
-            openai_api_key=(
-                config.openai_compat.api_key.get_secret_value()
-                if config.openai_compat.api_key is not None
-                else ""
-            ),
+            openai_api_key=self._resolve_active_openai_compat_api_key(config),
             openai_codex_default_model=config.openai_codex.model,
             openai_codex_access_token=(
                 self._resolve_openai_codex_access_token(config.openai_codex.auth_profile_id)
@@ -2278,32 +2331,93 @@ class AgentEngine:
                 return model
         return None
 
+    def _find_active_configured_model(self, config: MochiConfig | None = None) -> ConfiguredModelConfig | None:
+        current = config or self._config
+        for model in current.model_setup.configured_models:
+            if model.provider == "ollama":
+                if (
+                    current.model == model.model_spec
+                    and current.ollama.base_url.rstrip("/") == (model.base_url or current.ollama.base_url).rstrip("/")
+                ):
+                    return model
+                continue
+            if model.provider == "local":
+                if current.model == model.model_spec:
+                    return model
+                continue
+            if model.provider == "openai_codex":
+                expected_base_url = (model.base_url or model.model_spec).rstrip("/")
+                if (
+                    current.model.rstrip("/") == expected_base_url
+                    and current.openai_codex.base_url.rstrip("/") == expected_base_url
+                    and current.openai_codex.model == model.model
+                    and current.openai_codex.auth_profile_id == model.auth_profile_id
+                ):
+                    return model
+                continue
+
+            expected_model_spec = model.model_spec.rstrip("/")
+            expected_base_url = (model.base_url or model.model_spec).rstrip("/")
+            if configured_vllm_launch_mode(model) == "managed":
+                expected_model_spec = managed_vllm_base_url(model.base_url).rstrip("/")
+                expected_base_url = managed_vllm_base_url(model.base_url).rstrip("/")
+            if (
+                current.model.rstrip("/") == expected_model_spec
+                and current.openai_compat.provider == model.provider
+                and current.openai_compat.model == model.model
+                and current.openai_compat.base_url.rstrip("/") == expected_base_url
+            ):
+                return model
+        return None
+
+    def _resolve_configured_model_api_key(
+        self,
+        configured_model: ConfiguredModelConfig,
+        *,
+        config: MochiConfig | None = None,
+        base_url: str | None = None,
+    ) -> str:
+        current = config or self._config
+        if configured_model.api_key is not None:
+            return configured_model.api_key.get_secret_value()
+        if configured_model.provider == "vllm":
+            vllm_api_key = current.vllm.api_key
+            if vllm_api_key is not None:
+                return vllm_api_key.get_secret_value()
+        openai_api_key = current.openai_compat.api_key
+        if openai_api_key is None:
+            return ""
+        normalized_base_url = (base_url or configured_model.base_url or configured_model.model_spec).rstrip("/")
+        if current.openai_compat.provider != configured_model.provider:
+            return ""
+        if current.openai_compat.base_url.rstrip("/") != normalized_base_url:
+            return ""
+        return openai_api_key.get_secret_value()
+
+    def _resolve_active_openai_compat_api_key(self, config: MochiConfig | None = None) -> str:
+        current = config or self._config
+        configured_model = self._find_active_configured_model(current)
+        if configured_model is not None and configured_model.provider not in {"ollama", "local", "openai_codex"}:
+            return self._resolve_configured_model_api_key(configured_model, config=current)
+        openai_api_key = current.openai_compat.api_key
+        if openai_api_key is None:
+            return ""
+        return openai_api_key.get_secret_value()
+
     def _resolve_voice_reply_api_key(
         self,
         *,
         configured_model: ConfiguredModelConfig,
         base_url: str | None,
     ) -> str:
-        normalized_base_url = (base_url or configured_model.base_url or configured_model.model_spec).rstrip("/")
-
         if configured_model.provider == "openai_codex":
             return self._resolve_openai_codex_access_token(
                 configured_model.auth_profile_id or self._config.openai_codex.auth_profile_id
             )
-
-        if configured_model.provider == "vllm":
-            vllm_api_key = self._config.vllm.api_key
-            if vllm_api_key is not None:
-                return vllm_api_key.get_secret_value()
-
-        openai_api_key = self._config.openai_compat.api_key
-        if openai_api_key is None:
-            return ""
-        if self._config.openai_compat.provider != configured_model.provider:
-            return ""
-        if self._config.openai_compat.base_url.rstrip("/") != normalized_base_url:
-            return ""
-        return openai_api_key.get_secret_value()
+        return self._resolve_configured_model_api_key(
+            configured_model,
+            base_url=base_url,
+        )
 
     def _get_or_create_vllm_runtime_manager(self) -> object:
         manager = self._vllm_runtime_manager

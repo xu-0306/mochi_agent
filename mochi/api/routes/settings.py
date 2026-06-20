@@ -495,7 +495,10 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "setup_required": config.model_setup.setup_required,
             "fallback_chain": list(config.model_setup.fallback_chain),
             "configured_models": [
-                model.model_dump()
+                {
+                    **model.model_dump(exclude={"api_key"}),
+                    "api_key_configured": model.api_key is not None,
+                }
                 for model in config.model_setup.configured_models
             ],
         },

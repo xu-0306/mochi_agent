@@ -26,6 +26,7 @@ import {
   createInlineReasoningBuffer,
   extractInlineReasoning,
   finalizeInlineReasoningBuffer,
+  stripReasoningArtifacts,
 } from '@/lib/reasoning'
 import { getReasoningStepSource } from '@/lib/reasoning-trace'
 import { buildReasoningStepId, mergeReasoningStep } from '@/lib/reasoning-steps'
@@ -833,10 +834,13 @@ function buildReasoningStep(
 
   switch (event.phase) {
     case 'thinking':
+      if (!stripReasoningArtifacts(event.content)) {
+        return null
+      }
       return {
         id,
         type: 'thinking',
-        content: event.content,
+        content: stripReasoningArtifacts(event.content),
         timestamp,
         source,
         toolMeta: event.toolMeta,
@@ -915,10 +919,7 @@ function buildTokenStats(event: NormalizedTurnEvent): TokenStats | undefined {
 }
 
 function normalizeReasoningText(value: string): string {
-  return value
-    .replace(/\r\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
+  return stripReasoningArtifacts(value)
 }
 
 function appendInlineReasoning(
@@ -2345,6 +2346,12 @@ export interface ConfigureModelResult {
   configPath: string | null
 }
 
+interface BackendTestModelConnectionResponse {
+  type: 'model_connection_test'
+  provider: ModelProvider
+  tested_model: BackendModelInfo
+}
+
 interface BackendModelEntryUpdateResponse {
   type: 'model_entry_update'
   updated_model: BackendModelInfo
@@ -2392,6 +2399,22 @@ export interface DeleteModelEntryResult {
   configuredModel: string
   persisted: boolean
   configPath: string | null
+}
+
+export interface TestModelConnectionInput {
+  modelId?: string
+  provider?: ModelProvider
+  model?: string
+  modelSpec?: string | null
+  baseUrl?: string | null
+  apiKey?: string | null
+  authProfileId?: string | null
+}
+
+export interface TestModelConnectionResult {
+  type: 'model_connection_test'
+  provider: ModelProvider
+  testedModel: ModelInfo | null
 }
 
 export interface ToolCallingProbeResult {
@@ -2659,6 +2682,27 @@ export async function configureModel(input: ConfigureModelInput): Promise<Config
     apiKeyConfigured: payload.api_key_configured,
     persisted: Boolean(payload.persisted),
     configPath: payload.config_path ?? null,
+  }
+}
+
+export async function testModelConnection(input: TestModelConnectionInput): Promise<TestModelConnectionResult> {
+  const payload = await requestJson<BackendTestModelConnectionResponse>('/models/test-connection', {
+    method: 'POST',
+    body: JSON.stringify({
+      ...(input.modelId !== undefined ? { model_id: input.modelId } : {}),
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.modelSpec !== undefined ? { model_spec: input.modelSpec } : {}),
+      ...(input.baseUrl !== undefined ? { base_url: input.baseUrl } : {}),
+      ...(input.apiKey !== undefined ? { api_key: input.apiKey } : {}),
+      ...(input.authProfileId !== undefined ? { auth_profile_id: input.authProfileId } : {}),
+    }),
+  })
+
+  return {
+    type: payload.type,
+    provider: payload.provider,
+    testedModel: normalizeModelInfo(payload.tested_model),
   }
 }
 
@@ -5112,6 +5156,12 @@ export interface TaskSummary {
   project_id: string | null
   task_type: string | null
   metadata: Record<string, unknown>
+  display_name: string | null
+  role: string | null
+  instruction: string | null
+  objective: string | null
+  parent_session_id: string | null
+  delegated_subagent: Record<string, unknown> | null
   status: string
   input_message: string
   final_answer: string | null
@@ -5165,6 +5215,11 @@ export interface CreateTaskInput {
   input_message: string
 }
 
+export interface AppendTaskMessageInput {
+  content: string
+  metadata?: Record<string, unknown>
+}
+
 export interface ResolveApprovalInput {
   decision: 'approve_once' | 'approve_and_save_rule' | 'reject'
   reason?: string
@@ -5209,6 +5264,12 @@ function normalizeTaskSummary(payload: unknown): TaskSummary {
     project_id: getNullableString(record.project_id),
     task_type: getNullableString(record.task_type),
     metadata: isRecord(record.metadata) ? record.metadata : {},
+    display_name: getNullableString(record.display_name),
+    role: getNullableString(record.role),
+    instruction: getNullableString(record.instruction),
+    objective: getNullableString(record.objective),
+    parent_session_id: getNullableString(record.parent_session_id),
+    delegated_subagent: isRecord(record.delegated_subagent) ? record.delegated_subagent : null,
     status: getString(record.status) ?? 'unknown',
     input_message: getString(record.input_message) ?? '',
     final_answer: getNullableString(record.final_answer),
@@ -5400,6 +5461,20 @@ export async function fetchTasks(): Promise<TaskSummary[]> {
 
 export async function fetchTask(taskId: string): Promise<TaskDetail> {
   const payload = await requestJson<unknown>(`/tasks/${encodeURIComponent(taskId)}`)
+  return normalizeTaskDetail(payload)
+}
+
+export async function appendTaskMessage(
+  taskId: string,
+  input: AppendTaskMessageInput
+): Promise<TaskDetail> {
+  const payload = await requestJson<unknown>(`/tasks/${encodeURIComponent(taskId)}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({
+      content: input.content,
+      metadata: input.metadata ?? {},
+    }),
+  })
   return normalizeTaskDetail(payload)
 }
 
@@ -5642,6 +5717,14 @@ export interface AppendAgentRunGuidanceInput {
 
 export interface AgentRunConversationMessage {
   role: 'operator' | 'assistant'
+  content: string
+  projectId?: string | null
+  workspaceDir?: string | null
+  attachments?: ChatAttachment[]
+  metadata?: Record<string, unknown>
+}
+
+export interface AgentRunSubagentMessageInput {
   content: string
   projectId?: string | null
   workspaceDir?: string | null
@@ -6004,6 +6087,28 @@ export async function appendAgentRunMessage(
       metadata: input.metadata ?? {},
     }),
   })
+  return normalizeAgentRunDetail(payload)
+}
+
+export async function appendAgentRunSubagentMessage(
+  runId: string,
+  roleId: string,
+  input: AgentRunSubagentMessageInput
+): Promise<AgentRunDetail> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/subagents/${encodeURIComponent(roleId)}/messages`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        role: 'operator',
+        content: input.content,
+        project_id: input.projectId ?? null,
+        workspace_dir: input.workspaceDir ?? null,
+        attachments: serializeChatAttachments(input.attachments) ?? [],
+        metadata: input.metadata ?? {},
+      }),
+    }
+  )
   return normalizeAgentRunDetail(payload)
 }
 

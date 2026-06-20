@@ -188,6 +188,26 @@ class ConfigureModelResponse(BaseModel):
     config_path: str | None = None
 
 
+class TestModelConnectionRequest(BaseModel):
+    """`POST /v1/models/test-connection` request payload."""
+
+    model_id: str | None = None
+    provider: ModelProvider | None = None
+    model: str | None = None
+    model_spec: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    auth_profile_id: str | None = None
+
+
+class TestModelConnectionResponse(BaseModel):
+    """`POST /v1/models/test-connection` response payload."""
+
+    type: str = "model_connection_test"
+    provider: str
+    tested_model: dict[str, Any]
+
+
 class UpdateConfiguredModelPayload(BaseModel):
     """`PATCH /v1/models/configured/{model_id}` request payload??"""
 
@@ -426,6 +446,19 @@ async def probe_tool_calling(request: Request) -> ToolCallingProbeResponse:
     return ToolCallingProbeResponse(
         active_model=active_model,
         probe=probe_result,
+    )
+
+
+@router.post("/models/test-connection", response_model=TestModelConnectionResponse)
+async def test_model_connection(
+    request: Request,
+    payload: TestModelConnectionRequest,
+) -> TestModelConnectionResponse:
+    """Validate a model connection without saving config or switching the active model."""
+    provider, tested_model = await _run_model_connection_test(request, payload)
+    return TestModelConnectionResponse(
+        provider=provider,
+        tested_model=tested_model,
     )
 
 
@@ -751,7 +784,7 @@ async def convert_local_model(
         )
         request.app.state.config = updated
         persisted_path = _persist_config_if_enabled(request, updated, True)
-        saved_as_model = saved_entry.model_dump(exclude_none=True)
+        saved_as_model = _serialize_configured_model_entry(saved_entry)
         available_models = _serialize_configured_models(updated)
         active_model = saved_as_model
         persisted = True
@@ -1002,6 +1035,14 @@ async def update_configured_model(
         if next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS
         else None
     )
+    api_key_changed = "api_key" in payload.model_fields_set
+    next_entry_api_key: SecretStr | None = existing.api_key
+    if next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS:
+        incoming_api_key = (payload.api_key or "").strip() if api_key_changed else None
+        if incoming_api_key is not None:
+            next_entry_api_key = SecretStr(incoming_api_key) if incoming_api_key else None
+    else:
+        next_entry_api_key = None
 
     replacement = ConfiguredModelConfig(
         id=next_id,
@@ -1014,6 +1055,7 @@ async def update_configured_model(
         launch_mode=next_launch_mode,
         auth_profile_id=next_auth_profile_id,
         auth_mode=next_auth_mode,
+        api_key=next_entry_api_key,
     )
 
     deduped_models = [
@@ -1028,7 +1070,6 @@ async def update_configured_model(
     if is_active_entry:
         updated = _apply_configured_model_to_config(updated, replacement)
 
-    api_key_changed = "api_key" in payload.model_fields_set
     api_key_configured = False
     if next_provider == "openai_codex":
         updated.openai_codex.base_url = (next_base_url or next_model_spec).rstrip("/")
@@ -1039,27 +1080,16 @@ async def update_configured_model(
         updated.openai_compat.provider = next_provider
         updated.openai_compat.base_url = (next_base_url or next_model_spec).rstrip("/")
         updated.openai_compat.model = next_model
-
-        incoming_api_key = (payload.api_key or "").strip() if api_key_changed else None
-        if incoming_api_key is not None:
-            if incoming_api_key:
-                updated.openai_compat.api_key = SecretStr(incoming_api_key)
-                api_key_configured = True
-            else:
-                updated.openai_compat.api_key = None
-                api_key_configured = False
-        else:
-            api_key_configured = (
-                updated.openai_compat.api_key is not None
-                and updated.openai_compat.api_key.get_secret_value().strip() != ""
-            )
+        api_key_configured = next_entry_api_key is not None
+        if is_active_entry:
+            updated.openai_compat.api_key = next_entry_api_key
     else:
         api_key_configured = False
 
     request.app.state.config = updated
     persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
     return UpdateConfiguredModelResponse(
-        updated_model=replacement.model_dump(exclude_none=True),
+        updated_model=_serialize_configured_model_entry(replacement),
         available_models=_dump_saved_configured_models(updated),
         configured_model=str(updated.model),
         api_key_configured=api_key_configured,
@@ -1339,15 +1369,14 @@ async def configure_model(
         )
         normalized_base_url = _managed_vllm_base_url(_vllm_runtime_base_url_from_status(status))
 
-        same_saved_remote = (
-            config.openai_compat.provider == payload.provider
-            and config.openai_compat.base_url.rstrip("/") == normalized_base_url
+        matching_saved_remote = _find_matching_remote_configured_model(
+            config,
+            provider=payload.provider,
+            model=managed_model_spec,
+            model_spec=managed_model_spec,
+            base_url=normalized_base_url,
         )
-        existing_key = (
-            config.openai_compat.api_key.get_secret_value()
-            if same_saved_remote and config.openai_compat.api_key is not None
-            else ""
-        )
+        existing_key = _configured_model_api_key(matching_saved_remote, config) if matching_saved_remote else ""
         effective_api_key = payload.api_key or existing_key
         switch_openai = getattr(engine, "switch_openai_compat_backend", None)
         try:
@@ -1372,6 +1401,8 @@ async def configure_model(
         updated.openai_compat.provider = payload.provider
         if effective_api_key:
             updated.openai_compat.api_key = SecretStr(effective_api_key)
+        else:
+            updated.openai_compat.api_key = None
         updated.model_setup.configured_models = _upsert_configured_model(
             updated.model_setup.configured_models,
             _configured_model_from_parts(
@@ -1380,6 +1411,7 @@ async def configure_model(
                 model_spec=managed_model_spec,
                 base_url=normalized_base_url,
                 active_model=model_info,
+                api_key=SecretStr(effective_api_key) if effective_api_key else None,
             ),
         )
         request.app.state.config = updated
@@ -1399,15 +1431,14 @@ async def configure_model(
     provider_defaults = _REMOTE_PROVIDER_DEFAULTS[payload.provider]
     normalized_base_url = (payload.base_url or provider_defaults["base_url"]).strip().rstrip("/")
     normalized_model = payload.model.strip() or provider_defaults["model"]
-    same_saved_remote = (
-        config.openai_compat.provider == payload.provider
-        and config.openai_compat.base_url.rstrip("/") == normalized_base_url
+    matching_saved_remote = _find_matching_remote_configured_model(
+        config,
+        provider=payload.provider,
+        model=normalized_model,
+        model_spec=normalized_base_url,
+        base_url=normalized_base_url,
     )
-    existing_key = (
-        config.openai_compat.api_key.get_secret_value()
-        if same_saved_remote and config.openai_compat.api_key is not None
-        else ""
-    )
+    existing_key = _configured_model_api_key(matching_saved_remote, config) if matching_saved_remote else ""
     effective_api_key = payload.api_key or existing_key
     switch_openai = getattr(engine, "switch_openai_compat_backend", None)
     try:
@@ -1432,6 +1463,8 @@ async def configure_model(
     updated.openai_compat.provider = payload.provider
     if effective_api_key:
         updated.openai_compat.api_key = SecretStr(effective_api_key)
+    else:
+        updated.openai_compat.api_key = None
     updated.model_setup.configured_models = _upsert_configured_model(
         updated.model_setup.configured_models,
         _configured_model_from_parts(
@@ -1440,6 +1473,7 @@ async def configure_model(
             model_spec=normalized_base_url,
             base_url=normalized_base_url,
             active_model=model_info,
+            api_key=SecretStr(effective_api_key) if effective_api_key else None,
         ),
     )
     request.app.state.config = updated
@@ -1482,6 +1516,370 @@ async def list_ollama_models(
         if isinstance(item, dict) and isinstance(item.get("name"), str) and item.get("name")
     ]
     return OllamaModelsResponse(base_url=normalized_base_url, models=sorted(models))
+
+
+async def _run_model_connection_test(
+    request: Request,
+    payload: TestModelConnectionRequest,
+) -> tuple[str, dict[str, Any]]:
+    if payload.model_id and payload.model_id.strip():
+        return await _run_saved_model_connection_test(request, payload.model_id.strip(), payload.api_key)
+    return await _run_explicit_model_connection_test(request, payload)
+
+
+async def _run_saved_model_connection_test(
+    request: Request,
+    model_id: str,
+    api_key: str | None,
+) -> tuple[str, dict[str, Any]]:
+    config = await _get_config(request.app)
+    engine = await _get_or_create_engine(request.app)
+    entry = _find_configured_model(config, model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Configured model was not found: {model_id}")
+
+    try:
+        if entry.provider == "local":
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="local",
+                    model=entry.model_spec,
+                )
+            )
+        elif entry.provider == "ollama":
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="ollama",
+                    model=entry.model,
+                    base_url=entry.base_url or config.ollama.base_url,
+                )
+            )
+        elif entry.provider == "openai_codex":
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="openai_codex",
+                    model=entry.model,
+                    base_url=entry.base_url or entry.model_spec,
+                    auth_profile_id=entry.auth_profile_id or config.openai_codex.auth_profile_id,
+                )
+            )
+        elif _is_managed_vllm_configured_model(entry):
+            managed_model_spec = _resolve_vllm_managed_model_spec(entry, config)
+            status = await _start_managed_vllm_runtime(
+                manager=_get_or_create_vllm_runtime_manager(request),
+                model_id=entry.id,
+                model_spec=managed_model_spec,
+                base_url=_managed_vllm_base_url(entry.base_url),
+                config=config,
+            )
+            effective_base_url = _managed_vllm_base_url(_vllm_runtime_base_url_from_status(status))
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="vllm",
+                    model=managed_model_spec,
+                    base_url=effective_base_url,
+                    api_key=(api_key or _configured_model_api_key(entry, config)),
+                )
+            )
+            return (
+                entry.provider,
+                _serialize_tested_model_info(
+                    info,
+                    provider=entry.provider,
+                    model=managed_model_spec,
+                    model_spec=managed_model_spec,
+                    base_url=effective_base_url,
+                    launch_mode="managed",
+                ),
+            )
+        else:
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider=entry.provider,
+                    model=entry.model,
+                    base_url=entry.base_url or entry.model_spec,
+                    api_key=(api_key or _configured_model_api_key(entry, config)),
+                )
+            )
+    except (RuntimeError, ValueError) as exc:
+        raise _translate_model_switch_error(exc) from exc
+
+    return entry.provider, _serialize_active_model_info(info, configured_model=entry)
+
+
+async def _run_explicit_model_connection_test(
+    request: Request,
+    payload: TestModelConnectionRequest,
+) -> tuple[str, dict[str, Any]]:
+    config = await _get_config(request.app)
+    engine = await _get_or_create_engine(request.app)
+
+    provider = payload.provider
+    if provider is None:
+        raise HTTPException(status_code=400, detail="provider is required when model_id is not set.")
+
+    if provider == "local":
+        raw_model_spec = (payload.model_spec or payload.model or "").strip()
+        if not raw_model_spec:
+            raise HTTPException(status_code=400, detail="model is required for provider=local.")
+        normalized_model_spec = _normalize_local_model_spec(raw_model_spec, config)
+        try:
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="local",
+                    model=normalized_model_spec,
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise _translate_model_switch_error(exc) from exc
+        return (
+            provider,
+            _serialize_tested_model_info(
+                info,
+                provider=provider,
+                model=Path(normalized_model_spec).name,
+                model_spec=normalized_model_spec,
+                base_url=None,
+            ),
+        )
+
+    normalized_model = (payload.model or "").strip()
+    if not normalized_model:
+        provider_defaults = _REMOTE_PROVIDER_DEFAULTS.get(provider)
+        normalized_model = provider_defaults["model"] if provider_defaults is not None else ""
+    if not normalized_model:
+        raise HTTPException(status_code=400, detail="model is required.")
+
+    if provider == "ollama":
+        normalized_base_url = (payload.base_url or config.ollama.base_url).strip().rstrip("/")
+        try:
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="ollama",
+                    model=normalized_model,
+                    base_url=normalized_base_url,
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise _translate_model_switch_error(exc) from exc
+        return (
+            provider,
+            _serialize_tested_model_info(
+                info,
+                provider=provider,
+                model=normalized_model,
+                model_spec=f"ollama:{normalized_model}",
+                base_url=normalized_base_url,
+            ),
+        )
+
+    if provider == "openai_codex":
+        try:
+            normalized_base_url = normalize_openai_codex_base_url(
+                payload.base_url or _REMOTE_PROVIDER_DEFAULTS["openai_codex"]["base_url"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="openai_codex",
+                    model=normalized_model,
+                    base_url=normalized_base_url,
+                    auth_profile_id=payload.auth_profile_id or config.openai_codex.auth_profile_id,
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise _translate_model_switch_error(exc) from exc
+        return (
+            provider,
+            _serialize_tested_model_info(
+                info,
+                provider=provider,
+                model=normalized_model,
+                model_spec=normalized_base_url,
+                base_url=normalized_base_url,
+                auth_profile_id=payload.auth_profile_id or config.openai_codex.auth_profile_id,
+                auth_mode="oauth",
+            ),
+        )
+
+    if (
+        provider == "vllm"
+        and (payload.base_url or "").strip() == ""
+        and shared_is_possible_managed_vllm_target(normalized_model)
+    ):
+        managed_model_spec = _normalize_vllm_managed_model_spec(normalized_model, config)
+        status = await _start_managed_vllm_runtime(
+            manager=_get_or_create_vllm_runtime_manager(request),
+            model_id=None,
+            model_spec=managed_model_spec,
+            base_url=_managed_vllm_base_url(payload.base_url),
+            config=config,
+        )
+        effective_base_url = _managed_vllm_base_url(_vllm_runtime_base_url_from_status(status))
+        matching_saved_remote = _find_matching_remote_configured_model(
+            config,
+            provider=provider,
+            model=managed_model_spec,
+            model_spec=managed_model_spec,
+            base_url=effective_base_url,
+        )
+        try:
+            info = await _maybe_await(
+                engine.test_model_connection(
+                    provider="vllm",
+                    model=managed_model_spec,
+                    base_url=effective_base_url,
+                    api_key=_resolve_test_connection_api_key(
+                        payload.api_key,
+                        matching_saved_remote=matching_saved_remote,
+                        config=config,
+                    ),
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise _translate_model_switch_error(exc) from exc
+        return (
+            provider,
+            _serialize_tested_model_info(
+                info,
+                provider=provider,
+                model=managed_model_spec,
+                model_spec=managed_model_spec,
+                base_url=effective_base_url,
+                launch_mode="managed",
+            ),
+        )
+
+    provider_defaults = _REMOTE_PROVIDER_DEFAULTS[provider]
+    normalized_base_url = (payload.base_url or provider_defaults["base_url"]).strip().rstrip("/")
+    if not normalized_base_url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="Remote provider base_url must start with http:// or https://.",
+        )
+    matching_saved_remote = _find_matching_remote_configured_model(
+        config,
+        provider=provider,
+        model=normalized_model,
+        model_spec=normalized_base_url,
+        base_url=normalized_base_url,
+    )
+    try:
+        info = await _maybe_await(
+            engine.test_model_connection(
+                provider=provider,
+                model=normalized_model,
+                base_url=normalized_base_url,
+                api_key=_resolve_test_connection_api_key(
+                    payload.api_key,
+                    matching_saved_remote=matching_saved_remote,
+                    config=config,
+                ),
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise _translate_model_switch_error(exc) from exc
+    return (
+        provider,
+        _serialize_tested_model_info(
+            info,
+            provider=provider,
+            model=normalized_model,
+            model_spec=normalized_base_url,
+            base_url=normalized_base_url,
+        ),
+    )
+
+
+def _resolve_test_connection_api_key(
+    api_key: str | None,
+    *,
+    matching_saved_remote: ConfiguredModelConfig | None = None,
+    config: MochiConfig | None = None,
+) -> str:
+    explicit = (api_key or "").strip()
+    if explicit:
+        return explicit
+    if matching_saved_remote is not None and config is not None:
+        return _configured_model_api_key(matching_saved_remote, config)
+    return ""
+
+
+def _configured_model_api_key(
+    model: ConfiguredModelConfig,
+    config: MochiConfig,
+) -> str:
+    if model.provider == "openai_codex":
+        return ""
+    if model.api_key is not None:
+        return model.api_key.get_secret_value().strip()
+    configured = config.openai_compat.api_key
+    if configured is None:
+        return ""
+    if config.openai_compat.provider != model.provider:
+        return ""
+    normalized_base_url = _managed_vllm_base_url(model.base_url or model.model_spec).rstrip("/")
+    if config.openai_compat.base_url.rstrip("/") != normalized_base_url:
+        return ""
+    return configured.get_secret_value().strip()
+
+
+def _find_matching_remote_configured_model(
+    config: MochiConfig,
+    *,
+    provider: ModelProvider,
+    model: str,
+    model_spec: str,
+    base_url: str | None,
+) -> ConfiguredModelConfig | None:
+    normalized_base_url = (base_url or model_spec).rstrip("/")
+    normalized_model_spec = model_spec.rstrip("/")
+    for entry in config.model_setup.configured_models:
+        if entry.provider != provider:
+            continue
+        entry_base_url = (entry.base_url or entry.model_spec).rstrip("/")
+        entry_model_spec = entry.model_spec.rstrip("/")
+        if entry.model != model:
+            continue
+        if entry_model_spec == normalized_model_spec and entry_base_url == normalized_base_url:
+            return entry
+    return None
+
+
+def _serialize_configured_model_entry(model: ConfiguredModelConfig) -> dict[str, Any]:
+    payload = model.model_dump(exclude_none=True, exclude={"api_key"})
+    payload["api_key_configured"] = model.api_key is not None
+    return payload
+
+
+def _serialize_tested_model_info(
+    info: Any,
+    *,
+    provider: ModelProvider,
+    model: str,
+    model_spec: str,
+    base_url: str | None,
+    auth_profile_id: str | None = None,
+    auth_mode: Literal["none", "api_key", "oauth"] | None = None,
+    launch_mode: Literal["external", "managed"] | None = None,
+) -> dict[str, Any]:
+    payload = _serialize_model_info(info)
+    payload["provider"] = provider
+    payload["model_spec"] = model_spec
+    if base_url is not None:
+        payload["base_url"] = base_url
+    if auth_profile_id is not None:
+        payload["auth_profile_id"] = auth_profile_id
+    if auth_mode is not None:
+        payload["auth_mode"] = auth_mode
+    if launch_mode is not None:
+        payload["launch_mode"] = launch_mode
+    payload.setdefault("id", model_spec if provider in {"ollama", "local"} else f"{provider}:{(base_url or model_spec)}:{model}")
+    payload.setdefault("label", model if provider in {"ollama", "local"} else f"{model} ({provider})")
+    payload.setdefault("name", model)
+    return payload
 
 
 async def _load_active_model_info(
@@ -1541,6 +1939,7 @@ def _configured_model_from_parts(
     launch_mode: Literal["external", "managed"] | None = None,
     auth_profile_id: str | None = None,
     auth_mode: Literal["none", "api_key", "oauth"] | None = None,
+    api_key: SecretStr | None = None,
 ) -> ConfiguredModelConfig:
     """????賹??謜? runtime ?桀???梁???豯??賹?????獢???朝?"""
     backend_type = _model_info_backend_type(active_model) or (
@@ -1576,6 +1975,7 @@ def _configured_model_from_parts(
         launch_mode=resolved_launch_mode,
         auth_profile_id=auth_profile_id,
         auth_mode=auth_mode,
+        api_key=api_key,
     )
 
 
@@ -1722,18 +2122,11 @@ async def _switch_configured_model(
 
     switch_openai = getattr(engine, "switch_openai_compat_backend", None)
     if callable(switch_openai):
-        existing_key = (
-            config.openai_compat.api_key.get_secret_value()
-            if config.openai_compat.provider == model.provider
-            and config.openai_compat.base_url.rstrip("/") == _managed_vllm_base_url(effective_base_url).rstrip("/")
-            and config.openai_compat.api_key is not None
-            else ""
-        )
         return await _maybe_await(
             switch_openai(
                 base_url=effective_base_url,
                 model=effective_model,
-                api_key=existing_key,
+                api_key=_configured_model_api_key(model, config),
                 provider=model.provider,
             )
         )
@@ -1765,9 +2158,11 @@ def _apply_configured_model_to_config(
     else:
         updated.model = model.model_spec
 
+    resolved_api_key = _configured_model_api_key(model, config)
     updated.openai_compat.provider = model.provider
     updated.openai_compat.base_url = _managed_vllm_base_url(model.base_url or model.model_spec)
     updated.openai_compat.model = model.model
+    updated.openai_compat.api_key = SecretStr(resolved_api_key) if resolved_api_key else None
     return updated
 
 
@@ -1779,12 +2174,12 @@ def _serialize_configured_models(config: MochiConfig) -> list[dict[str, Any]]:
             models,
             _configured_model_from_config(config),
         )
-    return [model.model_dump(exclude_none=True) for model in models]
+    return [_serialize_configured_model_entry(model) for model in models]
 
 
 def _dump_saved_configured_models(config: MochiConfig) -> list[dict[str, Any]]:
     """?豯止齒???踐????config.model_setup ???????畾???? runtime fallback??"""
-    return [model.model_dump(exclude_none=True) for model in config.model_setup.configured_models]
+    return [_serialize_configured_model_entry(model) for model in config.model_setup.configured_models]
 
 
 def _configured_model_from_config(config: MochiConfig) -> ConfiguredModelConfig:
@@ -1823,6 +2218,7 @@ def _configured_model_from_config(config: MochiConfig) -> ConfiguredModelConfig:
             label=f"{config.openai_compat.model} ({provider})",
             backend_type="openai_compat",
             auth_mode="api_key",
+            api_key=config.openai_compat.api_key,
         )
     backend_type = (
         "gguf"
@@ -1876,6 +2272,7 @@ def _serialize_active_model_info(
     payload["base_url"] = configured_model.base_url
     payload["auth_profile_id"] = configured_model.auth_profile_id
     payload["auth_mode"] = configured_model.auth_mode
+    payload["api_key_configured"] = configured_model.api_key is not None
     payload["label"] = configured_model.label
     payload.setdefault("name", configured_model.model)
     payload.setdefault("backend_type", configured_model.backend_type)

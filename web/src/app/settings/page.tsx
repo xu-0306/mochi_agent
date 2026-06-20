@@ -84,6 +84,7 @@ type ApiModule = typeof api & {
   fetchModels?: () => Promise<unknown[]>
   fetchChannelsStatus?: () => Promise<api.ChannelsStatus>
   configureModel?: (input: api.ConfigureModelInput) => Promise<api.ConfigureModelResult>
+  testModelConnection?: (input: api.TestModelConnectionInput) => Promise<api.TestModelConnectionResult>
   fetchOpenAICodexAuthStatus?: () => Promise<api.OpenAICodexAuthStatus>
   importOpenAICodexCliLogin?: () => Promise<api.OpenAICodexImportResult>
   startOpenAICodexBrowserLogin?: (frontendOrigin?: string) => Promise<api.OpenAICodexLoginStartResult>
@@ -2481,6 +2482,7 @@ function ModelConnectionForm({
   const [openAICodexLoginStart, setOpenAICodexLoginStart] = React.useState<api.OpenAICodexLoginStartResult | null>(null)
   const [openAICodexManualCallbackUrl, setOpenAICodexManualCallbackUrl] = React.useState('')
   const [submitting, setSubmitting] = React.useState(false)
+  const [testingConnection, setTestingConnection] = React.useState(false)
   const [message, setMessage] = React.useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [editingModelId, setEditingModelId] = React.useState<string | null>(null)
   const [editingProvider, setEditingProvider] = React.useState<ProviderChoice>('ollama')
@@ -2489,6 +2491,7 @@ function ModelConnectionForm({
   const [editingBaseUrl, setEditingBaseUrl] = React.useState('')
   const [editingApiKey, setEditingApiKey] = React.useState('')
   const [entrySubmitting, setEntrySubmitting] = React.useState(false)
+  const [testingSavedModelId, setTestingSavedModelId] = React.useState<string | null>(null)
   const [entryMessage, setEntryMessage] = React.useState<FormMessage>(null)
   const [toolProbeBusy, setToolProbeBusy] = React.useState(false)
   const [toolProbeMessage, setToolProbeMessage] = React.useState<FormMessage>(null)
@@ -3303,6 +3306,51 @@ function ModelConnectionForm({
     }
   }
 
+  const handleTestCurrentConnection = async () => {
+    setTestingConnection(true)
+    setMessage(null)
+
+    try {
+      if (typeof settingsApi.testModelConnection !== 'function') {
+        throw new Error('Model test API client is unavailable.')
+      }
+
+      if (provider === 'local' && localModelInputLooksLikeGguf) {
+        const ggufRuntimeReady = (
+          localRuntimeStatus?.readiness === 'ready' ||
+          localRuntimeStatus?.readiness === 'degraded'
+        )
+        if (!ggufRuntimeReady) {
+          throw new Error(t('settings.modelConnection.ggufRuntimeMissing'))
+        }
+      }
+      if (provider === 'openai_codex' && !openAICodexStatus?.activeProfileId) {
+        throw new Error('Connect ChatGPT or import a Codex CLI login before testing OpenAI Codex.')
+      }
+
+      const result = await settingsApi.testModelConnection({
+        provider,
+        model,
+        modelSpec: provider === 'local' ? model : null,
+        baseUrl: provider === 'local' ? null : baseUrl,
+        apiKey: provider === 'local' || provider === 'openai_codex' ? null : apiKey,
+        authProfileId: provider === 'openai_codex' ? openAICodexStatus?.activeProfileId ?? null : null,
+      })
+      const testedModelLabel = result.testedModel ? modelInfoLabel(result.testedModel) : model
+      setMessage({
+        type: 'success',
+        text: t('settings.modelConnection.successTest', { model: testedModelLabel }),
+      })
+    } catch (testError) {
+      setMessage({
+        type: 'error',
+        text: messageWithDetail(t('settings.modelConnection.errorTest'), testError),
+      })
+    } finally {
+      setTestingConnection(false)
+    }
+  }
+
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setSubmitting(true)
@@ -3517,6 +3565,29 @@ function ModelConnectionForm({
       })
     } finally {
       setEntrySubmitting(false)
+    }
+  }
+
+  const testSavedModel = async (modelId: string) => {
+    setTestingSavedModelId(modelId)
+    setEntryMessage(null)
+    try {
+      if (typeof settingsApi.testModelConnection !== 'function') {
+        throw new Error('Model test API client is unavailable.')
+      }
+      const result = await settingsApi.testModelConnection({ modelId })
+      const testedModelLabel = result.testedModel ? modelInfoLabel(result.testedModel) : modelId
+      setEntryMessage({
+        type: 'success',
+        text: t('settings.savedModels.successTest', { model: testedModelLabel }),
+      })
+    } catch (testError) {
+      setEntryMessage({
+        type: 'error',
+        text: messageWithDetail(t('settings.savedModels.errorTest'), testError),
+      })
+    } finally {
+      setTestingSavedModelId(null)
     }
   }
 
@@ -4041,10 +4112,22 @@ function ModelConnectionForm({
                         <div className="flex items-center gap-1">
                           <Button
                             type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => void testSavedModel(id)}
+                            disabled={entrySubmitting || testingSavedModelId !== null}
+                            loading={testingSavedModelId === id}
+                            title={t('settings.action.test')}
+                            aria-label={t('settings.action.test')}
+                          >
+                            {t('settings.action.test')}
+                          </Button>
+                          <Button
+                            type="button"
                             size="icon-sm"
                             variant="ghost"
                             onClick={() => startEditSavedModel(entry)}
-                            disabled={entrySubmitting}
+                            disabled={entrySubmitting || testingSavedModelId !== null}
                             title={t('settings.savedModels.edit')}
                             aria-label={t('settings.savedModels.edit')}
                           >
@@ -4055,7 +4138,7 @@ function ModelConnectionForm({
                             size="icon-sm"
                             variant="ghost"
                             onClick={() => void deleteSavedModel(id)}
-                            disabled={entrySubmitting}
+                            disabled={entrySubmitting || testingSavedModelId !== null}
                             title={t('settings.savedModels.delete')}
                             aria-label={t('settings.savedModels.delete')}
                           >
@@ -4161,8 +4244,18 @@ function ModelConnectionForm({
         ) : null}
 
         <div className="flex items-center justify-end gap-2">
-          <Button type="submit" variant="primary" size="sm" loading={submitting}>
-            {t('settings.action.addApplyTest')}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            loading={testingConnection}
+            disabled={submitting}
+            onClick={() => void handleTestCurrentConnection()}
+          >
+            {t('settings.action.testConnection')}
+          </Button>
+          <Button type="submit" variant="primary" size="sm" loading={submitting} disabled={testingConnection}>
+            {t('settings.action.addModel')}
           </Button>
         </div>
       </form>
