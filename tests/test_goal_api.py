@@ -324,7 +324,7 @@ def test_goal_create_normalizes_prompt_duration_into_runtime_contract(tmp_path: 
         assert health_payload["run_policy"]["runtime_mode"] == "fixed_duration"
 
 
-def test_goal_execution_mode_round_trips_and_single_agent_uses_protocol_fallback(
+def test_goal_execution_mode_overrides_conflicting_protocol_id_for_single_agent_goals(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -352,20 +352,24 @@ def test_goal_execution_mode_round_trips_and_single_agent_uses_protocol_fallback
                 "objective": "Handle this as a single-agent goal.",
                 "title": "Single Agent Goal",
                 "execution_mode": "single_agent",
+                "protocol_id": "multi_agent_debate",
             },
         )
         assert create_response.status_code == 200
         created = create_response.json()
         goal_id = created["goal_id"]
         assert created["execution_mode"] == "single_agent"
+        assert created["protocol_id"] == "teacher_student_distill"
 
         list_response = client.get("/v1/goals")
         assert list_response.status_code == 200
         assert list_response.json()[0]["execution_mode"] == "single_agent"
+        assert list_response.json()[0]["protocol_id"] == "teacher_student_distill"
 
         get_response = client.get(f"/v1/goals/{goal_id}")
         assert get_response.status_code == 200
         assert get_response.json()["execution_mode"] == "single_agent"
+        assert get_response.json()["protocol_id"] == "teacher_student_distill"
 
         health_response = client.get(f"/v1/goals/{goal_id}/health")
         assert health_response.status_code == 200
@@ -374,9 +378,11 @@ def test_goal_execution_mode_round_trips_and_single_agent_uses_protocol_fallback
         start_response = client.post(f"/v1/goals/{goal_id}/start")
         assert start_response.status_code == 200
         assert start_response.json()["execution_mode"] == "single_agent"
+        assert start_response.json()["protocol_id"] == "teacher_student_distill"
 
         completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
         assert completed_goal["execution_mode"] == "single_agent"
+        assert completed_goal["protocol_id"] == "teacher_student_distill"
         linked_run_id = completed_goal["attempts"][0]["agent_run_id"]
         assert linked_run_id is not None
 

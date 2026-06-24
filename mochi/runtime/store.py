@@ -11,6 +11,7 @@ from typing import Any
 
 _UNSET = object()
 _DEFAULT_GOAL_EXECUTION_MODE = "workflow"
+_DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL = "teacher_student_distill"
 _GOAL_EXECUTION_MODES = {"single_agent", _DEFAULT_GOAL_EXECUTION_MODE}
 _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
     "cancelled",
@@ -849,6 +850,11 @@ class RuntimeStore:
     ) -> dict[str, Any]:
         await self.initialize()
         now = _now_iso()
+        normalized_execution_mode = _normalize_goal_execution_mode(execution_mode)
+        normalized_protocol_id = _normalize_goal_protocol_id(
+            normalized_execution_mode,
+            protocol_id,
+        )
 
         def _op() -> None:
             with sqlite3.connect(self._db_path) as conn:
@@ -866,8 +872,8 @@ class RuntimeStore:
                         objective,
                         title,
                         goal_type,
-                        _normalize_goal_execution_mode(execution_mode),
-                        protocol_id,
+                        normalized_execution_mode,
+                        normalized_protocol_id,
                         topic,
                         project_id,
                         workspace_dir,
@@ -2868,6 +2874,10 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     payload = dict(row)
     payload["execution_mode"] = _normalize_goal_execution_mode(payload.get("execution_mode"))
+    payload["protocol_id"] = _normalize_goal_protocol_id(
+        payload["execution_mode"],
+        payload.get("protocol_id"),
+    )
     payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
     payload["capability_policy"] = json.loads(payload.pop("capability_policy_json") or "{}")
     payload["source_manifest"] = json.loads(payload.pop("source_manifest_json") or "{}")
@@ -3012,6 +3022,13 @@ def _normalize_goal_execution_mode(value: Any) -> str:
     if normalized in _GOAL_EXECUTION_MODES:
         return normalized
     return _DEFAULT_GOAL_EXECUTION_MODE
+
+
+def _normalize_goal_protocol_id(execution_mode: Any, protocol_id: Any) -> str | None:
+    if _normalize_goal_execution_mode(execution_mode) == "single_agent":
+        return _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL
+    normalized = str(protocol_id or "").strip()
+    return normalized or None
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

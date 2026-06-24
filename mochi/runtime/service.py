@@ -2087,7 +2087,7 @@ class RuntimeService:
         if goal_capability_policy:
             summary["goal_capability_policy"] = goal_capability_policy
         return AgentRunCreateRequest(
-            protocol_id=str(goal.get("protocol_id") or "teacher_student_distill"),
+            protocol_id=_goal_effective_protocol_id(goal) or "teacher_student_distill",
             title=goal.get("title") if isinstance(goal.get("title"), str) else None,
             topic=goal.get("topic") or goal.get("objective"),
             project_id=goal.get("project_id") if isinstance(goal.get("project_id"), str) else None,
@@ -7009,7 +7009,7 @@ def _goal_response(goal: dict[str, Any]) -> dict[str, Any]:
         "title": goal.get("title"),
         "goal_type": goal.get("goal_type"),
         "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
-        "protocol_id": goal.get("protocol_id"),
+        "protocol_id": _goal_effective_protocol_id(goal),
         "topic": goal.get("topic"),
         "project_id": goal.get("project_id"),
         "workspace_dir": goal.get("workspace_dir"),
@@ -7056,6 +7056,13 @@ def _normalize_goal_execution_mode(value: Any) -> str:
     if normalized in GOAL_EXECUTION_MODES:
         return normalized
     return DEFAULT_GOAL_EXECUTION_MODE
+
+
+def _goal_effective_protocol_id(goal: Mapping[str, Any]) -> str | None:
+    if _normalize_goal_execution_mode(goal.get("execution_mode")) == "single_agent":
+        return "teacher_student_distill"
+    normalized = str(goal.get("protocol_id") or "").strip()
+    return normalized or None
 
 
 def _goal_recovery_state_from_agent_run(run: dict[str, Any]) -> dict[str, Any]:

@@ -73,7 +73,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
             title="Forum Corpus",
             goal_type="dataset_collection",
             execution_mode="single_agent",
-            protocol_id="teacher_student_distill",
+            protocol_id="multi_agent_debate",
             topic="forum corpus",
             project_id="proj-1",
             workspace_dir=str(tmp_path / "workspace"),
@@ -86,6 +86,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     )
     assert goal["id"] == "goal-1"
     assert goal["execution_mode"] == "single_agent"
+    assert goal["protocol_id"] == "teacher_student_distill"
     assert goal["status"] == "created"
     assert goal["attempts"] == []
 
@@ -132,6 +133,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     saved_goal = asyncio.run(store.get_goal("goal-1"))
     assert saved_goal is not None
     assert saved_goal["execution_mode"] == "single_agent"
+    assert saved_goal["protocol_id"] == "teacher_student_distill"
     assert saved_goal["current_attempt_id"] == "goal-attempt-1"
     assert saved_goal["run_policy"]["max_wall_clock_sec"] == 18_000
     assert saved_goal["capability_policy"]["allowed_tools"] == ["web_search"]
@@ -147,6 +149,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     assert len(goals) == 1
     assert goals[0]["id"] == "goal-1"
     assert goals[0]["execution_mode"] == "single_agent"
+    assert goals[0]["protocol_id"] == "teacher_student_distill"
     assert goals[0]["attempts"][0]["id"] == "goal-attempt-1"
 
 
