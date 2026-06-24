@@ -32,6 +32,7 @@ class UpdateSessionRequest(BaseModel):
 
     title: str | None = None
     workflow: dict[str, object] | None = None
+    goal: dict[str, object] | None = None
     security_override: dict[str, object] | None = None
 
 
@@ -86,6 +87,7 @@ async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]
                 "updated_at": updated_at,
                 "project_id": _session_project_id(events),
                 "workflow": _session_workflow_state(events),
+                "goal": _session_goal_state(events),
                 "security_override": _session_security_override(events),
             }
         )
@@ -153,6 +155,19 @@ def _session_workflow_state(events: list[dict]) -> dict[str, object] | None:
         workflow = event.get("workflow")
         if isinstance(workflow, dict):
             return dict(workflow)
+    return None
+
+
+def _session_goal_state(events: list[dict]) -> dict[str, object] | None:
+    """Resolve latest goal state from metadata events."""
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "goal_state_updated":
+            continue
+        goal = event.get("goal")
+        if isinstance(goal, dict):
+            return dict(goal)
     return None
 
 
@@ -364,6 +379,7 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "workflow": _session_workflow_state(events),
+        "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
         "events": events,
     }
@@ -396,6 +412,7 @@ async def rewrite_session_from_turn(
         "title": _session_title(session_id, rewritten),
         "project_id": _session_project_id(rewritten),
         "workflow": _session_workflow_state(rewritten),
+        "goal": _session_goal_state(rewritten),
         "security_override": _session_security_override(rewritten),
         "events": rewritten,
     }
@@ -424,6 +441,7 @@ async def append_session_events(
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "workflow": _session_workflow_state(events),
+        "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
         "events": events,
     }
@@ -438,11 +456,15 @@ async def update_session(
     """更新 session 顯示 metadata。"""
     title = payload.title.strip() if isinstance(payload.title, str) else None
     workflow = dict(payload.workflow) if isinstance(payload.workflow, dict) else None
+    goal = dict(payload.goal) if isinstance(payload.goal, dict) else None
     security_override = _normalize_session_security_override(
         dict(payload.security_override) if isinstance(payload.security_override, dict) else None
     )
-    if title is None and workflow is None and security_override is None:
-        raise HTTPException(status_code=422, detail="title, workflow, or security_override is required")
+    if title is None and workflow is None and goal is None and security_override is None:
+        raise HTTPException(
+            status_code=422,
+            detail="title, workflow, goal, or security_override is required",
+        )
     if title is not None and not title:
         raise HTTPException(status_code=422, detail="title must not be empty")
 
@@ -475,6 +497,17 @@ async def update_session(
                 "timestamp": now,
             },
         )
+    if goal is not None:
+        await store.save_event(
+            session_id,
+            {
+                "type": "session_meta",
+                "event": "goal_state_updated",
+                "session_id": session_id,
+                "goal": goal,
+                "timestamp": now,
+            },
+        )
     if security_override is not None:
         await store.save_event(
             session_id,
@@ -493,6 +526,7 @@ async def update_session(
         "title": _session_title(session_id, events),
         "project_id": _session_project_id(events),
         "workflow": _session_workflow_state(events),
+        "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
         "events": events,
     }

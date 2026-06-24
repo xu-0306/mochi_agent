@@ -73,12 +73,16 @@ class ApprovalResolution(BaseModel):
     replay_override: ApprovalReplayOverride | None = None
 
 
+GoalExecutionMode = Literal["single_agent", "workflow"]
+
+
 class GoalCreateRequest(BaseModel):
     """Request payload for creating a durable high-level goal."""
 
     objective: str = Field(min_length=1)
     title: str | None = None
     goal_type: str | None = None
+    execution_mode: GoalExecutionMode = "workflow"
     protocol_id: str | None = None
     topic: str | None = None
     project_id: str | None = None
@@ -115,6 +119,7 @@ class GoalResponse(BaseModel):
     objective: str
     title: str | None = None
     goal_type: str | None = None
+    execution_mode: GoalExecutionMode = "workflow"
     protocol_id: str | None = None
     topic: str | None = None
     project_id: str | None = None

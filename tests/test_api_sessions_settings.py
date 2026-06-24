@@ -57,6 +57,7 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
         assert list_payload["items"][1]["event_count"] == 1
         assert list_payload["items"][1]["title"] == "alpha"
         assert list_payload["items"][1]["project_id"] is None
+        assert list_payload["items"][1]["goal"] is None
 
         get_response = client.get("/v1/sessions/alpha")
         assert get_response.status_code == 200
@@ -66,6 +67,7 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
             "title": "alpha",
             "project_id": None,
             "workflow": None,
+            "goal": None,
             "security_override": None,
             "events": [
                 {
@@ -94,6 +96,7 @@ def test_get_missing_session_returns_empty_events(tmp_path: Path) -> None:
         "title": "missing",
         "project_id": None,
         "workflow": None,
+        "goal": None,
         "security_override": None,
         "events": [],
     }
@@ -339,6 +342,56 @@ def test_sessions_can_rewrite_from_turn_in_place(tmp_path: Path) -> None:
         ]
 
 
+def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Path) -> None:
+    """Session PATCH should expose goal metadata separately from workflow state."""
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
+
+        update_response = client.patch(
+            "/v1/sessions/alpha",
+            json={
+                "workflow": {"enabled": True, "bound_run_id": "run-1"},
+                "goal": {"goal_id": "goal-1", "status": "running", "execution_mode": "single_agent"},
+            },
+        )
+
+        assert update_response.status_code == 200
+        updated = update_response.json()
+        assert updated["workflow"] == {"enabled": True, "bound_run_id": "run-1"}
+        assert updated["goal"] == {
+            "goal_id": "goal-1",
+            "status": "running",
+            "execution_mode": "single_agent",
+        }
+        assert updated["events"][-2]["event"] == "workflow_state_updated"
+        assert updated["events"][-1]["event"] == "goal_state_updated"
+
+        detail_response = client.get("/v1/sessions/alpha")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["workflow"] == {"enabled": True, "bound_run_id": "run-1"}
+        assert detail_response.json()["goal"] == {
+            "goal_id": "goal-1",
+            "status": "running",
+            "execution_mode": "single_agent",
+        }
+
+        list_response = client.get("/v1/sessions")
+        assert list_response.status_code == 200
+        assert list_response.json()["items"][0]["workflow"] == {
+            "enabled": True,
+            "bound_run_id": "run-1",
+        }
+        assert list_response.json()["items"][0]["goal"] == {
+            "goal_id": "goal-1",
+            "status": "running",
+            "execution_mode": "single_agent",
+        }
+
+
 def test_sessions_can_rename_and_delete(tmp_path: Path) -> None:
     """session 應可更新顯示名稱並刪除。"""
     sessions_dir = tmp_path / "sessions"
@@ -357,6 +410,7 @@ def test_sessions_can_rename_and_delete(tmp_path: Path) -> None:
         assert rename_payload["title"] == "研究筆記"
         assert rename_payload["project_id"] is None
         assert rename_payload["workflow"] is None
+        assert rename_payload["goal"] is None
         assert isinstance(rename_payload["events"], list)
 
         get_response = client.get("/v1/sessions/alpha")

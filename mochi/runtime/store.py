@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 _UNSET = object()
+_DEFAULT_GOAL_EXECUTION_MODE = "workflow"
+_GOAL_EXECUTION_MODES = {"single_agent", _DEFAULT_GOAL_EXECUTION_MODE}
 _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
     "cancelled",
     "completed",
@@ -154,6 +156,7 @@ class RuntimeStore:
                     objective TEXT NOT NULL,
                     title TEXT,
                     goal_type TEXT,
+                    execution_mode TEXT NOT NULL DEFAULT 'workflow',
                     protocol_id TEXT,
                     topic TEXT,
                     project_id TEXT,
@@ -407,6 +410,12 @@ class RuntimeStore:
             _ensure_column(conn, "agent_run_artifacts", "artifact_id", "TEXT")
             _ensure_column(conn, "goals", "title", "TEXT")
             _ensure_column(conn, "goals", "goal_type", "TEXT")
+            _ensure_column(
+                conn,
+                "goals",
+                "execution_mode",
+                "TEXT NOT NULL DEFAULT 'workflow'",
+            )
             _ensure_column(conn, "goals", "protocol_id", "TEXT")
             _ensure_column(conn, "goals", "topic", "TEXT")
             _ensure_column(conn, "goals", "project_id", "TEXT")
@@ -826,6 +835,7 @@ class RuntimeStore:
         objective: str,
         title: str | None = None,
         goal_type: str | None = None,
+        execution_mode: str = _DEFAULT_GOAL_EXECUTION_MODE,
         protocol_id: str | None = None,
         topic: str | None = None,
         project_id: str | None = None,
@@ -845,17 +855,18 @@ class RuntimeStore:
                 conn.execute(
                     """
                     INSERT INTO goals (
-                        id, objective, title, goal_type, protocol_id, topic, project_id,
+                        id, objective, title, goal_type, execution_mode, protocol_id, topic, project_id,
                         workspace_dir, status, current_attempt_id, run_policy_json,
                         capability_policy_json, source_manifest_json, summary_json,
                         metadata_json, latest_error, started_at, finished_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         goal_id,
                         objective,
                         title,
                         goal_type,
+                        _normalize_goal_execution_mode(execution_mode),
                         protocol_id,
                         topic,
                         project_id,
@@ -2856,6 +2867,7 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     payload = dict(row)
+    payload["execution_mode"] = _normalize_goal_execution_mode(payload.get("execution_mode"))
     payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
     payload["capability_policy"] = json.loads(payload.pop("capability_policy_json") or "{}")
     payload["source_manifest"] = json.loads(payload.pop("source_manifest_json") or "{}")
@@ -2993,6 +3005,13 @@ def _load_agent_run_artifacts(conn: sqlite3.Connection, run_id: str) -> list[dic
             }
         )
     return artifacts
+
+
+def _normalize_goal_execution_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in _GOAL_EXECUTION_MODES:
+        return normalized
+    return _DEFAULT_GOAL_EXECUTION_MODE
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

@@ -72,6 +72,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
             objective="Collect forum conversations for corpus building",
             title="Forum Corpus",
             goal_type="dataset_collection",
+            execution_mode="single_agent",
             protocol_id="teacher_student_distill",
             topic="forum corpus",
             project_id="proj-1",
@@ -84,6 +85,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
         )
     )
     assert goal["id"] == "goal-1"
+    assert goal["execution_mode"] == "single_agent"
     assert goal["status"] == "created"
     assert goal["attempts"] == []
 
@@ -129,6 +131,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
 
     saved_goal = asyncio.run(store.get_goal("goal-1"))
     assert saved_goal is not None
+    assert saved_goal["execution_mode"] == "single_agent"
     assert saved_goal["current_attempt_id"] == "goal-attempt-1"
     assert saved_goal["run_policy"]["max_wall_clock_sec"] == 18_000
     assert saved_goal["capability_policy"]["allowed_tools"] == ["web_search"]
@@ -143,6 +146,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     goals = asyncio.run(store.list_goals())
     assert len(goals) == 1
     assert goals[0]["id"] == "goal-1"
+    assert goals[0]["execution_mode"] == "single_agent"
     assert goals[0]["attempts"][0]["id"] == "goal-attempt-1"
 
 
@@ -681,3 +685,47 @@ def test_runtime_store_reads_legacy_goal_rows_without_packet_c_fields(tmp_path: 
     assert len(goals) == 1
     assert goals[0]["run_policy"]["max_wall_clock_sec"] == 18_000
     assert "requested_duration_sec" not in goals[0]["run_policy"]
+
+
+def test_runtime_store_reads_legacy_goal_rows_without_execution_mode_column(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE goals (
+                id TEXT PRIMARY KEY,
+                objective TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO goals(id, objective, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "goal-legacy-execution-mode-1",
+                "Load a legacy goal row without execution mode",
+                "created",
+                "2026-06-25T00:00:00+00:00",
+                "2026-06-25T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    saved_goal = asyncio.run(store.get_goal("goal-legacy-execution-mode-1"))
+    assert saved_goal is not None
+    assert saved_goal["execution_mode"] == "workflow"
+
+    goals = asyncio.run(store.list_goals())
+    assert len(goals) == 1
+    assert goals[0]["execution_mode"] == "workflow"

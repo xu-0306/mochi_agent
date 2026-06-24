@@ -324,6 +324,67 @@ def test_goal_create_normalizes_prompt_duration_into_runtime_contract(tmp_path: 
         assert health_payload["run_policy"]["runtime_mode"] == "fixed_duration"
 
 
+def test_goal_execution_mode_round_trips_and_single_agent_uses_protocol_fallback(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        del self
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="teacher_student_distill",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Single-agent goal completed."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Handle this as a single-agent goal.",
+                "title": "Single Agent Goal",
+                "execution_mode": "single_agent",
+            },
+        )
+        assert create_response.status_code == 200
+        created = create_response.json()
+        goal_id = created["goal_id"]
+        assert created["execution_mode"] == "single_agent"
+
+        list_response = client.get("/v1/goals")
+        assert list_response.status_code == 200
+        assert list_response.json()[0]["execution_mode"] == "single_agent"
+
+        get_response = client.get(f"/v1/goals/{goal_id}")
+        assert get_response.status_code == 200
+        assert get_response.json()["execution_mode"] == "single_agent"
+
+        health_response = client.get(f"/v1/goals/{goal_id}/health")
+        assert health_response.status_code == 200
+        assert health_response.json()["execution_mode"] == "single_agent"
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+        assert start_response.json()["execution_mode"] == "single_agent"
+
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+        assert completed_goal["execution_mode"] == "single_agent"
+        linked_run_id = completed_goal["attempts"][0]["agent_run_id"]
+        assert linked_run_id is not None
+
+        linked_run_response = client.get(f"/v1/agent-runs/{linked_run_id}")
+        assert linked_run_response.status_code == 200
+        assert linked_run_response.json()["protocol_id"] == "teacher_student_distill"
+
+
 def test_goal_create_explicit_runtime_policy_duration_overrides_prompt_duration(
     tmp_path: Path,
 ) -> None:
@@ -6845,6 +6906,7 @@ def test_goal_pause_resume_and_cancel_manage_attempts_without_auto_relaunching_p
             json={
                 "objective": "Collect forum corpora with operator controls",
                 "title": "Controllable Goal",
+                "execution_mode": "single_agent",
                 "protocol_id": "teacher_student_distill",
             },
         )
@@ -6854,20 +6916,24 @@ def test_goal_pause_resume_and_cancel_manage_attempts_without_auto_relaunching_p
         start_response = client.post(f"/v1/goals/{goal_id}/start")
         assert start_response.status_code == 200
         started = start_response.json()
+        assert started["execution_mode"] == "single_agent"
         assert len(started["attempts"]) == 1
 
         running_goal = _wait_goal_until(client, goal_id, {"running"}, timeout_seconds=4.0)
+        assert running_goal["execution_mode"] == "single_agent"
         assert running_goal["attempts"][0]["agent_run_id"] is not None
 
         pause_response = client.post(f"/v1/goals/{goal_id}/pause")
         assert pause_response.status_code == 200
         paused = pause_response.json()
+        assert paused["execution_mode"] == "single_agent"
         assert paused["status"] == "paused"
         assert paused["attempts"][0]["status"] == "paused"
 
         resume_response = client.post(f"/v1/goals/{goal_id}/resume")
         assert resume_response.status_code == 200
         resumed = resume_response.json()
+        assert resumed["execution_mode"] == "single_agent"
         assert resumed["status"] == "running"
         assert len(resumed["attempts"]) == 1
         resumed_attempt = resumed["attempts"][0]
@@ -6877,6 +6943,7 @@ def test_goal_pause_resume_and_cancel_manage_attempts_without_auto_relaunching_p
         cancel_response = client.post(f"/v1/goals/{goal_id}/cancel")
         assert cancel_response.status_code == 200
         cancelled = cancel_response.json()
+        assert cancelled["execution_mode"] == "single_agent"
         assert cancelled["status"] == "cancelled"
         assert cancelled["attempts"][-1]["status"] == "cancelled"
 

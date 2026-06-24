@@ -75,6 +75,8 @@ TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 GOAL_ACTIVE_STATUS = {"queued", "running"}
 GOAL_TERMINAL_STATUS = {"completed", "failed", "cancelled"}
 GOAL_RESUMABLE_STATUS = {"paused", "awaiting_resources", "stalled", "waiting_approval", "failed"}
+GOAL_EXECUTION_MODES = {"single_agent", "workflow"}
+DEFAULT_GOAL_EXECUTION_MODE = "workflow"
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
 AGENT_RUN_ACTIVE_STATUS = {"running"}
 AGENT_RUN_OPERATOR_FINALIZEABLE_STATUS = {"awaiting_resources", "stalled"}
@@ -419,6 +421,7 @@ class RuntimeService:
             objective=payload.objective,
             title=payload.title,
             goal_type=payload.goal_type,
+            execution_mode=payload.execution_mode,
             protocol_id=payload.protocol_id,
             topic=payload.topic,
             project_id=payload.project_id,
@@ -560,6 +563,7 @@ class RuntimeService:
         ]
         return {
             "goal_id": goal_id,
+            "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
             "status": current_status,
             "current_attempt_id": goal.get("current_attempt_id"),
             "attempt_count": len(goal.get("attempts") or []),
@@ -7004,6 +7008,7 @@ def _goal_response(goal: dict[str, Any]) -> dict[str, Any]:
         "objective": goal["objective"],
         "title": goal.get("title"),
         "goal_type": goal.get("goal_type"),
+        "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
         "protocol_id": goal.get("protocol_id"),
         "topic": goal.get("topic"),
         "project_id": goal.get("project_id"),
@@ -7044,6 +7049,13 @@ def _goal_attempt_response(attempt: dict[str, Any]) -> dict[str, Any]:
         "started_at": attempt.get("started_at"),
         "finished_at": attempt.get("finished_at"),
     }
+
+
+def _normalize_goal_execution_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in GOAL_EXECUTION_MODES:
+        return normalized
+    return DEFAULT_GOAL_EXECUTION_MODE
 
 
 def _goal_recovery_state_from_agent_run(run: dict[str, Any]) -> dict[str, Any]:
