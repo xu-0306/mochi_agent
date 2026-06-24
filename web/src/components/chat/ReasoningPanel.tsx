@@ -21,6 +21,7 @@ interface ReasoningPanelProps {
   isStreaming?: boolean
   tokenStats?: TokenStats
   onUndoFileChange?: (change: FileChangeSummary) => Promise<void> | void
+  onOpenTask?: (taskId: string) => void
 }
 
 function StepIcon({ type, status }: { type: ReasoningStep['type']; status?: ReasoningStep['status'] }) {
@@ -253,6 +254,7 @@ export function ReasoningPanel({
   isStreaming = false,
   tokenStats,
   onUndoFileChange,
+  onOpenTask,
 }: ReasoningPanelProps) {
   const [open, setOpen] = React.useState(isStreaming)
   const [userInteracted, setUserInteracted] = React.useState(false)
@@ -374,6 +376,7 @@ export function ReasoningPanel({
                         errorMessage={step.toolError}
                         status={step.status === 'running' ? 'calling' : step.status}
                         type={step.type}
+                        onOpenTask={onOpenTask}
                       />
                     </div>
                   ) : step.content ? (

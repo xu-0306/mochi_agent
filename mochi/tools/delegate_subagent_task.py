@@ -119,5 +119,8 @@ class DelegateSubagentTaskTool(BaseTool):
                 "status": payload.get("status"),
                 "task_id": payload.get("task_id"),
                 "task_type": payload.get("task_type"),
+                "display_name": payload.get("display_name"),
+                "role": payload.get("role"),
+                "parent_session_id": payload.get("parent_session_id"),
             },
         )

@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from mochi.config import defaults
-from mochi.runtime.approvals import InMemoryApprovalStore
+from mochi.runtime.approvals import ApprovalStore, InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.exec_sessions import SessionPollResult
 from mochi.security import deny_security_decision
@@ -18,7 +18,7 @@ from mochi.utils.command_security import CommandSecurityPolicy, CommandSecurityR
 from mochi.utils.security import build_policy_metadata, normalize_workspace_dir, resolve_path_in_workspace
 
 _SHARED_RUNTIME: ExecRuntime | None = None
-_SHARED_APPROVAL_STORE: InMemoryApprovalStore | None = None
+_SHARED_APPROVAL_STORE: ApprovalStore | None = None
 
 
 def _build_suggested_rule(
@@ -62,7 +62,7 @@ def get_shared_exec_runtime() -> ExecRuntime:
     return _SHARED_RUNTIME
 
 
-def get_shared_exec_approval_store() -> InMemoryApprovalStore:
+def get_shared_exec_approval_store() -> ApprovalStore:
     """Return process-wide shared approval store for exec tool family."""
     global _SHARED_APPROVAL_STORE
     if _SHARED_APPROVAL_STORE is None:
@@ -93,7 +93,7 @@ class ExecCommandTool(BaseTool):
         self,
         *,
         runtime: ExecRuntime | None = None,
-        approval_store: InMemoryApprovalStore | None = None,
+        approval_store: ApprovalStore | None = None,
         workspace_dir: str | Path | None = None,
         command_rules: list[dict[str, object]] | None = None,
         allowed_env_vars: list[str] | None = None,

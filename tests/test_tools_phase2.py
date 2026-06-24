@@ -137,30 +137,44 @@ async def test_file_read_tool_result_continues_from_original_source_after_overfl
 async def test_file_read_tool_result_falls_back_to_artifact_when_source_missing(
     tmp_path: Path,
 ) -> None:
-    artifact_dir = tmp_path / "tool-results"
-    artifact_dir.mkdir()
-    artifact_path = artifact_dir / "file_read-fallback.txt"
-    artifact_path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
     source_path = tmp_path / "deleted-source.txt"
+    source_path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
 
     tool = FileReadTool(workspace_dir=tmp_path)
     context = ToolExecutionContext(
         workspace_dir=str(tmp_path),
-        tool_result_store_dir=str(artifact_dir),
-        tool_result_references={
-            "file_read-fallback": {
-                "reference_id": "file_read-fallback",
-                "artifact_path": str(artifact_path),
-                "artifact_encoding": "utf-8",
-                "source_path": str(source_path),
-                "tool_name": "file_read",
-                "encoding": "utf-16",
-            }
-        },
+        session_id="session-fallback-artifact",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
     )
+    guard = ToolResultTransportGuard(preview_chars=120)
+
+    first_chunk = await tool.execute(
+        path="deleted-source.txt",
+        offset=1,
+        limit=3,
+        line_numbers=True,
+        context=context,
+    )
+    assert first_chunk.error is None
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=first_chunk,
+        formatted_content=tool.format_result_for_model(first_chunk, max_chars=10),
+        context=context,
+        max_chars=10,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+    reference_id = outcome.diagnostics["reference_id"]
+    assert reference_id
+
+    artifact_path = Path(context.tool_result_references[reference_id]["artifact_path"])
+    assert artifact_path.is_file()
+    source_path.unlink()
 
     result = await tool.execute(
-        path="tool-result://file_read-fallback",
+        path=f"tool-result://{reference_id}",
         offset=2,
         limit=1,
         line_numbers=True,
@@ -168,10 +182,11 @@ async def test_file_read_tool_result_falls_back_to_artifact_when_source_missing(
     )
 
     assert result.error is None
-    assert result.output == "2: beta"
+    assert result.output == "2: 2: beta"
     assert result.metadata["source_path"] == str(source_path)
     assert result.metadata["artifact_path"] == str(artifact_path)
     assert result.metadata["encoding"] == "utf-8"
+    assert result.metadata["path"] == f"tool-result://{reference_id}"
 
 
 @pytest.mark.asyncio
@@ -225,3 +240,58 @@ async def test_file_read_tool_result_preserves_original_encoding_for_continuatio
     assert continued.error is None
     assert continued.output == "61: line 61\n62: line 62\n63: line 63"
     assert continued.metadata["encoding"] == "utf-16"
+
+
+@pytest.mark.asyncio
+async def test_file_read_tool_result_falls_back_to_artifact_with_artifact_encoding(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "deleted-utf16.txt"
+    target.write_text("alpha\nbeta\ngamma\n", encoding="utf-16")
+
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        session_id="session-fallback-utf16",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+    )
+    tool = FileReadTool(workspace_dir=tmp_path)
+    guard = ToolResultTransportGuard(preview_chars=120)
+
+    first_chunk = await tool.execute(
+        path="deleted-utf16.txt",
+        encoding="utf-16",
+        offset=1,
+        limit=3,
+        line_numbers=True,
+        context=context,
+    )
+    assert first_chunk.error is None
+
+    outcome = guard.guard(
+        tool_name="file_read",
+        result=first_chunk,
+        formatted_content=tool.format_result_for_model(first_chunk, max_chars=10),
+        context=context,
+        max_chars=10,
+        backend_name="openai_compat",
+        api_mode="responses",
+    )
+    reference_id = outcome.diagnostics["reference_id"]
+    assert reference_id
+
+    artifact_path = Path(context.tool_result_references[reference_id]["artifact_path"])
+    assert artifact_path.is_file()
+    target.unlink()
+
+    continued = await tool.execute(
+        path=f"tool-result://{reference_id}",
+        offset=2,
+        limit=1,
+        line_numbers=True,
+        context=context,
+    )
+
+    assert continued.error is None
+    assert continued.output == "2: 2: beta"
+    assert continued.metadata["encoding"] == "utf-8"
+    assert continued.metadata["artifact_path"] == str(artifact_path)

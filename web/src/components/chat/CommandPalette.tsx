@@ -25,8 +25,8 @@ export function buildBuiltinActions(): CommandPaletteAction[] {
     { kind: 'builtin', id: 'voice', label: '/voice', description: 'Open voice overlay' },
     { kind: 'builtin', id: 'model', label: '/model', description: 'Focus model selector' },
     { kind: 'builtin', id: 'export', label: '/export', description: 'Export current conversation' },
-    { kind: 'builtin', id: 'workflow', label: '/workflow', description: 'Enable workflow mode for this conversation' },
-    { kind: 'builtin', id: 'chat', label: '/chat', description: 'Return this conversation to normal chat mode' },
+    { kind: 'builtin', id: 'workflow', label: '/workflow', description: 'Insert the workflow command into the composer' },
+    { kind: 'builtin', id: 'chat', label: '/chat', description: 'Insert the chat command into the composer' },
   ]
 }
 

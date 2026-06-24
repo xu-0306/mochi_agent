@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from mochi.agents.multi_agent.execution_policy import SubagentExecutionPolicy
 from mochi.agents.multi_agent.roles import build_controlled_execution_roles
 from mochi.agents.multi_agent.utils import parse_json_payload
-from mochi.runtime.approvals import InMemoryApprovalStore
+from mochi.runtime.approvals import ApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.tools.exec_command import ExecCommandTool
 
@@ -39,7 +39,7 @@ class SubagentExecutionCoordinator:
         generate_role_candidate: RoleGenerator,
         invoke_text: TextInvoker,
         exec_runtime: ExecRuntime | None = None,
-        exec_approval_store: InMemoryApprovalStore | None = None,
+        exec_approval_store: ApprovalStore | None = None,
         require_approval: bool = True,
         command_rules: list[dict[str, Any]] | None = None,
         allowed_env_vars: list[str] | None = None,
@@ -60,6 +60,7 @@ class SubagentExecutionCoordinator:
         task_input: str,
         execution_policy: SubagentExecutionPolicy,
         guidance_messages: list[str],
+        role_guidance_messages: dict[str, list[str]] | None,
         selected_models_roles: dict[str, str],
         ordered_models: list[str],
         metadata: dict[str, Any],
@@ -125,7 +126,11 @@ class SubagentExecutionCoordinator:
                 role_instruction=planner_role.instruction,
                 model_id=planner_model_id,
                 task_input=task_input,
-                guidance_messages=guidance_messages,
+                guidance_messages=_guidance_messages_for_role(
+                    guidance_messages=guidance_messages,
+                    role_guidance_messages=role_guidance_messages,
+                    role_id=planner_role.role_id,
+                ),
                 supporting_candidates=[],
                 stage=planner_task_key,
             )
@@ -159,7 +164,11 @@ class SubagentExecutionCoordinator:
             max_commands_per_request=execution_policy.max_commands_per_request,
             default_timeout_sec=execution_policy.default_timeout_sec,
             background_allowed=execution_policy.background_allowed,
-            guidance_messages=guidance_messages,
+            guidance_messages=_guidance_messages_for_role(
+                guidance_messages=guidance_messages,
+                role_guidance_messages=role_guidance_messages,
+                role_id=executor_role.role_id,
+            ),
         )
         executor_summary = _resume_task_summary(resume_hooks, executor_task_key)
         executor_output = _resume_candidate_payload(executor_summary, "executor_output")
@@ -267,6 +276,12 @@ class SubagentExecutionCoordinator:
                 task_input=task_input,
                 execution_plan=str(planner_output.get("content") or ""),
                 execution_request=execution_request,
+            )
+            controller_prompt = _append_role_guidance_to_prompt(
+                prompt=controller_prompt,
+                guidance_messages=guidance_messages,
+                role_guidance_messages=role_guidance_messages,
+                role_id=controller_role.role_id,
             )
             saved_controller_summary = _resume_task_summary(resume_hooks, controller_task_key)
             decision = _resume_dict_summary(saved_controller_summary, "controller_decision")
@@ -412,6 +427,12 @@ class SubagentExecutionCoordinator:
                 execution_requests=execution_requests,
                 controller_decisions=controller_decisions,
                 execution_results=execution_results,
+            )
+            evaluator_prompt = _append_role_guidance_to_prompt(
+                prompt=evaluator_prompt,
+                guidance_messages=guidance_messages,
+                role_guidance_messages=role_guidance_messages,
+                role_id=evaluator_role.role_id,
             )
             _mark_task_running(
                 resume_hooks,
@@ -709,6 +730,45 @@ def _mark_task_reused(
     marker = resume_hooks.mark_task_reused if resume_hooks is not None else None
     if callable(marker):
         marker(**kwargs)
+
+
+def _guidance_messages_for_role(
+    *,
+    guidance_messages: list[str],
+    role_guidance_messages: dict[str, list[str]] | None,
+    role_id: str,
+) -> list[str]:
+    merged = [item for item in guidance_messages if item.strip()]
+    role_messages = (role_guidance_messages or {}).get(role_id, [])
+    for item in role_messages:
+        text = str(item).strip()
+        if text and text not in merged:
+            merged.append(text)
+    return merged
+
+
+def _append_role_guidance_to_prompt(
+    *,
+    prompt: str,
+    guidance_messages: list[str],
+    role_guidance_messages: dict[str, list[str]] | None,
+    role_id: str,
+) -> str:
+    role_messages = [
+        str(item).strip()
+        for item in (role_guidance_messages or {}).get(role_id, [])
+        if str(item).strip() and str(item).strip() not in guidance_messages
+    ]
+    if not role_messages:
+        return prompt
+    return "\n".join(
+        [
+            prompt.rstrip(),
+            "",
+            "Role-specific guidance:",
+            *[f"- {item}" for item in role_messages],
+        ]
+    ).strip()
 
 
 def _build_controlled_execution_request_prompt(

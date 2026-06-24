@@ -1,3 +1,6 @@
+import type { WorkflowProgressCardView } from '@/components/workflow/types'
+import type { DelegatedSubagentCardView } from '@/lib/subagent-tasks'
+
 export type MessageType = 'user' | 'assistant' | 'system' | 'error'
 
 export type MessageEventType =
@@ -80,8 +83,12 @@ export interface Message {
     visible: string
     reasoning: string
     pendingTag: string
+    activeTag: string | null
     isInsideThink: boolean
     startedReasoningBlock: boolean
   }
   inlineReasoningStepId?: string
+  workflowCard?: WorkflowProgressCardView
+  workflowCompletion?: boolean
+  subagentTaskCard?: DelegatedSubagentCardView
 }

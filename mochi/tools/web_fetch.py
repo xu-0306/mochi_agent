@@ -20,7 +20,7 @@ from mochi.tools._http import (
     http_request,
     make_default_client,
 )
-from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 # ---------------------------------------------------------------------------
 # trafilatura optional import
@@ -124,6 +124,43 @@ def _extract_with_htmlparser(html: str) -> str:
 def _is_supported_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _coerce_domain_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    domains: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        domain = item.strip().lower().lstrip(".").rstrip(".")
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def _blocked_domains_from_context(context: ToolExecutionContext | None) -> list[str]:
+    if context is None:
+        return []
+    return _coerce_domain_list(context.permission_policy.get("blocked_web_domains"))
+
+
+def _url_matches_blocked_domain(url: str, blocked_domains: list[str]) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in blocked_domains)
+
+
+def _blocked_url_tool_result(url: str, blocked_domains: list[str]) -> ToolResult:
+    return ToolResult(
+        error="Access to this URL is blocked by policy.",
+        metadata={
+            "url": url,
+            "blocked_domains": list(blocked_domains),
+        },
+        suggestion="Use a different source on an allowed domain.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +269,12 @@ class WebFetchTool(BaseTool):
             "additionalProperties": False,
         }
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """\u64f7\u53d6\u7db2\u5740\u5167\u5bb9\u3002"""
         url = str(kwargs.get("url", ""))
         output_format = str(kwargs.get("output_format", "text"))
@@ -242,6 +284,9 @@ class WebFetchTool(BaseTool):
             return ToolResult(error="`url` must not be empty.")
         if not _is_supported_url(clean_url):
             return ToolResult(error="`url` must be an HTTP or HTTPS URL.")
+        blocked_domains = _blocked_domains_from_context(context)
+        if _url_matches_blocked_domain(clean_url, blocked_domains):
+            return _blocked_url_tool_result(clean_url, blocked_domains)
 
         effective_max_bytes = (
             int(max_bytes_arg) if max_bytes_arg is not None else self._max_bytes

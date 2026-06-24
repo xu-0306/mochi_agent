@@ -39,6 +39,76 @@ if TYPE_CHECKING:
     from mochi.tools.registry import ToolRegistry
 
 
+_CHANNEL_MARKER_RE = re.compile(
+    r"(?:<\|channel\|?>|<channel\|>|<\|message\|?>|<message\|>)",
+    re.IGNORECASE,
+)
+_HEADER_MARKER_RE = re.compile(
+    r"(?:<\|start_header_id\|>|<\|end_header_id\|>|<\|im_start\|>|<\|im_end\|>|<\|eot_id\|>)",
+    re.IGNORECASE,
+)
+_ROLE_SENTINEL_RE = re.compile(
+    r"<[|｜]\s*(?:assistant|user|system|tool)\s*[|｜]>",
+    re.IGNORECASE,
+)
+_CHANNEL_REASONING_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:<\|channel\|?>|<channel\|>|<\|message\|?>|<message\|>)\s*)+"
+    r"(?:(?:thought|analysis|reasoning)\s*)?"
+    r"(?:(?:<\|channel\|?>|<channel\|>|<\|message\|?>|<message\|>)\s*)*",
+    re.IGNORECASE,
+)
+_ROLE_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:<\|start_header_id\|>|<\|im_start\|>)\s*)+"
+    r"(?:assistant|user|system|tool)\s*"
+    r"(?:(?:<\|end_header_id\|>|<\|im_end\|>|<\|eot_id\|>)\s*)*",
+    re.IGNORECASE,
+)
+_ROLE_SENTINEL_PREFIX_RE = re.compile(
+    r"^\s*<[|｜]\s*(?:assistant|user|system|tool)\s*[|｜]>\s*",
+    re.IGNORECASE,
+)
+_REASONING_TAGS: tuple[str, ...] = ("think", "analysis", "reasoning")
+_REASONING_OPEN_TAGS: tuple[str, ...] = tuple(f"<{tag}>" for tag in _REASONING_TAGS)
+
+
+def _find_opening_reasoning_tag(source: str) -> tuple[int, str, str] | None:
+    lowered = source.lower()
+    best_match: tuple[int, str, str] | None = None
+    for tag in _REASONING_TAGS:
+        token = f"<{tag}>"
+        index = lowered.find(token)
+        if index == -1:
+            continue
+        if best_match is None or index < best_match[0]:
+            best_match = (index, tag, token)
+    return best_match
+
+
+def _find_closing_reasoning_tag(source: str) -> tuple[int, str, str] | None:
+    lowered = source.lower()
+    best_match: tuple[int, str, str] | None = None
+    for tag in _REASONING_TAGS:
+        token = f"</{tag}>"
+        index = lowered.find(token)
+        if index == -1:
+            continue
+        if best_match is None or index < best_match[0]:
+            best_match = (index, tag, token)
+    return best_match
+
+
+def _find_partial_tag_suffix(source: str, candidates: tuple[str, ...]) -> str:
+    if not source or not candidates:
+        return ""
+    lowered = source.lower()
+    max_size = min(len(source), max(len(candidate) - 1 for candidate in candidates))
+    for size in range(max_size, 0, -1):
+        suffix = lowered[-size:]
+        if any(candidate.startswith(suffix) and candidate != suffix for candidate in candidates):
+            return source[-size:]
+    return ""
+
+
 class AsyncReActLoop:
     """Run a non-streaming ReAct loop until a final answer is produced."""
 
@@ -166,6 +236,7 @@ class AsyncReActLoop:
             "last_low_info_chars": None,
             "last_low_info_lines": None,
         }
+        allowed_tool_names = {tool.name for tool in tools}
 
         try:
             for iteration in range(self._max_iterations):
@@ -368,13 +439,30 @@ class AsyncReActLoop:
                             tool_call=tool_call,
                             evidence_guard_state=evidence_guard_state,
                         )
+                        unavailable_tool_result = self._build_unavailable_tool_result(
+                            tool_call=tool_call,
+                            allowed_tool_names=allowed_tool_names,
+                        )
+                        if unavailable_tool_result is not None:
+                            tool_output = unavailable_tool_result.output
+                            tool_error = unavailable_tool_result.error
+                            tool_metadata = (
+                                dict(unavailable_tool_result.metadata)
+                                if isinstance(unavailable_tool_result.metadata, dict)
+                                else {}
+                            )
+                            tool_result_payload = unavailable_tool_result
+                            formatted_content = self._format_tool_message_content(
+                                output=tool_output,
+                                error=tool_error,
+                            )
                         guarded_tool_result = self._build_guarded_tool_result(
                             tool_call=tool_call,
                             literature_state=literature_state,
                             web_fetch_guard_state=web_fetch_guard_state,
                             web_search_guard_state=web_search_guard_state,
                         )
-                        if guarded_tool_result is not None:
+                        if unavailable_tool_result is None and guarded_tool_result is not None:
                             tool_output = guarded_tool_result.output
                             tool_error = guarded_tool_result.error
                             tool_metadata = (
@@ -388,7 +476,7 @@ class AsyncReActLoop:
                                 error=tool_error,
                             )
                         if self._tool_registry is not None:
-                            if guarded_tool_result is None:
+                            if unavailable_tool_result is None and guarded_tool_result is None:
                                 try:
                                     tool_result = await self._tool_registry.execute(
                                         tool_call.name,
@@ -415,7 +503,7 @@ class AsyncReActLoop:
                                         output=tool_output,
                                         error=tool_error,
                                     )
-                        elif guarded_tool_result is None:
+                        elif unavailable_tool_result is None and guarded_tool_result is None:
                             tool_error = "No tool registry configured."
                             tool_result_payload = ToolResult(output=tool_output, error=tool_error)
                             formatted_content = self._format_tool_message_content(
@@ -574,6 +662,18 @@ class AsyncReActLoop:
         )
 
     def _split_thinking_blocks(self, content: str, thinking: str = "") -> tuple[str, str]:
+        closing_only_match = _find_closing_reasoning_tag(content)
+        if _find_opening_reasoning_tag(content) is None and closing_only_match is not None:
+            visible = content[closing_only_match[0] + len(closing_only_match[2]) :]
+            combined_thinking = "".join(
+                part
+                for part in (thinking, content[: closing_only_match[0]])
+                if part
+            ).strip()
+            return (
+                self._sanitize_reasoning_artifacts(visible),
+                self._sanitize_reasoning_artifacts(combined_thinking),
+            )
         state: dict[str, Any] = {"in_think": False, "buffer": ""}
         visible, extracted_thinking = self._split_stream_thinking_delta(content, state)
         visible_tail, thinking_tail = self._finalize_stream_thinking_delta(state)
@@ -582,7 +682,9 @@ class AsyncReActLoop:
             for part in (thinking, extracted_thinking, thinking_tail)
             if part
         ).strip()
-        return (visible + visible_tail).strip(), combined_thinking
+        sanitized_visible = self._sanitize_reasoning_artifacts((visible + visible_tail).strip())
+        sanitized_thinking = self._sanitize_reasoning_artifacts(combined_thinking)
+        return sanitized_visible, sanitized_thinking
 
     @staticmethod
     def _split_stream_thinking_delta(
@@ -592,17 +694,31 @@ class AsyncReActLoop:
         visible_parts: list[str] = []
         thinking_parts: list[str] = []
         buffer = str(state.get("buffer") or "")
-        in_think = bool(state.get("in_think"))
+        current_tag = str(state.get("current_tag") or "").lower() or None
+        in_think = bool(state.get("in_think") or current_tag)
 
         for char in delta:
             if buffer:
                 buffer += char
-                target = "</think>" if in_think else "<think>"
+                target = f"</{current_tag}>" if current_tag else None
                 lowered_buffer = buffer.lower()
-                if target.startswith(lowered_buffer):
+                if target is not None and target.startswith(lowered_buffer):
                     if lowered_buffer == target:
                         buffer = ""
-                        in_think = not in_think
+                        current_tag = None
+                        in_think = False
+                    continue
+                if target is None and any(
+                    candidate.startswith(lowered_buffer) for candidate in _REASONING_OPEN_TAGS
+                ):
+                    matched_open_tag = next(
+                        (candidate for candidate in _REASONING_OPEN_TAGS if candidate == lowered_buffer),
+                        None,
+                    )
+                    if matched_open_tag is not None:
+                        buffer = ""
+                        current_tag = matched_open_tag[1:-1]
+                        in_think = True
                     continue
                 if in_think:
                     thinking_parts.append(buffer)
@@ -622,21 +738,72 @@ class AsyncReActLoop:
 
         state["buffer"] = buffer
         state["in_think"] = in_think
+        state["current_tag"] = current_tag or ""
         return "".join(visible_parts), "".join(thinking_parts)
 
     @staticmethod
     def _finalize_stream_thinking_delta(state: dict[str, Any]) -> tuple[str, str]:
         buffer = str(state.get("buffer") or "")
-        in_think = bool(state.get("in_think"))
+        current_tag = str(state.get("current_tag") or "").lower() or None
+        in_think = bool(state.get("in_think") or current_tag)
         state["buffer"] = ""
+        state["current_tag"] = ""
         if not buffer:
             return "", ""
         if in_think:
             return "", buffer
         return buffer, ""
 
+    @staticmethod
+    def _sanitize_reasoning_artifacts(value: str) -> str:
+        if not value:
+            return ""
+        normalized = value.replace("\r\n", "\n")
+        stripped = _CHANNEL_REASONING_PREFIX_RE.sub("", normalized, count=1)
+        stripped = _ROLE_PREFIX_RE.sub("", stripped, count=1)
+        stripped = _ROLE_SENTINEL_PREFIX_RE.sub("", stripped, count=1)
+        stripped = _CHANNEL_MARKER_RE.sub("", stripped)
+        stripped = _HEADER_MARKER_RE.sub("", stripped)
+        stripped = _ROLE_SENTINEL_RE.sub("", stripped)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+        return stripped.strip()
+
     def _remember_turn_message(self, message: Message) -> None:
         self._turn_messages.append(Message(**message.__dict__))
+
+    def _build_unavailable_tool_result(
+        self,
+        *,
+        tool_call: ToolCall,
+        allowed_tool_names: set[str],
+    ) -> ToolResult | None:
+        if tool_call.name and tool_call.name in allowed_tool_names and self._tool_registry is not None:
+            if self._tool_registry.get(tool_call.name) is not None:
+                return None
+
+        available_tools = sorted(name for name in allowed_tool_names if name)
+        available_preview = ", ".join(available_tools[:12])
+        if len(available_tools) > 12:
+            available_preview = f"{available_preview}, +{len(available_tools) - 12} more"
+        available_hint = available_preview or "(none)"
+        requested_tool = tool_call.name or "(empty tool name)"
+
+        return ToolResult(
+            error=(
+                f"Tool '{requested_tool}' is not available in this turn. "
+                f"Use only the exposed tools: {available_hint}."
+            ),
+            metadata={
+                "guard": "tool_not_exposed",
+                "requested_tool": requested_tool,
+                "available_tools": available_tools,
+            },
+            retryable=False,
+            suggestion=(
+                "Choose one of the exposed tools for this turn, "
+                "or produce the final answer without calling unavailable tools."
+            ),
+        )
 
     def _format_tool_message_content(self, *, output: Any, error: str | None) -> str:
         if error:

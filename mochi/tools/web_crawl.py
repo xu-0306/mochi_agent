@@ -10,8 +10,15 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from mochi.tools._http import ToolHttpError, error_to_tool_result, http_request, make_default_client
-from mochi.tools.base import BaseTool, ToolResult
-from mochi.tools.web_fetch import _extract_with_htmlparser, _extract_with_trafilatura, _is_supported_url
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from mochi.tools.web_fetch import (
+    _blocked_domains_from_context,
+    _blocked_url_tool_result,
+    _extract_with_htmlparser,
+    _extract_with_trafilatura,
+    _is_supported_url,
+    _url_matches_blocked_domain,
+)
 
 
 class _LinkExtractor(HTMLParser):
@@ -130,12 +137,20 @@ class WebCrawlTool(BaseTool):
     def search_hint(self) -> str | None:
         return "Use this to collect a few related pages from one site before summarizing or extracting evidence."
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         url = str(kwargs.get("url", "")).strip()
         if not url:
             return ToolResult(error="`url` must not be empty.")
         if not _is_supported_url(url):
             return ToolResult(error="`url` must be an HTTP or HTTPS URL.")
+        blocked_domains = _blocked_domains_from_context(context)
+        if _url_matches_blocked_domain(url, blocked_domains):
+            return _blocked_url_tool_result(url, blocked_domains)
 
         max_pages = int(kwargs.get("max_pages", self._max_pages_default))
         max_depth = int(kwargs.get("max_depth", 1))
@@ -153,12 +168,16 @@ class WebCrawlTool(BaseTool):
         visited: set[str] = set()
         pages: list[dict[str, Any]] = []
         truncated = False
+        blocked_urls: list[str] = []
 
         while queue and len(pages) < max_pages:
             current_url, depth = queue.popleft()
             if current_url in visited:
                 continue
             visited.add(current_url)
+            if _url_matches_blocked_domain(current_url, blocked_domains):
+                blocked_urls.append(current_url)
+                continue
 
             fetched = await self._fetch_page(current_url, max_bytes=max_bytes)
             if fetched.error is not None:
@@ -184,6 +203,9 @@ class WebCrawlTool(BaseTool):
                     continue
                 if same_domain_only and (urlparse(link).hostname or "").lower() != origin_host:
                     continue
+                if _url_matches_blocked_domain(link, blocked_domains):
+                    blocked_urls.append(link)
+                    continue
                 if link in visited:
                     continue
                 queue.append((link, depth + 1))
@@ -200,6 +222,8 @@ class WebCrawlTool(BaseTool):
                 "max_depth": max_depth,
                 "same_domain_only": same_domain_only,
                 "truncated": truncated,
+                "blocked_domains": blocked_domains,
+                "blocked_urls": blocked_urls,
             },
         )
 

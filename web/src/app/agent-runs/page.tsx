@@ -24,6 +24,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { WorkflowDesk } from '@/components/workflow/WorkflowDesk'
 import {
   buildThinkingLevelOptions,
   findThinkingLevelOption,
@@ -82,27 +83,6 @@ const TERMINAL_RUN_STATUSES = new Set([
   'done',
   'error',
 ])
-
-const TIMELINE_ROLE_STYLES: Record<
-  WorkflowTimelineItem['role'],
-  { badge: string; bubble: string; label: string }
-> = {
-  system: {
-    badge: 'bg-primary-500/15 text-primary-200 ring-1 ring-primary-500/30',
-    bubble: 'border-primary-500/20 bg-primary-500/8',
-    label: 'System',
-  },
-  assistant: {
-    badge: 'bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-500/30',
-    bubble: 'border-emerald-500/20 bg-emerald-500/8',
-    label: 'Workflow',
-  },
-  operator: {
-    badge: 'bg-neutral-700/80 text-foreground ring-1 ring-border',
-    bubble: 'border-border bg-surface-layer',
-    label: 'Operator',
-  },
-}
 
 function createTimelineItem(
   item: Omit<WorkflowTimelineItem, 'id' | 'timestamp'> & { timestamp?: string }
@@ -1224,6 +1204,16 @@ export default function AgentRunsPage() {
   const activeRunTopic = activeRunSummary?.topic ?? null
   const activeRunWorkspaceDir = activeRunSummary?.workspace_dir ?? null
 
+  const handleWorkflowRunUpdated = React.useCallback((detail: api.AgentRunDetail) => {
+    setActiveRunDetail(detail)
+    setTimeline(buildTimelineFromRun(detail))
+    setRuns((current) =>
+      [detail, ...current.filter((run) => run.run_id !== detail.run_id)].sort(
+        (left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at)
+      )
+    )
+  }, [])
+
   const handleSendMessage = React.useCallback(async () => {
     if (!activeRunId) {
       await handleCreate()
@@ -1470,56 +1460,12 @@ export default function AgentRunsPage() {
 
                 <Separator />
 
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-semibold text-foreground">Conversation timeline</h3>
-                      <p className="text-xs text-muted-foreground">
-                        Operator and assistant messages are reconstructed from agent run events.
-                      </p>
-                    </div>
-                    {activeRunDetail ? (
-                      <Badge variant="outline">
-                        Events: {activeRunDetail.events.length}
-                      </Badge>
-                    ) : null}
-                  </div>
-
-                  <div className="space-y-3">
-                    {timeline.map((item) => {
-                      const style = TIMELINE_ROLE_STYLES[item.role]
-                      return (
-                        <div
-                          key={item.id}
-                          className={cn(
-                            'rounded-xl border p-4 shadow-sm',
-                            style.bubble,
-                            item.status === 'error' && 'border-destructive/40 bg-destructive/10',
-                            item.status === 'pending' && 'border-warning/40 bg-warning/10'
-                          )}
-                        >
-                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                            <div className="flex items-center gap-2">
-                              <span className={cn('rounded-full px-2 py-0.5 text-[11px] font-medium', style.badge)}>
-                                {style.label}
-                              </span>
-                              <span className="text-sm font-semibold text-foreground">{item.title}</span>
-                            </div>
-                            <span className="text-[11px] text-muted-foreground">
-                              {formatDateTime(item.timestamp)}
-                            </span>
-                          </div>
-                          <p className="whitespace-pre-wrap text-sm text-muted-foreground">{item.body}</p>
-                          {item.meta ? (
-                            <p className="mt-2 text-[11px] uppercase tracking-wide text-muted-foreground">
-                              {item.meta}
-                            </p>
-                          ) : null}
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
+                <WorkflowDesk
+                  run={activeRunDetail}
+                  summary={activeRunSummary}
+                  debugEntries={timeline}
+                  onRunUpdated={handleWorkflowRunUpdated}
+                />
               </CardContent>
             </Card>
 

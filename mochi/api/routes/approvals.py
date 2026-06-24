@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi import FastAPI
 
 from mochi.api.server import _get_config, _get_or_create_engine
+from mochi.runtime.approvals import PersistentApprovalStore
 from mochi.runtime.models import ApprovalResolution
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
@@ -88,7 +89,11 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
     engine = await _get_or_create_engine(app)
     store = RuntimeStore(Path(config.sessions_dir) / "runtime.db")
     await store.initialize()
-    service = RuntimeService(engine=engine, store=store)
+    service = RuntimeService(
+        engine=engine,
+        store=store,
+        exec_approval_store=PersistentApprovalStore(Path(config.sessions_dir) / "exec-approvals.db"),
+    )
     service.update_security_config(config.security)
     service.bind_app_config(config=config, config_path=getattr(app.state, "config_path", None))
     service.set_runtime_tasks_root(Path(config.sessions_dir) / "runtime-tasks")

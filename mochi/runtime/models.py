@@ -24,6 +24,19 @@ class TaskCreateRequest(BaseModel):
     inference_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskMessageRequest(BaseModel):
+    """Request payload for appending guidance-only transcript to a delegated task."""
+
+    content: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> TaskMessageRequest:
+        if not self.content.strip():
+            raise ValueError("content is required")
+        return self
+
+
 class ApprovalReplayOverride(BaseModel):
     """Optional approval replay payload used instead of the stored mutation call."""
 
@@ -58,6 +71,67 @@ class ApprovalResolution(BaseModel):
     reason: str | None = None
     rule: dict[str, Any] | None = None
     replay_override: ApprovalReplayOverride | None = None
+
+
+class GoalCreateRequest(BaseModel):
+    """Request payload for creating a durable high-level goal."""
+
+    objective: str = Field(min_length=1)
+    title: str | None = None
+    goal_type: str | None = None
+    protocol_id: str | None = None
+    topic: str | None = None
+    project_id: str | None = None
+    workspace_dir: str | None = None
+    run_policy: dict[str, Any] = Field(default_factory=dict)
+    capability_policy: dict[str, Any] = Field(default_factory=dict)
+    source_manifest: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GoalAttemptResponse(BaseModel):
+    """Serialized goal-attempt payload for API responses."""
+
+    attempt_id: str
+    goal_id: str
+    attempt_index: int
+    status: str
+    trigger: str | None = None
+    agent_run_id: str | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    latest_error: str | None = None
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class GoalResponse(BaseModel):
+    """Serialized goal payload for API responses."""
+
+    goal_id: str
+    objective: str
+    title: str | None = None
+    goal_type: str | None = None
+    protocol_id: str | None = None
+    topic: str | None = None
+    project_id: str | None = None
+    workspace_dir: str | None = None
+    status: str
+    current_attempt_id: str | None = None
+    run_policy: dict[str, Any] = Field(default_factory=dict)
+    capability_policy: dict[str, Any] = Field(default_factory=dict)
+    source_manifest: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    latest_error: str | None = None
+    attempts: list[GoalAttemptResponse] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 class AgentRunArtifact(BaseModel):
@@ -116,6 +190,10 @@ class AgentRunMessageRequest(BaseModel):
         return self
 
 
+class AgentRunSubagentMessageRequest(AgentRunMessageRequest):
+    """Request payload for appending a subagent-targeted workflow message to an Agent Run."""
+
+
 class AgentRunResumeRequest(BaseModel):
     """Request payload for resuming an Agent Run."""
 
@@ -171,6 +249,8 @@ class AgentRunAttemptPackageResponse(BaseModel):
     events: list[dict[str, Any]] = Field(default_factory=list)
     role_outputs: list[dict[str, Any]] = Field(default_factory=list)
     evaluation_events: list[dict[str, Any]] = Field(default_factory=list)
+    collector_shard_manifests: list[dict[str, Any]] = Field(default_factory=list)
+    collector_provenance_manifest: dict[str, Any] | None = None
     dataset_records: list[dict[str, Any]] = Field(default_factory=list)
     run_summary: dict[str, Any] | None = None
     evidence_summary: dict[str, Any] | None = None
@@ -190,6 +270,8 @@ class AgentRunDatasetPackageResponse(BaseModel):
     dataset_record_count: int = 0
     training_ready_count: int = 0
     excluded_record_count: int = 0
+    collector_shard_manifests: list[dict[str, Any]] = Field(default_factory=list)
+    collector_provenance_manifest: dict[str, Any] | None = None
     attempts: list[dict[str, Any]] = Field(default_factory=list)
     all_records: list[dict[str, Any]] = Field(default_factory=list)
     training_ready_records: list[dict[str, Any]] = Field(default_factory=list)

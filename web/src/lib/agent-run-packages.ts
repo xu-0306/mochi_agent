@@ -11,6 +11,10 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
 }
 
+function getNullableString(value: unknown): string | null {
+  return getString(value)
+}
+
 function getRecordArray(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter(isRecord) : []
 }
@@ -97,6 +101,75 @@ function artifactContent(
 ): Record<string, unknown> | null {
   const artifact = artifacts.find((item) => item.artifact_type === artifactType) ?? null
   return isRecord(artifact?.metadata.content) ? artifact.metadata.content : null
+}
+
+function extractCollectorShardManifests(
+  artifacts: api.AgentRunArtifact[]
+): Array<Record<string, unknown>> {
+  return artifacts
+    .filter((artifact) => artifact.artifact_type === 'collector_shard_manifest')
+    .map((artifact) => {
+      const content = isRecord(artifact.metadata.content) ? artifact.metadata.content : {}
+      return {
+        ...content,
+        artifact_id: artifact.artifact_id,
+        title: artifact.title,
+        uri: artifact.uri,
+      }
+    })
+}
+
+function filterCollectorShardManifests(
+  manifests: Array<Record<string, unknown>>,
+  attemptId: string | null
+): Array<Record<string, unknown>> {
+  return manifests.filter((manifest) => getString(manifest.attempt_id) === attemptId)
+}
+
+function buildCollectorProvenanceManifest(
+  records: Array<Record<string, unknown>>
+): Record<string, unknown> | null {
+  const manifestRecords: Array<Record<string, unknown>> = []
+  records.forEach((item, index) => {
+    const record = isRecord(item.record) ? item.record : item
+    const metadata = isRecord(record.metadata) ? record.metadata : null
+    const provenance = isRecord(metadata?.collector_provenance) ? metadata.collector_provenance : null
+    if (!provenance) {
+      return
+    }
+    manifestRecords.push({
+      ...provenance,
+      record_index: index + 1,
+      artifact_id: getString(item.artifact_id),
+      attempt_id: getString(item.attempt_id),
+    })
+  })
+  if (manifestRecords.length === 0) {
+    return null
+  }
+
+  const countByValue = (key: string) => {
+    const counts = new Map<string, number>()
+    for (const item of manifestRecords) {
+      const value = getString(item[key])
+      if (!value) {
+        continue
+      }
+      counts.set(value, (counts.get(value) ?? 0) + 1)
+    }
+    return Array.from(counts.entries())
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([value, count]) => ({ value, count }))
+  }
+
+  return {
+    schema_version: '1.0',
+    record_count: manifestRecords.length,
+    records: manifestRecords,
+    adapter_counts: countByValue('adapter_name'),
+    policy_disposition_counts: countByValue('policy_disposition'),
+    license_counts: countByValue('license'),
+  }
 }
 
 function selectedModelsByRole(run: api.AgentRunDetail): Record<string, string | null> {
@@ -212,6 +285,7 @@ export function buildAttemptPackageFallback(
     .filter((artifact) => artifact.artifact_type === 'dataset_record')
     .map((artifact) => artifact.metadata.record)
     .filter((record): record is Record<string, unknown> => isRecord(record))
+  const collectorShardManifests = extractCollectorShardManifests(artifacts)
   const candidateId = selectedCandidateId(run, datasetRecords)
   const finalAnswerValue = finalAnswer(run, datasetRecords)
 
@@ -240,6 +314,8 @@ export function buildAttemptPackageFallback(
     events,
     role_outputs: roleOutputs,
     evaluation_events: events.filter((event) => event.type === 'evaluation'),
+    collector_shard_manifests: collectorShardManifests,
+    collector_provenance_manifest: buildCollectorProvenanceManifest(datasetRecords),
     dataset_records: datasetRecords,
     run_summary: {
       ...run.summary,
@@ -260,6 +336,7 @@ export function buildAttemptPackageFallback(
 
 export function buildDatasetPackageFallback(run: api.AgentRunDetail): Record<string, unknown> {
   const datasetArtifacts = run.artifacts.filter((artifact) => artifact.artifact_type === 'dataset_record')
+  const collectorShardManifests = extractCollectorShardManifests(run.artifacts)
   const grouped = new Map<string, Array<Record<string, unknown>>>()
   const scheduleAttempts = getScheduleAttempts(run)
 
@@ -317,6 +394,10 @@ export function buildDatasetPackageFallback(run: api.AgentRunDetail): Record<str
       dataset_record_count: records.length,
       training_ready_count: trainingReady.length,
       excluded_record_count: excluded.length,
+      collector_shard_manifests: extractCollectorShardManifests(
+        scopedArtifacts(run, attemptId === 'unscoped' ? null : attemptId, attemptId)
+      ),
+      collector_provenance_manifest: buildCollectorProvenanceManifest(records),
       dataset_records: records,
     })
     allRecords.push(...records)
@@ -333,6 +414,8 @@ export function buildDatasetPackageFallback(run: api.AgentRunDetail): Record<str
     dataset_record_count: allRecords.length,
     training_ready_count: trainingReadyRecords.length,
     excluded_record_count: allRecords.length - trainingReadyRecords.length,
+    collector_shard_manifests: collectorShardManifests,
+    collector_provenance_manifest: buildCollectorProvenanceManifest(allRecords),
     attempts,
     all_records: allRecords,
     training_ready_records: trainingReadyRecords,
@@ -346,25 +429,43 @@ export function buildDatasetPackageFallback(run: api.AgentRunDetail): Record<str
 export function buildTrainingReadyOnlyDatasetPackage(
   datasetPackage: Record<string, unknown>
 ): Record<string, unknown> {
-  const attempts = getRecordArray(datasetPackage.attempts).map((attempt) => {
-    const datasetRecords = getRecordArray(attempt.dataset_records).filter(
-      (record) => record.training_ready === true
-    )
-    return {
+  const allCollectorShardManifests = getRecordArray(datasetPackage.collector_shard_manifests)
+  const attempts: Array<Record<string, unknown>> = getRecordArray(datasetPackage.attempts).map(
+    (attempt) => {
+      const datasetRecords = getRecordArray(attempt.dataset_records).filter(
+        (record) => record.training_ready === true
+      )
+      const attemptId = getNullableString(attempt.attempt_id)
+      return {
       ...attempt,
+      collector_shard_manifests: filterCollectorShardManifests(
+        allCollectorShardManifests,
+        attemptId
+      ),
+      collector_provenance_manifest: buildCollectorProvenanceManifest(datasetRecords),
       dataset_record_count: datasetRecords.length,
       training_ready_count: datasetRecords.length,
-      excluded_record_count: 0,
-      dataset_records: datasetRecords,
+        excluded_record_count: 0,
+        dataset_records: datasetRecords,
+      }
     }
-  })
-  const filteredAttempts = attempts.filter((attempt) => attempt.dataset_record_count > 0)
+  )
+  const filteredAttempts = attempts.filter(
+    (attempt) => typeof attempt.dataset_record_count === 'number' && attempt.dataset_record_count > 0
+  )
   const trainingReadyRecords = getRecordArray(datasetPackage.training_ready_records)
+  const allowedAttemptIds = new Set(
+    filteredAttempts.map((attempt) => getNullableString(attempt.attempt_id))
+  )
   return {
     ...datasetPackage,
     dataset_record_count: trainingReadyRecords.length,
     training_ready_count: trainingReadyRecords.length,
     excluded_record_count: 0,
+    collector_shard_manifests: allCollectorShardManifests.filter((manifest) =>
+      allowedAttemptIds.has(getNullableString(manifest.attempt_id))
+    ),
+    collector_provenance_manifest: buildCollectorProvenanceManifest(trainingReadyRecords),
     attempts: filteredAttempts,
     all_records: trainingReadyRecords,
     training_ready_records: trainingReadyRecords,

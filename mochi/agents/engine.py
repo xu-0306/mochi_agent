@@ -2575,6 +2575,7 @@ def _resolve_agent_run_evidence_permission_policy(
         "file_ops_scope",
         "approved_tool_calls",
         "denied_tool_calls",
+        "blocked_web_domains",
     }
     for candidate in _iter_agent_run_metadata_candidates(metadata):
         raw_policy = candidate.get("permission_policy")

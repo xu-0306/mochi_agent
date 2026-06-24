@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import SecretStr
 
 from mochi.security.policy import resolve_runtime_permission_policy
-from mochi.runtime.approvals import InMemoryApprovalStore
+from mochi.runtime.approvals import PersistentApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.tools.base import BaseTool
+from mochi.tools.collector_adapter import CollectorRequestPolicy
 from mochi.tools.exec_command import ExecCommandTool
 from mochi.tools.execute_code import ExecuteCodeTool
 from mochi.tools.execute_code_v2 import ExecuteCodeV2Tool
 from mochi.tools.csv_read import CsvReadTool
 from mochi.tools.delegate_subagent_task import DelegateSubagentTaskTool
+from mochi.tools.discourse_topic_adapter import DiscourseTopicCollectTool
 from mochi.tools.docx_read import DocxReadTool
 from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileReadTool, FileWriteTool
 from mochi.tools.glob_search import GlobSearchTool
@@ -82,7 +85,7 @@ class ToolRegistryFactory:
             default_shell=self._resolve_exec_default_shell(),
             output_tail_limit=self._config.security.exec_session_output_limit,
         )
-        self._exec_approval_store = InMemoryApprovalStore()
+        self._exec_approval_store = PersistentApprovalStore(Path(config.sessions_dir) / "exec-approvals.db")
         self._builtins = self._build_specs()
 
     @property
@@ -130,6 +133,7 @@ class ToolRegistryFactory:
             BuiltInToolSpec("web_search", "shared", "web", self._build_web_search),
             BuiltInToolSpec("web_fetch", "shared", "web", self._build_web_fetch),
             BuiltInToolSpec("web_crawl", "shared", "web", self._build_web_crawl),
+            BuiltInToolSpec("discourse_topic_collect", "shared", "collector", self._build_discourse_topic_collect),
             BuiltInToolSpec("get_current_time", "shared", "web", self._build_datetime),
             BuiltInToolSpec("calculator", "shared", "web", self._build_calculator),
             BuiltInToolSpec("delegate_subagent_task", "workspace", "workspace", self._build_delegate_subagent_task),
@@ -211,6 +215,17 @@ class ToolRegistryFactory:
     def _build_web_crawl(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del workspace_dir, services
         return WebCrawlTool(timeout=config.tools.http_timeout)
+
+    def _build_discourse_topic_collect(
+        self,
+        config: MochiConfig,
+        workspace_dir: str,
+        services: dict[str, Any],
+    ) -> BaseTool:
+        del workspace_dir, services
+        return DiscourseTopicCollectTool(
+            request_policy=CollectorRequestPolicy(timeout=config.tools.http_timeout),
+        )
 
     def _build_exec_command(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services

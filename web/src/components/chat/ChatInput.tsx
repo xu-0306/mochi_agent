@@ -130,7 +130,55 @@ function parseSlashQuery(nextValue: string, caret: number | null): string | null
   if (!currentToken.startsWith('/')) {
     return null
   }
+  if (/\s/.test(currentToken.slice(1))) {
+    return null
+  }
   return currentToken.slice(1).trim()
+}
+
+function getCurrentLineBounds(text: string, selectionStart: number, selectionEnd: number): {
+  lineStart: number
+  lineEnd: number
+} {
+  const safeStart = Math.max(0, Math.min(selectionStart, text.length))
+  const safeEnd = Math.max(safeStart, Math.min(selectionEnd, text.length))
+  const lineStart = Math.max(0, text.lastIndexOf('\n', Math.max(0, safeStart - 1)) + 1)
+  const nextBreak = text.indexOf('\n', safeEnd)
+  return {
+    lineStart,
+    lineEnd: nextBreak === -1 ? text.length : nextBreak,
+  }
+}
+
+function replaceCurrentLine(text: string, selectionStart: number, selectionEnd: number, replacement: string): {
+  nextValue: string
+  caret: number
+} {
+  const { lineStart, lineEnd } = getCurrentLineBounds(text, selectionStart, selectionEnd)
+  return {
+    nextValue: `${text.slice(0, lineStart)}${replacement}${text.slice(lineEnd)}`,
+    caret: lineStart + replacement.length,
+  }
+}
+
+function removeCurrentLine(text: string, selectionStart: number, selectionEnd: number): {
+  nextValue: string
+  caret: number
+} {
+  const { lineStart, lineEnd } = getCurrentLineBounds(text, selectionStart, selectionEnd)
+  let removeStart = lineStart
+  let removeEnd = lineEnd
+
+  if (removeEnd < text.length && text[removeEnd] === '\n') {
+    removeEnd += 1
+  } else if (removeStart > 0 && text[removeStart - 1] === '\n') {
+    removeStart -= 1
+  }
+
+  return {
+    nextValue: `${text.slice(0, removeStart)}${text.slice(removeEnd)}`,
+    caret: removeStart,
+  }
 }
 
 function buildSkillAction(skill: Skill): CommandPaletteAction {
@@ -688,8 +736,32 @@ export function ChatInput({
     textareaRef.current?.focus()
   }
 
+  const applyTextareaValue = React.useCallback((nextValue: string, caret: number) => {
+    setValue(nextValue)
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current
+      if (!textarea) {
+        return
+      }
+      textarea.focus()
+      textarea.setSelectionRange(caret, caret)
+    })
+  }, [])
+
   const handlePaletteSelect = React.useCallback((action: CommandPaletteAction) => {
+    const textarea = textareaRef.current
+    const selectionStart = textarea?.selectionStart ?? value.length
+    const selectionEnd = textarea?.selectionEnd ?? selectionStart
+
     if (action.kind === 'builtin') {
+      if (action.id === 'workflow' || action.id === 'chat') {
+        const commandText = action.id === 'workflow' ? '/workflow ' : '/chat '
+        const { nextValue, caret } = replaceCurrentLine(value, selectionStart, selectionEnd, commandText)
+        applyTextareaValue(nextValue, caret)
+        setPaletteDismissed(true)
+        return
+      }
+
       setPaletteDismissed(true)
       onBuiltinCommand?.(action.id)
       return
@@ -702,20 +774,11 @@ export function ChatInput({
       return [...prev, { id: action.id, name: action.label.replace(/^\//, '') }]
     })
 
-    const textarea = textareaRef.current
-    if (textarea) {
-      const start = textarea.selectionStart
-      const end = textarea.selectionEnd
-      const before = value.slice(0, start)
-      const after = value.slice(end)
-      const lineStart = Math.max(0, before.lastIndexOf('\n') + 1)
-      const updated = `${before.slice(0, lineStart)}${after}`.replace(/^\s+/, '')
-      setValue(updated)
-    }
+    const { nextValue, caret } = removeCurrentLine(value, selectionStart, selectionEnd)
+    applyTextareaValue(nextValue, caret)
 
     setPaletteDismissed(false)
-    textareaRef.current?.focus()
-  }, [onBuiltinCommand, value])
+  }, [applyTextareaValue, onBuiltinCommand, value])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (isStreaming && e.key === 'Escape') {

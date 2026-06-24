@@ -15,6 +15,7 @@ import {
   Search,
   Settings,
   Trash2,
+  Waypoints,
   Workflow,
   Zap,
 } from 'lucide-react'
@@ -421,7 +422,7 @@ export function Sidebar() {
             </>
           ) : null}
 
-          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-3')}>
+          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-4')}>
             <Button
               variant="ghost"
               size={collapsed ? 'icon' : 'sm'}
@@ -431,6 +432,16 @@ export function Sidebar() {
             >
               <Workflow className="h-4 w-4" />
               {!collapsed && <span>{t('sidebar.workflows')}</span>}
+            </Button>
+            <Button
+              variant="ghost"
+              size={collapsed ? 'icon' : 'sm'}
+              onClick={() => router.push('/goals')}
+              title={t('sidebar.goals')}
+              className={collapsed ? 'w-9' : 'justify-start'}
+            >
+              <Waypoints className="h-4 w-4" />
+              {!collapsed && <span>{t('sidebar.goals')}</span>}
             </Button>
             <Button
               variant="ghost"

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Mapping
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from mochi.agents.multi_agent.context import (
@@ -62,7 +64,13 @@ from mochi.agents.multi_agent.utils import parse_json_payload
 from mochi.agents.context_snapshot import estimate_text_tokens
 from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.types import GenerationResult, Message
-from mochi.runtime.approvals import InMemoryApprovalStore
+from mochi.runtime.collector_contracts import (
+    collector_dataset_records_from_result,
+    collector_record_provenance_list_from_result,
+    collector_shard_manifests_from_result,
+    dedupe_collector_shard_manifests,
+)
+from mochi.runtime.approvals import ApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.recovery import (
     build_resource_exhaustion_report,
@@ -73,6 +81,7 @@ RunState = Literal[
     "queued",
     "running",
     "awaiting_guidance",
+    "awaiting_approval",
     "awaiting_resources",
     "stalled",
     "partial",
@@ -80,12 +89,41 @@ RunState = Literal[
     "failed",
     "cancelled",
 ]
-RunEventType = Literal["state_changed", "guidance", "role_output", "verification", "evaluation", "artifact"]
+RunEventType = Literal[
+    "state_changed",
+    "guidance",
+    "role_started",
+    "role_progress",
+    "role_completed",
+    "role_error",
+    "role_output",
+    "verification",
+    "evaluation",
+    "artifact",
+]
 
 RUN_STATE_TRANSITIONS: dict[RunState, tuple[RunState, ...]] = {
     "queued": ("running", "cancelled"),
-    "running": ("awaiting_guidance", "awaiting_resources", "stalled", "partial", "succeeded", "failed", "cancelled"),
-    "awaiting_guidance": ("running", "awaiting_resources", "stalled", "partial", "failed", "cancelled"),
+    "running": (
+        "awaiting_guidance",
+        "awaiting_approval",
+        "awaiting_resources",
+        "stalled",
+        "partial",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ),
+    "awaiting_guidance": (
+        "running",
+        "awaiting_approval",
+        "awaiting_resources",
+        "stalled",
+        "partial",
+        "failed",
+        "cancelled",
+    ),
+    "awaiting_approval": (),
     "awaiting_resources": (),
     "stalled": ("running", "failed", "cancelled"),
     "partial": (),
@@ -125,6 +163,18 @@ class RoleOutputPayload:
 
 
 @dataclass(frozen=True)
+class RoleProgressPayload:
+    """Readable role lifecycle/progress payload."""
+
+    role_id: str
+    status: Literal["thinking", "running_tool", "waiting", "blocked", "done", "error"]
+    current_action: str
+    stage: str | None = None
+    model_id: str | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class EvaluationPayload:
     """Evaluation payload."""
 
@@ -158,6 +208,7 @@ class ResumeExecutionPayload:
     stage: str
     checkpoint: dict[str, Any]
     guidance_messages: list[str] = field(default_factory=list)
+    role_guidance_messages: dict[str, list[str]] = field(default_factory=dict)
     metadata_state: dict[str, Any] = field(default_factory=dict)
     precomputed_artifacts: dict[str, Any] = field(default_factory=dict)
     protocol_artifacts: dict[str, Any] = field(default_factory=dict)
@@ -183,6 +234,7 @@ class ResumeExecutionPayload:
             "stage": self.stage,
             "checkpoint": _json_safe_clone(self.checkpoint),
             "guidance_messages": [str(item) for item in self.guidance_messages if str(item).strip()],
+            "role_guidance_messages": _normalize_role_guidance_messages(self.role_guidance_messages),
             "metadata_state": _json_safe_clone(self.metadata_state),
             "precomputed_artifacts": _json_safe_clone(self.precomputed_artifacts),
             "protocol_artifacts": _json_safe_clone(self.protocol_artifacts),
@@ -249,8 +301,11 @@ class MultiAgentRunRequest:
     run_id: str | None = None
     reasoning_effort: str | None = None
     guidance_messages: list[str] = field(default_factory=list)
+    role_guidance_messages: dict[str, list[str]] = field(default_factory=dict)
     run_policy: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    runtime_event_callback: Any | None = None
+    event_callback: Any | None = None
 
 
 @dataclass
@@ -362,7 +417,7 @@ class MultiAgentOrchestrator:
         engine: Any | None = None,
         scoring_policy: LLMFirstScoringPolicy | None = None,
         exec_runtime: ExecRuntime | None = None,
-        exec_approval_store: InMemoryApprovalStore | None = None,
+        exec_approval_store: ApprovalStore | None = None,
         controlled_exec_require_approval: bool = True,
         controlled_exec_command_rules: list[dict[str, Any]] | None = None,
         controlled_exec_allowed_env_vars: list[str] | None = None,
@@ -392,6 +447,12 @@ class MultiAgentOrchestrator:
         self._task_states: dict[str, dict[str, Any]] = {}
         self._role_resume_plan: dict[str, Any] = {}
         self._default_reasoning_effort: str | None = None
+        self._role_guidance_messages: dict[str, list[str]] = {}
+        self._tool_allowlist: list[str] | None = None
+        self._tool_denylist: list[str] | None = None
+        self._permission_policy: dict[str, Any] | None = None
+        self._emit_runtime_event: Any | None = None
+        self._collector_artifact_callback: Any | None = None
 
     def _configure_run_policy(self, run_policy: Mapping[str, Any] | None) -> None:
         self._run_policy = dict(run_policy or {})
@@ -403,6 +464,12 @@ class MultiAgentOrchestrator:
         self._role_task_states = {}
         self._task_states = {}
         self._role_resume_plan = {}
+        self._role_guidance_messages = {}
+        self._tool_allowlist = None
+        self._tool_denylist = None
+        self._permission_policy = None
+        self._emit_runtime_event = None
+        self._collector_artifact_callback = None
         max_wall_clock_sec = self._run_policy.get("max_wall_clock_sec")
         try:
             max_wall_clock = int(max_wall_clock_sec)
@@ -433,6 +500,68 @@ class MultiAgentOrchestrator:
         if action not in {"retry_then_degrade", "pause", "fail"}:
             return "retry_then_degrade"
         return action
+
+    def _guidance_messages_for_role(self, role_id: str, guidance_messages: list[str]) -> list[str]:
+        role_guidance = self._role_guidance_messages.get(role_id, [])
+        return _merge_guidance_messages(guidance_messages, role_guidance)
+
+    def _append_role_guidance_to_prompt(
+        self,
+        *,
+        prompt: str,
+        role_id: str,
+        guidance_messages: list[str],
+    ) -> str:
+        role_guidance = [
+            item
+            for item in self._role_guidance_messages.get(role_id, [])
+            if item not in guidance_messages
+        ]
+        if not role_guidance:
+            return prompt
+        lines = [prompt.rstrip(), "", "Role-specific guidance:"]
+        lines.extend(f"- {item}" for item in role_guidance)
+        return "\n".join(lines).strip()
+
+    def _emit_role_progress(
+        self,
+        event_type: Literal["role_started", "role_progress", "role_completed", "role_error"],
+        *,
+        role_id: str,
+        status: Literal["thinking", "running_tool", "waiting", "blocked", "done", "error"],
+        current_action: str,
+        stage: str | None = None,
+        model_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        if self._emit_runtime_event is None:
+            return
+        self._emit_runtime_event(
+            event_type,
+            asdict(
+                RoleProgressPayload(
+                    role_id=role_id,
+                    status=status,
+                    current_action=current_action,
+                    stage=stage,
+                    model_id=model_id,
+                    detail=detail,
+                )
+            ),
+        )
+
+    def _emit_live_subagent_runtime_artifact(self) -> None:
+        if self._emit_runtime_event is None or not self._invocation_traces:
+            return
+        self._emit_runtime_event(
+            "artifact",
+            asdict(
+                ArtifactPayload(
+                    name="subagent_runtime",
+                    content=_build_subagent_runtime_artifact(self._invocation_traces),
+                )
+            ),
+        )
 
     def _record_subagent_failure(
         self,
@@ -1116,6 +1245,18 @@ class MultiAgentOrchestrator:
         except (TypeError, ValueError):
             self._checkpoint_count = 0
 
+    def _goal_owned_checkpoint_cadence_step_limit(self) -> int | None:
+        if not bool(self._run_policy.get("goal_checkpoint_cadence_owned")):
+            return None
+        raw_value = self._run_policy.get("goal_checkpoint_cadence_effective_steps")
+        if raw_value is None:
+            raw_value = self._run_policy.get("checkpoint_interval_steps")
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
     def _raise_if_run_policy_exhausted(
         self,
         *,
@@ -1134,6 +1275,28 @@ class MultiAgentOrchestrator:
             protocol_artifacts=protocol_artifacts,
             extra=extra,
         )
+        checkpoint_interval_steps = self._goal_owned_checkpoint_cadence_step_limit()
+        if (
+            checkpoint_interval_steps is not None
+            and self._checkpoint_count >= checkpoint_interval_steps
+            and self._checkpoint_count % checkpoint_interval_steps == 0
+        ):
+            action = str(self._run_policy.get("on_budget_exhausted") or "pause").strip().lower()
+            if action not in {"pause", "finalize_partial"}:
+                action = "pause"
+            status: Literal["partial", "awaiting_resources"] = (
+                "awaiting_resources" if action == "pause" else "partial"
+            )
+            raise RunPolicyStop(
+                status=status,
+                action=action,
+                reason=(
+                    "Run reached checkpoint_interval_steps="
+                    f"{checkpoint_interval_steps} at checkpoint_index={self._checkpoint_count}."
+                ),
+                stage=stage,
+                checkpoint=self._latest_checkpoint,
+            )
         if self._deadline_monotonic is None:
             return
         if time.monotonic() < self._deadline_monotonic:
@@ -1165,19 +1328,47 @@ class MultiAgentOrchestrator:
         events: list[MultiAgentRunEvent] = []
         self._invocation_traces = []
         seq = 0
+        pending_runtime_event_callback_tasks: list[asyncio.Task[None]] = []
+        collector_shard_manifests: list[dict[str, Any]] = []
+        collector_dataset_records: list[dict[str, Any]] = []
+        collector_record_provenance: list[dict[str, Any]] = []
+
+        async def _await_runtime_event_callback(result: Any) -> None:
+            await result
+
+        async def _drain_runtime_event_callback_tasks() -> None:
+            if not pending_runtime_event_callback_tasks:
+                return
+            tasks = list(pending_runtime_event_callback_tasks)
+            pending_runtime_event_callback_tasks.clear()
+            await asyncio.gather(*tasks)
+
+        async def _finalize_run_result(result: MultiAgentRunResult) -> MultiAgentRunResult:
+            await _drain_runtime_event_callback_tasks()
+            return result
+
+        def _emit_runtime_event_callback(runtime_event: MultiAgentRunEvent) -> None:
+            callback = request.runtime_event_callback or request.event_callback
+            if callback is None:
+                return
+            callback_result = callback(runtime_event)
+            if inspect.isawaitable(callback_result):
+                pending_runtime_event_callback_tasks.append(
+                    asyncio.create_task(_await_runtime_event_callback(callback_result))
+                )
 
         def emit(event_type: RunEventType, payload: dict[str, Any]) -> None:
             nonlocal seq
             seq += 1
-            events.append(
-                MultiAgentRunEvent(
-                    run_id=run_id,
-                    seq=seq,
-                    type=event_type,
-                    payload=payload,
-                    timestamp=datetime.now(UTC).isoformat(),
-                )
+            runtime_event = MultiAgentRunEvent(
+                run_id=run_id,
+                seq=seq,
+                type=event_type,
+                payload=payload,
+                timestamp=datetime.now(UTC).isoformat(),
             )
+            events.append(runtime_event)
+            _emit_runtime_event_callback(runtime_event)
 
         emit(
             "state_changed",
@@ -1202,8 +1393,12 @@ class MultiAgentOrchestrator:
         )
 
         self._configure_run_policy(request.run_policy)
+        self._emit_runtime_event = emit
         self._default_reasoning_effort = request.reasoning_effort
         requested_guidance_messages = [item.strip() for item in request.guidance_messages if item.strip()]
+        requested_role_guidance_messages = _normalize_role_guidance_messages(
+            request.role_guidance_messages
+        )
         resume_payload = _resolve_resume_execution_payload(request.metadata)
         selected_models_roles = _resolve_selected_model_roles(request.metadata)
         effective_metadata = dict(request.metadata)
@@ -1219,11 +1414,90 @@ class MultiAgentOrchestrator:
         verification_summary: dict[str, Any] | None = None
         selected_candidate_id: str | None = None
         evaluation_payload: EvaluationPayload | None = None
+        def _collector_artifacts_bundle() -> dict[str, Any]:
+            bundle: dict[str, Any] = {}
+            if collector_shard_manifests:
+                bundle["collector_shard_manifests"] = {
+                    "shards": _json_safe_clone(collector_shard_manifests)
+                }
+            if collector_dataset_records:
+                bundle["collector_dataset_records"] = {
+                    "records": _json_safe_clone(collector_dataset_records)
+                }
+            if collector_record_provenance:
+                bundle["collector_record_provenance"] = {
+                    "records": _json_safe_clone(collector_record_provenance)
+                }
+            return bundle
+
+        def _refresh_collector_protocol_artifacts(*, emit_live: bool) -> None:
+            bundle = _collector_artifacts_bundle()
+            if not bundle:
+                return
+            protocol_artifacts.update(bundle)
+            if emit_live:
+                for artifact_name in (
+                    "collector_record_provenance",
+                    "collector_dataset_records",
+                    "collector_shard_manifests",
+                ):
+                    if artifact_name not in bundle:
+                        continue
+                    emit(
+                        "artifact",
+                        asdict(
+                            ArtifactPayload(
+                                name=artifact_name,
+                                content=dict(bundle[artifact_name]),
+                            )
+                        ),
+                    )
+
+        def _ingest_collector_result_payload(*, payload: Any, emit_live: bool) -> None:
+            nonlocal collector_shard_manifests, collector_dataset_records, collector_record_provenance
+            if not isinstance(payload, Mapping):
+                return
+            shard_updates = collector_shard_manifests_from_result(payload)
+            record_updates = collector_dataset_records_from_result(payload)
+            provenance_updates = collector_record_provenance_list_from_result(payload)
+            changed = False
+            if shard_updates:
+                merged_shards = dedupe_collector_shard_manifests(
+                    [*collector_shard_manifests, *shard_updates]
+                )
+                if merged_shards != collector_shard_manifests:
+                    collector_shard_manifests = merged_shards
+                    changed = True
+            if record_updates:
+                collector_dataset_records.extend(_json_safe_clone(record_updates))
+                changed = True
+            if provenance_updates:
+                collector_record_provenance.extend(_json_safe_clone(provenance_updates))
+                changed = True
+            if changed:
+                _refresh_collector_protocol_artifacts(emit_live=emit_live)
+
+        self._collector_artifact_callback = lambda event: _ingest_collector_result_payload(
+            payload=getattr(event, "result", None),
+            emit_live=True,
+        )
         guidance_messages = (
             _merge_guidance_messages(resume_payload.guidance_messages, requested_guidance_messages)
             if resume_payload is not None and resume_payload.executor == "continue_from_checkpoint"
             else list(requested_guidance_messages)
         )
+        role_guidance_messages = (
+            _merge_role_guidance_messages(
+                resume_payload.role_guidance_messages,
+                requested_role_guidance_messages,
+            )
+            if resume_payload is not None and resume_payload.executor == "continue_from_checkpoint"
+            else dict(requested_role_guidance_messages)
+        )
+        self._role_guidance_messages = role_guidance_messages
+        self._tool_allowlist = _goal_capability_tool_allowlist(request.metadata)
+        self._tool_denylist = _goal_operator_tool_denylist(request.metadata)
+        self._permission_policy = _goal_operator_permission_policy(request.metadata)
         if not guidance_messages:
             guidance_messages.append("Keep outputs concise and grounded.")
 
@@ -1241,20 +1515,28 @@ class MultiAgentOrchestrator:
 
         def build_recovery_result(
             *,
-            status: Literal["partial", "awaiting_resources", "stalled"],
+            status: Literal["partial", "awaiting_approval", "awaiting_resources", "stalled"],
             action: str,
             reason: str,
             stage: str,
             checkpoint: dict[str, Any] | None = None,
             resource_report: dict[str, Any] | None = None,
+            role_task_snapshot_override: Mapping[str, Any] | None = None,
+            recovery_state_extra: Mapping[str, Any] | None = None,
+            transition_reason: str | None = None,
         ) -> MultiAgentRunResult:
             protocol_artifact_bundle = {**precomputed_artifacts, **protocol_artifacts}
             recovery_checkpoint = dict(checkpoint or self._latest_checkpoint or {})
-            role_task_snapshot = self._build_role_task_snapshot(selected_models_roles=selected_models_roles)
+            role_task_snapshot = (
+                _mapping_to_plain_dict(role_task_snapshot_override)
+                if isinstance(role_task_snapshot_override, Mapping)
+                else self._build_role_task_snapshot(selected_models_roles=selected_models_roles)
+            )
             resume_state_payload = _build_resume_execution_payload(
                 stage=stage,
                 checkpoint=recovery_checkpoint,
                 guidance_messages=guidance_messages,
+                role_guidance_messages=role_guidance_messages,
                 metadata=effective_metadata,
                 precomputed_artifacts=precomputed_artifacts,
                 protocol_artifacts=protocol_artifacts,
@@ -1281,11 +1563,18 @@ class MultiAgentOrchestrator:
                     and isinstance(protocol_config, MultiAgentDebateProtocol),
                 ),
             }
+            recovery_state.update(_mapping_to_plain_dict(recovery_state_extra))
             if resource_report is not None:
                 recovery_state["resource_exhaustion_report"] = dict(resource_report)
                 recovery_state["recommended_resume_conditions"] = list(
                     resource_report.get("recommended_resume_conditions") or []
                 )
+            elif status == "awaiting_approval":
+                recovery_state["recommended_resume_conditions"] = [
+                    "Resolve every pending approval before resuming the run.",
+                    "Resume the run after approval resolution so the blocked execution step can rerun.",
+                    "Review the pending command or tool arguments in approval_state before approving.",
+                ]
             elif status == "stalled":
                 recovery_state["recommended_resume_conditions"] = [
                     "Resume the run after the stalled subagent or model backend is healthy again.",
@@ -1343,7 +1632,8 @@ class MultiAgentOrchestrator:
                     StateChangedPayload(
                         previous_state=previous_state,
                         current_state=current_state,
-                        reason=(
+                        reason=transition_reason
+                        or (
                             "run_policy_exhausted"
                             if resource_report is None
                             else "resource_recovery_triggered"
@@ -1353,6 +1643,9 @@ class MultiAgentOrchestrator:
             )
             metadata = dict(effective_metadata)
             metadata["recovery_state"] = recovery_state
+            approval_state = recovery_state.get("approval_state")
+            if isinstance(approval_state, dict):
+                metadata["approval_state"] = dict(approval_state)
             metadata["degraded"] = bool(self._degraded_roles)
             return MultiAgentRunResult(
                 run_id=run_id,
@@ -1379,6 +1672,11 @@ class MultiAgentOrchestrator:
             precomputed_artifacts.update(resume_payload.precomputed_artifacts)
             protocol_artifacts.update(resume_payload.protocol_artifacts)
             protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+            collector_shard_manifests = dedupe_collector_shard_manifests(
+                collector_shard_manifests_from_result(protocol_artifacts)
+            )
+            collector_dataset_records = collector_dataset_records_from_result(protocol_artifacts)
+            collector_record_provenance = collector_record_provenance_list_from_result(protocol_artifacts)
             candidates = list(resume_payload.candidates)
             evidence_packets = [_json_safe_clone(item) for item in resume_payload.evidence_packets]
             evidence_collection_summary = (
@@ -1462,6 +1760,7 @@ class MultiAgentOrchestrator:
                     emit=emit,
                 )
                 protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+                _refresh_collector_protocol_artifacts(emit_live=False)
                 self._raise_if_run_policy_exhausted(
                     stage="protocol_completed",
                     task_input=request.task_input,
@@ -1477,6 +1776,7 @@ class MultiAgentOrchestrator:
                         )
             else:
                 protocol_artifacts = {**precomputed_artifacts, **protocol_artifacts}
+                _refresh_collector_protocol_artifacts(emit_live=False)
             if not _resume_stage_covers(resume_stage, "evidence_collected") and evidence_collection_summary is None:
                 self._raise_if_run_policy_exhausted(
                     stage="before_evidence_collection",
@@ -1615,25 +1915,61 @@ class MultiAgentOrchestrator:
             if execution_policy.mode != "disabled":
                 artifacts["execution_policy"] = execution_policy_to_dict(execution_policy)
             artifacts.update(protocol_artifacts)
-            emit(
-                "artifact",
-                asdict(ArtifactPayload(name="role_task_snapshot", content=role_task_snapshot)),
-            )
             if self._invocation_traces:
                 subagent_runtime = _build_subagent_runtime_artifact(self._invocation_traces)
                 artifacts["subagent_runtime"] = subagent_runtime
-                emit("artifact", asdict(ArtifactPayload(name="subagent_runtime", content=subagent_runtime)))
             if self._subagent_health_events:
                 subagent_health_snapshot = self._build_subagent_health_snapshot()
                 artifacts["subagent_health_snapshot"] = subagent_health_snapshot
-                emit(
-                    "artifact",
-                    asdict(ArtifactPayload(name="subagent_health_snapshot", content=subagent_health_snapshot)),
-                )
             if evidence_collection_summary is not None:
                 artifacts["evidence_collection"] = evidence_collection_summary
             if verification_summary is not None:
                 artifacts["verification"] = verification_summary
+            approval_wait_state = _build_approval_wait_state(
+                artifacts=artifacts,
+                role_task_snapshot=role_task_snapshot,
+            )
+            if approval_wait_state is not None:
+                self._record_checkpoint(
+                    stage=str(approval_wait_state.get("stage") or "protocol_completed"),
+                    task_input=request.task_input,
+                    protocol=protocol_config.protocol,
+                    candidates=candidates,
+                    protocol_artifacts=protocol_artifacts,
+                    extra={
+                        "approval_pending_count": approval_wait_state["approval_state"]["pending_count"],
+                        "approval_ids": approval_wait_state["approval_state"]["approval_ids"],
+                    },
+                )
+                return await _finalize_run_result(build_recovery_result(
+                    status="awaiting_approval",
+                    action="await_approval",
+                    reason=str(approval_wait_state.get("reason") or "Run is waiting for approval."),
+                    stage=str(approval_wait_state.get("stage") or "protocol_completed"),
+                    checkpoint=self._latest_checkpoint,
+                    role_task_snapshot_override=approval_wait_state["role_task_snapshot"],
+                    recovery_state_extra={"approval_state": approval_wait_state["approval_state"]},
+                    transition_reason="approval_pending",
+                ))
+            emit(
+                "artifact",
+                asdict(ArtifactPayload(name="role_task_snapshot", content=role_task_snapshot)),
+            )
+            if isinstance(artifacts.get("subagent_runtime"), dict):
+                emit(
+                    "artifact",
+                    asdict(ArtifactPayload(name="subagent_runtime", content=artifacts["subagent_runtime"])),
+                )
+            if isinstance(artifacts.get("subagent_health_snapshot"), dict):
+                emit(
+                    "artifact",
+                    asdict(
+                        ArtifactPayload(
+                            name="subagent_health_snapshot",
+                            content=artifacts["subagent_health_snapshot"],
+                        )
+                    ),
+                )
             emit("artifact", asdict(ArtifactPayload(name="run_summary", content=dict(artifacts))))
 
             previous, current = state_machine.transition("succeeded")
@@ -1648,7 +1984,7 @@ class MultiAgentOrchestrator:
                 ),
             )
 
-            return MultiAgentRunResult(
+            return await _finalize_run_result(MultiAgentRunResult(
                 run_id=run_id,
                 protocol=protocol_config.protocol,
                 state=state_machine.state,
@@ -1659,15 +1995,15 @@ class MultiAgentOrchestrator:
                 artifacts=artifacts,
                 events=events,
                 metadata={**effective_metadata, "degraded": bool(self._degraded_roles)},
-            )
+            ))
         except RunPolicyStop as stop:
-            return build_recovery_result(
+            return await _finalize_run_result(build_recovery_result(
                 status=stop.status,
                 action=stop.action,
                 reason=stop.reason,
                 stage=stop.stage,
                 checkpoint=stop.checkpoint,
-            )
+            ))
         except SubagentRoleError as exc:
             try:
                 self._raise_subagent_disconnect_stop(
@@ -1679,13 +2015,13 @@ class MultiAgentOrchestrator:
                     protocol_artifacts={**precomputed_artifacts, **protocol_artifacts},
                 )
             except RunPolicyStop as stop:
-                return build_recovery_result(
+                return await _finalize_run_result(build_recovery_result(
                     status=stop.status,
                     action=stop.action,
                     reason=stop.reason,
                     stage=stop.stage,
                     checkpoint=stop.checkpoint,
-                )
+                ))
             except Exception as inner_exc:
                 classified = classify_agent_run_recovery_issue(inner_exc)
                 if classified is None:
@@ -1695,14 +2031,14 @@ class MultiAgentOrchestrator:
                     stage=exc.stage,
                     exception=inner_exc,
                 )
-                return build_recovery_result(
+                return await _finalize_run_result(build_recovery_result(
                     status="awaiting_resources",
                     action="pause",
                     reason=classified.reason,
                     stage=exc.stage,
                     checkpoint=self._latest_checkpoint,
                     resource_report=resource_report,
-                )
+                ))
         except Exception as exc:
             classified = classify_agent_run_recovery_issue(exc)
             if classified is None:
@@ -1725,14 +2061,14 @@ class MultiAgentOrchestrator:
                 stage=stage,
                 exception=exc,
             )
-            return build_recovery_result(
+            return await _finalize_run_result(build_recovery_result(
                 status="awaiting_resources",
                 action="pause",
                 reason=classified.reason,
                 stage=stage,
                 checkpoint=self._latest_checkpoint,
                 resource_report=resource_report,
-            )
+            ))
 
     async def _run_protocol(
         self,
@@ -2252,6 +2588,7 @@ class MultiAgentOrchestrator:
             task_input=task_input,
             execution_policy=execution_policy,
             guidance_messages=guidance_messages,
+            role_guidance_messages=self._role_guidance_messages,
             selected_models_roles=selected_models_roles,
             ordered_models=list(selected_models_roles.values()),
             metadata=metadata,
@@ -2299,6 +2636,7 @@ class MultiAgentOrchestrator:
             task_input=task_input,
             execution_policy=execution_policy,
             guidance_messages=guidance_messages,
+            role_guidance_messages=self._role_guidance_messages,
             selected_models_roles=selected_models_roles,
             ordered_models=ordered_models,
             metadata=metadata,
@@ -2433,40 +2771,67 @@ class MultiAgentOrchestrator:
         prompt_override: str | None = None,
         stage: str | None = None,
     ) -> CandidateOutput:
+        effective_guidance_messages = self._guidance_messages_for_role(role_id, guidance_messages)
         prompt = (
             prompt_override
             if isinstance(prompt_override, str) and prompt_override.strip()
             else _build_role_prompt(
                 task_input=task_input,
                 role_title=role_title,
-                guidance_messages=guidance_messages,
+                guidance_messages=effective_guidance_messages,
                 supporting_candidates=supporting_candidates,
             )
         )
+        if isinstance(prompt_override, str) and prompt_override.strip():
+            prompt = self._append_role_guidance_to_prompt(
+                prompt=prompt,
+                role_id=role_id,
+                guidance_messages=guidance_messages,
+            )
         role_runtime_context = self._build_role_runtime_context(role_id)
         if role_runtime_context:
             prompt = f"{prompt}\n\nRole runtime context:\n{role_runtime_context}"
         role_stage = stage or f"role::{role_id}"
-        content, diagnostics = await self._await_subagent_operation(
-            lambda: self._invoke_configured_text(
-                model_id=model_id,
-                system_prompt=role_instruction,
-                user_prompt=prompt,
-                temperature=0.2,
-                max_tokens=1024,
-                reasoning_effort=self._default_reasoning_effort,
-                execution_profile="subagent_readonly",
-                tool_mode="auto",
-                system_prompt_addendum=(
-                    f"Role identity: {role_title} ({role_id}).\n"
-                    f"Role instruction: {role_instruction}"
-                ),
-                session_scope=f"role::{role_id}",
-            ),
+        self._emit_role_progress(
+            "role_started",
             role_id=role_id,
-            model_id=model_id,
+            status="thinking",
+            current_action=f"{role_title} is preparing a response.",
             stage=role_stage,
+            model_id=model_id,
         )
+        try:
+            content, diagnostics = await self._await_subagent_operation(
+                lambda: self._invoke_configured_text(
+                    model_id=model_id,
+                    system_prompt=role_instruction,
+                    user_prompt=prompt,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    reasoning_effort=self._default_reasoning_effort,
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                    system_prompt_addendum=(
+                        f"Role identity: {role_title} ({role_id}).\n"
+                        f"Role instruction: {role_instruction}"
+                    ),
+                    session_scope=f"role::{role_id}",
+                ),
+                role_id=role_id,
+                model_id=model_id,
+                stage=role_stage,
+            )
+        except Exception as exc:
+            self._emit_role_progress(
+                "role_error",
+                role_id=role_id,
+                status="error",
+                current_action=f"{role_title} failed during this step.",
+                stage=role_stage,
+                model_id=model_id,
+                detail=str(exc),
+            )
+            raise
         candidate = CandidateOutput(
             candidate_id=role_id,
             role_id=role_id,
@@ -2485,6 +2850,14 @@ class MultiAgentOrchestrator:
             model_id=model_id,
             stage=role_stage,
             candidate=candidate,
+        )
+        self._emit_role_progress(
+            "role_completed",
+            role_id=role_id,
+            status="done",
+            current_action=f"{role_title} produced an output.",
+            stage=role_stage,
+            model_id=model_id,
         )
         return candidate
 
@@ -2582,6 +2955,21 @@ class MultiAgentOrchestrator:
                     tool_mode=tool_mode,  # type: ignore[arg-type]
                     execution_profile=execution_profile,  # type: ignore[arg-type]
                     system_prompt_addendum=system_prompt_addendum,
+                    permission_policy=(
+                        dict(self._permission_policy)
+                        if self._permission_policy is not None
+                        else None
+                    ),
+                    tool_allowlist=(
+                        list(self._tool_allowlist)
+                        if self._tool_allowlist is not None
+                        else None
+                    ),
+                    tool_denylist=(
+                        list(self._tool_denylist)
+                        if self._tool_denylist is not None
+                        else None
+                    ),
                     persist_session=False,
                 )
             )
@@ -2599,6 +2987,13 @@ class MultiAgentOrchestrator:
                     fallback=False,
                 )
             )
+            self._emit_live_subagent_runtime_artifact()
+            collector_artifact_callback = self._collector_artifact_callback
+            if collector_artifact_callback is not None:
+                for event in result.events:
+                    if getattr(event, "type", None) != "tool_call_result":
+                        continue
+                    collector_artifact_callback(event)
             return content, diagnostics
 
         generate = fallback_generate or getattr(self._engine, "generate_with_configured_model", None)
@@ -2634,6 +3029,7 @@ class MultiAgentOrchestrator:
                 fallback=True,
             )
         )
+        self._emit_live_subagent_runtime_artifact()
         return content, diagnostics
 
     async def _run_model_backed_debate(
@@ -3442,6 +3838,11 @@ class MultiAgentOrchestrator:
                     evidence_packets=evidence_chunk,
                     candidates=candidates,
                 )
+            prompt = self._append_role_guidance_to_prompt(
+                prompt=prompt,
+                role_id="verifier",
+                guidance_messages=guidance_messages,
+            )
             if research_appendix:
                 prompt = f"{prompt}\n\nResearch context:\n{research_appendix}"
             try:
@@ -3619,9 +4020,19 @@ class MultiAgentOrchestrator:
         }
         collect = getattr(self._engine, "collect_agent_run_evidence", None)
         if callable(collect):
+            metadata_payload = dict(metadata or {})
+            if self._permission_policy is not None:
+                raw_permission_policy = metadata_payload.get("permission_policy")
+                merged_permission_policy = (
+                    dict(raw_permission_policy)
+                    if isinstance(raw_permission_policy, Mapping)
+                    else {}
+                )
+                merged_permission_policy.update(self._permission_policy)
+                metadata_payload["permission_policy"] = merged_permission_policy
             packets, summary = await collect(
                 queries=evidence_queries,
-                metadata=dict(metadata or {}),
+                metadata=metadata_payload,
             )
             collected_packets = _normalize_evidence_packets(packets)
             if isinstance(summary, Mapping):
@@ -3701,6 +4112,11 @@ class MultiAgentOrchestrator:
                 guidance_messages=guidance_messages,
                 candidates=candidates,
             )
+        )
+        prompt = self._append_role_guidance_to_prompt(
+            prompt=prompt,
+            role_id="judge",
+            guidance_messages=guidance_messages,
         )
         research_appendix = _research_prompt_appendix(metadata)
         if research_appendix:
@@ -3794,6 +4210,7 @@ def _build_invocation_trace(
 ) -> dict[str, Any]:
     tool_events: list[dict[str, Any]] = []
     approval_pending: list[dict[str, Any]] = []
+    completion: dict[str, Any] | None = None
     for event in events:
         event_type = getattr(event, "type", None)
         if event_type == "tool_call_request":
@@ -3805,6 +4222,35 @@ def _build_invocation_trace(
                     "arguments": dict(getattr(event, "arguments", {}) or {}),
                 }
             )
+            continue
+        if event_type == "final_answer":
+            input_tokens = getattr(event, "input_tokens", None)
+            output_tokens = getattr(event, "output_tokens", None)
+            generation_time_ms = getattr(event, "generation_time_ms", None)
+            finish_reason = str(getattr(event, "finish_reason", "") or "").strip()
+            completion = {
+                "trajectory_id": getattr(event, "trajectory_id", None),
+                **(
+                    {"input_tokens": int(input_tokens)}
+                    if isinstance(input_tokens, int) and input_tokens >= 0
+                    else {}
+                ),
+                **(
+                    {"output_tokens": int(output_tokens)}
+                    if isinstance(output_tokens, int) and output_tokens >= 0
+                    else {}
+                ),
+                **(
+                    {"generation_time_ms": float(generation_time_ms)}
+                    if isinstance(generation_time_ms, (int, float)) and generation_time_ms >= 0
+                    else {}
+                ),
+                **({"finish_reason": finish_reason} if finish_reason else {}),
+            }
+            if "input_tokens" in completion and "output_tokens" in completion:
+                completion["total_tokens"] = int(completion["input_tokens"]) + int(
+                    completion["output_tokens"]
+                )
             continue
         if event_type != "tool_call_result":
             continue
@@ -3836,6 +4282,7 @@ def _build_invocation_trace(
         "diagnostics": dict(diagnostics),
         "tool_events": tool_events,
         "approval_pending": approval_pending,
+        **({"completion": completion} if completion is not None else {}),
     }
 
 
@@ -3869,16 +4316,297 @@ def _build_subagent_runtime_artifact(invocations: list[dict[str, Any]]) -> dict[
         for event in tool_events
         if str(event.get("tool_name") or "") in risky_tool_names
     ]
+    completed_invocation_count = 0
+    token_tracked_invocation_count = 0
+    input_tokens = 0
+    output_tokens = 0
+    generation_time_ms = 0.0
+    finish_reason_counts: dict[str, int] = {}
+    for invocation in invocations:
+        if not isinstance(invocation, dict):
+            continue
+        completion = invocation.get("completion")
+        if not isinstance(completion, dict):
+            continue
+        completed_invocation_count += 1
+        completion_input_tokens = completion.get("input_tokens")
+        completion_output_tokens = completion.get("output_tokens")
+        completion_generation_time_ms = completion.get("generation_time_ms")
+        if isinstance(completion_input_tokens, int) and completion_input_tokens >= 0:
+            input_tokens += completion_input_tokens
+        if isinstance(completion_output_tokens, int) and completion_output_tokens >= 0:
+            output_tokens += completion_output_tokens
+        if (
+            isinstance(completion_input_tokens, int)
+            or isinstance(completion_output_tokens, int)
+            or isinstance(completion_generation_time_ms, (int, float))
+        ):
+            token_tracked_invocation_count += 1
+        if isinstance(completion_generation_time_ms, (int, float)) and completion_generation_time_ms >= 0:
+            generation_time_ms += float(completion_generation_time_ms)
+        finish_reason = str(completion.get("finish_reason") or "").strip()
+        if finish_reason:
+            finish_reason_counts[finish_reason] = finish_reason_counts.get(finish_reason, 0) + 1
     return {
         "execution_boundary": "multi_agent_subagents_research_only_main_agent_executes_code_and_training",
         "invocation_count": len(invocations),
         "tool_event_count": len(tool_events),
         "approval_pending_count": len(approval_pending),
         "risky_tool_event_count": len(risky_tool_events),
+        "completed_invocation_count": completed_invocation_count,
+        "token_tracked_invocation_count": token_tracked_invocation_count,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "generation_time_ms": round(generation_time_ms, 3),
+        "finish_reason_counts": finish_reason_counts,
         "approval_pending": approval_pending,
         "risky_tool_events": risky_tool_events,
         "invocations": invocations,
     }
+
+
+def _build_approval_wait_state(
+    *,
+    artifacts: Mapping[str, Any],
+    role_task_snapshot: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    pending_approvals = _collect_pending_approval_entries(
+        artifacts=artifacts,
+        role_task_snapshot=role_task_snapshot,
+    )
+    if not pending_approvals:
+        return None
+    stage = next(
+        (
+            str(item.get("stage") or "").strip()
+            for item in pending_approvals
+            if isinstance(item.get("stage"), str) and str(item.get("stage")).strip()
+        ),
+        "",
+    )
+    if not stage:
+        stage = "protocol_completed"
+    approval_ids = sorted(
+        {
+            str(item.get("approval_id") or "").strip()
+            for item in pending_approvals
+            if isinstance(item.get("approval_id"), str) and str(item.get("approval_id")).strip()
+        }
+    )
+    reason = next(
+        (
+            str(item.get("reason") or "").strip()
+            for item in pending_approvals
+            if isinstance(item.get("reason"), str) and str(item.get("reason")).strip()
+        ),
+        "",
+    )
+    if not reason:
+        approval_word = "approval" if len(pending_approvals) == 1 else "approvals"
+        reason = f"Run is waiting for {len(pending_approvals)} pending {approval_word} before it can continue."
+    approval_state = {
+        "status": "awaiting_approval",
+        "requires_approval": True,
+        "resume_stage": stage,
+        "pending_count": len(pending_approvals),
+        "approval_ids": approval_ids,
+        "pending_approvals": [_mapping_to_plain_dict(item) for item in pending_approvals],
+    }
+    return {
+        "stage": stage,
+        "reason": reason,
+        "approval_state": approval_state,
+        "role_task_snapshot": _prune_role_task_snapshot_for_pending_approvals(
+            snapshot=role_task_snapshot,
+            pending_approvals=pending_approvals,
+        ),
+    }
+
+
+def _collect_pending_approval_entries(
+    *,
+    artifacts: Mapping[str, Any],
+    role_task_snapshot: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    execution_results = (
+        artifacts.get("execution_results", {}).get("items")
+        if isinstance(artifacts.get("execution_results"), Mapping)
+        else None
+    )
+    if isinstance(execution_results, list):
+        for result in execution_results:
+            if not isinstance(result, Mapping):
+                continue
+            metadata = result.get("metadata") if isinstance(result.get("metadata"), Mapping) else {}
+            status = str(result.get("status") or metadata.get("status") or "").strip()
+            approval_id = metadata.get("approval_id")
+            requires_approval = bool(metadata.get("requires_approval"))
+            if status != "approval_pending" and not requires_approval and not isinstance(approval_id, str):
+                continue
+            request_id = str(result.get("request_id") or "").strip()
+            pending.append(
+                {
+                    "source": "controlled_execution",
+                    "role_id": "controller",
+                    "task_key": f"controlled_execution_exec:{request_id}" if request_id else None,
+                    "controller_task_key": (
+                        f"controlled_execution_controller:{request_id}" if request_id else None
+                    ),
+                    "stage": f"controlled_execution_exec:{request_id}" if request_id else None,
+                    "request_id": request_id or None,
+                    "tool_name": "exec_command",
+                    "command": result.get("command"),
+                    "shell": result.get("shell"),
+                    "background": bool(result.get("background")),
+                    "approval_id": approval_id,
+                    "approval_kind": metadata.get("approval_kind"),
+                    "approval_scope": metadata.get("approval_scope"),
+                    "reason": metadata.get("reason") or result.get("error"),
+                    "status": status or "approval_pending",
+                    "metadata": _mapping_to_plain_dict(metadata),
+                }
+            )
+    subagent_runtime = (
+        artifacts.get("subagent_runtime")
+        if isinstance(artifacts.get("subagent_runtime"), Mapping)
+        else {}
+    )
+    invocations = subagent_runtime.get("invocations") if isinstance(subagent_runtime.get("invocations"), list) else []
+    for invocation in invocations:
+        if not isinstance(invocation, Mapping):
+            continue
+        invocation_pending = (
+            invocation.get("approval_pending")
+            if isinstance(invocation.get("approval_pending"), list)
+            else []
+        )
+        session_scope = str(invocation.get("session_scope") or "").strip()
+        role_id = _role_id_from_session_scope(session_scope)
+        task_key = _snapshot_task_key_for_role(role_task_snapshot, role_id)
+        for event in invocation_pending:
+            if not isinstance(event, Mapping):
+                continue
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+            approval_id = metadata.get("approval_id")
+            if (
+                metadata.get("status") != "approval_pending"
+                and metadata.get("requires_approval") is not True
+                and not isinstance(approval_id, str)
+            ):
+                continue
+            pending.append(
+                {
+                    "source": "subagent_invocation",
+                    "role_id": role_id,
+                    "task_key": task_key,
+                    "stage": task_key,
+                    "session_scope": session_scope or None,
+                    "session_id": invocation.get("session_id"),
+                    "model_id": invocation.get("model_id"),
+                    "execution_profile": invocation.get("execution_profile"),
+                    "call_id": event.get("call_id"),
+                    "tool_name": event.get("tool_name"),
+                    "approval_id": approval_id,
+                    "approval_kind": metadata.get("approval_kind"),
+                    "approval_scope": metadata.get("approval_scope"),
+                    "reason": metadata.get("reason") or event.get("error"),
+                    "status": metadata.get("status") or "approval_pending",
+                    "metadata": _mapping_to_plain_dict(metadata),
+                }
+            )
+    return pending
+
+
+def _prune_role_task_snapshot_for_pending_approvals(
+    *,
+    snapshot: Mapping[str, Any] | None,
+    pending_approvals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    pruned = _mapping_to_plain_dict(snapshot)
+    roles = pruned.get("roles") if isinstance(pruned.get("roles"), Mapping) else {}
+    tasks = pruned.get("tasks") if isinstance(pruned.get("tasks"), Mapping) else {}
+    updated_roles = {
+        role_id: _mapping_to_plain_dict(entry)
+        for role_id, entry in roles.items()
+        if isinstance(role_id, str) and isinstance(entry, Mapping)
+    }
+    updated_tasks = {
+        task_key: _mapping_to_plain_dict(entry)
+        for task_key, entry in tasks.items()
+        if isinstance(task_key, str) and isinstance(entry, Mapping)
+    }
+    drop_controlled_evaluator = False
+    for item in pending_approvals:
+        source = str(item.get("source") or "").strip()
+        task_key = item.get("task_key")
+        role_id = item.get("role_id")
+        reason = str(item.get("reason") or "").strip()
+        if source == "controlled_execution":
+            if isinstance(task_key, str) and task_key:
+                updated_tasks.pop(task_key, None)
+            controller_task_key = item.get("controller_task_key")
+            if (
+                isinstance(role_id, str)
+                and role_id
+                and isinstance(controller_task_key, str)
+                and isinstance(updated_tasks.get(controller_task_key), Mapping)
+            ):
+                controller_task = _mapping_to_plain_dict(updated_tasks[controller_task_key])
+                controller_task.pop("task_key", None)
+                controller_task["role_id"] = role_id
+                updated_roles[role_id] = controller_task
+            drop_controlled_evaluator = True
+            continue
+        if not isinstance(role_id, str) or not role_id:
+            continue
+        if isinstance(task_key, str) and task_key:
+            updated_tasks.pop(task_key, None)
+        role_entry = _mapping_to_plain_dict(updated_roles.get(role_id))
+        if not role_entry:
+            role_entry = {"role_id": role_id}
+        role_entry["status"] = "waiting_approval"
+        role_entry["resume_action"] = "rerun"
+        if reason:
+            role_entry["last_error"] = reason
+        role_entry.pop("candidate", None)
+        role_entry.pop("candidate_id", None)
+        role_entry.pop("output_preview", None)
+        role_entry.pop("result_summary", None)
+        updated_roles[role_id] = role_entry
+    if drop_controlled_evaluator:
+        updated_tasks.pop("controlled_execution_evaluator", None)
+        updated_roles.pop("evaluator", None)
+    pruned["roles"] = updated_roles
+    pruned["tasks"] = updated_tasks
+    if isinstance(pruned.get("resume_plan"), Mapping):
+        pruned["resume_plan"] = {}
+    return pruned
+
+
+def _role_id_from_session_scope(session_scope: str) -> str | None:
+    if not session_scope.startswith("role::"):
+        return None
+    role_id, _, _ = session_scope[6:].partition("::")
+    normalized = role_id.strip()
+    return normalized or None
+
+
+def _snapshot_task_key_for_role(
+    snapshot: Mapping[str, Any] | None,
+    role_id: str | None,
+) -> str | None:
+    if not isinstance(snapshot, Mapping) or not isinstance(role_id, str) or not role_id.strip():
+        return None
+    roles = snapshot.get("roles") if isinstance(snapshot.get("roles"), Mapping) else {}
+    entry = roles.get(role_id) if isinstance(roles, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return None
+    stage = entry.get("stage")
+    if not isinstance(stage, str) or not stage.strip():
+        return None
+    return stage.strip()
 
 
 def _deterministic_score(candidate: CandidateOutput) -> float:
@@ -4905,6 +5633,7 @@ def _parse_resume_execution_payload(payload: Any) -> ResumeExecutionPayload | No
         for item in (payload.get("guidance_messages") or [])
         if isinstance(item, str) and item.strip()
     ]
+    role_guidance_messages = _normalize_role_guidance_messages(payload.get("role_guidance_messages"))
     metadata_state = _mapping_to_plain_dict(payload.get("metadata_state"))
     precomputed_artifacts = _mapping_to_plain_dict(payload.get("precomputed_artifacts"))
     protocol_artifacts = _mapping_to_plain_dict(payload.get("protocol_artifacts"))
@@ -4938,6 +5667,7 @@ def _parse_resume_execution_payload(payload: Any) -> ResumeExecutionPayload | No
         stage=stage,
         checkpoint=checkpoint,
         guidance_messages=guidance_messages,
+        role_guidance_messages=role_guidance_messages,
         metadata_state=metadata_state,
         precomputed_artifacts=precomputed_artifacts,
         protocol_artifacts=protocol_artifacts,
@@ -4956,6 +5686,7 @@ def _build_resume_execution_payload(
     stage: str,
     checkpoint: Mapping[str, Any] | None,
     guidance_messages: list[str],
+    role_guidance_messages: Mapping[str, list[str]] | None,
     metadata: Mapping[str, Any],
     precomputed_artifacts: Mapping[str, Any],
     protocol_artifacts: Mapping[str, Any],
@@ -4982,6 +5713,7 @@ def _build_resume_execution_payload(
         stage=stage,
         checkpoint=_mapping_to_plain_dict(checkpoint),
         guidance_messages=list(guidance_messages),
+        role_guidance_messages=_normalize_role_guidance_messages(role_guidance_messages),
         metadata_state=_build_resume_metadata_state(metadata),
         precomputed_artifacts=_mapping_to_plain_dict(precomputed_artifacts),
         protocol_artifacts=_mapping_to_plain_dict(protocol_artifacts),
@@ -5035,6 +5767,129 @@ def _merge_guidance_messages(base: list[str], extra: list[str]) -> list[str]:
         if not text or text in merged:
             continue
         merged.append(text)
+    return merged
+
+
+def _normalize_role_guidance_messages(payload: Any) -> dict[str, list[str]]:
+    if not isinstance(payload, Mapping):
+        return {}
+    normalized: dict[str, list[str]] = {}
+    for raw_role_id, raw_messages in payload.items():
+        role_id = str(raw_role_id or "").strip()
+        if not role_id or not isinstance(raw_messages, list):
+            continue
+        messages: list[str] = []
+        for item in raw_messages:
+            text = str(item).strip() if isinstance(item, str) else ""
+            if text and text not in messages:
+                messages.append(text)
+        if messages:
+            normalized[role_id] = messages
+    return normalized
+
+
+def _goal_capability_tool_allowlist(metadata: Any) -> list[str] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    capability_policy = metadata.get("goal_capability_policy")
+    if not isinstance(capability_policy, Mapping) or "allowed_tools" not in capability_policy:
+        return None
+    return _normalize_tool_name_list(capability_policy.get("allowed_tools"))
+
+
+def _goal_operator_tool_denylist(metadata: Any) -> list[str] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    operator_controls = metadata.get("goal_operator_controls")
+    if not isinstance(operator_controls, Mapping) or "tool_denylist" not in operator_controls:
+        return None
+    return _normalize_tool_name_list(operator_controls.get("tool_denylist"))
+
+
+def _goal_operator_permission_policy(metadata: Any) -> dict[str, Any] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    permission_policy: dict[str, Any] = {}
+    existing_policy = metadata.get("permission_policy")
+    if isinstance(existing_policy, Mapping):
+        permission_policy.update(existing_policy)
+    existing_blocked_domains = _normalize_domain_list(
+        permission_policy.get("blocked_web_domains")
+    )
+    if existing_blocked_domains:
+        permission_policy["blocked_web_domains"] = existing_blocked_domains
+    operator_controls = metadata.get("goal_operator_controls")
+    if isinstance(operator_controls, Mapping):
+        blocked_domains = _normalize_domain_list(operator_controls.get("blocked_domains"))
+        if blocked_domains:
+            permission_policy["blocked_web_domains"] = _merge_domain_lists(
+                existing_blocked_domains,
+                blocked_domains,
+            )
+    return permission_policy or None
+
+
+def _normalize_tool_name_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    normalized: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or text in normalized:
+            continue
+        normalized.append(text)
+    return normalized
+
+
+def _normalize_domain_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    normalized: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = item.strip().lower()
+        if not text:
+            continue
+        if "://" in text:
+            parsed = urlparse(text)
+            text = (parsed.hostname or "").strip().lower()
+        else:
+            text = text.split("/", 1)[0].strip().lower()
+            if ":" in text:
+                text = text.split(":", 1)[0].strip().lower()
+        text = text.lstrip(".").rstrip(".")
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _merge_domain_lists(*domain_lists: list[str]) -> list[str]:
+    merged: list[str] = []
+    for domain_list in domain_lists:
+        for domain in domain_list:
+            if domain and domain not in merged:
+                merged.append(domain)
+    return merged
+
+
+def _merge_role_guidance_messages(
+    base: Mapping[str, list[str]] | None,
+    extra: Mapping[str, list[str]] | None,
+) -> dict[str, list[str]]:
+    merged = _normalize_role_guidance_messages(base)
+    for role_id, messages in _normalize_role_guidance_messages(extra).items():
+        merged[role_id] = _merge_guidance_messages(merged.get(role_id, []), messages)
     return merged
 
 

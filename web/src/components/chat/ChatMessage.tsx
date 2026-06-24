@@ -16,6 +16,8 @@ import { createMarkdownCodeComponents } from '@/components/code/markdown-code'
 import { ChatAttachments } from './ChatAttachments'
 import { FileChangeCard } from './FileChangeCard'
 import type { FileChangeGroupSummary } from '@/lib/file-change-preview'
+import { WorkflowProgressCard } from './WorkflowProgressCard'
+import { SubagentTaskCard } from './SubagentTaskCard'
 
 interface ChatMessageProps {
   message: Message
@@ -24,6 +26,7 @@ interface ChatMessageProps {
   onRegenerate?: (message: Message) => void
   onEditAndResend?: (message: Message, nextContent: string) => Promise<void> | void
   onUndoFileChange?: (change: FileChangeSummary) => Promise<void> | void
+  onOpenTask?: (taskId: string) => void
 }
 
 function hasWideMarkdownContent(content: string): boolean {
@@ -77,6 +80,7 @@ export function ChatMessage({
   onRegenerate,
   onEditAndResend,
   onUndoFileChange,
+  onOpenTask,
 }: ChatMessageProps) {
   const { type, content, errorCode, isStreaming, reasoningSteps } = message
   const tokenStatsLabel = type === 'assistant' ? formatTokenStats(message) : null
@@ -201,6 +205,54 @@ export function ChatMessage({
     )
   }
 
+  if (message.workflowCard) {
+    return (
+      <div className="group animate-slide-up">
+        <div className="flex justify-start">
+          <div className="w-full max-w-[860px]">
+            <div className="flex gap-3">
+              <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/15">
+                <Bot className="h-3.5 w-3.5 text-primary-400" />
+              </div>
+              <div className="min-w-0 flex-1 pt-0.5">
+                <WorkflowProgressCard card={message.workflowCard} />
+                <div className="mt-2 opacity-0 transition-opacity group-hover:opacity-100">
+                  <span className="text-[11px] text-muted-foreground" title={timestampTitle}>
+                    {timestampLabel}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (message.subagentTaskCard) {
+    return (
+      <div className="group animate-slide-up">
+        <div className="flex justify-start">
+          <div className="w-full max-w-[800px]">
+            <div className="flex gap-3">
+              <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/15">
+                <Bot className="h-3.5 w-3.5 text-primary-400" />
+              </div>
+              <div className="min-w-0 flex-1 pt-0.5">
+                <SubagentTaskCard card={message.subagentTaskCard} onOpenTask={onOpenTask} />
+                <div className="mt-2 opacity-0 transition-opacity group-hover:opacity-100">
+                  <span className="text-[11px] text-muted-foreground" title={timestampTitle}>
+                    {timestampLabel}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="group animate-slide-up">
       <div className="flex justify-start">
@@ -217,6 +269,7 @@ export function ChatMessage({
             isStreaming={isStreaming}
             tokenStats={message.tokenStats}
             onUndoFileChange={onUndoFileChange}
+            onOpenTask={onOpenTask}
           />
           <div className="flex gap-3">
             <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/15">

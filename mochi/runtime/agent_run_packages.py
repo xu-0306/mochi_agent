@@ -6,6 +6,12 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
+from mochi.runtime.collector_contracts import (
+    build_collector_provenance_manifest,
+    dedupe_collector_shard_manifests,
+    extract_collector_shard_manifests,
+)
+
 ATTEMPT_BUNDLE_MANIFEST_VERSION = "mochi.agent_run.attempt_bundle.v1"
 DATASET_PACKAGE_MANIFEST_VERSION = "mochi.agent_run.dataset_package.v1"
 
@@ -24,12 +30,16 @@ def build_attempt_bundle(
     evaluation_events = [
         event for event in events if str(event.get("type") or "") == "evaluation"
     ]
+    collector_shard_manifests = dedupe_collector_shard_manifests(
+        extract_collector_shard_manifests(artifacts)
+    )
     dataset_records = [
         dict(artifact.get("metadata", {}).get("record") or {})
         for artifact in artifacts
         if str(artifact.get("artifact_type") or "") == "dataset_record"
         and isinstance(artifact.get("metadata", {}).get("record"), dict)
     ]
+    collector_provenance_manifest = build_collector_provenance_manifest(dataset_records)
     selected_candidate_id = _selected_candidate_id(run, dataset_records=dataset_records)
     final_answer = _final_answer(run, dataset_records=dataset_records)
 
@@ -49,6 +59,8 @@ def build_attempt_bundle(
         "events": [dict(event) for event in events],
         "role_outputs": role_outputs,
         "evaluation_events": [dict(event) for event in evaluation_events],
+        "collector_shard_manifests": collector_shard_manifests,
+        "collector_provenance_manifest": collector_provenance_manifest,
         "dataset_records": dataset_records,
         "run_summary": _run_summary_payload(run, artifacts, attempt_id),
         "evidence_summary": _artifact_content(artifacts, "evidence_summary"),
@@ -75,8 +87,10 @@ def build_dataset_package(run: Mapping[str, Any]) -> dict[str, Any]:
         for attempt in recent_attempts
         if (attempt_id := _string(attempt.get("attempt_id"))) is not None
     }
-    grouped: dict[str, list[dict[str, Any]]] = {}
     grouped_attempt_records: dict[str, list[dict[str, Any]]] = {}
+    collector_shard_manifests = dedupe_collector_shard_manifests(
+        extract_collector_shard_manifests(_artifacts(run))
+    )
 
     for artifact in _artifacts(run):
         if str(artifact.get("artifact_type") or "") != "dataset_record":
@@ -91,7 +105,6 @@ def build_dataset_package(run: Mapping[str, Any]) -> dict[str, Any]:
             artifact=artifact,
             record=record,
         )
-        grouped.setdefault(attempt_id, []).append(governed_record)
         grouped_attempt_records.setdefault(attempt_id, []).append(governed_record)
 
     attempts: list[dict[str, Any]] = []
@@ -119,15 +132,23 @@ def build_dataset_package(run: Mapping[str, Any]) -> dict[str, Any]:
         for record in excluded:
             for reason in _string_array(record.get("exclusion_reasons")):
                 excluded_reason_counts[reason] += 1
+        attempt_scope = None if grouped_attempt_id == "unscoped" else grouped_attempt_id
+        scoped_collector_shard_manifests = dedupe_collector_shard_manifests(
+            extract_collector_shard_manifests(
+                _scoped_artifacts(run, attempt_scope)
+            )
+        )
         attempts.append(
             {
-                "attempt_id": None if grouped_attempt_id == "unscoped" else grouped_attempt_id,
+                "attempt_id": attempt_scope,
                 "schedule_attempt": None
                 if grouped_attempt_id == "unscoped"
                 else attempt_lookup.get(grouped_attempt_id),
                 "dataset_record_count": len(records),
                 "training_ready_count": len(training_ready),
                 "excluded_record_count": len(excluded),
+                "collector_shard_manifests": scoped_collector_shard_manifests,
+                "collector_provenance_manifest": build_collector_provenance_manifest(records),
                 "dataset_records": records,
             }
         )
@@ -152,6 +173,8 @@ def build_dataset_package(run: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_record_count": len(all_records),
         "training_ready_count": len(training_ready_records),
         "excluded_record_count": excluded_records_summary["excluded_count"],
+        "collector_shard_manifests": collector_shard_manifests,
+        "collector_provenance_manifest": build_collector_provenance_manifest(all_records),
         "attempts": attempts,
         "all_records": all_records,
         "training_ready_records": training_ready_records,

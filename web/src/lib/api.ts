@@ -703,14 +703,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       phase === 'workflow_artifact' ||
       phase === 'workflow_exec_update'
     ) {
-      return {
-        kind: 'message',
-        role: phase === 'workflow_status' ? 'assistant' : 'system',
-        content: getPayloadContent(payload) || getString(event.content) || '',
-        attachments: [],
-        timestamp,
-        turnKey,
-      }
+      return null
     }
     const finishReason =
       getNonEmptyString(payload.finish_reason) ??
@@ -5655,6 +5648,8 @@ export interface AgentRunAttemptPackage {
   events: Array<Record<string, unknown>>
   role_outputs: Array<Record<string, unknown>>
   evaluation_events: Array<Record<string, unknown>>
+  collector_shard_manifests: Array<Record<string, unknown>>
+  collector_provenance_manifest: Record<string, unknown> | null
   dataset_records: Array<Record<string, unknown>>
   run_summary: Record<string, unknown> | null
   evidence_summary: Record<string, unknown> | null
@@ -5672,6 +5667,8 @@ export interface AgentRunDatasetPackage {
   dataset_record_count: number
   training_ready_count: number
   excluded_record_count: number
+  collector_shard_manifests: Array<Record<string, unknown>>
+  collector_provenance_manifest: Record<string, unknown> | null
   attempts: Array<Record<string, unknown>>
   all_records: Array<Record<string, unknown>>
   training_ready_records: Array<Record<string, unknown>>
@@ -5924,6 +5921,10 @@ function normalizeAgentRunAttemptPackage(payload: unknown): AgentRunAttemptPacka
     events: getRecordArray(record.events),
     role_outputs: getRecordArray(record.role_outputs),
     evaluation_events: getRecordArray(record.evaluation_events),
+    collector_shard_manifests: getRecordArray(record.collector_shard_manifests),
+    collector_provenance_manifest: isRecord(record.collector_provenance_manifest)
+      ? record.collector_provenance_manifest
+      : null,
     dataset_records: getRecordArray(record.dataset_records),
     run_summary: isRecord(record.run_summary) ? record.run_summary : null,
     evidence_summary: isRecord(record.evidence_summary) ? record.evidence_summary : null,
@@ -5946,6 +5947,10 @@ function normalizeAgentRunDatasetPackage(payload: unknown): AgentRunDatasetPacka
     dataset_record_count: getNumber(record.dataset_record_count) ?? 0,
     training_ready_count: getNumber(record.training_ready_count) ?? 0,
     excluded_record_count: getNumber(record.excluded_record_count) ?? 0,
+    collector_shard_manifests: getRecordArray(record.collector_shard_manifests),
+    collector_provenance_manifest: isRecord(record.collector_provenance_manifest)
+      ? record.collector_provenance_manifest
+      : null,
     attempts: getRecordArray(record.attempts),
     all_records: getRecordArray(record.all_records),
     training_ready_records: getRecordArray(record.training_ready_records),
@@ -6196,4 +6201,742 @@ export async function reattachAgentRunExecSession(
     }
   )
   return normalizeAgentRunExecSessionPayload(payload)
+}
+
+export interface GoalAttemptSummary {
+  attempt_id: string
+  goal_id: string
+  attempt_index: number
+  status: string
+  trigger: string | null
+  agent_run_id: string | null
+  summary: Record<string, unknown>
+  metadata: Record<string, unknown>
+  latest_error: string | null
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface GoalSummary {
+  goal_id: string
+  objective: string
+  title: string | null
+  goal_type: string | null
+  protocol_id: string | null
+  topic: string | null
+  project_id: string | null
+  workspace_dir: string | null
+  status: string
+  current_attempt_id: string | null
+  run_policy: Record<string, unknown>
+  capability_policy: Record<string, unknown>
+  source_manifest: Record<string, unknown>
+  summary: Record<string, unknown>
+  metadata: Record<string, unknown>
+  latest_error: string | null
+  attempts: GoalAttemptSummary[]
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface GoalCheckpointRecord {
+  checkpoint_id: number
+  goal_id: string
+  attempt_id: string | null
+  agent_run_id: string | null
+  checkpoint_index: number | null
+  stage: string | null
+  source: string | null
+  payload: Record<string, unknown>
+  metadata: Record<string, unknown>
+  captured_at: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface GoalMemorySnapshotRecord {
+  snapshot_id: number
+  goal_id: string
+  attempt_id: string | null
+  checkpoint_id: number | null
+  snapshot_kind: string | null
+  snapshot: Record<string, unknown>
+  metadata: Record<string, unknown>
+  captured_at: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface GoalWorkerGenerationSummary {
+  generation_id: number
+  goal_id: string | null
+  attempt_id: string | null
+  agent_run_id: string | null
+  generation_index: number | null
+  status: string | null
+  rollover_reason: string | null
+  parent_generation_id: number | null
+  resume_source_snapshot_id: number | null
+  metadata: Record<string, unknown>
+  started_at: string | null
+  finished_at: string | null
+  created_at: string | null
+  updated_at: string | null
+  elapsed_sec?: number
+  generation_refresh_interval_sec?: number
+  refresh_interval_sec?: number
+  refresh_due?: boolean
+  refresh_overdue_sec?: number
+  context_handoff_due?: boolean
+  context_handoff_threshold?: number
+  context_handoff_over_threshold?: number
+  usage_ratio?: number
+  context_usage_ratio?: number
+  role_id?: string
+  stage?: string
+  compaction_level?: string
+  largest_section?: string
+  estimated_prompt_tokens?: number
+  reserved_output_tokens?: number
+  max_input_tokens?: number
+  truncated?: boolean
+  used_chunking?: boolean
+  overflow?: boolean
+  subagent_invocation_count?: number
+  subagent_completed_invocation_count?: number
+  subagent_token_tracked_invocation_count?: number
+  generation_token_refresh_threshold?: number
+  token_refresh_due?: boolean
+  token_refresh_over_threshold?: number
+  observed_input_tokens?: number
+  observed_output_tokens?: number
+  observed_total_tokens?: number
+  observed_generation_time_ms?: number
+  observed_finish_reason_counts?: Record<string, number>
+  last_subagent_runtime_snapshot_at?: string | null
+}
+
+export interface GoalAuditFinding {
+  finding_id: number
+  goal_id: string
+  finding_code: string
+  status: string
+  severity: string
+  summary: string | null
+  details: Record<string, unknown>
+  resolved_at: string | null
+  closed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface GoalOperatorControls {
+  scope: string
+  stop_all_goals: boolean
+  blocked_tools: string[]
+  blocked_domains: string[]
+  block_network_usage: boolean
+  tool_denylist: string[]
+  metadata: Record<string, unknown>
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface GoalOperatorAuditEntry {
+  audit_id: number
+  event_type: string | null
+  subject_type: string | null
+  subject_id: string | null
+  action: string | null
+  summary: string | null
+  details: Record<string, unknown>
+  created_at: string | null
+}
+
+export interface GoalHealthSummary {
+  goal_id: string
+  status: string
+  current_attempt_id: string | null
+  attempt_count: number
+  run_policy: Record<string, unknown>
+  capability_policy: Record<string, unknown>
+  operator_controls: GoalOperatorControls
+  latest_error: string | null
+  current_attempt: GoalAttemptSummary | null
+  runtime_budget: Record<string, unknown>
+  recovery_state: Record<string, unknown>
+  checkpoint: Record<string, unknown> | null
+  persisted_checkpoint: GoalCheckpointRecord | null
+  memory_snapshot: GoalMemorySnapshotRecord | null
+  current_generation: GoalWorkerGenerationSummary | null
+  approval_state: Record<string, unknown> | null
+  checkpoint_policy: Record<string, unknown>
+  collector_state: Record<string, unknown> | null
+  linked_agent_run: Record<string, unknown> | null
+  runtime_owner_id: string | null
+  lease: Record<string, unknown> | null
+  open_findings: GoalAuditFinding[]
+  recommended_next_action: Record<string, unknown> | null
+}
+
+export interface CreateGoalInput {
+  objective: string
+  title?: string | null
+  goal_type?: string | null
+  protocol_id?: string | null
+  topic?: string | null
+  projectId?: string | null
+  workspaceDir?: string | null
+  run_policy?: Record<string, unknown>
+  capability_policy?: Record<string, unknown>
+  source_manifest?: Record<string, unknown>
+  summary?: Record<string, unknown>
+  metadata?: Record<string, unknown>
+}
+
+export interface ResumeGoalInput {
+  strategy?: 'continue_from_checkpoint' | 'restart_attempt'
+  approval_id?: string | null
+  decision?: 'approve_once' | 'approve_and_save_rule' | 'reject'
+  reason?: string | null
+  rule?: Record<string, unknown> | null
+}
+
+export interface RefreshGoalInput {
+  strategy?: 'continue_from_checkpoint' | 'restart_attempt' | null
+}
+
+export interface RetryGoalFailedShardInput {
+  shard_id?: string | null
+  strategy?: 'continue_from_checkpoint' | 'restart_attempt' | null
+}
+
+export interface GoalEstopUpdateInput {
+  stop_all_goals?: boolean
+  blocked_tools?: string[]
+  blocked_domains?: string[]
+  block_network_usage?: boolean
+  reason?: string | null
+}
+
+function normalizeGoalAttemptSummary(payload: unknown): GoalAttemptSummary | null {
+  const record = isRecord(payload) ? payload : {}
+  const attemptId = getString(record.attempt_id)
+  const goalId = getString(record.goal_id)
+  if (!attemptId || !goalId) {
+    return null
+  }
+
+  return {
+    attempt_id: attemptId,
+    goal_id: goalId,
+    attempt_index: getNumber(record.attempt_index) ?? 0,
+    status: getString(record.status) ?? 'unknown',
+    trigger: getNullableString(record.trigger),
+    agent_run_id: getNullableString(record.agent_run_id),
+    summary: isRecord(record.summary) ? record.summary : {},
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+    latest_error: getNullableString(record.latest_error),
+    created_at: getString(record.created_at) ?? new Date(0).toISOString(),
+    updated_at: getString(record.updated_at) ?? new Date(0).toISOString(),
+    started_at: getNullableString(record.started_at),
+    finished_at: getNullableString(record.finished_at),
+  }
+}
+
+function normalizeGoalSummary(payload: unknown): GoalSummary {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    goal_id: getString(record.goal_id) ?? '',
+    objective: getString(record.objective) ?? '',
+    title: getNullableString(record.title),
+    goal_type: getNullableString(record.goal_type),
+    protocol_id: getNullableString(record.protocol_id),
+    topic: getNullableString(record.topic),
+    project_id: getNullableString(record.project_id),
+    workspace_dir: getNullableString(record.workspace_dir),
+    status: getString(record.status) ?? 'unknown',
+    current_attempt_id: getNullableString(record.current_attempt_id),
+    run_policy: isRecord(record.run_policy) ? record.run_policy : {},
+    capability_policy: isRecord(record.capability_policy) ? record.capability_policy : {},
+    source_manifest: isRecord(record.source_manifest) ? record.source_manifest : {},
+    summary: isRecord(record.summary) ? record.summary : {},
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+    latest_error: getNullableString(record.latest_error),
+    attempts: getRecordArray(record.attempts)
+      .map((item) => normalizeGoalAttemptSummary(item))
+      .filter((item): item is GoalAttemptSummary => item !== null),
+    created_at: getString(record.created_at) ?? new Date(0).toISOString(),
+    updated_at: getString(record.updated_at) ?? new Date(0).toISOString(),
+    started_at: getNullableString(record.started_at),
+    finished_at: getNullableString(record.finished_at),
+  }
+}
+
+function normalizeGoalCheckpointRecord(payload: unknown): GoalCheckpointRecord | null {
+  const record = isRecord(payload) ? payload : {}
+  const checkpointId = getNumber(record.checkpoint_id)
+  const goalId = getString(record.goal_id)
+  if (checkpointId === null || !goalId) {
+    return null
+  }
+  return {
+    checkpoint_id: checkpointId,
+    goal_id: goalId,
+    attempt_id: getNullableString(record.attempt_id),
+    agent_run_id: getNullableString(record.agent_run_id),
+    checkpoint_index: getNumber(record.checkpoint_index),
+    stage: getNullableString(record.stage),
+    source: getNullableString(record.source),
+    payload: isRecord(record.payload) ? record.payload : {},
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+    captured_at: getNullableString(record.captured_at),
+    created_at: getNullableString(record.created_at),
+    updated_at: getNullableString(record.updated_at),
+  }
+}
+
+function normalizeGoalMemorySnapshotRecord(payload: unknown): GoalMemorySnapshotRecord | null {
+  const record = isRecord(payload) ? payload : {}
+  const snapshotId = getNumber(record.snapshot_id)
+  const goalId = getString(record.goal_id)
+  if (snapshotId === null || !goalId) {
+    return null
+  }
+  return {
+    snapshot_id: snapshotId,
+    goal_id: goalId,
+    attempt_id: getNullableString(record.attempt_id),
+    checkpoint_id: getNumber(record.checkpoint_id),
+    snapshot_kind: getNullableString(record.snapshot_kind),
+    snapshot: isRecord(record.snapshot) ? record.snapshot : {},
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+    captured_at: getNullableString(record.captured_at),
+    created_at: getNullableString(record.created_at),
+    updated_at: getNullableString(record.updated_at),
+  }
+}
+
+function normalizeGoalWorkerGenerationSummary(payload: unknown): GoalWorkerGenerationSummary | null {
+  const record = isRecord(payload) ? payload : {}
+  const generationId = getNumber(record.generation_id)
+  if (generationId === null) {
+    return null
+  }
+  const generationRefreshIntervalSec = getOptionalNumber(
+    record.generation_refresh_interval_sec ?? record.refresh_interval_sec
+  )
+  const usageRatio = getOptionalNumber(record.usage_ratio ?? record.context_usage_ratio)
+  const observedFinishReasonCounts = isRecord(record.observed_finish_reason_counts)
+    ? (Object.fromEntries(
+        Object.entries(record.observed_finish_reason_counts).filter(
+          ([key, value]) =>
+            typeof key === 'string' && key.length > 0 && typeof value === 'number' && Number.isFinite(value)
+        )
+      ) as Record<string, number>)
+    : undefined
+  return {
+    generation_id: generationId,
+    goal_id: getNullableString(record.goal_id),
+    attempt_id: getNullableString(record.attempt_id),
+    agent_run_id: getNullableString(record.agent_run_id),
+    generation_index: getNumber(record.generation_index),
+    status: getNullableString(record.status),
+    rollover_reason: getNullableString(record.rollover_reason),
+    parent_generation_id: getNumber(record.parent_generation_id),
+    resume_source_snapshot_id: getNumber(record.resume_source_snapshot_id),
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+    started_at: getNullableString(record.started_at),
+    finished_at: getNullableString(record.finished_at),
+    created_at: getNullableString(record.created_at),
+    updated_at: getNullableString(record.updated_at),
+    elapsed_sec: getOptionalNumber(record.elapsed_sec),
+    generation_refresh_interval_sec: generationRefreshIntervalSec,
+    refresh_interval_sec: generationRefreshIntervalSec,
+    refresh_due: getOptionalBoolean(record.refresh_due),
+    refresh_overdue_sec: getOptionalNumber(record.refresh_overdue_sec),
+    context_handoff_due: getOptionalBoolean(record.context_handoff_due),
+    context_handoff_threshold: getOptionalNumber(record.context_handoff_threshold),
+    context_handoff_over_threshold: getOptionalNumber(record.context_handoff_over_threshold),
+    usage_ratio: usageRatio,
+    context_usage_ratio: usageRatio,
+    role_id: getNullableString(record.role_id) ?? undefined,
+    stage: getNullableString(record.stage) ?? undefined,
+    compaction_level: getNullableString(record.compaction_level) ?? undefined,
+    largest_section: getNullableString(record.largest_section) ?? undefined,
+    estimated_prompt_tokens: getOptionalNumber(record.estimated_prompt_tokens),
+    reserved_output_tokens: getOptionalNumber(record.reserved_output_tokens),
+    max_input_tokens: getOptionalNumber(record.max_input_tokens),
+    truncated: getOptionalBoolean(record.truncated),
+    used_chunking: getOptionalBoolean(record.used_chunking),
+    overflow: getOptionalBoolean(record.overflow),
+    subagent_invocation_count: getOptionalNumber(record.subagent_invocation_count),
+    subagent_completed_invocation_count: getOptionalNumber(record.subagent_completed_invocation_count),
+    subagent_token_tracked_invocation_count: getOptionalNumber(record.subagent_token_tracked_invocation_count),
+    generation_token_refresh_threshold: getOptionalNumber(record.generation_token_refresh_threshold),
+    token_refresh_due: getOptionalBoolean(record.token_refresh_due),
+    token_refresh_over_threshold: getOptionalNumber(record.token_refresh_over_threshold),
+    observed_input_tokens: getOptionalNumber(record.observed_input_tokens),
+    observed_output_tokens: getOptionalNumber(record.observed_output_tokens),
+    observed_total_tokens: getOptionalNumber(record.observed_total_tokens),
+    observed_generation_time_ms: getOptionalNumber(record.observed_generation_time_ms),
+    observed_finish_reason_counts: observedFinishReasonCounts,
+    last_subagent_runtime_snapshot_at: getNullableString(record.last_subagent_runtime_snapshot_at),
+  }
+}
+
+function normalizeGoalAuditFinding(payload: unknown): GoalAuditFinding | null {
+  const record = isRecord(payload) ? payload : {}
+  const findingId = getNumber(record.finding_id)
+  const goalId = getString(record.goal_id)
+  const findingCode = getString(record.finding_code)
+  if (findingId === null || !goalId || !findingCode) {
+    return null
+  }
+  return {
+    finding_id: findingId,
+    goal_id: goalId,
+    finding_code: findingCode,
+    status: getString(record.status) ?? 'open',
+    severity: getString(record.severity) ?? 'warning',
+    summary: getNullableString(record.summary),
+    details: isRecord(record.details) ? record.details : {},
+    resolved_at: getNullableString(record.resolved_at),
+    closed_at: getNullableString(record.closed_at),
+    created_at: getString(record.created_at) ?? new Date(0).toISOString(),
+    updated_at: getString(record.updated_at) ?? new Date(0).toISOString(),
+  }
+}
+
+function normalizeGoalOperatorControls(payload: unknown): GoalOperatorControls {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    scope: getString(record.scope) ?? 'global',
+    stop_all_goals: getBoolean(record.stop_all_goals) ?? false,
+    blocked_tools: getStringArray(record.blocked_tools),
+    blocked_domains: getStringArray(record.blocked_domains),
+    block_network_usage: getBoolean(record.block_network_usage) ?? false,
+    tool_denylist: getStringArray(record.tool_denylist),
+    metadata: isRecord(record.metadata) ? record.metadata : {},
+    created_at: getNullableString(record.created_at),
+    updated_at: getNullableString(record.updated_at),
+  }
+}
+
+function normalizeGoalOperatorAuditEntry(payload: unknown): GoalOperatorAuditEntry | null {
+  const record = isRecord(payload) ? payload : {}
+  const auditId = getNumber(record.audit_id)
+  if (auditId === null) {
+    return null
+  }
+  return {
+    audit_id: auditId,
+    event_type: getNullableString(record.event_type),
+    subject_type: getNullableString(record.subject_type),
+    subject_id: getNullableString(record.subject_id),
+    action: getNullableString(record.action),
+    summary: getNullableString(record.summary),
+    details: isRecord(record.details) ? record.details : {},
+    created_at: getNullableString(record.created_at),
+  }
+}
+
+function normalizeGoalHealthSummary(payload: unknown): GoalHealthSummary {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    goal_id: getString(record.goal_id) ?? '',
+    status: getString(record.status) ?? 'unknown',
+    current_attempt_id: getNullableString(record.current_attempt_id),
+    attempt_count: getNumber(record.attempt_count) ?? 0,
+    run_policy: isRecord(record.run_policy) ? record.run_policy : {},
+    capability_policy: isRecord(record.capability_policy) ? record.capability_policy : {},
+    operator_controls: normalizeGoalOperatorControls(record.operator_controls),
+    latest_error: getNullableString(record.latest_error),
+    current_attempt: normalizeGoalAttemptSummary(record.current_attempt),
+    runtime_budget: isRecord(record.runtime_budget) ? record.runtime_budget : {},
+    recovery_state: isRecord(record.recovery_state) ? record.recovery_state : {},
+    checkpoint: isRecord(record.checkpoint) ? record.checkpoint : null,
+    persisted_checkpoint: normalizeGoalCheckpointRecord(record.persisted_checkpoint),
+    memory_snapshot: normalizeGoalMemorySnapshotRecord(record.memory_snapshot),
+    current_generation: normalizeGoalWorkerGenerationSummary(record.current_generation),
+    approval_state: isRecord(record.approval_state) ? record.approval_state : null,
+    checkpoint_policy: isRecord(record.checkpoint_policy) ? record.checkpoint_policy : {},
+    collector_state: isRecord(record.collector_state) ? record.collector_state : null,
+    linked_agent_run: isRecord(record.linked_agent_run) ? record.linked_agent_run : null,
+    runtime_owner_id: getNullableString(record.runtime_owner_id),
+    lease: isRecord(record.lease) ? record.lease : null,
+    open_findings: getRecordArray(record.open_findings)
+      .map((item) => normalizeGoalAuditFinding(item))
+      .filter((item): item is GoalAuditFinding => item !== null),
+    recommended_next_action: isRecord(record.recommended_next_action)
+      ? record.recommended_next_action
+      : null,
+  }
+}
+
+export async function fetchGoals(): Promise<GoalSummary[]> {
+  const payload = await requestJson<unknown>('/goals')
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload.map((item) => normalizeGoalSummary(item))
+}
+
+export async function fetchGoal(goalId: string): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}`)
+  return normalizeGoalSummary(payload)
+}
+
+export async function fetchGoalHealth(goalId: string): Promise<GoalHealthSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/health`)
+  return normalizeGoalHealthSummary(payload)
+}
+
+export async function fetchGoalCheckpoints(
+  goalId: string,
+  options?: { attemptId?: string | null; limit?: number }
+): Promise<GoalCheckpointRecord[]> {
+  const search = new URLSearchParams()
+  if (options?.attemptId) {
+    search.set('attempt_id', options.attemptId)
+  }
+  if (typeof options?.limit === 'number') {
+    search.set('limit', String(options.limit))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/checkpoints${query}`
+  )
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload
+    .map((item) => normalizeGoalCheckpointRecord(item))
+    .filter((item): item is GoalCheckpointRecord => item !== null)
+}
+
+export async function fetchGoalMemorySnapshots(
+  goalId: string,
+  options?: { attemptId?: string | null; limit?: number }
+): Promise<GoalMemorySnapshotRecord[]> {
+  const search = new URLSearchParams()
+  if (options?.attemptId) {
+    search.set('attempt_id', options.attemptId)
+  }
+  if (typeof options?.limit === 'number') {
+    search.set('limit', String(options.limit))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/memory-snapshots${query}`
+  )
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload
+    .map((item) => normalizeGoalMemorySnapshotRecord(item))
+    .filter((item): item is GoalMemorySnapshotRecord => item !== null)
+}
+
+export async function fetchGoalAuditFindings(
+  goalId: string,
+  options?: { status?: 'open' | 'resolved' | 'closed' | null }
+): Promise<GoalAuditFinding[]> {
+  const search = new URLSearchParams()
+  if (options?.status) {
+    search.set('status', options.status)
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/audit-findings${query}`
+  )
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload
+    .map((item) => normalizeGoalAuditFinding(item))
+    .filter((item): item is GoalAuditFinding => item !== null)
+}
+
+export async function resolveGoalAuditFinding(
+  goalId: string,
+  findingId: number
+): Promise<GoalAuditFinding> {
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/audit-findings/${findingId}/resolve`,
+    { method: 'POST' }
+  )
+  return normalizeGoalAuditFinding(payload) ?? {
+    finding_id: findingId,
+    goal_id: goalId,
+    finding_code: 'unknown',
+    status: 'resolved',
+    severity: 'warning',
+    summary: null,
+    details: {},
+    resolved_at: null,
+    closed_at: null,
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString(),
+  }
+}
+
+export async function closeGoalAuditFinding(
+  goalId: string,
+  findingId: number
+): Promise<GoalAuditFinding> {
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/audit-findings/${findingId}/close`,
+    { method: 'POST' }
+  )
+  return normalizeGoalAuditFinding(payload) ?? {
+    finding_id: findingId,
+    goal_id: goalId,
+    finding_code: 'unknown',
+    status: 'closed',
+    severity: 'warning',
+    summary: null,
+    details: {},
+    resolved_at: null,
+    closed_at: null,
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString(),
+  }
+}
+
+export async function createGoal(input: CreateGoalInput): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>('/goals', {
+    method: 'POST',
+    body: JSON.stringify({
+      objective: input.objective,
+      title: input.title ?? null,
+      goal_type: input.goal_type ?? null,
+      protocol_id: input.protocol_id ?? null,
+      topic: input.topic ?? null,
+      project_id: input.projectId ?? null,
+      workspace_dir: input.workspaceDir ?? null,
+      run_policy: input.run_policy ?? {},
+      capability_policy: input.capability_policy ?? {},
+      source_manifest: input.source_manifest ?? {},
+      summary: input.summary ?? {},
+      metadata: input.metadata ?? {},
+    }),
+  })
+  return normalizeGoalSummary(payload)
+}
+
+export async function startGoal(goalId: string): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/start`, {
+    method: 'POST',
+  })
+  return normalizeGoalSummary(payload)
+}
+
+export async function pauseGoal(goalId: string): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/pause`, {
+    method: 'POST',
+  })
+  return normalizeGoalSummary(payload)
+}
+
+export async function resumeGoal(
+  goalId: string,
+  input?: ResumeGoalInput
+): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({
+      strategy: input?.strategy ?? 'continue_from_checkpoint',
+      approval_id: input?.approval_id ?? null,
+      decision: input?.decision ?? 'approve_once',
+      reason: input?.reason ?? null,
+      rule: input?.rule ?? null,
+    }),
+  })
+  return normalizeGoalSummary(payload)
+}
+
+export async function refreshGoal(
+  goalId: string,
+  input?: RefreshGoalInput
+): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/refresh`, {
+    method: 'POST',
+    body: JSON.stringify({
+      strategy: input?.strategy ?? null,
+    }),
+  })
+  return normalizeGoalSummary(payload)
+}
+
+export async function retryGoalFailedShard(
+  goalId: string,
+  input?: RetryGoalFailedShardInput
+): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/retry-failed-shard`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        shard_id: input?.shard_id ?? null,
+        strategy: input?.strategy ?? 'continue_from_checkpoint',
+      }),
+    }
+  )
+  return normalizeGoalSummary(payload)
+}
+
+export async function cancelGoal(goalId: string): Promise<GoalSummary> {
+  const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/cancel`, {
+    method: 'POST',
+  })
+  return normalizeGoalSummary(payload)
+}
+
+export async function fetchGoalEstop(): Promise<GoalOperatorControls> {
+  const payload = await requestJson<unknown>('/goals/estop')
+  return normalizeGoalOperatorControls(payload)
+}
+
+export async function updateGoalEstop(
+  input: GoalEstopUpdateInput
+): Promise<GoalOperatorControls> {
+  const payload = await requestJson<unknown>('/goals/estop', {
+    method: 'POST',
+    body: JSON.stringify({
+      stop_all_goals: input.stop_all_goals,
+      blocked_tools: input.blocked_tools ?? null,
+      blocked_domains: input.blocked_domains ?? null,
+      block_network_usage: input.block_network_usage,
+      reason: input.reason ?? null,
+    }),
+  })
+  return normalizeGoalOperatorControls(payload)
+}
+
+export async function fetchGoalOperatorAuditLog(
+  options?: { eventType?: string | null; goalId?: string | null; limit?: number }
+): Promise<GoalOperatorAuditEntry[]> {
+  const search = new URLSearchParams()
+  if (options?.eventType) {
+    search.set('event_type', options.eventType)
+  }
+  if (options?.goalId) {
+    search.set('goal_id', options.goalId)
+  }
+  if (typeof options?.limit === 'number') {
+    search.set('limit', String(options.limit))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(`/goals/operator-audit-log${query}`)
+  if (!Array.isArray(payload)) {
+    return []
+  }
+  return payload
+    .map((item) => normalizeGoalOperatorAuditEntry(item))
+    .filter((item): item is GoalOperatorAuditEntry => item !== null)
 }

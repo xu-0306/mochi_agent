@@ -113,6 +113,7 @@ class ToolExposurePlanner:
         "crossref_search": 146,
         "pubmed_search": 148,
         "web_search": 150,
+        "discourse_topic_collect": 155,
         "web_fetch": 160,
         "web_crawl": 165,
         "get_current_time": 170,
@@ -253,6 +254,30 @@ class ToolExposurePlanner:
         "改寫",
         "改写",
         "修正",
+    )
+    _ATTACHMENT_PROCESSING_INTENT_KEYWORDS: tuple[str, ...] = (
+        "translate",
+        "translation",
+        "transform",
+        "convert",
+        "reformat",
+        "normalize",
+        "parse",
+        "json",
+        "json array",
+        "structured output",
+        "output json",
+        "return json",
+        "翻譯",
+        "轉換",
+        "整理",
+    )
+    _NON_MUTATING_EXECUTION_TOOLS: frozenset[str] = frozenset(
+        {
+            "exec_command",
+            "execute_code",
+            "execute_code_v2",
+        }
     )
     _FILE_BROWSE_INTENT_KEYWORDS: tuple[str, ...] = (
         "browse",
@@ -446,6 +471,7 @@ class ToolExposurePlanner:
         # Falling back to the structured planner message would let attachment
         # filenames/paths reintroduce false positives like `updated-report.pdf`.
         lowered_user_intent = (user_intent_message or "").lower()
+        lowered_primary_intent = lowered_user_intent or lowered
         normalized_attachment_count = max(0, attachment_count)
         normalized_workspace_attachment_count = max(0, workspace_attachment_count)
         attached_workspace_files = normalized_workspace_attachment_count > 0 or any(
@@ -454,6 +480,13 @@ class ToolExposurePlanner:
         attachment_mutation_request = self._matches_any_keyword(
             lowered_user_intent,
             self._ATTACHMENT_MUTATION_INTENT_KEYWORDS,
+        )
+        attachment_processing_request = (
+            attached_workspace_files
+            and self._matches_any_keyword(
+                lowered_primary_intent,
+                self._ATTACHMENT_PROCESSING_INTENT_KEYWORDS,
+            )
         )
         read_only_file_request = (
             attached_workspace_files
@@ -547,6 +580,10 @@ class ToolExposurePlanner:
             self._SYMBOL_LOOKUP_INTENT_KEYWORDS,
         ):
             preferred.append("read_symbol")
+        if attachment_processing_request:
+            for tool_name in ("exec_command", "execute_code", "execute_code_v2"):
+                if tool_name in available_order:
+                    preferred.append(tool_name)
         preferred = list(dict.fromkeys(preferred))
 
         selected: list[str] = []
@@ -609,9 +646,20 @@ class ToolExposurePlanner:
                 self._CONTEXT_KEYWORDS,
             ):
                 continue
-            if read_only_file_request and tool_name in self._RISKY_TOOLS:
+            if (
+                read_only_file_request
+                and tool_name in self._RISKY_TOOLS
+                and not (
+                    attachment_processing_request
+                    and tool_name in self._NON_MUTATING_EXECUTION_TOOLS
+                )
+            ):
                 continue
-            if file_browse_request and tool_name == "exec_command":
+            if (
+                file_browse_request
+                and tool_name == "exec_command"
+                and not attachment_processing_request
+            ):
                 continue
             if effective_mode == "strict" and tool_name in self._STRICT_BLOCKED_TOOLS:
                 continue

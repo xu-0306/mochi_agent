@@ -15,6 +15,7 @@ export interface InlineReasoningBuffer {
   visible: string
   reasoning: string
   pendingTag: string
+  activeTag: string | null
   isInsideThink: boolean
   startedReasoningBlock: boolean
 }
@@ -25,11 +26,79 @@ export interface InlineReasoningChunkResult {
   reasoningDelta: string | null
 }
 
+const CHANNEL_MARKER_RE = /(?:<\|channel\|?>|<channel\|>|<\|message\|?>|<message\|>)/gi
+const HEADER_MARKER_RE = /(?:<\|start_header_id\|>|<\|end_header_id\|>|<\|im_start\|>|<\|im_end\|>|<\|eot_id\|>)/gi
+const ROLE_SENTINEL_RE = /<[|｜]\s*(?:assistant|user|system|tool)\s*[|｜]>/gi
+const CHANNEL_REASONING_PREFIX_RE =
+  /^\s*(?:(?:<\|channel\|?>|<channel\|>|<\|message\|?>|<message\|>)\s*)+(?:(?:thought|analysis|reasoning)\s*)?(?:(?:<\|channel\|?>|<channel\|>|<\|message\|?>|<message\|>)\s*)*/i
+const ROLE_PREFIX_RE =
+  /^\s*(?:(?:<\|start_header_id\|>|<\|im_start\|>)\s*)+(?:assistant|user|system|tool)\s*(?:(?:<\|end_header_id\|>|<\|im_end\|>|<\|eot_id\|>)\s*)*/i
+const ROLE_SENTINEL_PREFIX_RE = /^\s*<[|｜]\s*(?:assistant|user|system|tool)\s*[|｜]>\s*/i
+const REASONING_TAGS = ['think', 'analysis', 'reasoning'] as const
+const REASONING_OPEN_TAGS = REASONING_TAGS.map((tag) => `<${tag}>`)
+
+function normalizeTagName(tag: string): string {
+  return tag.trim().toLowerCase()
+}
+
+function findOpeningReasoningTag(source: string): { index: number; tag: string; token: string } | null {
+  let bestMatch: { index: number; tag: string; token: string } | null = null
+  for (const tag of REASONING_TAGS) {
+    const token = `<${tag}>`
+    const index = source.toLowerCase().indexOf(token)
+    if (index === -1) {
+      continue
+    }
+    if (bestMatch === null || index < bestMatch.index) {
+      bestMatch = { index, tag, token }
+    }
+  }
+  return bestMatch
+}
+
+function findReasoningClosingTag(source: string): { index: number; tag: string; token: string } | null {
+  let bestMatch: { index: number; tag: string; token: string } | null = null
+  for (const tag of REASONING_TAGS) {
+    const token = `</${tag}>`
+    const index = source.toLowerCase().indexOf(token)
+    if (index === -1) {
+      continue
+    }
+    if (bestMatch === null || index < bestMatch.index) {
+      bestMatch = { index, tag, token }
+    }
+  }
+  return bestMatch
+}
+
+function findPartialTagSuffix(source: string, candidates: ReadonlyArray<string>): string {
+  const lowered = source.toLowerCase()
+  for (let size = Math.min(source.length, Math.max(...candidates.map((candidate) => candidate.length - 1))); size > 0; size -= 1) {
+    const suffix = lowered.slice(-size)
+    if (candidates.some((candidate) => candidate.startsWith(suffix) && candidate !== suffix)) {
+      return source.slice(-size)
+    }
+  }
+  return ''
+}
+
 function normalizeTextBlock(value: string): string {
   return value
     .replace(/\r\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+export function stripReasoningArtifacts(value: string): string {
+  return normalizeTextBlock(
+    value
+      .replace(CHANNEL_REASONING_PREFIX_RE, '')
+      .replace(ROLE_PREFIX_RE, '')
+      .replace(ROLE_SENTINEL_PREFIX_RE, '')
+      .replace(CHANNEL_MARKER_RE, '')
+      .replace(HEADER_MARKER_RE, '')
+      .replace(ROLE_SENTINEL_RE, '')
+  )
 }
 
 function consumeReasoningStream(
@@ -41,15 +110,16 @@ function consumeReasoningStream(
   let reasoning = buffer.reasoning
   let contentDelta = ''
   let reasoningDelta = ''
+  let activeTag = buffer.activeTag
   let isInsideThink = buffer.isInsideThink
   let startedReasoningBlock = buffer.startedReasoningBlock
 
   while (source.length > 0) {
-    if (isInsideThink) {
-      const closeIndex = source.search(/<\/think>/i)
+    if (activeTag) {
+      const closeToken = `</${activeTag}>`
+      const closeIndex = source.toLowerCase().indexOf(closeToken)
       if (closeIndex === -1) {
-        const partialCloseMatch = source.match(/<\/th?i?n?k?$/i)
-        const pendingTag = partialCloseMatch?.[0] ?? ''
+        const pendingTag = findPartialTagSuffix(source, [closeToken])
         const commit = pendingTag ? source.slice(0, -pendingTag.length) : source
         reasoning += commit
         reasoningDelta += commit
@@ -58,6 +128,7 @@ function consumeReasoningStream(
             visible,
             reasoning,
             pendingTag,
+            activeTag,
             isInsideThink: true,
             startedReasoningBlock,
           },
@@ -69,15 +140,15 @@ function consumeReasoningStream(
       const nextReasoning = source.slice(0, closeIndex)
       reasoning += nextReasoning
       reasoningDelta += nextReasoning
-      source = source.slice(closeIndex + 8)
+      source = source.slice(closeIndex + closeToken.length)
+      activeTag = null
       isInsideThink = false
       continue
     }
 
-    const openIndex = source.search(/<think>/i)
-    if (openIndex === -1) {
-      const partialOpenMatch = source.match(/<t?h?i?n?k?$/i)
-      const pendingTag = partialOpenMatch?.[0] ?? ''
+    const openMatch = findOpeningReasoningTag(source)
+    if (openMatch === null) {
+      const pendingTag = findPartialTagSuffix(source, REASONING_OPEN_TAGS)
       const commit = pendingTag ? source.slice(0, -pendingTag.length) : source
       visible += commit
       contentDelta += commit
@@ -86,6 +157,7 @@ function consumeReasoningStream(
           visible,
           reasoning,
           pendingTag,
+          activeTag: null,
           isInsideThink: false,
           startedReasoningBlock: buffer.startedReasoningBlock,
         },
@@ -94,15 +166,16 @@ function consumeReasoningStream(
       }
     }
 
-    const nextVisible = source.slice(0, openIndex)
+    const nextVisible = source.slice(0, openMatch.index)
     visible += nextVisible
     contentDelta += nextVisible
-    source = source.slice(openIndex + 7)
+    source = source.slice(openMatch.index + openMatch.token.length)
     if (startedReasoningBlock || reasoning.length > 0) {
       reasoning += '\n\n'
       reasoningDelta += '\n\n'
     }
     startedReasoningBlock = true
+    activeTag = normalizeTagName(openMatch.tag)
     isInsideThink = true
   }
 
@@ -111,6 +184,7 @@ function consumeReasoningStream(
       visible,
       reasoning,
       pendingTag: '',
+      activeTag,
       isInsideThink,
       startedReasoningBlock,
     },
@@ -121,37 +195,24 @@ function consumeReasoningStream(
 
 export function extractInlineReasoning(content: string): InlineReasoningExtraction {
   const normalized = content.replace(/\r\n/g, '\n')
-  const matches = [...normalized.matchAll(/<think>([\s\S]*?)<\/think>/gi)]
-  if (matches.length === 0) {
-    const closingOnlyIndex = normalized.search(/<\/think>/i)
-    if (closingOnlyIndex !== -1) {
-      const hidden = normalizeTextBlock(normalized.slice(0, closingOnlyIndex))
-      const visible = normalizeTextBlock(normalized.slice(closingOnlyIndex + 8))
+  const closingOnlyMatch = findReasoningClosingTag(normalized)
+  if (!findOpeningReasoningTag(normalized) && closingOnlyMatch !== null) {
+      const hidden = stripReasoningArtifacts(normalized.slice(0, closingOnlyMatch.index))
+      const visible = stripReasoningArtifacts(
+        normalized.slice(closingOnlyMatch.index + closingOnlyMatch.token.length)
+      )
       return {
         content: visible,
         reasoning: hidden || null,
       }
-    }
-
-    return {
-      content: normalized.trim(),
-      reasoning: null,
-    }
   }
 
-  const reasoning = normalizeTextBlock(
-    matches
-      .map((match) => match[1] ?? '')
-      .join('\n\n')
-  )
-
-  const visible = normalizeTextBlock(
-    normalized.replace(/<think>[\s\S]*?<\/think>/gi, '\n')
-  )
+  const streamed = appendInlineReasoningChunk(createInlineReasoningBuffer(), normalized)
+  const finalized = finalizeInlineReasoningBuffer(streamed.buffer)
 
   return {
-    content: visible,
-    reasoning: reasoning || null,
+    content: finalized.content,
+    reasoning: finalized.reasoning,
   }
 }
 
@@ -160,6 +221,7 @@ export function createInlineReasoningBuffer(): InlineReasoningBuffer {
     visible: '',
     reasoning: '',
     pendingTag: '',
+    activeTag: null,
     isInsideThink: false,
     startedReasoningBlock: false,
   }
@@ -174,11 +236,11 @@ export function appendInlineReasoningChunk(
 
 export function finalizeInlineReasoningBuffer(buffer: InlineReasoningBuffer): InlineReasoningExtraction {
   const pending = buffer.pendingTag.trim()
-  const trailingVisible = !buffer.isInsideThink && pending ? pending : ''
-  const trailingReasoning = buffer.isInsideThink && pending ? pending : ''
+  const trailingVisible = !buffer.activeTag && pending ? pending : ''
+  const trailingReasoning = buffer.activeTag && pending ? pending : ''
   return {
-    content: normalizeTextBlock(`${buffer.visible}${trailingVisible}`),
-    reasoning: normalizeTextBlock(`${buffer.reasoning}${trailingReasoning}`) || null,
+    content: stripReasoningArtifacts(`${buffer.visible}${trailingVisible}`),
+    reasoning: stripReasoningArtifacts(`${buffer.reasoning}${trailingReasoning}`) || null,
   }
 }
 
@@ -191,7 +253,7 @@ export function buildInlineReasoningStep(
   return {
     id: ['reasoning-inline', turnKey ?? 'na', timestamp ?? 'now', String(index)].join('-'),
     type: 'thinking',
-    content: reasoning,
+    content: stripReasoningArtifacts(reasoning),
     timestamp: Number.isNaN(stepTimestamp.getTime()) ? new Date() : stepTimestamp,
     status: 'success',
   }

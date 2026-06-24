@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import inspect
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 from mochi.api.routes.approvals import _get_runtime_service
 from mochi.runtime.models import (
@@ -13,11 +15,23 @@ from mochi.runtime.models import (
     AgentRunDatasetPackageResponse,
     AgentRunGuidanceRequest,
     AgentRunMessageRequest,
-    AgentRunResumeRequest,
+    AgentRunSubagentMessageRequest,
     AgentRunResponse,
 )
 
 router = APIRouter(prefix="/v1/agent-runs")
+
+
+class AgentRunResumeRequest(BaseModel):
+    """Request payload for resuming an Agent Run, optionally resolving an approval first."""
+
+    strategy: Literal["continue_from_checkpoint", "restart_attempt"] = (
+        "continue_from_checkpoint"
+    )
+    approval_id: str | None = None
+    decision: Literal["approve_once", "approve_and_save_rule", "reject"] = "approve_once"
+    reason: str | None = None
+    rule: dict[str, Any] | None = None
 
 
 @router.post("", response_model=AgentRunResponse)
@@ -181,6 +195,31 @@ async def resume_agent_run(
     payload: AgentRunResumeRequest | None = None,
 ) -> AgentRunResponse:
     service = await _get_runtime_service(request.app)
+    approval_id = (
+        payload.approval_id.strip()
+        if payload is not None and isinstance(payload.approval_id, str) and payload.approval_id.strip()
+        else None
+    )
+    if approval_id is not None:
+        current = await service.get_agent_run(run_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Agent run not found")
+        try:
+            approval = await service.resolve_approval(
+                approval_id,
+                decision=payload.decision,
+                reason=payload.reason,
+                rule=payload.rule,
+                auto_resume_linked_run=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if approval is None:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        if payload.decision == "reject":
+            updated = await service.get_agent_run(run_id)
+            return AgentRunResponse.model_validate(updated or current)
+
     strategy = payload.strategy if payload is not None else "continue_from_checkpoint"
     resume_agent_run = service.resume_agent_run
     try:
@@ -226,6 +265,20 @@ async def append_agent_run_message(
 ) -> AgentRunResponse:
     service = await _get_runtime_service(request.app)
     run = await service.append_agent_run_message(run_id, payload)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    return AgentRunResponse.model_validate(run)
+
+
+@router.post("/{run_id}/subagents/{role_id}/messages", response_model=AgentRunResponse)
+async def append_agent_run_subagent_message(
+    request: Request,
+    run_id: str,
+    role_id: str,
+    payload: AgentRunSubagentMessageRequest,
+) -> AgentRunResponse:
+    service = await _get_runtime_service(request.app)
+    run = await service.append_agent_run_subagent_message(run_id, role_id, payload)
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return AgentRunResponse.model_validate(run)

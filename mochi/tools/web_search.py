@@ -17,7 +17,7 @@ from mochi.tools._http import (
     http_request,
     make_default_client,
 )
-from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.tools.web_search_providers import (
     get_web_search_provider_spec,
     iter_web_search_provider_specs,
@@ -332,7 +332,12 @@ class WebSearchTool(BaseTool):
             "additionalProperties": False,
         }
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """\u57f7\u884c\u7db2\u9801\u641c\u5c0b\uff0c\u5931\u6557\u6642\u81ea\u52d5 fallback\u3002"""
         query = str(kwargs.get("query", "")).strip()
         top_k_result = _coerce_top_k(kwargs.get("top_k", 5))
@@ -342,7 +347,10 @@ class WebSearchTool(BaseTool):
         search_depth = str(kwargs.get("search_depth", "basic"))
         include_content = bool(kwargs.get("include_content", False))
         allowed_domains = _coerce_domain_list(kwargs.get("allowed_domains"))
-        blocked_domains = _coerce_domain_list(kwargs.get("blocked_domains"))
+        blocked_domains = _merge_domain_lists(
+            _coerce_domain_list(kwargs.get("blocked_domains")),
+            _blocked_domains_from_context(context),
+        )
         language = str(kwargs.get("language", "")).strip() or self._language
         region = str(kwargs.get("region", "")).strip() or self._region
 
@@ -1120,14 +1128,29 @@ def _coerce_domain_list(value: Any) -> list[str]:
     for item in value:
         if not isinstance(item, str):
             continue
-        domain = item.strip().lower()
+        domain = item.strip().lower().lstrip(".").rstrip(".")
         if domain:
             domains.append(domain)
     return domains
 
 
+def _merge_domain_lists(*domain_lists: list[str]) -> list[str]:
+    merged: list[str] = []
+    for domain_list in domain_lists:
+        for domain in domain_list:
+            if domain and domain not in merged:
+                merged.append(domain)
+    return merged
+
+
+def _blocked_domains_from_context(context: ToolExecutionContext | None) -> list[str]:
+    if context is None:
+        return []
+    return _coerce_domain_list(context.permission_policy.get("blocked_web_domains"))
+
+
 def _domain_allowed(url: str, allowed_domains: list[str], blocked_domains: list[str]) -> bool:
-    host = (urlparse(url).hostname or "").lower()
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
     if not host:
         return False
     if allowed_domains and not any(host == domain or host.endswith(f".{domain}") for domain in allowed_domains):

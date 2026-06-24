@@ -24,12 +24,15 @@ import { ExportDialog } from '@/components/chat/ExportDialog'
 import { InferencePanel } from '@/components/chat/InferencePanel'
 import { ScrollToBottom } from '@/components/chat/ScrollToBottom'
 import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
-import { TaskPanel } from '@/components/chat/TaskPanel'
+import { TaskPanel, type TaskPanelMode } from '@/components/chat/TaskPanel'
 import { WorkflowPanel } from '@/components/chat/WorkflowPanel'
 import { WorkspacePanel } from '@/components/chat/WorkspacePanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
+import { buildWorkflowProgressCardView } from '@/components/workflow/utils'
 import * as api from '@/lib/api'
 import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
+import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
+import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
   findRegeneratePrompt,
   isConversationEffectivelyEmpty,
@@ -60,6 +63,7 @@ import {
 
 const MODELS_UPDATED_EVENT = 'mochi:models-updated'
 const DEFAULT_WORKFLOW_PROTOCOL: api.AgentRunProtocolId = 'teacher_student_distill'
+const WORKFLOW_CARD_POLL_MS = 4000
 type WorkflowTemplate = 'standard' | 'research_debate'
 type WorkflowRunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
 const WORKFLOW_PROTOCOL_OPTIONS: Array<{
@@ -347,6 +351,22 @@ function workflowScheduleEnabled(workflow: api.SessionWorkflowState): boolean {
   )
 }
 
+type ChatModeCommand = {
+  mode: 'workflow' | 'chat'
+  content: string
+}
+
+function parseChatModeCommand(value: string): ChatModeCommand | null {
+  const match = value.match(/^\/(workflow|chat)(?:\s+([\s\S]*))?$/i)
+  if (!match) {
+    return null
+  }
+  return {
+    mode: match[1].toLowerCase() as ChatModeCommand['mode'],
+    content: (match[2] ?? '').trim(),
+  }
+}
+
 type WorkflowScheduleType = 'interval' | 'once' | 'cron'
 
 function defaultScheduleTimezone(): string {
@@ -514,6 +534,21 @@ function formatWorkflowLifecycleMessage(event: Record<string, unknown>): string 
   return type.replaceAll('_', ' ')
 }
 
+function isWorkflowRunSettledForPolling(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return (
+    normalized === 'succeeded' ||
+    normalized === 'failed' ||
+    normalized === 'cancelled' ||
+    normalized === 'completed' ||
+    normalized === 'done' ||
+    normalized === 'error' ||
+    normalized === 'partial' ||
+    normalized === 'awaiting_resources' ||
+    normalized === 'stalled'
+  )
+}
+
 const INFERENCE_PARAM_KEY_MAP: Record<string, keyof ReturnType<typeof resolveEffectiveInferenceParams>> = {
   temperature: 'temperature',
   max_tokens: 'maxTokens',
@@ -625,9 +660,34 @@ function formatModelSource(model: Record<string, unknown>): string | null {
     return toolMode ? `OpenAI Codex · ${toolMode}` : 'OpenAI Codex'
   }
 
-  if (provider === 'openai_compat' || backendType === 'openai_compat') {
+  if (provider === 'openai_compat' || (backendType === 'openai_compat' && !provider)) {
     const source = baseUrl ?? 'OpenAI-Compatible'
     return toolMode ? `${source} · ${toolMode}` : source
+  }
+
+  if (provider === 'gemini') {
+    const source = baseUrl ? `Gemini @ ${baseUrl}` : 'Gemini'
+    return toolMode ? `${source} | ${toolMode}` : source
+  }
+
+  if (provider === 'anthropic') {
+    const source = baseUrl ? `Anthropic @ ${baseUrl}` : 'Anthropic'
+    return toolMode ? `${source} | ${toolMode}` : source
+  }
+
+  if (provider === 'vllm') {
+    const source = baseUrl ? `vLLM @ ${baseUrl}` : 'vLLM'
+    return toolMode ? `${source} | ${toolMode}` : source
+  }
+
+  if (provider === 'sglang') {
+    const source = baseUrl ? `SGLang @ ${baseUrl}` : 'SGLang'
+    return toolMode ? `${source} | ${toolMode}` : source
+  }
+
+  if (provider === 'tensorrt_llm') {
+    const source = baseUrl ? `TensorRT-LLM @ ${baseUrl}` : 'TensorRT-LLM'
+    return toolMode ? `${source} | ${toolMode}` : source
   }
 
   if (provider === 'ollama' || backendType === 'ollama') {
@@ -986,6 +1046,8 @@ export default function ChatPage() {
   const [settings, setSettings] = React.useState<api.Settings | null>(null)
   const [mobileInferenceOpen, setMobileInferenceOpen] = React.useState(false)
   const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
+  const [taskPanelMode, setTaskPanelMode] = React.useState<TaskPanelMode>('default')
+  const [taskPanelFocusedTaskId, setTaskPanelFocusedTaskId] = React.useState<string | null>(null)
   const [workflowPanelOpen, setWorkflowPanelOpen] = React.useState(false)
   const [workspaceMobileOpen, setWorkspaceMobileOpen] = React.useState(false)
   const [queuedWorkspaceAttachments, setQueuedWorkspaceAttachments] = React.useState<ChatAttachment[]>([])
@@ -1000,6 +1062,7 @@ export default function ChatPage() {
   const [workflowDraftBySessionId, setWorkflowDraftBySessionId] = React.useState<
     Record<string, api.SessionWorkflowState>
   >({})
+  const [workflowCardRun, setWorkflowCardRun] = React.useState<api.AgentRunDetail | null>(null)
   const [editState, setEditState] = React.useState<ComposerEditState | null>(null)
   const [voiceOpen, setVoiceOpen] = React.useState(false)
   const [voicePhase, setVoicePhase] = React.useState<VoiceRuntimePhase>('idle')
@@ -1258,6 +1321,10 @@ export default function ChatPage() {
     setWorkspaceContext,
   ])
 
+  React.useEffect(() => {
+    void useTaskStore.getState().load()
+  }, [currentSessionId, effectiveProjectId])
+
   const effectiveWorkflowWorkspace =
     workflowState.workspace_dir_override ||
     workflowConfig.workspace_dir_override ||
@@ -1291,6 +1358,43 @@ export default function ChatPage() {
 
     return createInitialMessages(t)
   }, [currentSessionDetail, currentSessionId, currentSessionMessages, isLoadingDetail, t])
+  const delegatedSubagentToolResultCount = React.useMemo(
+    () =>
+      messages.reduce((count, message) => (
+        count + (message.reasoningSteps ?? []).filter(
+          (step) => step.type === 'tool_result' && step.toolName === DELEGATE_SUBAGENT_TOOL_NAME
+        ).length
+      ), 0),
+    [messages]
+  )
+  const workflowProgressCard = React.useMemo(
+    () => buildWorkflowProgressCardView(workflowCardRun),
+    [workflowCardRun]
+  )
+  const displayMessages = React.useMemo<Message[]>(() => {
+    return buildProjectedDisplayMessages({
+      messages,
+      runtimeTasks: contextualRuntimeTasks,
+      workflowProgressCard,
+      workflowRun: workflowCardRun,
+    })
+  }, [contextualRuntimeTasks, messages, workflowCardRun, workflowProgressCard])
+
+  React.useEffect(() => {
+    if (delegatedSubagentToolResultCount > 0) {
+      void useTaskStore.getState().load()
+    }
+  }, [delegatedSubagentToolResultCount])
+
+  React.useEffect(() => {
+    if (activeTaskCount === 0 && pendingApprovalCount === 0) {
+      return
+    }
+    const intervalId = window.setInterval(() => {
+      void useTaskStore.getState().load()
+    }, 8000)
+    return () => window.clearInterval(intervalId)
+  }, [activeTaskCount, pendingApprovalCount])
 
   React.useEffect(() => {
     const presetNames = activeAgentSettings?.presets.map((preset) => preset.name) ?? []
@@ -1337,7 +1441,7 @@ export default function ChatPage() {
     if (shouldAutoScrollRef.current) {
       scrollToBottom()
     }
-  }, [messages, scrollToBottom])
+  }, [displayMessages, scrollToBottom])
 
   React.useEffect(() => {
     const element = scrollRef.current
@@ -1587,6 +1691,10 @@ export default function ChatPage() {
             }
           }
           if (type === 'assistant_message') {
+            const metadata = isRecord(event.metadata) ? event.metadata : {}
+            if (metadata.acknowledgement === true) {
+              return null
+            }
             return {
               type: 'message',
               role: 'assistant',
@@ -1641,11 +1749,27 @@ export default function ChatPage() {
           }
         })
         .filter((event) => {
+          if (event === null) {
+            return false
+          }
           if (event.type === 'message') {
             return Boolean(event.content) || (Array.isArray(event.attachments) && event.attachments.length > 0)
           }
           return true
-        })
+        }) as Record<string, unknown>[]
+
+      if (mappedEvents.length === 0) {
+        const unchanged = normalizeWorkflowState(
+          {
+            ...normalizedWorkflow,
+            bound_run_id: runDetail.run_id,
+            synced_run_event_count: events.length,
+          },
+          effectiveInference.reasoningEffort
+        )
+        await persistWorkflowState(sessionId, unchanged)
+        return unchanged
+      }
 
       const detail = await api.appendSessionEvents(sessionId, mappedEvents)
       upsertSessionDetail(detail)
@@ -1663,6 +1787,53 @@ export default function ChatPage() {
     },
     [effectiveInference.reasoningEffort, persistWorkflowState, upsertSessionDetail]
   )
+
+  React.useEffect(() => {
+    if (!currentSessionId || !workflowBoundRunId) {
+      setWorkflowCardRun(null)
+      return
+    }
+
+    let cancelled = false
+    let timeoutId: number | null = null
+    setWorkflowCardRun((current) => (current?.run_id === workflowBoundRunId ? current : null))
+
+    const scheduleNext = (run: api.AgentRunDetail | null) => {
+      if (cancelled || isWorkflowRunSettledForPolling(run?.status)) {
+        return
+      }
+      timeoutId = window.setTimeout(() => {
+        void loadWorkflowRun()
+      }, WORKFLOW_CARD_POLL_MS)
+    }
+
+    const loadWorkflowRun = async () => {
+      try {
+        const run = await api.fetchAgentRun(workflowBoundRunId)
+        if (cancelled) {
+          return
+        }
+        setWorkflowCardRun(run)
+        try {
+          await syncWorkflowRunEventsToSession(currentSessionId, run, workflowState)
+        } catch {
+          // The card is the primary UX; session event sync can recover on the next poll.
+        }
+        scheduleNext(run)
+      } catch {
+        scheduleNext(null)
+      }
+    }
+
+    void loadWorkflowRun()
+
+    return () => {
+      cancelled = true
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
+  }, [currentSessionId, syncWorkflowRunEventsToSession, workflowBoundRunId, workflowState])
 
   const syncSessionFromServer = React.useCallback(async (sessionId: string) => {
     try {
@@ -1992,6 +2163,8 @@ export default function ChatPage() {
       const targetSessionId = options?.forceSessionId ?? currentSessionId
       const selectedSkillIds = options?.selectedSkillIds ?? []
       const attachments = options?.attachments ?? []
+      const modeCommand = parseChatModeCommand(text)
+      const requestText = modeCommand ? modeCommand.content : text
       const initialSessionId = targetSessionId ?? createDraftSession(activeProjectId)
       const targetSession = sessions.find((session) => session.id === initialSessionId)
       const sessionId = (
@@ -2001,24 +2174,53 @@ export default function ChatPage() {
         : initialSessionId
       const latestSessionState = useSessionStore.getState()
       const sessionAfterMaterialize = latestSessionState.sessions.find((session) => session.id === sessionId)
-      const normalizedWorkflow = normalizeWorkflowState(
+      const baseWorkflow = normalizeWorkflowState(
         workflowDraftBySessionId[sessionId] ??
+          (sessionId !== initialSessionId ? workflowDraftBySessionId[initialSessionId] : undefined) ??
           sessionAfterMaterialize?.workflow ??
           (latestSessionState.currentSessionDetail?.id === sessionId
             ? latestSessionState.currentSessionDetail.workflow
-            : null),
+            : null) ??
+          targetSession?.workflow,
         effectiveInference.reasoningEffort
       )
+      const normalizedWorkflow = modeCommand
+        ? normalizeWorkflowState(
+            {
+              ...baseWorkflow,
+              enabled: modeCommand.mode === 'workflow',
+            },
+            effectiveInference.reasoningEffort
+          )
+        : baseWorkflow
+
+      if (modeCommand) {
+        if (modeCommand.mode === 'workflow') {
+          setTaskPanelOpen(false)
+          setTaskPanelMode('default')
+          setTaskPanelFocusedTaskId(null)
+          setPanelOpen(false)
+          setMobileInferenceOpen(false)
+          setWorkflowPanelOpen(true)
+        } else {
+          setWorkflowPanelOpen(false)
+        }
+        await persistWorkflowState(sessionId, normalizedWorkflow)
+        if (requestText.length === 0 && attachments.length === 0) {
+          return
+        }
+      }
+
       const turnKey = `turn-${Date.now()}`
       const userMessage: Message = {
         id: `user-${Date.now()}`,
         type: 'user',
-        content: text,
+        content: requestText,
         attachments,
         timestamp: new Date(),
       }
       const lastMessageSummary =
-        text.trim() ||
+        requestText.trim() ||
         (attachments.length > 0
           ? attachments.slice(0, 2).map((attachment) => attachment.name).join(', ')
           : '')
@@ -2050,7 +2252,6 @@ export default function ChatPage() {
             null
 
           let runId = normalizedWorkflow.bound_run_id ?? null
-          let appendedDetail: api.AgentRunDetail
           if (!runId) {
             const workflowSchedule = normalizeWorkflowScheduleConfig(
               (normalizedWorkflow.config?.schedule ?? {}) as Record<string, unknown>
@@ -2130,7 +2331,7 @@ export default function ChatPage() {
                   ? 'multi_agent_debate'
                   : normalizedWorkflow.config?.protocol_id ?? DEFAULT_WORKFLOW_PROTOCOL,
               title: normalizedWorkflow.config?.title ?? null,
-              topic: text.trim() || null,
+              topic: requestText.trim() || null,
               projectId: workflowSessionProjectId,
               workspaceDir: effectiveWorkspaceDir,
               reasoning_effort:
@@ -2190,7 +2391,7 @@ export default function ChatPage() {
                   : {}),
               },
               summary: {
-                operator_message: text,
+                operator_message: requestText,
                 selected_skill_ids: selectedSkillIds,
                 execution_policy: workflowExecutionPolicy,
                 ...(evidenceQueries.length > 0 ? { evidence_queries: evidenceQueries } : {}),
@@ -2221,9 +2422,9 @@ export default function ChatPage() {
             runId = createdRun.run_id
           }
 
-          appendedDetail = await api.appendAgentRunMessage(runId, {
+          await api.appendAgentRunMessage(runId, {
             role: 'operator',
-            content: text,
+            content: requestText,
             projectId: workflowSessionProjectId,
             workspaceDir: effectiveWorkspaceDir,
             attachments,
@@ -2284,7 +2485,7 @@ export default function ChatPage() {
         let streamed = false
         let latestAssistantContent = ''
         try {
-          for await (const chunk of api.streamChatMessages(text, {
+          for await (const chunk of api.streamChatMessages(requestText, {
             sessionId,
             projectId:
               sessions.find((session) => session.id === sessionId)?.projectId ?? activeProjectId ?? null,
@@ -2327,7 +2528,7 @@ export default function ChatPage() {
 
         if (!streamed) {
           const response = await requestChat(
-            text,
+            requestText,
             sessionId,
             sessions.find((session) => session.id === sessionId)?.projectId ?? activeProjectId ?? null,
             currentModel,
@@ -2416,6 +2617,7 @@ export default function ChatPage() {
       projects,
       resolveMessagesForSession,
       selectSession,
+      setPanelOpen,
       setSessionMessages,
       sessions,
       startStreaming,
@@ -2588,34 +2790,14 @@ export default function ChatPage() {
       return
     }
     if (command === 'workflow' || command === 'chat') {
-      const initialSessionId = currentSessionId ?? createDraftSession(activeProjectId)
-      const targetSession = sessions.find((session) => session.id === initialSessionId)
-      const sessionId = targetSession?.isDraft ? initialSessionId : initialSessionId
-      const nextWorkflow = normalizeWorkflowState(
-        workflowDraftBySessionId[sessionId] ?? targetSession?.workflow ?? null,
-        effectiveInference.reasoningEffort
-      )
-      nextWorkflow.enabled = command === 'workflow'
-      if (command === 'workflow') {
-        setTaskPanelOpen(false)
-        setPanelOpen(false)
-        setMobileInferenceOpen(false)
-      }
-      setWorkflowPanelOpen(command === 'workflow')
-      await persistWorkflowState(sessionId, nextWorkflow)
+      return
     }
   }, [
-    activeProjectId,
-    createDraftSession,
     currentSessionId,
-    effectiveInference.reasoningEffort,
     handleVoiceEntry,
-    persistWorkflowState,
     router,
-    sessions,
     setSessionMessages,
     t,
-    workflowDraftBySessionId,
   ])
 
   const handleUndoFileChange = React.useCallback(async (change: FileChangeSummary) => {
@@ -2748,6 +2930,8 @@ export default function ChatPage() {
     nextWorkflow.enabled = enabled
     if (enabled) {
       setTaskPanelOpen(false)
+      setTaskPanelMode('default')
+      setTaskPanelFocusedTaskId(null)
       setPanelOpen(false)
       setMobileInferenceOpen(false)
     }
@@ -2760,6 +2944,7 @@ export default function ChatPage() {
     effectiveInference.reasoningEffort,
     persistWorkflowState,
     sessions,
+    setPanelOpen,
     workflowDraftBySessionId,
   ])
 
@@ -3019,6 +3204,8 @@ export default function ChatPage() {
     }
     if (except !== 'tasks') {
       setTaskPanelOpen(false)
+      setTaskPanelMode('default')
+      setTaskPanelFocusedTaskId(null)
     }
     if (except !== 'workflow') {
       setWorkflowPanelOpen(false)
@@ -3045,6 +3232,13 @@ export default function ChatPage() {
   const handleTaskPanelToggle = React.useCallback(() => {
     const nextOpen = !taskPanelOpen
     closeRightPanels('tasks')
+    if (nextOpen) {
+      setTaskPanelMode('default')
+      setTaskPanelFocusedTaskId(null)
+    } else {
+      setTaskPanelMode('default')
+      setTaskPanelFocusedTaskId(null)
+    }
     setTaskPanelOpen(nextOpen)
   }, [closeRightPanels, taskPanelOpen])
 
@@ -3057,8 +3251,26 @@ export default function ChatPage() {
 
   const handleOpenTaskPanel = React.useCallback(() => {
     closeRightPanels('tasks')
+    setTaskPanelMode('default')
+    setTaskPanelFocusedTaskId(null)
     setTaskPanelOpen(true)
   }, [closeRightPanels])
+
+  const handleOpenRuntimeTask = React.useCallback((taskId: string) => {
+    closeRightPanels('tasks')
+    setTaskPanelMode('subagent')
+    setTaskPanelFocusedTaskId(taskId)
+    setTaskPanelOpen(true)
+    void useTaskStore.getState().selectTask(taskId)
+  }, [closeRightPanels])
+
+  const handleTaskPanelOpenChange = React.useCallback((open: boolean) => {
+    setTaskPanelOpen(open)
+    if (!open) {
+      setTaskPanelMode('default')
+      setTaskPanelFocusedTaskId(null)
+    }
+  }, [])
 
   const handleOpenWorkflowPanel = React.useCallback(() => {
     closeRightPanels('workflow')
@@ -3093,7 +3305,7 @@ export default function ChatPage() {
           }
         : null
 
-  const showEmptyState = isConversationEffectivelyEmpty(messages)
+  const showEmptyState = isConversationEffectivelyEmpty(displayMessages)
 
   return (
     <div className="flex h-full flex-col">
@@ -3201,7 +3413,12 @@ export default function ChatPage() {
             onClose={() => setWorkspacePanelOpen(false)}
           />
         </FloatingPanelShell>
-        <div className="min-w-0 flex-1">
+        <div
+          className={cn(
+            'min-w-0 flex-1 transition-[padding] duration-300 ease-out-smooth',
+            workspacePanelOpen ? 'lg:pl-[calc(min(40vw,44rem)+0.75rem)]' : ''
+          )}
+        >
           <ScrollToBottom visible={showScrollToBottom} onClick={scrollToBottom} />
           <div ref={scrollRef} className="h-full overflow-y-auto">
             <div className="mx-auto flex w-full max-w-4xl flex-col px-4 py-8 sm:px-6">
@@ -3213,7 +3430,7 @@ export default function ChatPage() {
                 />
               ) : (
                 <div className="space-y-6">
-                  {messages.map((message) => (
+                  {displayMessages.map((message) => (
                     <ChatMessage
                       key={message.id}
                       message={
@@ -3223,9 +3440,17 @@ export default function ChatPage() {
                       }
                       sessionId={currentSessionId}
                       projectId={effectiveProjectId}
-                      onRegenerate={message.type === 'assistant' ? handleRegenerate : undefined}
+                      onRegenerate={
+                        message.type === 'assistant' &&
+                        !message.workflowCard &&
+                        !message.workflowCompletion &&
+                        !message.subagentTaskCard
+                          ? handleRegenerate
+                          : undefined
+                      }
                       onEditAndResend={message.type === 'user' ? (message) => handleEditAndResend(message) : undefined}
                       onUndoFileChange={handleUndoFileChange}
+                      onOpenTask={handleOpenRuntimeTask}
                     />
                   ))}
                 </div>
@@ -3235,7 +3460,9 @@ export default function ChatPage() {
         </div>
         <TaskPanel
           open={taskPanelOpen}
-          onOpenChange={setTaskPanelOpen}
+          onOpenChange={handleTaskPanelOpenChange}
+          mode={taskPanelMode}
+          focusedTaskId={taskPanelFocusedTaskId}
           workflowRunId={workflowBoundRunId}
           onOpenWorkflowRun={(runId) => router.push(`/agent-runs/${runId}`)}
         />
