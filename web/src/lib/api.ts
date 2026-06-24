@@ -6,6 +6,9 @@
 
 import type {
   ChatAttachment,
+  GoalCardExecutionMode,
+  GoalCardKind,
+  GoalCardView,
   Message,
   MessageEventType,
   ReasoningStep,
@@ -62,6 +65,88 @@ function getStringArray(value: unknown): string[] {
     return []
   }
   return value.filter((item): item is string => typeof item === 'string')
+}
+
+function isGoalCardKind(value: unknown): value is GoalCardKind {
+  return value === 'proposal' || value === 'revised_proposal' || value === 'started'
+}
+
+function isGoalCardExecutionMode(value: unknown): value is GoalCardExecutionMode {
+  return value === 'single_agent' || value === 'workflow'
+}
+
+function normalizeGoalCardRecord(value: unknown): GoalCardView | null {
+  const record = isRecord(value) ? value : null
+  if (!record) {
+    return null
+  }
+
+  const kind = getString(record.kind)
+  const label = getNonEmptyString(record.label)
+  const objective = getNonEmptyString(record.objective)
+  const executionMode =
+    getString(record.execution_mode) ??
+    getString(record.executionMode)
+
+  if (
+    !isGoalCardKind(kind) ||
+    !label ||
+    !objective ||
+    !isGoalCardExecutionMode(executionMode)
+  ) {
+    return null
+  }
+
+  return {
+    kind,
+    label,
+    objective,
+    executionMode,
+    protocolId:
+      getNonEmptyString(record.protocol_id) ??
+      getNonEmptyString(record.protocolId) ??
+      null,
+    models: getStringArray(record.models)
+      .map((model) => model.trim())
+      .filter((model, index, models) => model.length > 0 && models.indexOf(model) === index),
+    roleSummary:
+      getNonEmptyString(record.role_summary) ??
+      getNonEmptyString(record.roleSummary) ??
+      null,
+    runtimeMode:
+      getNonEmptyString(record.runtime_mode) ??
+      getNonEmptyString(record.runtimeMode) ??
+      null,
+    riskNote:
+      getNonEmptyString(record.risk_note) ??
+      getNonEmptyString(record.riskNote) ??
+      null,
+    goalId:
+      getNonEmptyString(record.goal_id) ??
+      getNonEmptyString(record.goalId) ??
+      null,
+    status: getNonEmptyString(record.status) ?? null,
+    superseded: getBoolean(record.superseded),
+  }
+}
+
+function extractGoalCard(record: Record<string, unknown>): GoalCardView | null {
+  const direct =
+    normalizeGoalCardRecord(record.goal_card) ??
+    normalizeGoalCardRecord(record.goalCard)
+  if (direct) {
+    return direct
+  }
+
+  const metadata = isRecord(record.metadata) ? record.metadata : null
+  if (!metadata) {
+    return null
+  }
+
+  return (
+    normalizeGoalCardRecord(metadata.goal_card) ??
+    normalizeGoalCardRecord(metadata.goalCard)
+  )
 }
 
 function getOptionalBoolean(value: unknown): boolean | undefined {
@@ -349,6 +434,8 @@ export interface TurnEventPayload extends Record<string, unknown> {
   trajectory_id?: unknown
   trajectoryId?: unknown
   metadata?: unknown
+  goal_card?: unknown
+  goalCard?: unknown
   input_tokens?: unknown
   output_tokens?: unknown
   generation_time_ms?: unknown
@@ -360,6 +447,9 @@ export interface SessionMessageEvent {
   role?: string
   content?: string
   attachments?: unknown
+  metadata?: unknown
+  goal_card?: unknown
+  goalCard?: unknown
   timestamp?: string
   turn_id?: string | number
   turnId?: string | number
@@ -485,6 +575,7 @@ interface NormalizedMessageEvent {
   role: 'user' | 'assistant' | 'system'
   content: string
   attachments: ChatAttachment[]
+  goalCard?: GoalCardView
   timestamp?: string
   turnKey: string | null
 }
@@ -507,6 +598,7 @@ interface NormalizedTurnEvent {
   outputTokens?: number
   generationTimeMs?: number
   finishReason?: string
+  goalCard?: GoalCardView
 }
 
 interface NormalizedTextChunkEvent {
@@ -672,6 +764,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
     const role = getString(event.role)
     const content = getString(event.content) ?? ''
     const attachments = normalizeAttachments(event.attachments)
+    const goalCard = extractGoalCard(event)
 
     if (!role) {
       return null
@@ -681,7 +774,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       return null
     }
 
-    if (content.trim().length === 0 && attachments.length === 0) {
+    if (content.trim().length === 0 && attachments.length === 0 && !goalCard) {
       return null
     }
 
@@ -690,6 +783,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       role,
       content,
       attachments,
+      goalCard: role === 'assistant' ? goalCard ?? undefined : undefined,
       timestamp,
       turnKey,
     }
@@ -698,6 +792,12 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
   if (type === 'turn_event') {
     const phase = getString(event.phase)
     const payload = isRecord(event.payload) ? event.payload : {}
+    const metadata = getPayloadRecord(payload, 'metadata', 'metadata')
+    const goalCard =
+      normalizeGoalCardRecord(payload.goal_card) ??
+      normalizeGoalCardRecord(payload.goalCard) ??
+      normalizeGoalCardRecord(metadata?.goal_card) ??
+      normalizeGoalCardRecord(metadata?.goalCard)
     if (
       phase === 'workflow_status' ||
       phase === 'workflow_artifact' ||
@@ -742,6 +842,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getPayloadNumber(payload, 'output_tokens', 'outputTokens'),
       generationTimeMs: getPayloadNumber(payload, 'generation_time_ms', 'generationTimeMs'),
       finishReason,
+      goalCard: goalCard ?? undefined,
     }
   }
 
@@ -788,6 +889,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getNumber(event.output_tokens) ?? undefined,
       generationTimeMs: getNumber(event.generation_time_ms) ?? undefined,
       finishReason: getNonEmptyString(event.finish_reason) ?? undefined,
+      goalCard: extractGoalCard(event) ?? undefined,
     }
   }
 
@@ -1094,13 +1196,22 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
       if (event.role === 'assistant') {
         const existingIndex = event.turnKey ? assistantIndexByTurn.get(event.turnKey) : undefined
         if (existingIndex !== undefined) {
+          const nextContent =
+            event.content.trim().length > 0
+              ? event.content
+              : messages[existingIndex].content
+          const nextAttachments =
+            event.attachments.length > 0
+              ? event.attachments
+              : messages[existingIndex].attachments
           messages[existingIndex] = appendInlineReasoning({
             ...messages[existingIndex],
-            content: event.content,
-            attachments: event.attachments,
+            content: nextContent,
+            attachments: nextAttachments,
+            goalCard: event.goalCard ?? messages[existingIndex].goalCard,
             timestamp: toMessageTimestamp(event.timestamp),
           }, {
-            content: event.content,
+            content: nextContent,
             index,
             turnKey: event.turnKey,
             timestamp: event.timestamp,
@@ -1114,6 +1225,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
         type: event.role,
         content: event.content,
         attachments: event.attachments,
+        goalCard: event.role === 'assistant' ? event.goalCard : undefined,
         timestamp: toMessageTimestamp(event.timestamp),
         turnKey: event.turnKey,
         turnId: event.turnKey,
@@ -1182,6 +1294,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
           timestamp: toMessageTimestamp(event.timestamp),
           eventType: 'final_answer',
           isStreaming: false,
+          goalCard: event.goalCard ?? messages[existingIndex].goalCard,
           tokenStats: tokenStats ?? messages[existingIndex].tokenStats,
         }, {
           content: event.content,
@@ -1198,6 +1311,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
           eventType: 'final_answer',
           turnKey,
           turnId: turnKey,
+          goalCard: event.goalCard,
           isStreaming: false,
           reasoningSteps: [],
           tokenStats: tokenStats,
@@ -1776,6 +1890,7 @@ interface BackendSessionListItem {
   updated_at: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
 }
 
@@ -1792,6 +1907,7 @@ export interface SessionSummary {
   eventCount: number
   projectId: string | null
   workflow: SessionWorkflowState | null
+  goal: SessionGoalState | null
   security_override: SessionSecurityOverride | null
 }
 
@@ -1803,6 +1919,7 @@ interface BackendSessionResponse {
   title?: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
   events: Record<string, unknown>[]
 }
@@ -1814,6 +1931,8 @@ export interface SessionDetail extends SessionSummary {
 export interface SessionSecurityOverride {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
 }
+
+export type SessionGoalState = Record<string, unknown>
 
 export interface SessionWorkflowConfig {
   title?: string | null
@@ -1870,6 +1989,13 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
         }
       : {},
   }
+}
+
+function normalizeSessionGoalState(value: unknown): SessionGoalState | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  return { ...value }
 }
 
 function normalizeSessionSecurityOverride(value: unknown): SessionSecurityOverride | null {

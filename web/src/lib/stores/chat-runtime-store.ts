@@ -32,6 +32,22 @@ function buildMessageSignature(message: Message): string {
       quote: attachment.quote ?? null,
       note: attachment.note ?? null,
     })),
+    goalCard: message.goalCard
+      ? {
+          kind: message.goalCard.kind,
+          label: message.goalCard.label,
+          objective: message.goalCard.objective,
+          executionMode: message.goalCard.executionMode,
+          protocolId: message.goalCard.protocolId ?? null,
+          models: message.goalCard.models,
+          roleSummary: message.goalCard.roleSummary ?? null,
+          runtimeMode: message.goalCard.runtimeMode ?? null,
+          riskNote: message.goalCard.riskNote ?? null,
+          goalId: message.goalCard.goalId ?? null,
+          status: message.goalCard.status ?? null,
+          superseded: message.goalCard.superseded ?? null,
+        }
+      : null,
     reasoningSteps: (message.reasoningSteps ?? []).map((step) => ({
       id: step.id,
       type: step.type,

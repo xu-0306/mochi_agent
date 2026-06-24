@@ -66,6 +66,25 @@ export interface ChatAttachment {
   note?: string | null
 }
 
+export type GoalCardKind = 'proposal' | 'revised_proposal' | 'started'
+
+export type GoalCardExecutionMode = 'single_agent' | 'workflow'
+
+export interface GoalCardView {
+  kind: GoalCardKind
+  label: string
+  objective: string
+  executionMode: GoalCardExecutionMode
+  protocolId?: string | null
+  models: string[]
+  roleSummary?: string | null
+  runtimeMode?: string | null
+  riskNote?: string | null
+  goalId?: string | null
+  status?: string | null
+  superseded?: boolean | null
+}
+
 export interface Message {
   id: string
   type: MessageType
@@ -88,6 +107,7 @@ export interface Message {
     startedReasoningBlock: boolean
   }
   inlineReasoningStepId?: string
+  goalCard?: GoalCardView
   workflowCard?: WorkflowProgressCardView
   workflowCompletion?: boolean
   subagentTaskCard?: DelegatedSubagentCardView

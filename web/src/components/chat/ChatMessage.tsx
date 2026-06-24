@@ -18,6 +18,7 @@ import { FileChangeCard } from './FileChangeCard'
 import type { FileChangeGroupSummary } from '@/lib/file-change-preview'
 import { WorkflowProgressCard } from './WorkflowProgressCard'
 import { SubagentTaskCard } from './SubagentTaskCard'
+import { GoalCard } from './GoalCard'
 
 interface ChatMessageProps {
   message: Message
@@ -107,6 +108,12 @@ export function ChatMessage({
         .filter((change): change is FileChangeGroupSummary => change !== null),
     [reasoningSteps]
   )
+  const goalCardSupplementaryContent =
+    message.goalCard &&
+    content.trim().length > 0 &&
+    content.trim() !== message.goalCard.objective.trim()
+      ? content
+      : null
 
   if (type === 'system') {
     return (
@@ -221,6 +228,61 @@ export function ChatMessage({
                     {timestampLabel}
                   </span>
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (message.goalCard) {
+    return (
+      <div className="group animate-slide-up">
+        <div className="flex justify-start">
+          <div className="w-full max-w-[860px]">
+            <ReasoningPanel
+              steps={reasoningSteps ?? []}
+              isStreaming={isStreaming}
+              tokenStats={message.tokenStats}
+              onUndoFileChange={onUndoFileChange}
+              onOpenTask={onOpenTask}
+            />
+            <div className="flex gap-3">
+              <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-primary-500/30 bg-primary-500/15">
+                <Bot className="h-3.5 w-3.5 text-primary-400" />
+              </div>
+              <div className="min-w-0 flex-1 pt-0.5">
+                <GoalCard card={message.goalCard} />
+                {goalCardSupplementaryContent ? (
+                  <div className="mt-4 prose prose-invert max-w-none text-sm leading-7 text-foreground">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      rehypePlugins={[rehypeHighlight]}
+                      components={markdownCodeComponents}
+                    >
+                      {goalCardSupplementaryContent}
+                    </ReactMarkdown>
+                  </div>
+                ) : null}
+                {message.attachments && message.attachments.length > 0 ? (
+                  <div className="mt-4">
+                    <ChatAttachments
+                      attachments={message.attachments}
+                      variant="message"
+                      sessionId={sessionId}
+                      projectId={projectId}
+                    />
+                  </div>
+                ) : null}
+                <div className="mt-2 opacity-0 transition-opacity group-hover:opacity-100">
+                  <span className="text-[11px] text-muted-foreground" title={timestampTitle}>
+                    {timestampLabel}
+                  </span>
+                </div>
+                {tokenStatsLabel ? (
+                  <p className="mt-1 text-xs text-muted-foreground">{tokenStatsLabel}</p>
+                ) : null}
               </div>
             </div>
           </div>

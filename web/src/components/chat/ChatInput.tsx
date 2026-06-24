@@ -754,8 +754,13 @@ export function ChatInput({
     const selectionEnd = textarea?.selectionEnd ?? selectionStart
 
     if (action.kind === 'builtin') {
-      if (action.id === 'workflow' || action.id === 'chat') {
-        const commandText = action.id === 'workflow' ? '/workflow ' : '/chat '
+      if (action.id === 'workflow' || action.id === 'goal' || action.id === 'chat') {
+        const commandText =
+          action.id === 'workflow'
+            ? '/workflow '
+            : action.id === 'goal'
+              ? '/goal '
+              : '/chat '
         const { nextValue, caret } = replaceCurrentLine(value, selectionStart, selectionEnd, commandText)
         applyTextareaValue(nextValue, caret)
         setPaletteDismissed(true)
