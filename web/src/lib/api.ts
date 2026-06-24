@@ -1890,6 +1890,7 @@ interface BackendSessionListItem {
   updated_at: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
 }
 
@@ -1906,6 +1907,7 @@ export interface SessionSummary {
   eventCount: number
   projectId: string | null
   workflow: SessionWorkflowState | null
+  goal: SessionGoalState | null
   security_override: SessionSecurityOverride | null
 }
 
@@ -1917,6 +1919,7 @@ interface BackendSessionResponse {
   title?: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
   events: Record<string, unknown>[]
 }
@@ -1928,6 +1931,8 @@ export interface SessionDetail extends SessionSummary {
 export interface SessionSecurityOverride {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
 }
+
+export type SessionGoalState = Record<string, unknown>
 
 export interface SessionWorkflowConfig {
   title?: string | null
@@ -1984,6 +1989,13 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
         }
       : {},
   }
+}
+
+function normalizeSessionGoalState(value: unknown): SessionGoalState | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  return { ...value }
 }
 
 function normalizeSessionSecurityOverride(value: unknown): SessionSecurityOverride | null {
