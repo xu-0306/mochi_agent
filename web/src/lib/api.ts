@@ -2011,6 +2011,7 @@ function normalizeSessionSummary(item: BackendSessionListItem): SessionSummary {
     eventCount: item.event_count,
     projectId: getString(item.project_id) ?? null,
     workflow: normalizeSessionWorkflowState(item.workflow),
+    goal: normalizeSessionGoalState(item.goal),
     security_override: normalizeSessionSecurityOverride(item.security_override),
   }
 }
@@ -2101,6 +2102,7 @@ function normalizeSessionDetail(payload: BackendSessionResponse): SessionDetail 
     eventCount: events.length,
     projectId: getString(payload.project_id) ?? null,
     workflow: normalizeSessionWorkflowState(payload.workflow),
+    goal: normalizeSessionGoalState(payload.goal),
     security_override: normalizeSessionSecurityOverride(payload.security_override),
     events,
   }
@@ -2124,6 +2126,7 @@ export async function rewriteSessionFromTurn(
 interface BackendCreateSessionResponse {
   type: 'session'
   session_id: string
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
 }
 
@@ -2154,6 +2157,7 @@ export async function createSession(
     eventCount: 1,
     projectId: projectId ?? null,
     workflow: null,
+    goal: normalizeSessionGoalState(payload.goal),
     security_override: normalizeSessionSecurityOverride(payload.security_override),
   }
 }
@@ -2177,6 +2181,7 @@ export async function forkSession(input: ForkSessionInput): Promise<SessionSumma
     eventCount: 1,
     projectId: input.projectId ?? null,
     workflow: null,
+    goal: normalizeSessionGoalState(payload.goal),
     security_override: normalizeSessionSecurityOverride(payload.security_override),
   }
 }
@@ -2187,6 +2192,7 @@ interface BackendUpdateSessionResponse {
   title?: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
   events?: Record<string, unknown>[]
 }
@@ -2209,6 +2215,7 @@ export async function renameSession(sessionId: string, title: string): Promise<S
     eventCount: 0,
     projectId: getString(payload.project_id) ?? null,
     workflow: normalizeSessionWorkflowState(payload.workflow),
+    goal: normalizeSessionGoalState(payload.goal),
     security_override: normalizeSessionSecurityOverride(payload.security_override),
   }
 }
@@ -2222,6 +2229,20 @@ export async function updateSessionWorkflowState(
     {
       method: 'PATCH',
       body: JSON.stringify({ workflow }),
+    }
+  )
+  return normalizeSessionDetail(payload)
+}
+
+export async function updateSessionGoalState(
+  sessionId: string,
+  goal: SessionGoalState
+): Promise<SessionDetail> {
+  const payload = await requestJson<BackendSessionResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ goal }),
     }
   )
   return normalizeSessionDetail(payload)
@@ -6333,11 +6354,14 @@ export interface GoalAttemptSummary {
   finished_at: string | null
 }
 
+export type GoalExecutionMode = 'single_agent' | 'workflow'
+
 export interface GoalSummary {
   goal_id: string
   objective: string
   title: string | null
   goal_type: string | null
+  execution_mode: GoalExecutionMode
   protocol_id: string | null
   topic: string | null
   project_id: string | null
@@ -6473,6 +6497,7 @@ export interface GoalOperatorAuditEntry {
 
 export interface GoalHealthSummary {
   goal_id: string
+  execution_mode: GoalExecutionMode
   status: string
   current_attempt_id: string | null
   attempt_count: number
@@ -6501,6 +6526,7 @@ export interface CreateGoalInput {
   objective: string
   title?: string | null
   goal_type?: string | null
+  execution_mode?: GoalExecutionMode
   protocol_id?: string | null
   topic?: string | null
   projectId?: string | null
@@ -6537,6 +6563,10 @@ export interface GoalEstopUpdateInput {
   reason?: string | null
 }
 
+function normalizeGoalExecutionMode(value: unknown): GoalExecutionMode {
+  return value === 'single_agent' ? 'single_agent' : 'workflow'
+}
+
 function normalizeGoalAttemptSummary(payload: unknown): GoalAttemptSummary | null {
   const record = isRecord(payload) ? payload : {}
   const attemptId = getString(record.attempt_id)
@@ -6569,6 +6599,7 @@ function normalizeGoalSummary(payload: unknown): GoalSummary {
     objective: getString(record.objective) ?? '',
     title: getNullableString(record.title),
     goal_type: getNullableString(record.goal_type),
+    execution_mode: normalizeGoalExecutionMode(record.execution_mode),
     protocol_id: getNullableString(record.protocol_id),
     topic: getNullableString(record.topic),
     project_id: getNullableString(record.project_id),
@@ -6763,6 +6794,7 @@ function normalizeGoalHealthSummary(payload: unknown): GoalHealthSummary {
   const record = isRecord(payload) ? payload : {}
   return {
     goal_id: getString(record.goal_id) ?? '',
+    execution_mode: normalizeGoalExecutionMode(record.execution_mode),
     status: getString(record.status) ?? 'unknown',
     current_attempt_id: getNullableString(record.current_attempt_id),
     attempt_count: getNumber(record.attempt_count) ?? 0,
@@ -6929,6 +6961,7 @@ export async function createGoal(input: CreateGoalInput): Promise<GoalSummary> {
       objective: input.objective,
       title: input.title ?? null,
       goal_type: input.goal_type ?? null,
+      execution_mode: input.execution_mode ?? 'workflow',
       protocol_id: input.protocol_id ?? null,
       topic: input.topic ?? null,
       project_id: input.projectId ?? null,

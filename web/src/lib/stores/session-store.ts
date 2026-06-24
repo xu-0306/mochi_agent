@@ -10,6 +10,7 @@ import {
   renameSession as renameSessionApi,
   updateSessionProject as updateSessionProjectApi,
   type SessionSecurityOverride,
+  type SessionGoalState,
   type SessionWorkflowState,
   type SessionDetail,
   type SessionSummary,
@@ -29,6 +30,7 @@ export interface Session {
   messageCount: number
   projectId: string | null
   workflow: SessionWorkflowState | null
+  goal: SessionGoalState | null
   securityOverride: SessionSecurityOverride | null
   isDraft: boolean
 }
@@ -120,6 +122,7 @@ function normalizeSummary(summary: SessionSummary): Session {
     messageCount: summary.eventCount,
     projectId: summary.projectId,
     workflow: summary.workflow,
+    goal: summary.goal,
     securityOverride: summary.security_override,
     isDraft: false,
   }
@@ -135,6 +138,7 @@ function mergeSession(target: Session, detail: SessionDetail): Session {
     messageCount: detail.eventCount,
     projectId: detail.projectId,
     workflow: detail.workflow,
+    goal: detail.goal,
     securityOverride: detail.security_override,
     isDraft: false,
   }
@@ -152,6 +156,7 @@ function buildDraftSession(projectId: string | null): Session {
     messageCount: 0,
     projectId,
     workflow: null,
+    goal: null,
     securityOverride: null,
     isDraft: true,
   }
@@ -233,6 +238,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
               eventCount: 0,
               projectId: target.projectId,
               workflow: target.workflow,
+              goal: target.goal,
               security_override: target.securityOverride,
               events: [],
             }
@@ -286,6 +292,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
         eventCount: 0,
         projectId: draft.projectId,
         workflow: draft.workflow,
+        goal: draft.goal,
         security_override: draft.securityOverride,
         events: [],
       },
@@ -321,6 +328,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
                   isPinned: session.isPinned,
                   projectId: draft.projectId,
                   workflow: session.workflow,
+                  goal: session.goal,
                   isDraft: false,
                 },
                 detail
