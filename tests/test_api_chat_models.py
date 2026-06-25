@@ -22,7 +22,11 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
-from mochi.agents.engine import AgentEngine
+from mochi.agents.engine import (
+    AgentEngine,
+    _build_response_language_prompt_addendum,
+    _merge_prompt_addenda,
+)
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest, AgentInvocationResult
 from mochi.api.server import create_app
 from mochi.auth.models import OpenAICodexAuthProfile
@@ -595,6 +599,65 @@ def test_agent_engine_chat_yields_events_before_invocation_finishes() -> None:
     assert [event.type for event in events] == ["thinking", "final_answer"]
     assert first_event_elapsed < 0.15
     assert total_elapsed >= 0.25
+
+
+def test_response_language_addendum_tracks_traditional_chinese_messages() -> None:
+    addendum = _build_response_language_prompt_addendum(
+        "same_as_user",
+        "幫我查詢 ESG 相關 LLM 微調資訊，方法等",
+    )
+
+    assert addendum is not None
+    assert "Reply in the same language as the user's latest message" in addendum
+    assert "Traditional Chinese" in addendum
+    assert "current user message is in Traditional Chinese" in addendum
+
+
+def test_response_language_addendum_tracks_japanese_messages_without_chinese_bias() -> None:
+    addendum = _build_response_language_prompt_addendum(
+        "same_as_user",
+        "ハイ",
+    )
+
+    assert addendum is not None
+    assert "Reply in the same language as the user's latest message" in addendum
+    assert "The current user message is in Japanese. Reply in Japanese." in addendum
+    assert "Traditional Chinese" not in addendum
+
+
+def test_response_language_addendum_tracks_latin_script_messages_without_language_switch() -> None:
+    addendum = _build_response_language_prompt_addendum(
+        "same_as_user",
+        "hi there",
+    )
+
+    assert addendum is not None
+    assert "Reply in the same language as the user's latest message" in addendum
+    assert "The current user message is written in a Latin-script language." in addendum
+    assert "Traditional Chinese" not in addendum
+
+
+def test_response_language_addendum_respects_explicit_language_preference() -> None:
+    addendum = _build_response_language_prompt_addendum(
+        "en-US",
+        "請用中文回覆這段測試",
+    )
+
+    assert addendum is not None
+    assert "Default response language: en-US." in addendum
+    assert "Keep using that language unless the user explicitly requests another language." in addendum
+
+
+def test_merge_prompt_addenda_preserves_existing_invocation_context() -> None:
+    merged = _merge_prompt_addenda(
+        "Language Policy:\n- Reply in Traditional Chinese.",
+        "Goal context:\n- Active goal is blocked.",
+    )
+
+    assert merged == (
+        "Language Policy:\n- Reply in Traditional Chinese.\n\n"
+        "Goal context:\n- Active goal is blocked."
+    )
 
 
 def test_chat_stream_route_persists_fallback_turn_events(tmp_path: Path) -> None:

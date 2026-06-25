@@ -2,6 +2,7 @@
   "name": "mochi-webgui",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -18,6 +19,8 @@
     "test:chat-wide-content-layout": "node ./scripts/test-chat-wide-content-layout.mjs",
     "test:edit-resend-branching": "node --experimental-strip-types ./scripts/test-edit-resend-branching.mjs",
     "test:chat-inference-context-settings": "node ./scripts/test-chat-inference-context-settings.mjs",
+    "test:chat-goal-routing": "node --experimental-strip-types ./scripts/test-chat-goal-routing.mjs",
+    "test:chat-send-contract": "node --experimental-strip-types ./scripts/test-chat-send-contract.mjs",
     "test:chat-markdown-code-renderers": "node ./scripts/test-chat-markdown-code-renderers.mjs",
     "test:code-theme-preferences": "node ./scripts/test-code-theme-preferences.mjs",
     "test:task-panel-desktop-conditional-render": "node ./scripts/test-task-panel-desktop-conditional-render.mjs",

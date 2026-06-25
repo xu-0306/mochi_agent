@@ -12,6 +12,7 @@ import * as api from '@/lib/api'
 import type { AgentRunDetail, AgentRunHealthSummary, ApprovalSummary, TaskDetail, TaskSummary } from '@/lib/api'
 import type { FileChangeGroupSummary, PatchPreviewResult } from '@/lib/file-change-preview'
 import { buildDelegatedSubagentTranscript, delegatedSubagentTitle, resolveDelegatedSubagentView } from '@/lib/subagent-tasks'
+import { useSessionStore } from '@/lib/stores/session-store'
 import { useTaskStore } from '@/lib/stores/task-store'
 import { cn } from '@/lib/utils'
 
@@ -131,6 +132,11 @@ function isWorkflowAttentionStatus(
     Boolean(health?.degraded) ||
     Object.keys(health?.detached_exec_jobs ?? {}).length > 0
   )
+}
+
+function getGoalExecutionMode(goal: Record<string, unknown> | null | undefined): 'single_agent' | 'workflow' | null {
+  const executionMode = goal?.execution_mode
+  return executionMode === 'single_agent' || executionMode === 'workflow' ? executionMode : null
 }
 
 export type TaskPanelMode = 'default' | 'subagent'
@@ -639,6 +645,7 @@ function TaskPanelBody({
   workflowRun,
   workflowHealth,
   workflowLoading,
+  workflowNativeContext,
   mode,
   onOpenWorkflowRun,
   onClose,
@@ -686,6 +693,7 @@ function TaskPanelBody({
   workflowRun: AgentRunDetail | null
   workflowHealth: AgentRunHealthSummary | null
   workflowLoading: boolean
+  workflowNativeContext: boolean
   mode: TaskPanelMode
   onOpenWorkflowRun?: (runId: string) => void
   onClose?: () => void
@@ -708,7 +716,8 @@ function TaskPanelBody({
   const [guidanceError, setGuidanceError] = React.useState<string | null>(null)
   const [guidanceSuccess, setGuidanceSuccess] = React.useState<string | null>(null)
   const workflowNeedsAttention = isWorkflowAttentionStatus(workflowRun, workflowHealth)
-  const showWorkflowSection = !subagentFocusedMode || workflowNeedsAttention || workflowLoading
+  const showWorkflowSection =
+    workflowNativeContext && (!subagentFocusedMode || workflowNeedsAttention || workflowLoading)
   const showPendingApprovalsSection = !subagentFocusedMode || pendingApprovals.length > 0
 
   React.useEffect(() => {
@@ -1213,9 +1222,24 @@ export function TaskPanel({
     cancel,
     stopApprovalExecSession,
   } = useTaskStore()
+  const currentSessionGoal = useSessionStore((state) =>
+    state.currentSessionDetail?.goal ??
+    state.sessions.find((session) => session.id === state.currentSessionId)?.goal ??
+    null
+  )
+  const currentSessionWorkflow = useSessionStore((state) =>
+    state.currentSessionDetail?.workflow ??
+    state.sessions.find((session) => session.id === state.currentSessionId)?.workflow ??
+    null
+  )
+  const sessionGoalExecutionMode = getGoalExecutionMode(currentSessionGoal)
   const [workflowRun, setWorkflowRun] = React.useState<AgentRunDetail | null>(null)
   const [workflowHealth, setWorkflowHealth] = React.useState<AgentRunHealthSummary | null>(null)
   const [workflowLoading, setWorkflowLoading] = React.useState(false)
+  const hasSessionGoal = sessionGoalExecutionMode !== null
+  const workflowNativeContext =
+    sessionGoalExecutionMode === 'workflow' ||
+    (!hasSessionGoal && Boolean(currentSessionWorkflow?.enabled || workflowRunId))
 
   React.useEffect(() => {
     if (!open || !focusedTaskId || selectedTaskId === focusedTaskId) {
@@ -1247,7 +1271,7 @@ export function TaskPanel({
   }, [approvalExecSessions, approvals, open, refreshApprovalExecSession])
 
   React.useEffect(() => {
-    if (!workflowRunId) {
+    if (!workflowNativeContext || !workflowRunId) {
       setWorkflowRun(null)
       setWorkflowHealth(null)
       setWorkflowLoading(false)
@@ -1286,7 +1310,7 @@ export function TaskPanel({
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [workflowRunId])
+  }, [workflowNativeContext, workflowRunId])
 
   return (
     <FloatingPanelShell
@@ -1323,6 +1347,7 @@ export function TaskPanel({
         workflowRun={workflowRun}
         workflowHealth={workflowHealth}
         workflowLoading={workflowLoading}
+        workflowNativeContext={workflowNativeContext}
         mode={mode}
         onOpenWorkflowRun={onOpenWorkflowRun}
         onClose={() => onOpenChange(false)}

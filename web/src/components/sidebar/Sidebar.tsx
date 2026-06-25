@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { useRouter } from 'next/navigation'
+import { usePathname, useRouter } from 'next/navigation'
 import {
   Check,
   ChevronDown,
@@ -79,6 +79,7 @@ function sortSessions(sessions: Session[]): Session[] {
 
 export function Sidebar() {
   const router = useRouter()
+  const pathname = usePathname()
   const { t } = useI18n()
   const collapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed)
@@ -422,27 +423,7 @@ export function Sidebar() {
             </>
           ) : null}
 
-          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-4')}>
-            <Button
-              variant="ghost"
-              size={collapsed ? 'icon' : 'sm'}
-              onClick={() => router.push('/agent-runs')}
-              title={t('sidebar.workflows')}
-              className={collapsed ? 'w-9' : 'justify-start'}
-            >
-              <Workflow className="h-4 w-4" />
-              {!collapsed && <span>{t('sidebar.workflows')}</span>}
-            </Button>
-            <Button
-              variant="ghost"
-              size={collapsed ? 'icon' : 'sm'}
-              onClick={() => router.push('/goals')}
-              title={t('sidebar.goals')}
-              className={collapsed ? 'w-9' : 'justify-start'}
-            >
-              <Waypoints className="h-4 w-4" />
-              {!collapsed && <span>{t('sidebar.goals')}</span>}
-            </Button>
+          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-2')}>
             <Button
               variant="ghost"
               size={collapsed ? 'icon' : 'sm'}
@@ -467,6 +448,35 @@ export function Sidebar() {
         </div>
 
         <nav className="flex-1 space-y-3 overflow-y-auto px-2 py-2">
+          <SidebarSection title={t('sidebar.advancedTools')} collapsed={collapsed}>
+            {!collapsed ? (
+              <div className="mx-1 rounded-xl border border-primary-500/20 bg-primary-500/8 p-2.5">
+                <p className="text-xs font-semibold text-primary-200">
+                  {t('sidebar.primaryHintTitle')}
+                </p>
+                <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+                  {t('sidebar.primaryHintDescription')}
+                </p>
+              </div>
+            ) : null}
+            <SidebarNavButton
+              collapsed={collapsed}
+              active={pathname === '/goals'}
+              icon={<Waypoints className="h-4 w-4" />}
+              title={t('sidebar.goalConsole')}
+              description={t('sidebar.goalConsoleDescription')}
+              onClick={() => router.push('/goals')}
+            />
+            <SidebarNavButton
+              collapsed={collapsed}
+              active={pathname === '/agent-runs' || pathname.startsWith('/agent-runs/')}
+              icon={<Workflow className="h-4 w-4" />}
+              title={t('sidebar.runDesk')}
+              description={t('sidebar.runDeskDescription')}
+              onClick={() => router.push('/agent-runs')}
+            />
+          </SidebarSection>
+
           {selectionMode && !collapsed ? (
             <div className="mx-1 rounded-xl border border-primary-500/20 bg-primary-500/8 p-2.5">
               <p className="text-xs font-semibold uppercase tracking-[0.14em] text-primary-300">
@@ -760,5 +770,43 @@ function SidebarSection({
       ) : null}
       <div className="space-y-1">{children}</div>
     </div>
+  )
+}
+
+function SidebarNavButton({
+  collapsed,
+  active,
+  icon,
+  title,
+  description,
+  onClick,
+}: {
+  collapsed: boolean
+  active: boolean
+  icon: React.ReactNode
+  title: string
+  description: string
+  onClick: () => void
+}) {
+  return (
+    <Button
+      variant={active ? 'secondary' : 'ghost'}
+      size={collapsed ? 'icon' : 'sm'}
+      onClick={onClick}
+      title={title}
+      className={cn(
+        collapsed ? 'mx-auto w-9' : 'h-auto w-full justify-start rounded-xl px-3 py-2.5'
+      )}
+    >
+      <span className="shrink-0">{icon}</span>
+      {!collapsed ? (
+        <span className="min-w-0 text-left">
+          <span className="block truncate text-sm font-medium">{title}</span>
+          <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
+            {description}
+          </span>
+        </span>
+      ) : null}
+    </Button>
   )
 }

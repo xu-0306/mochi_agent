@@ -84,6 +84,44 @@ def test_tui_command_calls_async_helper(monkeypatch) -> None:
     }
 
 
+def test_chat_command_calls_terminal_async_helper(monkeypatch) -> None:
+    called: dict[str, object] = {}
+
+    async def fake_chat_async_terminal(
+        text: str,
+        model: str | None,
+        config_path: str | None,
+        session_id: str,
+    ) -> None:
+        called["text"] = text
+        called["model"] = model
+        called["config_path"] = config_path
+        called["session_id"] = session_id
+
+    monkeypatch.setattr("mochi.main._chat_async_terminal", fake_chat_async_terminal)
+    result = runner.invoke(
+        app,
+        [
+            "chat",
+            "--model",
+            "ollama:qwen3",
+            "--config",
+            "cfg.yaml",
+            "--session-id",
+            "cli-s1",
+            "hello from cli",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert called == {
+        "text": "hello from cli",
+        "model": "ollama:qwen3",
+        "config_path": "cfg.yaml",
+        "session_id": "cli-s1",
+    }
+
+
 @pytest.mark.asyncio
 async def test_chat_tui_async_streaming_and_session_switch(monkeypatch, capsys) -> None:
     """TUI 應支援 slash 命令、session 切換與串流輸出。"""
@@ -688,9 +726,17 @@ async def test_chat_tui_async_clear_resets_session_history(monkeypatch, capsys) 
     class _FakeSessionStore:
         def __init__(self, sessions_dir) -> None:  # noqa: ANN001, ARG002
             self.deleted: list[str] = []
+            self.events: dict[str, list[dict[str, object]]] = {}
+
+        async def save_event(self, session_id: str, event: dict[str, object]) -> None:
+            self.events.setdefault(session_id, []).append(dict(event))
+
+        async def load_session(self, session_id: str) -> list[dict[str, object]]:
+            return list(self.events.get(session_id, []))
 
         async def delete_session(self, session_id: str) -> bool:
             self.deleted.append(session_id)
+            self.events.pop(session_id, None)
             return True
 
     inputs = iter(["/clear", "hi", "/exit"])
@@ -786,3 +832,402 @@ async def test_chat_tui_async_prints_tool_errors(monkeypatch, capsys) -> None:
     assert "/approve-save exec-approval-1" in captured
     assert "/reject exec-approval-1" in captured
     assert "done" in captured
+
+
+@pytest.mark.asyncio
+async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
+    monkeypatch,
+    capsys,
+) -> None:
+    from mochi.main import _chat_tui_async
+
+    class _FakeEngine:
+        def __init__(self, config) -> None:  # noqa: ANN001, ARG002
+            self.calls: list[tuple[str, str | None]] = []
+            self.closed = False
+
+        async def initialize(self) -> None:
+            return None
+
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+        ) -> AsyncIterator[object]:
+            self.calls.append((message, session_id))
+            yield FinalAnswerEvent(content="unexpected")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FakeSessionStore:
+        def __init__(self, sessions_dir) -> None:  # noqa: ANN001, ARG002
+            self.by_session: dict[str, list[dict[str, object]]] = {}
+
+        async def save_event(self, session_id: str, event: dict[str, object]) -> None:
+            self.by_session.setdefault(session_id, []).append(dict(event))
+
+        async def load_session(self, session_id: str) -> list[dict[str, object]]:
+            return list(self.by_session.get(session_id, []))
+
+        async def delete_session(self, session_id: str) -> bool:
+            self.by_session.pop(session_id, None)
+            return True
+
+    class _FakeRuntimeService:
+        def __init__(self) -> None:
+            self.goal: dict[str, object] | None = None
+
+        async def create_goal(self, payload) -> dict[str, object]:  # noqa: ANN001
+            self.goal = {
+                "goal_id": "goal-1",
+                "objective": payload.objective,
+                "execution_mode": payload.execution_mode,
+                "protocol_id": payload.protocol_id,
+                "status": "created",
+                "attempts": [],
+                "current_attempt_id": None,
+                "project_id": payload.project_id,
+                "workspace_dir": payload.workspace_dir,
+                "latest_error": None,
+            }
+            return dict(self.goal)
+
+        async def start_goal(self, goal_id: str) -> dict[str, object]:
+            assert goal_id == "goal-1"
+            assert self.goal is not None
+            self.goal.update(
+                {
+                    "status": "running",
+                    "current_attempt_id": "attempt-1",
+                    "attempts": [
+                        {
+                            "attempt_id": "attempt-1",
+                            "agent_run_id": "run-1",
+                        }
+                    ],
+                }
+            )
+            return dict(self.goal)
+
+        async def get_goal(self, goal_id: str) -> dict[str, object] | None:
+            assert goal_id == "goal-1"
+            return dict(self.goal) if self.goal is not None else None
+
+        async def pause_goal(self, goal_id: str) -> dict[str, object]:
+            assert goal_id == "goal-1"
+            assert self.goal is not None
+            self.goal["status"] = "paused"
+            return dict(self.goal)
+
+        async def resume_goal(self, goal_id: str) -> dict[str, object]:
+            assert goal_id == "goal-1"
+            assert self.goal is not None
+            self.goal["status"] = "running"
+            return dict(self.goal)
+
+        async def cancel_goal(self, goal_id: str) -> dict[str, object]:
+            assert goal_id == "goal-1"
+            assert self.goal is not None
+            self.goal["status"] = "cancelled"
+            return dict(self.goal)
+
+        async def close(self) -> None:
+            return None
+
+    fake_store = _FakeSessionStore(None)
+    fake_runtime = _FakeRuntimeService()
+    fake_engine = _FakeEngine(None)
+    inputs = iter(
+        [
+            "/goal keep working on this for 30 minutes",
+            "start",
+            "/goal status",
+            "/goal pause",
+            "/goal resume",
+            "/goal stop",
+            "/exit",
+        ]
+    )
+
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config",
+        lambda config_path=None: SimpleNamespace(  # noqa: ARG005
+            model="ollama:base",
+            sessions_dir="/tmp/mochi-sessions",
+            security=SecurityConfig(),
+        ),
+    )
+    monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005
+    monkeypatch.setattr("mochi.sessions.store.SessionStore", lambda sessions_dir: fake_store)  # noqa: ARG005
+    async def fake_runtime_service_factory(**kwargs):  # noqa: ANN003, ARG001
+        return fake_runtime
+
+    monkeypatch.setattr("mochi.main._create_tui_runtime_service", fake_runtime_service_factory)
+    monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
+
+    await _chat_tui_async(
+        model=None,
+        config_path=None,
+        session_id="goal-session",
+        max_turns=2,
+    )
+    captured = capsys.readouterr().out
+
+    assert "Prepared a goal proposal." in captured
+    assert "Goal started." in captured
+    assert "Fetched the latest goal status." in captured
+    assert "Paused the active goal." in captured
+    assert "Resumed the active goal." in captured
+    assert "Stopped the active goal." in captured
+    assert fake_engine.calls == []
+
+    session_events = fake_store.by_session["goal-session"]
+    workflow_updates = [
+        event
+        for event in session_events
+        if event.get("type") == "session_meta" and event.get("event") == "workflow_state_updated"
+    ]
+    goal_updates = [
+        event
+        for event in session_events
+        if event.get("type") == "session_meta" and event.get("event") == "goal_state_updated"
+    ]
+    assert workflow_updates[-1]["workflow"]["enabled"] is False
+    assert workflow_updates[-1]["workflow"]["bound_run_id"] is None
+    assert goal_updates[-1]["goal"]["active_goal_id"] is None
+    assert goal_updates[-1]["goal"]["active_goal_status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_chat_tui_async_routes_active_goal_followups_and_chat_escape(
+    monkeypatch,
+    capsys,
+) -> None:
+    from mochi.main import _chat_tui_async
+
+    class _FakeEngine:
+        def __init__(self, config) -> None:  # noqa: ANN001, ARG002
+            self.calls: list[tuple[str, str | None]] = []
+            self.closed = False
+
+        async def initialize(self) -> None:
+            return None
+
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+        ) -> AsyncIterator[object]:
+            self.calls.append((message, session_id))
+            yield FinalAnswerEvent(content="plain chat reply")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FakeSessionStore:
+        def __init__(self, sessions_dir) -> None:  # noqa: ANN001, ARG002
+            self.by_session: dict[str, list[dict[str, object]]] = {
+                "goal-session": [
+                    {
+                        "type": "session_meta",
+                        "event": "goal_state_updated",
+                        "session_id": "goal-session",
+                        "goal": {
+                            "active_goal_id": "goal-1",
+                            "active_goal_status": "running",
+                            "execution_mode": "single_agent",
+                            "default_route": "goal",
+                            "last_goal_summary": {
+                                "goal_id": "goal-1",
+                                "objective": "Ship the task",
+                                "execution_mode": "single_agent",
+                                "protocol_id": None,
+                                "models": ["ollama:base"],
+                                "role_summary": "Primary agent continues the task directly with the current chat tools.",
+                                "runtime_mode": "Single-agent long-running execution",
+                                "risk_note": None,
+                                "status": "running",
+                            },
+                            "pending_proposal": None,
+                        },
+                        "timestamp": "2026-06-25T00:00:00+00:00",
+                    }
+                ]
+            }
+
+        async def save_event(self, session_id: str, event: dict[str, object]) -> None:
+            self.by_session.setdefault(session_id, []).append(dict(event))
+
+        async def load_session(self, session_id: str) -> list[dict[str, object]]:
+            return list(self.by_session.get(session_id, []))
+
+        async def delete_session(self, session_id: str) -> bool:
+            self.by_session.pop(session_id, None)
+            return True
+
+    class _FakeRuntimeService:
+        def __init__(self) -> None:
+            self.appended_messages: list[str] = []
+
+        async def get_goal_health(self, goal_id: str) -> dict[str, object]:
+            assert goal_id == "goal-1"
+            return {
+                "goal_id": "goal-1",
+                "status": "running",
+                "current_attempt": {"agent_run_id": "run-1"},
+                "linked_agent_run": {"run_id": "run-1", "status": "running"},
+                "recommended_next_action": {
+                    "action": "monitor",
+                    "summary": "The goal can continue with more guidance.",
+                },
+            }
+
+        async def get_goal(self, goal_id: str) -> dict[str, object]:
+            assert goal_id == "goal-1"
+            return {
+                "goal_id": "goal-1",
+                "objective": "Ship the task",
+                "execution_mode": "single_agent",
+                "protocol_id": None,
+                "status": "running",
+                "current_attempt_id": "attempt-1",
+                "attempts": [{"attempt_id": "attempt-1", "agent_run_id": "run-1"}],
+                "project_id": None,
+                "workspace_dir": None,
+                "latest_error": None,
+            }
+
+        async def append_agent_run_message(self, run_id: str, payload) -> dict[str, object]:  # noqa: ANN001
+            assert run_id == "run-1"
+            self.appended_messages.append(payload.content)
+            return {"run_id": run_id}
+
+        async def close(self) -> None:
+            return None
+
+    fake_store = _FakeSessionStore(None)
+    fake_runtime = _FakeRuntimeService()
+    fake_engine = _FakeEngine(None)
+    inputs = iter(
+        [
+            "please focus on tests",
+            "/chat what time is it",
+            "/exit",
+        ]
+    )
+
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config",
+        lambda config_path=None: SimpleNamespace(  # noqa: ARG005
+            model="ollama:base",
+            sessions_dir="/tmp/mochi-sessions",
+            security=SecurityConfig(),
+        ),
+    )
+    monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005
+    monkeypatch.setattr("mochi.sessions.store.SessionStore", lambda sessions_dir: fake_store)  # noqa: ARG005
+    async def fake_runtime_service_factory(**kwargs):  # noqa: ANN003, ARG001
+        return fake_runtime
+
+    monkeypatch.setattr("mochi.main._create_tui_runtime_service", fake_runtime_service_factory)
+    monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
+
+    await _chat_tui_async(
+        model=None,
+        config_path=None,
+        session_id="goal-session",
+        max_turns=2,
+    )
+    captured = capsys.readouterr().out
+
+    assert "Forwarded your guidance to the active goal." in captured
+    assert fake_runtime.appended_messages == ["please focus on tests"]
+    assert fake_engine.calls == [("what time is it", "goal-session")]
+    assert "plain chat reply" in captured
+
+
+@pytest.mark.asyncio
+async def test_chat_tui_async_shows_active_goal_summary_on_start_and_session_query(
+    monkeypatch,
+    capsys,
+) -> None:
+    from mochi.main import _chat_tui_async
+
+    class _FakeEngine:
+        def __init__(self, config) -> None:  # noqa: ANN001, ARG002
+            self.closed = False
+
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FakeSessionStore:
+        def __init__(self, sessions_dir) -> None:  # noqa: ANN001, ARG002
+            self.by_session: dict[str, list[dict[str, object]]] = {
+                "goal-session": [
+                    {
+                        "type": "session_meta",
+                        "event": "goal_state_updated",
+                        "session_id": "goal-session",
+                        "goal": {
+                            "active_goal_id": "goal-9",
+                            "active_goal_status": "running",
+                            "execution_mode": "single_agent",
+                            "default_route": "goal",
+                            "last_goal_summary": {
+                                "goal_id": "goal-9",
+                                "objective": "Finalize the release checklist",
+                                "execution_mode": "single_agent",
+                                "protocol_id": None,
+                                "models": ["ollama:base"],
+                                "role_summary": "Primary agent continues the task directly with the current chat tools.",
+                                "runtime_mode": "Single-agent long-running execution",
+                                "risk_note": None,
+                                "status": "running",
+                            },
+                            "pending_proposal": None,
+                        },
+                        "timestamp": "2026-06-25T00:00:00+00:00",
+                    }
+                ]
+            }
+
+        async def save_event(self, session_id: str, event: dict[str, object]) -> None:
+            self.by_session.setdefault(session_id, []).append(dict(event))
+
+        async def load_session(self, session_id: str) -> list[dict[str, object]]:
+            return list(self.by_session.get(session_id, []))
+
+        async def delete_session(self, session_id: str) -> bool:
+            self.by_session.pop(session_id, None)
+            return True
+
+    fake_store = _FakeSessionStore(None)
+    inputs = iter(["/session", "/exit"])
+
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config",
+        lambda config_path=None: SimpleNamespace(  # noqa: ARG005
+            model="ollama:base",
+            sessions_dir="/tmp/mochi-sessions",
+            security=SecurityConfig(),
+        ),
+    )
+    monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: _FakeEngine(config))  # noqa: ARG005
+    monkeypatch.setattr("mochi.sessions.store.SessionStore", lambda sessions_dir: fake_store)  # noqa: ARG005
+    monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
+
+    await _chat_tui_async(
+        model=None,
+        config_path=None,
+        session_id="goal-session",
+        max_turns=2,
+    )
+    captured = capsys.readouterr().out
+
+    assert captured.count("Active goal summary for this session.") >= 2
+    assert "Active goal" in captured
+    assert "Finalize the release checklist" in captured

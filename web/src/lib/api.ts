@@ -67,6 +67,10 @@ function getStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string')
 }
 
+function hasOwnField(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key)
+}
+
 function isGoalCardKind(value: unknown): value is GoalCardKind {
   return value === 'proposal' || value === 'revised_proposal' || value === 'started'
 }
@@ -575,6 +579,8 @@ interface NormalizedMessageEvent {
   role: 'user' | 'assistant' | 'system'
   content: string
   attachments: ChatAttachment[]
+  hasContentField: boolean
+  hasAttachmentsField: boolean
   goalCard?: GoalCardView
   timestamp?: string
   turnKey: string | null
@@ -764,6 +770,8 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
     const role = getString(event.role)
     const content = getString(event.content) ?? ''
     const attachments = normalizeAttachments(event.attachments)
+    const hasContentField = hasOwnField(event, 'content')
+    const hasAttachmentsField = hasOwnField(event, 'attachments')
     const goalCard = extractGoalCard(event)
 
     if (!role) {
@@ -783,6 +791,8 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       role,
       content,
       attachments,
+      hasContentField,
+      hasAttachmentsField,
       goalCard: role === 'assistant' ? goalCard ?? undefined : undefined,
       timestamp,
       turnKey,
@@ -1196,14 +1206,12 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
       if (event.role === 'assistant') {
         const existingIndex = event.turnKey ? assistantIndexByTurn.get(event.turnKey) : undefined
         if (existingIndex !== undefined) {
-          const nextContent =
-            event.content.trim().length > 0
-              ? event.content
-              : messages[existingIndex].content
-          const nextAttachments =
-            event.attachments.length > 0
-              ? event.attachments
-              : messages[existingIndex].attachments
+          const nextContent = event.hasContentField
+            ? event.content
+            : messages[existingIndex].content
+          const nextAttachments = event.hasAttachmentsField
+            ? event.attachments
+            : messages[existingIndex].attachments
           messages[existingIndex] = appendInlineReasoning({
             ...messages[existingIndex],
             content: nextContent,
@@ -1890,6 +1898,7 @@ interface BackendSessionListItem {
   updated_at: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
 }
 
@@ -1906,6 +1915,7 @@ export interface SessionSummary {
   eventCount: number
   projectId: string | null
   workflow: SessionWorkflowState | null
+  goal: SessionGoalState | null
   security_override: SessionSecurityOverride | null
 }
 
@@ -1917,6 +1927,7 @@ interface BackendSessionResponse {
   title?: string
   project_id?: string | null
   workflow?: SessionWorkflowState | null
+  goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
   events: Record<string, unknown>[]
 }
@@ -1928,6 +1939,8 @@ export interface SessionDetail extends SessionSummary {
 export interface SessionSecurityOverride {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
 }
+
+export type SessionGoalState = Record<string, unknown>
 
 export interface SessionWorkflowConfig {
   title?: string | null
@@ -1984,6 +1997,13 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
         }
       : {},
   }
+}
+
+function normalizeSessionGoalState(value: unknown): SessionGoalState | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  return { ...value }
 }
 
 function normalizeSessionSecurityOverride(value: unknown): SessionSecurityOverride | null {

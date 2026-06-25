@@ -87,6 +87,7 @@ interface ChatRuntimeStore {
   setSessionMessages: (sessionId: string, messages: Message[]) => void
   updateSessionMessages: (sessionId: string, updater: (messages: Message[]) => Message[]) => void
   hydrateSessionMessages: (sessionId: string, messages: Message[]) => void
+  moveSessionMessages: (fromSessionId: string, toSessionId: string) => void
   clearSessionMessages: (sessionId: string) => void
   startStreaming: (sessionId: string, controller: AbortController) => void
   finishStreaming: (sessionId: string) => void
@@ -140,6 +141,30 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
           ...state.messagesBySessionId,
           [sessionId]: messages,
         },
+      }
+    }),
+
+  moveSessionMessages: (fromSessionId, toSessionId) =>
+    set((state) => {
+      if (fromSessionId === toSessionId) {
+        return state
+      }
+
+      const sourceMessages = state.messagesBySessionId[fromSessionId]
+      if (!sourceMessages || sourceMessages.length === 0) {
+        return state
+      }
+
+      const nextMessagesBySessionId = { ...state.messagesBySessionId }
+      nextMessagesBySessionId[toSessionId] = sourceMessages
+      delete nextMessagesBySessionId[fromSessionId]
+
+      return {
+        messagesBySessionId: nextMessagesBySessionId,
+        streamingSessionId:
+          state.streamingSessionId === fromSessionId
+            ? toSessionId
+            : state.streamingSessionId,
       }
     }),
 

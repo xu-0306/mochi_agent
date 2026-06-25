@@ -27,6 +27,7 @@ import type {
   SessionWorkflowState,
 } from '@/lib/api'
 import type { ChatInputModelOption } from '@/components/chat/ChatInput'
+import { useSessionStore } from '@/lib/stores/session-store'
 type WorkflowScheduleType = 'interval' | 'once' | 'cron'
 type WorkflowSaveState = 'idle' | 'saving' | 'saved' | 'error'
 type WorkflowTemplate = 'standard' | 'research_debate'
@@ -367,6 +368,11 @@ function normalizeEvidenceCollectionMode(value: unknown): string {
   return typeof value === 'string' && value.trim().length > 0 ? value : 'hybrid'
 }
 
+function getGoalExecutionMode(goal: Record<string, unknown> | null | undefined): 'single_agent' | 'workflow' | null {
+  const executionMode = goal?.execution_mode
+  return executionMode === 'single_agent' || executionMode === 'workflow' ? executionMode : null
+}
+
 function WorkflowPanelBody({
   sessionId,
   workflowEnabled,
@@ -414,6 +420,17 @@ function WorkflowPanelBody({
 }: Omit<WorkflowPanelProps, 'open' | 'onOpenChange'> & {
   onClose?: () => void
 }) {
+  const currentSessionGoal = useSessionStore((state) => {
+    if (sessionId && state.currentSessionDetail?.id === sessionId) {
+      return state.currentSessionDetail.goal ?? null
+    }
+    if (sessionId) {
+      return state.sessions.find((session) => session.id === sessionId)?.goal ?? null
+    }
+    return state.currentSessionDetail?.goal ?? null
+  })
+  const sessionGoalExecutionMode = getGoalExecutionMode(currentSessionGoal)
+  const workflowUiSuppressed = sessionGoalExecutionMode === 'single_agent'
   const selectedRolesKey = serializeSelectedModelRoles(workflowConfig.selected_models_roles)
   const roleDraftScopeKey = `${sessionId ?? '__no_session__'}:${selectedRolesKey}`
   const selectedRolesSyncRef = React.useRef(roleDraftScopeKey)
@@ -606,6 +623,33 @@ function WorkflowPanelBody({
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
+        {workflowUiSuppressed ? (
+          <div className="space-y-4">
+            <PanelSectionCard
+              title="Workflow override"
+              description="This chat is currently bound to a single-agent goal, so workflow-native controls stay out of the main path."
+            >
+              <div className="space-y-3 rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-3 text-sm text-muted-foreground">
+                <p>
+                  Single-agent goals should stay chat-first. Workflow routing, bound-run controls, and role configuration are hidden until you explicitly prepare a workflow goal.
+                </p>
+                <p>
+                  Use <code>/workflow &lt;request&gt;</code> when you want to promote the next long-running task into a workflow proposal.
+                </p>
+                <p>
+                  The existing workflow settings remain stored for this chat, but they are not active while the current goal stays in single-agent mode.
+                </p>
+              </div>
+            </PanelSectionCard>
+            {onClose ? (
+              <div className="flex justify-end">
+                <Button type="button" variant="outline" onClick={onClose}>
+                  Close
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        ) : (
         <div className="space-y-4">
           <PanelSectionCard
             title="Workflow mode"
@@ -1877,6 +1921,7 @@ function WorkflowPanelBody({
             </Button>
           </div>
         </div>
+        )}
       </div>
     </div>
   )

@@ -87,6 +87,7 @@ class ToolRegistryFactory:
         )
         self._exec_approval_store = PersistentApprovalStore(Path(config.sessions_dir) / "exec-approvals.db")
         self._builtins = self._build_specs()
+        self._registry_cache: dict[str, ToolRegistry] = {}
 
     @property
     def tool_groups(self) -> dict[str, list[str]]:
@@ -101,6 +102,11 @@ class ToolRegistryFactory:
 
     def create_registry(self, workspace_dir: str) -> ToolRegistry:
         """Create a registry bound to one effective workspace."""
+        cache_key = self._registry_cache_key(workspace_dir)
+        cached = self._registry_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         registry = ToolRegistry(
             extra_dirs=self._config.tools.extra_tools_dirs or None,
             discover_builtin=False,
@@ -119,7 +125,20 @@ class ToolRegistryFactory:
             for tool in self._mcp_runtime_manager.materialize_tools():
                 registry.register(tool)
         registry.register(ToolSearchTool(catalog_provider=registry.list_tools))
+        self._registry_cache[cache_key] = registry
         return registry
+
+    def list_cached_registries(self) -> list[ToolRegistry]:
+        """Return unique cached registries managed by this factory."""
+        unique: list[ToolRegistry] = []
+        seen: set[int] = set()
+        for registry in self._registry_cache.values():
+            registry_id = id(registry)
+            if registry_id in seen:
+                continue
+            seen.add(registry_id)
+            unique.append(registry)
+        return unique
 
     def _services(self) -> dict[str, Any]:
         return {
@@ -127,6 +146,10 @@ class ToolRegistryFactory:
             "mcp_runtime_manager": self._mcp_runtime_manager,
             "process_service": self._process_service,
         }
+
+    @staticmethod
+    def _registry_cache_key(workspace_dir: str) -> str:
+        return str(Path(workspace_dir).expanduser().resolve())
 
     def _build_specs(self) -> list[BuiltInToolSpec]:
         return [

@@ -52,6 +52,13 @@ function kindTone(kind: GoalCardView['kind'], superseded: boolean): string {
 function statusTone(status: string | null | undefined): string {
   const normalized = (status ?? '').toLowerCase()
   if (
+    normalized === 'completed' ||
+    normalized === 'succeeded' ||
+    normalized === 'done'
+  ) {
+    return 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200'
+  }
+  if (
     normalized === 'running' ||
     normalized === 'active' ||
     normalized === 'started' ||
@@ -60,9 +67,13 @@ function statusTone(status: string | null | undefined): string {
     return 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200'
   }
   if (
+    normalized === 'waiting_approval' ||
     normalized === 'blocked' ||
     normalized === 'paused' ||
-    normalized === 'awaiting_approval'
+    normalized === 'awaiting_approval' ||
+    normalized === 'awaiting_resources' ||
+    normalized === 'stalled' ||
+    normalized === 'partial'
   ) {
     return 'border-warning/30 bg-warning/10 text-warning-foreground'
   }

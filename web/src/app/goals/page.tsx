@@ -1655,9 +1655,9 @@ export default function GoalsPage() {
       <header className="shrink-0 border-b border-border px-6 pb-4 pt-5">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-            <h1 className="text-xl font-bold text-foreground">Goals</h1>
+            <h1 className="text-xl font-bold text-foreground">Goal Console</h1>
             <p className="mt-0.5 text-sm text-muted-foreground">
-              Operator surface for long-running goals, runtime budgets, worker generations, audit findings, and emergency stop.
+              Advanced operator surface for long-running goals, runtime budgets, worker generations, audit findings, and emergency stop.
             </p>
           </div>
 
@@ -1702,7 +1702,7 @@ export default function GoalsPage() {
               <CardHeader>
                 <CardTitle>Create Goal</CardTitle>
                 <CardDescription>
-                  Create the durable goal first, then start or resume it explicitly from the operator console.
+                  Create the durable goal first, then start or resume it explicitly from the console when chat-first steering is not enough.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">

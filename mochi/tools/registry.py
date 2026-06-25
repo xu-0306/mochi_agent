@@ -42,8 +42,17 @@ class ToolRegistry:
                 self._discover(Path(directory))
 
     def register(self, tool: BaseTool) -> None:
+        self._register_tool(tool, log_registration=True)
+
+    def _register_tool(
+        self,
+        tool: BaseTool,
+        *,
+        log_registration: bool = False,
+    ) -> None:
         self._tools[tool.name] = tool
-        logger.debug("Registered tool: {}", tool.name)
+        if log_registration:
+            logger.debug("Registered tool: {}", tool.name)
 
     def register_factory(self, name: str, factory: ToolFactory) -> None:
         self._factories[name] = factory
@@ -75,6 +84,14 @@ class ToolRegistry:
     def get_schemas(self) -> list[dict[str, Any]]:
         return [tool.to_schema_dict() for tool in self.list_tools()]
 
+    def get_schemas_for_names(self, tool_names: list[str]) -> list[dict[str, Any]]:
+        schemas: list[dict[str, Any]] = []
+        for name in tool_names:
+            tool = self.get(name)
+            if tool is not None:
+                schemas.append(tool.to_schema_dict())
+        return schemas
+
     def create_view(
         self,
         tool_names: list[str],
@@ -88,7 +105,7 @@ class ToolRegistry:
             tool = self.get(name)
             if tool is not None:
                 if isinstance(tool, ToolSearchTool):
-                    registry.register(
+                    registry._register_tool(
                         tool.scoped_to_catalog(
                             lambda: [
                                 candidate
@@ -98,7 +115,7 @@ class ToolRegistry:
                         )
                     )
                     continue
-                registry.register(tool)
+                registry._register_tool(tool)
         return registry
 
     async def execute(

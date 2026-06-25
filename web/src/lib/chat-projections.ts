@@ -26,6 +26,16 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
 }
 
+function getLatestGoalCardExecutionMode(messages: Message[]): 'single_agent' | 'workflow' | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const goalCard = messages[index]?.goalCard
+    if (goalCard?.executionMode === 'single_agent' || goalCard?.executionMode === 'workflow') {
+      return goalCard.executionMode
+    }
+  }
+  return null
+}
+
 export function buildWorkflowCompletionContent(run: AgentRunDetail | null): string | null {
   if (!run || !isWorkflowCompletionReportStatus(run.status)) {
     return null
@@ -101,7 +111,13 @@ export function buildProjectedDisplayMessages(input: {
   workflowRun?: AgentRunDetail | null
 }): Message[] {
   const { messages, runtimeTasks, workflowProgressCard = null, workflowRun = null } = input
-  const workflowCompletionContent = buildWorkflowCompletionContent(workflowRun)
+  const latestGoalExecutionMode = getLatestGoalCardExecutionMode(messages)
+  const allowWorkflowNativeContent =
+    latestGoalExecutionMode === 'workflow' ||
+    (latestGoalExecutionMode === null && Boolean(workflowProgressCard || workflowRun))
+  const workflowCompletionContent = allowWorkflowNativeContent
+    ? buildWorkflowCompletionContent(workflowRun)
+    : null
   const subagentTaskCards = new Map<string, { card: DelegatedSubagentCardView; timestamp: Date }>()
   const subagentCardKeyByTaskId = new Map<string, string>()
   const subagentCardKeyByToolCallId = new Map<string, string>()
@@ -183,10 +199,6 @@ export function buildProjectedDisplayMessages(input: {
     upsertSubagentTaskCard(card, dateFromIso(task.created_at, new Date()))
   }
 
-  if (!workflowProgressCard && !workflowCompletionContent && subagentTaskCards.size === 0) {
-    return messages
-  }
-
   let nextMessages = messages
 
   for (const { card, timestamp } of [...subagentTaskCards.values()].sort(
@@ -201,7 +213,7 @@ export function buildProjectedDisplayMessages(input: {
     })
   }
 
-  if (workflowProgressCard) {
+  if (allowWorkflowNativeContent && workflowProgressCard) {
     nextMessages = insertDisplayMessageByTimestamp(nextMessages, {
       id: `workflow-card-${workflowProgressCard.runId}`,
       type: 'assistant',
@@ -213,7 +225,7 @@ export function buildProjectedDisplayMessages(input: {
     })
   }
 
-  if (workflowCompletionContent && workflowRun) {
+  if (allowWorkflowNativeContent && workflowCompletionContent && workflowRun) {
     nextMessages = insertDisplayMessageByTimestamp(nextMessages, {
       id: `workflow-completion-${workflowRun.run_id}`,
       type: 'assistant',
@@ -228,5 +240,31 @@ export function buildProjectedDisplayMessages(input: {
     })
   }
 
-  return nextMessages
+  const latestGoalCardIndexByGoalId = new Map<string, number>()
+  nextMessages.forEach((message, index) => {
+    const goalCard = message.goalCard
+    if (goalCard?.goalId) {
+      latestGoalCardIndexByGoalId.set(goalCard.goalId, index)
+    }
+  })
+
+  return nextMessages.map((message, index) => {
+    const goalCard = message.goalCard
+    if (!goalCard?.goalId) {
+      return message
+    }
+
+    const shouldMarkSuperseded = latestGoalCardIndexByGoalId.get(goalCard.goalId) !== index
+    if (!shouldMarkSuperseded && !goalCard.superseded) {
+      return message
+    }
+
+    return {
+      ...message,
+      goalCard: {
+        ...goalCard,
+        superseded: Boolean(goalCard.superseded) || shouldMarkSuperseded,
+      },
+    }
+  })
 }

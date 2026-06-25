@@ -445,6 +445,53 @@ def test_registry_factory_registers_tool_search(tmp_path: Path) -> None:
     assert "web_crawl" in factory.tool_groups["web"]
 
 
+def test_registry_factory_caches_registries_per_workspace(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    factory = ToolRegistryFactory(
+        config,
+        memory_store=MemoryStore(db_path=tmp_path / "memory.db"),
+    )
+
+    primary = factory.create_registry(str(tmp_path))
+    primary_again = factory.create_registry(str(tmp_path))
+    secondary_workspace = tmp_path / "other"
+    secondary_workspace.mkdir()
+    secondary = factory.create_registry(str(secondary_workspace))
+
+    assert primary is primary_again
+    assert secondary is not primary
+    assert factory.list_cached_registries() == [primary, secondary]
+
+
+def test_registry_get_schemas_for_names_returns_requested_schemas_only() -> None:
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(_EchoTool())
+    registry.register(_GuardedTool())
+
+    schemas = registry.get_schemas_for_names(["guarded", "missing", "echo"])
+
+    assert [schema["function"]["name"] for schema in schemas] == ["guarded", "echo"]
+
+
+def test_registry_create_view_skips_registration_debug_logs_for_view_population() -> None:
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(_EchoTool())
+    registry.register(ToolSearchTool(catalog_provider=registry.list_tools))
+
+    with patch("mochi.tools.registry.logger.debug") as debug_mock:
+        view = registry.create_view(["echo", "tool_search"])
+
+    assert view.get("echo") is not None
+    assert view.get("tool_search") is not None
+    debug_mock.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_mcp_call_uses_runtime_when_available() -> None:
     adapter = _FakeMcpAdapter()

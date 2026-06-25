@@ -1271,15 +1271,16 @@ export default function AgentRunsPage() {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="space-y-2">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="outline">Chat-first workflow</Badge>
+              <Badge variant="outline">{t('agentRuns.badge.chatFirst')}</Badge>
+              <Badge variant="outline">{t('agentRuns.badge.advanced')}</Badge>
               <Badge variant={activeRunSummary ? statusVariant(activeRunSummary.status) : 'neutral'}>
                 {activeRunSummary ? translateRunStatus(activeRunSummary.status, t) : 'No active run'}
               </Badge>
               <Badge variant="outline">{activeRunsCount} active</Badge>
             </div>
             <div>
-              <h1 className="text-xl font-bold text-foreground">{t('workflows.title')}</h1>
-              <p className="mt-0.5 text-sm text-muted-foreground">{t('workflows.description')}</p>
+              <h1 className="text-xl font-bold text-foreground">{t('agentRuns.deskTitle')}</h1>
+              <p className="mt-0.5 text-sm text-muted-foreground">{t('agentRuns.deskDescription')}</p>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1309,7 +1310,7 @@ export default function AgentRunsPage() {
                   Workflow Conversation
                 </CardTitle>
                 <CardDescription>
-                  Talk to the workflow main agent here. The right sidebar keeps the run machinery visible without making it the primary surface.
+                  This is the advanced run desk. Chat remains the primary place to start and steer goals; use this page when you need direct run inspection or manual recovery.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5 p-5">

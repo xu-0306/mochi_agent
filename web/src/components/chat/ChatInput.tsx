@@ -572,6 +572,19 @@ export function ChatInput({
   }, [onSearchSkills, paletteOpen, paletteQuery])
 
   React.useEffect(() => {
+    const trimmedValue = value.trim()
+    const hasContextPreviewInput = trimmedValue.length > 0 || attachedFiles.length > 0
+    if (!hasContextPreviewInput) {
+      setContextLoading(false)
+      setContextError(null)
+      setContextSnapshot(null)
+      return
+    }
+    if (disabled || isStreaming || isUploadingFiles) {
+      setContextLoading(false)
+      return
+    }
+
     const controller = new AbortController()
     const sequence = ++contextRequestSeqRef.current
     const timer = window.setTimeout(() => {
@@ -637,6 +650,9 @@ export function ChatInput({
     sessionId,
     value,
     attachedFiles,
+    disabled,
+    isStreaming,
+    isUploadingFiles,
   ])
 
   React.useEffect(() => {

@@ -6,7 +6,7 @@ import asyncio
 import copy
 import json
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 import tempfile
@@ -116,6 +116,110 @@ def _active_remote_provider(config: MochiConfig) -> str | None:
     ):
         return "openai_codex"
     return config.openai_compat.provider
+
+
+_TRADITIONAL_CHINESE_HINTS = set("這個為麼嗎請幫體應該對照還後讓與會開發資訊網頁臺繁")
+_SIMPLIFIED_CHINESE_HINTS = set("这个为么吗请帮体应该对照还后让与会开发资讯网页台繁")
+
+
+def _contains_japanese_kana(text: str) -> bool:
+    return any(
+        ("\u3040" <= char <= "\u309f")
+        or ("\u30a0" <= char <= "\u30ff")
+        or ("\u31f0" <= char <= "\u31ff")
+        or ("\uff66" <= char <= "\uff9f")
+        for char in text
+    )
+
+
+def _contains_hangul(text: str) -> bool:
+    return any(
+        ("\u1100" <= char <= "\u11ff")
+        or ("\u3130" <= char <= "\u318f")
+        or ("\uac00" <= char <= "\ud7af")
+        for char in text
+    )
+
+
+def _contains_ascii_letters(text: str) -> bool:
+    return any(("A" <= char <= "Z") or ("a" <= char <= "z") for char in text)
+
+
+def _detect_message_language_hint(message: str) -> str | None:
+    text = message.strip()
+    if not text:
+        return None
+
+    if _contains_japanese_kana(text):
+        return "japanese"
+
+    if _contains_hangul(text):
+        return "korean"
+
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        traditional_hits = sum(char in _TRADITIONAL_CHINESE_HINTS for char in text)
+        simplified_hits = sum(char in _SIMPLIFIED_CHINESE_HINTS for char in text)
+        if traditional_hits > simplified_hits:
+            return "traditional_chinese"
+        if simplified_hits > traditional_hits:
+            return "simplified_chinese"
+        return "chinese"
+
+    if _contains_ascii_letters(text):
+        return "latin_script"
+
+    return None
+
+
+def _build_response_language_prompt_addendum(
+    response_language: str | None,
+    message: str,
+) -> str | None:
+    preference = (response_language or "").strip()
+    if not preference:
+        return None
+
+    if preference == "same_as_user":
+        detected_language = _detect_message_language_hint(message)
+        lines = [
+            "Language Policy:",
+            "- Reply in the same language as the user's latest message unless they explicitly request another language.",
+            "- For the current turn, this latest-message language rule overrides any general default-language preference in other instructions.",
+            "- Match the user's writing system when practical.",
+        ]
+        if detected_language == "traditional_chinese":
+            lines.append("- If the user writes in Traditional Chinese, reply in Traditional Chinese.")
+            lines.append("- The current user message is in Traditional Chinese. Reply in Traditional Chinese.")
+        elif detected_language == "simplified_chinese":
+            lines.append("- If the user writes in Simplified Chinese, reply in Simplified Chinese.")
+            lines.append("- The current user message is in Simplified Chinese. Reply in Simplified Chinese.")
+        elif detected_language == "chinese":
+            lines.append("- If the user writes in Chinese, reply in the same script variant used by the user.")
+            lines.append("- The current user message is in Chinese. Reply in the same script variant used by the user.")
+        elif detected_language == "japanese":
+            lines.append("- The current user message is in Japanese. Reply in Japanese.")
+        elif detected_language == "korean":
+            lines.append("- The current user message is in Korean. Reply in Korean.")
+        elif detected_language == "latin_script":
+            lines.append(
+                "- The current user message is written in a Latin-script language. Reply in that same language instead of switching to another default language."
+            )
+        return "\n".join(lines)
+
+    return "\n".join(
+        [
+            "Language Policy:",
+            f"- Default response language: {preference}.",
+            "- Keep using that language unless the user explicitly requests another language.",
+        ]
+    )
+
+
+def _merge_prompt_addenda(*parts: str | None) -> str | None:
+    normalized = [part.strip() for part in parts if isinstance(part, str) and part.strip()]
+    if not normalized:
+        return None
+    return "\n\n".join(normalized)
 
 
 def _active_remote_model_name(config: MochiConfig) -> str:
@@ -328,14 +432,16 @@ class AgentEngine:
             attachment_count=self._attachment_count(attachments),
             workspace_attachment_count=self._workspace_attachment_count(attachments),
         )
-        tool_registry = workspace_registry.create_view(
-            exposure_plan.tool_names,
-            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
-        )
-        tool_schemas = tool_registry.get_schemas()
+        tool_schemas = workspace_registry.get_schemas_for_names(exposure_plan.tool_names)
         attachment_context = self._build_attachment_prompt_context(
             attachments=attachments,
             available_tool_names=exposure_plan.tool_names,
+        )
+        system_prompt_addendum = _merge_prompt_addenda(
+            _build_response_language_prompt_addendum(
+                self._config.locale_defaults.response_language,
+                message,
+            )
         )
 
         system_prompt = self._prompt_builder.build_system_prompt(
@@ -347,6 +453,7 @@ class AgentEngine:
             attachment_context=attachment_context,
             base_prompt=str(sanitized.get("system_prompt") or resolved["system_prompt"]),
             task_workspace_dir=None,
+            system_prompt_addendum=system_prompt_addendum,
         )
 
         system_estimate = estimate_backend_text_tokens(
@@ -528,10 +635,8 @@ class AgentEngine:
             or effective_workspace_dir != self._config.workspace_dir
         )
         workspace_registry = self._tool_registry
-        owns_workspace_registry = False
         if effective_workspace_dir != self._config.workspace_dir:
             workspace_registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
-            owns_workspace_registry = True
         available_tools = workspace_registry.list_tools()
 
         configured_model_id = (
@@ -583,6 +688,13 @@ class AgentEngine:
             attachments=request.attachments,
             available_tool_names=exposure_plan.tool_names,
         )
+        system_prompt_addendum = _merge_prompt_addenda(
+            _build_response_language_prompt_addendum(
+                self._config.locale_defaults.response_language,
+                request.message,
+            ),
+            request.system_prompt_addendum,
+        )
         system_prompt = self._prompt_builder.build_system_prompt(
             skills_context=skills_context,
             memory_context=self._merge_memory_and_summary_context(
@@ -592,7 +704,7 @@ class AgentEngine:
             attachment_context=attachment_context,
             base_prompt=resolved["system_prompt"],
             task_workspace_dir=request.task_workspace_dir,
-            system_prompt_addendum=request.system_prompt_addendum,
+            system_prompt_addendum=system_prompt_addendum,
         )
         persist_turn_events = request.persist_session if request.persist_turn_events is None else request.persist_turn_events
         persist_learning = request.persist_session if request.persist_learning is None else request.persist_learning
@@ -707,8 +819,6 @@ class AgentEngine:
             await self._router.mark_backend_idle(active_backend)
             if owns_invocation_backend:
                 await active_backend.close()
-            if owns_workspace_registry:
-                await self._close_tool_registry(workspace_registry)
 
         if persist_learning:
             await self._finish_learning_cycle(trajectory_id)
@@ -1194,6 +1304,7 @@ class AgentEngine:
             self._config.local_models.model_dump(),
             self._config.workspace_dir,
         )
+        await self._close_tool_registries(self._tool_registry_factory.list_cached_registries())
         self._config = config
         self._prompt_builder = PromptBuilder(config.agent.system_prompt)
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
@@ -1365,7 +1476,7 @@ class AgentEngine:
 
     async def close(self) -> None:
         """釋放所有資源。"""
-        await self._close_tool_registry(self._tool_registry)
+        await self._close_tool_registries(self._tool_registry_factory.list_cached_registries())
         await self._router.close()
         if self._initialized:
             logger.info("AgentEngine closed.")
@@ -1384,6 +1495,16 @@ class AgentEngine:
             maybe_awaitable = close_method()
             if inspect.isawaitable(maybe_awaitable):
                 await maybe_awaitable
+
+    async def _close_tool_registries(self, registries: Iterable[ToolRegistry]) -> None:
+        """Close a registry collection without double-closing shared instances."""
+        seen: set[int] = set()
+        for registry in registries:
+            registry_id = id(registry)
+            if registry_id in seen:
+                continue
+            seen.add(registry_id)
+            await self._close_tool_registry(registry)
 
     def _skills_db_path(self) -> Path:
         """取得本地技能庫 SQLite 路徑。"""
@@ -2223,61 +2344,55 @@ class AgentEngine:
         permission_policy = _resolve_agent_run_evidence_permission_policy(metadata)
 
         registry = self._tool_registry
-        owns_registry = False
         if effective_workspace_dir != self._config.workspace_dir:
             registry = self._tool_registry_factory.create_registry(effective_workspace_dir)
-            owns_registry = True
 
-        try:
-            search_tool = registry.get("web_search")
-            mode_requires_web = str(policy["mode"]).strip().lower() in {"web", "hybrid"}
-            if mode_requires_web and search_tool is None:
-                return [], {
-                    "query_count": len([item for item in queries if isinstance(item, str) and item.strip()]),
-                    "collected_packet_count": 0,
-                    "provider_counts": {},
-                    "queries": [
-                        {
-                            "query": item,
-                            "packet_count": 0,
-                            "error": "web_search tool is not available.",
-                        }
-                        for item in queries
-                        if isinstance(item, str) and item.strip()
-                    ],
-                }
-            tool_execution_context = self._get_tool_execution_context(
-                session_id=session_id,
-                workspace_dir=effective_workspace_dir,
-                task_workspace_dir=task_workspace_dir,
-                permission_policy_override=permission_policy,
-            )
+        search_tool = registry.get("web_search")
+        mode_requires_web = str(policy["mode"]).strip().lower() in {"web", "hybrid"}
+        if mode_requires_web and search_tool is None:
+            return [], {
+                "query_count": len([item for item in queries if isinstance(item, str) and item.strip()]),
+                "collected_packet_count": 0,
+                "provider_counts": {},
+                "queries": [
+                    {
+                        "query": item,
+                        "packet_count": 0,
+                        "error": "web_search tool is not available.",
+                    }
+                    for item in queries
+                    if isinstance(item, str) and item.strip()
+                ],
+            }
+        tool_execution_context = self._get_tool_execution_context(
+            session_id=session_id,
+            workspace_dir=effective_workspace_dir,
+            task_workspace_dir=task_workspace_dir,
+            permission_policy_override=permission_policy,
+        )
 
-            async def execute_tool(name: str, args: dict[str, Any]) -> Any:
-                return await registry.execute(name, args, context=tool_execution_context)
+        async def execute_tool(name: str, args: dict[str, Any]) -> Any:
+            return await registry.execute(name, args, context=tool_execution_context)
 
-            rag_mcp_servers = _resolve_agent_run_rag_mcp_servers(
-                metadata=metadata,
-                runtime_manager=self._mcp_runtime_manager,
-            )
-            return await collect_evidence_packets(
-                queries=queries,
-                execute_tool=execute_tool,
-                search_tool=search_tool,
-                fetch_tool=registry.get("web_fetch"),
-                memory_search_tool=registry.get("memory_search"),
-                mcp_list_resources_tool=registry.get("mcp_list_resources"),
-                mcp_read_resource_tool=registry.get("mcp_read_resource"),
-                rag_provider=str(policy["rag_provider"]),
-                rag_mcp_servers=rag_mcp_servers,
-                mode=str(policy["mode"]),
-                max_results_per_query=int(policy["max_results_per_query"]),
-                max_fetch_per_query=int(policy["max_fetch_per_query"]),
-                max_content_chars=int(policy["max_content_chars"]),
-            )
-        finally:
-            if owns_registry:
-                await self._close_tool_registry(registry)
+        rag_mcp_servers = _resolve_agent_run_rag_mcp_servers(
+            metadata=metadata,
+            runtime_manager=self._mcp_runtime_manager,
+        )
+        return await collect_evidence_packets(
+            queries=queries,
+            execute_tool=execute_tool,
+            search_tool=search_tool,
+            fetch_tool=registry.get("web_fetch"),
+            memory_search_tool=registry.get("memory_search"),
+            mcp_list_resources_tool=registry.get("mcp_list_resources"),
+            mcp_read_resource_tool=registry.get("mcp_read_resource"),
+            rag_provider=str(policy["rag_provider"]),
+            rag_mcp_servers=rag_mcp_servers,
+            mode=str(policy["mode"]),
+            max_results_per_query=int(policy["max_results_per_query"]),
+            max_fetch_per_query=int(policy["max_fetch_per_query"]),
+            max_content_chars=int(policy["max_content_chars"]),
+        )
 
     async def _acquire_configured_model_backend(self, model_id: str) -> BaseLLMBackend:
         configured_model = self._find_configured_model(model_id)

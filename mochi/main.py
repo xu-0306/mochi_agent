@@ -10,6 +10,7 @@ import shlex
 import sys
 from collections import deque
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -288,9 +289,20 @@ def chat(
     text: Annotated[str, typer.Argument(help="Message to send to the agent")],
     model: Annotated[str, typer.Option("--model", "-m", help="Model spec")] = "",
     config_path: Annotated[str, typer.Option("--config", "-c", help="Config file path")] = "",
+    session_id: Annotated[
+        str,
+        typer.Option("--session-id", help="Text chat session ID"),
+    ] = DEFAULT_TUI_SESSION_ID,
 ) -> None:
     """Send one message and print the agent response."""
-    asyncio.run(_chat_async(text, model or None, config_path or None))
+    asyncio.run(
+        _chat_async_terminal(
+            text,
+            model or None,
+            config_path or None,
+            session_id or DEFAULT_TUI_SESSION_ID,
+        )
+    )
 
 
 @app.command("tui")
@@ -505,6 +517,7 @@ async def _chat_async(
     text: str,
     model: str | None,
     config_path: str | None,
+    session_id: str,
 ) -> None:
     """非同步執行對話。"""
     from mochi.agents.engine import AgentEngine
@@ -545,6 +558,99 @@ async def _chat_async(
     console.print()
 
 
+async def _chat_async_terminal(
+    text: str,
+    model: str | None,
+    config_path: str | None,
+    session_id: str,
+) -> None:
+    """Send one text turn through the shared terminal goal-aware flow."""
+    from mochi.agents.engine import AgentEngine
+    from mochi.agents.events import ErrorEvent, FinalAnswerEvent, TextChunkEvent
+    from mochi.config import defaults
+    from mochi.config.manager import load_config
+    from mochi.config.schema import SecurityConfig
+    from mochi.sessions.store import SessionStore
+
+    cfg = load_config(config_path)
+    if model:
+        cfg.model = model
+
+    engine = AgentEngine(cfg)
+    runtime_service: object | None = None
+    current_session = session_id.strip() or DEFAULT_TUI_SESSION_ID
+
+    def _sessions_dir() -> str:
+        return str(getattr(cfg, "sessions_dir", defaults.default_sessions_dir()))
+
+    def _ensure_security_config() -> SecurityConfig:
+        current = getattr(cfg, "security", None)
+        if isinstance(current, SecurityConfig):
+            return current
+        payload = {}
+        if current is not None and hasattr(current, "__dict__"):
+            payload = dict(current.__dict__)
+        normalized = SecurityConfig.model_validate(payload)
+        setattr(cfg, "security", normalized)
+        return normalized
+
+    session_store = SessionStore(sessions_dir=_sessions_dir())
+
+    async def _build_runtime_service() -> object:
+        _ensure_security_config()
+        return await _create_tui_runtime_service(
+            engine=engine,
+            config=cfg,
+            config_path=config_path,
+        )
+
+    async def _ensure_runtime_service() -> object:
+        nonlocal runtime_service
+        if runtime_service is None:
+            runtime_service = await _build_runtime_service()
+        return runtime_service
+
+    try:
+        await engine.initialize()
+    except Exception as exc:
+        console.print(f"[red]Initialization failed: {exc}[/red]")
+        sys.exit(1)
+
+    console.print(f"[dim]Model: {cfg.model}[/dim]")
+    console.print(f"[dim]Session: {current_session}[/dim]")
+    console.print()
+
+    full_reply = ""
+    try:
+        routing_result = await _handle_terminal_goal_input(
+            text=text,
+            session_id=current_session,
+            current_model=cfg.model,
+            autonomy_mode=_ensure_security_config().autonomy_mode,
+            session_store=session_store,
+            ensure_runtime_service=_ensure_runtime_service,
+        )
+        if routing_result["handled"]:
+            return
+
+        chat_text = routing_result["chat_text"] or text
+        async for event in engine.chat(chat_text, session_id=current_session):
+            if isinstance(event, TextChunkEvent):
+                console.print(event.content, end="", highlight=False)
+                full_reply += event.content
+            elif isinstance(event, FinalAnswerEvent) and not full_reply:
+                console.print(event.content, highlight=False)
+            elif isinstance(event, ErrorEvent):
+                console.print(f"\n[red]Error: {event.message}[/red]")
+                break
+    finally:
+        if runtime_service is not None:
+            await runtime_service.close()
+        await engine.close()
+
+    console.print()
+
+
 def _print_tui_help() -> None:
     """輸出互動式 TUI 可用 slash 指令。"""
     console.print("[bold]Slash Commands[/bold]")
@@ -555,6 +661,14 @@ def _print_tui_help() -> None:
     console.print("  /model <spec>        Switch model for this session")
     console.print("  /session             Show current session id")
     console.print("  /session <id>        Switch session id")
+    console.print("  /goal <request>      Prepare a long-running single-agent goal")
+    console.print("  /goal                Show the active goal summary or goal help")
+    console.print("  /goal status         Show the active goal status")
+    console.print("  /goal pause          Pause the active goal")
+    console.print("  /goal resume         Resume the active goal")
+    console.print("  /goal stop           Stop the active goal or clear a pending proposal")
+    console.print("  /workflow <request>  Prepare a workflow goal")
+    console.print("  /chat <request>      Send one turn outside the active goal lane")
     console.print("  /approvals           Show approval requests")
     console.print("  /approve <id>        Approve one request once")
     console.print("  /approve-save <id>   Approve and save the suggested exec rule")
@@ -594,6 +708,753 @@ def _parse_tui_slash_command(text: str) -> tuple[str, list[str]]:
     command = tokens[0].strip().lower()
     args = [token.strip() for token in tokens[1:]]
     return command, args
+
+
+def _session_workflow_state(events: list[dict[str, object]]) -> dict[str, object] | None:
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "workflow_state_updated":
+            continue
+        workflow = event.get("workflow")
+        if isinstance(workflow, dict):
+            return dict(workflow)
+    return None
+
+
+def _session_goal_state(events: list[dict[str, object]]) -> dict[str, object] | None:
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "goal_state_updated":
+            continue
+        goal = event.get("goal")
+        if isinstance(goal, dict):
+            return dict(goal)
+    return None
+
+
+def _session_project_id(events: list[dict[str, object]]) -> str | None:
+    for event in reversed(events):
+        if event.get("type") != "session_meta":
+            continue
+        if event.get("event") != "project_assigned":
+            continue
+        project_id = event.get("project_id")
+        if isinstance(project_id, str) and project_id.strip():
+            return project_id.strip()
+        return None
+    return None
+
+
+def _string_or_none(value: object) -> str | None:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        return trimmed or None
+    return None
+
+
+def _get_goal_attempt_run_id(goal: dict[str, object]) -> str | None:
+    current_attempt_id = _string_or_none(goal.get("current_attempt_id"))
+    attempts = goal.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        attempt_id = _string_or_none(attempt.get("attempt_id")) or _string_or_none(attempt.get("id"))
+        if current_attempt_id is not None and attempt_id == current_attempt_id:
+            return _string_or_none(attempt.get("agent_run_id"))
+    for attempt in reversed(attempts):
+        if isinstance(attempt, dict):
+            run_id = _string_or_none(attempt.get("agent_run_id"))
+            if run_id is not None:
+                return run_id
+    return None
+
+
+def _print_goal_card(goal_card: dict[str, object]) -> None:
+    label = _string_or_none(goal_card.get("label")) or "Goal"
+    objective = _string_or_none(goal_card.get("objective")) or ""
+    execution_mode = _string_or_none(goal_card.get("executionMode")) or "workflow"
+    status = _string_or_none(goal_card.get("status"))
+    protocol_id = _string_or_none(goal_card.get("protocolId"))
+    models = goal_card.get("models") if isinstance(goal_card.get("models"), list) else []
+    role_summary = _string_or_none(goal_card.get("roleSummary"))
+    runtime_mode = _string_or_none(goal_card.get("runtimeMode"))
+    risk_note = _string_or_none(goal_card.get("riskNote"))
+
+    console.print(f"[bold]{label}[/bold]")
+    if objective:
+        console.print(f"  Objective: {objective}", highlight=False)
+    console.print(f"  Mode: {execution_mode}", highlight=False)
+    if status:
+        console.print(f"  Status: {status}", highlight=False)
+    if protocol_id:
+        console.print(f"  Protocol: {protocol_id}", highlight=False)
+    if models:
+        console.print(f"  Models: {', '.join(str(item) for item in models)}", highlight=False)
+    if role_summary:
+        console.print(f"  Roles: {role_summary}", highlight=False)
+    if runtime_mode:
+        console.print(f"  Runtime: {runtime_mode}", highlight=False)
+    if risk_note:
+        console.print(f"  Risk: {risk_note}", highlight=False)
+
+
+async def _append_terminal_goal_conversation(
+    *,
+    session_store: object,
+    session_id: str,
+    user_content: str,
+    assistant_content: str,
+    goal_card: dict[str, object] | None = None,
+) -> None:
+    now = datetime.now(tz=UTC).isoformat()
+    await session_store.save_event(
+        session_id,
+        {
+            "type": "message",
+            "role": "user",
+            "content": user_content,
+            "timestamp": now,
+        },
+    )
+    assistant_event: dict[str, object] = {
+        "type": "message",
+        "role": "assistant",
+        "content": assistant_content,
+        "timestamp": now,
+    }
+    if goal_card is not None:
+        assistant_event["goal_card"] = goal_card
+    await session_store.save_event(session_id, assistant_event)
+    console.print(f"[green]Mochi[/green] {assistant_content}", highlight=False)
+    if goal_card is not None:
+        _print_goal_card(goal_card)
+
+
+async def _persist_terminal_goal_state(
+    *,
+    session_store: object,
+    session_id: str,
+    goal_state: dict[str, object],
+) -> None:
+    await session_store.save_event(
+        session_id,
+        {
+            "type": "session_meta",
+            "event": "goal_state_updated",
+            "session_id": session_id,
+            "goal": goal_state,
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        },
+    )
+
+
+async def _persist_terminal_workflow_state(
+    *,
+    session_store: object,
+    session_id: str,
+    workflow_state: dict[str, object],
+) -> None:
+    await session_store.save_event(
+        session_id,
+        {
+            "type": "session_meta",
+            "event": "workflow_state_updated",
+            "session_id": session_id,
+            "workflow": workflow_state,
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        },
+    )
+
+
+async def _sync_terminal_workflow_state_for_goal(
+    *,
+    session_store: object,
+    session_id: str,
+    execution_mode: str,
+    goal_status: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    from mochi.terminal_goal_helpers import is_goal_terminal_status
+
+    events = await session_store.load_session(session_id)
+    base_workflow = _session_workflow_state(events) or {}
+    goal_terminal = is_goal_terminal_status(goal_status)
+    next_run_id = run_id if execution_mode == "workflow" and not goal_terminal else None
+    workflow_enabled = execution_mode == "workflow" and not goal_terminal and goal_status != "paused"
+    next_state = dict(base_workflow)
+    next_state["enabled"] = workflow_enabled
+    next_state["bound_run_id"] = next_run_id
+    if next_run_id and next_run_id == _string_or_none(base_workflow.get("bound_run_id")):
+        next_state["synced_run_event_count"] = base_workflow.get("synced_run_event_count", 0)
+    else:
+        next_state["synced_run_event_count"] = 0
+    await _persist_terminal_workflow_state(
+        session_store=session_store,
+        session_id=session_id,
+        workflow_state=next_state,
+    )
+
+
+async def _show_terminal_goal_summary(
+    *,
+    session_store: object,
+    session_id: str,
+    prefix: str | None = None,
+) -> None:
+    from mochi.terminal_goal_helpers import (
+        goal_card_from_summary,
+        normalize_goal_session_state,
+    )
+
+    events = await session_store.load_session(session_id)
+    goal_state = normalize_goal_session_state(_session_goal_state(events))
+    pending_proposal = goal_state.get("pending_proposal")
+    last_goal_summary = goal_state.get("last_goal_summary")
+    active_goal_id = goal_state.get("active_goal_id")
+    active_goal_status = goal_state.get("active_goal_status")
+
+    if prefix:
+        console.print(prefix, highlight=False)
+
+    if isinstance(pending_proposal, dict):
+        console.print("[dim]Pending goal proposal in this session.[/dim]")
+        _print_goal_card(
+            goal_card_from_summary(
+                pending_proposal,
+                kind="revised_proposal" if int(pending_proposal.get("revision_index", 0) or 0) > 0 else "proposal",
+            )
+        )
+        return
+
+    if isinstance(last_goal_summary, dict):
+        console.print(
+            "[dim]Active goal summary for this session.[/dim]"
+            if active_goal_id
+            else "[dim]Most recent goal summary for this session.[/dim]"
+        )
+        _print_goal_card(
+            goal_card_from_summary(
+                last_goal_summary,
+                kind="started",
+                label="Active goal" if active_goal_id else "Most recent goal",
+                goal_id=last_goal_summary.get("goal_id"),
+                status=active_goal_status or last_goal_summary.get("status"),
+            )
+        )
+
+
+async def _handle_terminal_goal_input(
+    *,
+    text: str,
+    session_id: str,
+    current_model: str,
+    autonomy_mode: str | None,
+    session_store: object,
+    ensure_runtime_service: object,
+) -> dict[str, object]:
+    from mochi.runtime.models import AgentRunMessageRequest, GoalCreateRequest
+    from mochi.terminal_goal_helpers import (
+        GOAL_PROPOSAL_REPLY_HELP,
+        build_goal_proposal_state,
+        build_goal_summary_from_goal,
+        goal_card_from_summary,
+        is_goal_terminal_status,
+        normalize_goal_session_state,
+        resolve_goal_continuation_decision,
+        resolve_goal_workflow_routing,
+    )
+
+    events = await session_store.load_session(session_id)
+    base_goal_state = normalize_goal_session_state(_session_goal_state(events))
+    routing_decision = resolve_goal_workflow_routing(
+        text=text,
+        has_pending_proposal=base_goal_state["pending_proposal"] is not None,
+        has_active_goal=(
+            base_goal_state["active_goal_id"] is not None
+            and not is_goal_terminal_status(base_goal_state["active_goal_status"])
+        ),
+    )
+
+    mode_command = routing_decision.mode_command
+    if mode_command is not None and mode_command.mode == "chat":
+        if not mode_command.content:
+            console.print("[yellow]Usage: /chat <request>[/yellow]")
+            return {"handled": True, "chat_text": None}
+        return {"handled": False, "chat_text": routing_decision.request_text}
+
+    if mode_command is not None and mode_command.mode == "workflow" and not mode_command.content:
+        console.print("[yellow]Usage: /workflow <request>[/yellow]")
+        return {"handled": True, "chat_text": None}
+
+    if not routing_decision.should_handle_goal_workflow_routing:
+        return {"handled": False, "chat_text": None}
+
+    pending_proposal = base_goal_state["pending_proposal"]
+    latest_goal_summary = base_goal_state["last_goal_summary"]
+    active_goal_id = base_goal_state["active_goal_id"]
+    goal_command = routing_decision.goal_command
+
+    if goal_command is not None and goal_command.action == "help":
+        if pending_proposal is not None:
+            pending_card = goal_card_from_summary(
+                pending_proposal,
+                kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
+            )
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=goal_command.raw,
+                assistant_content=f"A goal proposal is pending. {GOAL_PROPOSAL_REPLY_HELP}",
+                goal_card=pending_card,
+            )
+            return {"handled": True, "chat_text": None}
+        if latest_goal_summary is not None:
+            summary_card = goal_card_from_summary(
+                latest_goal_summary,
+                kind="started",
+                label="Goal summary" if active_goal_id else "Most recent goal",
+                goal_id=latest_goal_summary.get("goal_id"),
+                status=base_goal_state["active_goal_status"] or latest_goal_summary.get("status"),
+            )
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=goal_command.raw,
+                assistant_content=(
+                    "Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage the active goal."
+                    if active_goal_id
+                    else "No active goal is currently bound to this chat. Start a new one with `/goal <request>` or `/workflow <request>`."
+                ),
+                goal_card=summary_card,
+            )
+            return {"handled": True, "chat_text": None}
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=goal_command.raw,
+            assistant_content=(
+                "Use `/goal <request>` to prepare a long-running single-agent goal.\n"
+                "Use `/workflow <request>` to prepare a workflow goal.\n"
+                "Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` after a goal starts."
+            ),
+        )
+        return {"handled": True, "chat_text": None}
+
+    if (
+        (
+            goal_command is not None
+            and goal_command.action == "proposal"
+        )
+        or routing_decision.workflow_proposal_requested
+        or routing_decision.natural_language_goal_requested
+    ) and active_goal_id and not is_goal_terminal_status(base_goal_state["active_goal_status"]):
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=goal_command.content if goal_command is not None and goal_command.action == "proposal" else routing_decision.request_text,
+            assistant_content=(
+                "This chat already has an active goal. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` before starting a new one."
+            ),
+        )
+        return {"handled": True, "chat_text": None}
+
+    if (
+        (goal_command is not None and goal_command.action == "proposal")
+        or routing_decision.workflow_proposal_requested
+        or routing_decision.natural_language_goal_requested
+        or routing_decision.proposal_revision_requested
+    ):
+        revision_source_text = (
+            routing_decision.request_text
+            if routing_decision.proposal_revision_requested
+            else goal_command.content
+            if goal_command is not None and goal_command.action == "proposal"
+            else routing_decision.request_text
+        )
+        explicit_execution_mode = (
+            "workflow"
+            if routing_decision.workflow_proposal_requested
+            else "single_agent"
+            if goal_command is not None and goal_command.action == "proposal"
+            else base_goal_state["execution_mode"] or "single_agent"
+        )
+        proposal_objective = (
+            pending_proposal.get("objective")
+            if routing_decision.proposal_revision_requested and isinstance(pending_proposal, dict)
+            else goal_command.content
+            if goal_command is not None and goal_command.action == "proposal"
+            else routing_decision.request_text
+        )
+        next_proposal = build_goal_proposal_state(
+            proposal_objective,
+            explicit_execution_mode,
+            current_model=current_model,
+            autonomy_mode=autonomy_mode,
+            previous=pending_proposal,
+            revision_text=revision_source_text if pending_proposal is not None else None,
+        )
+        next_goal_state = {
+            "active_goal_id": None,
+            "active_goal_status": None,
+            "execution_mode": next_proposal["execution_mode"],
+            "default_route": "workflow" if next_proposal["execution_mode"] == "workflow" else "goal",
+            "last_goal_summary": latest_goal_summary,
+            "pending_proposal": next_proposal,
+        }
+        await _persist_terminal_goal_state(
+            session_store=session_store,
+            session_id=session_id,
+            goal_state=next_goal_state,
+        )
+        if next_proposal["execution_mode"] == "single_agent":
+            await _sync_terminal_workflow_state_for_goal(
+                session_store=session_store,
+                session_id=session_id,
+                execution_mode=next_proposal["execution_mode"],
+            )
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=revision_source_text,
+            assistant_content=(
+                f"Updated the pending goal proposal. {GOAL_PROPOSAL_REPLY_HELP}"
+                if pending_proposal is not None
+                else f"Prepared a goal proposal. {GOAL_PROPOSAL_REPLY_HELP}"
+            ),
+            goal_card=goal_card_from_summary(
+                next_proposal,
+                kind="revised_proposal" if pending_proposal is not None or routing_decision.proposal_revision_requested else "proposal",
+            ),
+        )
+        return {"handled": True, "chat_text": None}
+
+    if routing_decision.confirmation_requested and pending_proposal is not None:
+        runtime_service = await ensure_runtime_service()
+        created_goal = await runtime_service.create_goal(
+            GoalCreateRequest(
+                objective=pending_proposal["objective"],
+                execution_mode=pending_proposal["execution_mode"],
+                protocol_id=pending_proposal["protocol_id"] if pending_proposal["execution_mode"] == "workflow" else None,
+                topic=pending_proposal["objective"],
+                project_id=_session_project_id(events),
+                summary={
+                    "operator_message": pending_proposal["objective"],
+                    "source_session_id": session_id,
+                },
+                metadata={
+                    "channel": "terminal_goal",
+                    "source_session_id": session_id,
+                    "pending_proposal_id": pending_proposal["proposal_id"],
+                },
+            )
+        )
+        started_goal = await runtime_service.start_goal(created_goal["goal_id"])
+        started_summary = build_goal_summary_from_goal(started_goal, pending_proposal)
+        started_run_id = _get_goal_attempt_run_id(started_goal)
+        await _sync_terminal_workflow_state_for_goal(
+            session_store=session_store,
+            session_id=session_id,
+            execution_mode=started_goal["execution_mode"],
+            goal_status=started_goal.get("status"),
+            run_id=started_run_id,
+        )
+        await _persist_terminal_goal_state(
+            session_store=session_store,
+            session_id=session_id,
+            goal_state={
+                "active_goal_id": started_goal["goal_id"],
+                "active_goal_status": started_goal.get("status"),
+                "execution_mode": started_goal["execution_mode"],
+                "default_route": "workflow" if started_goal["execution_mode"] == "workflow" else "goal",
+                "last_goal_summary": started_summary,
+                "pending_proposal": None,
+            },
+        )
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=text.strip(),
+            assistant_content="Goal started. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage it.",
+            goal_card=goal_card_from_summary(
+                started_summary,
+                kind="started",
+                goal_id=started_goal["goal_id"],
+                status=started_goal.get("status"),
+            ),
+        )
+        return {"handled": True, "chat_text": None}
+
+    if active_goal_id is None:
+        if goal_command is not None and goal_command.action == "status" and pending_proposal is not None:
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=goal_command.raw,
+                assistant_content=f"A goal proposal is pending. {GOAL_PROPOSAL_REPLY_HELP}",
+                goal_card=goal_card_from_summary(
+                    pending_proposal,
+                    kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
+                ),
+            )
+            return {"handled": True, "chat_text": None}
+        if goal_command is not None and goal_command.action == "stop" and pending_proposal is not None:
+            await _persist_terminal_goal_state(
+                session_store=session_store,
+                session_id=session_id,
+                goal_state={
+                    "active_goal_id": None,
+                    "active_goal_status": None,
+                    "execution_mode": latest_goal_summary.get("execution_mode") if isinstance(latest_goal_summary, dict) else None,
+                    "default_route": "chat",
+                    "last_goal_summary": latest_goal_summary,
+                    "pending_proposal": None,
+                },
+            )
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=goal_command.raw,
+                assistant_content="Cleared the pending goal proposal. Start a new one with `/goal <request>` or `/workflow <request>`.",
+            )
+            return {"handled": True, "chat_text": None}
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=(goal_command.raw if goal_command is not None else text.strip()),
+            assistant_content="No active goal is bound to this chat. Start one with `/goal <request>` or `/workflow <request>`.",
+        )
+        return {"handled": True, "chat_text": None}
+
+    runtime_service = await ensure_runtime_service()
+
+    if routing_decision.active_goal_follow_up_requested:
+        health = await runtime_service.get_goal_health(active_goal_id)
+        continuation = resolve_goal_continuation_decision(health or {})
+
+        if continuation.action in {"manual_resolution_required", "blocked"}:
+            active_goal = await runtime_service.get_goal(active_goal_id)
+            active_goal_summary = build_goal_summary_from_goal(active_goal or {}, latest_goal_summary)
+            active_goal_status = _string_or_none((active_goal or {}).get("status"))
+            await _persist_terminal_goal_state(
+                session_store=session_store,
+                session_id=session_id,
+                goal_state={
+                    "active_goal_id": None if is_goal_terminal_status(active_goal_status) else (active_goal or {}).get("goal_id"),
+                    "active_goal_status": active_goal_status,
+                    "execution_mode": (active_goal or {}).get("execution_mode"),
+                    "default_route": (
+                        "chat"
+                        if is_goal_terminal_status(active_goal_status)
+                        else "workflow"
+                        if (active_goal or {}).get("execution_mode") == "workflow"
+                        else "goal"
+                    ),
+                    "last_goal_summary": active_goal_summary,
+                    "pending_proposal": None,
+                },
+            )
+            assistant_content = (
+                f"{continuation.summary} Review the pending approval{'s' if len(continuation.approval_ids) > 1 else ''} from the goal drawer or Goal Console before continuing."
+                if continuation.action == "manual_resolution_required" and continuation.approval_ids
+                else f"{continuation.summary} Open the Goal Console to inspect the blocking approval state before continuing."
+                if continuation.action == "manual_resolution_required"
+                else f"{continuation.summary} Adjust the goal from the Goal Console before sending more execution guidance."
+            )
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=routing_decision.request_text,
+                assistant_content=assistant_content,
+                goal_card=goal_card_from_summary(
+                    active_goal_summary,
+                    kind="started",
+                    label="Goal blocked",
+                    goal_id=(active_goal or {}).get("goal_id"),
+                    status=active_goal_status,
+                ),
+            )
+            return {"handled": True, "chat_text": None}
+
+        active_goal = (
+            await runtime_service.refresh_goal(active_goal_id)
+            if continuation.action == "refresh_then_forward"
+            else await runtime_service.resume_goal(active_goal_id)
+            if continuation.action == "resume_then_forward"
+            else await runtime_service.get_goal(active_goal_id)
+        )
+        active_goal_summary = build_goal_summary_from_goal(active_goal or {}, latest_goal_summary)
+        active_goal_status = _string_or_none((active_goal or {}).get("status"))
+        active_run_id = _get_goal_attempt_run_id(active_goal or {})
+
+        if active_run_id is None:
+            await _persist_terminal_goal_state(
+                session_store=session_store,
+                session_id=session_id,
+                goal_state={
+                    "active_goal_id": None if is_goal_terminal_status(active_goal_status) else (active_goal or {}).get("goal_id"),
+                    "active_goal_status": active_goal_status,
+                    "execution_mode": (active_goal or {}).get("execution_mode"),
+                    "default_route": (
+                        "chat"
+                        if is_goal_terminal_status(active_goal_status)
+                        else "workflow"
+                        if (active_goal or {}).get("execution_mode") == "workflow"
+                        else "goal"
+                    ),
+                    "last_goal_summary": active_goal_summary,
+                    "pending_proposal": None,
+                },
+            )
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=routing_decision.request_text,
+                assistant_content="The active goal still does not have a live attempt ready to receive follow-up guidance. Use the Goal Console to inspect the current recovery state.",
+                goal_card=goal_card_from_summary(
+                    active_goal_summary,
+                    kind="started",
+                    label="Goal status",
+                    goal_id=(active_goal or {}).get("goal_id"),
+                    status=active_goal_status,
+                ),
+            )
+            return {"handled": True, "chat_text": None}
+
+        await runtime_service.append_agent_run_message(
+            active_run_id,
+            AgentRunMessageRequest(
+                role="operator",
+                content=routing_decision.request_text,
+                project_id=(active_goal or {}).get("project_id"),
+                workspace_dir=(active_goal or {}).get("workspace_dir"),
+                metadata={
+                    "channel": "terminal_goal",
+                    "goal_id": (active_goal or {}).get("goal_id"),
+                    "source_session_id": session_id,
+                },
+            ),
+        )
+        await _sync_terminal_workflow_state_for_goal(
+            session_store=session_store,
+            session_id=session_id,
+            execution_mode=(active_goal or {}).get("execution_mode") or "workflow",
+            goal_status=active_goal_status,
+            run_id=active_run_id,
+        )
+        await _persist_terminal_goal_state(
+            session_store=session_store,
+            session_id=session_id,
+            goal_state={
+                "active_goal_id": None if is_goal_terminal_status(active_goal_status) else (active_goal or {}).get("goal_id"),
+                "active_goal_status": active_goal_status,
+                "execution_mode": (active_goal or {}).get("execution_mode"),
+                "default_route": (
+                    "chat"
+                    if is_goal_terminal_status(active_goal_status)
+                    else "workflow"
+                    if (active_goal or {}).get("execution_mode") == "workflow"
+                    else "goal"
+                ),
+                "last_goal_summary": active_goal_summary,
+                "pending_proposal": None,
+            },
+        )
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=routing_decision.request_text,
+            assistant_content=(
+                "Refreshed the active worker generation and forwarded your guidance to the updated goal attempt."
+                if continuation.action == "refresh_then_forward"
+                else "Resumed the active goal and forwarded your guidance to the current attempt."
+                if continuation.action == "resume_then_forward"
+                else "Forwarded your guidance to the active goal. It will continue working with this updated direction."
+            ),
+            goal_card=goal_card_from_summary(
+                active_goal_summary,
+                kind="started",
+                label="Goal updated",
+                goal_id=(active_goal or {}).get("goal_id"),
+                status=active_goal_status,
+            ),
+        )
+        return {"handled": True, "chat_text": None}
+
+    next_goal = (
+        await runtime_service.get_goal(active_goal_id)
+        if goal_command is not None and goal_command.action == "status"
+        else await runtime_service.pause_goal(active_goal_id)
+        if goal_command is not None and goal_command.action == "pause"
+        else await runtime_service.resume_goal(active_goal_id)
+        if goal_command is not None and goal_command.action == "resume"
+        else await runtime_service.cancel_goal(active_goal_id)
+    )
+    next_goal_summary = build_goal_summary_from_goal(next_goal or {}, latest_goal_summary)
+    next_run_id = _get_goal_attempt_run_id(next_goal or {})
+    next_goal_status = _string_or_none((next_goal or {}).get("status"))
+    next_goal_terminal = is_goal_terminal_status(next_goal_status)
+    await _sync_terminal_workflow_state_for_goal(
+        session_store=session_store,
+        session_id=session_id,
+        execution_mode=(next_goal or {}).get("execution_mode") or "workflow",
+        goal_status=next_goal_status,
+        run_id=next_run_id,
+    )
+    await _persist_terminal_goal_state(
+        session_store=session_store,
+        session_id=session_id,
+        goal_state={
+            "active_goal_id": None if next_goal_terminal else (next_goal or {}).get("goal_id"),
+            "active_goal_status": next_goal_status,
+            "execution_mode": (next_goal or {}).get("execution_mode"),
+            "default_route": (
+                "chat"
+                if next_goal_terminal
+                else "workflow"
+                if (next_goal or {}).get("execution_mode") == "workflow"
+                else "goal"
+            ),
+            "last_goal_summary": next_goal_summary,
+            "pending_proposal": None,
+        },
+    )
+    lifecycle_label = (
+        "Goal status"
+        if goal_command is not None and goal_command.action == "status"
+        else "Goal paused"
+        if goal_command is not None and goal_command.action == "pause"
+        else "Goal resumed"
+        if goal_command is not None and goal_command.action == "resume"
+        else "Goal stopped"
+    )
+    lifecycle_content = _string_or_none((next_goal or {}).get("latest_error"))
+    if lifecycle_content is None:
+        if goal_command is not None and goal_command.action == "status":
+            lifecycle_content = "Fetched the latest goal status."
+        elif goal_command is not None and goal_command.action == "pause":
+            lifecycle_content = "Paused the active goal."
+        elif goal_command is not None and goal_command.action == "resume":
+            lifecycle_content = "Resumed the active goal."
+        else:
+            lifecycle_content = "Stopped the active goal."
+    await _append_terminal_goal_conversation(
+        session_store=session_store,
+        session_id=session_id,
+        user_content=goal_command.raw if goal_command is not None else text.strip(),
+        assistant_content=lifecycle_content,
+        goal_card=goal_card_from_summary(
+            next_goal_summary,
+            kind="started",
+            label=lifecycle_label,
+            goal_id=(next_goal or {}).get("goal_id"),
+            status=next_goal_status,
+        ),
+    )
+    return {"handled": True, "chat_text": None}
 
 
 async def _create_tui_runtime_service(
@@ -846,6 +1707,10 @@ async def _chat_tui_async(
     console.print(
         f"[dim]session={current_session} | max_turns={max_turns} | type /help for commands[/dim]"
     )
+    await _show_terminal_goal_summary(
+        session_store=session_store,
+        session_id=current_session,
+    )
     console.print()
 
     async def _run_chat_turn(user_text: str) -> bool:
@@ -1002,6 +1867,10 @@ async def _chat_tui_async(
                 if command == "session":
                     if not args:
                         console.print(f"[dim]Current session: {current_session}[/dim]")
+                        await _show_terminal_goal_summary(
+                            session_store=session_store,
+                            session_id=current_session,
+                        )
                         continue
                     next_session = args[0].strip()
                     if not next_session:
@@ -1009,6 +1878,10 @@ async def _chat_tui_async(
                         continue
                     current_session = next_session
                     console.print(f"[green]Session switched:[/green] {current_session}")
+                    await _show_terminal_goal_summary(
+                        session_store=session_store,
+                        session_id=current_session,
+                    )
                     continue
                 if command == "tools":
                     if not args:
@@ -1110,8 +1983,35 @@ async def _chat_tui_async(
                     console.print(f"[yellow]Unknown /tools command: {subcommand}[/yellow]")
                     continue
 
-                console.print(f"[yellow]Unknown command: /{command}[/yellow]")
-                continue
+                routing_result = await _handle_terminal_goal_input(
+                    text=text,
+                    session_id=current_session,
+                    current_model=cfg.model,
+                    autonomy_mode=_ensure_security_config().autonomy_mode,
+                    session_store=session_store,
+                    ensure_runtime_service=_ensure_runtime_service,
+                )
+                if routing_result["handled"]:
+                    continue
+                if routing_result["chat_text"]:
+                    text = str(routing_result["chat_text"])
+                else:
+                    console.print(f"[yellow]Unknown command: /{command}[/yellow]")
+                    continue
+
+            else:
+                routing_result = await _handle_terminal_goal_input(
+                    text=text,
+                    session_id=current_session,
+                    current_model=cfg.model,
+                    autonomy_mode=_ensure_security_config().autonomy_mode,
+                    session_store=session_store,
+                    ensure_runtime_service=_ensure_runtime_service,
+                )
+                if routing_result["handled"]:
+                    continue
+                if routing_result["chat_text"]:
+                    text = str(routing_result["chat_text"])
 
             turns += 1
             try:

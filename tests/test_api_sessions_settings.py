@@ -355,7 +355,12 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
             "/v1/sessions/alpha",
             json={
                 "workflow": {"enabled": True, "bound_run_id": "run-1"},
-                "goal": {"goal_id": "goal-1", "status": "running", "execution_mode": "single_agent"},
+                "goal": {
+                    "goal_id": "goal-1",
+                    "status": "running",
+                    "execution_mode": "single_agent",
+                    "default_route": "continue",
+                },
             },
         )
 
@@ -366,6 +371,7 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
             "goal_id": "goal-1",
             "status": "running",
             "execution_mode": "single_agent",
+            "default_route": "continue",
         }
         assert updated["events"][-2]["event"] == "workflow_state_updated"
         assert updated["events"][-1]["event"] == "goal_state_updated"
@@ -377,6 +383,7 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
             "goal_id": "goal-1",
             "status": "running",
             "execution_mode": "single_agent",
+            "default_route": "continue",
         }
 
         list_response = client.get("/v1/sessions")
@@ -389,7 +396,185 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
             "goal_id": "goal-1",
             "status": "running",
             "execution_mode": "single_agent",
+            "default_route": "continue",
         }
+
+
+def test_sessions_goal_only_patch_preserves_prior_workflow_metadata(tmp_path: Path) -> None:
+    """Goal-only PATCH should not clear previously persisted workflow state."""
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
+
+        workflow = {"enabled": True, "bound_run_id": "run-1"}
+        goal = {
+            "goal_id": "goal-1",
+            "status": "running",
+            "execution_mode": "single_agent",
+            "default_route": "continue",
+        }
+
+        workflow_response = client.patch("/v1/sessions/alpha", json={"workflow": workflow})
+        assert workflow_response.status_code == 200
+        assert workflow_response.json()["workflow"] == workflow
+        assert workflow_response.json()["goal"] is None
+
+        goal_response = client.patch("/v1/sessions/alpha", json={"goal": goal})
+        assert goal_response.status_code == 200
+        goal_payload = goal_response.json()
+        assert goal_payload["workflow"] == workflow
+        assert goal_payload["goal"] == goal
+        assert goal_payload["events"][-1]["event"] == "goal_state_updated"
+
+        detail_response = client.get("/v1/sessions/alpha")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["workflow"] == workflow
+        assert detail_response.json()["goal"] == goal
+
+        list_response = client.get("/v1/sessions")
+        assert list_response.status_code == 200
+        assert list_response.json()["items"][0]["workflow"] == workflow
+        assert list_response.json()["items"][0]["goal"] == goal
+
+
+def test_sessions_workflow_only_patch_preserves_prior_goal_metadata(tmp_path: Path) -> None:
+    """Workflow-only PATCH should not clear previously persisted goal state."""
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
+
+        goal = {
+            "goal_id": "goal-1",
+            "status": "running",
+            "execution_mode": "single_agent",
+            "default_route": "continue",
+        }
+        workflow = {"enabled": True, "bound_run_id": "run-1"}
+
+        goal_response = client.patch("/v1/sessions/alpha", json={"goal": goal})
+        assert goal_response.status_code == 200
+        assert goal_response.json()["goal"] == goal
+        assert goal_response.json()["workflow"] is None
+
+        workflow_response = client.patch("/v1/sessions/alpha", json={"workflow": workflow})
+        assert workflow_response.status_code == 200
+        workflow_payload = workflow_response.json()
+        assert workflow_payload["workflow"] == workflow
+        assert workflow_payload["goal"] == goal
+        assert workflow_payload["events"][-1]["event"] == "workflow_state_updated"
+
+        detail_response = client.get("/v1/sessions/alpha")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["workflow"] == workflow
+        assert detail_response.json()["goal"] == goal
+
+        list_response = client.get("/v1/sessions")
+        assert list_response.status_code == 200
+        assert list_response.json()["items"][0]["workflow"] == workflow
+        assert list_response.json()["items"][0]["goal"] == goal
+
+
+def test_sessions_goal_and_workflow_round_trip_across_fresh_app_instance(
+    tmp_path: Path,
+) -> None:
+    """Goal and workflow metadata should survive reload through a fresh app/store instance."""
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    workflow = {"enabled": True, "bound_run_id": "run-1"}
+    goal = {
+        "goal_id": "goal-1",
+        "status": "running",
+        "execution_mode": "single_agent",
+        "default_route": "continue",
+    }
+
+    first_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+    with TestClient(first_app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
+        update_response = client.patch(
+            "/v1/sessions/alpha",
+            json={"workflow": workflow, "goal": goal},
+        )
+        assert update_response.status_code == 200
+        assert update_response.json()["workflow"] == workflow
+        assert update_response.json()["goal"] == goal
+
+    reloaded_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+    with TestClient(reloaded_app) as reloaded_client:
+        detail_response = reloaded_client.get("/v1/sessions/alpha")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["workflow"] == workflow
+        assert detail_response.json()["goal"] == goal
+
+        list_response = reloaded_client.get("/v1/sessions")
+        assert list_response.status_code == 200
+        assert list_response.json()["items"][0]["workflow"] == workflow
+        assert list_response.json()["items"][0]["goal"] == goal
+
+
+def test_sessions_goal_state_round_trips_completed_summary_and_pending_proposal(
+    tmp_path: Path,
+) -> None:
+    """Completed goal continuity and pending proposal state should survive a fresh app reload."""
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    goal = {
+        "active_goal_id": None,
+        "active_goal_status": None,
+        "execution_mode": "workflow",
+        "default_route": "goal",
+        "last_goal_summary": {
+            "goal_id": "goal-completed-1",
+            "objective": "Finish the existing migration plan.",
+            "execution_mode": "single_agent",
+            "protocol_id": None,
+            "models": ["gpt-5"],
+            "role_summary": "Primary agent continues the task directly with the current chat tools.",
+            "runtime_mode": "Single-agent long-running execution",
+            "risk_note": None,
+            "status": "completed",
+        },
+        "pending_proposal": {
+            "proposal_id": "goal-proposal-2",
+            "goal_id": None,
+            "objective": "Draft a follow-up validation workflow for the migration.",
+            "execution_mode": "workflow",
+            "protocol_id": "controlled_subagent_execution",
+            "models": ["gpt-5", "claude-sonnet-4-6"],
+            "role_summary": "planner, executor, controller, evaluator",
+            "runtime_mode": "Workflow run starts immediately",
+            "risk_note": "Riskier runtime actions may still require approval.",
+            "status": None,
+            "revision_index": 1,
+            "updated_at": "2026-06-25T12:00:00Z",
+        },
+    }
+
+    first_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+    with TestClient(first_app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
+        update_response = client.patch(
+            "/v1/sessions/alpha",
+            json={"goal": goal},
+        )
+        assert update_response.status_code == 200
+        assert update_response.json()["goal"] == goal
+
+    reloaded_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+    with TestClient(reloaded_app) as reloaded_client:
+        detail_response = reloaded_client.get("/v1/sessions/alpha")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["goal"] == goal
+
+        list_response = reloaded_client.get("/v1/sessions")
+        assert list_response.status_code == 200
+        assert list_response.json()["items"][0]["goal"] == goal
 
 
 def test_sessions_can_rename_and_delete(tmp_path: Path) -> None:

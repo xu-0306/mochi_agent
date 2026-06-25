@@ -18,6 +18,12 @@ import {
   type ChatComposerSeed,
   type ChatInputModelOption,
 } from '@/components/chat/ChatInput'
+import {
+  GoalDrawerContent,
+  GoalHeaderChip,
+  type GoalDrawerBlockerView,
+  type GoalHeaderChipView,
+} from '@/components/chat/GoalHeaderChip'
 import { ChatMessage } from '@/components/chat/ChatMessage'
 import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
@@ -30,7 +36,22 @@ import { WorkspacePanel } from '@/components/chat/WorkspacePanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import { buildWorkflowProgressCardView } from '@/components/workflow/utils'
 import * as api from '@/lib/api'
-import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
+import type { ChatAttachment, GoalCardView, Message, ReasoningStep } from '@/lib/chat'
+import {
+  buildOptimisticConversationTurnMessages,
+} from '@/lib/chat-send-contract'
+import { resolveGoalContinuationDecision } from '@/lib/chat-goal-continuation'
+import {
+  resolveChatGoalWorkflowRouting,
+  type ChatGoalWorkflowRoute,
+} from '@/lib/chat-goal-routing'
+import {
+  applyGoalProposalModelReadiness,
+  buildGoalProposalProbeCandidates,
+  selectGoalProposalModels,
+  summarizeGoalProposalModelReadinessRisk,
+  type GoalProposalModelReadinessById,
+} from '@/lib/goal-proposal-models'
 import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
@@ -47,7 +68,7 @@ import {
 } from '@/lib/stores/inference-store'
 import { useChatRuntimeStore } from '@/lib/stores/chat-runtime-store'
 import { useProjectStore } from '@/lib/stores/project-store'
-import { useSessionStore } from '@/lib/stores/session-store'
+import { useSessionStore, type Session } from '@/lib/stores/session-store'
 import { useTaskStore } from '@/lib/stores/task-store'
 import { useUIStore } from '@/lib/stores/ui-store'
 import { useWorkspaceStore } from '@/lib/stores/workspace-store'
@@ -351,20 +372,388 @@ function workflowScheduleEnabled(workflow: api.SessionWorkflowState): boolean {
   )
 }
 
-type ChatModeCommand = {
-  mode: 'workflow' | 'chat'
-  content: string
+interface GoalSessionSummary {
+  goal_id: string | null
+  objective: string
+  execution_mode: api.GoalExecutionMode
+  protocol_id: string | null
+  models: string[]
+  role_summary: string | null
+  runtime_mode: string | null
+  risk_note: string | null
+  status: string | null
 }
 
-function parseChatModeCommand(value: string): ChatModeCommand | null {
-  const match = value.match(/^\/(workflow|chat)(?:\s+([\s\S]*))?$/i)
-  if (!match) {
+interface GoalSessionProposal extends GoalSessionSummary {
+  proposal_id: string
+  revision_index: number
+  updated_at: string
+}
+
+interface GoalSessionState {
+  active_goal_id: string | null
+  active_goal_status: string | null
+  execution_mode: api.GoalExecutionMode | null
+  default_route: 'chat' | 'goal' | 'workflow'
+  last_goal_summary: GoalSessionSummary | null
+  pending_proposal: GoalSessionProposal | null
+}
+
+interface GoalConversationAppendInput {
+  sessionId: string
+  attachments: ChatAttachment[]
+  userContent: string
+  assistantContent: string
+  goalCard?: GoalCardView
+}
+
+interface SyncGoalWorkflowStateInput {
+  sessionId: string
+  baseWorkflow: api.SessionWorkflowState
+  executionMode: api.GoalExecutionMode
+  goalStatus?: string | null
+  runId?: string | null
+}
+
+interface GoalWorkflowRoutingHandlerInput {
+  sessionId: string
+  attachments: ChatAttachment[]
+  selectedSkillIds: string[]
+  route: Exclude<ChatGoalWorkflowRoute, { kind: 'direct_chat' }>
+  requestText: string
+  baseWorkflow: api.SessionWorkflowState
+  baseGoalState: GoalSessionState
+  workflowSessionProjectId: string | null
+  effectiveWorkspaceDir: string | null
+}
+
+interface SendSessionContext {
+  latestSessionState: {
+    sessions: Session[]
+    currentSessionDetail: api.SessionDetail | null
+  }
+  sessionAfterMaterialize: Session | undefined
+  baseWorkflow: api.SessionWorkflowState
+  baseGoalState: GoalSessionState
+  workflowSessionProjectId: string | null
+  effectiveWorkspaceDir: string | null
+}
+
+interface SendSessionScope {
+  getSessionId: () => string
+  getContext: () => SendSessionContext
+  materializeIfNeeded: () => Promise<string>
+}
+
+interface DirectChatTurnInput {
+  targetSessionId: string | null
+  requestText: string
+  attachments: ChatAttachment[]
+  selectedSkillIds: string[]
+  normalizedWorkflow: api.SessionWorkflowState
+  sessionScope: SendSessionScope
+}
+
+const GOAL_PROPOSAL_REPLY_HELP =
+  'Reply `start`, `go ahead`, `proceed`, `yes`, or `run it` to launch it. Send another follow-up to revise it, or use `/chat` to step outside the goal lane.'
+
+function normalizeGoalExecutionMode(value: unknown): api.GoalExecutionMode | null {
+  return value === 'single_agent' || value === 'workflow' ? value : null
+}
+
+function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null {
+  if (!isRecord(value)) {
     return null
   }
-  return {
-    mode: match[1].toLowerCase() as ChatModeCommand['mode'],
-    content: (match[2] ?? '').trim(),
+
+  const objective = getString(value.objective)
+  const executionMode = normalizeGoalExecutionMode(value.execution_mode)
+  if (!objective || !executionMode) {
+    return null
   }
+
+  return {
+    goal_id: getString(value.goal_id) ?? null,
+    objective,
+    execution_mode: executionMode,
+    protocol_id: getString(value.protocol_id) ?? null,
+    models: getStringArray(value.models),
+    role_summary: getString(value.role_summary) ?? null,
+    runtime_mode: getString(value.runtime_mode) ?? null,
+    risk_note: getString(value.risk_note) ?? null,
+    status: getString(value.status) ?? null,
+  }
+}
+
+function normalizeGoalSessionProposal(value: unknown): GoalSessionProposal | null {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const summary = normalizeGoalSessionSummary(value)
+  if (!summary) {
+    return null
+  }
+
+  return {
+    ...summary,
+    proposal_id: getString(value.proposal_id) ?? getString(value.id) ?? `goal-proposal-${Date.now()}`,
+    revision_index: Math.max(0, Number(getString(value.revision_index) ?? value.revision_index ?? 0) || 0),
+    updated_at: getString(value.updated_at) ?? new Date().toISOString(),
+  }
+}
+
+function normalizeGoalSessionState(value: api.SessionGoalState | null | undefined): GoalSessionState {
+  if (!isRecord(value)) {
+    return {
+      active_goal_id: null,
+      active_goal_status: null,
+      execution_mode: null,
+      default_route: 'chat',
+      last_goal_summary: null,
+      pending_proposal: null,
+    }
+  }
+
+  return {
+    active_goal_id: getString(value.active_goal_id) ?? null,
+    active_goal_status: getString(value.active_goal_status) ?? null,
+    execution_mode:
+      normalizeGoalExecutionMode(value.execution_mode) ??
+      normalizeGoalExecutionMode(value.pending_proposal && isRecord(value.pending_proposal) ? value.pending_proposal.execution_mode : null) ??
+      normalizeGoalExecutionMode(value.last_goal_summary && isRecord(value.last_goal_summary) ? value.last_goal_summary.execution_mode : null) ??
+      null,
+    default_route:
+      value.default_route === 'goal' || value.default_route === 'workflow'
+        ? value.default_route
+        : 'chat',
+    last_goal_summary: normalizeGoalSessionSummary(value.last_goal_summary),
+    pending_proposal: normalizeGoalSessionProposal(value.pending_proposal),
+  }
+}
+
+function isGoalTerminalStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return (
+    normalized === 'completed' ||
+    normalized === 'done' ||
+    normalized === 'succeeded' ||
+    normalized === 'cancelled' ||
+    normalized === 'canceled' ||
+    normalized === 'failed' ||
+    normalized === 'error'
+  )
+}
+
+function isGoalCompletedStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return normalized === 'completed' || normalized === 'done' || normalized === 'succeeded'
+}
+
+function isGoalBlockedStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return (
+    normalized === 'blocked' ||
+    normalized === 'paused' ||
+    normalized === 'awaiting_approval' ||
+    normalized === 'waiting_approval' ||
+    normalized === 'awaiting_resources' ||
+    normalized === 'stalled' ||
+    normalized === 'partial'
+  )
+}
+
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.map((value) => (typeof value === 'string' ? value.trim() : '')).filter((value) => value.length > 0))]
+}
+
+function formatGoalRoleSummary(roles: string[]): string | null {
+  if (roles.length === 0) {
+    return null
+  }
+  return roles.map((role) => role.replaceAll('_', ' ')).join(', ')
+}
+
+function detectGoalExecutionModeHint(value: string): api.GoalExecutionMode | null {
+  const normalized = value.toLowerCase()
+  if (
+    normalized.includes('single agent') ||
+    normalized.includes('single-agent') ||
+    normalized.includes('solo agent') ||
+    normalized.includes('one agent')
+  ) {
+    return 'single_agent'
+  }
+  if (
+    normalized.includes('workflow') ||
+    normalized.includes('debate') ||
+    normalized.includes('distill') ||
+    normalized.includes('planner') ||
+    normalized.includes('executor') ||
+    normalized.includes('controller') ||
+    normalized.includes('evaluator')
+  ) {
+    return 'workflow'
+  }
+  return null
+}
+
+function detectGoalProtocolHint(value: string): api.AgentRunProtocolId | null {
+  const normalized = value.toLowerCase()
+  if (normalized.includes('debate')) {
+    return 'multi_agent_debate'
+  }
+  if (normalized.includes('self evolve') || normalized.includes('self-evolve') || normalized.includes('dr zero')) {
+    return 'dr_zero_self_evolve'
+  }
+  if (normalized.includes('controlled')) {
+    return 'controlled_subagent_execution'
+  }
+  if (normalized.includes('distill') || normalized.includes('teacher') || normalized.includes('student')) {
+    return 'teacher_student_distill'
+  }
+  return null
+}
+
+function suggestGoalWorkflowStrategy(value: string): {
+  protocolId: api.AgentRunProtocolId
+  roles: string[]
+} {
+  const normalized = value.toLowerCase()
+  if (/\b(compare|comparison|evaluate|evaluation|debate|judge)\b/.test(normalized)) {
+    return {
+      protocolId: 'multi_agent_debate',
+      roles: ['debater_a', 'debater_b', 'judge'],
+    }
+  }
+  if (/\b(distill|distillation|compress|compression|teacher|student|summarize)\b/.test(normalized)) {
+    return {
+      protocolId: 'teacher_student_distill',
+      roles: ['teacher', 'student', 'evaluator'],
+    }
+  }
+  if (/\b(research|investigate|survey|literature|analyze sources|verify claims)\b/.test(normalized)) {
+    return {
+      protocolId: 'multi_agent_debate',
+      roles: ['planner', 'researcher_a', 'researcher_b', 'synthesizer', 'verifier'],
+    }
+  }
+  return {
+    protocolId: 'controlled_subagent_execution',
+    roles: ['planner', 'executor', 'controller', 'evaluator'],
+  }
+}
+
+function detectGoalRuntimeHint(value: string): string | null {
+  const normalized = value.trim()
+  const durationMatch = normalized.match(/\b\d+\s*(?:min(?:ute)?s?|hour(?:s)?|hr|hrs)\b/i)
+  if (durationMatch) {
+    return `Requested duration: ${durationMatch[0]}`
+  }
+  if (/schedule|cron|interval/i.test(normalized)) {
+    return 'Scheduled goal execution requested'
+  }
+  return null
+}
+
+function detectGoalModelHints(
+  value: string,
+  candidates: ChatInputModelOption[],
+  currentModel: string | null
+): string[] {
+  const normalized = value.toLowerCase()
+  const matches: string[] = []
+
+  const currentModelTrimmed = currentModel?.trim() ?? ''
+  if (currentModelTrimmed && normalized.includes(currentModelTrimmed.toLowerCase())) {
+    matches.push(currentModelTrimmed)
+  }
+
+  for (const candidate of candidates) {
+    const id = candidate.id.trim()
+    const label = candidate.label.trim().toLowerCase()
+    if (!id) {
+      continue
+    }
+    if (normalized.includes(id.toLowerCase()) || (label && normalized.includes(label))) {
+      matches.push(id)
+    }
+  }
+
+  return uniqueStrings(matches)
+}
+
+function goalCardFromSummary(
+  summary: GoalSessionSummary,
+  kind: GoalCardView['kind'],
+  overrides?: Partial<GoalCardView>
+): GoalCardView {
+  const defaultLabel =
+    kind === 'started'
+      ? 'Goal started'
+      : kind === 'revised_proposal'
+        ? 'Revised goal proposal'
+        : 'Goal proposal'
+
+  return {
+    kind,
+    label: defaultLabel,
+    objective: summary.objective,
+    executionMode: summary.execution_mode,
+    protocolId: summary.protocol_id,
+    models: summary.models,
+    roleSummary: summary.role_summary,
+    runtimeMode: summary.runtime_mode,
+    riskNote: summary.risk_note,
+    goalId: summary.goal_id,
+    status: summary.status,
+    superseded: false,
+    ...overrides,
+  }
+}
+
+function resolveGoalWorkflowRouteUserContent(
+  route: Exclude<ChatGoalWorkflowRoute, { kind: 'direct_chat' }>,
+  requestText: string
+): string {
+  switch (route.kind) {
+    case 'goal_help':
+      return route.raw
+    case 'goal_proposal':
+      return route.content
+    case 'workflow_proposal':
+    case 'natural_language_goal_proposal':
+    case 'goal_revision':
+    case 'goal_follow_up':
+      return requestText
+    case 'goal_confirmation':
+    case 'goal_lifecycle':
+      return route.raw
+  }
+}
+
+function getGoalAttemptRunId(goal: api.GoalSummary): string | null {
+  const currentAttempt = goal.attempts.find((attempt) => attempt.attempt_id === goal.current_attempt_id)
+  return currentAttempt?.agent_run_id ?? goal.attempts.at(-1)?.agent_run_id ?? null
+}
+
+function formatGoalOperatorControlHint(controls: api.GoalOperatorControls | null | undefined): string | null {
+  if (!controls) {
+    return null
+  }
+
+  const segments: string[] = []
+  if (controls.block_network_usage) {
+    segments.push('network access is blocked')
+  }
+  if (controls.blocked_tools.length > 0) {
+    segments.push(`blocked tools: ${controls.blocked_tools.join(', ')}`)
+  }
+  if (controls.blocked_domains.length > 0) {
+    segments.push(`blocked domains: ${controls.blocked_domains.join(', ')}`)
+  }
+
+  return segments.length > 0 ? `Current operator controls: ${segments.join('; ')}.` : null
 }
 
 type WorkflowScheduleType = 'interval' | 'once' | 'cron'
@@ -740,7 +1129,7 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
       const modelId = resolveModelOptionId(entry)
       pushModel(
         modelId,
-        'connected',
+        'configured',
         modelId ? resolveModelLabel(entry, modelId) : null,
         formatModelSource(entry)
       )
@@ -755,7 +1144,7 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
       const modelId = resolveModelOptionId(entry)
       pushModel(
         modelId,
-        'connected',
+        'configured',
         modelId ? resolveModelLabel(entry, modelId) : null,
         formatModelSource(entry)
       )
@@ -898,23 +1287,6 @@ function isLocalModelId(modelId: string | null): boolean {
   return modelId.startsWith('/') || /^[A-Za-z]:[\\/]/.test(modelId)
 }
 
-function buildTurnPlaceholder(
-  turnKey: string,
-  options?: {
-    content?: string
-  }
-): Message {
-  return {
-    id: `assistant-turn-${turnKey}`,
-    type: 'assistant',
-    content: options?.content ?? '',
-    timestamp: new Date(),
-    turnKey,
-    reasoningSteps: [],
-    isStreaming: true,
-  }
-}
-
 function applyStreamChunk(
   prev: Message[],
   chunk: StreamChatChunk,
@@ -1048,6 +1420,15 @@ export default function ChatPage() {
   const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
   const [taskPanelMode, setTaskPanelMode] = React.useState<TaskPanelMode>('default')
   const [taskPanelFocusedTaskId, setTaskPanelFocusedTaskId] = React.useState<string | null>(null)
+  const [goalDrawerOpen, setGoalDrawerOpen] = React.useState(false)
+  const [goalDrawerBusyAction, setGoalDrawerBusyAction] = React.useState<'status' | 'pause' | 'resume' | 'stop' | null>(null)
+  const [goalDrawerHealth, setGoalDrawerHealth] = React.useState<api.GoalHealthSummary | null>(null)
+  const [goalDrawerHealthLoading, setGoalDrawerHealthLoading] = React.useState(false)
+  const [goalDrawerHealthError, setGoalDrawerHealthError] = React.useState<string | null>(null)
+  const [goalDrawerApprovals, setGoalDrawerApprovals] = React.useState<api.ApprovalSummary[]>([])
+  const [goalDrawerApprovalsLoading, setGoalDrawerApprovalsLoading] = React.useState(false)
+  const [goalDrawerApprovalError, setGoalDrawerApprovalError] = React.useState<string | null>(null)
+  const [goalDrawerResolvingApprovalKey, setGoalDrawerResolvingApprovalKey] = React.useState<string | null>(null)
   const [workflowPanelOpen, setWorkflowPanelOpen] = React.useState(false)
   const [workspaceMobileOpen, setWorkspaceMobileOpen] = React.useState(false)
   const [queuedWorkspaceAttachments, setQueuedWorkspaceAttachments] = React.useState<ChatAttachment[]>([])
@@ -1083,6 +1464,8 @@ export default function ChatPage() {
   const shouldAutoScrollRef = React.useRef(true)
   const voiceClientRef = React.useRef<VoiceWsClient | null>(null)
   const voiceSessionIdRef = React.useRef<string | null>(null)
+  const goalProposalModelReadinessRef = React.useRef<GoalProposalModelReadinessById>({})
+  const goalProposalModelProbeInFlightRef = React.useRef<Set<string>>(new Set())
 
   const {
     sessions,
@@ -1114,6 +1497,7 @@ export default function ChatPage() {
   const setSessionMessages = useChatRuntimeStore((state) => state.setSessionMessages)
   const updateSessionMessages = useChatRuntimeStore((state) => state.updateSessionMessages)
   const hydrateSessionMessages = useChatRuntimeStore((state) => state.hydrateSessionMessages)
+  const moveSessionMessages = useChatRuntimeStore((state) => state.moveSessionMessages)
   const startStreaming = useChatRuntimeStore((state) => state.startStreaming)
   const finishStreaming = useChatRuntimeStore((state) => state.finishStreaming)
   const abortStreaming = useChatRuntimeStore((state) => state.abortStreaming)
@@ -1181,6 +1565,10 @@ export default function ChatPage() {
       effectiveInference.reasoningEffort
     )
   }, [currentSessionId, effectiveInference.reasoningEffort, persistedWorkflowState, workflowDraftBySessionId])
+  const currentSessionGoalState = React.useMemo(
+    () => normalizeGoalSessionState(currentSessionDetail?.goal ?? currentSession?.goal ?? null),
+    [currentSession?.goal, currentSessionDetail?.goal]
+  )
   const workflowEnabled = Boolean(workflowState.enabled)
   const workflowBoundRunId = workflowState.bound_run_id ?? null
   const workflowConfig = workflowState.config ?? {}
@@ -1212,6 +1600,9 @@ export default function ChatPage() {
     () => (workflowConfig.research ?? {}) as Record<string, unknown>,
     [workflowConfig.research]
   )
+  const shouldSuppressWorkflowUiForGoal =
+    currentSessionGoalState.execution_mode === 'single_agent' &&
+    (currentSessionGoalState.active_goal_id !== null || currentSessionGoalState.pending_proposal !== null)
   const workflowScheduleConfig = React.useMemo(
     () => normalizeWorkflowScheduleConfig((workflowConfig.schedule ?? {}) as Record<string, unknown>),
     [workflowConfig.schedule]
@@ -1367,18 +1758,19 @@ export default function ChatPage() {
       ), 0),
     [messages]
   )
+  const projectedWorkflowRun = shouldSuppressWorkflowUiForGoal ? null : workflowCardRun
   const workflowProgressCard = React.useMemo(
-    () => buildWorkflowProgressCardView(workflowCardRun),
-    [workflowCardRun]
+    () => buildWorkflowProgressCardView(projectedWorkflowRun),
+    [projectedWorkflowRun]
   )
   const displayMessages = React.useMemo<Message[]>(() => {
     return buildProjectedDisplayMessages({
       messages,
       runtimeTasks: contextualRuntimeTasks,
       workflowProgressCard,
-      workflowRun: workflowCardRun,
+      workflowRun: projectedWorkflowRun,
     })
-  }, [contextualRuntimeTasks, messages, workflowCardRun, workflowProgressCard])
+  }, [contextualRuntimeTasks, messages, projectedWorkflowRun, workflowProgressCard])
 
   React.useEffect(() => {
     if (delegatedSubagentToolResultCount > 0) {
@@ -1545,6 +1937,132 @@ export default function ChatPage() {
     return createInitialMessages(t)
   }, [t])
 
+  const moveWorkflowDraftState = React.useCallback((fromSessionId: string, toSessionId: string) => {
+    if (fromSessionId === toSessionId) {
+      return
+    }
+
+    setWorkflowDraftBySessionId((current) => {
+      const existing = current[fromSessionId]
+      if (existing === undefined) {
+        return current
+      }
+
+      const next = { ...current }
+      if (next[toSessionId] === undefined) {
+        next[toSessionId] = existing
+      }
+      delete next[fromSessionId]
+      return next
+    })
+  }, [])
+
+  const resolveSendSessionContext = React.useCallback((
+    resolvedSessionId: string,
+    initialSessionId: string,
+    targetSession: Session | undefined
+  ): SendSessionContext => {
+    const latestSessionState = useSessionStore.getState()
+    const resolvedSession = latestSessionState.sessions.find((session) => session.id === resolvedSessionId)
+    const resolvedSessionDetail =
+      latestSessionState.currentSessionDetail?.id === resolvedSessionId
+        ? latestSessionState.currentSessionDetail
+        : null
+    const baseWorkflow = normalizeWorkflowState(
+      workflowDraftBySessionId[resolvedSessionId] ??
+        (resolvedSessionId !== initialSessionId ? workflowDraftBySessionId[initialSessionId] : undefined) ??
+        resolvedSession?.workflow ??
+        resolvedSessionDetail?.workflow ??
+        targetSession?.workflow,
+      effectiveInference.reasoningEffort
+    )
+    const workflowSessionProjectId = resolvedSession?.projectId ?? activeProjectId ?? null
+
+    return {
+      latestSessionState,
+      sessionAfterMaterialize: resolvedSession,
+      baseWorkflow,
+      baseGoalState: normalizeGoalSessionState(
+        resolvedSession?.goal ??
+          resolvedSessionDetail?.goal ??
+          targetSession?.goal
+      ),
+      workflowSessionProjectId,
+      effectiveWorkspaceDir:
+        baseWorkflow.workspace_dir_override ||
+        baseWorkflow.config?.workspace_dir_override ||
+        projects.find((project) => project.id === workflowSessionProjectId)?.workspaceDir ||
+        uploadTargetDir ||
+        null,
+    }
+  }, [
+    activeProjectId,
+    effectiveInference.reasoningEffort,
+    projects,
+    uploadTargetDir,
+    workflowDraftBySessionId,
+  ])
+
+  const createSendSessionScope = React.useCallback((
+    initialSessionId: string,
+    targetSession: Session | undefined
+  ): SendSessionScope => {
+    let sessionId = initialSessionId
+    let sessionContext = resolveSendSessionContext(sessionId, initialSessionId, targetSession)
+
+    const materializeIfNeeded = async () => {
+      const latestSessionState = useSessionStore.getState()
+      const currentSession = latestSessionState.sessions.find((session) => session.id === sessionId)
+      const needsMaterialize = Boolean(currentSession?.isDraft) || sessionId.startsWith('draft-')
+      if (!needsMaterialize) {
+        sessionContext = resolveSendSessionContext(sessionId, initialSessionId, targetSession)
+        return sessionId
+      }
+
+      const nextSessionId = await materializeDraftSession(sessionId)
+      if (nextSessionId !== sessionId) {
+        moveSessionMessages(sessionId, nextSessionId)
+        moveWorkflowDraftState(sessionId, nextSessionId)
+      }
+      sessionId = nextSessionId
+      sessionContext = resolveSendSessionContext(sessionId, initialSessionId, targetSession)
+      return sessionId
+    }
+
+    return {
+      getSessionId: () => sessionId,
+      getContext: () => sessionContext,
+      materializeIfNeeded,
+    }
+  }, [
+    materializeDraftSession,
+    moveSessionMessages,
+    moveWorkflowDraftState,
+    resolveSendSessionContext,
+  ])
+
+  const appendOptimisticConversationTurn = React.useCallback((
+    sessionId: string,
+    userContent: string,
+    attachments: ChatAttachment[],
+    turnKey: string,
+    assistantPlaceholderContent = ''
+  ) => {
+    const next = buildOptimisticConversationTurnMessages({
+      existingMessages: resolveMessagesForSession(sessionId),
+      userContent,
+      attachments,
+      turnKey,
+      assistantPlaceholderContent,
+    })
+    setSessionMessages(sessionId, next.messages)
+    updateLastMessage(sessionId, next.lastMessageSummary)
+  }, [
+    resolveMessagesForSession,
+    setSessionMessages,
+    updateLastMessage,
+  ])
+
   const upsertSessionDetail = React.useCallback(
     (detail: api.SessionDetail) => {
       useSessionStore.setState((state) => ({
@@ -1557,6 +2075,7 @@ export default function ChatPage() {
                 messageCount: detail.eventCount,
                 projectId: detail.projectId,
                 workflow: detail.workflow,
+                goal: detail.goal,
                 securityOverride: detail.security_override,
                 isDraft: false,
               }
@@ -1601,6 +2120,46 @@ export default function ChatPage() {
       const detail = await api.updateSessionSecurityOverride(sessionId, {
         autonomy_mode: autonomyMode,
       })
+      upsertSessionDetail(detail)
+      return detail
+    },
+    [upsertSessionDetail]
+  )
+
+  const persistSessionGoalState = React.useCallback(
+    async (sessionId: string, nextGoalState: GoalSessionState) => {
+      const goalPayload: api.SessionGoalState = {
+        active_goal_id: nextGoalState.active_goal_id,
+        active_goal_status: nextGoalState.active_goal_status,
+        execution_mode: nextGoalState.execution_mode,
+        default_route: nextGoalState.default_route,
+        last_goal_summary: nextGoalState.last_goal_summary,
+        pending_proposal: nextGoalState.pending_proposal,
+      }
+
+      const targetSession = useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+      if (targetSession?.isDraft || sessionId.startsWith('draft-')) {
+        useSessionStore.setState((state) => ({
+          sessions: state.sessions.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  goal: goalPayload,
+                }
+              : session
+          ),
+          currentSessionDetail:
+            state.currentSessionDetail?.id === sessionId
+              ? {
+                  ...state.currentSessionDetail,
+                  goal: goalPayload,
+                }
+              : state.currentSessionDetail,
+        }))
+        return null
+      }
+
+      const detail = await api.updateSessionGoalState(sessionId, goalPayload)
       upsertSessionDetail(detail)
       return detail
     },
@@ -1835,26 +2394,29 @@ export default function ChatPage() {
     }
   }, [currentSessionId, syncWorkflowRunEventsToSession, workflowBoundRunId, workflowState])
 
-  const syncSessionFromServer = React.useCallback(async (sessionId: string) => {
-    try {
-      const detail = await api.fetchSession(sessionId)
+  const hydrateSessionFromDetail = React.useCallback(
+    (detail: api.SessionDetail) => {
       const replayMessages = api.buildMessagesFromSessionEvents(detail.events)
+      setSessionMessages(detail.id, replayMessages.length > 0 ? replayMessages : createInitialMessages(t))
       const lastRetainedMessage = [...replayMessages]
         .reverse()
         .find((message) => message.type === 'user' || message.type === 'assistant')
-
-      if (replayMessages.length > 0) {
-        setSessionMessages(sessionId, replayMessages)
-      }
       if (lastRetainedMessage) {
-        updateLastMessage(sessionId, lastRetainedMessage.content)
+        updateLastMessage(detail.id, lastRetainedMessage.content)
       }
+    },
+    [setSessionMessages, t, updateLastMessage]
+  )
 
+  const syncSessionFromServer = React.useCallback(async (sessionId: string) => {
+    try {
+      const detail = await api.fetchSession(sessionId)
+      hydrateSessionFromDetail(detail)
       upsertSessionDetail(detail)
     } catch {
       // Keep the optimistic transcript if canonical session refresh fails.
     }
-  }, [setSessionMessages, updateLastMessage, upsertSessionDetail])
+  }, [hydrateSessionFromDetail, upsertSessionDetail])
 
   const appendVoiceMessages = React.useCallback(
     (result: VoiceTurnResult) => {
@@ -2016,6 +2578,76 @@ export default function ChatPage() {
     }
   }, [])
 
+  const recordGoalProposalModelReadiness = React.useCallback((
+    readinessEntries: GoalProposalModelReadinessById,
+    selectedModelId?: string | null
+  ) => {
+    const entries = Object.entries(readinessEntries)
+    if (entries.length === 0) {
+      return
+    }
+
+    const mergedReadiness = {
+      ...goalProposalModelReadinessRef.current,
+      ...readinessEntries,
+    }
+    goalProposalModelReadinessRef.current = mergedReadiness
+    setModelOptions((prev) => applyGoalProposalModelReadiness(
+      prev,
+      selectedModelId ?? currentModel,
+      mergedReadiness
+    ))
+  }, [currentModel])
+
+  const clearFailedGoalProposalModelReadiness = React.useCallback(() => {
+    const nextEntries = Object.fromEntries(
+      Object.entries(goalProposalModelReadinessRef.current).filter(([, value]) => value !== 'failed')
+    ) as GoalProposalModelReadinessById
+    goalProposalModelReadinessRef.current = nextEntries
+    setModelOptions((prev) => applyGoalProposalModelReadiness(prev, currentModel, nextEntries))
+  }, [currentModel])
+
+  const probeGoalProposalModels = React.useCallback(async (
+    modelIds: string[],
+    selectedModelId?: string | null
+  ) => {
+    const candidates = uniqueStrings(modelIds).filter((modelId) => {
+      const readiness = goalProposalModelReadinessRef.current[modelId]
+      return (
+        !goalProposalModelProbeInFlightRef.current.has(modelId) &&
+        readiness !== 'ready' &&
+        readiness !== 'failed'
+      )
+    })
+
+    if (candidates.length === 0) {
+      return goalProposalModelReadinessRef.current
+    }
+
+    for (const modelId of candidates) {
+      goalProposalModelProbeInFlightRef.current.add(modelId)
+    }
+
+    try {
+      const results = await Promise.allSettled(
+        candidates.map(async (modelId) => {
+          await api.testModelConnection({ modelId })
+          return modelId
+        })
+      )
+      const readinessEntries: GoalProposalModelReadinessById = {}
+      results.forEach((result, index) => {
+        readinessEntries[candidates[index]] = result.status === 'fulfilled' ? 'ready' : 'failed'
+      })
+      recordGoalProposalModelReadiness(readinessEntries, selectedModelId)
+      return goalProposalModelReadinessRef.current
+    } finally {
+      for (const modelId of candidates) {
+        goalProposalModelProbeInFlightRef.current.delete(modelId)
+      }
+    }
+  }, [recordGoalProposalModelReadiness])
+
   const loadModels = React.useCallback(async (signal?: AbortSignal) => {
     const [modelsResponse, localRuntimeResult] = await Promise.all([
       fetch('/v1/models', {
@@ -2029,14 +2661,25 @@ export default function ChatPage() {
     }
 
     const payload = (await modelsResponse.json()) as ModelsResponse
-    const nextOptions = deriveModelOptions(payload)
-    const activeModel = resolveActiveModelId(payload, nextOptions)
+    const nextConfiguredOptions = deriveModelOptions(payload)
+    const activeModel = resolveActiveModelId(payload, nextConfiguredOptions)
     const nextActiveModelInfo = isRecord(payload.active_model) ? payload.active_model : null
     const activeModelMetadata = isRecord(payload.active_model?.metadata) ? payload.active_model?.metadata : null
     const loaded =
       activeModelMetadata && typeof activeModelMetadata.loaded === 'boolean'
         ? activeModelMetadata.loaded
         : null
+    if (activeModel) {
+      goalProposalModelReadinessRef.current = {
+        ...goalProposalModelReadinessRef.current,
+        [activeModel]: 'ready',
+      }
+    }
+    const nextOptions = applyGoalProposalModelReadiness(
+      nextConfiguredOptions,
+      activeModel,
+      goalProposalModelReadinessRef.current
+    )
 
     setModelOptions(nextOptions)
     setCurrentModel(activeModel)
@@ -2061,6 +2704,7 @@ export default function ChatPage() {
     }
 
     const handleModelsUpdated = () => {
+      clearFailedGoalProposalModelReadiness()
       void refreshModels()
     }
     const handleFocus = () => {
@@ -2084,7 +2728,7 @@ export default function ChatPage() {
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [loadModels])
+  }, [clearFailedGoalProposalModelReadiness, loadModels])
 
   const handleSwitchModel = React.useCallback(async (modelId: string) => {
     setModelSwitchError(null)
@@ -2109,6 +2753,7 @@ export default function ChatPage() {
       setCurrentModel(nextModel)
       setActiveModelInfo(isRecord(nextModelPayload?.active_model) ? nextModelPayload?.active_model : null)
       setSettings(nextSettings)
+      recordGoalProposalModelReadiness({ [nextModel]: 'ready' }, nextModel)
       setModelOptions((prev) => {
         if (prev.some((option) => option.id === nextModel)) {
           return prev.map((option) =>
@@ -2129,7 +2774,7 @@ export default function ChatPage() {
       const detail = error instanceof Error ? error.message : t('chat.modelSwitchFailed')
       setModelSwitchError(`${t('chat.modelSwitchFailed')}: ${detail}`)
     }
-  }, [t])
+  }, [recordGoalProposalModelReadiness, t])
 
   const handleUnloadCurrentModel = React.useCallback(async () => {
     setIsUnloadingCurrentModel(true)
@@ -2147,103 +2792,754 @@ export default function ChatPage() {
     }
   }, [])
 
-  const handleSend = React.useCallback(
-    async (
-      text: string,
+  const buildGoalProposalState = React.useCallback(
+    (
+      objective: string,
+      executionMode: api.GoalExecutionMode,
       options?: {
-        forceSessionId?: string
-        selectedSkillIds?: string[]
-        attachments?: ChatAttachment[]
+        previous?: GoalSessionProposal | null
+        revisionText?: string | null
+        modelCandidates?: ChatInputModelOption[]
+        currentModelId?: string | null
       }
-    ) => {
-      if (hasActiveStream) {
-        return
-      }
-
-      const targetSessionId = options?.forceSessionId ?? currentSessionId
-      const selectedSkillIds = options?.selectedSkillIds ?? []
-      const attachments = options?.attachments ?? []
-      const modeCommand = parseChatModeCommand(text)
-      const requestText = modeCommand ? modeCommand.content : text
-      const initialSessionId = targetSessionId ?? createDraftSession(activeProjectId)
-      const targetSession = sessions.find((session) => session.id === initialSessionId)
-      const sessionId = (
-        targetSession?.isDraft
-      ) || initialSessionId.startsWith('draft-')
-        ? await materializeDraftSession(initialSessionId)
-        : initialSessionId
-      const latestSessionState = useSessionStore.getState()
-      const sessionAfterMaterialize = latestSessionState.sessions.find((session) => session.id === sessionId)
-      const baseWorkflow = normalizeWorkflowState(
-        workflowDraftBySessionId[sessionId] ??
-          (sessionId !== initialSessionId ? workflowDraftBySessionId[initialSessionId] : undefined) ??
-          sessionAfterMaterialize?.workflow ??
-          (latestSessionState.currentSessionDetail?.id === sessionId
-            ? latestSessionState.currentSessionDetail.workflow
-            : null) ??
-          targetSession?.workflow,
-        effectiveInference.reasoningEffort
+    ): GoalSessionProposal => {
+      const revisionText = options?.revisionText?.trim() ?? ''
+      const heuristicSource = revisionText || objective
+      const availableModelOptions = options?.modelCandidates ?? modelOptions
+      const selectedCurrentModel = options?.currentModelId ?? currentModel
+      const hintedExecutionMode = detectGoalExecutionModeHint(revisionText)
+      const effectiveExecutionMode = hintedExecutionMode ?? executionMode
+      const suggestedWorkflowStrategy = suggestGoalWorkflowStrategy(heuristicSource)
+      const selectedRoles = normalizeSelectedModelRoles(workflowConfig.selected_models_roles)
+      const selectedRoleNames = Object.keys(selectedRoles)
+      const fallbackWorkflowRoles =
+        workflowTemplate === 'research_debate'
+          ? ['planner', 'debater_a', 'debater_b', 'judge']
+          : workflowProtocolId === 'controlled_subagent_execution'
+            ? ['planner', 'executor', 'controller', 'evaluator']
+            : workflowProtocolId === 'multi_agent_debate'
+              ? ['debater_a', 'debater_b', 'judge']
+              : workflowProtocolId === 'dr_zero_self_evolve'
+                ? ['proposer', 'solver', 'verifier']
+                : suggestedWorkflowStrategy.roles
+      const workflowModels = uniqueStrings([
+        ...Object.values(selectedRoles),
+        selectedCurrentModel,
+        availableModelOptions[0]?.id ?? null,
+      ])
+      const explicitModelHints = detectGoalModelHints(
+        heuristicSource,
+        availableModelOptions,
+        selectedCurrentModel
       )
-      const normalizedWorkflow = modeCommand
-        ? normalizeWorkflowState(
-            {
-              ...baseWorkflow,
-              enabled: modeCommand.mode === 'workflow',
-            },
-            effectiveInference.reasoningEffort
+      const primaryModels =
+        effectiveExecutionMode === 'workflow'
+          ? uniqueStrings([
+              ...selectGoalProposalModels(
+                availableModelOptions,
+                selectedCurrentModel,
+                effectiveExecutionMode,
+                explicitModelHints
+              ),
+              ...workflowModels,
+            ]).slice(0, 3)
+          : selectGoalProposalModels(
+              availableModelOptions,
+              selectedCurrentModel,
+              effectiveExecutionMode,
+              explicitModelHints
+            )
+      const protocolHint = detectGoalProtocolHint(heuristicSource)
+      const runtimeHint = detectGoalRuntimeHint(heuristicSource)
+      const roleSummary =
+        effectiveExecutionMode === 'workflow'
+          ? formatGoalRoleSummary(selectedRoleNames.length > 0 ? selectedRoleNames : fallbackWorkflowRoles)
+          : 'Primary agent continues the task directly with the current chat tools.'
+      const runtimeMode =
+        runtimeHint ??
+        (effectiveExecutionMode === 'workflow'
+          ? workflowScheduleEnabled(workflowState)
+            ? `Scheduled ${workflowScheduleType} workflow`
+            : 'Workflow run starts immediately'
+          : 'Single-agent long-running execution')
+      const modelReadinessRisk = summarizeGoalProposalModelReadinessRisk(
+        availableModelOptions,
+        primaryModels
+      )
+      const autonomyRisk =
+        effectiveAutonomyMode === 'strict'
+          ? 'Runtime actions may pause for approval before execution.'
+          : effectiveAutonomyMode === 'trusted_workspace'
+            ? 'Riskier runtime actions may still require approval.'
+            : null
+      const riskNote = [modelReadinessRisk, autonomyRisk].filter(Boolean).join(' ') || null
+
+      return {
+        goal_id: null,
+        proposal_id: options?.previous?.proposal_id ?? `goal-proposal-${Date.now()}`,
+        objective: objective.trim(),
+        execution_mode: effectiveExecutionMode,
+        protocol_id:
+          effectiveExecutionMode === 'workflow'
+            ? protocolHint ??
+              (workflowTemplate === 'research_debate'
+                ? 'multi_agent_debate'
+                : workflowProtocolId === DEFAULT_WORKFLOW_PROTOCOL
+                  ? suggestedWorkflowStrategy.protocolId
+                  : workflowProtocolId)
+            : null,
+        models: primaryModels,
+        role_summary: roleSummary,
+        runtime_mode: runtimeMode,
+        risk_note: riskNote,
+        status: null,
+        revision_index: (options?.previous?.revision_index ?? -1) + 1,
+        updated_at: new Date().toISOString(),
+      }
+    },
+    [
+      currentModel,
+      effectiveAutonomyMode,
+      modelOptions,
+      workflowConfig.selected_models_roles,
+      workflowProtocolId,
+      workflowScheduleType,
+      workflowState,
+      workflowTemplate,
+    ]
+  )
+
+  const buildGoalSummaryFromGoal = React.useCallback(
+    (goal: api.GoalSummary, fallback?: GoalSessionSummary | GoalSessionProposal | null): GoalSessionSummary => ({
+      goal_id: goal.goal_id ? goal.goal_id : (fallback?.goal_id ?? null),
+      objective: goal.objective ? goal.objective : (fallback?.objective ?? ''),
+      execution_mode: goal.execution_mode,
+      protocol_id: goal.protocol_id ?? fallback?.protocol_id ?? null,
+      models: fallback?.models ?? [],
+      role_summary: fallback?.role_summary ?? null,
+      runtime_mode: fallback?.runtime_mode ?? null,
+      risk_note: fallback?.risk_note ?? null,
+      status: goal.status,
+    }),
+    []
+  )
+
+  const persistGoalConversation = React.useCallback(
+    async ({
+      sessionId,
+      attachments,
+      userContent,
+      assistantContent,
+      goalCard,
+    }: GoalConversationAppendInput) => {
+      const detail = await api.appendSessionEvents(sessionId, [
+        {
+          type: 'message',
+          role: 'user',
+          content: userContent,
+          attachments,
+          timestamp: new Date().toISOString(),
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: assistantContent,
+          timestamp: new Date().toISOString(),
+          ...(goalCard ? { goal_card: goalCard } : {}),
+        },
+      ])
+      upsertSessionDetail(detail)
+      hydrateSessionFromDetail(detail)
+    },
+    [hydrateSessionFromDetail, upsertSessionDetail]
+  )
+
+  const syncWorkflowStateForGoal = React.useCallback(
+    async ({
+      sessionId,
+      baseWorkflow,
+      executionMode,
+      goalStatus = null,
+      runId = null,
+    }: SyncGoalWorkflowStateInput) => {
+      const goalTerminal = isGoalTerminalStatus(goalStatus)
+      const nextBoundRunId =
+        executionMode === 'workflow' && !goalTerminal
+          ? runId
+          : null
+      const workflowEnabled =
+        executionMode === 'workflow' &&
+        !goalTerminal &&
+        goalStatus !== 'paused'
+
+      await persistWorkflowState(
+        sessionId,
+        normalizeWorkflowState(
+          {
+            ...baseWorkflow,
+            enabled: workflowEnabled,
+            bound_run_id: nextBoundRunId,
+            synced_run_event_count:
+              nextBoundRunId && nextBoundRunId === baseWorkflow.bound_run_id
+                ? baseWorkflow.synced_run_event_count ?? 0
+                : 0,
+          },
+          effectiveInference.reasoningEffort
+        )
+      )
+    },
+    [effectiveInference.reasoningEffort, persistWorkflowState]
+  )
+
+  const handleGoalWorkflowRouting = React.useCallback(
+    async ({
+      sessionId,
+      attachments,
+      selectedSkillIds,
+      route,
+      requestText,
+      baseWorkflow,
+      baseGoalState,
+      workflowSessionProjectId,
+      effectiveWorkspaceDir,
+    }: GoalWorkflowRoutingHandlerInput): Promise<boolean> => {
+      const pendingProposal = baseGoalState.pending_proposal
+      const latestGoalSummary = baseGoalState.last_goal_summary
+      const activeGoalId = baseGoalState.active_goal_id
+      const proposalRequested =
+        route.kind === 'goal_proposal' ||
+        route.kind === 'workflow_proposal' ||
+        route.kind === 'natural_language_goal_proposal'
+      const proposalRevisionRequested = route.kind === 'goal_revision'
+      const activeGoalFollowUpRequested = route.kind === 'goal_follow_up'
+      const confirmationRequested = route.kind === 'goal_confirmation'
+
+      if (route.kind === 'goal_help') {
+        if (pendingProposal) {
+          const pendingCard = goalCardFromSummary(
+            pendingProposal,
+            pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal'
           )
-        : baseWorkflow
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: route.raw,
+            assistantContent: `A goal proposal is pending. ${GOAL_PROPOSAL_REPLY_HELP}`,
+            goalCard: pendingCard,
+          })
+          return true
+        }
 
-      if (modeCommand) {
-        if (modeCommand.mode === 'workflow') {
-          setTaskPanelOpen(false)
-          setTaskPanelMode('default')
-          setTaskPanelFocusedTaskId(null)
-          setPanelOpen(false)
-          setMobileInferenceOpen(false)
-          setWorkflowPanelOpen(true)
-        } else {
-          setWorkflowPanelOpen(false)
+        if (latestGoalSummary) {
+          const summaryCard = goalCardFromSummary(latestGoalSummary, 'started', {
+            label: activeGoalId ? 'Goal summary' : 'Most recent goal',
+            goalId: latestGoalSummary.goal_id,
+            status: baseGoalState.active_goal_status ?? latestGoalSummary.status,
+          })
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: route.raw,
+            assistantContent: activeGoalId
+              ? 'Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage the active goal.'
+              : 'No active goal is currently bound to this chat. Start a new one with `/goal <request>` or `/workflow <request>`.',
+            goalCard: summaryCard,
+          })
+          return true
         }
-        await persistWorkflowState(sessionId, normalizedWorkflow)
-        if (requestText.length === 0 && attachments.length === 0) {
-          return
-        }
+
+        await persistGoalConversation({
+          sessionId,
+          attachments,
+          userContent: route.raw,
+          assistantContent: [
+            'Use `/goal <request>` to prepare a long-running single-agent goal.',
+            'Use `/workflow <request>` to prepare a workflow goal.',
+            'Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` after a goal starts.',
+          ].join('\n'),
+        })
+        return true
       }
 
-      const turnKey = `turn-${Date.now()}`
-      const userMessage: Message = {
-        id: `user-${Date.now()}`,
-        type: 'user',
-        content: requestText,
+      if (
+        proposalRequested &&
+        activeGoalId &&
+        !isGoalTerminalStatus(baseGoalState.active_goal_status)
+      ) {
+        await persistGoalConversation({
+          sessionId,
+          attachments,
+          userContent:
+            route.kind === 'goal_proposal'
+              ? route.content
+              : requestText,
+          assistantContent:
+            'This chat already has an active goal. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` before starting a new one.',
+        })
+        return true
+      }
+
+      if (proposalRequested || proposalRevisionRequested) {
+        const revisionSourceText = proposalRevisionRequested
+          ? requestText
+          : route.kind === 'goal_proposal'
+            ? route.content
+            : requestText
+        const explicitExecutionMode =
+          route.kind === 'workflow_proposal'
+            ? 'workflow'
+            : route.kind === 'goal_proposal'
+              ? 'single_agent'
+              : route.kind === 'natural_language_goal_proposal'
+                ? detectGoalExecutionModeHint(requestText) ?? 'single_agent'
+              : pendingProposal?.execution_mode ?? 'single_agent'
+        const proposalObjective = proposalRevisionRequested
+          ? pendingProposal?.objective ?? requestText
+          : route.kind === 'goal_proposal'
+            ? route.content
+            : requestText
+        const modelHintSource = revisionSourceText || proposalObjective
+        const candidateModelOptions = applyGoalProposalModelReadiness(
+          modelOptions,
+          currentModel,
+          goalProposalModelReadinessRef.current
+        )
+        const explicitModelHints = detectGoalModelHints(
+          modelHintSource,
+          candidateModelOptions,
+          currentModel
+        )
+        const probeCandidates = buildGoalProposalProbeCandidates(
+          candidateModelOptions,
+          currentModel,
+          explicitExecutionMode,
+          explicitModelHints
+        )
+        if (probeCandidates.length > 0) {
+          await probeGoalProposalModels(probeCandidates, currentModel)
+        }
+        const probedModelOptions = applyGoalProposalModelReadiness(
+          modelOptions,
+          currentModel,
+          goalProposalModelReadinessRef.current
+        )
+        const nextProposal = buildGoalProposalState(proposalObjective, explicitExecutionMode, {
+          previous: pendingProposal,
+          revisionText: pendingProposal ? revisionSourceText : null,
+          modelCandidates: probedModelOptions,
+          currentModelId: currentModel,
+        })
+        const nextGoalState: GoalSessionState = {
+          active_goal_id: null,
+          active_goal_status: null,
+          execution_mode: nextProposal.execution_mode,
+          default_route: nextProposal.execution_mode === 'workflow' ? 'workflow' : 'goal',
+          last_goal_summary: latestGoalSummary,
+          pending_proposal: nextProposal,
+        }
+
+        if (nextProposal.execution_mode === 'single_agent') {
+          await syncWorkflowStateForGoal({
+            sessionId,
+            baseWorkflow,
+            executionMode: nextProposal.execution_mode,
+          })
+        }
+
+        await persistSessionGoalState(sessionId, nextGoalState)
+        await persistGoalConversation({
+          sessionId,
+          attachments,
+          userContent:
+            proposalRevisionRequested || pendingProposal
+              ? revisionSourceText
+              : route.kind === 'workflow_proposal'
+                ? requestText
+                : route.kind === 'natural_language_goal_proposal'
+                  ? requestText
+                : route.kind === 'goal_proposal'
+                  ? route.content
+                  : requestText,
+          assistantContent: pendingProposal
+            ? `Updated the pending goal proposal. ${GOAL_PROPOSAL_REPLY_HELP}`
+            : `Prepared a goal proposal. ${GOAL_PROPOSAL_REPLY_HELP}`,
+          goalCard: goalCardFromSummary(
+            nextProposal,
+            pendingProposal || proposalRevisionRequested ? 'revised_proposal' : 'proposal'
+          ),
+        })
+        return true
+      }
+
+      if (confirmationRequested && pendingProposal) {
+        const createdGoal = await api.createGoal({
+          objective: pendingProposal.objective,
+          execution_mode: pendingProposal.execution_mode,
+          protocol_id:
+            pendingProposal.execution_mode === 'workflow'
+              ? pendingProposal.protocol_id
+              : null,
+          topic: pendingProposal.objective,
+          projectId: workflowSessionProjectId,
+          workspaceDir: effectiveWorkspaceDir,
+          summary: {
+            operator_message: pendingProposal.objective,
+            selected_skill_ids: selectedSkillIds,
+            source_session_id: sessionId,
+          },
+          metadata: {
+            channel: 'chat_goal',
+            source_session_id: sessionId,
+            pending_proposal_id: pendingProposal.proposal_id,
+          },
+        })
+        const startedGoal = await api.startGoal(createdGoal.goal_id)
+        const startedSummary = buildGoalSummaryFromGoal(startedGoal, pendingProposal)
+        const startedRunId = getGoalAttemptRunId(startedGoal)
+
+        await syncWorkflowStateForGoal({
+          sessionId,
+          baseWorkflow,
+          executionMode: startedGoal.execution_mode,
+          goalStatus: startedGoal.status,
+          runId: startedRunId,
+        })
+        await persistSessionGoalState(sessionId, {
+          active_goal_id: startedGoal.goal_id,
+          active_goal_status: startedGoal.status,
+          execution_mode: startedGoal.execution_mode,
+          default_route: startedGoal.execution_mode === 'workflow' ? 'workflow' : 'goal',
+          last_goal_summary: startedSummary,
+          pending_proposal: null,
+        })
+        await persistGoalConversation({
+          sessionId,
+          attachments,
+          userContent: route.raw,
+          assistantContent:
+            'Goal started. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage it.',
+          goalCard: goalCardFromSummary(startedSummary, 'started', {
+            goalId: startedGoal.goal_id,
+            status: startedGoal.status,
+          }),
+        })
+        return true
+      }
+
+      if (!activeGoalId) {
+        if (route.kind === 'goal_lifecycle' && route.action === 'status' && pendingProposal) {
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: route.raw,
+            assistantContent: `A goal proposal is pending. ${GOAL_PROPOSAL_REPLY_HELP}`,
+            goalCard: goalCardFromSummary(
+              pendingProposal,
+              pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal'
+            ),
+          })
+          return true
+        }
+
+        if (route.kind === 'goal_lifecycle' && route.action === 'stop' && pendingProposal) {
+          await persistSessionGoalState(sessionId, {
+            active_goal_id: null,
+            active_goal_status: null,
+            execution_mode: latestGoalSummary?.execution_mode ?? null,
+            default_route: 'chat',
+            last_goal_summary: latestGoalSummary,
+            pending_proposal: null,
+          })
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: route.raw,
+            assistantContent:
+              'Cleared the pending goal proposal. Start a new one with `/goal <request>` or `/workflow <request>`.',
+          })
+          return true
+        }
+
+        await persistGoalConversation({
+          sessionId,
+          attachments,
+          userContent: route.kind === 'goal_lifecycle' || route.kind === 'goal_confirmation' ? route.raw : requestText,
+          assistantContent:
+            'No active goal is bound to this chat. Start one with `/goal <request>` or `/workflow <request>`.',
+        })
+        return true
+      }
+
+      if (activeGoalFollowUpRequested) {
+        const health = await api.fetchGoalHealth(activeGoalId)
+        const continuation = resolveGoalContinuationDecision(health)
+
+        if (continuation.action === 'manual_resolution_required') {
+          const activeGoal = await api.fetchGoal(activeGoalId)
+          const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
+          const approvalToolNames = getStringArray(health.approval_state?.tool_names)
+          const approvalToolHint =
+            approvalToolNames.length > 0
+              ? ` Pending approval for ${approvalToolNames.join(', ')}.`
+              : ''
+          await persistSessionGoalState(sessionId, {
+            active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
+            active_goal_status: activeGoal.status,
+            execution_mode: activeGoal.execution_mode,
+            default_route: isGoalTerminalStatus(activeGoal.status)
+              ? 'chat'
+              : activeGoal.execution_mode === 'workflow'
+                ? 'workflow'
+                : 'goal',
+            last_goal_summary: activeGoalSummary,
+            pending_proposal: null,
+          })
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: requestText,
+            assistantContent:
+              continuation.approvalIds.length > 0
+                ? `${continuation.summary}${approvalToolHint} Review the pending approval${continuation.approvalIds.length > 1 ? 's' : ''} from the goal drawer or Goal Console before continuing.`
+                : `${continuation.summary}${approvalToolHint} Open the Goal Console to inspect the blocking approval state before continuing.`,
+            goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
+              label: 'Goal blocked',
+              goalId: activeGoal.goal_id,
+              status: activeGoal.status,
+            }),
+          })
+          return true
+        }
+
+        if (continuation.action === 'blocked') {
+          const activeGoal = await api.fetchGoal(activeGoalId)
+          const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
+          const operatorControlHint = formatGoalOperatorControlHint(health.operator_controls)
+          await persistSessionGoalState(sessionId, {
+            active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
+            active_goal_status: activeGoal.status,
+            execution_mode: activeGoal.execution_mode,
+            default_route: isGoalTerminalStatus(activeGoal.status)
+              ? 'chat'
+              : activeGoal.execution_mode === 'workflow'
+                ? 'workflow'
+                : 'goal',
+            last_goal_summary: activeGoalSummary,
+            pending_proposal: null,
+          })
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: requestText,
+            assistantContent: `${continuation.summary}${operatorControlHint ? ` ${operatorControlHint}` : ''} Adjust the goal from the Goal Console before sending more execution guidance.`,
+            goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
+              label: 'Goal blocked',
+              goalId: activeGoal.goal_id,
+              status: activeGoal.status,
+            }),
+          })
+          return true
+        }
+
+        let activeGoal =
+          continuation.action === 'refresh_then_forward'
+            ? await api.refreshGoal(activeGoalId)
+            : continuation.action === 'resume_then_forward'
+              ? await api.resumeGoal(activeGoalId)
+              : await api.fetchGoal(activeGoalId)
+        const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
+        const activeRunId = getGoalAttemptRunId(activeGoal)
+
+        if (!activeRunId) {
+          await persistSessionGoalState(sessionId, {
+            active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
+            active_goal_status: activeGoal.status,
+            execution_mode: activeGoal.execution_mode,
+            default_route: isGoalTerminalStatus(activeGoal.status)
+              ? 'chat'
+              : activeGoal.execution_mode === 'workflow'
+                ? 'workflow'
+                : 'goal',
+            last_goal_summary: activeGoalSummary,
+            pending_proposal: null,
+          })
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: requestText,
+            assistantContent:
+              'The active goal still does not have a live attempt ready to receive follow-up guidance. Use the Goal Console to inspect the current recovery state.',
+            goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
+              label: 'Goal status',
+              goalId: activeGoal.goal_id,
+              status: activeGoal.status,
+            }),
+          })
+          return true
+        }
+
+        await api.appendAgentRunMessage(activeRunId, {
+          role: 'operator',
+          content: requestText,
+          projectId: workflowSessionProjectId,
+          workspaceDir: effectiveWorkspaceDir,
+          attachments,
+          metadata: {
+            channel: 'goal-chat',
+            goal_id: activeGoal.goal_id,
+            source_session_id: sessionId,
+            selected_skill_ids: selectedSkillIds,
+          },
+        })
+
+        await syncWorkflowStateForGoal({
+          sessionId,
+          baseWorkflow,
+          executionMode: activeGoal.execution_mode,
+          goalStatus: activeGoal.status,
+          runId: activeRunId,
+        })
+        await persistSessionGoalState(sessionId, {
+          active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
+          active_goal_status: activeGoal.status,
+          execution_mode: activeGoal.execution_mode,
+          default_route: isGoalTerminalStatus(activeGoal.status)
+            ? 'chat'
+            : activeGoal.execution_mode === 'workflow'
+              ? 'workflow'
+              : 'goal',
+          last_goal_summary: activeGoalSummary,
+          pending_proposal: null,
+        })
+        await persistGoalConversation({
+          sessionId,
+          attachments,
+          userContent: requestText,
+          assistantContent:
+            continuation.action === 'refresh_then_forward'
+              ? 'Refreshed the active worker generation and forwarded your guidance to the updated goal attempt.'
+              : continuation.action === 'resume_then_forward'
+                ? 'Resumed the active goal and forwarded your guidance to the current attempt.'
+                : 'Forwarded your guidance to the active goal. It will continue working with this updated direction.',
+          goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
+            label: 'Goal updated',
+            goalId: activeGoal.goal_id,
+            status: activeGoal.status,
+          }),
+        })
+        return true
+      }
+
+      if (route.kind !== 'goal_lifecycle') {
+        return false
+      }
+
+      const nextGoal =
+        route.action === 'status'
+          ? await api.fetchGoal(activeGoalId)
+          : route.action === 'pause'
+            ? await api.pauseGoal(activeGoalId)
+            : route.action === 'resume'
+              ? await api.resumeGoal(activeGoalId)
+              : await api.cancelGoal(activeGoalId)
+      const nextGoalSummary = buildGoalSummaryFromGoal(nextGoal, latestGoalSummary)
+      const nextRunId = getGoalAttemptRunId(nextGoal)
+      const nextGoalTerminal = isGoalTerminalStatus(nextGoal.status)
+
+      await syncWorkflowStateForGoal({
+        sessionId,
+        baseWorkflow,
+        executionMode: nextGoal.execution_mode,
+        goalStatus: nextGoal.status,
+        runId: nextRunId,
+      })
+      await persistSessionGoalState(sessionId, {
+        active_goal_id: nextGoalTerminal ? null : nextGoal.goal_id,
+        active_goal_status: nextGoal.status,
+        execution_mode: nextGoal.execution_mode,
+        default_route: nextGoalTerminal ? 'chat' : nextGoal.execution_mode === 'workflow' ? 'workflow' : 'goal',
+        last_goal_summary: nextGoalSummary,
+        pending_proposal: null,
+      })
+
+      const lifecycleLabel =
+        route.action === 'status'
+          ? 'Goal status'
+          : route.action === 'pause'
+            ? 'Goal paused'
+            : route.action === 'resume'
+              ? 'Goal resumed'
+              : 'Goal stopped'
+      const lifecycleContent =
+        nextGoal.latest_error?.trim() ||
+        (route.action === 'status'
+          ? 'Fetched the latest goal status.'
+          : route.action === 'pause'
+            ? 'Paused the active goal.'
+            : route.action === 'resume'
+              ? 'Resumed the active goal.'
+              : 'Stopped the active goal.')
+
+      await persistGoalConversation({
+        sessionId,
         attachments,
-        timestamp: new Date(),
-      }
-      const lastMessageSummary =
-        requestText.trim() ||
-        (attachments.length > 0
-          ? attachments.slice(0, 2).map((attachment) => attachment.name).join(', ')
-          : '')
+        userContent: route.raw,
+        assistantContent: lifecycleContent,
+        goalCard: goalCardFromSummary(nextGoalSummary, 'started', {
+          label: lifecycleLabel,
+          goalId: nextGoal.goal_id,
+          status: nextGoal.status,
+        }),
+      })
+      return true
+    },
+    [
+      persistGoalConversation,
+      buildGoalProposalState,
+      buildGoalSummaryFromGoal,
+      currentModel,
+      modelOptions,
+      persistSessionGoalState,
+      probeGoalProposalModels,
+      syncWorkflowStateForGoal,
+    ]
+  )
 
+  const submitDirectChatTurn = React.useCallback(
+    async ({
+      targetSessionId,
+      requestText,
+      attachments,
+      selectedSkillIds,
+      normalizedWorkflow,
+      sessionScope,
+    }: DirectChatTurnInput) => {
+      let sessionId = sessionScope.getSessionId()
+      let sessionContext = sessionScope.getContext()
+      const turnKey = `turn-${Date.now()}`
       const placeholderContent = isLocalModelId(currentModel) && currentModelLoaded === false
         ? t('chat.loadingLocalModel')
         : ''
-
-      setSessionMessages(sessionId, [
-        ...resolveMessagesForSession(sessionId),
-        userMessage,
-        buildTurnPlaceholder(turnKey, { content: placeholderContent }),
-      ])
-      updateLastMessage(sessionId, lastMessageSummary)
+      appendOptimisticConversationTurn(
+        sessionId,
+        requestText,
+        attachments,
+        turnKey,
+        placeholderContent
+      )
       const abortController = new AbortController()
-      startStreaming(sessionId, abortController)
 
       try {
+        await sessionScope.materializeIfNeeded()
+        sessionId = sessionScope.getSessionId()
+        sessionContext = sessionScope.getContext()
+        startStreaming(sessionId, abortController)
+
         if (normalizedWorkflow.enabled) {
           setWorkflowBusy(true)
           setWorkflowError(null)
           const workflowSessionProjectId =
-            sessionAfterMaterialize?.projectId ?? activeProjectId ?? null
+            sessionContext.sessionAfterMaterialize?.projectId ?? activeProjectId ?? null
           const effectiveWorkspaceDir =
             normalizedWorkflow.workspace_dir_override ||
             normalizedWorkflow.config?.workspace_dir_override ||
@@ -2459,7 +3755,7 @@ export default function ChatPage() {
           const replayMessages = api.buildMessagesFromSessionEvents(
             (useSessionStore.getState().currentSessionDetail?.id === sessionId
               ? useSessionStore.getState().currentSessionDetail?.events
-              : latestSessionState.currentSessionDetail?.events) ?? []
+              : sessionContext.latestSessionState.currentSessionDetail?.events) ?? []
           )
           if (replayMessages.length > 0) {
             setSessionMessages(sessionId, replayMessages)
@@ -2488,7 +3784,9 @@ export default function ChatPage() {
           for await (const chunk of api.streamChatMessages(requestText, {
             sessionId,
             projectId:
-              sessions.find((session) => session.id === sessionId)?.projectId ?? activeProjectId ?? null,
+              sessionContext.latestSessionState.sessions.find((session) => session.id === sessionId)?.projectId ??
+              activeProjectId ??
+              null,
             model: currentModel ?? undefined,
             selectedSkillIds,
             attachments,
@@ -2530,7 +3828,9 @@ export default function ChatPage() {
           const response = await requestChat(
             requestText,
             sessionId,
-            sessions.find((session) => session.id === sessionId)?.projectId ?? activeProjectId ?? null,
+            sessionContext.latestSessionState.sessions.find((session) => session.id === sessionId)?.projectId ??
+              activeProjectId ??
+              null,
             currentModel,
             selectedSkillIds,
             attachments,
@@ -2568,10 +3868,8 @@ export default function ChatPage() {
           if (response.model) {
             setCurrentModel(response.model)
           }
-        } else {
-          if (latestAssistantContent) {
-            updateLastMessage(sessionId, latestAssistantContent)
-          }
+        } else if (latestAssistantContent) {
+          updateLastMessage(sessionId, latestAssistantContent)
         }
 
         await syncSessionFromServer(sessionId)
@@ -2604,30 +3902,175 @@ export default function ChatPage() {
     },
     [
       activeProjectId,
-      createDraftSession,
+      appendOptimisticConversationTurn,
       currentModel,
       currentModelLoaded,
-      currentSessionId,
       effectiveInference,
       finishStreaming,
-      hasActiveStream,
-      materializeDraftSession,
       modelOptions,
-      persistWorkflowState,
       projects,
       resolveMessagesForSession,
       selectSession,
-      setPanelOpen,
       setSessionMessages,
-      sessions,
       startStreaming,
+      syncSessionFromServer,
       syncWorkflowRunEventsToSession,
       t,
-      syncSessionFromServer,
-      uploadTargetDir,
       updateSessionMessages,
       updateLastMessage,
-      workflowDraftBySessionId,
+      uploadTargetDir,
+    ]
+  )
+
+  const handleSend = React.useCallback(
+    async (
+      text: string,
+      options?: {
+        forceSessionId?: string
+        selectedSkillIds?: string[]
+        attachments?: ChatAttachment[]
+      }
+    ) => {
+      if (hasActiveStream) {
+        return
+      }
+
+      const targetSessionId = options?.forceSessionId ?? currentSessionId
+      const selectedSkillIds = options?.selectedSkillIds ?? []
+      const attachments = options?.attachments ?? []
+      const initialSessionId = targetSessionId ?? createDraftSession(activeProjectId)
+      const targetSession = sessions.find((session) => session.id === initialSessionId)
+      const sessionScope = createSendSessionScope(initialSessionId, targetSession)
+      let sessionId = sessionScope.getSessionId()
+      let sessionContext = sessionScope.getContext()
+      const pendingProposal = sessionContext.baseGoalState.pending_proposal
+      const {
+        modeCommand,
+        requestText,
+        route,
+        workflowModeRequested,
+        requiresSessionMaterialization,
+        shouldHandleGoalWorkflowRouting,
+      } = resolveChatGoalWorkflowRouting({
+        text,
+        attachmentCount: attachments.length,
+        hasPendingProposal: pendingProposal !== null,
+        hasActiveGoal:
+          sessionContext.baseGoalState.active_goal_id !== null &&
+          !isGoalTerminalStatus(sessionContext.baseGoalState.active_goal_status),
+      })
+      const workflowProposalRequested = route.kind === 'workflow_proposal'
+
+      if (requiresSessionMaterialization) {
+        await sessionScope.materializeIfNeeded()
+        sessionId = sessionScope.getSessionId()
+        sessionContext = sessionScope.getContext()
+      }
+
+      const normalizedWorkflow = modeCommand
+        ? normalizeWorkflowState(
+            {
+              ...sessionContext.baseWorkflow,
+              enabled: workflowModeRequested,
+            },
+            effectiveInference.reasoningEffort
+          )
+        : sessionContext.baseWorkflow
+
+      if (modeCommand && route.kind === 'direct_chat') {
+        if (workflowModeRequested) {
+          setTaskPanelOpen(false)
+          setTaskPanelMode('default')
+          setTaskPanelFocusedTaskId(null)
+          setPanelOpen(false)
+          setMobileInferenceOpen(false)
+          setWorkflowPanelOpen(true)
+        } else {
+          setWorkflowPanelOpen(false)
+        }
+        await persistWorkflowState(sessionId, normalizedWorkflow)
+        if (requestText.length === 0 && attachments.length === 0) {
+          return
+        }
+      }
+      if (workflowProposalRequested) {
+        setTaskPanelOpen(false)
+        setTaskPanelMode('default')
+        setTaskPanelFocusedTaskId(null)
+        setPanelOpen(false)
+        setMobileInferenceOpen(false)
+        setWorkflowPanelOpen(true)
+      }
+
+      if (shouldHandleGoalWorkflowRouting && route.kind !== 'direct_chat') {
+        const routeTurnKey = `turn-${Date.now()}`
+        const routeUserContent = resolveGoalWorkflowRouteUserContent(route, requestText)
+        appendOptimisticConversationTurn(sessionId, routeUserContent, attachments, routeTurnKey)
+        try {
+          const handledGoalWorkflowRouting = await handleGoalWorkflowRouting({
+            sessionId,
+            attachments,
+            selectedSkillIds,
+            route,
+            requestText,
+            baseWorkflow: sessionContext.baseWorkflow,
+            baseGoalState: sessionContext.baseGoalState,
+            workflowSessionProjectId: sessionContext.workflowSessionProjectId,
+            effectiveWorkspaceDir: sessionContext.effectiveWorkspaceDir,
+          })
+          if (handledGoalWorkflowRouting) {
+            return
+          }
+          updateSessionMessages(sessionId, (prev) => prev.map((message) =>
+            message.turnKey === routeTurnKey ? { ...message, isStreaming: false } : message
+          ))
+          return
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : null
+          updateSessionMessages(sessionId, (prev) => [
+            ...prev.filter((message) => message.turnKey !== routeTurnKey),
+            {
+              id: `error-${Date.now()}`,
+              type: 'error',
+              eventType: 'error',
+              content: t('chat.requestFailed'),
+              errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+              timestamp: new Date(),
+            },
+          ])
+          return
+        }
+      }
+
+      await submitDirectChatTurn({
+        targetSessionId,
+        requestText,
+        attachments,
+        selectedSkillIds,
+        normalizedWorkflow,
+        sessionScope,
+      })
+    },
+    [
+      activeProjectId,
+      appendOptimisticConversationTurn,
+      createSendSessionScope,
+      createDraftSession,
+      currentSessionId,
+      effectiveInference,
+      handleGoalWorkflowRouting,
+      hasActiveStream,
+      persistWorkflowState,
+      setPanelOpen,
+      setTaskPanelFocusedTaskId,
+      setTaskPanelMode,
+      setTaskPanelOpen,
+      setMobileInferenceOpen,
+      setWorkflowPanelOpen,
+      sessions,
+      submitDirectChatTurn,
+      t,
+      updateSessionMessages,
     ]
   )
 
@@ -3196,8 +4639,11 @@ export default function ChatPage() {
     }
   }, [activeAgentSettings, effectiveInference, selectedPresetName])
 
-  const closeRightPanels = React.useCallback((except?: 'inference' | 'tasks' | 'workflow') => {
+  const closeRightPanels = React.useCallback((except?: 'goal' | 'inference' | 'tasks' | 'workflow') => {
     setWorkspaceMobileOpen(false)
+    if (except !== 'goal') {
+      setGoalDrawerOpen(false)
+    }
     if (except !== 'inference') {
       setPanelOpen(false)
       setMobileInferenceOpen(false)
@@ -3211,6 +4657,162 @@ export default function ChatPage() {
       setWorkflowPanelOpen(false)
     }
   }, [setPanelOpen])
+
+  const handleGoalDrawerToggle = React.useCallback(() => {
+    const nextOpen = !goalDrawerOpen
+    closeRightPanels('goal')
+    setGoalDrawerOpen(nextOpen)
+  }, [closeRightPanels, goalDrawerOpen])
+
+  const refreshCurrentGoalBinding = React.useCallback(async (goalId: string) => {
+    if (!currentSessionId) {
+      return null
+    }
+
+    const refreshedGoal = await api.fetchGoal(goalId)
+    const refreshedGoalSummary = buildGoalSummaryFromGoal(
+      refreshedGoal,
+      currentSessionGoalState.last_goal_summary
+    )
+    const refreshedRunId = getGoalAttemptRunId(refreshedGoal)
+
+    await syncWorkflowStateForGoal({
+      sessionId: currentSessionId,
+      baseWorkflow: workflowState,
+      executionMode: refreshedGoal.execution_mode,
+      goalStatus: refreshedGoal.status,
+      runId: refreshedRunId,
+    })
+    await persistSessionGoalState(currentSessionId, {
+      active_goal_id: isGoalTerminalStatus(refreshedGoal.status) ? null : refreshedGoal.goal_id,
+      active_goal_status: refreshedGoal.status,
+      execution_mode: refreshedGoal.execution_mode,
+      default_route: isGoalTerminalStatus(refreshedGoal.status)
+        ? 'chat'
+        : refreshedGoal.execution_mode === 'workflow'
+          ? 'workflow'
+          : 'goal',
+      last_goal_summary: refreshedGoalSummary,
+      pending_proposal: null,
+    })
+
+    return refreshedGoal
+  }, [
+    buildGoalSummaryFromGoal,
+    currentSessionGoalState.last_goal_summary,
+    currentSessionId,
+    persistSessionGoalState,
+    syncWorkflowStateForGoal,
+    workflowState,
+  ])
+
+  const loadGoalDrawerContext = React.useCallback(async (goalId: string) => {
+    setGoalDrawerHealthLoading(true)
+    setGoalDrawerHealthError(null)
+    setGoalDrawerApprovalError(null)
+    setGoalDrawerApprovalsLoading(false)
+
+    try {
+      const health = await api.fetchGoalHealth(goalId)
+      setGoalDrawerHealth(health)
+
+      const approvalIds = getStringArray(health.approval_state?.approval_ids)
+      if (approvalIds.length === 0) {
+        setGoalDrawerApprovals([])
+        setGoalDrawerApprovalsLoading(false)
+        return health
+      }
+
+      setGoalDrawerApprovalsLoading(true)
+      try {
+        const approvals = await api.fetchApprovals()
+        const approvalIdSet = new Set(approvalIds)
+        setGoalDrawerApprovals(
+          approvals.filter((approval) => approvalIdSet.has(approval.approval_id))
+        )
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'Failed to load pending approvals.'
+        setGoalDrawerApprovalError(detail)
+        setGoalDrawerApprovals([])
+      } finally {
+        setGoalDrawerApprovalsLoading(false)
+      }
+
+      return health
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Failed to load goal status.'
+      setGoalDrawerHealthError(detail)
+      setGoalDrawerHealth(null)
+      setGoalDrawerApprovals([])
+      setGoalDrawerApprovalsLoading(false)
+      return null
+    } finally {
+      setGoalDrawerHealthLoading(false)
+    }
+  }, [])
+
+  const handleGoalDrawerRefresh = React.useCallback(async () => {
+    const goalId =
+      currentSessionGoalState.active_goal_id ??
+      currentSessionGoalState.last_goal_summary?.goal_id ??
+      null
+    if (!goalId) {
+      return
+    }
+    setGoalDrawerBusyAction('status')
+    try {
+      await Promise.all([
+        refreshCurrentGoalBinding(goalId),
+        loadGoalDrawerContext(goalId),
+      ])
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Failed to refresh goal status.'
+      setGoalDrawerHealthError(detail)
+    } finally {
+      setGoalDrawerBusyAction(null)
+    }
+  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding])
+
+  const handleGoalDrawerResolveApproval = React.useCallback(async (
+    approvalId: string,
+    decision: 'approve_once' | 'reject'
+  ) => {
+    const goalId =
+      currentSessionGoalState.active_goal_id ??
+      currentSessionGoalState.last_goal_summary?.goal_id ??
+      null
+    setGoalDrawerResolvingApprovalKey(`${approvalId}:${decision}`)
+    setGoalDrawerApprovalError(null)
+    try {
+      await api.resolveApproval(approvalId, { decision })
+      if (goalId) {
+        await Promise.all([
+          refreshCurrentGoalBinding(goalId),
+          loadGoalDrawerContext(goalId),
+        ])
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Failed to resolve approval.'
+      setGoalDrawerApprovalError(detail)
+    } finally {
+      setGoalDrawerResolvingApprovalKey(null)
+    }
+  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding])
+
+  const runGoalDrawerCommand = React.useCallback(async (
+    action: 'status' | 'pause' | 'resume' | 'stop'
+  ) => {
+    const sessionId = currentSessionId
+    if (!sessionId) {
+      return
+    }
+    setGoalDrawerBusyAction(action)
+    try {
+      await handleSend(`/goal ${action}`, { forceSessionId: sessionId })
+    } finally {
+      setGoalDrawerBusyAction(null)
+    }
+  }, [currentSessionId, handleSend])
 
   const handleWorkflowPanelToggle = React.useCallback(() => {
     const nextOpen = !workflowPanelOpen
@@ -3288,6 +4890,97 @@ export default function ChatPage() {
     setWorkspacePanelOpen(!workspacePanelOpen)
   }, [closeRightPanels, setWorkspacePanelOpen, workspacePanelOpen])
 
+  const headerGoal = React.useMemo<GoalHeaderChipView | null>(() => {
+    if (currentSessionGoalState.pending_proposal) {
+      return null
+    }
+
+    const summary = currentSessionGoalState.last_goal_summary
+    if (!summary) {
+      return null
+    }
+
+    const status = (currentSessionGoalState.active_goal_status ?? summary.status ?? '').trim()
+    if (!status) {
+      return null
+    }
+
+    const isCompleted = isGoalCompletedStatus(status)
+    const isBlocked = isGoalBlockedStatus(status)
+    const isFailedOrCancelled =
+      isGoalTerminalStatus(status) &&
+      !isCompleted
+
+    if (isFailedOrCancelled) {
+      return null
+    }
+
+    const isActiveGoalBound =
+      currentSessionGoalState.active_goal_id !== null &&
+      !isGoalTerminalStatus(status)
+
+    if (!isCompleted && !isBlocked && !isActiveGoalBound) {
+      return null
+    }
+
+    return {
+      title: summary.objective,
+      goalId: currentSessionGoalState.active_goal_id ?? summary.goal_id ?? null,
+      status,
+      executionMode: summary.execution_mode,
+      protocolId: summary.protocol_id,
+      modelCount: summary.models.length,
+      runtimeMode: summary.runtime_mode,
+      pendingApprovalCount: isBlocked ? pendingApprovalCount : 0,
+      displayState: isCompleted ? 'completed' : isBlocked ? 'blocked' : 'active',
+    }
+  }, [currentSessionGoalState, pendingApprovalCount])
+
+  const goalDrawerBlocker = React.useMemo<GoalDrawerBlockerView | null>(() => {
+    if (!goalDrawerHealth) {
+      return null
+    }
+
+    return {
+      summary:
+        getString(goalDrawerHealth.recommended_next_action?.summary) ??
+        goalDrawerHealth.latest_error ??
+        null,
+      recommendedAction: getString(goalDrawerHealth.recommended_next_action?.action),
+      latestError: goalDrawerHealth.latest_error,
+      approvalIds: getStringArray(goalDrawerHealth.approval_state?.approval_ids),
+      approvalToolNames: getStringArray(goalDrawerHealth.approval_state?.tool_names),
+      blockedTools: goalDrawerHealth.operator_controls.blocked_tools,
+      blockedDomains: goalDrawerHealth.operator_controls.blocked_domains,
+      blockNetworkUsage: goalDrawerHealth.operator_controls.block_network_usage,
+    }
+  }, [goalDrawerHealth])
+
+  React.useEffect(() => {
+    if (!headerGoal) {
+      setGoalDrawerOpen(false)
+      setGoalDrawerHealth(null)
+      setGoalDrawerHealthLoading(false)
+      setGoalDrawerHealthError(null)
+      setGoalDrawerApprovals([])
+      setGoalDrawerApprovalsLoading(false)
+      setGoalDrawerApprovalError(null)
+      setGoalDrawerResolvingApprovalKey(null)
+    }
+  }, [headerGoal])
+
+  React.useEffect(() => {
+    const goalId = headerGoal?.goalId
+    if (!goalId) {
+      return
+    }
+    if (!goalDrawerOpen && headerGoal.displayState !== 'blocked') {
+      return
+    }
+
+    void loadGoalDrawerContext(goalId)
+  }, [goalDrawerOpen, headerGoal, loadGoalDrawerContext])
+
   const blockingRuntimeNotice =
     pendingApprovalCount > 0
       ? {
@@ -3315,6 +5008,15 @@ export default function ChatPage() {
             {displaySessionTitle(currentSession?.title, t('chat.newChat'))}
           </h1>
           <div className="flex items-center gap-1">
+            {headerGoal ? (
+              <div className="mr-1 flex">
+                <GoalHeaderChip
+                  goal={headerGoal}
+                  open={goalDrawerOpen}
+                  onClick={handleGoalDrawerToggle}
+                />
+              </div>
+            ) : null}
             <div className="mr-2 hidden max-w-[220px] items-center gap-1.5 text-xs text-muted-foreground sm:flex">
               {isStreaming ? (
                 <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
@@ -3413,6 +5115,56 @@ export default function ChatPage() {
             onClose={() => setWorkspacePanelOpen(false)}
           />
         </FloatingPanelShell>
+        {headerGoal ? (
+          <FloatingPanelShell
+            open={goalDrawerOpen}
+            onOpenChange={setGoalDrawerOpen}
+            desktopSide="right"
+            desktopWidthClass="w-[min(34vw,26rem)] min-w-[22rem] max-w-[30rem]"
+            desktopBreakpoint="lg"
+            mobileSide="right"
+            mobileClassName="w-[92vw] max-w-[92vw] p-0 sm:max-w-[28rem]"
+          >
+            <GoalDrawerContent
+              goal={headerGoal}
+              busyAction={goalDrawerBusyAction}
+              blocker={goalDrawerBlocker}
+              approvals={goalDrawerApprovals}
+              approvalLoading={goalDrawerHealthLoading || goalDrawerApprovalsLoading}
+              approvalError={goalDrawerHealthError ?? goalDrawerApprovalError}
+              resolvingApprovalKey={goalDrawerResolvingApprovalKey}
+              onRefresh={() => {
+                void handleGoalDrawerRefresh()
+              }}
+              onPause={
+                headerGoal.goalId
+                  ? () => {
+                      void runGoalDrawerCommand('pause')
+                    }
+                  : undefined
+              }
+              onResume={
+                headerGoal.goalId
+                  ? () => {
+                      void runGoalDrawerCommand('resume')
+                    }
+                  : undefined
+              }
+              onStop={
+                headerGoal.goalId
+                  ? () => {
+                      void runGoalDrawerCommand('stop')
+                    }
+                  : undefined
+              }
+              onResolveApproval={(approvalId, decision) => {
+                void handleGoalDrawerResolveApproval(approvalId, decision)
+              }}
+              onOpenConsole={() => router.push('/goals')}
+              onClose={() => setGoalDrawerOpen(false)}
+            />
+          </FloatingPanelShell>
+        ) : null}
         <div
           className={cn(
             'min-w-0 flex-1 transition-[padding] duration-300 ease-out-smooth',
