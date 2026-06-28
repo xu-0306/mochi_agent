@@ -1,4 +1,4 @@
-"""Goal runtime API tests."""
+﻿"""Goal runtime API tests."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -144,6 +145,163 @@ def _create_goal_audit_finding(
             status=status,
         )
     )
+
+
+def test_pending_goal_proposal_intent_route_uses_bounded_engine_invoke(tmp_path: Path) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def invoke(self, request: Any) -> Any:
+            self.requests.append(request)
+            return SimpleNamespace(
+                content='{"intent":"confirm_start","confidence":0.91,"rationale":"The user clearly wants to start the pending goal now."}'
+            )
+
+    app = create_app()
+    fake_engine = _FakeEngine()
+    app.state.engine_factory = lambda: fake_engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/pending-proposal-intent",
+            json={
+                "message": "Please launch the pending goal now.",
+                "proposal_objective": "Research ESG LLM fine-tuning methods",
+                "execution_mode": "single_agent",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "type": "goal_pending_proposal_intent",
+        "intent": "confirm_start",
+        "confidence": 0.91,
+        "rationale": "The user clearly wants to start the pending goal now.",
+    }
+    assert len(fake_engine.requests) == 1
+    request = fake_engine.requests[0]
+    assert request.tool_mode == "disabled"
+    assert request.execution_profile == "judge"
+    assert request.persist_session is False
+
+
+def test_goal_proposal_assistant_copy_route_uses_bounded_engine_invoke(tmp_path: Path) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def invoke(self, request: Any) -> Any:
+            self.requests.append(request)
+            return SimpleNamespace(
+                content=(
+                    "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd\u53ef\u4ee5\u76f4\u63a5\u555f\u52d5\u7684 goal \u63d0\u6848\u3002 "
+                    "\u76ee\u524d\u6703\u4ee5 autonomous_single_agent \u4f5c\u70ba\u57f7\u884c\u65b9\u5f0f\u3002"
+                )
+            )
+
+    app = create_app()
+    fake_engine = _FakeEngine()
+    app.state.engine_factory = lambda: fake_engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/proposal-assistant-copy",
+            json={
+                "message": "\u5e6b\u6211\u67e5\u8a62 ESG LLM \u5fae\u8abf\u76f8\u95dc\u8ad6\u6587",
+                "proposal_objective": "Research ESG LLM fine-tuning papers and compare them",
+                "execution_mode": "single_agent",
+                "protocol_selection": "autonomous_single_agent",
+                "role_summary": "Primary agent continues the task directly with the current chat tools.",
+                "runtime_mode": "Single-agent long-running execution",
+                "revision_index": 0,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "type": "goal_proposal_assistant_copy",
+        "explanation": "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd\u53ef\u4ee5\u76f4\u63a5\u555f\u52d5\u7684 goal \u63d0\u6848\u3002 \u76ee\u524d\u6703\u4ee5 autonomous_single_agent \u4f5c\u70ba\u57f7\u884c\u65b9\u5f0f\u3002",
+        "source": "model",
+    }
+    assert len(fake_engine.requests) == 1
+    request = fake_engine.requests[0]
+    assert request.tool_mode == "disabled"
+    assert request.execution_profile == "judge"
+    assert request.persist_session is False
+    assert "Latest user request" in request.message
+    assert "\u5e6b\u6211\u67e5\u8a62 ESG LLM \u5fae\u8abf\u76f8\u95dc\u8ad6\u6587" in request.message
+
+def test_pending_goal_proposal_intent_route_uses_deterministic_chinese_start_rule(
+    tmp_path: Path,
+) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def invoke(self, request: Any) -> Any:
+            self.requests.append(request)
+            raise AssertionError("deterministic confirm-start rule should bypass bounded invoke")
+
+    app = create_app()
+    fake_engine = _FakeEngine()
+    app.state.engine_factory = lambda: fake_engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/pending-proposal-intent",
+            json={
+                "message": "\u958b\u59cb",
+                "proposal_objective": "Research ESG LLM fine-tuning methods",
+                "execution_mode": "single_agent",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"] == "confirm_start"
+    assert payload["confidence"] == 1.0
+    assert len(fake_engine.requests) == 0
+
+
+def test_goal_proposal_assistant_copy_route_falls_back_to_chinese_copy(
+    tmp_path: Path,
+) -> None:
+    app = create_app()
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/proposal-assistant-copy",
+            json={
+                "message": "\u5e6b\u6211\u67e5\u8a62 ESG LLM \u5fae\u8abf\u76f8\u95dc\u8ad6\u6587",
+                "proposal_objective": "Research ESG LLM fine-tuning papers and compare them",
+                "execution_mode": "single_agent",
+                "protocol_selection": "autonomous_single_agent",
+                "role_summary": "Primary agent continues the task directly with the current chat tools.",
+                "runtime_mode": "Single-agent long-running execution",
+                "revision_index": 0,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "fallback"
+    assert "\u555f\u52d5" in payload["explanation"] or "\u57f7\u884c" in payload["explanation"]
 
 
 def _build_goal_linked_exec_approval_orchestrator(
@@ -324,7 +482,7 @@ def test_goal_create_normalizes_prompt_duration_into_runtime_contract(tmp_path: 
         assert health_payload["run_policy"]["runtime_mode"] == "fixed_duration"
 
 
-def test_goal_execution_mode_overrides_conflicting_protocol_id_for_single_agent_goals(
+def test_goal_create_preserves_explicit_protocol_for_single_agent_lane_goals(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -332,13 +490,13 @@ def test_goal_execution_mode_overrides_conflicting_protocol_id_for_single_agent_
         del self
         return MultiAgentRunResult(
             run_id=request.run_id,
-            protocol="teacher_student_distill",
+            protocol="multi_agent_debate",
             state="succeeded",
             task_input=request.task_input,
             candidates=[],
             selected_candidate_id=None,
             evaluation={},
-            artifacts={"final_answer": "Single-agent goal completed."},
+            artifacts={"final_answer": "Single-agent lane goal completed."},
             events=[],
             metadata={},
         )
@@ -359,36 +517,81 @@ def test_goal_execution_mode_overrides_conflicting_protocol_id_for_single_agent_
         created = create_response.json()
         goal_id = created["goal_id"]
         assert created["execution_mode"] == "single_agent"
-        assert created["protocol_id"] == "teacher_student_distill"
+        assert created["interaction_mode"] == "goal"
+        assert created["execution_topology"] == "multi_agent"
+        assert created["protocol_id"] == "multi_agent_debate"
+        assert created["bound_run_id"] is None
+        assert created["protocol_selection"] == "multi_agent_debate"
+        assert created["selection_rationale"] is None
 
         list_response = client.get("/v1/goals")
         assert list_response.status_code == 200
         assert list_response.json()[0]["execution_mode"] == "single_agent"
-        assert list_response.json()[0]["protocol_id"] == "teacher_student_distill"
+        assert list_response.json()[0]["protocol_id"] == "multi_agent_debate"
 
         get_response = client.get(f"/v1/goals/{goal_id}")
         assert get_response.status_code == 200
         assert get_response.json()["execution_mode"] == "single_agent"
-        assert get_response.json()["protocol_id"] == "teacher_student_distill"
+        assert get_response.json()["protocol_id"] == "multi_agent_debate"
 
         health_response = client.get(f"/v1/goals/{goal_id}/health")
         assert health_response.status_code == 200
-        assert health_response.json()["execution_mode"] == "single_agent"
+        health_payload = health_response.json()
+        assert health_payload["execution_mode"] == "single_agent"
+        assert health_payload["interaction_mode"] == "goal"
+        assert health_payload["execution_topology"] == "multi_agent"
+        assert health_payload["protocol_id"] == "multi_agent_debate"
+        assert health_payload["bound_run_id"] is None
+        assert health_payload["protocol_selection"] == "multi_agent_debate"
+        assert health_payload["selection_rationale"] is None
 
         start_response = client.post(f"/v1/goals/{goal_id}/start")
         assert start_response.status_code == 200
-        assert start_response.json()["execution_mode"] == "single_agent"
-        assert start_response.json()["protocol_id"] == "teacher_student_distill"
+        started = start_response.json()
+        assert started["execution_mode"] == "single_agent"
+        assert started["interaction_mode"] == "goal"
+        assert started["execution_topology"] == "multi_agent"
+        assert started["protocol_id"] == "multi_agent_debate"
+        assert started["protocol_selection"] == "multi_agent_debate"
+        assert started["selection_rationale"] is None
 
         completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
         assert completed_goal["execution_mode"] == "single_agent"
-        assert completed_goal["protocol_id"] == "teacher_student_distill"
+        assert completed_goal["interaction_mode"] == "goal"
+        assert completed_goal["execution_topology"] == "multi_agent"
+        assert completed_goal["protocol_id"] == "multi_agent_debate"
         linked_run_id = completed_goal["attempts"][0]["agent_run_id"]
         assert linked_run_id is not None
+        assert completed_goal["bound_run_id"] == linked_run_id
+        assert completed_goal["protocol_selection"] == "multi_agent_debate"
+        assert completed_goal["selection_rationale"] is None
 
         linked_run_response = client.get(f"/v1/agent-runs/{linked_run_id}")
         assert linked_run_response.status_code == 200
-        assert linked_run_response.json()["protocol_id"] == "teacher_student_distill"
+        assert linked_run_response.json()["protocol_id"] == "multi_agent_debate"
+
+
+def test_goal_create_defaults_missing_single_agent_protocol_to_autonomous_agent(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Handle this as a single-agent goal.",
+                "title": "Autonomous Single Agent Goal",
+                "execution_mode": "single_agent",
+            },
+        )
+        assert create_response.status_code == 200
+        created = create_response.json()
+
+        assert created["execution_mode"] == "single_agent"
+        assert created["interaction_mode"] == "goal"
+        assert created["execution_topology"] == "single_agent"
+        assert created["protocol_id"] == "autonomous_single_agent"
+        assert created["protocol_selection"] == "autonomous_single_agent"
+        assert created["selection_rationale"] is None
 
 
 def test_goal_create_explicit_runtime_policy_duration_overrides_prompt_duration(

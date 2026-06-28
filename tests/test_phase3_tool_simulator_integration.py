@@ -279,6 +279,66 @@ class _RoleSentinelBackend(BaseLLMBackend):
         return None
 
 
+class _ThinkingOnlyAfterToolBackend(BaseLLMBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+
+    async def generate(
+        self,
+        messages: list[Message],
+        tools: list[ToolSchema] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
+        stream: bool = False,
+    ) -> GenerationResult:
+        del tools, temperature, max_tokens, top_p, min_p, top_k
+        del frequency_penalty, presence_penalty, repeat_penalty, stream
+        self.calls.append(messages)
+
+        if any(
+            message.role == "user"
+            and "no user-visible final answer" in message.content
+            for message in messages
+        ):
+            return GenerationResult(content="Recovered visible answer.")
+
+        if any(message.role == "tool" for message in messages):
+            return GenerationResult(
+                content="",
+                thinking="I have enough information to answer now.",
+            )
+
+        return GenerationResult(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call-file-read-thinking-only",
+                    name="file_read",
+                    arguments={"path": "sample.txt", "line_numbers": False},
+                )
+            ],
+            finish_reason="tool_calls",
+        )
+
+    def supports_tool_calling(self) -> bool:
+        return True
+
+    def get_model_info(self) -> ModelInfo:
+        return ModelInfo(name="thinking-only-after-tool-backend", backend_type="test")
+
+    async def health_check(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_react_loop_preserves_small_json_looking_file_read_text(
     tmp_path: Path,
@@ -463,3 +523,40 @@ async def test_react_loop_strips_role_sentinels_from_visible_and_reasoning_text(
 
     assert thinking_event.content == "Review the attached records first."
     assert final_event.content == "Visible final answer."
+
+
+@pytest.mark.asyncio
+async def test_react_loop_recovers_when_backend_returns_thinking_only_after_tool(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sample.txt").write_text("tool payload", encoding="utf-8")
+
+    backend = _ThinkingOnlyAfterToolBackend()
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(FileReadTool(workspace_dir=tmp_path))
+    react_loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        tool_execution_context=ToolExecutionContext(workspace_dir=str(tmp_path)),
+        max_iterations=4,
+    )
+
+    events = [
+        event
+        async for event in react_loop.run(
+            system_prompt="system",
+            history=[],
+            user_message="read the file and answer",
+        )
+    ]
+
+    thinking_event = next(event for event in events if isinstance(event, ThinkingEvent))
+    final_event = next(event for event in events if isinstance(event, FinalAnswerEvent))
+
+    assert thinking_event.content == "I have enough information to answer now."
+    assert final_event.content == "Recovered visible answer."
+    assert len(backend.calls) == 3
+    assert any(
+        message.role == "user" and "no user-visible final answer" in message.content
+        for message in backend.calls[-1]
+    )

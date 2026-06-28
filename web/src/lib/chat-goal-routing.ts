@@ -17,6 +17,7 @@ export type ChatGoalWorkflowRoute =
   | { kind: 'goal_proposal'; content: string; raw: string }
   | { kind: 'workflow_proposal'; requestText: string }
   | { kind: 'natural_language_goal_proposal'; requestText: string }
+  | { kind: 'goal_pending_follow_up'; requestText: string; raw: string }
   | { kind: 'goal_confirmation'; requestText: string; raw: string }
   | { kind: 'goal_revision'; requestText: string }
   | { kind: 'goal_follow_up'; requestText: string }
@@ -80,17 +81,6 @@ export function parseGoalCommand(value: string): GoalCommand | null {
   }
 }
 
-export function isGoalConfirmationText(value: string): boolean {
-  const normalized = value.trim().toLowerCase().replace(/\s+/g, ' ')
-  return (
-    normalized === 'start' ||
-    normalized === 'go ahead' ||
-    normalized === 'proceed' ||
-    normalized === 'yes' ||
-    normalized === 'run it'
-  )
-}
-
 export function isNaturalLanguageGoalRequest(value: string): boolean {
   const normalized = value.trim().toLowerCase().replace(/\s+/g, ' ')
   if (!normalized) {
@@ -134,18 +124,17 @@ export function resolveChatGoalWorkflowRouting(
     input.hasActiveGoal &&
     (requestText.trim().length > 0 || input.attachmentCount > 0) &&
     !naturalLanguageGoalRequested
-  const confirmationRequested =
+  const pendingProposalFollowUpRequested =
     !goalCommand &&
     !modeCommand &&
     input.hasPendingProposal &&
     input.attachmentCount === 0 &&
-    isGoalConfirmationText(input.text)
+    requestText.trim().length > 0
   const proposalRevisionRequested =
     !goalCommand &&
     !modeCommand &&
     input.hasPendingProposal &&
-    !confirmationRequested &&
-    (requestText.trim().length > 0 || input.attachmentCount > 0)
+    input.attachmentCount > 0
 
   let route: ChatGoalWorkflowRoute = { kind: 'direct_chat' }
   if (goalCommand?.action === 'help') {
@@ -180,9 +169,9 @@ export function resolveChatGoalWorkflowRouting(
       kind: 'natural_language_goal_proposal',
       requestText,
     }
-  } else if (confirmationRequested) {
+  } else if (pendingProposalFollowUpRequested) {
     route = {
-      kind: 'goal_confirmation',
+      kind: 'goal_pending_follow_up',
       requestText,
       raw: input.text.trim(),
     }

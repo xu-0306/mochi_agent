@@ -1,4 +1,4 @@
-"""chat TUI CLI 測試。"""
+﻿"""Chat TUI CLI tests."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ runner = CliRunner()
 
 
 def test_root_without_args_enters_tui(monkeypatch) -> None:
-    """`mochi` 無參數應進入 TUI。"""
+    """`mochi` without args should enter the TUI."""
     called: dict[str, object] = {}
 
     async def fake_chat_tui_async(
@@ -44,7 +44,7 @@ def test_root_without_args_enters_tui(monkeypatch) -> None:
 
 
 def test_tui_command_calls_async_helper(monkeypatch) -> None:
-    """`mochi tui` 應將參數傳給 async helper。"""
+    """`mochi tui` should call the async helper."""
     called: dict[str, object] = {}
 
     async def fake_chat_tui_async(
@@ -124,7 +124,7 @@ def test_chat_command_calls_terminal_async_helper(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_chat_tui_async_streaming_and_session_switch(monkeypatch, capsys) -> None:
-    """TUI 應支援 slash 命令、session 切換與串流輸出。"""
+    """TUI should support slash commands, session switching, and streaming output."""
     from mochi.main import _chat_tui_async
 
     class _FakeEngine:
@@ -196,7 +196,7 @@ async def test_chat_tui_async_streaming_and_session_switch(monkeypatch, capsys) 
 
 @pytest.mark.asyncio
 async def test_chat_tui_async_rejects_non_positive_max_turns() -> None:
-    """max_turns <= 0 時應失敗。"""
+    """max_turns <= 0 should exit with an error."""
     from mochi.main import _chat_tui_async
 
     with pytest.raises(SystemExit) as exc_info:
@@ -212,7 +212,7 @@ async def test_chat_tui_async_rejects_non_positive_max_turns() -> None:
 
 @pytest.mark.asyncio
 async def test_chat_tui_async_supports_final_answer_event_fallback(monkeypatch, capsys) -> None:
-    """僅有 FinalAnswerEvent 時 TUI 仍應顯示回答。"""
+    """FinalAnswerEvent should still render in the TUI fallback path."""
     from mochi.main import _chat_tui_async
 
     class _FakeEngine:
@@ -698,7 +698,7 @@ async def test_chat_tui_async_supports_exec_session_commands(monkeypatch, capsys
 
 @pytest.mark.asyncio
 async def test_chat_tui_async_clear_resets_session_history(monkeypatch, capsys) -> None:
-    """`/clear` 應刪除當前 session 並以新 engine 繼續。"""
+    """`/clear` should reset the session and recreate the engine."""
     from mochi.main import _chat_tui_async
 
     class _FakeEngine:
@@ -773,7 +773,7 @@ async def test_chat_tui_async_clear_resets_session_history(monkeypatch, capsys) 
 
 @pytest.mark.asyncio
 async def test_chat_tui_async_prints_tool_errors(monkeypatch, capsys) -> None:
-    """工具失敗事件應在 TUI 中顯示。"""
+    """Tool failures should still be printed in the TUI."""
     from mochi.main import _chat_tui_async
 
     class _FakeEngine:
@@ -835,6 +835,7 @@ async def test_chat_tui_async_prints_tool_errors(monkeypatch, capsys) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     monkeypatch,
     capsys,
@@ -845,6 +846,7 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
         def __init__(self, config) -> None:  # noqa: ANN001, ARG002
             self.calls: list[tuple[str, str | None]] = []
             self.closed = False
+            self.invocations: list[object] = []
 
         async def initialize(self) -> None:
             return None
@@ -856,6 +858,20 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
         ) -> AsyncIterator[object]:
             self.calls.append((message, session_id))
             yield FinalAnswerEvent(content="unexpected")
+
+        async def invoke(self, request):  # noqa: ANN001
+            self.invocations.append(request)
+            if str(getattr(request, "session_id", "")).startswith("goal-proposal-copy:"):
+                return SimpleNamespace(
+                    content=(
+                        "I framed your request as a goal proposal that we can launch directly. "
+                        "This scope fits a single-agent long-running run best."
+                    )
+                )
+            assert '"user_follow_up": "start it"' in request.message
+            return SimpleNamespace(
+                content='{"intent":"confirm_start","confidence":0.93,"rationale":"The user clearly wants to launch the pending goal now."}'
+            )
 
         async def close(self) -> None:
             self.closed = True
@@ -941,7 +957,7 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     inputs = iter(
         [
             "/goal keep working on this for 30 minutes",
-            "start",
+            "start it",
             "/goal status",
             "/goal pause",
             "/goal resume",
@@ -960,6 +976,7 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005
     monkeypatch.setattr("mochi.sessions.store.SessionStore", lambda sessions_dir: fake_store)  # noqa: ARG005
+
     async def fake_runtime_service_factory(**kwargs):  # noqa: ANN003, ARG001
         return fake_runtime
 
@@ -974,13 +991,16 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     )
     captured = capsys.readouterr().out
 
-    assert "Prepared a goal proposal." in captured
+    assert "I framed your request as a goal proposal that we can launch directly." in captured
+    assert "Next step:" in captured
+    assert "Launch: Send a short confirmation when you want execution to begin." in captured
     assert "Goal started." in captured
     assert "Fetched the latest goal status." in captured
     assert "Paused the active goal." in captured
     assert "Resumed the active goal." in captured
     assert "Stopped the active goal." in captured
     assert fake_engine.calls == []
+    assert len(fake_engine.invocations) == 1
 
     session_events = fake_store.by_session["goal-session"]
     workflow_updates = [
@@ -997,6 +1017,11 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     assert workflow_updates[-1]["workflow"]["bound_run_id"] is None
     assert goal_updates[-1]["goal"]["active_goal_id"] is None
     assert goal_updates[-1]["goal"]["active_goal_status"] == "cancelled"
+    initial_pending_proposal = goal_updates[0]["goal"]["pending_proposal"]
+    assert initial_pending_proposal["assistant_explanation"] == (
+        "I framed your request as a goal proposal that we can launch directly. "
+        "This scope fits a single-agent long-running run best."
+    )
 
 
 @pytest.mark.asyncio

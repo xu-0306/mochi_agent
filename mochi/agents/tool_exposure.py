@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from mochi.agents.tool_intent_router import ToolIntent, normalize_tool_intent_name
 from mochi.backends.base import BaseLLMBackend
 
 
@@ -19,13 +20,17 @@ class ToolExposurePlan:
     discoverable_tool_names: list[str] = field(default_factory=list)
     workspace_bound: bool = False
     attachment_count: int = 0
+    intent_route: dict[str, Any] | None = None
 
     def exposure_metadata(self) -> dict[str, Any]:
-        return {
+        payload = {
             "exposed_tools": list(self.tool_names),
             "workspace_bound": self.workspace_bound,
             "attachment_count": self.attachment_count,
         }
+        if self.intent_route is not None:
+            payload["intent_route"] = dict(self.intent_route)
+        return payload
 
 
 class ToolExposurePlanner:
@@ -443,7 +448,17 @@ class ToolExposurePlanner:
         attachment_count: int = 0,
         workspace_attachment_count: int = 0,
         tool_mode: Literal["disabled", "auto", "required"] = "auto",
+        routed_intent: ToolIntent | None = None,
+        intent_confidence: float | None = None,
+        intent_source: str | None = None,
+        intent_rationale: str | None = None,
     ) -> ToolExposurePlan:
+        intent_route_metadata = self._intent_route_metadata(
+            routed_intent=routed_intent,
+            intent_confidence=intent_confidence,
+            intent_source=intent_source,
+            intent_rationale=intent_rationale,
+        )
         if tool_mode == "disabled":
             return ToolExposurePlan(
                 tool_names=[],
@@ -452,6 +467,7 @@ class ToolExposurePlanner:
                 discoverable_tool_names=[],
                 workspace_bound=session_bound_workspace,
                 attachment_count=max(0, attachment_count),
+                intent_route=intent_route_metadata,
             )
 
         backend_info = backend.get_model_info()
@@ -464,6 +480,7 @@ class ToolExposurePlanner:
                 discoverable_tool_names=[],
                 workspace_bound=session_bound_workspace,
                 attachment_count=max(0, attachment_count),
+                intent_route=intent_route_metadata,
             )
 
         lowered = message.lower()
@@ -472,29 +489,45 @@ class ToolExposurePlanner:
         # filenames/paths reintroduce false positives like `updated-report.pdf`.
         lowered_user_intent = (user_intent_message or "").lower()
         lowered_primary_intent = lowered_user_intent or lowered
+        normalized_routed_intent = self._normalize_routed_intent(routed_intent)
+        routed_workspace_write = normalized_routed_intent == "workspace_write"
+        routed_execution_request = normalized_routed_intent == "execution_or_process"
+        routed_workspace_request = normalized_routed_intent in {
+            "workspace_read",
+            "workspace_write",
+            "execution_or_process",
+        }
+        routed_tool_discovery = normalized_routed_intent == "tool_discovery"
+        routed_research_request = normalized_routed_intent == "literature_research"
+        routed_web_request = normalized_routed_intent == "open_world_lookup"
         normalized_attachment_count = max(0, attachment_count)
         normalized_workspace_attachment_count = max(0, workspace_attachment_count)
         attached_workspace_files = normalized_workspace_attachment_count > 0 or any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
-        attachment_mutation_request = self._matches_any_keyword(
+        attachment_mutation_request = routed_workspace_write or self._matches_any_keyword(
             lowered_user_intent,
             self._ATTACHMENT_MUTATION_INTENT_KEYWORDS,
         )
         attachment_processing_request = (
             attached_workspace_files
-            and self._matches_any_keyword(
-                lowered_primary_intent,
-                self._ATTACHMENT_PROCESSING_INTENT_KEYWORDS,
+            and (
+                routed_execution_request
+                or self._matches_any_keyword(
+                    lowered_primary_intent,
+                    self._ATTACHMENT_PROCESSING_INTENT_KEYWORDS,
+                )
             )
         )
         read_only_file_request = (
             attached_workspace_files
             and not attachment_mutation_request
+            and not routed_execution_request
             and not self._matches_any_keyword(lowered, self._EXECUTION_INTENT_KEYWORDS)
         )
         file_browse_request = (
             self._matches_any_keyword(lowered, self._FILE_BROWSE_INTENT_KEYWORDS)
+            and not routed_execution_request
             and not self._matches_any_keyword(lowered, self._EXECUTION_INTENT_KEYWORDS)
         )
 
@@ -509,12 +542,23 @@ class ToolExposurePlanner:
             normalized_capabilities,
         )
 
-        research_request = self._is_research_request(lowered)
+        research_request = routed_research_request or self._is_research_request(lowered)
         citation_request = self._is_citation_request(lowered)
         biomedical_request = self._matches_any_keyword(lowered, self._BIOMEDICAL_KEYWORDS)
         recent_research_request = self._matches_any_keyword(lowered, self._RECENT_RESEARCH_KEYWORDS)
-        workspace_request = self._matches_any_keyword(lowered, self._GROUP_KEYWORDS["workspace"])
-        web_request = self._matches_any_keyword(lowered, self._GROUP_KEYWORDS["web"])
+        workspace_request = routed_workspace_request or self._matches_any_keyword(
+            lowered,
+            self._GROUP_KEYWORDS["workspace"],
+        )
+        web_request = routed_web_request or self._matches_any_keyword(lowered, self._GROUP_KEYWORDS["web"])
+        explicit_workspace_request = (
+            routed_workspace_request
+            or workspace_request
+            or attached_workspace_files
+            or file_browse_request
+            or attachment_mutation_request
+            or attachment_processing_request
+        )
 
         matched_groups: list[str] = []
         for group_name in ("memory", "mcp"):
@@ -524,7 +568,15 @@ class ToolExposurePlanner:
             ):
                 matched_groups.append(group_name)
 
-        if research_request and tools_by_group["literature"]:
+        if routed_research_request and tools_by_group["literature"]:
+            matched_groups.append("literature")
+            if tools_by_group["web"]:
+                matched_groups.append("web")
+        elif routed_web_request and tools_by_group["web"]:
+            matched_groups.append("web")
+        elif routed_workspace_request and tools_by_group["workspace"]:
+            matched_groups.append("workspace")
+        elif research_request and tools_by_group["literature"]:
             matched_groups.append("literature")
             if tools_by_group["web"]:
                 matched_groups.append("web")
@@ -552,9 +604,12 @@ class ToolExposurePlanner:
             for tool_name in (preferred_tool_names or [])
             if tool_name in available_order
         ]
-        if "tool_search" in available_order and self._matches_any_keyword(
-            lowered,
-            self._TOOL_DISCOVERY_KEYWORDS,
+        if "tool_search" in available_order and (
+            routed_tool_discovery
+            or self._matches_any_keyword(
+                lowered,
+                self._TOOL_DISCOVERY_KEYWORDS,
+            )
         ):
             preferred = [
                 "tool_search",
@@ -618,9 +673,14 @@ class ToolExposurePlanner:
 
         workspace_focus_request = (
             session_bound_workspace
-            and "workspace" in matched_groups
-            and not web_request
-            and not research_request
+            and (
+                routed_workspace_request
+                or (
+                    explicit_workspace_request
+                    and not web_request
+                    and not research_request
+                )
+            )
         )
         non_workspace_attachment_request = (
             normalized_attachment_count > 0
@@ -674,8 +734,24 @@ class ToolExposurePlanner:
             for tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS
             if session_bound_workspace and tool_name in available
         ]
+        general_web_baseline = [
+            tool_name
+            for tool_name in ("web_search", "web_fetch", "get_current_time")
+            if (
+                session_bound_workspace
+                and not explicit_workspace_request
+                and tool_name in available
+                and tool_name in filtered
+            )
+        ]
         final_tool_names = list(filtered[:limit])
         for tool_name in workspace_baseline:
+            if tool_name not in final_tool_names:
+                final_tool_names.append(tool_name)
+        # A workspace-bound session should not silently lose general web lookup.
+        # Keep a small open-world baseline visible unless the user explicitly
+        # asked for workspace-local inspection/manipulation.
+        for tool_name in general_web_baseline:
             if tool_name not in final_tool_names:
                 final_tool_names.append(tool_name)
         if self._should_expose_tool_search(
@@ -696,7 +772,36 @@ class ToolExposurePlanner:
             discoverable_tool_names=list(filtered),
             workspace_bound=session_bound_workspace,
             attachment_count=normalized_attachment_count,
+            intent_route=intent_route_metadata,
         )
+
+    @staticmethod
+    def _normalize_routed_intent(routed_intent: ToolIntent | str | None) -> ToolIntent | None:
+        return normalize_tool_intent_name(routed_intent)
+
+    @classmethod
+    def _intent_route_metadata(
+        cls,
+        *,
+        routed_intent: ToolIntent | None,
+        intent_confidence: float | None,
+        intent_source: str | None,
+        intent_rationale: str | None,
+    ) -> dict[str, Any] | None:
+        normalized_routed_intent = cls._normalize_routed_intent(routed_intent)
+        if (
+            normalized_routed_intent is None
+            and intent_confidence is None
+            and not intent_source
+            and not intent_rationale
+        ):
+            return None
+        return {
+            "intent": normalized_routed_intent or "ambiguous",
+            "confidence": intent_confidence,
+            "source": intent_source or "fallback_keyword",
+            "rationale": intent_rationale or "",
+        }
 
     @classmethod
     def _should_expose_tool_search(

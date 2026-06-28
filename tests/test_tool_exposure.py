@@ -4,6 +4,11 @@ from collections.abc import AsyncIterator
 
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.tool_exposure import ToolExposurePlanner
+from mochi.agents.tool_intent_router import (
+    ToolIntentRoute,
+    ToolIntentRouter,
+    parse_tool_intent_classifier_result,
+)
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo, StreamChunk, ToolSchema
 from mochi.config.schema import MochiConfig
@@ -117,6 +122,24 @@ class _FakeBackend(BaseLLMBackend):
         return True
 
 
+class _FakeToolIntentClassifier:
+    def __init__(self, result: ToolIntentRoute | Exception) -> None:
+        self._result = result
+
+    async def classify(
+        self,
+        *,
+        user_message: str,
+        session_bound_workspace: bool,
+        attachment_count: int,
+        workspace_attachment_count: int,
+    ) -> ToolIntentRoute:
+        del user_message, session_bound_workspace, attachment_count, workspace_attachment_count
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
 class _DummyTool(BaseTool):
     def __init__(self, name: str, description: str, *, search_hint: str | None = None) -> None:
         self._name = name
@@ -146,6 +169,326 @@ class _DummyTool(BaseTool):
     async def execute(self, **kwargs: object) -> ToolResult:
         del kwargs
         return ToolResult(output=self._name)
+
+
+async def test_tool_intent_router_prefers_high_confidence_classifier_route() -> None:
+    router = ToolIntentRouter()
+
+    route = await router.route(
+        user_message="find matching files and search for TODO in the repo",
+        session_bound_workspace=True,
+        classifier=_FakeToolIntentClassifier(
+            ToolIntentRoute(
+                intent="workspace_read",
+                confidence=0.94,
+                source="classifier",
+                rationale="Repo inspection intent is explicit.",
+            )
+        ),
+    )
+
+    assert route.intent == "workspace_read"
+    assert route.source == "classifier"
+    assert route.confidence == 0.94
+
+
+async def test_tool_intent_router_low_confidence_classifier_falls_back_to_chinese_weather_route() -> None:
+    router = ToolIntentRouter()
+
+    route = await router.route(
+        user_message="\u5e6b\u6211\u67e5\u8a62\u53f0\u4e2d\u660e\u5929\u5929\u6c23",
+        session_bound_workspace=True,
+        classifier=_FakeToolIntentClassifier(
+            ToolIntentRoute(
+                intent="workspace_read",
+                confidence=0.22,
+                source="classifier",
+                rationale="Uncertain workspace classification.",
+            )
+        ),
+    )
+
+    assert route.intent == "open_world_lookup"
+    assert route.source == "fallback_keyword"
+    assert "weather" in route.rationale.lower() or "\u5929\u6c23" in route.rationale
+
+
+def test_parse_tool_intent_classifier_result_normalizes_legacy_workspace_aliases() -> None:
+    read_route = parse_tool_intent_classifier_result(
+        '{"intent":"workspace_inspection","confidence":0.91,"rationale":"legacy read alias"}'
+    )
+    write_route = parse_tool_intent_classifier_result(
+        '{"intent":"workspace_mutation","confidence":0.89,"rationale":"legacy write alias"}'
+    )
+
+    assert read_route.intent == "workspace_read"
+    assert write_route.intent == "workspace_write"
+
+
+async def test_tool_intent_router_routes_tool_discovery_queries() -> None:
+    route = await ToolIntentRouter().route(
+        user_message="which tool should I use to inspect notebook outputs?",
+        session_bound_workspace=True,
+    )
+
+    assert route.intent == "tool_discovery"
+    assert route.source == "fallback_keyword"
+
+
+async def test_tool_intent_router_fallback_keeps_generic_code_switching_query_out_of_workspace() -> None:
+    route = await ToolIntentRouter().route(
+        user_message="explain code switching in multilingual LLMs",
+        session_bound_workspace=True,
+    )
+
+    assert route.intent != "workspace_read"
+
+
+async def test_tool_intent_router_fallback_keeps_generic_rewrite_change_modify_queries_out_of_workspace_write() -> None:
+    router = ToolIntentRouter()
+
+    prompts = (
+        "rewrite code switching explanation for beginners",
+        "change project management explanation to be shorter",
+        "modify history source criticism summary",
+    )
+
+    for prompt in prompts:
+        route = await router.route(
+            user_message=prompt,
+            session_bound_workspace=True,
+        )
+
+        assert route.intent != "workspace_write"
+
+
+async def test_tool_intent_router_fallback_routes_explicit_repo_query_to_workspace_read() -> None:
+    route = await ToolIntentRouter().route(
+        user_message="find matching files and search for TODO in the repo",
+        session_bound_workspace=True,
+    )
+
+    assert route.intent == "workspace_read"
+    assert route.source == "fallback_keyword"
+
+
+async def test_tool_intent_router_fallback_routes_explicit_local_mutation_queries_to_workspace_write() -> None:
+    router = ToolIntentRouter()
+
+    prompts = (
+        (
+            "rewrite foo.py to remove TODO",
+            {"attachment_count": 0, "workspace_attachment_count": 0},
+        ),
+        (
+            "modify the workspace file report.md",
+            {"attachment_count": 0, "workspace_attachment_count": 0},
+        ),
+        (
+            "update this attached workspace file",
+            {"attachment_count": 1, "workspace_attachment_count": 1},
+        ),
+    )
+
+    for prompt, attachment_counts in prompts:
+        route = await router.route(
+            user_message=prompt,
+            session_bound_workspace=True,
+            **attachment_counts,
+        )
+
+        assert route.intent == "workspace_write"
+        assert route.source == "fallback_keyword"
+
+
+def test_tool_exposure_uses_routed_open_world_intent_for_chinese_weather_in_workspace() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search", "file_write"],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+        }
+    )
+
+    plan = planner.plan(
+        message="\u5e6b\u6211\u67e5\u8a62\u53f0\u4e2d\u660e\u5929\u5929\u6c23",
+        user_intent_message="\u5e6b\u6211\u67e5\u8a62\u53f0\u4e2d\u660e\u5929\u5929\u6c23",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "file_write",
+            "web_search",
+            "web_fetch",
+            "get_current_time",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities("web_search", "web_fetch"),
+        routed_intent="open_world_lookup",
+        intent_confidence=0.88,
+        intent_source="fallback_keyword",
+        intent_rationale="Matched open-world weather language.",
+    )
+
+    assert plan.matched_groups == ["web"]
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    assert plan.exposure_metadata()["intent_route"]["intent"] == "open_world_lookup"
+
+
+def test_tool_exposure_uses_routed_literature_intent_for_chinese_research_in_workspace() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search"],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+            "literature": ["arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"],
+        }
+    )
+    available_tools = [
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "web_search",
+        "web_fetch",
+        "get_current_time",
+        "arxiv_search",
+        "semantic_scholar_search",
+        "crossref_search",
+        "pubmed_search",
+    ]
+
+    plan = planner.plan(
+        message="\u5e6b\u6211\u7814\u7a76 ESG \u548c LLM \u7684\u95dc\u4fc2",
+        user_intent_message="\u5e6b\u6211\u7814\u7a76 ESG \u548c LLM \u7684\u95dc\u4fc2",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(*available_tools),
+        routed_intent="literature_research",
+        intent_confidence=0.9,
+        intent_source="fallback_keyword",
+        intent_rationale="Matched literature research language.",
+    )
+
+    assert plan.matched_groups == ["literature", "web"]
+    assert {"web_search", "web_fetch"} <= set(plan.tool_names)
+    assert (
+        {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"} & set(plan.tool_names)
+    )
+
+
+def test_tool_exposure_routed_workspace_read_stays_workspace_focused() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["glob_search", "grep_search", "file_read", "file_write"],
+            "web": ["web_search", "web_fetch"],
+            "literature": ["arxiv_search", "semantic_scholar_search"],
+        }
+    )
+    available_tools = [
+        "glob_search",
+        "grep_search",
+        "file_read",
+        "file_write",
+        "arxiv_search",
+        "semantic_scholar_search",
+        "web_search",
+        "web_fetch",
+    ]
+
+    plan = planner.plan(
+        message="find matching files and search for TODO in the repo",
+        user_intent_message="find matching files and search for TODO in the repo",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(*available_tools),
+        routed_intent="workspace_read",
+        intent_confidence=0.92,
+        intent_source="classifier",
+        intent_rationale="Repo inspection intent is explicit.",
+    )
+
+    assert plan.matched_groups == ["workspace"]
+    assert {"glob_search", "grep_search", "file_read", "file_write"} <= set(plan.tool_names)
+    assert "web_search" not in plan.tool_names
+    assert "semantic_scholar_search" not in plan.tool_names
+    assert plan.exposure_metadata()["intent_route"]["intent"] == "workspace_read"
+
+
+def test_tool_exposure_normalizes_legacy_workspace_read_alias_in_metadata() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["glob_search", "grep_search", "file_read", "file_write"],
+            "web": ["web_search", "web_fetch"],
+        }
+    )
+
+    plan = planner.plan(
+        message="find matching files and search for TODO in the repo",
+        user_intent_message="find matching files and search for TODO in the repo",
+        available_tool_names=[
+            "glob_search",
+            "grep_search",
+            "file_read",
+            "file_write",
+            "web_search",
+            "web_fetch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(
+            "glob_search",
+            "grep_search",
+            "file_read",
+            "file_write",
+            "web_search",
+            "web_fetch",
+        ),
+        routed_intent="workspace_inspection",
+        intent_confidence=0.92,
+        intent_source="classifier",
+        intent_rationale="Legacy alias should normalize to workspace_read.",
+    )
+
+    assert plan.exposure_metadata()["intent_route"]["intent"] == "workspace_read"
+
+
+def test_tool_exposure_routed_tool_discovery_prefers_tool_search() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search"],
+            "web": ["web_search", "web_fetch"],
+        }
+    )
+    available_tools = [
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "tool_search",
+        "web_search",
+        "web_fetch",
+        "memory_search",
+    ]
+
+    plan = planner.plan(
+        message="tell me which tool I should use to inspect notebook outputs",
+        user_intent_message="tell me which tool I should use to inspect notebook outputs",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        routed_intent="tool_discovery",
+        intent_confidence=0.87,
+        intent_source="fallback_keyword",
+        intent_rationale="Matched tool-discovery language.",
+    )
+
+    assert "tool_search" in plan.tool_names
+    assert plan.exposure_metadata()["intent_route"]["source"] == "fallback_keyword"
 
 
 def test_tool_exposure_strict_mode_filters_risky_tools() -> None:
@@ -578,6 +921,102 @@ def test_tool_exposure_keeps_full_workspace_baseline_under_web_heuristics() -> N
         "docx_read",
         "notebook_read",
     } <= set(plan.tool_names)
+
+
+def test_tool_exposure_keeps_general_web_tools_for_chinese_weather_queries_in_workspace() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "file_read",
+                "glob_search",
+                "grep_search",
+                "csv_read",
+                "pdf_read",
+                "docx_read",
+                "notebook_read",
+                "file_write",
+            ],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+        }
+    )
+    plan = planner.plan(
+        message="幫我查詢台中明天天氣",
+        user_intent_message="幫我查詢台中明天天氣",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "csv_read",
+            "pdf_read",
+            "docx_read",
+            "notebook_read",
+            "file_write",
+            "web_search",
+            "web_fetch",
+            "get_current_time",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities("web_search", "web_fetch"),
+    )
+
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    assert {
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "csv_read",
+        "pdf_read",
+        "docx_read",
+        "notebook_read",
+    } <= set(plan.tool_names)
+
+
+def test_tool_exposure_keeps_open_world_research_tools_for_chinese_research_queries_in_workspace() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search", "pdf_read", "docx_read", "notebook_read"],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+            "literature": ["arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"],
+        }
+    )
+    available_tools = [
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "pdf_read",
+        "docx_read",
+        "notebook_read",
+        "web_search",
+        "web_fetch",
+        "get_current_time",
+        "arxiv_search",
+        "semantic_scholar_search",
+        "crossref_search",
+        "pubmed_search",
+    ]
+    plan = planner.plan(
+        message="幫我查詢 ESG 相關 LLM 微調資訊",
+        user_intent_message="幫我查詢 ESG 相關 LLM 微調資訊",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(
+            "web_search",
+            "web_fetch",
+            "arxiv_search",
+            "semantic_scholar_search",
+            "crossref_search",
+            "pubmed_search",
+        ),
+    )
+
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    assert (
+        {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"} & set(plan.tool_names)
+    )
 
 
 def test_tool_exposure_keeps_repo_queries_on_workspace_tools_without_open_world_leakage() -> None:

@@ -470,10 +470,11 @@ export function Sidebar() {
             <SidebarNavButton
               collapsed={collapsed}
               active={pathname === '/agent-runs' || pathname.startsWith('/agent-runs/')}
-              icon={<Workflow className="h-4 w-4" />}
-              title={t('sidebar.runDesk')}
-              description={t('sidebar.runDeskDescription')}
               onClick={() => router.push('/agent-runs')}
+              title={t('sidebar.workflows')}
+              icon={<Workflow className="h-4 w-4" />}
+              ariaLabel={t('sidebar.workflows')}
+              description={t('sidebar.runDeskDescription')}
             />
           </SidebarSection>
 
@@ -778,6 +779,7 @@ function SidebarNavButton({
   active,
   icon,
   title,
+  ariaLabel,
   description,
   onClick,
 }: {
@@ -785,6 +787,7 @@ function SidebarNavButton({
   active: boolean
   icon: React.ReactNode
   title: string
+  ariaLabel?: string
   description: string
   onClick: () => void
 }) {
@@ -794,6 +797,7 @@ function SidebarNavButton({
       size={collapsed ? 'icon' : 'sm'}
       onClick={onClick}
       title={title}
+      aria-label={ariaLabel ?? title}
       className={cn(
         collapsed ? 'mx-auto w-9' : 'h-auto w-full justify-start rounded-xl px-3 py-2.5'
       )}

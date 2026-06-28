@@ -106,6 +106,10 @@ function normalizeGoalCardRecord(value: unknown): GoalCardView | null {
     label,
     objective,
     executionMode,
+    copySource:
+      getNonEmptyString(record.copy_source) ??
+      getNonEmptyString(record.copySource) ??
+      null,
     protocolId:
       getNonEmptyString(record.protocol_id) ??
       getNonEmptyString(record.protocolId) ??
@@ -800,21 +804,20 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
   }
 
   if (type === 'turn_event') {
-    const phase = getString(event.phase)
+    const rawPhase = getString(event.phase)
     const payload = isRecord(event.payload) ? event.payload : {}
     const metadata = getPayloadRecord(payload, 'metadata', 'metadata')
+    const phase =
+      rawPhase === 'workflow_status' ||
+      rawPhase === 'workflow_artifact' ||
+      rawPhase === 'workflow_exec_update'
+        ? 'status'
+        : rawPhase
     const goalCard =
       normalizeGoalCardRecord(payload.goal_card) ??
       normalizeGoalCardRecord(payload.goalCard) ??
       normalizeGoalCardRecord(metadata?.goal_card) ??
       normalizeGoalCardRecord(metadata?.goalCard)
-    if (
-      phase === 'workflow_status' ||
-      phase === 'workflow_artifact' ||
-      phase === 'workflow_exec_update'
-    ) {
-      return null
-    }
     const finishReason =
       getNonEmptyString(payload.finish_reason) ??
       getNonEmptyString(payload.finishReason) ??
@@ -841,7 +844,10 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       toolName: getString(payload.tool_name) ?? getString(payload.toolName) ?? undefined,
       toolArgs: getPayloadRecord(payload, 'arguments', 'toolArgs'),
       toolResult: payload.result ?? payload.toolResult,
-      toolMeta: getPayloadRecord(payload, 'metadata', 'metadata'),
+      toolMeta: {
+        ...(getPayloadRecord(payload, 'metadata', 'metadata') ?? {}),
+        ...(rawPhase && rawPhase !== phase ? { raw_phase: rawPhase } : {}),
+      },
       toolError:
         getNonEmptyString(payload.error) ??
         getNonEmptyString(payload.toolError) ??
@@ -1940,7 +1946,47 @@ export interface SessionSecurityOverride {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
 }
 
-export type SessionGoalState = Record<string, unknown>
+export type GoalInteractionMode = 'goal' | 'workflow'
+export type GoalExecutionTopology = 'single_agent' | 'multi_agent'
+
+export interface SessionGoalSummary {
+  goal_id?: string | null
+  objective?: string
+  execution_mode?: GoalExecutionMode | null
+  interaction_mode?: GoalInteractionMode | null
+  execution_topology?: GoalExecutionTopology | null
+  protocol_id?: string | null
+  bound_run_id?: string | null
+  protocol_selection?: string | null
+  selection_rationale?: string | null
+  models?: string[]
+  role_summary?: string | null
+  runtime_mode?: string | null
+  risk_note?: string | null
+  status?: string | null
+}
+
+export interface SessionGoalProposal extends SessionGoalSummary {
+  proposal_id?: string | null
+  revision_index?: number
+  updated_at?: string | null
+  assistant_explanation?: string | null
+  assistant_explanation_source?: string | null
+}
+
+export interface SessionGoalState {
+  active_goal_id?: string | null
+  active_goal_status?: string | null
+  execution_mode?: GoalExecutionMode | null
+  interaction_mode?: GoalInteractionMode | null
+  execution_topology?: GoalExecutionTopology | null
+  bound_run_id?: string | null
+  protocol_selection?: string | null
+  selection_rationale?: string | null
+  default_route?: 'chat' | 'goal' | 'workflow' | null
+  last_goal_summary?: SessionGoalSummary | null
+  pending_proposal?: SessionGoalProposal | null
+}
 
 export interface SessionWorkflowConfig {
   title?: string | null
@@ -1999,11 +2045,82 @@ function normalizeSessionWorkflowState(value: unknown): SessionWorkflowState | n
   }
 }
 
+function normalizeGoalInteractionModeValue(value: unknown): GoalInteractionMode | null {
+  return value === 'goal' || value === 'workflow' ? value : null
+}
+
+function normalizeGoalExecutionTopologyValue(value: unknown): GoalExecutionTopology | null {
+  return value === 'single_agent' || value === 'multi_agent' ? value : null
+}
+
+function normalizeSessionGoalSummary(value: unknown): SessionGoalSummary | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  const objective = getString(value.objective)
+  if (!objective) {
+    return null
+  }
+  return {
+    goal_id: getNullableString(value.goal_id),
+    objective,
+    execution_mode: normalizeGoalExecutionMode(value.execution_mode),
+    interaction_mode: normalizeGoalInteractionModeValue(value.interaction_mode),
+    execution_topology: normalizeGoalExecutionTopologyValue(value.execution_topology),
+    protocol_id: getNullableString(value.protocol_id),
+    bound_run_id: getNullableString(value.bound_run_id),
+    protocol_selection: getNullableString(value.protocol_selection),
+    selection_rationale: getNullableString(value.selection_rationale),
+    models: getStringArray(value.models),
+    role_summary: getNullableString(value.role_summary),
+    runtime_mode: getNullableString(value.runtime_mode),
+    risk_note: getNullableString(value.risk_note),
+    status: getNullableString(value.status),
+  }
+}
+
+function normalizeSessionGoalProposal(value: unknown): SessionGoalProposal | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  const summary = normalizeSessionGoalSummary(value)
+  if (!summary) {
+    return null
+  }
+  return {
+    ...summary,
+    proposal_id: getNullableString(value.proposal_id) ?? getNullableString(value.id),
+    revision_index: getNumber(value.revision_index) ?? 0,
+    updated_at: getNullableString(value.updated_at),
+    assistant_explanation:
+      getNullableString(value.assistant_explanation) ??
+      getNullableString(value.assistantExplanation),
+    assistant_explanation_source:
+      getNullableString(value.assistant_explanation_source) ??
+      getNullableString(value.assistantExplanationSource),
+  }
+}
+
 function normalizeSessionGoalState(value: unknown): SessionGoalState | null {
   if (!isRecord(value)) {
     return null
   }
-  return { ...value }
+  return {
+    active_goal_id: getNullableString(value.active_goal_id),
+    active_goal_status: getNullableString(value.active_goal_status),
+    execution_mode: normalizeGoalExecutionMode(value.execution_mode),
+    interaction_mode: normalizeGoalInteractionModeValue(value.interaction_mode),
+    execution_topology: normalizeGoalExecutionTopologyValue(value.execution_topology),
+    bound_run_id: getNullableString(value.bound_run_id),
+    protocol_selection: getNullableString(value.protocol_selection),
+    selection_rationale: getNullableString(value.selection_rationale),
+    default_route:
+      value.default_route === 'goal' || value.default_route === 'workflow' || value.default_route === 'chat'
+        ? value.default_route
+        : 'chat',
+    last_goal_summary: normalizeSessionGoalSummary(value.last_goal_summary),
+    pending_proposal: normalizeSessionGoalProposal(value.pending_proposal),
+  }
 }
 
 function normalizeSessionSecurityOverride(value: unknown): SessionSecurityOverride | null {
@@ -6382,7 +6499,12 @@ export interface GoalSummary {
   title: string | null
   goal_type: string | null
   execution_mode: GoalExecutionMode
+  interaction_mode: GoalInteractionMode
+  execution_topology: GoalExecutionTopology
   protocol_id: string | null
+  bound_run_id: string | null
+  protocol_selection: string | null
+  selection_rationale: string | null
   topic: string | null
   project_id: string | null
   workspace_dir: string | null
@@ -6518,6 +6640,12 @@ export interface GoalOperatorAuditEntry {
 export interface GoalHealthSummary {
   goal_id: string
   execution_mode: GoalExecutionMode
+  interaction_mode: GoalInteractionMode
+  execution_topology: GoalExecutionTopology
+  protocol_id: string | null
+  bound_run_id: string | null
+  protocol_selection: string | null
+  selection_rationale: string | null
   status: string
   current_attempt_id: string | null
   attempt_count: number
@@ -6547,7 +6675,12 @@ export interface CreateGoalInput {
   title?: string | null
   goal_type?: string | null
   execution_mode?: GoalExecutionMode
+  interaction_mode?: GoalInteractionMode | null
+  execution_topology?: GoalExecutionTopology | null
   protocol_id?: string | null
+  bound_run_id?: string | null
+  protocol_selection?: string | null
+  selection_rationale?: string | null
   topic?: string | null
   projectId?: string | null
   workspaceDir?: string | null
@@ -6556,6 +6689,39 @@ export interface CreateGoalInput {
   source_manifest?: Record<string, unknown>
   summary?: Record<string, unknown>
   metadata?: Record<string, unknown>
+}
+
+export type GoalPendingProposalIntent =
+  | 'confirm_start'
+  | 'revise_proposal'
+  | 'exit_goal_lane'
+  | 'ambiguous'
+
+export interface ClassifyPendingGoalProposalIntentInput {
+  message: string
+  proposalObjective: string
+  executionMode: GoalExecutionMode
+}
+
+export interface PendingGoalProposalIntentResult {
+  intent: GoalPendingProposalIntent
+  confidence: number | null
+  rationale: string
+}
+
+export interface GenerateGoalProposalAssistantCopyInput {
+  message: string
+  proposalObjective: string
+  executionMode: GoalExecutionMode
+  protocolSelection?: string | null
+  roleSummary?: string | null
+  runtimeMode?: string | null
+  revisionIndex?: number
+}
+
+export interface GoalProposalAssistantCopyResult {
+  explanation: string
+  source: 'model' | 'fallback'
 }
 
 export interface ResumeGoalInput {
@@ -6620,7 +6786,12 @@ function normalizeGoalSummary(payload: unknown): GoalSummary {
     title: getNullableString(record.title),
     goal_type: getNullableString(record.goal_type),
     execution_mode: normalizeGoalExecutionMode(record.execution_mode),
+    interaction_mode: normalizeGoalInteractionModeValue(record.interaction_mode) ?? 'workflow',
+    execution_topology: normalizeGoalExecutionTopologyValue(record.execution_topology) ?? 'multi_agent',
     protocol_id: getNullableString(record.protocol_id),
+    bound_run_id: getNullableString(record.bound_run_id),
+    protocol_selection: getNullableString(record.protocol_selection) ?? getNullableString(record.protocol_id),
+    selection_rationale: getNullableString(record.selection_rationale),
     topic: getNullableString(record.topic),
     project_id: getNullableString(record.project_id),
     workspace_dir: getNullableString(record.workspace_dir),
@@ -6815,6 +6986,12 @@ function normalizeGoalHealthSummary(payload: unknown): GoalHealthSummary {
   return {
     goal_id: getString(record.goal_id) ?? '',
     execution_mode: normalizeGoalExecutionMode(record.execution_mode),
+    interaction_mode: normalizeGoalInteractionModeValue(record.interaction_mode) ?? 'workflow',
+    execution_topology: normalizeGoalExecutionTopologyValue(record.execution_topology) ?? 'multi_agent',
+    protocol_id: getNullableString(record.protocol_id),
+    bound_run_id: getNullableString(record.bound_run_id),
+    protocol_selection: getNullableString(record.protocol_selection) ?? getNullableString(record.protocol_id),
+    selection_rationale: getNullableString(record.selection_rationale),
     status: getString(record.status) ?? 'unknown',
     current_attempt_id: getNullableString(record.current_attempt_id),
     attempt_count: getNumber(record.attempt_count) ?? 0,
@@ -6982,7 +7159,12 @@ export async function createGoal(input: CreateGoalInput): Promise<GoalSummary> {
       title: input.title ?? null,
       goal_type: input.goal_type ?? null,
       execution_mode: input.execution_mode ?? 'workflow',
+      interaction_mode: input.interaction_mode ?? null,
+      execution_topology: input.execution_topology ?? null,
       protocol_id: input.protocol_id ?? null,
+      bound_run_id: input.bound_run_id ?? null,
+      protocol_selection: input.protocol_selection ?? null,
+      selection_rationale: input.selection_rationale ?? null,
       topic: input.topic ?? null,
       project_id: input.projectId ?? null,
       workspace_dir: input.workspaceDir ?? null,
@@ -6994,6 +7176,56 @@ export async function createGoal(input: CreateGoalInput): Promise<GoalSummary> {
     }),
   })
   return normalizeGoalSummary(payload)
+}
+
+export async function classifyPendingGoalProposalIntent(
+  input: ClassifyPendingGoalProposalIntentInput
+): Promise<PendingGoalProposalIntentResult> {
+  const payload = await requestJson<Record<string, ApiValue>>('/goals/pending-proposal-intent', {
+    method: 'POST',
+    body: JSON.stringify({
+      message: input.message,
+      proposal_objective: input.proposalObjective,
+      execution_mode: input.executionMode,
+    }),
+  })
+
+  const rawIntent = getNonEmptyString(payload.intent)
+  const intent: GoalPendingProposalIntent =
+    rawIntent === 'confirm_start' ||
+    rawIntent === 'revise_proposal' ||
+    rawIntent === 'exit_goal_lane' ||
+    rawIntent === 'ambiguous'
+      ? rawIntent
+      : 'ambiguous'
+
+  return {
+    intent,
+    confidence: getNumber(payload.confidence) ?? null,
+    rationale: getNonEmptyString(payload.rationale) ?? 'No classifier rationale provided.',
+  }
+}
+
+export async function generateGoalProposalAssistantCopy(
+  input: GenerateGoalProposalAssistantCopyInput
+): Promise<GoalProposalAssistantCopyResult> {
+  const payload = await requestJson<Record<string, ApiValue>>('/goals/proposal-assistant-copy', {
+    method: 'POST',
+    body: JSON.stringify({
+      message: input.message,
+      proposal_objective: input.proposalObjective,
+      execution_mode: input.executionMode,
+      protocol_selection: input.protocolSelection ?? null,
+      role_summary: input.roleSummary ?? null,
+      runtime_mode: input.runtimeMode ?? null,
+      revision_index: input.revisionIndex ?? 0,
+    }),
+  })
+
+  return {
+    explanation: getNonEmptyString(payload.explanation) ?? '',
+    source: payload.source === 'fallback' ? 'fallback' : 'model',
+  }
 }
 
 export async function startGoal(goalId: string): Promise<GoalSummary> {

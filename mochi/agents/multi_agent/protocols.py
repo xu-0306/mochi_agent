@@ -6,11 +6,21 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
 ProtocolName = Literal[
+    "autonomous_single_agent",
     "teacher_student_distill",
     "multi_agent_debate",
     "dr_zero_self_evolve",
     "controlled_subagent_execution",
 ]
+
+
+@dataclass(frozen=True)
+class AutonomousSingleAgentProtocol:
+    """Single-agent autonomous execution with one durable worker role."""
+
+    protocol: Literal["autonomous_single_agent"] = "autonomous_single_agent"
+    agent_role_id: str = "agent"
+    guidance_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,7 +69,8 @@ class ControlledSubagentExecutionProtocol:
 
 
 ProtocolConfig = (
-    TeacherStudentDistillProtocol
+    AutonomousSingleAgentProtocol
+    | TeacherStudentDistillProtocol
     | MultiAgentDebateProtocol
     | DrZeroSelfEvolveProtocol
     | ControlledSubagentExecutionProtocol
@@ -73,6 +84,7 @@ def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) ->
     if isinstance(
         payload,
         (
+            AutonomousSingleAgentProtocol,
             TeacherStudentDistillProtocol,
             MultiAgentDebateProtocol,
             DrZeroSelfEvolveProtocol,
@@ -82,6 +94,11 @@ def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) ->
         return payload
 
     raw_protocol = str(payload.get("protocol", "teacher_student_distill")).strip()
+    if raw_protocol == "autonomous_single_agent":
+        return AutonomousSingleAgentProtocol(
+            agent_role_id=_clean_role_id(payload.get("agent_role_id"), default="agent"),
+            guidance_required=bool(payload.get("guidance_required", False)),
+        )
     if raw_protocol == "teacher_student_distill":
         return TeacherStudentDistillProtocol(
             rounds=_bounded_rounds(payload.get("rounds"), default=1),

@@ -134,9 +134,28 @@ function isWorkflowAttentionStatus(
   )
 }
 
-function getGoalExecutionMode(goal: Record<string, unknown> | null | undefined): 'single_agent' | 'workflow' | null {
-  const executionMode = goal?.execution_mode
-  return executionMode === 'single_agent' || executionMode === 'workflow' ? executionMode : null
+function getGoalRuntimeContext(goal: {
+  execution_mode?: unknown
+  interaction_mode?: unknown
+  execution_topology?: unknown
+} | null | undefined): {
+  executionMode: 'single_agent' | 'workflow' | null
+  interactionMode: 'goal' | 'workflow' | null
+  executionTopology: 'single_agent' | 'multi_agent' | null
+} {
+  const executionMode =
+    goal?.execution_mode === 'single_agent' || goal?.execution_mode === 'workflow'
+      ? goal.execution_mode
+      : null
+  const interactionMode =
+    goal?.interaction_mode === 'goal' || goal?.interaction_mode === 'workflow'
+      ? goal.interaction_mode
+      : null
+  const executionTopology =
+    goal?.execution_topology === 'single_agent' || goal?.execution_topology === 'multi_agent'
+      ? goal.execution_topology
+      : null
+  return { executionMode, interactionMode, executionTopology }
 }
 
 export type TaskPanelMode = 'default' | 'subagent'
@@ -1232,13 +1251,15 @@ export function TaskPanel({
     state.sessions.find((session) => session.id === state.currentSessionId)?.workflow ??
     null
   )
-  const sessionGoalExecutionMode = getGoalExecutionMode(currentSessionGoal)
+  const goalRuntimeContext = getGoalRuntimeContext(currentSessionGoal)
+  const sessionGoalExecutionMode = goalRuntimeContext.executionMode
   const [workflowRun, setWorkflowRun] = React.useState<AgentRunDetail | null>(null)
   const [workflowHealth, setWorkflowHealth] = React.useState<AgentRunHealthSummary | null>(null)
   const [workflowLoading, setWorkflowLoading] = React.useState(false)
   const hasSessionGoal = sessionGoalExecutionMode !== null
   const workflowNativeContext =
-    sessionGoalExecutionMode === 'workflow' ||
+    goalRuntimeContext.interactionMode === 'workflow' ||
+    goalRuntimeContext.executionTopology === 'multi_agent' ||
     (!hasSessionGoal && Boolean(currentSessionWorkflow?.enabled || workflowRunId))
 
   React.useEffect(() => {

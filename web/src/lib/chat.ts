@@ -75,6 +75,7 @@ export interface GoalCardView {
   label: string
   objective: string
   executionMode: GoalCardExecutionMode
+  copySource?: string | null
   protocolId?: string | null
   models: string[]
   roleSummary?: string | null

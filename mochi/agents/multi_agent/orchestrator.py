@@ -38,6 +38,7 @@ from mochi.agents.multi_agent.evaluator import (
     resolve_evidence_gate_status,
 )
 from mochi.agents.multi_agent.protocols import (
+    AutonomousSingleAgentProtocol,
     ControlledSubagentExecutionProtocol,
     DrZeroSelfEvolveProtocol,
     MultiAgentDebateProtocol,
@@ -56,6 +57,7 @@ from mochi.agents.multi_agent.research import (
     synthesize_research_brief,
 )
 from mochi.agents.multi_agent.roles import (
+    build_autonomous_single_agent_roles,
     build_dr_zero_roles,
     build_multi_agent_debate_roles,
     build_teacher_student_roles,
@@ -2117,6 +2119,16 @@ class MultiAgentOrchestrator:
         emit: Any,
     ) -> tuple[list[CandidateOutput], dict[str, Any]]:
         ordered_models = list(selected_models_roles.values())
+        if isinstance(protocol_config, AutonomousSingleAgentProtocol):
+            return await self._run_model_backed_autonomous_single_agent(
+                task_input=task_input,
+                protocol_config=protocol_config,
+                guidance_messages=guidance_messages,
+                selected_models_roles=selected_models_roles,
+                ordered_models=ordered_models,
+                emit=emit,
+            )
+
         if isinstance(protocol_config, TeacherStudentDistillProtocol):
             roles = build_teacher_student_roles(
                 teacher_role_id=protocol_config.teacher_role_id,
@@ -2287,6 +2299,76 @@ class MultiAgentOrchestrator:
             ordered_models=ordered_models,
             emit=emit,
         )
+
+    async def _run_model_backed_autonomous_single_agent(
+        self,
+        *,
+        task_input: str,
+        protocol_config: AutonomousSingleAgentProtocol,
+        guidance_messages: list[str],
+        selected_models_roles: dict[str, str],
+        ordered_models: list[str],
+        emit: Any,
+    ) -> tuple[list[CandidateOutput], dict[str, Any]]:
+        roles = build_autonomous_single_agent_roles(
+            agent_role_id=protocol_config.agent_role_id,
+        )
+        agent_role = roles[0]
+        agent_model_id = _resolve_protocol_role_model_id(
+            role_id=agent_role.role_id,
+            selected_models_roles=selected_models_roles,
+            ordered_fallback=ordered_models,
+            fallback_index=0,
+        )
+        agent_output = self._resume_candidate_for_task("autonomous_single_agent")
+        if agent_output is None and not agent_model_id:
+            return [], {}
+
+        if agent_output is not None:
+            self._mark_role_task_reused(
+                role_id=agent_role.role_id,
+                stage="autonomous_single_agent",
+                candidate=agent_output,
+            )
+            self._mark_task_reused(
+                task_key="autonomous_single_agent",
+                role_id=agent_role.role_id,
+                stage="autonomous_single_agent",
+                candidate=agent_output,
+            )
+            return [agent_output], {}
+
+        try:
+            agent_output = await self._generate_role_candidate(
+                role_id=agent_role.role_id,
+                role_title=agent_role.title,
+                role_instruction=agent_role.instruction,
+                model_id=agent_model_id,
+                task_input=task_input,
+                guidance_messages=guidance_messages,
+                supporting_candidates=[],
+                stage="autonomous_single_agent",
+            )
+            emit(
+                "role_output",
+                asdict(
+                    RoleOutputPayload(
+                        role_id=agent_output.role_id,
+                        content=agent_output.content,
+                        round_index=1,
+                        candidate_id=agent_output.candidate_id,
+                        model_id=agent_model_id,
+                    )
+                ),
+            )
+        except SubagentRoleError as exc:
+            self._raise_subagent_disconnect_stop(
+                error=exc,
+                task_input=task_input,
+                protocol=protocol_config.protocol,
+                stage=exc.stage,
+            )
+        return [agent_output], {}
 
     async def _run_model_backed_dr_zero(
         self,
@@ -3531,6 +3613,31 @@ class MultiAgentOrchestrator:
         protocol_config: ProtocolConfig,
         emit: Any,
     ) -> tuple[list[CandidateOutput], dict[str, Any]]:
+        if isinstance(protocol_config, AutonomousSingleAgentProtocol):
+            roles = build_autonomous_single_agent_roles(
+                agent_role_id=protocol_config.agent_role_id,
+            )
+            agent_role = roles[0]
+            candidate = CandidateOutput(
+                candidate_id=agent_role.role_id,
+                role_id=agent_role.role_id,
+                content=f"{agent_role.title} placeholder response for: {task_input}",
+                metadata={"placeholder": True},
+            )
+            emit(
+                "role_output",
+                asdict(
+                    RoleOutputPayload(
+                        role_id=candidate.role_id,
+                        content=candidate.content,
+                        round_index=1,
+                        candidate_id=candidate.candidate_id,
+                        model_id=None,
+                    )
+                ),
+            )
+            return [candidate], {}
+
         if isinstance(protocol_config, TeacherStudentDistillProtocol):
             roles = build_teacher_student_roles(
                 teacher_role_id=protocol_config.teacher_role_id,
@@ -4741,6 +4848,14 @@ def _resolve_judge_model_id(
     selected_models_roles: dict[str, str],
 ) -> str | None:
     ordered_models = list(selected_models_roles.values())
+    if isinstance(protocol_config, AutonomousSingleAgentProtocol):
+        return (
+            selected_models_roles.get(protocol_config.agent_role_id)
+            or selected_models_roles.get("agent")
+            or selected_models_roles.get("judge")
+            or selected_models_roles.get("evaluator")
+            or (ordered_models[0] if ordered_models else None)
+        )
     if isinstance(protocol_config, TeacherStudentDistillProtocol):
         return (
             selected_models_roles.get("judge")

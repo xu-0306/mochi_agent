@@ -27,6 +27,7 @@ from mochi.agents.multi_agent.orchestrator import (
     RunStateTransitionError,
 )
 from mochi.agents.multi_agent.protocols import (
+    AutonomousSingleAgentProtocol,
     ControlledSubagentExecutionProtocol,
     DrZeroSelfEvolveProtocol,
     MultiAgentDebateProtocol,
@@ -37,6 +38,7 @@ from mochi.agents.multi_agent.protocols import (
 )
 from mochi.agents.multi_agent.roles import (
     AgentRoleProfile,
+    build_autonomous_single_agent_roles,
     build_controlled_execution_roles,
     build_dr_zero_roles,
     build_multi_agent_debate_roles,
@@ -45,6 +47,7 @@ from mochi.agents.multi_agent.roles import (
 
 __all__ = [
     "AgentRoleProfile",
+    "AutonomousSingleAgentProtocol",
     "BoundedRunStateMachine",
     "CandidateOutput",
     "CandidateScore",
@@ -65,6 +68,7 @@ __all__ = [
     "SubagentExecutionCoordinator",
     "SubagentExecutionPolicy",
     "TeacherStudentDistillProtocol",
+    "build_autonomous_single_agent_roles",
     "build_dr_zero_roles",
     "build_controlled_execution_roles",
     "build_multi_agent_debate_roles",

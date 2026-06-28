@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 RoleKind = Literal[
+    "agent",
     "teacher",
     "student",
     "debater",
@@ -39,6 +40,24 @@ class AgentRoleProfile:
             "instruction": self.instruction,
             "metadata": dict(self.metadata),
         }
+
+
+def build_autonomous_single_agent_roles(
+    *,
+    agent_role_id: str = "agent",
+) -> list[AgentRoleProfile]:
+    """Build the single durable worker role for autonomous goal execution."""
+    return [
+        AgentRoleProfile(
+            role_id=agent_role_id,
+            kind="agent",
+            title="Autonomous Agent",
+            instruction=(
+                "Work through the task directly, use available tools when helpful, and return "
+                "the strongest grounded answer you can produce."
+            ),
+        )
+    ]
 
 
 def build_teacher_student_roles(

@@ -12,28 +12,18 @@ import {
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import type { GoalCardView } from '@/lib/chat'
+import {
+  buildGoalCardChromeCopy,
+  buildGoalCardExecutionModeLabel,
+  buildGoalCardKindLabel,
+  buildGoalCardStatusLabel,
+  buildGoalHiddenModelsLabel,
+  buildGoalProposalSystemCtaCopy,
+} from '@/lib/goal-proposal-copy'
 import { cn } from '@/lib/utils'
 
 interface GoalCardProps {
   card: GoalCardView
-}
-
-function formatEnumLabel(value: string): string {
-  return value.replaceAll('_', ' ')
-}
-
-function kindLabel(kind: GoalCardView['kind']): string {
-  if (kind === 'revised_proposal') {
-    return 'Revised proposal'
-  }
-  if (kind === 'started') {
-    return 'Goal started'
-  }
-  return 'Proposal'
-}
-
-function executionModeLabel(mode: GoalCardView['executionMode']): string {
-  return mode === 'single_agent' ? 'Single agent' : 'Workflow'
 }
 
 function kindTone(kind: GoalCardView['kind'], superseded: boolean): string {
@@ -130,17 +120,36 @@ export function GoalCard({ card }: GoalCardProps) {
   const KindIcon = kindIcon(card.kind)
   const visibleModels = card.models.slice(0, 3)
   const hiddenModelCount = Math.max(0, card.models.length - visibleModels.length)
+  const copySource =
+    card.copySource ||
+    card.objective ||
+    card.roleSummary ||
+    card.runtimeMode ||
+    card.label
+  const chromeCopy = buildGoalCardChromeCopy(copySource)
+  const localizedKindLabel = buildGoalCardKindLabel(copySource, card.kind)
+  const localizedExecutionModeLabel = buildGoalCardExecutionModeLabel(
+    copySource,
+    card.executionMode
+  )
+  const localizedStatusLabel = buildGoalCardStatusLabel(copySource, card.status)
+  const showProposalCta =
+    !card.superseded &&
+    (card.kind === 'proposal' || card.kind === 'revised_proposal')
+  const proposalCtaCopy = buildGoalProposalSystemCtaCopy(
+    copySource
+  )
   const metadata = [
     {
       icon: Target,
-      label: 'Execution',
-      value: executionModeLabel(card.executionMode),
+      label: chromeCopy.executionLabel,
+      value: localizedExecutionModeLabel,
       mono: false,
     },
     ...(card.protocolId
       ? [{
           icon: Layers3,
-          label: 'Protocol',
+          label: chromeCopy.protocolLabel,
           value: card.protocolId,
           mono: true,
         }]
@@ -148,7 +157,7 @@ export function GoalCard({ card }: GoalCardProps) {
     ...(card.runtimeMode
       ? [{
           icon: Compass,
-          label: 'Runtime',
+          label: chromeCopy.runtimeLabel,
           value: card.runtimeMode,
           mono: false,
         }]
@@ -156,7 +165,7 @@ export function GoalCard({ card }: GoalCardProps) {
     ...(card.goalId
       ? [{
           icon: Flag,
-          label: 'Goal ID',
+          label: chromeCopy.goalIdLabel,
           value: card.goalId,
           mono: true,
         }]
@@ -173,7 +182,7 @@ export function GoalCard({ card }: GoalCardProps) {
             </span>
             <div className="min-w-0">
               <p className="truncate text-sm font-semibold text-foreground">{card.label}</p>
-              <p className="text-xs text-muted-foreground">{kindLabel(card.kind)}</p>
+              <p className="text-xs text-muted-foreground">{localizedKindLabel}</p>
             </div>
           </div>
         </div>
@@ -184,26 +193,26 @@ export function GoalCard({ card }: GoalCardProps) {
               kindTone(card.kind, Boolean(card.superseded))
             )}
           >
-            {kindLabel(card.kind)}
+            {localizedKindLabel}
           </span>
-          <Badge variant="outline">{executionModeLabel(card.executionMode)}</Badge>
-          {card.status ? (
+          <Badge variant="outline">{localizedExecutionModeLabel}</Badge>
+          {localizedStatusLabel ? (
             <span
               className={cn(
                 'rounded-full border px-2.5 py-1 text-[11px] font-medium capitalize',
                 statusTone(card.status)
               )}
             >
-              {formatEnumLabel(card.status)}
+              {localizedStatusLabel}
             </span>
           ) : null}
-          {card.superseded ? <Badge variant="outline">Superseded</Badge> : null}
+          {card.superseded ? <Badge variant="outline">{chromeCopy.supersededLabel}</Badge> : null}
         </div>
       </div>
 
       <div className="mt-4 rounded-xl border border-border bg-surface-layer/70 p-3">
         <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-          Objective
+          {chromeCopy.objectiveLabel}
         </p>
         <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">
           {card.objective}
@@ -227,7 +236,7 @@ export function GoalCard({ card }: GoalCardProps) {
       {visibleModels.length > 0 ? (
         <div className="mt-4 rounded-xl border border-border bg-surface-layer/50 p-3">
           <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-            Models
+            {chromeCopy.modelsLabel}
           </p>
           <div className="mt-2 flex flex-wrap gap-2">
             {visibleModels.map((model) => (
@@ -236,8 +245,45 @@ export function GoalCard({ card }: GoalCardProps) {
               </Badge>
             ))}
             {hiddenModelCount > 0 ? (
-              <Badge variant="outline">+{hiddenModelCount} more</Badge>
+              <Badge variant="outline">{buildGoalHiddenModelsLabel(copySource, hiddenModelCount)}</Badge>
             ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {showProposalCta ? (
+        <div className="mt-4 rounded-xl border border-primary-400/20 bg-primary-500/8 p-3">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+            {proposalCtaCopy.title}
+          </p>
+          <div className="mt-2 grid gap-2 sm:grid-cols-3">
+            <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
+                <PlayCircle className="h-4 w-4 text-primary-300" />
+                <span>{proposalCtaCopy.launchLabel}</span>
+              </div>
+              <p className="mt-1 text-xs leading-5 text-foreground/80">
+                {proposalCtaCopy.launchBody}
+              </p>
+            </div>
+            <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
+                <RefreshCcw className="h-4 w-4 text-primary-300" />
+                <span>{proposalCtaCopy.reviseLabel}</span>
+              </div>
+              <p className="mt-1 text-xs leading-5 text-foreground/80">
+                {proposalCtaCopy.reviseBody}
+              </p>
+            </div>
+            <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
+                <Compass className="h-4 w-4 text-primary-300" />
+                <span>{proposalCtaCopy.chatLabel}</span>
+              </div>
+              <p className="mt-1 text-xs leading-5 text-foreground/80">
+                {proposalCtaCopy.chatBody}
+              </p>
+            </div>
           </div>
         </div>
       ) : null}
@@ -245,7 +291,7 @@ export function GoalCard({ card }: GoalCardProps) {
       {card.roleSummary ? (
         <div className="mt-4 rounded-xl border border-border bg-surface-layer/50 p-3">
           <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-            Role summary
+            {chromeCopy.roleSummaryLabel}
           </p>
           <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-foreground/90">
             {card.roleSummary}
@@ -259,7 +305,7 @@ export function GoalCard({ card }: GoalCardProps) {
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning-foreground" />
             <div className="min-w-0">
               <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-warning-foreground">
-                Risk note
+                {chromeCopy.riskNoteLabel}
               </p>
               <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-warning-foreground/90">
                 {card.riskNote}

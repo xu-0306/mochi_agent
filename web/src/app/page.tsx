@@ -52,6 +52,19 @@ import {
   summarizeGoalProposalModelReadinessRisk,
   type GoalProposalModelReadinessById,
 } from '@/lib/goal-proposal-models'
+import {
+  buildGoalCardChromeCopy,
+  buildGoalCardKindLabel,
+  buildGoalCommandHelpMessage,
+  buildGoalFollowUpMessage,
+  buildGoalLifecycleMessage,
+  buildGoalOpenWorkflowLabel,
+  buildGoalPendingApprovalNotice,
+  buildGoalReviewApprovalsLabel,
+  buildGoalUiErrorMessage,
+  buildLocalGoalProposalAssistantExplanation,
+} from '@/lib/goal-proposal-copy'
+import { resolvePreferredCurrentModelId } from '@/lib/current-model-selection'
 import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
@@ -376,7 +389,12 @@ interface GoalSessionSummary {
   goal_id: string | null
   objective: string
   execution_mode: api.GoalExecutionMode
+  interaction_mode: api.GoalInteractionMode
+  execution_topology: api.GoalExecutionTopology
   protocol_id: string | null
+  bound_run_id: string | null
+  protocol_selection: string | null
+  selection_rationale: string | null
   models: string[]
   role_summary: string | null
   runtime_mode: string | null
@@ -388,12 +406,19 @@ interface GoalSessionProposal extends GoalSessionSummary {
   proposal_id: string
   revision_index: number
   updated_at: string
+  assistant_explanation: string | null
+  assistant_explanation_source: string | null
 }
 
 interface GoalSessionState {
   active_goal_id: string | null
   active_goal_status: string | null
   execution_mode: api.GoalExecutionMode | null
+  interaction_mode: api.GoalInteractionMode | null
+  execution_topology: api.GoalExecutionTopology | null
+  bound_run_id: string | null
+  protocol_selection: string | null
+  selection_rationale: string | null
   default_route: 'chat' | 'goal' | 'workflow'
   last_goal_summary: GoalSessionSummary | null
   pending_proposal: GoalSessionProposal | null
@@ -411,6 +436,8 @@ interface SyncGoalWorkflowStateInput {
   sessionId: string
   baseWorkflow: api.SessionWorkflowState
   executionMode: api.GoalExecutionMode
+  interactionMode?: api.GoalInteractionMode | null
+  executionTopology?: api.GoalExecutionTopology | null
   goalStatus?: string | null
   runId?: string | null
 }
@@ -454,11 +481,16 @@ interface DirectChatTurnInput {
   sessionScope: SendSessionScope
 }
 
-const GOAL_PROPOSAL_REPLY_HELP =
-  'Reply `start`, `go ahead`, `proceed`, `yes`, or `run it` to launch it. Send another follow-up to revise it, or use `/chat` to step outside the goal lane.'
-
 function normalizeGoalExecutionMode(value: unknown): api.GoalExecutionMode | null {
   return value === 'single_agent' || value === 'workflow' ? value : null
+}
+
+function normalizeGoalInteractionMode(value: unknown): api.GoalInteractionMode | null {
+  return value === 'goal' || value === 'workflow' ? value : null
+}
+
+function normalizeGoalExecutionTopology(value: unknown): api.GoalExecutionTopology | null {
+  return value === 'single_agent' || value === 'multi_agent' ? value : null
 }
 
 function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null {
@@ -476,7 +508,12 @@ function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null 
     goal_id: getString(value.goal_id) ?? null,
     objective,
     execution_mode: executionMode,
+    interaction_mode: normalizeGoalInteractionMode(value.interaction_mode) ?? 'workflow',
+    execution_topology: normalizeGoalExecutionTopology(value.execution_topology) ?? 'multi_agent',
     protocol_id: getString(value.protocol_id) ?? null,
+    bound_run_id: getString(value.bound_run_id) ?? null,
+    protocol_selection: getString(value.protocol_selection) ?? getString(value.protocol_id) ?? null,
+    selection_rationale: getString(value.selection_rationale) ?? null,
     models: getStringArray(value.models),
     role_summary: getString(value.role_summary) ?? null,
     runtime_mode: getString(value.runtime_mode) ?? null,
@@ -500,6 +537,11 @@ function normalizeGoalSessionProposal(value: unknown): GoalSessionProposal | nul
     proposal_id: getString(value.proposal_id) ?? getString(value.id) ?? `goal-proposal-${Date.now()}`,
     revision_index: Math.max(0, Number(getString(value.revision_index) ?? value.revision_index ?? 0) || 0),
     updated_at: getString(value.updated_at) ?? new Date().toISOString(),
+    assistant_explanation: getString(value.assistant_explanation) ?? getString(value.assistantExplanation) ?? null,
+    assistant_explanation_source:
+      getString(value.assistant_explanation_source) ??
+      getString(value.assistantExplanationSource) ??
+      null,
   }
 }
 
@@ -509,6 +551,11 @@ function normalizeGoalSessionState(value: api.SessionGoalState | null | undefine
       active_goal_id: null,
       active_goal_status: null,
       execution_mode: null,
+      interaction_mode: null,
+      execution_topology: null,
+      bound_run_id: null,
+      protocol_selection: null,
+      selection_rationale: null,
       default_route: 'chat',
       last_goal_summary: null,
       pending_proposal: null,
@@ -520,8 +567,33 @@ function normalizeGoalSessionState(value: api.SessionGoalState | null | undefine
     active_goal_status: getString(value.active_goal_status) ?? null,
     execution_mode:
       normalizeGoalExecutionMode(value.execution_mode) ??
-      normalizeGoalExecutionMode(value.pending_proposal && isRecord(value.pending_proposal) ? value.pending_proposal.execution_mode : null) ??
-      normalizeGoalExecutionMode(value.last_goal_summary && isRecord(value.last_goal_summary) ? value.last_goal_summary.execution_mode : null) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.execution_mode ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.execution_mode ??
+      null,
+    interaction_mode:
+      normalizeGoalInteractionMode(value.interaction_mode) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.interaction_mode ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.interaction_mode ??
+      null,
+    execution_topology:
+      normalizeGoalExecutionTopology(value.execution_topology) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.execution_topology ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.execution_topology ??
+      null,
+    bound_run_id:
+      getString(value.bound_run_id) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.bound_run_id ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.bound_run_id ??
+      null,
+    protocol_selection:
+      getString(value.protocol_selection) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.protocol_selection ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.protocol_selection ??
+      null,
+    selection_rationale:
+      getString(value.selection_rationale) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.selection_rationale ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.selection_rationale ??
       null,
     default_route:
       value.default_route === 'goal' || value.default_route === 'workflow'
@@ -586,12 +658,10 @@ function detectGoalExecutionModeHint(value: string): api.GoalExecutionMode | nul
   }
   if (
     normalized.includes('workflow') ||
-    normalized.includes('debate') ||
-    normalized.includes('distill') ||
-    normalized.includes('planner') ||
-    normalized.includes('executor') ||
-    normalized.includes('controller') ||
-    normalized.includes('evaluator')
+    normalized.includes('multi agent') ||
+    normalized.includes('multi-agent') ||
+    normalized.includes('orchestrate') ||
+    normalized.includes('orchestrated')
   ) {
     return 'workflow'
   }
@@ -632,15 +702,15 @@ function suggestGoalWorkflowStrategy(value: string): {
       roles: ['teacher', 'student', 'evaluator'],
     }
   }
-  if (/\b(research|investigate|survey|literature|analyze sources|verify claims)\b/.test(normalized)) {
+  if (/\b(controlled|controller|approval|approve commands|executor)\b/.test(normalized)) {
     return {
-      protocolId: 'multi_agent_debate',
-      roles: ['planner', 'researcher_a', 'researcher_b', 'synthesizer', 'verifier'],
+      protocolId: 'controlled_subagent_execution',
+      roles: ['planner', 'executor', 'controller', 'evaluator'],
     }
   }
   return {
-    protocolId: 'controlled_subagent_execution',
-    roles: ['planner', 'executor', 'controller', 'evaluator'],
+    protocolId: 'autonomous_single_agent',
+    roles: ['agent'],
   }
 }
 
@@ -654,6 +724,36 @@ function detectGoalRuntimeHint(value: string): string | null {
     return 'Scheduled goal execution requested'
   }
   return null
+}
+
+function goalProtocolExecutionTopology(
+  protocolId: api.AgentRunProtocolId | null
+): api.GoalExecutionTopology {
+  return protocolId === 'autonomous_single_agent' ? 'single_agent' : 'multi_agent'
+}
+
+function describeGoalProtocolSelection(
+  protocolId: api.AgentRunProtocolId,
+  interactionMode: api.GoalInteractionMode
+): string {
+  if (protocolId === 'autonomous_single_agent') {
+    return 'Routed to autonomous_single_agent for direct long-running execution.'
+  }
+  if (protocolId === 'teacher_student_distill') {
+    return 'Routed to teacher_student_distill for summarization and distillation work.'
+  }
+  if (protocolId === 'multi_agent_debate') {
+    return 'Routed to multi_agent_debate for comparison or evaluation work.'
+  }
+  if (protocolId === 'controlled_subagent_execution') {
+    return 'Routed to controlled_subagent_execution for operator-gated execution steps.'
+  }
+  if (protocolId === 'dr_zero_self_evolve') {
+    return 'Routed to dr_zero_self_evolve for iterative self-evolving problem solving.'
+  }
+  return interactionMode === 'goal'
+    ? 'Routed into the goal lane with workflow-capable execution.'
+    : 'Routed into the workflow lane for orchestrated execution.'
 }
 
 function detectGoalModelHints(
@@ -688,18 +788,15 @@ function goalCardFromSummary(
   kind: GoalCardView['kind'],
   overrides?: Partial<GoalCardView>
 ): GoalCardView {
-  const defaultLabel =
-    kind === 'started'
-      ? 'Goal started'
-      : kind === 'revised_proposal'
-        ? 'Revised goal proposal'
-        : 'Goal proposal'
+  const copySource = overrides?.copySource ?? summary.objective
+  const defaultLabel = buildGoalCardKindLabel(copySource, kind)
 
   return {
     kind,
     label: defaultLabel,
     objective: summary.objective,
     executionMode: summary.execution_mode,
+    copySource,
     protocolId: summary.protocol_id,
     models: summary.models,
     roleSummary: summary.role_summary,
@@ -725,6 +822,7 @@ function resolveGoalWorkflowRouteUserContent(
     case 'natural_language_goal_proposal':
     case 'goal_revision':
     case 'goal_follow_up':
+    case 'goal_pending_follow_up':
       return requestText
     case 'goal_confirmation':
     case 'goal_lifecycle':
@@ -1046,12 +1144,12 @@ function formatModelSource(model: Record<string, unknown>): string | null {
   const toolMode = formatToolModeDetail(model)
 
   if (provider === 'openai_codex' || backendType === 'openai_codex') {
-    return toolMode ? `OpenAI Codex · ${toolMode}` : 'OpenAI Codex'
+    return toolMode ? `OpenAI Codex 繚 ${toolMode}` : 'OpenAI Codex'
   }
 
   if (provider === 'openai_compat' || (backendType === 'openai_compat' && !provider)) {
     const source = baseUrl ?? 'OpenAI-Compatible'
-    return toolMode ? `${source} · ${toolMode}` : source
+    return toolMode ? `${source} 繚 ${toolMode}` : source
   }
 
   if (provider === 'gemini') {
@@ -1080,16 +1178,16 @@ function formatModelSource(model: Record<string, unknown>): string | null {
   }
 
   if (provider === 'ollama' || backendType === 'ollama') {
-    return toolMode ? `Ollama · ${toolMode}` : 'Ollama'
+    return toolMode ? `Ollama 繚 ${toolMode}` : 'Ollama'
   }
 
   if (provider === 'local') {
     const source = backendType ? `Local ${backendType}` : 'Local'
-    return toolMode ? `${source} · ${toolMode}` : source
+    return toolMode ? `${source} 繚 ${toolMode}` : source
   }
 
   const source = provider ?? backendType ?? baseUrl
-  return toolMode && source ? `${source} · ${toolMode}` : source
+  return toolMode && source ? `${source} 繚 ${toolMode}` : source
 }
 
 function displaySessionTitle(title: string | undefined, fallback: string): string {
@@ -1176,29 +1274,6 @@ function deriveModelOptions(payload: ModelsResponse): ChatInputModelOption[] {
   }
 
   return candidates
-}
-
-function resolveActiveModelId(
-  payload: ModelsResponse,
-  options: ChatInputModelOption[]
-): string | null {
-  const configuredModel = getString(payload.configured_model)
-  if (configuredModel) {
-    const configuredOption = options.find((option) => option.id === configuredModel)
-    if (configuredOption) {
-      return configuredOption.id
-    }
-  }
-
-  const activeName = resolveModelOptionId(payload.active_model ?? undefined)
-  if (activeName) {
-    const activeOption = options.find(
-      (option) => option.id === activeName || option.id.endsWith(`:${activeName}`)
-    )
-    return activeOption?.id ?? activeName
-  }
-
-  return configuredModel ?? options[0]?.id ?? null
 }
 
 async function requestChat(
@@ -1571,6 +1646,11 @@ export default function ChatPage() {
   )
   const workflowEnabled = Boolean(workflowState.enabled)
   const workflowBoundRunId = workflowState.bound_run_id ?? null
+  const goalBoundRunId =
+    currentSessionGoalState.bound_run_id ??
+    currentSessionGoalState.last_goal_summary?.bound_run_id ??
+    null
+  const sessionBoundRunId = goalBoundRunId ?? workflowBoundRunId
   const workflowConfig = workflowState.config ?? {}
   const workflowTemplate: WorkflowTemplate =
     workflowConfig.template === 'research_debate' ? 'research_debate' : 'standard'
@@ -1601,7 +1681,8 @@ export default function ChatPage() {
     [workflowConfig.research]
   )
   const shouldSuppressWorkflowUiForGoal =
-    currentSessionGoalState.execution_mode === 'single_agent' &&
+    currentSessionGoalState.interaction_mode === 'goal' &&
+    currentSessionGoalState.execution_topology === 'single_agent' &&
     (currentSessionGoalState.active_goal_id !== null || currentSessionGoalState.pending_proposal !== null)
   const workflowScheduleConfig = React.useMemo(
     () => normalizeWorkflowScheduleConfig((workflowConfig.schedule ?? {}) as Record<string, unknown>),
@@ -1749,6 +1830,25 @@ export default function ChatPage() {
 
     return createInitialMessages(t)
   }, [currentSessionDetail, currentSessionId, currentSessionMessages, isLoadingDetail, t])
+  const resolveGoalSurfaceCopySource = React.useCallback((
+    goalId: string | null,
+    objective: string | null | undefined
+  ): string => {
+    const normalizedObjective = (objective ?? '').trim()
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const goalCard = messages[index]?.goalCard
+      if (!goalCard?.copySource) {
+        continue
+      }
+      if (goalId && goalCard.goalId === goalId) {
+        return goalCard.copySource
+      }
+      if (!goalId && normalizedObjective && goalCard.objective === normalizedObjective) {
+        return goalCard.copySource
+      }
+    }
+    return normalizedObjective
+  }, [messages])
   const delegatedSubagentToolResultCount = React.useMemo(
     () =>
       messages.reduce((count, message) => (
@@ -2132,6 +2232,11 @@ export default function ChatPage() {
         active_goal_id: nextGoalState.active_goal_id,
         active_goal_status: nextGoalState.active_goal_status,
         execution_mode: nextGoalState.execution_mode,
+        interaction_mode: nextGoalState.interaction_mode,
+        execution_topology: nextGoalState.execution_topology,
+        bound_run_id: nextGoalState.bound_run_id,
+        protocol_selection: nextGoalState.protocol_selection,
+        selection_rationale: nextGoalState.selection_rationale,
         default_route: nextGoalState.default_route,
         last_goal_summary: nextGoalState.last_goal_summary,
         pending_proposal: nextGoalState.pending_proposal,
@@ -2232,9 +2337,63 @@ export default function ChatPage() {
       }
 
       const mappedEvents = nextEvents
-        .map((event) => {
+        .map((event, eventIndex) => {
           const type = getString(event.type)
           const timestamp = getString(event.timestamp) ?? new Date().toISOString()
+          const turnId = `${runDetail.run_id}:${syncedCount + eventIndex}`
+          const nestedPayload = isRecord(event.payload) ? event.payload : null
+          if (type === 'turn_event') {
+            return {
+              type: 'turn_event',
+              phase: getString(event.phase) ?? 'status',
+              timestamp,
+              turn_id: turnId,
+              payload: nestedPayload
+                ? {
+                    ...nestedPayload,
+                    metadata: {
+                      ...(isRecord(nestedPayload.metadata) ? nestedPayload.metadata : {}),
+                      channel: 'workflow',
+                      workflow_run_id: runDetail.run_id,
+                    },
+                  }
+                : {
+                    content: formatWorkflowLifecycleMessage(event),
+                    metadata: {
+                      channel: 'workflow',
+                      workflow_run_id: runDetail.run_id,
+                    },
+                  },
+            }
+          }
+          if (
+            type === 'thinking' ||
+            type === 'status' ||
+            type === 'tool_call_request' ||
+            type === 'tool_call_result' ||
+            type === 'error' ||
+            type === 'final_answer'
+          ) {
+            return {
+              ...event,
+              type,
+              timestamp,
+              turn_id: turnId,
+              metadata: {
+                ...(isRecord(event.metadata) ? event.metadata : {}),
+                channel: 'workflow',
+                workflow_run_id: runDetail.run_id,
+              },
+            }
+          }
+          if (type === 'text_chunk' && getString(event.content)) {
+            return {
+              type: 'text_chunk',
+              content: getString(event.content) ?? '',
+              timestamp,
+              turn_id: turnId,
+            }
+          }
           if (type === 'operator_message') {
             return {
               type: 'message',
@@ -2242,7 +2401,7 @@ export default function ChatPage() {
               content: getString(event.content) ?? '',
               attachments: Array.isArray(event.attachments) ? event.attachments : [],
               timestamp,
-              turn_id: `${runDetail.run_id}:${syncedCount}`,
+              turn_id: turnId,
               metadata: {
                 channel: 'workflow',
                 workflow_run_id: runDetail.run_id,
@@ -2259,7 +2418,7 @@ export default function ChatPage() {
               role: 'assistant',
               content: getString(event.content) ?? '',
               timestamp,
-              turn_id: `${runDetail.run_id}:${syncedCount}`,
+              turn_id: turnId,
               metadata: {
                 channel: 'workflow',
                 workflow_run_id: runDetail.run_id,
@@ -2269,41 +2428,56 @@ export default function ChatPage() {
           if (type === 'artifact') {
             return {
               type: 'turn_event',
-              phase: 'workflow_artifact',
+              phase: 'status',
               timestamp,
+              turn_id: turnId,
               payload: {
                 content:
                   getString(event.title) ??
                   getString(event.artifact_type) ??
                   'Workflow artifact recorded.',
                 artifact_type: getString(event.artifact_type),
-                workflow_run_id: runDetail.run_id,
+                metadata: {
+                  channel: 'workflow',
+                  workflow_run_id: runDetail.run_id,
+                  raw_phase: 'workflow_artifact',
+                },
               },
             }
           }
           if (type === 'exec_update' || type === 'detached_exec_reattached' || type === 'detached_exec_stop') {
             return {
               type: 'turn_event',
-              phase: 'workflow_exec_update',
+              phase: 'status',
               timestamp,
+              turn_id: turnId,
               payload: {
                 content:
                   getString(event.content) ??
                   getString(event.status) ??
                   'Workflow execution updated.',
-                workflow_run_id: runDetail.run_id,
+                metadata: {
+                  channel: 'workflow',
+                  workflow_run_id: runDetail.run_id,
+                  raw_phase: 'workflow_exec_update',
+                },
               },
             }
           }
           return {
             type: 'turn_event',
-            phase: 'workflow_status',
+            phase: 'status',
             timestamp,
+            turn_id: turnId,
             payload: {
               content: formatWorkflowLifecycleMessage(event),
               status: getString(event.status),
               event_type: type,
-              workflow_run_id: runDetail.run_id,
+              metadata: {
+                channel: 'workflow',
+                workflow_run_id: runDetail.run_id,
+                raw_phase: 'workflow_status',
+              },
             },
           }
         })
@@ -2348,14 +2522,14 @@ export default function ChatPage() {
   )
 
   React.useEffect(() => {
-    if (!currentSessionId || !workflowBoundRunId) {
+    if (!currentSessionId || !sessionBoundRunId) {
       setWorkflowCardRun(null)
       return
     }
 
     let cancelled = false
     let timeoutId: number | null = null
-    setWorkflowCardRun((current) => (current?.run_id === workflowBoundRunId ? current : null))
+    setWorkflowCardRun((current) => (current?.run_id === sessionBoundRunId ? current : null))
 
     const scheduleNext = (run: api.AgentRunDetail | null) => {
       if (cancelled || isWorkflowRunSettledForPolling(run?.status)) {
@@ -2368,7 +2542,7 @@ export default function ChatPage() {
 
     const loadWorkflowRun = async () => {
       try {
-        const run = await api.fetchAgentRun(workflowBoundRunId)
+        const run = await api.fetchAgentRun(sessionBoundRunId)
         if (cancelled) {
           return
         }
@@ -2392,7 +2566,7 @@ export default function ChatPage() {
         window.clearTimeout(timeoutId)
       }
     }
-  }, [currentSessionId, syncWorkflowRunEventsToSession, workflowBoundRunId, workflowState])
+  }, [currentSessionId, sessionBoundRunId, syncWorkflowRunEventsToSession, workflowState])
 
   const hydrateSessionFromDetail = React.useCallback(
     (detail: api.SessionDetail) => {
@@ -2662,7 +2836,13 @@ export default function ChatPage() {
 
     const payload = (await modelsResponse.json()) as ModelsResponse
     const nextConfiguredOptions = deriveModelOptions(payload)
-    const activeModel = resolveActiveModelId(payload, nextConfiguredOptions)
+    const activeModel = resolvePreferredCurrentModelId(
+      {
+        configuredModel: getString(payload.configured_model),
+        activeModelId: resolveModelOptionId(payload.active_model ?? undefined),
+      },
+      nextConfiguredOptions
+    )
     const nextActiveModelInfo = isRecord(payload.active_model) ? payload.active_model : null
     const activeModelMetadata = isRecord(payload.active_model?.metadata) ? payload.active_model?.metadata : null
     const loaded =
@@ -2807,8 +2987,8 @@ export default function ChatPage() {
       const heuristicSource = revisionText || objective
       const availableModelOptions = options?.modelCandidates ?? modelOptions
       const selectedCurrentModel = options?.currentModelId ?? currentModel
-      const hintedExecutionMode = detectGoalExecutionModeHint(revisionText)
-      const effectiveExecutionMode = hintedExecutionMode ?? executionMode
+      const interactionMode: api.GoalInteractionMode =
+        executionMode === 'workflow' ? 'workflow' : 'goal'
       const suggestedWorkflowStrategy = suggestGoalWorkflowStrategy(heuristicSource)
       const selectedRoles = normalizeSelectedModelRoles(workflowConfig.selected_models_roles)
       const selectedRoleNames = Object.keys(selectedRoles)
@@ -2832,13 +3012,24 @@ export default function ChatPage() {
         availableModelOptions,
         selectedCurrentModel
       )
+      const protocolHint = detectGoalProtocolHint(heuristicSource)
+      const protocolId: api.AgentRunProtocolId =
+        executionMode === 'workflow'
+          ? protocolHint ??
+            (workflowTemplate === 'research_debate'
+              ? 'multi_agent_debate'
+              : workflowProtocolId === DEFAULT_WORKFLOW_PROTOCOL
+                ? suggestedWorkflowStrategy.protocolId
+                : workflowProtocolId)
+          : protocolHint ?? suggestedWorkflowStrategy.protocolId
+      const executionTopology = goalProtocolExecutionTopology(protocolId)
       const primaryModels =
-        effectiveExecutionMode === 'workflow'
+        executionTopology === 'multi_agent'
           ? uniqueStrings([
               ...selectGoalProposalModels(
                 availableModelOptions,
                 selectedCurrentModel,
-                effectiveExecutionMode,
+                executionMode,
                 explicitModelHints
               ),
               ...workflowModels,
@@ -2846,22 +3037,23 @@ export default function ChatPage() {
           : selectGoalProposalModels(
               availableModelOptions,
               selectedCurrentModel,
-              effectiveExecutionMode,
+              executionMode,
               explicitModelHints
             )
-      const protocolHint = detectGoalProtocolHint(heuristicSource)
       const runtimeHint = detectGoalRuntimeHint(heuristicSource)
       const roleSummary =
-        effectiveExecutionMode === 'workflow'
+        executionTopology === 'multi_agent'
           ? formatGoalRoleSummary(selectedRoleNames.length > 0 ? selectedRoleNames : fallbackWorkflowRoles)
           : 'Primary agent continues the task directly with the current chat tools.'
       const runtimeMode =
         runtimeHint ??
-        (effectiveExecutionMode === 'workflow'
+        (executionTopology === 'single_agent'
+          ? 'Single-agent long-running execution'
+          : interactionMode === 'workflow'
           ? workflowScheduleEnabled(workflowState)
             ? `Scheduled ${workflowScheduleType} workflow`
             : 'Workflow run starts immediately'
-          : 'Single-agent long-running execution')
+          : 'Goal-backed orchestrated execution')
       const modelReadinessRisk = summarizeGoalProposalModelReadinessRisk(
         availableModelOptions,
         primaryModels
@@ -2878,16 +3070,13 @@ export default function ChatPage() {
         goal_id: null,
         proposal_id: options?.previous?.proposal_id ?? `goal-proposal-${Date.now()}`,
         objective: objective.trim(),
-        execution_mode: effectiveExecutionMode,
-        protocol_id:
-          effectiveExecutionMode === 'workflow'
-            ? protocolHint ??
-              (workflowTemplate === 'research_debate'
-                ? 'multi_agent_debate'
-                : workflowProtocolId === DEFAULT_WORKFLOW_PROTOCOL
-                  ? suggestedWorkflowStrategy.protocolId
-                  : workflowProtocolId)
-            : null,
+        execution_mode: executionMode,
+        interaction_mode: interactionMode,
+        execution_topology: executionTopology,
+        protocol_id: protocolId,
+        bound_run_id: null,
+        protocol_selection: protocolId,
+        selection_rationale: describeGoalProtocolSelection(protocolId, interactionMode),
         models: primaryModels,
         role_summary: roleSummary,
         runtime_mode: runtimeMode,
@@ -2895,6 +3084,8 @@ export default function ChatPage() {
         status: null,
         revision_index: (options?.previous?.revision_index ?? -1) + 1,
         updated_at: new Date().toISOString(),
+        assistant_explanation: options?.previous?.assistant_explanation ?? null,
+        assistant_explanation_source: options?.previous?.assistant_explanation_source ?? null,
       }
     },
     [
@@ -2914,13 +3105,48 @@ export default function ChatPage() {
       goal_id: goal.goal_id ? goal.goal_id : (fallback?.goal_id ?? null),
       objective: goal.objective ? goal.objective : (fallback?.objective ?? ''),
       execution_mode: goal.execution_mode,
+      interaction_mode: goal.interaction_mode,
+      execution_topology: goal.execution_topology,
       protocol_id: goal.protocol_id ?? fallback?.protocol_id ?? null,
+      bound_run_id: goal.bound_run_id ?? fallback?.bound_run_id ?? null,
+      protocol_selection: goal.protocol_selection ?? fallback?.protocol_selection ?? goal.protocol_id ?? null,
+      selection_rationale: goal.selection_rationale ?? fallback?.selection_rationale ?? null,
       models: fallback?.models ?? [],
       role_summary: fallback?.role_summary ?? null,
       runtime_mode: fallback?.runtime_mode ?? null,
       risk_note: fallback?.risk_note ?? null,
       status: goal.status,
     }),
+    []
+  )
+
+  const generateGoalProposalAssistantExplanation = React.useCallback(
+    async (
+      userMessage: string,
+      proposal: GoalSessionProposal
+    ): Promise<{ explanation: string; source: string }> => {
+      try {
+        const result = await api.generateGoalProposalAssistantCopy({
+          message: userMessage.trim() || proposal.objective,
+          proposalObjective: proposal.objective,
+          executionMode: proposal.execution_mode,
+          protocolSelection: proposal.protocol_selection,
+          roleSummary: proposal.role_summary,
+          runtimeMode: proposal.runtime_mode,
+          revisionIndex: proposal.revision_index,
+        })
+        if (result.explanation.trim().length > 0) {
+          return result
+        }
+      } catch {
+        // Fall back locally so proposal creation never blocks on copy generation.
+      }
+
+      return {
+        explanation: buildLocalGoalProposalAssistantExplanation(userMessage, proposal),
+        source: 'fallback',
+      }
+    },
     []
   )
 
@@ -2959,16 +3185,16 @@ export default function ChatPage() {
       sessionId,
       baseWorkflow,
       executionMode,
+      interactionMode = null,
+      executionTopology = null,
       goalStatus = null,
       runId = null,
     }: SyncGoalWorkflowStateInput) => {
       const goalTerminal = isGoalTerminalStatus(goalStatus)
-      const nextBoundRunId =
-        executionMode === 'workflow' && !goalTerminal
-          ? runId
-          : null
+      const nextBoundRunId = !goalTerminal ? runId : null
       const workflowEnabled =
-        executionMode === 'workflow' &&
+        Boolean(nextBoundRunId) &&
+        (interactionMode === 'workflow' || executionTopology === 'multi_agent' || executionMode === 'workflow') &&
         !goalTerminal &&
         goalStatus !== 'paused'
 
@@ -3018,23 +3244,28 @@ export default function ChatPage() {
         if (pendingProposal) {
           const pendingCard = goalCardFromSummary(
             pendingProposal,
-            pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal'
+            pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal',
+            {
+              copySource: route.raw,
+            }
           )
           await persistGoalConversation({
             sessionId,
             attachments,
             userContent: route.raw,
-            assistantContent: `A goal proposal is pending. ${GOAL_PROPOSAL_REPLY_HELP}`,
+            assistantContent: pendingProposal.assistant_explanation ?? '',
             goalCard: pendingCard,
           })
           return true
         }
 
         if (latestGoalSummary) {
+          const cardCopy = buildGoalCardChromeCopy(route.raw)
           const summaryCard = goalCardFromSummary(latestGoalSummary, 'started', {
-            label: activeGoalId ? 'Goal summary' : 'Most recent goal',
+            label: activeGoalId ? cardCopy.goalSummaryLabel : cardCopy.mostRecentGoalLabel,
             goalId: latestGoalSummary.goal_id,
             status: baseGoalState.active_goal_status ?? latestGoalSummary.status,
+            copySource: route.raw,
           })
           await persistGoalConversation({
             sessionId,
@@ -3052,11 +3283,7 @@ export default function ChatPage() {
           sessionId,
           attachments,
           userContent: route.raw,
-          assistantContent: [
-            'Use `/goal <request>` to prepare a long-running single-agent goal.',
-            'Use `/workflow <request>` to prepare a workflow goal.',
-            'Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` after a goal starts.',
-          ].join('\n'),
+          assistantContent: buildGoalCommandHelpMessage(route.raw),
         })
         return true
       }
@@ -3073,8 +3300,12 @@ export default function ChatPage() {
             route.kind === 'goal_proposal'
               ? route.content
               : requestText,
-          assistantContent:
-            'This chat already has an active goal. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` before starting a new one.',
+          assistantContent: buildGoalFollowUpMessage(
+            route.kind === 'goal_proposal'
+              ? route.content
+              : requestText,
+            'active_goal_exists'
+          ),
         })
         return true
       }
@@ -3129,43 +3360,61 @@ export default function ChatPage() {
           modelCandidates: probedModelOptions,
           currentModelId: currentModel,
         })
+        const proposalConversationUserContent =
+          proposalRevisionRequested || pendingProposal
+            ? revisionSourceText
+            : route.kind === 'workflow_proposal'
+              ? requestText
+              : route.kind === 'natural_language_goal_proposal'
+                ? requestText
+                : route.kind === 'goal_proposal'
+                  ? route.content
+                  : requestText
+        const proposalExplanationSourceText =
+          proposalConversationUserContent || proposalObjective
+        const proposalAssistantCopy = await generateGoalProposalAssistantExplanation(
+          proposalExplanationSourceText,
+          nextProposal
+        )
+        const nextProposalWithExplanation: GoalSessionProposal = {
+          ...nextProposal,
+          assistant_explanation: proposalAssistantCopy.explanation,
+          assistant_explanation_source: proposalAssistantCopy.source,
+        }
         const nextGoalState: GoalSessionState = {
           active_goal_id: null,
           active_goal_status: null,
-          execution_mode: nextProposal.execution_mode,
-          default_route: nextProposal.execution_mode === 'workflow' ? 'workflow' : 'goal',
+          execution_mode: nextProposalWithExplanation.execution_mode,
+          interaction_mode: nextProposalWithExplanation.interaction_mode,
+          execution_topology: nextProposalWithExplanation.execution_topology,
+          bound_run_id: nextProposalWithExplanation.bound_run_id,
+          protocol_selection: nextProposalWithExplanation.protocol_selection,
+          selection_rationale: nextProposalWithExplanation.selection_rationale,
+          default_route: nextProposalWithExplanation.execution_mode === 'workflow' ? 'workflow' : 'goal',
           last_goal_summary: latestGoalSummary,
-          pending_proposal: nextProposal,
+          pending_proposal: nextProposalWithExplanation,
         }
 
-        if (nextProposal.execution_mode === 'single_agent') {
-          await syncWorkflowStateForGoal({
-            sessionId,
-            baseWorkflow,
-            executionMode: nextProposal.execution_mode,
-          })
-        }
+        await syncWorkflowStateForGoal({
+          sessionId,
+          baseWorkflow,
+          executionMode: nextProposalWithExplanation.execution_mode,
+          interactionMode: nextProposalWithExplanation.interaction_mode,
+          executionTopology: nextProposalWithExplanation.execution_topology,
+        })
 
         await persistSessionGoalState(sessionId, nextGoalState)
         await persistGoalConversation({
           sessionId,
           attachments,
-          userContent:
-            proposalRevisionRequested || pendingProposal
-              ? revisionSourceText
-              : route.kind === 'workflow_proposal'
-                ? requestText
-                : route.kind === 'natural_language_goal_proposal'
-                  ? requestText
-                : route.kind === 'goal_proposal'
-                  ? route.content
-                  : requestText,
-          assistantContent: pendingProposal
-            ? `Updated the pending goal proposal. ${GOAL_PROPOSAL_REPLY_HELP}`
-            : `Prepared a goal proposal. ${GOAL_PROPOSAL_REPLY_HELP}`,
+          userContent: proposalConversationUserContent,
+          assistantContent: nextProposalWithExplanation.assistant_explanation ?? '',
           goalCard: goalCardFromSummary(
-            nextProposal,
-            pendingProposal || proposalRevisionRequested ? 'revised_proposal' : 'proposal'
+            nextProposalWithExplanation,
+            pendingProposal || proposalRevisionRequested ? 'revised_proposal' : 'proposal',
+            {
+              copySource: proposalConversationUserContent,
+            }
           ),
         })
         return true
@@ -3175,10 +3424,12 @@ export default function ChatPage() {
         const createdGoal = await api.createGoal({
           objective: pendingProposal.objective,
           execution_mode: pendingProposal.execution_mode,
-          protocol_id:
-            pendingProposal.execution_mode === 'workflow'
-              ? pendingProposal.protocol_id
-              : null,
+          interaction_mode: pendingProposal.interaction_mode,
+          execution_topology: pendingProposal.execution_topology,
+          protocol_id: pendingProposal.protocol_id,
+          bound_run_id: pendingProposal.bound_run_id,
+          protocol_selection: pendingProposal.protocol_selection,
+          selection_rationale: pendingProposal.selection_rationale,
           topic: pendingProposal.objective,
           projectId: workflowSessionProjectId,
           workspaceDir: effectiveWorkspaceDir,
@@ -3201,6 +3452,8 @@ export default function ChatPage() {
           sessionId,
           baseWorkflow,
           executionMode: startedGoal.execution_mode,
+          interactionMode: startedGoal.interaction_mode,
+          executionTopology: startedGoal.execution_topology,
           goalStatus: startedGoal.status,
           runId: startedRunId,
         })
@@ -3208,6 +3461,11 @@ export default function ChatPage() {
           active_goal_id: startedGoal.goal_id,
           active_goal_status: startedGoal.status,
           execution_mode: startedGoal.execution_mode,
+          interaction_mode: startedGoal.interaction_mode,
+          execution_topology: startedGoal.execution_topology,
+          bound_run_id: startedSummary.bound_run_id,
+          protocol_selection: startedSummary.protocol_selection,
+          selection_rationale: startedSummary.selection_rationale,
           default_route: startedGoal.execution_mode === 'workflow' ? 'workflow' : 'goal',
           last_goal_summary: startedSummary,
           pending_proposal: null,
@@ -3216,11 +3474,14 @@ export default function ChatPage() {
           sessionId,
           attachments,
           userContent: route.raw,
-          assistantContent:
-            'Goal started. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage it.',
+          assistantContent: buildGoalLifecycleMessage(
+            pendingProposal.objective || route.raw,
+            'goal_started'
+          ),
           goalCard: goalCardFromSummary(startedSummary, 'started', {
             goalId: startedGoal.goal_id,
             status: startedGoal.status,
+            copySource: route.raw,
           }),
         })
         return true
@@ -3232,10 +3493,13 @@ export default function ChatPage() {
             sessionId,
             attachments,
             userContent: route.raw,
-            assistantContent: `A goal proposal is pending. ${GOAL_PROPOSAL_REPLY_HELP}`,
+            assistantContent: pendingProposal.assistant_explanation ?? '',
             goalCard: goalCardFromSummary(
               pendingProposal,
-              pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal'
+              pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal',
+              {
+                copySource: route.raw,
+              }
             ),
           })
           return true
@@ -3246,6 +3510,11 @@ export default function ChatPage() {
             active_goal_id: null,
             active_goal_status: null,
             execution_mode: latestGoalSummary?.execution_mode ?? null,
+            interaction_mode: latestGoalSummary?.interaction_mode ?? null,
+            execution_topology: latestGoalSummary?.execution_topology ?? null,
+            bound_run_id: latestGoalSummary?.bound_run_id ?? null,
+            protocol_selection: latestGoalSummary?.protocol_selection ?? null,
+            selection_rationale: latestGoalSummary?.selection_rationale ?? null,
             default_route: 'chat',
             last_goal_summary: latestGoalSummary,
             pending_proposal: null,
@@ -3254,8 +3523,10 @@ export default function ChatPage() {
             sessionId,
             attachments,
             userContent: route.raw,
-            assistantContent:
-              'Cleared the pending goal proposal. Start a new one with `/goal <request>` or `/workflow <request>`.',
+            assistantContent: buildGoalLifecycleMessage(
+              pendingProposal.objective || route.raw,
+              'pending_cleared'
+            ),
           })
           return true
         }
@@ -3264,8 +3535,14 @@ export default function ChatPage() {
           sessionId,
           attachments,
           userContent: route.kind === 'goal_lifecycle' || route.kind === 'goal_confirmation' ? route.raw : requestText,
-          assistantContent:
-            'No active goal is bound to this chat. Start one with `/goal <request>` or `/workflow <request>`.',
+          assistantContent: buildGoalLifecycleMessage(
+            latestGoalSummary?.objective ||
+              (route.kind === 'goal_lifecycle' || route.kind === 'goal_confirmation'
+                ? route.raw
+                : requestText) ||
+              '',
+            'no_active_goal'
+          ),
         })
         return true
       }
@@ -3278,14 +3555,16 @@ export default function ChatPage() {
           const activeGoal = await api.fetchGoal(activeGoalId)
           const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
           const approvalToolNames = getStringArray(health.approval_state?.tool_names)
-          const approvalToolHint =
-            approvalToolNames.length > 0
-              ? ` Pending approval for ${approvalToolNames.join(', ')}.`
-              : ''
+          const cardCopy = buildGoalCardChromeCopy(requestText)
           await persistSessionGoalState(sessionId, {
             active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
             active_goal_status: activeGoal.status,
             execution_mode: activeGoal.execution_mode,
+            interaction_mode: activeGoal.interaction_mode,
+            execution_topology: activeGoal.execution_topology,
+            bound_run_id: activeGoalSummary.bound_run_id,
+            protocol_selection: activeGoalSummary.protocol_selection,
+            selection_rationale: activeGoalSummary.selection_rationale,
             default_route: isGoalTerminalStatus(activeGoal.status)
               ? 'chat'
               : activeGoal.execution_mode === 'workflow'
@@ -3298,14 +3577,16 @@ export default function ChatPage() {
             sessionId,
             attachments,
             userContent: requestText,
-            assistantContent:
-              continuation.approvalIds.length > 0
-                ? `${continuation.summary}${approvalToolHint} Review the pending approval${continuation.approvalIds.length > 1 ? 's' : ''} from the goal drawer or Goal Console before continuing.`
-                : `${continuation.summary}${approvalToolHint} Open the Goal Console to inspect the blocking approval state before continuing.`,
+            assistantContent: buildGoalFollowUpMessage(requestText, 'manual_resolution_required', {
+              summary: continuation.summary,
+              approvalCount: continuation.approvalIds.length,
+              toolNames: approvalToolNames,
+            }),
             goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-              label: 'Goal blocked',
+              label: cardCopy.goalBlockedLabel,
               goalId: activeGoal.goal_id,
               status: activeGoal.status,
+              copySource: requestText,
             }),
           })
           return true
@@ -3315,10 +3596,16 @@ export default function ChatPage() {
           const activeGoal = await api.fetchGoal(activeGoalId)
           const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
           const operatorControlHint = formatGoalOperatorControlHint(health.operator_controls)
+          const cardCopy = buildGoalCardChromeCopy(requestText)
           await persistSessionGoalState(sessionId, {
             active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
             active_goal_status: activeGoal.status,
             execution_mode: activeGoal.execution_mode,
+            interaction_mode: activeGoal.interaction_mode,
+            execution_topology: activeGoal.execution_topology,
+            bound_run_id: activeGoalSummary.bound_run_id,
+            protocol_selection: activeGoalSummary.protocol_selection,
+            selection_rationale: activeGoalSummary.selection_rationale,
             default_route: isGoalTerminalStatus(activeGoal.status)
               ? 'chat'
               : activeGoal.execution_mode === 'workflow'
@@ -3331,11 +3618,15 @@ export default function ChatPage() {
             sessionId,
             attachments,
             userContent: requestText,
-            assistantContent: `${continuation.summary}${operatorControlHint ? ` ${operatorControlHint}` : ''} Adjust the goal from the Goal Console before sending more execution guidance.`,
+            assistantContent: buildGoalFollowUpMessage(requestText, 'blocked', {
+              summary: continuation.summary,
+              operatorControlHint,
+            }),
             goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-              label: 'Goal blocked',
+              label: cardCopy.goalBlockedLabel,
               goalId: activeGoal.goal_id,
               status: activeGoal.status,
+              copySource: requestText,
             }),
           })
           return true
@@ -3355,6 +3646,11 @@ export default function ChatPage() {
             active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
             active_goal_status: activeGoal.status,
             execution_mode: activeGoal.execution_mode,
+            interaction_mode: activeGoal.interaction_mode,
+            execution_topology: activeGoal.execution_topology,
+            bound_run_id: activeGoalSummary.bound_run_id,
+            protocol_selection: activeGoalSummary.protocol_selection,
+            selection_rationale: activeGoalSummary.selection_rationale,
             default_route: isGoalTerminalStatus(activeGoal.status)
               ? 'chat'
               : activeGoal.execution_mode === 'workflow'
@@ -3367,12 +3663,12 @@ export default function ChatPage() {
             sessionId,
             attachments,
             userContent: requestText,
-            assistantContent:
-              'The active goal still does not have a live attempt ready to receive follow-up guidance. Use the Goal Console to inspect the current recovery state.',
+            assistantContent: buildGoalFollowUpMessage(requestText, 'no_live_attempt'),
             goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-              label: 'Goal status',
+              label: buildGoalCardChromeCopy(requestText).goalStatusLabel,
               goalId: activeGoal.goal_id,
               status: activeGoal.status,
+              copySource: requestText,
             }),
           })
           return true
@@ -3396,6 +3692,8 @@ export default function ChatPage() {
           sessionId,
           baseWorkflow,
           executionMode: activeGoal.execution_mode,
+          interactionMode: activeGoal.interaction_mode,
+          executionTopology: activeGoal.execution_topology,
           goalStatus: activeGoal.status,
           runId: activeRunId,
         })
@@ -3403,6 +3701,11 @@ export default function ChatPage() {
           active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
           active_goal_status: activeGoal.status,
           execution_mode: activeGoal.execution_mode,
+          interaction_mode: activeGoal.interaction_mode,
+          execution_topology: activeGoal.execution_topology,
+          bound_run_id: activeGoalSummary.bound_run_id,
+          protocol_selection: activeGoalSummary.protocol_selection,
+          selection_rationale: activeGoalSummary.selection_rationale,
           default_route: isGoalTerminalStatus(activeGoal.status)
             ? 'chat'
             : activeGoal.execution_mode === 'workflow'
@@ -3415,16 +3718,19 @@ export default function ChatPage() {
           sessionId,
           attachments,
           userContent: requestText,
-          assistantContent:
+          assistantContent: buildGoalFollowUpMessage(
+            requestText,
             continuation.action === 'refresh_then_forward'
-              ? 'Refreshed the active worker generation and forwarded your guidance to the updated goal attempt.'
+              ? 'refreshed_forwarded'
               : continuation.action === 'resume_then_forward'
-                ? 'Resumed the active goal and forwarded your guidance to the current attempt.'
-                : 'Forwarded your guidance to the active goal. It will continue working with this updated direction.',
+                ? 'resumed_forwarded'
+                : 'forwarded'
+          ),
           goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-            label: 'Goal updated',
+            label: buildGoalCardChromeCopy(requestText).goalUpdatedLabel,
             goalId: activeGoal.goal_id,
             status: activeGoal.status,
+            copySource: requestText,
           }),
         })
         return true
@@ -3450,6 +3756,8 @@ export default function ChatPage() {
         sessionId,
         baseWorkflow,
         executionMode: nextGoal.execution_mode,
+        interactionMode: nextGoal.interaction_mode,
+        executionTopology: nextGoal.execution_topology,
         goalStatus: nextGoal.status,
         runId: nextRunId,
       })
@@ -3457,28 +3765,37 @@ export default function ChatPage() {
         active_goal_id: nextGoalTerminal ? null : nextGoal.goal_id,
         active_goal_status: nextGoal.status,
         execution_mode: nextGoal.execution_mode,
+        interaction_mode: nextGoal.interaction_mode,
+        execution_topology: nextGoal.execution_topology,
+        bound_run_id: nextGoalSummary.bound_run_id,
+        protocol_selection: nextGoalSummary.protocol_selection,
+        selection_rationale: nextGoalSummary.selection_rationale,
         default_route: nextGoalTerminal ? 'chat' : nextGoal.execution_mode === 'workflow' ? 'workflow' : 'goal',
         last_goal_summary: nextGoalSummary,
         pending_proposal: null,
       })
 
+      const lifecycleCopy = buildGoalCardChromeCopy(route.raw)
       const lifecycleLabel =
         route.action === 'status'
-          ? 'Goal status'
+          ? lifecycleCopy.goalStatusLabel
           : route.action === 'pause'
-            ? 'Goal paused'
+            ? lifecycleCopy.goalPausedLabel
             : route.action === 'resume'
-              ? 'Goal resumed'
-              : 'Goal stopped'
+              ? lifecycleCopy.goalResumedLabel
+              : lifecycleCopy.goalStoppedLabel
       const lifecycleContent =
         nextGoal.latest_error?.trim() ||
-        (route.action === 'status'
-          ? 'Fetched the latest goal status.'
-          : route.action === 'pause'
-            ? 'Paused the active goal.'
-            : route.action === 'resume'
-              ? 'Resumed the active goal.'
-              : 'Stopped the active goal.')
+        buildGoalLifecycleMessage(
+          nextGoalSummary.objective || route.raw || '',
+          route.action === 'status'
+            ? 'status_fetched'
+            : route.action === 'pause'
+              ? 'goal_paused'
+              : route.action === 'resume'
+                ? 'goal_resumed'
+                : 'goal_stopped'
+        )
 
       await persistGoalConversation({
         sessionId,
@@ -3489,6 +3806,7 @@ export default function ChatPage() {
           label: lifecycleLabel,
           goalId: nextGoal.goal_id,
           status: nextGoal.status,
+          copySource: route.raw,
         }),
       })
       return true
@@ -3498,6 +3816,7 @@ export default function ChatPage() {
       buildGoalProposalState,
       buildGoalSummaryFromGoal,
       currentModel,
+      generateGoalProposalAssistantExplanation,
       modelOptions,
       persistSessionGoalState,
       probeGoalProposalModels,
@@ -3944,7 +4263,7 @@ export default function ChatPage() {
       let sessionId = sessionScope.getSessionId()
       let sessionContext = sessionScope.getContext()
       const pendingProposal = sessionContext.baseGoalState.pending_proposal
-      const {
+      let {
         modeCommand,
         requestText,
         route,
@@ -3965,6 +4284,65 @@ export default function ChatPage() {
         await sessionScope.materializeIfNeeded()
         sessionId = sessionScope.getSessionId()
         sessionContext = sessionScope.getContext()
+      }
+
+      if (route.kind === 'goal_pending_follow_up') {
+        const currentPendingProposal = sessionContext.baseGoalState.pending_proposal
+        if (currentPendingProposal) {
+          let intentResult: api.PendingGoalProposalIntentResult
+          try {
+            intentResult = await api.classifyPendingGoalProposalIntent({
+              message: route.requestText,
+              proposalObjective: currentPendingProposal.objective,
+              executionMode: currentPendingProposal.execution_mode,
+            })
+          } catch (error) {
+            intentResult = {
+              intent: 'ambiguous',
+              confidence: null,
+              rationale: error instanceof Error ? error.message : 'Goal intent classification failed.',
+            }
+          }
+
+          if (intentResult.intent === 'confirm_start') {
+            route = {
+              kind: 'goal_confirmation',
+              requestText: route.requestText,
+              raw: route.raw,
+            }
+          } else if (intentResult.intent === 'revise_proposal') {
+            route = {
+              kind: 'goal_revision',
+              requestText: route.requestText,
+            }
+          } else if (intentResult.intent === 'exit_goal_lane') {
+            route = { kind: 'direct_chat' }
+            shouldHandleGoalWorkflowRouting = false
+          } else {
+            await persistGoalConversation({
+              sessionId,
+              attachments,
+              userContent: route.raw,
+              assistantContent:
+                currentPendingProposal.assistant_explanation ??
+                buildLocalGoalProposalAssistantExplanation(
+                  route.requestText || route.raw || currentPendingProposal.objective,
+                  currentPendingProposal
+                ),
+              goalCard: goalCardFromSummary(
+                currentPendingProposal,
+                currentPendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal',
+                {
+                  copySource: route.raw,
+                }
+              ),
+            })
+            return
+          }
+        } else {
+          route = { kind: 'direct_chat' }
+          shouldHandleGoalWorkflowRouting = false
+        }
       }
 
       const normalizedWorkflow = modeCommand
@@ -4060,6 +4438,7 @@ export default function ChatPage() {
       effectiveInference,
       handleGoalWorkflowRouting,
       hasActiveStream,
+      persistGoalConversation,
       persistWorkflowState,
       setPanelOpen,
       setTaskPanelFocusedTaskId,
@@ -4680,6 +5059,8 @@ export default function ChatPage() {
       sessionId: currentSessionId,
       baseWorkflow: workflowState,
       executionMode: refreshedGoal.execution_mode,
+      interactionMode: refreshedGoal.interaction_mode,
+      executionTopology: refreshedGoal.execution_topology,
       goalStatus: refreshedGoal.status,
       runId: refreshedRunId,
     })
@@ -4687,6 +5068,11 @@ export default function ChatPage() {
       active_goal_id: isGoalTerminalStatus(refreshedGoal.status) ? null : refreshedGoal.goal_id,
       active_goal_status: refreshedGoal.status,
       execution_mode: refreshedGoal.execution_mode,
+      interaction_mode: refreshedGoal.interaction_mode,
+      execution_topology: refreshedGoal.execution_topology,
+      bound_run_id: refreshedGoalSummary.bound_run_id,
+      protocol_selection: refreshedGoalSummary.protocol_selection,
+      selection_rationale: refreshedGoalSummary.selection_rationale,
       default_route: isGoalTerminalStatus(refreshedGoal.status)
         ? 'chat'
         : refreshedGoal.execution_mode === 'workflow'
@@ -4707,6 +5093,11 @@ export default function ChatPage() {
   ])
 
   const loadGoalDrawerContext = React.useCallback(async (goalId: string) => {
+    const copySource = resolveGoalSurfaceCopySource(
+      goalId,
+      currentSessionGoalState.last_goal_summary?.objective ?? null
+    )
+    const drawerCopy = buildGoalCardChromeCopy(copySource)
     setGoalDrawerHealthLoading(true)
     setGoalDrawerHealthError(null)
     setGoalDrawerApprovalError(null)
@@ -4731,7 +5122,11 @@ export default function ChatPage() {
           approvals.filter((approval) => approvalIdSet.has(approval.approval_id))
         )
       } catch (error) {
-        const detail = error instanceof Error ? error.message : 'Failed to load pending approvals.'
+        const detail = buildGoalUiErrorMessage(
+          copySource,
+          error instanceof Error ? error.message : null,
+          drawerCopy.pendingApprovalsLoadFailedLabel
+        )
         setGoalDrawerApprovalError(detail)
         setGoalDrawerApprovals([])
       } finally {
@@ -4740,7 +5135,11 @@ export default function ChatPage() {
 
       return health
     } catch (error) {
-      const detail = error instanceof Error ? error.message : 'Failed to load goal status.'
+      const detail = buildGoalUiErrorMessage(
+        copySource,
+        error instanceof Error ? error.message : null,
+        drawerCopy.goalStatusLoadFailedLabel
+      )
       setGoalDrawerHealthError(detail)
       setGoalDrawerHealth(null)
       setGoalDrawerApprovals([])
@@ -4749,7 +5148,7 @@ export default function ChatPage() {
     } finally {
       setGoalDrawerHealthLoading(false)
     }
-  }, [])
+  }, [currentSessionGoalState.last_goal_summary, resolveGoalSurfaceCopySource])
 
   const handleGoalDrawerRefresh = React.useCallback(async () => {
     const goalId =
@@ -4766,12 +5165,20 @@ export default function ChatPage() {
         loadGoalDrawerContext(goalId),
       ])
     } catch (error) {
-      const detail = error instanceof Error ? error.message : 'Failed to refresh goal status.'
+      const copySource = resolveGoalSurfaceCopySource(
+        goalId,
+        currentSessionGoalState.last_goal_summary?.objective ?? null
+      )
+      const detail = buildGoalUiErrorMessage(
+        copySource,
+        error instanceof Error ? error.message : null,
+        buildGoalCardChromeCopy(copySource).goalStatusRefreshFailedLabel
+      )
       setGoalDrawerHealthError(detail)
     } finally {
       setGoalDrawerBusyAction(null)
     }
-  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding])
+  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding, resolveGoalSurfaceCopySource])
 
   const handleGoalDrawerResolveApproval = React.useCallback(async (
     approvalId: string,
@@ -4792,12 +5199,20 @@ export default function ChatPage() {
         ])
       }
     } catch (error) {
-      const detail = error instanceof Error ? error.message : 'Failed to resolve approval.'
+      const copySource = resolveGoalSurfaceCopySource(
+        goalId,
+        currentSessionGoalState.last_goal_summary?.objective ?? null
+      )
+      const detail = buildGoalUiErrorMessage(
+        copySource,
+        error instanceof Error ? error.message : null,
+        buildGoalCardChromeCopy(copySource).approvalResolveFailedLabel
+      )
       setGoalDrawerApprovalError(detail)
     } finally {
       setGoalDrawerResolvingApprovalKey(null)
     }
-  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding])
+  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding, resolveGoalSurfaceCopySource])
 
   const runGoalDrawerCommand = React.useCallback(async (
     action: 'status' | 'pause' | 'resume' | 'stop'
@@ -4923,18 +5338,29 @@ export default function ChatPage() {
       return null
     }
 
+    const goalId = currentSessionGoalState.active_goal_id ?? summary.goal_id ?? null
+    const copySource = resolveGoalSurfaceCopySource(goalId, summary.objective)
+
     return {
       title: summary.objective,
-      goalId: currentSessionGoalState.active_goal_id ?? summary.goal_id ?? null,
+      goalId,
       status,
       executionMode: summary.execution_mode,
+      copySource,
       protocolId: summary.protocol_id,
       modelCount: summary.models.length,
       runtimeMode: summary.runtime_mode,
       pendingApprovalCount: isBlocked ? pendingApprovalCount : 0,
       displayState: isCompleted ? 'completed' : isBlocked ? 'blocked' : 'active',
     }
-  }, [currentSessionGoalState, pendingApprovalCount])
+  }, [currentSessionGoalState, pendingApprovalCount, resolveGoalSurfaceCopySource])
+
+  const goalSurfaceCopySource =
+    headerGoal?.copySource ??
+    resolveGoalSurfaceCopySource(
+      currentSessionGoalState.active_goal_id ?? currentSessionGoalState.last_goal_summary?.goal_id ?? null,
+      currentSessionGoalState.last_goal_summary?.objective ?? null
+    )
 
   const goalDrawerBlocker = React.useMemo<GoalDrawerBlockerView | null>(() => {
     if (!goalDrawerHealth) {
@@ -4985,15 +5411,15 @@ export default function ChatPage() {
     pendingApprovalCount > 0
       ? {
           tone: 'warning' as const,
-          message: `${pendingApprovalCount} approval${pendingApprovalCount > 1 ? 's are' : ' is'} waiting before background work can continue.`,
-          actionLabel: 'Review approvals',
+          message: buildGoalPendingApprovalNotice(goalSurfaceCopySource, pendingApprovalCount),
+          actionLabel: buildGoalReviewApprovalsLabel(goalSurfaceCopySource),
           onAction: handleOpenTaskPanel,
         }
       : workflowError
         ? {
             tone: 'error' as const,
             message: workflowError,
-            actionLabel: 'Open workflow',
+            actionLabel: buildGoalOpenWorkflowLabel(goalSurfaceCopySource),
             onAction: handleOpenWorkflowPanel,
           }
         : null

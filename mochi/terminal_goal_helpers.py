@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 GoalExecutionMode = Literal["single_agent", "workflow"]
+GoalInteractionMode = Literal["goal", "workflow"]
+GoalExecutionTopology = Literal["single_agent", "multi_agent"]
 GoalCommandAction = Literal["help", "proposal", "status", "pause", "resume", "stop"]
 GoalContinuationAction = Literal[
     "forward_guidance",
@@ -14,11 +16,6 @@ GoalContinuationAction = Literal[
     "manual_resolution_required",
     "blocked",
 ]
-
-GOAL_PROPOSAL_REPLY_HELP = (
-    "Reply `start`, `go ahead`, `proceed`, `yes`, or `run it` to launch it. "
-    "Send another follow-up to revise it, or use `/chat` to step outside the goal lane."
-)
 
 _GOAL_TERMINAL_STATUSES = {
     "completed",
@@ -94,6 +91,7 @@ class GoalRoutingDecision:
     workflow_proposal_requested: bool
     natural_language_goal_requested: bool
     active_goal_follow_up_requested: bool
+    pending_proposal_follow_up_requested: bool
     confirmation_requested: bool
     proposal_revision_requested: bool
     should_handle_goal_workflow_routing: bool
@@ -113,6 +111,11 @@ def empty_goal_session_state() -> dict[str, Any]:
         "active_goal_id": None,
         "active_goal_status": None,
         "execution_mode": None,
+        "interaction_mode": None,
+        "execution_topology": None,
+        "bound_run_id": None,
+        "protocol_selection": None,
+        "selection_rationale": None,
         "default_route": "chat",
         "last_goal_summary": None,
         "pending_proposal": None,
@@ -130,7 +133,13 @@ def normalize_goal_session_summary(value: Any) -> dict[str, Any] | None:
         "goal_id": _string_or_none(value.get("goal_id")),
         "objective": objective,
         "execution_mode": execution_mode,
+        "interaction_mode": normalize_goal_interaction_mode(value.get("interaction_mode")) or "workflow",
+        "execution_topology": normalize_goal_execution_topology(value.get("execution_topology")) or "multi_agent",
         "protocol_id": _string_or_none(value.get("protocol_id")),
+        "bound_run_id": _string_or_none(value.get("bound_run_id")),
+        "protocol_selection": _string_or_none(value.get("protocol_selection"))
+        or _string_or_none(value.get("protocol_id")),
+        "selection_rationale": _string_or_none(value.get("selection_rationale")),
         "models": _string_list(value.get("models")),
         "role_summary": _string_or_none(value.get("role_summary")),
         "runtime_mode": _string_or_none(value.get("runtime_mode")),
@@ -155,6 +164,12 @@ def normalize_goal_session_proposal(value: Any) -> dict[str, Any] | None:
         or f"goal-proposal-{int(datetime.now(tz=UTC).timestamp() * 1000)}",
         "revision_index": revision_index,
         "updated_at": _string_or_none(value.get("updated_at")) or datetime.now(tz=UTC).isoformat(),
+        "assistant_explanation": _string_or_none(value.get("assistant_explanation"))
+        or _string_or_none(value.get("assistantExplanation")),
+        "assistant_explanation_source": _string_or_none(
+            value.get("assistant_explanation_source")
+        )
+        or _string_or_none(value.get("assistantExplanationSource")),
     }
 
 
@@ -173,6 +188,21 @@ def normalize_goal_session_state(value: Any) -> dict[str, Any]:
         "active_goal_id": _string_or_none(value.get("active_goal_id")) or _string_or_none(value.get("goal_id")),
         "active_goal_status": _string_or_none(value.get("active_goal_status")) or _string_or_none(value.get("status")),
         "execution_mode": execution_mode,
+        "interaction_mode": normalize_goal_interaction_mode(value.get("interaction_mode"))
+        or (pending or {}).get("interaction_mode")
+        or (last_summary or {}).get("interaction_mode"),
+        "execution_topology": normalize_goal_execution_topology(value.get("execution_topology"))
+        or (pending or {}).get("execution_topology")
+        or (last_summary or {}).get("execution_topology"),
+        "bound_run_id": _string_or_none(value.get("bound_run_id"))
+        or _string_or_none((pending or {}).get("bound_run_id"))
+        or _string_or_none((last_summary or {}).get("bound_run_id")),
+        "protocol_selection": _string_or_none(value.get("protocol_selection"))
+        or _string_or_none((pending or {}).get("protocol_selection"))
+        or _string_or_none((last_summary or {}).get("protocol_selection")),
+        "selection_rationale": _string_or_none(value.get("selection_rationale"))
+        or _string_or_none((pending or {}).get("selection_rationale"))
+        or _string_or_none((last_summary or {}).get("selection_rationale")),
         "default_route": default_route if default_route in {"chat", "goal", "workflow"} else "chat",
         "last_goal_summary": last_summary,
         "pending_proposal": pending,
@@ -182,6 +212,20 @@ def normalize_goal_session_state(value: Any) -> dict[str, Any]:
 def normalize_goal_execution_mode(value: Any) -> GoalExecutionMode | None:
     normalized = _string_or_none(value)
     if normalized in {"single_agent", "workflow"}:
+        return normalized
+    return None
+
+
+def normalize_goal_interaction_mode(value: Any) -> GoalInteractionMode | None:
+    normalized = _string_or_none(value)
+    if normalized in {"goal", "workflow"}:
+        return normalized
+    return None
+
+
+def normalize_goal_execution_topology(value: Any) -> GoalExecutionTopology | None:
+    normalized = _string_or_none(value)
+    if normalized in {"single_agent", "multi_agent"}:
         return normalized
     return None
 
@@ -211,11 +255,6 @@ def parse_goal_command(value: str) -> GoalCommand | None:
     if normalized in {"status", "pause", "resume", "stop"}:
         return GoalCommand(action=normalized, content="", raw=value.strip())
     return GoalCommand(action="proposal", content=content, raw=value.strip())
-
-
-def is_goal_confirmation_text(value: str) -> bool:
-    normalized = re.sub(r"\s+", " ", value.strip().lower())
-    return normalized in {"start", "go ahead", "proceed", "yes", "run it"}
 
 
 def is_natural_language_goal_request(value: str) -> bool:
@@ -265,19 +304,14 @@ def resolve_goal_workflow_routing(
         and len(request_text.strip()) > 0
         and not natural_language_goal_requested
     )
-    confirmation_requested = (
+    pending_proposal_follow_up_requested = (
         goal_command is None
         and mode_command is None
         and has_pending_proposal
-        and is_goal_confirmation_text(text)
-    )
-    proposal_revision_requested = (
-        goal_command is None
-        and mode_command is None
-        and has_pending_proposal
-        and not confirmation_requested
         and len(request_text.strip()) > 0
     )
+    confirmation_requested = False
+    proposal_revision_requested = False
     return GoalRoutingDecision(
         mode_command=mode_command,
         goal_command=goal_command,
@@ -286,6 +320,7 @@ def resolve_goal_workflow_routing(
         workflow_proposal_requested=workflow_proposal_requested,
         natural_language_goal_requested=natural_language_goal_requested,
         active_goal_follow_up_requested=active_goal_follow_up_requested,
+        pending_proposal_follow_up_requested=pending_proposal_follow_up_requested,
         confirmation_requested=confirmation_requested,
         proposal_revision_requested=proposal_revision_requested,
         should_handle_goal_workflow_routing=(
@@ -293,8 +328,7 @@ def resolve_goal_workflow_routing(
             or workflow_proposal_requested
             or natural_language_goal_requested
             or active_goal_follow_up_requested
-            or confirmation_requested
-            or proposal_revision_requested
+            or pending_proposal_follow_up_requested
         ),
     )
 
@@ -305,7 +339,7 @@ def detect_goal_execution_mode_hint(value: str) -> GoalExecutionMode | None:
         return "single_agent"
     if any(
         token in normalized
-        for token in ("workflow", "debate", "distill", "planner", "executor", "controller", "evaluator")
+        for token in ("workflow", "multi agent", "multi-agent", "orchestrate", "orchestrated")
     ):
         return "workflow"
     return None
@@ -317,9 +351,9 @@ def _suggest_workflow_roles_and_protocol(value: str) -> tuple[list[str], str]:
         return ["debater_a", "debater_b", "judge"], "multi_agent_debate"
     if any(token in normalized for token in ("distill", "compression", "compress", "teacher", "student")):
         return ["teacher", "student", "evaluator"], "teacher_student_distill"
-    if any(token in normalized for token in ("research", "investigate", "survey", "literature")):
-        return ["planner", "researcher_a", "researcher_b", "synthesizer", "verifier"], "multi_agent_debate"
-    return ["planner", "executor", "controller", "evaluator"], "controlled_subagent_execution"
+    if any(token in normalized for token in ("controlled", "controller", "approval", "executor")):
+        return ["planner", "executor", "controller", "evaluator"], "controlled_subagent_execution"
+    return ["agent"], "autonomous_single_agent"
 
 
 def detect_goal_runtime_hint(value: str) -> str | None:
@@ -329,6 +363,29 @@ def detect_goal_runtime_hint(value: str) -> str | None:
     if re.search(r"schedule|cron|interval", value, flags=re.IGNORECASE):
         return "Scheduled goal execution requested"
     return None
+
+
+def _goal_protocol_execution_topology(protocol_id: str | None) -> GoalExecutionTopology:
+    return "single_agent" if protocol_id == "autonomous_single_agent" else "multi_agent"
+
+
+def _describe_goal_protocol_selection(
+    protocol_id: str,
+    interaction_mode: GoalInteractionMode,
+) -> str:
+    if protocol_id == "autonomous_single_agent":
+        return "Routed to autonomous_single_agent for direct long-running execution."
+    if protocol_id == "teacher_student_distill":
+        return "Routed to teacher_student_distill for summarization and distillation work."
+    if protocol_id == "multi_agent_debate":
+        return "Routed to multi_agent_debate for comparison or evaluation work."
+    if protocol_id == "controlled_subagent_execution":
+        return "Routed to controlled_subagent_execution for operator-gated execution steps."
+    return (
+        "Routed into the goal lane with workflow-capable execution."
+        if interaction_mode == "goal"
+        else "Routed into the workflow lane for orchestrated execution."
+    )
 
 
 def format_goal_role_summary(roles: list[str]) -> str | None:
@@ -348,19 +405,27 @@ def build_goal_proposal_state(
 ) -> dict[str, Any]:
     normalized_objective = objective.strip()
     revision_source = (revision_text or "").strip()
-    effective_execution_mode = detect_goal_execution_mode_hint(revision_source) or execution_mode
+    interaction_mode: GoalInteractionMode = "workflow" if execution_mode == "workflow" else "goal"
     workflow_roles, default_protocol = _suggest_workflow_roles_and_protocol(revision_source or normalized_objective)
+    protocol_id = default_protocol
+    execution_topology = _goal_protocol_execution_topology(protocol_id)
     runtime_hint = detect_goal_runtime_hint(revision_source or normalized_objective)
-    primary_models = _unique_strings([current_model])[:3] if effective_execution_mode == "workflow" else _unique_strings([current_model])[:1]
+    primary_models = (
+        _unique_strings([current_model])[:3]
+        if execution_topology == "multi_agent"
+        else _unique_strings([current_model])[:1]
+    )
     role_summary = (
         format_goal_role_summary(workflow_roles)
-        if effective_execution_mode == "workflow"
+        if execution_topology == "multi_agent"
         else "Primary agent continues the task directly with the current chat tools."
     )
     runtime_mode = runtime_hint or (
-        "Workflow run starts immediately"
-        if effective_execution_mode == "workflow"
-        else "Single-agent long-running execution"
+        "Single-agent long-running execution"
+        if execution_topology == "single_agent"
+        else "Workflow run starts immediately"
+        if interaction_mode == "workflow"
+        else "Goal-backed orchestrated execution"
     )
     risk_note = (
         "Runtime actions may pause for approval before execution."
@@ -382,8 +447,13 @@ def build_goal_proposal_state(
         )
         or f"goal-proposal-{int(datetime.now(tz=UTC).timestamp() * 1000)}",
         "objective": normalized_objective,
-        "execution_mode": effective_execution_mode,
-        "protocol_id": default_protocol if effective_execution_mode == "workflow" else None,
+        "execution_mode": execution_mode,
+        "interaction_mode": interaction_mode,
+        "execution_topology": execution_topology,
+        "protocol_id": protocol_id,
+        "bound_run_id": None,
+        "protocol_selection": protocol_id,
+        "selection_rationale": _describe_goal_protocol_selection(protocol_id, interaction_mode),
         "models": primary_models,
         "role_summary": role_summary,
         "runtime_mode": runtime_mode,
@@ -391,6 +461,16 @@ def build_goal_proposal_state(
         "status": None,
         "revision_index": revision_index + 1,
         "updated_at": datetime.now(tz=UTC).isoformat(),
+        "assistant_explanation": (
+            _string_or_none(previous.get("assistant_explanation"))
+            if isinstance(previous, dict)
+            else None
+        ),
+        "assistant_explanation_source": (
+            _string_or_none(previous.get("assistant_explanation_source"))
+            if isinstance(previous, dict)
+            else None
+        ),
     }
 
 
@@ -402,7 +482,12 @@ def build_goal_summary_from_goal(
         "goal_id": _string_or_none(goal.get("goal_id")) or _string_or_none(goal.get("id")) or (fallback or {}).get("goal_id"),
         "objective": _string_or_none(goal.get("objective")) or (fallback or {}).get("objective") or "",
         "execution_mode": normalize_goal_execution_mode(goal.get("execution_mode")) or (fallback or {}).get("execution_mode") or "workflow",
+        "interaction_mode": normalize_goal_interaction_mode(goal.get("interaction_mode")) or (fallback or {}).get("interaction_mode") or "workflow",
+        "execution_topology": normalize_goal_execution_topology(goal.get("execution_topology")) or (fallback or {}).get("execution_topology") or "multi_agent",
         "protocol_id": _string_or_none(goal.get("protocol_id")) or (fallback or {}).get("protocol_id"),
+        "bound_run_id": _string_or_none(goal.get("bound_run_id")) or (fallback or {}).get("bound_run_id"),
+        "protocol_selection": _string_or_none(goal.get("protocol_selection")) or (fallback or {}).get("protocol_selection") or _string_or_none(goal.get("protocol_id")) or (fallback or {}).get("protocol_id"),
+        "selection_rationale": _string_or_none(goal.get("selection_rationale")) or (fallback or {}).get("selection_rationale"),
         "models": list((fallback or {}).get("models") or []),
         "role_summary": (fallback or {}).get("role_summary"),
         "runtime_mode": (fallback or {}).get("runtime_mode"),
@@ -416,22 +501,24 @@ def goal_card_from_summary(
     *,
     kind: Literal["proposal", "revised_proposal", "started"],
     label: str | None = None,
+    copy_source: str | None = None,
     goal_id: str | None = None,
     status: str | None = None,
     superseded: bool | None = None,
 ) -> dict[str, Any]:
-    default_label = (
-        "Goal started"
-        if kind == "started"
-        else "Revised goal proposal"
-        if kind == "revised_proposal"
-        else "Goal proposal"
+    from mochi.goal_proposal_copy import build_goal_card_kind_label
+
+    resolved_copy_source = copy_source or _string_or_none(summary.get("objective")) or label or ""
+    default_label = build_goal_card_kind_label(
+        user_message=resolved_copy_source,
+        kind=kind,
     )
     return {
         "kind": kind,
         "label": label or default_label,
         "objective": summary.get("objective") or "",
         "executionMode": summary.get("execution_mode") or "workflow",
+        "copySource": resolved_copy_source,
         "protocolId": summary.get("protocol_id"),
         "models": list(summary.get("models") or []),
         "roleSummary": summary.get("role_summary"),

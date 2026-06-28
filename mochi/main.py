@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated
 
 import typer
@@ -629,6 +630,7 @@ async def _chat_async_terminal(
             autonomy_mode=_ensure_security_config().autonomy_mode,
             session_store=session_store,
             ensure_runtime_service=_ensure_runtime_service,
+            intent_invoker=engine,
         )
         if routing_result["handled"]:
             return
@@ -774,32 +776,80 @@ def _get_goal_attempt_run_id(goal: dict[str, object]) -> str | None:
 
 
 def _print_goal_card(goal_card: dict[str, object]) -> None:
+    from mochi.goal_proposal_copy import (
+        build_goal_card_chrome_copy,
+        build_goal_card_execution_mode_label,
+        build_goal_card_kind_label,
+        build_goal_card_status_label,
+        build_goal_proposal_system_cta_copy,
+    )
+
     label = _string_or_none(goal_card.get("label")) or "Goal"
     objective = _string_or_none(goal_card.get("objective")) or ""
     execution_mode = _string_or_none(goal_card.get("executionMode")) or "workflow"
+    copy_source = (
+        _string_or_none(goal_card.get("copySource"))
+        or objective
+        or _string_or_none(goal_card.get("roleSummary"))
+        or _string_or_none(goal_card.get("runtimeMode"))
+        or label
+    )
+    kind = _string_or_none(goal_card.get("kind")) or "proposal"
     status = _string_or_none(goal_card.get("status"))
     protocol_id = _string_or_none(goal_card.get("protocolId"))
     models = goal_card.get("models") if isinstance(goal_card.get("models"), list) else []
     role_summary = _string_or_none(goal_card.get("roleSummary"))
     runtime_mode = _string_or_none(goal_card.get("runtimeMode"))
     risk_note = _string_or_none(goal_card.get("riskNote"))
+    superseded = bool(goal_card.get("superseded"))
+    chrome_copy = build_goal_card_chrome_copy(user_message=copy_source)
+    localized_kind_label = build_goal_card_kind_label(
+        user_message=copy_source,
+        kind=kind,  # type: ignore[arg-type]
+    )
+    localized_execution_mode = build_goal_card_execution_mode_label(
+        user_message=copy_source,
+        execution_mode=execution_mode,
+    )
+    localized_status = build_goal_card_status_label(
+        user_message=copy_source,
+        status=status,
+    )
 
     console.print(f"[bold]{label}[/bold]")
     if objective:
-        console.print(f"  Objective: {objective}", highlight=False)
-    console.print(f"  Mode: {execution_mode}", highlight=False)
-    if status:
-        console.print(f"  Status: {status}", highlight=False)
+        console.print(f"  {chrome_copy.objective_label}: {objective}", highlight=False)
+    console.print(f"  {chrome_copy.execution_label}: {localized_execution_mode}", highlight=False)
+    console.print(f"  {localized_kind_label}", highlight=False)
+    if localized_status:
+        console.print(f"  {chrome_copy.goal_status_label}: {localized_status}", highlight=False)
     if protocol_id:
-        console.print(f"  Protocol: {protocol_id}", highlight=False)
+        console.print(f"  {chrome_copy.protocol_label}: {protocol_id}", highlight=False)
     if models:
-        console.print(f"  Models: {', '.join(str(item) for item in models)}", highlight=False)
+        console.print(f"  {chrome_copy.models_label}: {', '.join(str(item) for item in models)}", highlight=False)
     if role_summary:
-        console.print(f"  Roles: {role_summary}", highlight=False)
+        console.print(f"  {chrome_copy.role_summary_label}: {role_summary}", highlight=False)
     if runtime_mode:
-        console.print(f"  Runtime: {runtime_mode}", highlight=False)
+        console.print(f"  {chrome_copy.runtime_label}: {runtime_mode}", highlight=False)
     if risk_note:
-        console.print(f"  Risk: {risk_note}", highlight=False)
+        console.print(f"  {chrome_copy.risk_note_label}: {risk_note}", highlight=False)
+    if not superseded and kind in {"proposal", "revised_proposal"}:
+        cta_copy = build_goal_proposal_system_cta_copy(
+            user_message=copy_source
+        )
+        console.print(f"  {cta_copy.title}:", highlight=False)
+        console.print(
+            f"    {cta_copy.launch_label}: {cta_copy.launch_body}",
+            highlight=False,
+        )
+        console.print(
+            f"    {cta_copy.revise_label}: {cta_copy.revise_body}",
+            highlight=False,
+        )
+        console.print(
+            f"    {cta_copy.chat_label}: {cta_copy.chat_body}",
+            highlight=False,
+        )
 
 
 async def _append_terminal_goal_conversation(
@@ -875,6 +925,8 @@ async def _sync_terminal_workflow_state_for_goal(
     session_store: object,
     session_id: str,
     execution_mode: str,
+    interaction_mode: str | None = None,
+    execution_topology: str | None = None,
     goal_status: str | None = None,
     run_id: str | None = None,
 ) -> None:
@@ -883,8 +935,17 @@ async def _sync_terminal_workflow_state_for_goal(
     events = await session_store.load_session(session_id)
     base_workflow = _session_workflow_state(events) or {}
     goal_terminal = is_goal_terminal_status(goal_status)
-    next_run_id = run_id if execution_mode == "workflow" and not goal_terminal else None
-    workflow_enabled = execution_mode == "workflow" and not goal_terminal and goal_status != "paused"
+    next_run_id = run_id if not goal_terminal else None
+    workflow_enabled = (
+        bool(next_run_id)
+        and not goal_terminal
+        and goal_status != "paused"
+        and (
+            interaction_mode == "workflow"
+            or execution_topology == "multi_agent"
+            or execution_mode == "workflow"
+        )
+    )
     next_state = dict(base_workflow)
     next_state["enabled"] = workflow_enabled
     next_state["bound_run_id"] = next_run_id
@@ -905,6 +966,7 @@ async def _show_terminal_goal_summary(
     session_id: str,
     prefix: str | None = None,
 ) -> None:
+    from mochi.goal_proposal_copy import build_goal_card_chrome_copy
     from mochi.terminal_goal_helpers import (
         goal_card_from_summary,
         normalize_goal_session_state,
@@ -921,26 +983,34 @@ async def _show_terminal_goal_summary(
         console.print(prefix, highlight=False)
 
     if isinstance(pending_proposal, dict):
-        console.print("[dim]Pending goal proposal in this session.[/dim]")
+        copy = build_goal_card_chrome_copy(
+            user_message=str(pending_proposal.get("objective") or ""),
+        )
+        console.print(f"[dim]{copy.pending_summary_intro}[/dim]")
         _print_goal_card(
             goal_card_from_summary(
                 pending_proposal,
                 kind="revised_proposal" if int(pending_proposal.get("revision_index", 0) or 0) > 0 else "proposal",
+                copy_source=str(pending_proposal.get("objective") or ""),
             )
         )
         return
 
     if isinstance(last_goal_summary, dict):
+        copy = build_goal_card_chrome_copy(
+            user_message=str(last_goal_summary.get("objective") or ""),
+        )
         console.print(
-            "[dim]Active goal summary for this session.[/dim]"
+            f"[dim]{copy.active_summary_intro}[/dim]"
             if active_goal_id
-            else "[dim]Most recent goal summary for this session.[/dim]"
+            else f"[dim]{copy.recent_summary_intro}[/dim]"
         )
         _print_goal_card(
             goal_card_from_summary(
                 last_goal_summary,
                 kind="started",
-                label="Active goal" if active_goal_id else "Most recent goal",
+                label=copy.active_goal_label if active_goal_id else copy.most_recent_goal_label,
+                copy_source=str(last_goal_summary.get("objective") or ""),
                 goal_id=last_goal_summary.get("goal_id"),
                 status=active_goal_status or last_goal_summary.get("status"),
             )
@@ -955,10 +1025,19 @@ async def _handle_terminal_goal_input(
     autonomy_mode: str | None,
     session_store: object,
     ensure_runtime_service: object,
+    intent_invoker: object,
 ) -> dict[str, object]:
     from mochi.runtime.models import AgentRunMessageRequest, GoalCreateRequest
+    from mochi.goal_intent import classify_goal_proposal_follow_up_intent
+    from mochi.goal_proposal_copy import (
+        build_goal_card_chrome_copy,
+        build_goal_command_help_message,
+        build_goal_follow_up_message,
+        build_goal_lifecycle_message,
+        build_goal_proposal_assistant_copy_fallback,
+        generate_goal_proposal_assistant_copy,
+    )
     from mochi.terminal_goal_helpers import (
-        GOAL_PROPOSAL_REPLY_HELP,
         build_goal_proposal_state,
         build_goal_summary_from_goal,
         goal_card_from_summary,
@@ -967,6 +1046,57 @@ async def _handle_terminal_goal_input(
         resolve_goal_continuation_decision,
         resolve_goal_workflow_routing,
     )
+
+    def _proposal_revision_index(proposal: dict[str, object]) -> int:
+        try:
+            return max(0, int(proposal.get("revision_index", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    async def _resolve_goal_proposal_assistant_content(
+        *,
+        user_message: str,
+        proposal: dict[str, object],
+    ) -> tuple[str, str]:
+        try:
+            result = await generate_goal_proposal_assistant_copy(
+                intent_invoker,  # type: ignore[arg-type]
+                user_message=user_message.strip()
+                or str(proposal.get("objective") or ""),
+                proposal_objective=str(proposal.get("objective") or ""),
+                execution_mode=str(proposal.get("execution_mode") or "single_agent"),
+                protocol_selection=_string_or_none(proposal.get("protocol_selection")),
+                role_summary=_string_or_none(proposal.get("role_summary")),
+                runtime_mode=_string_or_none(proposal.get("runtime_mode")),
+                revision_index=_proposal_revision_index(proposal),
+            )
+            if result.explanation.strip():
+                return result.explanation, result.source
+        except Exception:
+            pass
+        return (
+            build_goal_proposal_assistant_copy_fallback(
+                user_message=user_message.strip()
+                or str(proposal.get("objective") or ""),
+                proposal_objective=str(proposal.get("objective") or ""),
+                execution_mode=str(proposal.get("execution_mode") or "single_agent"),
+                protocol_selection=_string_or_none(proposal.get("protocol_selection")),
+                revision_index=_proposal_revision_index(proposal),
+            ),
+            "fallback",
+        )
+
+    def _pending_goal_proposal_assistant_content(proposal: dict[str, object]) -> str:
+        explanation = _string_or_none(proposal.get("assistant_explanation"))
+        if explanation is not None:
+            return explanation
+        return build_goal_proposal_assistant_copy_fallback(
+            user_message=str(proposal.get("objective") or ""),
+            proposal_objective=str(proposal.get("objective") or ""),
+            execution_mode=str(proposal.get("execution_mode") or "single_agent"),
+            protocol_selection=_string_or_none(proposal.get("protocol_selection")),
+            revision_index=_proposal_revision_index(proposal),
+        )
 
     events = await session_store.load_session(session_id)
     base_goal_state = normalize_goal_session_state(_session_goal_state(events))
@@ -997,26 +1127,65 @@ async def _handle_terminal_goal_input(
     latest_goal_summary = base_goal_state["last_goal_summary"]
     active_goal_id = base_goal_state["active_goal_id"]
     goal_command = routing_decision.goal_command
+    confirmation_requested = routing_decision.confirmation_requested
+    proposal_revision_requested = routing_decision.proposal_revision_requested
+
+    if routing_decision.pending_proposal_follow_up_requested and isinstance(pending_proposal, dict):
+        try:
+            intent_result = await classify_goal_proposal_follow_up_intent(
+                intent_invoker,  # type: ignore[arg-type]
+                user_message=routing_decision.request_text,
+                proposal_objective=str(pending_proposal.get("objective") or ""),
+                execution_mode=str(pending_proposal.get("execution_mode") or "single_agent"),
+            )
+        except Exception as exc:
+            intent_result = SimpleNamespace(
+                intent="ambiguous",
+                confidence=None,
+                rationale=str(exc),
+            )
+
+        if intent_result.intent == "confirm_start":
+            confirmation_requested = True
+        elif intent_result.intent == "revise_proposal":
+            proposal_revision_requested = True
+        elif intent_result.intent == "exit_goal_lane":
+            return {"handled": False, "chat_text": text}
+        else:
+            await _append_terminal_goal_conversation(
+                session_store=session_store,
+                session_id=session_id,
+                user_content=text.strip(),
+                assistant_content=_pending_goal_proposal_assistant_content(pending_proposal),
+                goal_card=goal_card_from_summary(
+                    pending_proposal,
+                    kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
+                ),
+            )
+            return {"handled": True, "chat_text": None}
 
     if goal_command is not None and goal_command.action == "help":
         if pending_proposal is not None:
             pending_card = goal_card_from_summary(
                 pending_proposal,
                 kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
+                copy_source=goal_command.raw,
             )
             await _append_terminal_goal_conversation(
                 session_store=session_store,
                 session_id=session_id,
                 user_content=goal_command.raw,
-                assistant_content=f"A goal proposal is pending. {GOAL_PROPOSAL_REPLY_HELP}",
+                assistant_content=_pending_goal_proposal_assistant_content(pending_proposal),
                 goal_card=pending_card,
             )
             return {"handled": True, "chat_text": None}
         if latest_goal_summary is not None:
+            card_copy = build_goal_card_chrome_copy(user_message=goal_command.raw)
             summary_card = goal_card_from_summary(
                 latest_goal_summary,
                 kind="started",
-                label="Goal summary" if active_goal_id else "Most recent goal",
+                label=card_copy.goal_summary_label if active_goal_id else card_copy.most_recent_goal_label,
+                copy_source=goal_command.raw,
                 goal_id=latest_goal_summary.get("goal_id"),
                 status=base_goal_state["active_goal_status"] or latest_goal_summary.get("status"),
             )
@@ -1025,9 +1194,19 @@ async def _handle_terminal_goal_input(
                 session_id=session_id,
                 user_content=goal_command.raw,
                 assistant_content=(
-                    "Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage the active goal."
+                    build_goal_lifecycle_message(
+                        user_message=(
+                            (latest_goal_summary.get("objective") or goal_command.raw)
+                            if isinstance(latest_goal_summary, dict)
+                            else goal_command.raw
+                        ),
+                        kind="goal_manage_hint",
+                    )
                     if active_goal_id
-                    else "No active goal is currently bound to this chat. Start a new one with `/goal <request>` or `/workflow <request>`."
+                    else build_goal_lifecycle_message(
+                        user_message=goal_command.raw,
+                        kind="no_active_goal",
+                    )
                 ),
                 goal_card=summary_card,
             )
@@ -1036,10 +1215,8 @@ async def _handle_terminal_goal_input(
             session_store=session_store,
             session_id=session_id,
             user_content=goal_command.raw,
-            assistant_content=(
-                "Use `/goal <request>` to prepare a long-running single-agent goal.\n"
-                "Use `/workflow <request>` to prepare a workflow goal.\n"
-                "Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` after a goal starts."
+            assistant_content=build_goal_command_help_message(
+                user_message=goal_command.raw,
             ),
         )
         return {"handled": True, "chat_text": None}
@@ -1056,8 +1233,13 @@ async def _handle_terminal_goal_input(
             session_store=session_store,
             session_id=session_id,
             user_content=goal_command.content if goal_command is not None and goal_command.action == "proposal" else routing_decision.request_text,
-            assistant_content=(
-                "This chat already has an active goal. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` before starting a new one."
+            assistant_content=build_goal_follow_up_message(
+                user_message=(
+                    goal_command.content
+                    if goal_command is not None and goal_command.action == "proposal"
+                    else routing_decision.request_text
+                ),
+                kind="active_goal_exists",
             ),
         )
         return {"handled": True, "chat_text": None}
@@ -1066,11 +1248,11 @@ async def _handle_terminal_goal_input(
         (goal_command is not None and goal_command.action == "proposal")
         or routing_decision.workflow_proposal_requested
         or routing_decision.natural_language_goal_requested
-        or routing_decision.proposal_revision_requested
+        or proposal_revision_requested
     ):
         revision_source_text = (
             routing_decision.request_text
-            if routing_decision.proposal_revision_requested
+            if proposal_revision_requested
             else goal_command.content
             if goal_command is not None and goal_command.action == "proposal"
             else routing_decision.request_text
@@ -1084,7 +1266,7 @@ async def _handle_terminal_goal_input(
         )
         proposal_objective = (
             pending_proposal.get("objective")
-            if routing_decision.proposal_revision_requested and isinstance(pending_proposal, dict)
+            if proposal_revision_requested and isinstance(pending_proposal, dict)
             else goal_command.content
             if goal_command is not None and goal_command.action == "proposal"
             else routing_decision.request_text
@@ -1097,10 +1279,26 @@ async def _handle_terminal_goal_input(
             previous=pending_proposal,
             revision_text=revision_source_text if pending_proposal is not None else None,
         )
+        proposal_user_content = revision_source_text
+        proposal_explanation_source = revision_source_text or proposal_objective
+        (
+            proposal_assistant_content,
+            proposal_assistant_content_source,
+        ) = await _resolve_goal_proposal_assistant_content(
+            user_message=proposal_explanation_source,
+            proposal=next_proposal,
+        )
+        next_proposal["assistant_explanation"] = proposal_assistant_content
+        next_proposal["assistant_explanation_source"] = proposal_assistant_content_source
         next_goal_state = {
             "active_goal_id": None,
             "active_goal_status": None,
             "execution_mode": next_proposal["execution_mode"],
+            "interaction_mode": next_proposal["interaction_mode"],
+            "execution_topology": next_proposal["execution_topology"],
+            "bound_run_id": next_proposal["bound_run_id"],
+            "protocol_selection": next_proposal["protocol_selection"],
+            "selection_rationale": next_proposal["selection_rationale"],
             "default_route": "workflow" if next_proposal["execution_mode"] == "workflow" else "goal",
             "last_goal_summary": latest_goal_summary,
             "pending_proposal": next_proposal,
@@ -1110,35 +1308,38 @@ async def _handle_terminal_goal_input(
             session_id=session_id,
             goal_state=next_goal_state,
         )
-        if next_proposal["execution_mode"] == "single_agent":
-            await _sync_terminal_workflow_state_for_goal(
-                session_store=session_store,
-                session_id=session_id,
-                execution_mode=next_proposal["execution_mode"],
-            )
+        await _sync_terminal_workflow_state_for_goal(
+            session_store=session_store,
+            session_id=session_id,
+            execution_mode=next_proposal["execution_mode"],
+            interaction_mode=next_proposal.get("interaction_mode"),
+            execution_topology=next_proposal.get("execution_topology"),
+        )
         await _append_terminal_goal_conversation(
             session_store=session_store,
             session_id=session_id,
-            user_content=revision_source_text,
-            assistant_content=(
-                f"Updated the pending goal proposal. {GOAL_PROPOSAL_REPLY_HELP}"
-                if pending_proposal is not None
-                else f"Prepared a goal proposal. {GOAL_PROPOSAL_REPLY_HELP}"
-            ),
+            user_content=proposal_user_content,
+            assistant_content=proposal_assistant_content,
             goal_card=goal_card_from_summary(
                 next_proposal,
-                kind="revised_proposal" if pending_proposal is not None or routing_decision.proposal_revision_requested else "proposal",
+                kind="revised_proposal" if pending_proposal is not None or proposal_revision_requested else "proposal",
+                copy_source=proposal_user_content,
             ),
         )
         return {"handled": True, "chat_text": None}
 
-    if routing_decision.confirmation_requested and pending_proposal is not None:
+    if confirmation_requested and pending_proposal is not None:
         runtime_service = await ensure_runtime_service()
         created_goal = await runtime_service.create_goal(
             GoalCreateRequest(
                 objective=pending_proposal["objective"],
                 execution_mode=pending_proposal["execution_mode"],
-                protocol_id=pending_proposal["protocol_id"] if pending_proposal["execution_mode"] == "workflow" else None,
+                interaction_mode=pending_proposal.get("interaction_mode"),
+                execution_topology=pending_proposal.get("execution_topology"),
+                protocol_id=pending_proposal.get("protocol_id"),
+                bound_run_id=pending_proposal.get("bound_run_id"),
+                protocol_selection=pending_proposal.get("protocol_selection"),
+                selection_rationale=pending_proposal.get("selection_rationale"),
                 topic=pending_proposal["objective"],
                 project_id=_session_project_id(events),
                 summary={
@@ -1159,6 +1360,8 @@ async def _handle_terminal_goal_input(
             session_store=session_store,
             session_id=session_id,
             execution_mode=started_goal["execution_mode"],
+            interaction_mode=_string_or_none(started_goal.get("interaction_mode")),
+            execution_topology=_string_or_none(started_goal.get("execution_topology")),
             goal_status=started_goal.get("status"),
             run_id=started_run_id,
         )
@@ -1169,6 +1372,11 @@ async def _handle_terminal_goal_input(
                 "active_goal_id": started_goal["goal_id"],
                 "active_goal_status": started_goal.get("status"),
                 "execution_mode": started_goal["execution_mode"],
+                "interaction_mode": started_summary.get("interaction_mode"),
+                "execution_topology": started_summary.get("execution_topology"),
+                "bound_run_id": started_summary.get("bound_run_id"),
+                "protocol_selection": started_summary.get("protocol_selection"),
+                "selection_rationale": started_summary.get("selection_rationale"),
                 "default_route": "workflow" if started_goal["execution_mode"] == "workflow" else "goal",
                 "last_goal_summary": started_summary,
                 "pending_proposal": None,
@@ -1178,10 +1386,14 @@ async def _handle_terminal_goal_input(
             session_store=session_store,
             session_id=session_id,
             user_content=text.strip(),
-            assistant_content="Goal started. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage it.",
+            assistant_content=build_goal_lifecycle_message(
+                user_message=str(pending_proposal.get("objective") or "") or text.strip(),
+                kind="goal_started",
+            ),
             goal_card=goal_card_from_summary(
                 started_summary,
                 kind="started",
+                copy_source=text.strip(),
                 goal_id=started_goal["goal_id"],
                 status=started_goal.get("status"),
             ),
@@ -1194,10 +1406,11 @@ async def _handle_terminal_goal_input(
                 session_store=session_store,
                 session_id=session_id,
                 user_content=goal_command.raw,
-                assistant_content=f"A goal proposal is pending. {GOAL_PROPOSAL_REPLY_HELP}",
+                assistant_content=_pending_goal_proposal_assistant_content(pending_proposal),
                 goal_card=goal_card_from_summary(
                     pending_proposal,
                     kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
+                    copy_source=goal_command.raw,
                 ),
             )
             return {"handled": True, "chat_text": None}
@@ -1209,6 +1422,11 @@ async def _handle_terminal_goal_input(
                     "active_goal_id": None,
                     "active_goal_status": None,
                     "execution_mode": latest_goal_summary.get("execution_mode") if isinstance(latest_goal_summary, dict) else None,
+                    "interaction_mode": latest_goal_summary.get("interaction_mode") if isinstance(latest_goal_summary, dict) else None,
+                    "execution_topology": latest_goal_summary.get("execution_topology") if isinstance(latest_goal_summary, dict) else None,
+                    "bound_run_id": latest_goal_summary.get("bound_run_id") if isinstance(latest_goal_summary, dict) else None,
+                    "protocol_selection": latest_goal_summary.get("protocol_selection") if isinstance(latest_goal_summary, dict) else None,
+                    "selection_rationale": latest_goal_summary.get("selection_rationale") if isinstance(latest_goal_summary, dict) else None,
                     "default_route": "chat",
                     "last_goal_summary": latest_goal_summary,
                     "pending_proposal": None,
@@ -1218,14 +1436,29 @@ async def _handle_terminal_goal_input(
                 session_store=session_store,
                 session_id=session_id,
                 user_content=goal_command.raw,
-                assistant_content="Cleared the pending goal proposal. Start a new one with `/goal <request>` or `/workflow <request>`.",
+                assistant_content=build_goal_lifecycle_message(
+                    user_message=str(pending_proposal.get("objective") or "") or goal_command.raw,
+                    kind="pending_cleared",
+                ),
             )
             return {"handled": True, "chat_text": None}
         await _append_terminal_goal_conversation(
             session_store=session_store,
             session_id=session_id,
             user_content=(goal_command.raw if goal_command is not None else text.strip()),
-            assistant_content="No active goal is bound to this chat. Start one with `/goal <request>` or `/workflow <request>`.",
+            assistant_content=build_goal_lifecycle_message(
+                user_message=(
+                    str(latest_goal_summary.get("objective") or "")
+                    if isinstance(latest_goal_summary, dict)
+                    else ""
+                )
+                or (
+                    goal_command.raw
+                    if goal_command is not None
+                    else text.strip()
+                ),
+                kind="no_active_goal",
+            ),
         )
         return {"handled": True, "chat_text": None}
 
@@ -1239,6 +1472,9 @@ async def _handle_terminal_goal_input(
             active_goal = await runtime_service.get_goal(active_goal_id)
             active_goal_summary = build_goal_summary_from_goal(active_goal or {}, latest_goal_summary)
             active_goal_status = _string_or_none((active_goal or {}).get("status"))
+            card_copy = build_goal_card_chrome_copy(
+                user_message=routing_decision.request_text,
+            )
             await _persist_terminal_goal_state(
                 session_store=session_store,
                 session_id=session_id,
@@ -1246,6 +1482,11 @@ async def _handle_terminal_goal_input(
                     "active_goal_id": None if is_goal_terminal_status(active_goal_status) else (active_goal or {}).get("goal_id"),
                     "active_goal_status": active_goal_status,
                     "execution_mode": (active_goal or {}).get("execution_mode"),
+                    "interaction_mode": active_goal_summary.get("interaction_mode"),
+                    "execution_topology": active_goal_summary.get("execution_topology"),
+                    "bound_run_id": active_goal_summary.get("bound_run_id"),
+                    "protocol_selection": active_goal_summary.get("protocol_selection"),
+                    "selection_rationale": active_goal_summary.get("selection_rationale"),
                     "default_route": (
                         "chat"
                         if is_goal_terminal_status(active_goal_status)
@@ -1257,12 +1498,26 @@ async def _handle_terminal_goal_input(
                     "pending_proposal": None,
                 },
             )
-            assistant_content = (
-                f"{continuation.summary} Review the pending approval{'s' if len(continuation.approval_ids) > 1 else ''} from the goal drawer or Goal Console before continuing."
-                if continuation.action == "manual_resolution_required" and continuation.approval_ids
-                else f"{continuation.summary} Open the Goal Console to inspect the blocking approval state before continuing."
-                if continuation.action == "manual_resolution_required"
-                else f"{continuation.summary} Adjust the goal from the Goal Console before sending more execution guidance."
+            approval_state = health.get("approval_state") if isinstance(health, dict) else {}
+            approval_tool_names = (
+                [
+                    str(item).strip()
+                    for item in (approval_state.get("tool_names") or [])
+                    if str(item).strip()
+                ]
+                if isinstance(approval_state, dict)
+                else []
+            )
+            assistant_content = build_goal_follow_up_message(
+                user_message=routing_decision.request_text,
+                kind=(
+                    "manual_resolution_required"
+                    if continuation.action == "manual_resolution_required"
+                    else "blocked"
+                ),
+                summary=continuation.summary,
+                approval_count=len(continuation.approval_ids),
+                tool_names=approval_tool_names,
             )
             await _append_terminal_goal_conversation(
                 session_store=session_store,
@@ -1272,7 +1527,8 @@ async def _handle_terminal_goal_input(
                 goal_card=goal_card_from_summary(
                     active_goal_summary,
                     kind="started",
-                    label="Goal blocked",
+                    label=card_copy.goal_blocked_label,
+                    copy_source=routing_decision.request_text,
                     goal_id=(active_goal or {}).get("goal_id"),
                     status=active_goal_status,
                 ),
@@ -1298,6 +1554,11 @@ async def _handle_terminal_goal_input(
                     "active_goal_id": None if is_goal_terminal_status(active_goal_status) else (active_goal or {}).get("goal_id"),
                     "active_goal_status": active_goal_status,
                     "execution_mode": (active_goal or {}).get("execution_mode"),
+                    "interaction_mode": active_goal_summary.get("interaction_mode"),
+                    "execution_topology": active_goal_summary.get("execution_topology"),
+                    "bound_run_id": active_goal_summary.get("bound_run_id"),
+                    "protocol_selection": active_goal_summary.get("protocol_selection"),
+                    "selection_rationale": active_goal_summary.get("selection_rationale"),
                     "default_route": (
                         "chat"
                         if is_goal_terminal_status(active_goal_status)
@@ -1313,11 +1574,17 @@ async def _handle_terminal_goal_input(
                 session_store=session_store,
                 session_id=session_id,
                 user_content=routing_decision.request_text,
-                assistant_content="The active goal still does not have a live attempt ready to receive follow-up guidance. Use the Goal Console to inspect the current recovery state.",
+                assistant_content=build_goal_follow_up_message(
+                    user_message=routing_decision.request_text,
+                    kind="no_live_attempt",
+                ),
                 goal_card=goal_card_from_summary(
                     active_goal_summary,
                     kind="started",
-                    label="Goal status",
+                    label=build_goal_card_chrome_copy(
+                        user_message=routing_decision.request_text,
+                    ).goal_status_label,
+                    copy_source=routing_decision.request_text,
                     goal_id=(active_goal or {}).get("goal_id"),
                     status=active_goal_status,
                 ),
@@ -1342,6 +1609,8 @@ async def _handle_terminal_goal_input(
             session_store=session_store,
             session_id=session_id,
             execution_mode=(active_goal or {}).get("execution_mode") or "workflow",
+            interaction_mode=active_goal_summary.get("interaction_mode"),
+            execution_topology=active_goal_summary.get("execution_topology"),
             goal_status=active_goal_status,
             run_id=active_run_id,
         )
@@ -1352,6 +1621,11 @@ async def _handle_terminal_goal_input(
                 "active_goal_id": None if is_goal_terminal_status(active_goal_status) else (active_goal or {}).get("goal_id"),
                 "active_goal_status": active_goal_status,
                 "execution_mode": (active_goal or {}).get("execution_mode"),
+                "interaction_mode": active_goal_summary.get("interaction_mode"),
+                "execution_topology": active_goal_summary.get("execution_topology"),
+                "bound_run_id": active_goal_summary.get("bound_run_id"),
+                "protocol_selection": active_goal_summary.get("protocol_selection"),
+                "selection_rationale": active_goal_summary.get("selection_rationale"),
                 "default_route": (
                     "chat"
                     if is_goal_terminal_status(active_goal_status)
@@ -1367,17 +1641,23 @@ async def _handle_terminal_goal_input(
             session_store=session_store,
             session_id=session_id,
             user_content=routing_decision.request_text,
-            assistant_content=(
-                "Refreshed the active worker generation and forwarded your guidance to the updated goal attempt."
-                if continuation.action == "refresh_then_forward"
-                else "Resumed the active goal and forwarded your guidance to the current attempt."
-                if continuation.action == "resume_then_forward"
-                else "Forwarded your guidance to the active goal. It will continue working with this updated direction."
+            assistant_content=build_goal_follow_up_message(
+                user_message=routing_decision.request_text,
+                kind=(
+                    "refreshed_forwarded"
+                    if continuation.action == "refresh_then_forward"
+                    else "resumed_forwarded"
+                    if continuation.action == "resume_then_forward"
+                    else "forwarded"
+                ),
             ),
             goal_card=goal_card_from_summary(
                 active_goal_summary,
                 kind="started",
-                label="Goal updated",
+                label=build_goal_card_chrome_copy(
+                    user_message=routing_decision.request_text,
+                ).goal_updated_label,
+                copy_source=routing_decision.request_text,
                 goal_id=(active_goal or {}).get("goal_id"),
                 status=active_goal_status,
             ),
@@ -1401,6 +1681,8 @@ async def _handle_terminal_goal_input(
         session_store=session_store,
         session_id=session_id,
         execution_mode=(next_goal or {}).get("execution_mode") or "workflow",
+        interaction_mode=next_goal_summary.get("interaction_mode"),
+        execution_topology=next_goal_summary.get("execution_topology"),
         goal_status=next_goal_status,
         run_id=next_run_id,
     )
@@ -1411,6 +1693,11 @@ async def _handle_terminal_goal_input(
             "active_goal_id": None if next_goal_terminal else (next_goal or {}).get("goal_id"),
             "active_goal_status": next_goal_status,
             "execution_mode": (next_goal or {}).get("execution_mode"),
+            "interaction_mode": next_goal_summary.get("interaction_mode"),
+            "execution_topology": next_goal_summary.get("execution_topology"),
+            "bound_run_id": next_goal_summary.get("bound_run_id"),
+            "protocol_selection": next_goal_summary.get("protocol_selection"),
+            "selection_rationale": next_goal_summary.get("selection_rationale"),
             "default_route": (
                 "chat"
                 if next_goal_terminal
@@ -1422,25 +1709,41 @@ async def _handle_terminal_goal_input(
             "pending_proposal": None,
         },
     )
+    lifecycle_copy = build_goal_card_chrome_copy(
+        user_message=goal_command.raw if goal_command is not None else text.strip(),
+    )
     lifecycle_label = (
-        "Goal status"
+        lifecycle_copy.goal_status_label
         if goal_command is not None and goal_command.action == "status"
-        else "Goal paused"
+        else lifecycle_copy.goal_paused_label
         if goal_command is not None and goal_command.action == "pause"
-        else "Goal resumed"
+        else lifecycle_copy.goal_resumed_label
         if goal_command is not None and goal_command.action == "resume"
-        else "Goal stopped"
+        else lifecycle_copy.goal_stopped_label
     )
     lifecycle_content = _string_or_none((next_goal or {}).get("latest_error"))
     if lifecycle_content is None:
         if goal_command is not None and goal_command.action == "status":
-            lifecycle_content = "Fetched the latest goal status."
+            lifecycle_content = build_goal_lifecycle_message(
+                user_message=str(next_goal_summary.get("objective") or "") or goal_command.raw,
+                kind="status_fetched",
+            )
         elif goal_command is not None and goal_command.action == "pause":
-            lifecycle_content = "Paused the active goal."
+            lifecycle_content = build_goal_lifecycle_message(
+                user_message=str(next_goal_summary.get("objective") or "") or goal_command.raw,
+                kind="goal_paused",
+            )
         elif goal_command is not None and goal_command.action == "resume":
-            lifecycle_content = "Resumed the active goal."
+            lifecycle_content = build_goal_lifecycle_message(
+                user_message=str(next_goal_summary.get("objective") or "") or goal_command.raw,
+                kind="goal_resumed",
+            )
         else:
-            lifecycle_content = "Stopped the active goal."
+            lifecycle_content = build_goal_lifecycle_message(
+                user_message=str(next_goal_summary.get("objective") or "")
+                or (goal_command.raw if goal_command is not None else text.strip()),
+                kind="goal_stopped",
+            )
     await _append_terminal_goal_conversation(
         session_store=session_store,
         session_id=session_id,
@@ -1450,6 +1753,7 @@ async def _handle_terminal_goal_input(
             next_goal_summary,
             kind="started",
             label=lifecycle_label,
+            copy_source=goal_command.raw if goal_command is not None else text.strip(),
             goal_id=(next_goal or {}).get("goal_id"),
             status=next_goal_status,
         ),
@@ -1990,6 +2294,7 @@ async def _chat_tui_async(
                     autonomy_mode=_ensure_security_config().autonomy_mode,
                     session_store=session_store,
                     ensure_runtime_service=_ensure_runtime_service,
+                    intent_invoker=engine,
                 )
                 if routing_result["handled"]:
                     continue
@@ -2007,6 +2312,7 @@ async def _chat_tui_async(
                     autonomy_mode=_ensure_security_config().autonomy_mode,
                     session_store=session_store,
                     ensure_runtime_service=_ensure_runtime_service,
+                    intent_invoker=engine,
                 )
                 if routing_result["handled"]:
                     continue

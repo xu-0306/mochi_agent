@@ -16,6 +16,19 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import type { ApprovalSummary } from '@/lib/api'
 import { getFileName } from '@/lib/file-change-preview'
+import {
+  buildGoalApprovalCountLabel,
+  buildGoalApprovalScopeLabel,
+  buildGoalBlockerSummary,
+  buildGoalCardChromeCopy,
+  buildGoalCardExecutionModeLabel,
+  buildGoalCardStatusLabel,
+  buildGoalDisplayStateLabel,
+  buildGoalFileCountLabel,
+  buildGoalModelCountLabel,
+  buildGoalMoreFilesLabel,
+  buildGoalRecommendedActionLabel,
+} from '@/lib/goal-proposal-copy'
 import { cn } from '@/lib/utils'
 
 export type GoalHeaderDisplayState = 'active' | 'blocked' | 'completed'
@@ -25,6 +38,7 @@ export interface GoalHeaderChipView {
   goalId: string | null
   status: string
   executionMode: 'single_agent' | 'workflow'
+  copySource?: string | null
   protocolId: string | null
   modelCount: number
   runtimeMode: string | null
@@ -69,19 +83,11 @@ interface GoalDrawerContentProps {
   onClose: () => void
 }
 
-function formatEnumLabel(value: string): string {
-  return value.replaceAll('_', ' ')
-}
-
 function previewText(value: string, limit = 140): string {
   if (value.length <= limit) {
     return value
   }
   return `${value.slice(0, Math.max(0, limit - 3))}...`
-}
-
-function executionModeLabel(mode: GoalHeaderChipView['executionMode']): string {
-  return mode === 'single_agent' ? 'Single agent' : 'Workflow'
 }
 
 function displayStateTone(state: GoalHeaderDisplayState, open: boolean): string {
@@ -110,16 +116,6 @@ function statusBadgeVariant(state: GoalHeaderDisplayState): 'primary' | 'warning
   return 'primary'
 }
 
-function displayStateLabel(state: GoalHeaderDisplayState): string {
-  if (state === 'completed') {
-    return 'Completed goal'
-  }
-  if (state === 'blocked') {
-    return 'Goal needs attention'
-  }
-  return 'Active goal'
-}
-
 function canPauseGoal(status: string): boolean {
   const normalized = status.toLowerCase()
   return (
@@ -142,10 +138,6 @@ function canResumeGoal(status: string): boolean {
   )
 }
 
-function formatApprovalScope(approval: ApprovalSummary): string {
-  return approval.approval_scope ? formatEnumLabel(approval.approval_scope) : 'operator'
-}
-
 function countApprovalFiles(approval: ApprovalSummary): number {
   return approval.file_change_groups.reduce((total, group) => total + group.files.length, 0)
 }
@@ -154,18 +146,37 @@ function approvalSummaryBadges(approval: ApprovalSummary): string[] {
   const badges: string[] = []
   const changedFiles = countApprovalFiles(approval)
   if (changedFiles > 0) {
-    badges.push(`${changedFiles} file${changedFiles > 1 ? 's' : ''}`)
+    badges.push(String(changedFiles))
   }
   if (approval.patch_validation_supported) {
-    badges.push('patch validation')
+    badges.push('patch_validation')
   }
   if (approval.replay_safe) {
-    badges.push('replay safe')
+    badges.push('replay_safe')
   }
   return badges
 }
 
+function goalCopySource(
+  goal: GoalHeaderChipView,
+  blocker?: GoalDrawerBlockerView | null
+): string {
+  return (
+    goal.copySource ||
+    blocker?.summary ||
+    blocker?.latestError ||
+    goal.title ||
+    goal.runtimeMode ||
+    goal.protocolId ||
+    goal.status
+  )
+}
+
 export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
+  const copySource = goalCopySource(goal)
+  const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
+  const executionLabel = buildGoalCardExecutionModeLabel(copySource, goal.executionMode)
+
   return (
     <button
       type="button"
@@ -174,7 +185,7 @@ export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
         'inline-flex min-w-0 max-w-[11rem] items-center gap-2 rounded-full border px-2.5 py-1.5 text-left transition-all duration-150 ease-out-smooth hover:translate-y-[-1px] sm:max-w-[18rem] sm:px-3',
         displayStateTone(goal.displayState, open)
       )}
-      aria-label={`${displayStateLabel(goal.displayState)}: ${goal.title}`}
+      aria-label={`${displayLabel}: ${goal.title}`}
       title={goal.title}
     >
       {goal.displayState === 'completed' ? (
@@ -187,8 +198,8 @@ export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
       <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-semibold">{goal.title}</span>
         <span className="hidden truncate text-[11px] opacity-80 sm:block">
-          {executionModeLabel(goal.executionMode)}
-          {goal.protocolId ? ` · ${goal.protocolId}` : ''}
+          {executionLabel}
+          {goal.protocolId ? ` | ${goal.protocolId}` : ''}
         </span>
       </span>
       {goal.pendingApprovalCount > 0 ? (
@@ -216,6 +227,12 @@ export function GoalDrawerContent({
   onOpenConsole,
   onClose,
 }: GoalDrawerContentProps) {
+  const copySource = goalCopySource(goal, blocker)
+  const chromeCopy = buildGoalCardChromeCopy(copySource)
+  const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
+  const executionLabel = buildGoalCardExecutionModeLabel(copySource, goal.executionMode)
+  const statusLabel =
+    buildGoalCardStatusLabel(copySource, goal.status) ?? goal.status.replaceAll('_', ' ')
   const pauseAvailable = Boolean(goal.goalId && onPause && canPauseGoal(goal.status))
   const resumeAvailable = Boolean(
     goal.goalId &&
@@ -237,30 +254,36 @@ export function GoalDrawerContent({
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-4">
         <div className="min-w-0">
           <p className="text-xs font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-            {displayStateLabel(goal.displayState)}
+            {displayLabel}
           </p>
           <h2 className="mt-1 text-sm font-semibold text-foreground">{goal.title}</h2>
         </div>
-        <Button type="button" variant="ghost" size="icon-sm" onClick={onClose} title="Close goal drawer">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          onClick={onClose}
+          title={chromeCopy.closeGoalDrawerLabel}
+        >
           <X className="h-3.5 w-3.5" />
         </Button>
       </div>
 
       <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={statusBadgeVariant(goal.displayState)} className="capitalize">
-            {formatEnumLabel(goal.status)}
+          <Badge variant={statusBadgeVariant(goal.displayState)}>
+            {statusLabel}
           </Badge>
-          <Badge variant="outline">{executionModeLabel(goal.executionMode)}</Badge>
+          <Badge variant="outline">{executionLabel}</Badge>
           {goal.protocolId ? <Badge variant="outline">{goal.protocolId}</Badge> : null}
           {goal.modelCount > 0 ? (
             <Badge variant="outline">
-              {goal.modelCount} model{goal.modelCount > 1 ? 's' : ''}
+              {buildGoalModelCountLabel(copySource, goal.modelCount)}
             </Badge>
           ) : null}
           {goal.pendingApprovalCount > 0 ? (
             <Badge variant="error">
-              {goal.pendingApprovalCount} approval{goal.pendingApprovalCount > 1 ? 's' : ''}
+              {buildGoalApprovalCountLabel(copySource, goal.pendingApprovalCount)}
             </Badge>
           ) : null}
         </div>
@@ -268,7 +291,7 @@ export function GoalDrawerContent({
         {goal.runtimeMode ? (
           <div className="rounded-2xl border border-border bg-elevated-layer/80 p-3">
             <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-              Runtime mode
+              {chromeCopy.runtimeLabel}
             </p>
             <p className="mt-1 text-sm leading-6 text-foreground">{goal.runtimeMode}</p>
           </div>
@@ -282,23 +305,23 @@ export function GoalDrawerContent({
 
         <div className="rounded-2xl border border-border bg-elevated-layer/80 p-3">
           <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-            Goal summary
+            {chromeCopy.goalSummaryLabel}
           </p>
           <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
             <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
               <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
                 <Target className="h-3.5 w-3.5" />
-                Objective
+                {chromeCopy.objectiveLabel}
               </div>
               <p className="mt-2 whitespace-pre-wrap break-words text-foreground">{goal.title}</p>
             </div>
             <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
               <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
                 <Workflow className="h-3.5 w-3.5" />
-                Goal ID
+                {chromeCopy.goalIdLabel}
               </div>
               <p className="mt-2 break-all font-mono text-xs text-foreground">
-                {goal.goalId ?? 'Not started'}
+                {goal.goalId ?? chromeCopy.notStartedLabel}
               </p>
             </div>
           </div>
@@ -307,14 +330,16 @@ export function GoalDrawerContent({
         {showBlockedDetails ? (
           <div className="rounded-2xl border border-warning/30 bg-warning/10 p-3">
             <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-warning-foreground/80">
-              Blocked status
+              {chromeCopy.blockedStatusLabel}
             </p>
             <p className="mt-1 text-sm leading-6 text-foreground">
-              {blocker?.summary ?? blocker?.latestError ?? 'This goal needs operator attention before it can continue.'}
+              {buildGoalBlockerSummary(copySource, blocker?.summary, blocker?.latestError)}
             </p>
             {blocker?.recommendedAction ? (
               <p className="mt-2 text-xs text-muted-foreground">
-                Recommended action: {formatEnumLabel(blocker.recommendedAction)}
+                {chromeCopy.recommendedActionLabel}:{' '}
+                {buildGoalRecommendedActionLabel(copySource, blocker.recommendedAction) ??
+                  blocker.recommendedAction}
               </p>
             ) : null}
             {blocker?.latestError ? (
@@ -322,26 +347,42 @@ export function GoalDrawerContent({
                 {blocker.latestError}
               </p>
             ) : null}
-            {(blocker?.blockNetworkUsage || (blocker?.blockedTools.length ?? 0) > 0 || (blocker?.blockedDomains.length ?? 0) > 0) ? (
+            {(blocker?.blockNetworkUsage ||
+              (blocker?.blockedTools.length ?? 0) > 0 ||
+              (blocker?.blockedDomains.length ?? 0) > 0) ? (
               <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2">
                 <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
-                  <p className="font-medium text-muted-foreground">Operator controls</p>
+                  <p className="font-medium text-muted-foreground">{chromeCopy.operatorControlsLabel}</p>
                   <div className="mt-2 space-y-1.5 text-foreground">
-                    <p>Network: {blocker?.blockNetworkUsage ? 'Blocked' : 'Allowed'}</p>
                     <p>
-                      Tools: {(blocker?.blockedTools.length ?? 0) > 0 ? blocker?.blockedTools.join(', ') : 'No tool blocks'}
+                      {chromeCopy.networkLabel}:{' '}
+                      {blocker?.blockNetworkUsage
+                        ? chromeCopy.blockedValueLabel
+                        : chromeCopy.allowedValueLabel}
                     </p>
                     <p>
-                      Domains: {(blocker?.blockedDomains.length ?? 0) > 0 ? blocker?.blockedDomains.join(', ') : 'No domain blocks'}
+                      {chromeCopy.toolsSectionLabel}:{' '}
+                      {(blocker?.blockedTools.length ?? 0) > 0
+                        ? blocker?.blockedTools.join(', ')
+                        : chromeCopy.blockedToolsEmptyLabel}
+                    </p>
+                    <p>
+                      {chromeCopy.domainsSectionLabel}:{' '}
+                      {(blocker?.blockedDomains.length ?? 0) > 0
+                        ? blocker?.blockedDomains.join(', ')
+                        : chromeCopy.blockedDomainsEmptyLabel}
                     </p>
                   </div>
                 </div>
                 <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
-                  <p className="font-medium text-muted-foreground">Approval wait</p>
+                  <p className="font-medium text-muted-foreground">{chromeCopy.approvalWaitLabel}</p>
                   <div className="mt-2 space-y-1.5 text-foreground">
-                    <p>Pending approvals: {blocker?.approvalIds.length ?? 0}</p>
+                    <p>{chromeCopy.pendingApprovalsCountLabel}: {blocker?.approvalIds.length ?? 0}</p>
                     <p>
-                      Tools: {(blocker?.approvalToolNames.length ?? 0) > 0 ? blocker?.approvalToolNames.join(', ') : 'Not reported'}
+                      {chromeCopy.toolsSectionLabel}:{' '}
+                      {(blocker?.approvalToolNames.length ?? 0) > 0
+                        ? blocker?.approvalToolNames.join(', ')
+                        : chromeCopy.notReportedLabel}
                     </p>
                   </div>
                 </div>
@@ -355,22 +396,22 @@ export function GoalDrawerContent({
             <div className="flex items-center justify-between gap-3">
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-                  Pending approvals
+                  {chromeCopy.pendingApprovalsCountLabel}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Resolve the pending approval here, or open the full Goal Console for deeper review.
+                  {chromeCopy.pendingApprovalsDescription}
                 </p>
               </div>
               {goal.pendingApprovalCount > 0 ? (
                 <Badge variant="error">
-                  {goal.pendingApprovalCount} approval{goal.pendingApprovalCount > 1 ? 's' : ''}
+                  {buildGoalApprovalCountLabel(copySource, goal.pendingApprovalCount)}
                 </Badge>
               ) : null}
             </div>
 
             {approvalLoading ? (
               <div className="mt-3 rounded-xl border border-border bg-surface-layer/70 px-3 py-4 text-xs text-muted-foreground">
-                Loading pending approvals...
+                {chromeCopy.loadingPendingApprovalsLabel}
               </div>
             ) : approvals.length > 0 ? (
               <div className="mt-3 space-y-3">
@@ -383,7 +424,10 @@ export function GoalDrawerContent({
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="min-w-0 flex-1 space-y-2">
                           <div className="flex flex-wrap items-center gap-2">
-                            <Badge variant="warning">{approval.status}</Badge>
+                            <Badge variant="warning">
+                              {buildGoalCardStatusLabel(copySource, approval.status) ??
+                                approval.status.replaceAll('_', ' ')}
+                            </Badge>
                             <span className="text-sm font-semibold text-foreground">{approval.tool_name}</span>
                           </div>
                           <p className="text-xs text-muted-foreground">
@@ -394,20 +438,26 @@ export function GoalDrawerContent({
                           <p className="text-xs text-muted-foreground">
                             {approval.workdir
                               ? `${approval.shell || 'shell'} | ${approval.workdir}`
-                              : approval.shell || 'No shell'}
+                              : approval.shell || chromeCopy.noShellLabel}
                           </p>
                           <div className="flex flex-wrap gap-2">
-                            <Badge variant="outline">{formatApprovalScope(approval)}</Badge>
+                            <Badge variant="outline">
+                              {buildGoalApprovalScopeLabel(copySource, approval.approval_scope)}
+                            </Badge>
                             {approvalSummaryBadges(approval).map((badge) => (
                               <Badge key={`${approval.approval_id}-${badge}`} variant="outline">
-                                {badge}
+                                {badge === 'patch_validation'
+                                  ? chromeCopy.patchValidationLabel
+                                  : badge === 'replay_safe'
+                                    ? chromeCopy.replaySafeLabel
+                                    : buildGoalFileCountLabel(copySource, Number(badge))}
                               </Badge>
                             ))}
                           </div>
                           {previewFiles.length > 0 ? (
                             <div className="rounded-xl border border-border bg-elevated-layer/60 p-2.5">
                               <p className="text-[11px] font-medium text-muted-foreground">
-                                {approval.file_change_groups[0]?.title ?? 'Pending file review'}
+                                {approval.file_change_groups[0]?.title ?? chromeCopy.pendingFileReviewLabel}
                               </p>
                               <div className="mt-2 space-y-2">
                                 {previewFiles.map((file) => (
@@ -431,7 +481,7 @@ export function GoalDrawerContent({
                               </div>
                               {extraFileCount > 0 ? (
                                 <p className="mt-2 text-[11px] text-muted-foreground">
-                                  +{extraFileCount} more file{extraFileCount > 1 ? 's' : ''}
+                                  {buildGoalMoreFilesLabel(copySource, extraFileCount)}
                                 </p>
                               ) : null}
                             </div>
@@ -448,7 +498,7 @@ export function GoalDrawerContent({
                               }}
                               loading={resolvingApprovalKey === `${approval.approval_id}:approve_once`}
                             >
-                              Approve once
+                              {chromeCopy.approveOnceLabel}
                             </Button>
                           ) : null}
                           {approval.allowed_decisions.includes('reject') && onResolveApproval ? (
@@ -461,7 +511,7 @@ export function GoalDrawerContent({
                               }}
                               loading={resolvingApprovalKey === `${approval.approval_id}:reject`}
                             >
-                              Reject
+                              {chromeCopy.rejectLabel}
                             </Button>
                           ) : null}
                         </div>
@@ -472,7 +522,7 @@ export function GoalDrawerContent({
               </div>
             ) : (
               <div className="mt-3 rounded-xl border border-dashed border-border px-3 py-4 text-xs text-muted-foreground">
-                Approval metadata is present, but the detailed approval payload is not available yet on this surface.
+                {chromeCopy.approvalMetadataUnavailableLabel}
               </div>
             )}
           </div>
@@ -489,7 +539,7 @@ export function GoalDrawerContent({
             loading={busyAction === 'status'}
           >
             {busyAction === 'status' ? null : <Loader2 className="h-3.5 w-3.5" />}
-            Refresh
+            {chromeCopy.refreshLabel}
           </Button>
           {pauseAvailable ? (
             <Button
@@ -500,7 +550,7 @@ export function GoalDrawerContent({
               loading={busyAction === 'pause'}
             >
               {busyAction === 'pause' ? null : <Pause className="h-3.5 w-3.5" />}
-              Pause
+              {chromeCopy.pauseLabel}
             </Button>
           ) : null}
           {resumeAvailable ? (
@@ -512,7 +562,7 @@ export function GoalDrawerContent({
               loading={busyAction === 'resume'}
             >
               {busyAction === 'resume' ? null : <Play className="h-3.5 w-3.5" />}
-              Resume
+              {chromeCopy.resumeLabel}
             </Button>
           ) : null}
           {stopAvailable ? (
@@ -524,12 +574,12 @@ export function GoalDrawerContent({
               loading={busyAction === 'stop'}
             >
               {busyAction === 'stop' ? null : <Square className="h-3.5 w-3.5" />}
-              Stop
+              {chromeCopy.stopLabel}
             </Button>
           ) : null}
           <Button type="button" variant="ghost" size="sm" onClick={onOpenConsole}>
             <ExternalLink className="h-3.5 w-3.5" />
-            Open console
+            {chromeCopy.openConsoleLabel}
           </Button>
         </div>
       </div>

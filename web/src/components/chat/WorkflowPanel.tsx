@@ -368,9 +368,28 @@ function normalizeEvidenceCollectionMode(value: unknown): string {
   return typeof value === 'string' && value.trim().length > 0 ? value : 'hybrid'
 }
 
-function getGoalExecutionMode(goal: Record<string, unknown> | null | undefined): 'single_agent' | 'workflow' | null {
-  const executionMode = goal?.execution_mode
-  return executionMode === 'single_agent' || executionMode === 'workflow' ? executionMode : null
+function getGoalRuntimeContext(goal: {
+  execution_mode?: unknown
+  interaction_mode?: unknown
+  execution_topology?: unknown
+} | null | undefined): {
+  executionMode: 'single_agent' | 'workflow' | null
+  interactionMode: 'goal' | 'workflow' | null
+  executionTopology: 'single_agent' | 'multi_agent' | null
+} {
+  const executionMode =
+    goal?.execution_mode === 'single_agent' || goal?.execution_mode === 'workflow'
+      ? goal.execution_mode
+      : null
+  const interactionMode =
+    goal?.interaction_mode === 'goal' || goal?.interaction_mode === 'workflow'
+      ? goal.interaction_mode
+      : null
+  const executionTopology =
+    goal?.execution_topology === 'single_agent' || goal?.execution_topology === 'multi_agent'
+      ? goal.execution_topology
+      : null
+  return { executionMode, interactionMode, executionTopology }
 }
 
 function WorkflowPanelBody({
@@ -429,8 +448,11 @@ function WorkflowPanelBody({
     }
     return state.currentSessionDetail?.goal ?? null
   })
-  const sessionGoalExecutionMode = getGoalExecutionMode(currentSessionGoal)
-  const workflowUiSuppressed = sessionGoalExecutionMode === 'single_agent'
+  const sessionGoalRuntimeContext = getGoalRuntimeContext(currentSessionGoal)
+  const sessionGoalExecutionMode = sessionGoalRuntimeContext.executionMode
+  const workflowUiSuppressed =
+    sessionGoalRuntimeContext.interactionMode === 'goal' &&
+    sessionGoalRuntimeContext.executionTopology === 'single_agent'
   const selectedRolesKey = serializeSelectedModelRoles(workflowConfig.selected_models_roles)
   const roleDraftScopeKey = `${sessionId ?? '__no_session__'}:${selectedRolesKey}`
   const selectedRolesSyncRef = React.useRef(roleDraftScopeKey)

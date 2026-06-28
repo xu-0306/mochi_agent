@@ -74,15 +74,27 @@ from mochi.tools.file_mutations import summarize_file_change_payload
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 GOAL_ACTIVE_STATUS = {"queued", "running"}
 GOAL_TERMINAL_STATUS = {"completed", "failed", "cancelled"}
-GOAL_RESUMABLE_STATUS = {"paused", "awaiting_resources", "stalled", "waiting_approval", "failed"}
+GOAL_RESUMABLE_STATUS = {
+    "paused",
+    "awaiting_operator",
+    "awaiting_resources",
+    "stalled",
+    "waiting_approval",
+    "failed",
+}
 GOAL_EXECUTION_MODES = {"single_agent", "workflow"}
+GOAL_INTERACTION_MODES = {"goal", "workflow"}
+GOAL_EXECUTION_TOPOLOGIES = {"single_agent", "multi_agent"}
 DEFAULT_GOAL_EXECUTION_MODE = "workflow"
+DEFAULT_GOAL_INTERACTION_MODE = "workflow"
+AUTONOMOUS_SINGLE_AGENT_PROTOCOL = "autonomous_single_agent"
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
 AGENT_RUN_ACTIVE_STATUS = {"running"}
 AGENT_RUN_OPERATOR_FINALIZEABLE_STATUS = {"awaiting_resources", "stalled"}
 AGENT_RUN_RESUMABLE_STATUS = {"paused", "awaiting_approval", "awaiting_resources", "partial", "stalled"}
 DELEGATED_MULTI_AGENT_TASK_TYPE = "delegated_multi_agent"
 AGENT_RUN_SUPPORTED_PROTOCOLS = {
+    AUTONOMOUS_SINGLE_AGENT_PROTOCOL,
     "teacher_student_distill",
     "multi_agent_debate",
     "dr_zero_self_evolve",
@@ -412,6 +424,21 @@ class RuntimeService:
         )
         capability_policy = _normalize_goal_capability_policy(payload.capability_policy)
         summary = dict(payload.summary)
+        interaction_mode = _normalize_goal_interaction_mode(
+            payload.interaction_mode,
+            execution_mode=payload.execution_mode,
+        )
+        execution_topology = _normalize_goal_execution_topology(
+            payload.execution_topology,
+            execution_mode=payload.execution_mode,
+            protocol_id=payload.protocol_id,
+        )
+        summary.setdefault("interaction_mode", interaction_mode)
+        summary.setdefault("execution_topology", execution_topology)
+        if isinstance(payload.protocol_selection, str) and payload.protocol_selection.strip():
+            summary["protocol_selection"] = payload.protocol_selection.strip()
+        if isinstance(payload.selection_rationale, str) and payload.selection_rationale.strip():
+            summary["selection_rationale"] = payload.selection_rationale.strip()
         if payload.project_id is not None:
             summary.setdefault("project_id", payload.project_id)
         if payload.workspace_dir is not None:
@@ -564,6 +591,12 @@ class RuntimeService:
         return {
             "goal_id": goal_id,
             "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
+            "interaction_mode": _goal_effective_interaction_mode(goal),
+            "execution_topology": _goal_effective_execution_topology(goal),
+            "protocol_id": _goal_effective_protocol_id(goal),
+            "bound_run_id": _goal_bound_run_id(goal),
+            "protocol_selection": _goal_protocol_selection(goal),
+            "selection_rationale": _goal_selection_rationale(goal),
             "status": current_status,
             "current_attempt_id": goal.get("current_attempt_id"),
             "attempt_count": len(goal.get("attempts") or []),
@@ -1168,11 +1201,18 @@ class RuntimeService:
     ) -> dict[str, Any]:
         effective_run_id = run_id or str(uuid4())
         schedule = _normalize_agent_run_schedule(payload.schedule)
+        summary = dict(payload.summary)
+        goal_linked = isinstance(summary.get("goal_id"), str) and bool(str(summary.get("goal_id")).strip())
+        default_run_policy = _default_agent_run_policy_from_security(self._security_config)
+        if goal_linked and "checkpoint_interval_steps" not in dict(payload.run_policy or {}):
+            default_run_policy = {
+                key: value for key, value in default_run_policy.items() if key != "checkpoint_interval_steps"
+            }
         run_policy = _normalize_agent_run_policy(
             payload.run_policy,
-            defaults=_default_agent_run_policy_from_security(self._security_config),
+            defaults=default_run_policy,
+            apply_default_checkpoint_interval_steps=not goal_linked,
         )
-        summary = dict(payload.summary)
         if payload.reasoning_effort is not None:
             summary["reasoning_effort"] = payload.reasoning_effort
         if payload.project_id is not None:
@@ -2083,11 +2123,15 @@ class RuntimeService:
             "goal_attempt_id": attempt_id,
             "objective": goal.get("objective"),
             "task_input": goal.get("objective"),
+            "interaction_mode": _goal_effective_interaction_mode(goal),
+            "execution_topology": _goal_effective_execution_topology(goal),
+            "protocol_selection": _goal_protocol_selection(goal),
+            "selection_rationale": _goal_selection_rationale(goal),
         }
         if goal_capability_policy:
             summary["goal_capability_policy"] = goal_capability_policy
         return AgentRunCreateRequest(
-            protocol_id=_goal_effective_protocol_id(goal) or "teacher_student_distill",
+            protocol_id=_goal_effective_protocol_id(goal) or AUTONOMOUS_SINGLE_AGENT_PROTOCOL,
             title=goal.get("title") if isinstance(goal.get("title"), str) else None,
             topic=goal.get("topic") or goal.get("objective"),
             project_id=goal.get("project_id") if isinstance(goal.get("project_id"), str) else None,
@@ -7009,7 +7053,12 @@ def _goal_response(goal: dict[str, Any]) -> dict[str, Any]:
         "title": goal.get("title"),
         "goal_type": goal.get("goal_type"),
         "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
+        "interaction_mode": _goal_effective_interaction_mode(goal),
+        "execution_topology": _goal_effective_execution_topology(goal),
         "protocol_id": _goal_effective_protocol_id(goal),
+        "bound_run_id": _goal_bound_run_id(goal),
+        "protocol_selection": _goal_protocol_selection(goal),
+        "selection_rationale": _goal_selection_rationale(goal),
         "topic": goal.get("topic"),
         "project_id": goal.get("project_id"),
         "workspace_dir": goal.get("workspace_dir"),
@@ -7058,11 +7107,114 @@ def _normalize_goal_execution_mode(value: Any) -> str:
     return DEFAULT_GOAL_EXECUTION_MODE
 
 
-def _goal_effective_protocol_id(goal: Mapping[str, Any]) -> str | None:
-    if _normalize_goal_execution_mode(goal.get("execution_mode")) == "single_agent":
-        return "teacher_student_distill"
+def _normalize_goal_interaction_mode(value: Any, *, execution_mode: Any = None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in GOAL_INTERACTION_MODES:
+        return normalized
+    if _normalize_goal_execution_mode(execution_mode) == "single_agent":
+        return "goal"
+    return DEFAULT_GOAL_INTERACTION_MODE
+
+
+def _normalize_goal_execution_topology(
+    value: Any,
+    *,
+    execution_mode: Any = None,
+    protocol_id: Any = None,
+) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in GOAL_EXECUTION_TOPOLOGIES:
+        return normalized
+    requested_protocol = str(protocol_id or "").strip()
+    if requested_protocol == AUTONOMOUS_SINGLE_AGENT_PROTOCOL:
+        return "single_agent"
+    if requested_protocol:
+        return "multi_agent"
+    if _normalize_goal_execution_mode(execution_mode) == "single_agent":
+        return "single_agent"
+    return "multi_agent"
+
+
+def _goal_summary_payload(goal: Mapping[str, Any]) -> dict[str, Any]:
+    summary = goal.get("summary")
+    return dict(summary) if isinstance(summary, Mapping) else {}
+
+
+def _goal_metadata_payload(goal: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = goal.get("metadata")
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+
+def _goal_summary_text(goal: Mapping[str, Any], key: str) -> str | None:
+    summary = _goal_summary_payload(goal)
+    metadata = _goal_metadata_payload(goal)
+    for source in (summary, metadata):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _goal_requested_protocol_id(goal: Mapping[str, Any]) -> str | None:
     normalized = str(goal.get("protocol_id") or "").strip()
     return normalized or None
+
+
+def _goal_has_explicit_distill_intent(goal: Mapping[str, Any]) -> bool:
+    explicit_selection = _goal_summary_text(goal, "protocol_selection")
+    if explicit_selection == "teacher_student_distill":
+        return True
+    selection_rationale = _goal_summary_text(goal, "selection_rationale")
+    if isinstance(selection_rationale, str) and "distill" in selection_rationale.lower():
+        return True
+    return False
+
+
+def _goal_effective_interaction_mode(goal: Mapping[str, Any]) -> str:
+    return _normalize_goal_interaction_mode(
+        _goal_summary_text(goal, "interaction_mode"),
+        execution_mode=goal.get("execution_mode"),
+    )
+
+
+def _goal_effective_protocol_id(goal: Mapping[str, Any]) -> str | None:
+    execution_mode = _normalize_goal_execution_mode(goal.get("execution_mode"))
+    requested_protocol = _goal_requested_protocol_id(goal)
+    if requested_protocol is not None:
+        if (
+            requested_protocol == "teacher_student_distill"
+            and execution_mode == "single_agent"
+            and not _goal_has_explicit_distill_intent(goal)
+        ):
+            return AUTONOMOUS_SINGLE_AGENT_PROTOCOL
+        return requested_protocol
+    if execution_mode == "single_agent":
+        return AUTONOMOUS_SINGLE_AGENT_PROTOCOL
+    return "teacher_student_distill"
+
+
+def _goal_effective_execution_topology(goal: Mapping[str, Any]) -> str:
+    return _normalize_goal_execution_topology(
+        _goal_summary_text(goal, "execution_topology"),
+        execution_mode=goal.get("execution_mode"),
+        protocol_id=_goal_effective_protocol_id(goal),
+    )
+
+
+def _goal_bound_run_id(goal: Mapping[str, Any]) -> str | None:
+    attempt = _current_goal_attempt(dict(goal))
+    if not isinstance(attempt, Mapping):
+        return None
+    agent_run_id = str(attempt.get("agent_run_id") or "").strip()
+    return agent_run_id or None
+
+
+def _goal_protocol_selection(goal: Mapping[str, Any]) -> str | None:
+    return _goal_summary_text(goal, "protocol_selection") or _goal_effective_protocol_id(goal)
+
+
+def _goal_selection_rationale(goal: Mapping[str, Any]) -> str | None:
+    return _goal_summary_text(goal, "selection_rationale")
 
 
 def _goal_recovery_state_from_agent_run(run: dict[str, Any]) -> dict[str, Any]:
@@ -8262,12 +8414,19 @@ def _goal_recommended_next_action(
         if run_id:
             payload["run_id"] = run_id
         return payload
-    if goal_status in {"paused", "stalled", "awaiting_resources"}:
-        return {
+    if goal_status in {"paused", "stalled", "awaiting_resources", "awaiting_operator"}:
+        payload = {
             "action": "resume_goal",
-            "summary": "Goal is resumable but not actively progressing.",
-            "blocking": goal_status != "paused",
+            "summary": (
+                "Goal is waiting at a durable checkpoint for operator guidance before continuing."
+                if goal_status == "awaiting_operator"
+                else "Goal is resumable but not actively progressing."
+            ),
+            "blocking": goal_status not in {"paused", "awaiting_operator"},
         }
+        if run_id:
+            payload["run_id"] = run_id
+        return payload
     if goal_status in GOAL_ACTIVE_STATUS:
         payload = {
             "action": "monitor",
@@ -10022,7 +10181,9 @@ def _goal_status_from_agent_run_status(status: str) -> str:
         return "waiting_approval"
     if normalized == "awaiting_resources":
         return "awaiting_resources"
-    if normalized in {"stalled", "partial"}:
+    if normalized == "partial":
+        return "awaiting_operator"
+    if normalized == "stalled":
         return "stalled"
     if normalized == "succeeded":
         return "completed"
@@ -10038,12 +10199,14 @@ def _goal_status_from_agent_run(
     *,
     linked_approval_state: dict[str, Any] | None = None,
 ) -> str:
-    base_status = _goal_status_from_agent_run_status(str(run.get("status") or "created"))
+    base_status = _goal_status_from_agent_run_status(
+        _effective_agent_run_status_for_goal_projection(run)
+    )
     approval_state = linked_approval_state or _goal_approval_state_from_agent_run(run)
     if (
         isinstance(approval_state, dict)
         and str(approval_state.get("status") or "") in {"waiting_approval", "awaiting_approval"}
-        and base_status == "stalled"
+        and base_status in {"awaiting_operator", "stalled"}
     ):
         return "waiting_approval"
     return base_status
@@ -10845,6 +11008,7 @@ def _normalize_agent_run_policy(
     run_policy: dict[str, Any] | None,
     *,
     defaults: dict[str, Any] | None = None,
+    apply_default_checkpoint_interval_steps: bool = True,
 ) -> dict[str, Any]:
     payload = {**dict(defaults or {}), **dict(run_policy or {})}
     normalized = {
@@ -10888,18 +11052,23 @@ def _normalize_agent_run_policy(
         maximum=100,
     )
 
+    checkpoint_interval_steps = _optional_positive_int("checkpoint_interval_steps", maximum=10_000)
+
     normalized.update(
         {
-        "max_wall_clock_sec": _optional_positive_int("max_wall_clock_sec"),
-        "heartbeat_timeout_sec": _optional_positive_int("heartbeat_timeout_sec"),
-        "checkpoint_interval_steps": _optional_positive_int("checkpoint_interval_steps", maximum=10_000) or 1,
-        "max_subagent_failures_per_role": (
-            2 if max_subagent_failures_per_role is None else max_subagent_failures_per_role
-        ),
-        "on_budget_exhausted": on_budget_exhausted,
-        "on_subagent_disconnect": on_subagent_disconnect,
+            "max_wall_clock_sec": _optional_positive_int("max_wall_clock_sec"),
+            "heartbeat_timeout_sec": _optional_positive_int("heartbeat_timeout_sec"),
+            "max_subagent_failures_per_role": (
+                2 if max_subagent_failures_per_role is None else max_subagent_failures_per_role
+            ),
+            "on_budget_exhausted": on_budget_exhausted,
+            "on_subagent_disconnect": on_subagent_disconnect,
         }
     )
+    if checkpoint_interval_steps is not None:
+        normalized["checkpoint_interval_steps"] = checkpoint_interval_steps
+    elif apply_default_checkpoint_interval_steps:
+        normalized["checkpoint_interval_steps"] = 1
     return {key: value for key, value in normalized.items() if value is not None}
 
 

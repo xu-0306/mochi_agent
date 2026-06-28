@@ -9,6 +9,11 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from mochi.api.routes.approvals import _get_runtime_service
+from mochi.goal_intent import classify_goal_proposal_follow_up_intent
+from mochi.goal_proposal_copy import (
+    build_goal_proposal_assistant_copy_fallback,
+    generate_goal_proposal_assistant_copy,
+)
 from mochi.runtime.models import GoalCreateRequest, GoalResponse
 
 router = APIRouter(prefix="/v1/goals")
@@ -47,6 +52,50 @@ class GoalEstopUpdateRequest(BaseModel):
     blocked_domains: list[str] | None = None
     block_network_usage: bool | None = None
     reason: str | None = None
+
+
+class PendingGoalProposalIntentRequest(BaseModel):
+    """Bounded intent classification request for a pending goal proposal follow-up."""
+
+    message: str
+    proposal_objective: str
+    execution_mode: Literal["single_agent", "workflow"]
+
+
+class PendingGoalProposalIntentResponse(BaseModel):
+    """Bounded intent classification result for a pending goal proposal follow-up."""
+
+    type: Literal["goal_pending_proposal_intent"] = "goal_pending_proposal_intent"
+    intent: Literal["confirm_start", "revise_proposal", "exit_goal_lane", "ambiguous"]
+    confidence: float | None = None
+    rationale: str
+
+
+class GoalProposalAssistantCopyRequest(BaseModel):
+    """Bounded assistant-copy request for a goal proposal card."""
+
+    message: str
+    proposal_objective: str
+    execution_mode: Literal["single_agent", "workflow"]
+    protocol_selection: str | None = None
+    role_summary: str | None = None
+    runtime_mode: str | None = None
+    revision_index: int = 0
+
+
+class GoalProposalAssistantCopyResponse(BaseModel):
+    """Assistant explanation text for a goal proposal card."""
+
+    type: Literal["goal_proposal_assistant_copy"] = "goal_proposal_assistant_copy"
+    explanation: str
+    source: Literal["model", "fallback"]
+
+
+async def _get_or_create_goal_intent_engine(request: Request) -> Any:
+    # Import lazily to avoid module-import cycles while still reusing the canonical app helper.
+    from mochi.api.server import _get_or_create_engine
+
+    return await _get_or_create_engine(request.app)
 
 
 def _current_goal_attempt(goal: dict[str, Any]) -> dict[str, Any] | None:
@@ -89,6 +138,65 @@ async def create_goal(
 ) -> GoalResponse:
     service = await _get_runtime_service(request.app)
     return GoalResponse.model_validate(await service.create_goal(payload))
+
+
+@router.post("/pending-proposal-intent", response_model=PendingGoalProposalIntentResponse)
+async def classify_pending_goal_proposal_intent(
+    request: Request,
+    payload: PendingGoalProposalIntentRequest,
+) -> PendingGoalProposalIntentResponse:
+    engine = await _get_or_create_goal_intent_engine(request)
+    invoke = getattr(engine, "invoke", None)
+    if not callable(invoke):
+        raise HTTPException(
+            status_code=501,
+            detail="Engine does not support bounded goal intent classification.",
+        )
+    result = await classify_goal_proposal_follow_up_intent(
+        engine,
+        user_message=payload.message,
+        proposal_objective=payload.proposal_objective,
+        execution_mode=payload.execution_mode,
+    )
+    return PendingGoalProposalIntentResponse(
+        intent=result.intent,
+        confidence=result.confidence,
+        rationale=result.rationale,
+    )
+
+
+@router.post("/proposal-assistant-copy", response_model=GoalProposalAssistantCopyResponse)
+async def build_goal_proposal_assistant_copy(
+    request: Request,
+    payload: GoalProposalAssistantCopyRequest,
+) -> GoalProposalAssistantCopyResponse:
+    engine = await _get_or_create_goal_intent_engine(request)
+    invoke = getattr(engine, "invoke", None)
+    if not callable(invoke):
+        return GoalProposalAssistantCopyResponse(
+            explanation=build_goal_proposal_assistant_copy_fallback(
+                user_message=payload.message,
+                proposal_objective=payload.proposal_objective,
+                execution_mode=payload.execution_mode,
+                protocol_selection=payload.protocol_selection,
+                revision_index=payload.revision_index,
+            ),
+            source="fallback",
+        )
+    result = await generate_goal_proposal_assistant_copy(
+        engine,
+        user_message=payload.message,
+        proposal_objective=payload.proposal_objective,
+        execution_mode=payload.execution_mode,
+        protocol_selection=payload.protocol_selection,
+        role_summary=payload.role_summary,
+        runtime_mode=payload.runtime_mode,
+        revision_index=payload.revision_index,
+    )
+    return GoalProposalAssistantCopyResponse(
+        explanation=result.explanation,
+        source=result.source,
+    )
 
 
 @router.get("", response_model=list[GoalResponse])

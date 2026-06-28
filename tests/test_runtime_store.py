@@ -86,7 +86,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     )
     assert goal["id"] == "goal-1"
     assert goal["execution_mode"] == "single_agent"
-    assert goal["protocol_id"] == "teacher_student_distill"
+    assert goal["protocol_id"] == "multi_agent_debate"
     assert goal["status"] == "created"
     assert goal["attempts"] == []
 
@@ -133,7 +133,7 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     saved_goal = asyncio.run(store.get_goal("goal-1"))
     assert saved_goal is not None
     assert saved_goal["execution_mode"] == "single_agent"
-    assert saved_goal["protocol_id"] == "teacher_student_distill"
+    assert saved_goal["protocol_id"] == "multi_agent_debate"
     assert saved_goal["current_attempt_id"] == "goal-attempt-1"
     assert saved_goal["run_policy"]["max_wall_clock_sec"] == 18_000
     assert saved_goal["capability_policy"]["allowed_tools"] == ["web_search"]
@@ -149,8 +149,28 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     assert len(goals) == 1
     assert goals[0]["id"] == "goal-1"
     assert goals[0]["execution_mode"] == "single_agent"
-    assert goals[0]["protocol_id"] == "teacher_student_distill"
+    assert goals[0]["protocol_id"] == "multi_agent_debate"
     assert goals[0]["attempts"][0]["id"] == "goal-attempt-1"
+
+
+def test_runtime_store_defaults_missing_single_agent_goal_protocol_to_autonomous_agent(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    goal = asyncio.run(
+        store.create_goal(
+            goal_id="goal-default-protocol-1",
+            objective="Work through the task directly",
+            execution_mode="single_agent",
+        )
+    )
+
+    assert goal["execution_mode"] == "single_agent"
+    assert goal["protocol_id"] == "autonomous_single_agent"
+
+    saved_goal = asyncio.run(store.get_goal("goal-default-protocol-1"))
+    assert saved_goal is not None
+    assert saved_goal["protocol_id"] == "autonomous_single_agent"
 
 
 def test_runtime_store_persists_goal_leases_and_audit_findings(tmp_path: Path) -> None:

@@ -74,6 +74,8 @@ class ApprovalResolution(BaseModel):
 
 
 GoalExecutionMode = Literal["single_agent", "workflow"]
+GoalInteractionMode = Literal["goal", "workflow"]
+GoalExecutionTopology = Literal["single_agent", "multi_agent"]
 
 
 class GoalCreateRequest(BaseModel):
@@ -83,7 +85,12 @@ class GoalCreateRequest(BaseModel):
     title: str | None = None
     goal_type: str | None = None
     execution_mode: GoalExecutionMode = "workflow"
+    interaction_mode: GoalInteractionMode | None = None
+    execution_topology: GoalExecutionTopology | None = None
     protocol_id: str | None = None
+    bound_run_id: str | None = None
+    protocol_selection: str | None = None
+    selection_rationale: str | None = None
     topic: str | None = None
     project_id: str | None = None
     workspace_dir: str | None = None
@@ -120,7 +127,12 @@ class GoalResponse(BaseModel):
     title: str | None = None
     goal_type: str | None = None
     execution_mode: GoalExecutionMode = "workflow"
+    interaction_mode: GoalInteractionMode = "workflow"
+    execution_topology: GoalExecutionTopology = "multi_agent"
     protocol_id: str | None = None
+    bound_run_id: str | None = None
+    protocol_selection: str | None = None
+    selection_rationale: str | None = None
     topic: str | None = None
     project_id: str | None = None
     workspace_dir: str | None = None

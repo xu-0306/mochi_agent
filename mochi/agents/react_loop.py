@@ -209,6 +209,7 @@ class AsyncReActLoop:
         finish_reason = "stop"
         last_tool_signature: tuple[str, ...] | None = None
         repeated_tool_rounds = 0
+        empty_final_recovery_attempts = 0
         web_fetch_guard_state: dict[str, Any] = {
             "last_failed_url": None,
             "failure_streak": 0,
@@ -590,6 +591,9 @@ class AsyncReActLoop:
                     continue
 
                 final_text, final_thinking = self._split_thinking_blocks(result.content, result.thinking)
+                if streamed_generation and held_stream_text and not final_text.strip():
+                    final_text = held_stream_text.strip()
+                    held_stream_text = ""
                 if self._should_force_followup_retrieval(evidence_guard_state):
                     messages.append(
                         Message(
@@ -605,6 +609,19 @@ class AsyncReActLoop:
                         metadata={"source": "model_summary"},
                     )
                 if not final_text.strip():
+                    if self._should_retry_empty_final_response(
+                        final_thinking=final_thinking,
+                        messages=messages,
+                        retry_count=empty_final_recovery_attempts,
+                    ):
+                        empty_final_recovery_attempts += 1
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=self._build_empty_final_response_prompt(),
+                            )
+                        )
+                        continue
                     backend_info = self._backend.get_model_info()
                     logger.warning("ReAct loop received an empty final response from the backend.")
                     yield ErrorEvent(
@@ -1133,6 +1150,28 @@ class AsyncReActLoop:
             return True
 
         return False
+
+    @staticmethod
+    def _should_retry_empty_final_response(
+        *,
+        final_thinking: str,
+        messages: list[Message],
+        retry_count: int,
+    ) -> bool:
+        if retry_count >= 1:
+            return False
+        if final_thinking.strip():
+            return True
+        return any(message.role == "tool" for message in messages)
+
+    @staticmethod
+    def _build_empty_final_response_prompt() -> str:
+        return (
+            "Your last response contained no user-visible final answer. "
+            "Return the final answer now in plain assistant text for the user, "
+            "using the user's language. Do not repeat hidden reasoning. "
+            "Do not call tools again unless another tool is strictly necessary."
+        )
 
     def _build_backend_error_metadata(self, exc: Exception) -> dict[str, Any]:
         backend_info = self._backend.get_model_info()

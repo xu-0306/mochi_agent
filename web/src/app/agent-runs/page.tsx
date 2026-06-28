@@ -1279,8 +1279,8 @@ export default function AgentRunsPage() {
               <Badge variant="outline">{activeRunsCount} active</Badge>
             </div>
             <div>
-              <h1 className="text-xl font-bold text-foreground">{t('agentRuns.deskTitle')}</h1>
-              <p className="mt-0.5 text-sm text-muted-foreground">{t('agentRuns.deskDescription')}</p>
+              <h1 className="text-xl font-bold text-foreground">{t('workflows.title')}</h1>
+              <p className="mt-0.5 text-sm text-muted-foreground">{t('workflows.description')}</p>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1441,7 +1441,7 @@ export default function AgentRunsPage() {
                     disabled={!operatorMessage.trim() || (!activeRunId && !canCreate)}
                   >
                     <Rocket className="h-4 w-4" />
-                    {activeRunId ? 'Send to active run' : 'Create run from message'}
+                    {activeRunId ? 'Send to active run' : t('workflows.create')}
                   </Button>
                   {activeRunSummary ? (
                     <Link

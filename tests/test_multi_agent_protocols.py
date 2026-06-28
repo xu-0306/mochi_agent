@@ -5,6 +5,7 @@ from mochi.agents.multi_agent.execution_policy import (
     parse_subagent_execution_policy,
 )
 from mochi.agents.multi_agent.protocols import (
+    AutonomousSingleAgentProtocol,
     ControlledSubagentExecutionProtocol,
     DrZeroSelfEvolveProtocol,
     MultiAgentDebateProtocol,
@@ -12,6 +13,15 @@ from mochi.agents.multi_agent.protocols import (
     parse_protocol_config,
 )
 from mochi.agents.multi_agent.research import ResearchDebatePolicy
+
+
+def test_parse_autonomous_single_agent_protocol_defaults() -> None:
+    resolved = parse_protocol_config({"protocol": "autonomous_single_agent"})
+
+    assert isinstance(resolved, AutonomousSingleAgentProtocol)
+    assert resolved.protocol == "autonomous_single_agent"
+    assert resolved.agent_role_id == "agent"
+    assert resolved.guidance_required is False
 
 
 def test_parse_teacher_student_protocol_defaults() -> None:

@@ -23,6 +23,74 @@ class _SwitchableBackend:
         return ModelInfo(name=self.name, backend_type="test")
 
 
+def test_engine_get_model_info_before_initialize_prefers_ollama_model_spec(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:qwen3.5:4b",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "openai_compat": {
+                "model": "gpt-5.4-mini",
+                "base_url": "https://www.right.codes/codex/v1",
+                "provider": "openai_compat",
+            },
+        }
+    )
+    engine = AgentEngine(config)
+
+    info = engine.get_model_info()
+
+    assert info.provider == "ollama"
+    assert info.backend_type == "ollama"
+    assert info.name == "qwen3.5:4b"
+
+
+@pytest.mark.asyncio
+async def test_engine_probe_active_tool_calling_before_initialize_does_not_inject_remote_model_name_into_ollama(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:qwen3.5:4b",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "openai_compat": {
+                "model": "gpt-5.4-mini",
+                "base_url": "https://www.right.codes/codex/v1",
+                "provider": "openai_compat",
+            },
+        }
+    )
+    engine = AgentEngine(config)
+    seen_kwargs: dict[str, object] = {}
+
+    class _ProbeBackend:
+        async def probe_tool_calling(self) -> dict[str, bool]:
+            return {"ok": True}
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_acquire_temporary_backend(*, model_spec: str, **kwargs: object) -> _ProbeBackend:
+        seen_kwargs["model_spec"] = model_spec
+        seen_kwargs.update(kwargs)
+        return _ProbeBackend()
+
+    engine._router.acquire_temporary_backend = fake_acquire_temporary_backend  # type: ignore[method-assign]
+
+    result = await engine.probe_active_tool_calling()
+
+    assert result == {"ok": True}
+    assert seen_kwargs["model_spec"] == "ollama:qwen3.5:4b"
+    assert "model_name" not in seen_kwargs
+    assert "provider" not in seen_kwargs
+    assert "base_url" not in seen_kwargs
+
+
 @pytest.mark.asyncio
 async def test_engine_switch_model_updates_config(tmp_path: Path) -> None:
     """switch_model() 應透過 router 切換並更新 config.model。"""

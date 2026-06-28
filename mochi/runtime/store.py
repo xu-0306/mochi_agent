@@ -11,7 +11,7 @@ from typing import Any
 
 _UNSET = object()
 _DEFAULT_GOAL_EXECUTION_MODE = "workflow"
-_DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL = "teacher_student_distill"
+_DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL = "autonomous_single_agent"
 _GOAL_EXECUTION_MODES = {"single_agent", _DEFAULT_GOAL_EXECUTION_MODE}
 _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
     "cancelled",
@@ -3025,10 +3025,12 @@ def _normalize_goal_execution_mode(value: Any) -> str:
 
 
 def _normalize_goal_protocol_id(execution_mode: Any, protocol_id: Any) -> str | None:
+    normalized = str(protocol_id or "").strip()
+    if normalized:
+        return normalized
     if _normalize_goal_execution_mode(execution_mode) == "single_agent":
         return _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL
-    normalized = str(protocol_id or "").strip()
-    return normalized or None
+    return None
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
