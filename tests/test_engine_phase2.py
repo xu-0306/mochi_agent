@@ -13,6 +13,7 @@ from mochi.agents.engine import AgentEngine
 from mochi.agents.events import AgentEvent, FinalAnswerEvent
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest
 from mochi.agents.tool_exposure import ToolExposurePlan
+from mochi.agents.tool_intent_router import ToolIntentRoute
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.types import AttachmentRef, GenerationResult, Message, ModelInfo, ResponsesReplayState, StreamChunk
@@ -56,7 +57,10 @@ class FakeBackend(BaseLLMBackend):
         return GenerationResult(content="fake reply")
 
     def supports_tool_calling(self) -> bool:
-        return True
+        return not (
+            self.metadata.get("tool_call_mode") == "unavailable"
+            or self.metadata.get("tool_calling_blocked") is True
+        )
 
     def get_model_info(self) -> ModelInfo:
         return ModelInfo(name="fake", backend_type=self.backend_type, metadata=dict(self.metadata))
@@ -105,6 +109,239 @@ async def test_engine_preflight_probe_removes_tools_when_openai_provider_blocks_
     assert backend.probe_calls == 1
     assert filtered.tool_names == []
     assert filtered.limit == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_probe_calls_backend_probe_when_status_unknown(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="ollama",
+        metadata={"native_tool_calling_status": "unknown"},
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 1
+    assert filtered.tool_names == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_probe_retries_recoverable_fallback_state(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="ollama",
+        metadata={
+            "tool_call_mode": "simulated_fallback",
+            "native_tool_calling_status": "native_tool_calls_missing",
+        },
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 1
+    assert filtered.tool_names == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_probe_calls_capable_backend_for_unresolved_state(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="custom_backend",
+        metadata={"native_tool_calling_status": "unknown"},
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 1
+    assert filtered.tool_names == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_probe_skips_resolved_supported_state_without_reprobe(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="ollama",
+        metadata={
+            "tool_call_mode": "native",
+            "native_tool_calling_status": "supported",
+        },
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 0
+    assert filtered.tool_names == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_probe_skips_terminal_state_without_reprobe(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="ollama",
+        metadata={
+            "tool_call_mode": "unavailable",
+            "native_tool_calling_status": "simulated_protocol_rejected",
+            "tool_calling_blocked": True,
+        },
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 0
+    assert filtered.tool_names == []
+    assert filtered.limit == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_preview_and_chat_invoke_share_classifier_first_tool_intent_contract(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(backend_type="openai_compat")
+    scoped_workspace = tmp_path / "scoped-workspace"
+    scoped_workspace.mkdir()
+    route_calls: list[bool] = []
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        engine._router._active = backend  # noqa: SLF001
+        return backend
+
+    async def fake_route(
+        *,
+        user_message: str,
+        session_bound_workspace: bool,
+        attachment_count: int = 0,
+        workspace_attachment_count: int = 0,
+        classifier=None,
+    ) -> ToolIntentRoute:
+        del user_message, session_bound_workspace, attachment_count, workspace_attachment_count
+        route_calls.append(classifier is not None)
+        return ToolIntentRoute(
+            intent="ambiguous",
+            confidence=0.0,
+            source="fallback_keyword",
+            rationale="test route",
+        )
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    engine._tool_intent_router.route = fake_route  # type: ignore[method-assign]
+
+    await engine.preview_chat_context(
+        "Summarize foo.py",
+        session_id="preview-parity",
+        workspace_dir=str(scoped_workspace),
+    )
+    await engine.invoke(
+        AgentInvocationRequest(
+            message="Summarize foo.py",
+            session_id="preview-parity",
+            workspace_dir=str(scoped_workspace),
+            tool_mode="auto",
+            execution_profile="chat",
+            persist_session=False,
+        )
+    )
+
+    assert route_calls == [True, True]
+    await engine.close()
 
 
 @pytest.mark.asyncio
@@ -163,8 +400,9 @@ async def test_engine_persists_and_restores_session_history(tmp_path: Path) -> N
     restored_events = [event async for event in restored.chat("second turn", session_id="s1")]
 
     assert any(isinstance(event, FinalAnswerEvent) for event in restored_events)
-    assert len(restored_backend.calls) == 1
-    restored_messages = restored_backend.calls[0]
+    assert restored_backend.probe_calls == 1
+    assert len(restored_backend.calls) == 2
+    restored_messages = restored_backend.calls[-1]
     assert [message.content for message in restored_messages[1:3]] == [
         "first turn",
         "fake reply",
@@ -648,11 +886,12 @@ async def test_engine_invoke_exposes_tool_exposure_metadata_from_final_plan(
         )
     )
 
-    assert result.diagnostics.to_dict()["tool_exposure"] == {
-        "exposed_tools": result.diagnostics.exposed_tools,
-        "workspace_bound": True,
-        "attachment_count": 2,
-    }
+    tool_exposure = result.diagnostics.to_dict()["tool_exposure"]
+    assert tool_exposure["exposed_tools"] == result.diagnostics.exposed_tools
+    assert tool_exposure["workspace_bound"] is True
+    assert tool_exposure["attachment_count"] == 2
+    assert tool_exposure["intent_route"]["intent"] == "workspace_read"
+    assert tool_exposure["intent_route"]["source"] == "fallback_keyword"
 
     await engine.close()
 

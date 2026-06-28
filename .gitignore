@@ -74,6 +74,7 @@ logs/
 .gemini/
 .superpowers/
 .tmp/
+.worktrees/
 mochi/config.yaml
 mochi/workspace/
 mochi/sessions/

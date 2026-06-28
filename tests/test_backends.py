@@ -11,7 +11,9 @@ import pytest
 from mochi.backends.ollama import OllamaBackend
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.router import BackendRouter
-from mochi.backends.types import Message, ToolCall, ToolSchema
+from mochi.backends.simulated_tool_protocol import SimulatedToolProtocol
+from mochi.backends.tool_call_contract import validate_tool_turn_result
+from mochi.backends.types import GenerationResult, Message, ToolCall, ToolSchema
 
 
 @pytest.fixture
@@ -32,6 +34,67 @@ def _mock_response(data: dict) -> MagicMock:
 def _httpx_json_response(url: str, status_code: int, data: dict) -> httpx.Response:
     request = httpx.Request("POST", url)
     return httpx.Response(status_code, request=request, json=data)
+
+
+def test_validate_tool_turn_accepts_structured_tool_calls() -> None:
+    result = GenerationResult(
+        content="",
+        thinking="plan",
+        tool_calls=[ToolCall(id="1", name="web_search", arguments={})],
+    )
+
+    verdict = validate_tool_turn_result(result=result, tools_requested=True)
+
+    assert verdict.is_valid is True
+    assert verdict.reason == "tool_calls"
+
+
+def test_validate_tool_turn_rejects_thinking_only_output() -> None:
+    result = GenerationResult(content="", thinking="planning only", tool_calls=[])
+
+    verdict = validate_tool_turn_result(result=result, tools_requested=True)
+
+    assert verdict.is_valid is False
+    assert verdict.reason == "thinking_only"
+
+
+def test_simulated_tool_protocol_flattens_prior_tool_messages() -> None:
+    protocol = SimulatedToolProtocol()
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    messages = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="1", name="web_search", arguments={"query": "Mochi"})],
+        ),
+        Message(
+            role="tool",
+            content="Tool web_search result:\nfound",
+            tool_call_id="1",
+            name="web_search",
+        ),
+    ]
+
+    prepared = protocol.prepare_messages(messages=messages, tools=tools)
+
+    assert any(
+        message.role == "assistant" and "Tool request: web_search" in message.content
+        for message in prepared
+    )
+    assert any(
+        message.role == "user" and message.content.startswith("Tool web_search result:")
+        for message in prepared
+    )
 
 
 @pytest.mark.asyncio
@@ -171,6 +234,374 @@ async def test_generate_with_tool_calls(backend: OllamaBackend) -> None:
     assert result.tool_calls[0].name == "web_search"
     assert result.tool_calls[0].arguments == {"query": "Mochi AI"}
     assert result.finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_ollama_falls_back_to_simulated_tool_mode_when_native_response_has_only_thinking(
+    backend: OllamaBackend,
+) -> None:
+    tools = [
+        ToolSchema(
+            name="arxiv_search",
+            description="Search arXiv",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    native_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": "I should search arXiv first.",
+            },
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 18,
+            "eval_count": 7,
+        }
+    )
+    simulated_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": (
+                    "<tool_call>\n"
+                    '{"name": "arxiv_search", "arguments": {"query": "ESG LLM fine-tuning"}}\n'
+                    "</tool_call>"
+                ),
+            },
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 24,
+            "eval_count": 11,
+        }
+    )
+
+    with patch.object(
+        backend._client,
+        "post",
+        new_callable=AsyncMock,
+        side_effect=[native_response, simulated_response],
+    ) as post:
+        result = await backend.generate(
+            messages=[Message(role="user", content="Find ESG LLM fine-tuning papers.")],
+            tools=tools,
+            stream=False,
+        )
+
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "arxiv_search"
+    assert result.tool_calls[0].arguments == {"query": "ESG LLM fine-tuning"}
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "simulated_fallback"
+    assert metadata["native_tool_calling_status"] == "native_tool_calls_missing"
+    assert metadata["fallback_diagnostics"]
+
+    first_payload = post.await_args_list[0].kwargs["json"]
+    second_payload = post.await_args_list[1].kwargs["json"]
+    assert "tools" in first_payload
+    assert "tools" not in second_payload
+    assert second_payload["messages"][0]["role"] == "system"
+    assert "## Tool Use Instructions" in second_payload["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_simulated_tool_mode_flattens_prior_tool_messages() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    mock_resp = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "done"},
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 20,
+            "eval_count": 6,
+        }
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call-1",
+                    name="web_search",
+                    arguments={"query": "Mochi AI"},
+                )
+            ],
+        ),
+        Message(
+            role="tool",
+            content="Tool web_search result:\nfound: Mochi AI",
+            tool_call_id="call-1",
+            name="web_search",
+        ),
+    ]
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp) as post:
+            await backend.generate(messages=messages, tools=tools, stream=False)
+    finally:
+        await backend.close()
+
+    payload = post.await_args.kwargs["json"]
+    assert "tools" not in payload
+    assert payload["messages"][0]["role"] == "system"
+    assert "## Tool Use Instructions" in payload["messages"][0]["content"]
+    assert payload["messages"][1] == {
+        "role": "assistant",
+        "content": "Tool request: web_search\nArguments: {'query': 'Mochi AI'}",
+    }
+    assert payload["messages"][2] == {
+        "role": "user",
+        "content": "Tool web_search result:\nfound: Mochi AI",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ollama_retry_that_returns_only_thinking_raises_backend_error() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    native_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "", "thinking": "Need web context."},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    retry_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "", "thinking": "Still deciding."},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            side_effect=[native_response, retry_response],
+        ):
+            with pytest.raises(RuntimeError, match="invalid tool-eligible turn"):
+                await backend.generate(
+                    messages=[Message(role="user", content="Search Mochi AI")],
+                    tools=tools,
+                    stream=False,
+                )
+    finally:
+        await backend.close()
+
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "unavailable"
+    assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
+
+
+@pytest.mark.asyncio
+async def test_ollama_probe_reenables_native_mode_after_fallback() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    backend._tool_state.native_status = "native_tool_calls_missing"  # noqa: SLF001
+    backend._tool_state.fallback_validation_status = "validated"  # noqa: SLF001
+    probe_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "probe-call-1",
+                        "function": {"name": "mochi_tool_probe", "arguments": {"value": "ok"}},
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=probe_response):
+            result = await backend.probe_tool_calling()
+    finally:
+        await backend.close()
+
+    assert result is not None
+    assert result["status"] == "supported"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["native_tool_calling_status"] == "supported"
+
+
+@pytest.mark.asyncio
+async def test_ollama_simulated_retry_http_error_marks_backend_unavailable() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    native_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "", "thinking": "Need web context."},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    request = httpx.Request("POST", "http://localhost:11434/api/chat")
+    simulated_error = httpx.HTTPStatusError(
+        "EOF",
+        request=request,
+        response=httpx.Response(500, request=request, text='{"error":"EOF"}'),
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            side_effect=[native_response, simulated_error],
+        ):
+            with pytest.raises(RuntimeError, match="EOF|500"):
+                await backend.generate(
+                    messages=[Message(role="user", content="Search Mochi AI")],
+                    tools=tools,
+                    stream=False,
+                )
+    finally:
+        await backend.close()
+
+    assert backend.get_model_info().metadata["tool_call_mode"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_ollama_probe_failure_from_native_mode_marks_backend_unavailable() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    failure_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "", "thinking": "Need a tool."},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=failure_response):
+            result = await backend.probe_tool_calling()
+    finally:
+        await backend.close()
+
+    assert result is not None
+    assert result["status"] == "thinking_only"
+    assert backend.get_model_info().metadata["tool_call_mode"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_ollama_failed_reprobe_after_validated_fallback_stays_in_simulated_mode() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    backend._tool_state.native_status = "native_tool_calls_missing"  # noqa: SLF001
+    backend._tool_state.fallback_validation_status = "validated"  # noqa: SLF001
+    failure_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "", "thinking": "Need a tool."},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=failure_response):
+            result = await backend.probe_tool_calling()
+    finally:
+        await backend.close()
+
+    assert result is not None
+    assert result["status"] == "thinking_only"
+    assert backend.get_model_info().metadata["tool_call_mode"] == "simulated_fallback"
+
+
+@pytest.mark.asyncio
+async def test_ollama_manual_probe_can_recover_from_unavailable_state() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend._tool_state.active_mode = "unavailable"  # noqa: SLF001
+    backend._tool_state.native_status = "simulated_protocol_rejected"  # noqa: SLF001
+    backend._tool_state.fallback_validation_status = "rejected"  # noqa: SLF001
+    probe_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "probe-call-1",
+                        "function": {"name": "mochi_tool_probe", "arguments": {"value": "ok"}},
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=probe_response):
+            result = await backend.probe_tool_calling()
+    finally:
+        await backend.close()
+
+    assert result is not None
+    assert result["status"] == "supported"
+    assert backend.get_model_info().metadata["tool_call_mode"] == "native"
+
+
+def test_ollama_supports_tool_calling_false_when_mode_is_unavailable() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend._tool_state.active_mode = "unavailable"  # noqa: SLF001
+
+    assert backend.supports_tool_calling() is False
 
 
 def test_ollama_serializes_messages_in_native_shape(backend: OllamaBackend) -> None:
@@ -439,7 +870,7 @@ async def test_openai_compat_vllm_falls_back_when_auto_tool_choice_is_disabled()
         await backend.close()
 
     assert result.content == "ok"
-    assert backend.supports_tool_calling() is False
+    assert backend.supports_tool_calling() is True
     assert "tools" in post.await_args_list[0].kwargs["json"]
     assert "tools" not in post.await_args_list[1].kwargs["json"]
     diagnostics = backend.get_model_info().metadata["fallback_diagnostics"]
@@ -517,8 +948,11 @@ async def test_openai_compat_falls_back_when_provider_rejects_native_tools() -> 
     retry_payload = post.await_args_list[1].kwargs["json"]
     assert "tools" in first_payload
     assert "tools" not in retry_payload
-    assert "## Tool Use Instructions" in retry_payload["messages"][0]["content"]
-    assert backend.supports_tool_calling() is False
+    if "messages" in retry_payload:
+        assert "## Tool Use Instructions" in retry_payload["messages"][0]["content"]
+    else:
+        assert "## Tool Use Instructions" in retry_payload["instructions"]
+    assert backend.supports_tool_calling() is True
     assert result.content == ""
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].name == "web_search"
@@ -533,7 +967,7 @@ async def test_openai_compat_uses_simulated_tool_mode_after_vllm_fallback() -> N
         model="google/gemma-4-26B-A4B-it",
         provider="vllm",
     )
-    backend._tool_calling_enabled = False  # noqa: SLF001
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
     success_response = _mock_response(
         {
             "model": "google/gemma-4-26B-A4B-it",
@@ -588,7 +1022,7 @@ async def test_openai_compat_flattens_tool_messages_in_simulated_mode() -> None:
         model="google/gemma-4-26B-A4B-it",
         provider="vllm",
     )
-    backend._tool_calling_enabled = False  # noqa: SLF001
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
     success_response = _mock_response(
         {
             "model": "google/gemma-4-26B-A4B-it",
@@ -641,6 +1075,58 @@ async def test_openai_compat_flattens_tool_messages_in_simulated_mode() -> None:
         message["role"] == "user" and message["content"].startswith("Tool web_search result:\nfound: Mochi AI")
         for message in payload_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_simulated_thinking_only_turn_marks_backend_unavailable() -> None:
+    backend = OpenAICompatBackend(
+        base_url="http://localhost:8000/v1",
+        model="google/gemma-4-26B-A4B-it",
+        provider="vllm",
+    )
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    response = _mock_response(
+        {
+            "model": "google/gemma-4-26B-A4B-it",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning": "still deciding",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+        }
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=response,
+        ):
+            with pytest.raises(RuntimeError, match="invalid tool-eligible turn"):
+                await backend.generate(
+                    messages=[Message(role="system", content="You are helpful."), Message(role="user", content="hi")],
+                    tools=[
+                        ToolSchema(
+                            name="web_search",
+                            description="Search the web",
+                            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+                        )
+                    ],
+                    stream=False,
+                )
+    finally:
+        await backend.close()
+
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "unavailable"
+    assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
 
 
 @pytest.mark.asyncio
@@ -699,7 +1185,7 @@ async def test_openai_compat_probe_tool_calling_reenables_native_mode_after_fall
         model="google/gemma-4-26B-A4B-it",
         provider="vllm",
     )
-    backend._tool_calling_enabled = False  # noqa: SLF001
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
     success_response = _mock_response(
         {
             "model": "google/gemma-4-26B-A4B-it",

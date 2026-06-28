@@ -44,6 +44,11 @@ from mochi.agents.invocation import (
 )
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
+from mochi.agents.tool_intent_router import (
+    BackendToolIntentClassifier,
+    ToolIntentRoute,
+    ToolIntentRouter,
+)
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.inference_capabilities import (
     InferenceCapabilities,
@@ -309,10 +314,44 @@ class AgentEngine:
             mcp_runtime_manager=self._mcp_runtime_manager,
         )
         self._tool_registry = self._tool_registry_factory.create_registry(config.workspace_dir)
+        self._tool_intent_router = ToolIntentRouter()
         self._tool_exposure_planner = ToolExposurePlanner(
             tool_groups=self._tool_registry_factory.tool_groups,
         )
+        self._preinitialized_model_info_cache: ModelInfo | None = None
         self._initialized = False
+
+    def _preinitialized_active_backend_kwargs(self) -> dict[str, Any]:
+        """Only remote model specs should inherit remote provider/model settings before init."""
+        if not self._config.model.startswith(("http://", "https://")):
+            return {}
+
+        active_remote_provider = _active_remote_provider(self._config)
+        return {
+            "model_name": _active_remote_model_name(self._config),
+            "provider": active_remote_provider or self._config.openai_compat.provider,
+            "base_url": (
+                self._config.openai_codex.base_url
+                if active_remote_provider == "openai_codex"
+                else self._config.openai_compat.base_url
+            ),
+            "api_key": (
+                self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
+                if active_remote_provider == "openai_codex"
+                else self._resolve_active_openai_compat_api_key(self._config)
+            ),
+        }
+
+    def _clear_preinitialized_model_info_cache(self) -> None:
+        self._preinitialized_model_info_cache = None
+
+    def _cache_preinitialized_model_info(self, backend: BaseLLMBackend) -> None:
+        if self._initialized:
+            return
+        try:
+            self._preinitialized_model_info_cache = copy.deepcopy(backend.get_model_info())
+        except Exception:
+            logger.debug("Unable to cache preinitialized backend model info after probe.")
 
     @staticmethod
     def _default_max_iterations_for_backend(base_iterations: int, backend: BaseLLMBackend) -> int:
@@ -323,6 +362,7 @@ class AgentEngine:
 
     async def initialize(self) -> None:
         """非同步初始化：載入後端並完成準備。"""
+        self._clear_preinitialized_model_info_cache()
         if _active_remote_provider(self._config) == "openai_codex":
             await self.switch_openai_codex_backend(
                 base_url=self._config.openai_codex.base_url,
@@ -413,6 +453,20 @@ class AgentEngine:
         sanitized = sanitize_inference_params_for_capabilities(resolved, capabilities)
         reasoning_effort = sanitized.get("reasoning_effort")
         planner_message = self._build_tool_planner_message(message, attachments)
+        attachment_count = self._attachment_count(attachments)
+        workspace_attachment_count = self._workspace_attachment_count(attachments)
+        tool_intent_route = await self._route_tool_intent_for_exposure(
+            message=message,
+            session_bound_workspace=(
+                scope.project_id is not None
+                or effective_workspace_dir != self._config.workspace_dir
+            ),
+            attachment_count=attachment_count,
+            workspace_attachment_count=workspace_attachment_count,
+            active_backend=active_backend,
+            execution_profile="chat",
+            tool_mode="auto",
+        )
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
             user_intent_message=message,
@@ -429,8 +483,12 @@ class AgentEngine:
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
-            attachment_count=self._attachment_count(attachments),
-            workspace_attachment_count=self._workspace_attachment_count(attachments),
+            attachment_count=attachment_count,
+            workspace_attachment_count=workspace_attachment_count,
+            routed_intent=tool_intent_route.intent,
+            intent_confidence=tool_intent_route.confidence,
+            intent_source=tool_intent_route.source,
+            intent_rationale=tool_intent_route.rationale,
         )
         tool_schemas = workspace_registry.get_schemas_for_names(exposure_plan.tool_names)
         attachment_context = self._build_attachment_prompt_context(
@@ -655,6 +713,17 @@ class AgentEngine:
         capabilities = self._inference_capabilities_for_backend(active_backend)
         sanitized = sanitize_inference_params_for_capabilities(resolved, capabilities)
         reasoning_effort = sanitized.get("reasoning_effort")
+        attachment_count = self._attachment_count(request.attachments)
+        workspace_attachment_count = self._workspace_attachment_count(request.attachments)
+        tool_intent_route = await self._route_tool_intent_for_exposure(
+            message=request.message,
+            session_bound_workspace=session_bound_workspace,
+            attachment_count=attachment_count,
+            workspace_attachment_count=workspace_attachment_count,
+            active_backend=active_backend,
+            execution_profile=request.execution_profile,
+            tool_mode=request.tool_mode,
+        )
         exposure_plan = self._tool_exposure_planner.plan(
             message=planner_message,
             user_intent_message=request.message,
@@ -668,9 +737,13 @@ class AgentEngine:
             ),
             preferred_tool_names=skill_selection.preferred_tool_names,
             tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
-            attachment_count=self._attachment_count(request.attachments),
-            workspace_attachment_count=self._workspace_attachment_count(request.attachments),
+            attachment_count=attachment_count,
+            workspace_attachment_count=workspace_attachment_count,
             tool_mode=request.tool_mode,
+            routed_intent=tool_intent_route.intent,
+            intent_confidence=tool_intent_route.confidence,
+            intent_source=tool_intent_route.source,
+            intent_rationale=tool_intent_route.rationale,
         )
         exposure_plan = self._apply_invocation_tool_overrides(
             exposure_plan,
@@ -755,10 +828,12 @@ class AgentEngine:
         )
         tool_exposure_metadata = diagnostics.tool_exposure or exposure_plan.exposure_metadata()
         logger.debug(
-            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
+            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, routed_intent={}, route_source={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
             active_backend.get_model_info().backend_type,
             request.tool_mode,
             request.execution_profile,
+            tool_intent_route.intent,
+            tool_intent_route.source,
             exposure_plan.matched_groups,
             exposure_plan.tool_names,
             exposure_plan.workspace_bound,
@@ -848,18 +923,9 @@ class AgentEngine:
             return exposure_plan
         backend_info = backend.get_model_info()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
-        if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
-            return ToolExposurePlan(
-                tool_names=[],
-                matched_groups=exposure_plan.matched_groups,
-                limit=0,
-                discoverable_tool_names=[],
-                workspace_bound=exposure_plan.workspace_bound,
-                attachment_count=exposure_plan.attachment_count,
-            )
-        if backend_info.backend_type != "openai_compat":
-            return exposure_plan
-        if metadata.get("native_tool_calling_status") not in {None, "unknown"}:
+        if self._tool_calling_state_is_terminal(metadata):
+            return self._disable_tool_exposure_plan(exposure_plan)
+        if not self._should_probe_tool_calling_preflight(metadata):
             return exposure_plan
         probe = getattr(backend, "probe_tool_calling", None)
         if not callable(probe):
@@ -873,24 +939,46 @@ class AgentEngine:
             return exposure_plan
         refreshed = backend.get_model_info()
         refreshed_metadata = refreshed.metadata if isinstance(refreshed.metadata, dict) else {}
-        if (
-            refreshed_metadata.get("tool_calling_blocked") is True
-            or refreshed_metadata.get("tool_call_mode") == "unavailable"
-        ):
+        if self._tool_calling_state_is_terminal(refreshed_metadata):
             logger.warning(
                 "Tool exposure disabled because backend reports tool calling unavailable: provider=%s, model=%s",
                 refreshed.provider,
                 refreshed.name,
             )
-            return ToolExposurePlan(
-                tool_names=[],
-                matched_groups=exposure_plan.matched_groups,
-                limit=0,
-                discoverable_tool_names=[],
-                workspace_bound=exposure_plan.workspace_bound,
-                attachment_count=exposure_plan.attachment_count,
-            )
+            return self._disable_tool_exposure_plan(exposure_plan)
         return exposure_plan
+
+    @staticmethod
+    def _tool_calling_state_is_terminal(metadata: dict[str, Any]) -> bool:
+        return (
+            metadata.get("tool_calling_blocked") is True
+            or metadata.get("tool_call_mode") == "unavailable"
+        )
+
+    @classmethod
+    def _should_probe_tool_calling_preflight(cls, metadata: dict[str, Any]) -> bool:
+        if cls._tool_calling_state_is_terminal(metadata):
+            return False
+        if metadata.get("tool_call_mode") == "simulated_fallback":
+            return True
+        return metadata.get("native_tool_calling_status") in {
+            None,
+            "",
+            "unknown",
+            "native_tool_calls_missing",
+        }
+
+    @staticmethod
+    def _disable_tool_exposure_plan(exposure_plan: ToolExposurePlan) -> ToolExposurePlan:
+        return ToolExposurePlan(
+            tool_names=[],
+            matched_groups=exposure_plan.matched_groups,
+            limit=0,
+            discoverable_tool_names=[],
+            workspace_bound=exposure_plan.workspace_bound,
+            attachment_count=exposure_plan.attachment_count,
+            intent_route=copy.deepcopy(exposure_plan.intent_route),
+        )
 
     def _apply_execution_profile(
         self,
@@ -944,6 +1032,7 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
+                intent_route=copy.deepcopy(exposure_plan.intent_route),
             )
         if execution_profile == "subagent_execution_request":
             return ToolExposurePlan(
@@ -955,6 +1044,7 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
+                intent_route=copy.deepcopy(exposure_plan.intent_route),
             )
         if execution_profile == "controller_exec":
             controller_tools = list(exposure_plan.tool_names)
@@ -970,6 +1060,7 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
+                intent_route=copy.deepcopy(exposure_plan.intent_route),
             )
         if execution_profile in {"subagent_research", "judge", "verifier"}:
             return ToolExposurePlan(
@@ -981,6 +1072,7 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
+                intent_route=copy.deepcopy(exposure_plan.intent_route),
             )
         return exposure_plan
 
@@ -1021,11 +1113,13 @@ class AgentEngine:
             discoverable_tool_names=discoverable_tool_names,
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
+            intent_route=copy.deepcopy(exposure_plan.intent_route),
         )
 
     async def switch_model(self, model_spec: str) -> ModelInfo:
         """切換活躍模型並回傳新模型資訊。"""
         backend = await self._router.switch(model_spec)
+        self._clear_preinitialized_model_info_cache()
         self._config.model = model_spec
         self._initialized = True
         return backend.get_model_info()
@@ -1041,23 +1135,13 @@ class AgentEngine:
         """回傳目前活躍模型資訊；尚未初始化時依 config 產生摘要。"""
         if self._initialized:
             return self._router.active.get_model_info()
+        if self._preinitialized_model_info_cache is not None:
+            return copy.deepcopy(self._preinitialized_model_info_cache)
 
         try:
-            active_remote_provider = _active_remote_provider(self._config)
             return self._router._resolve(  # noqa: SLF001
                 self._config.model,
-                model_name=_active_remote_model_name(self._config),
-                provider=active_remote_provider or self._config.openai_compat.provider,
-                base_url=(
-                    self._config.openai_codex.base_url
-                    if active_remote_provider == "openai_codex"
-                    else self._config.openai_compat.base_url
-                ),
-                api_key=(
-                    self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
-                    if active_remote_provider == "openai_codex"
-                    else self._resolve_active_openai_compat_api_key(self._config)
-                ),
+                **self._preinitialized_active_backend_kwargs(),
             ).get_model_info()
         except (RuntimeError, ValueError):
             model_spec = self._config.model
@@ -1088,29 +1172,24 @@ class AgentEngine:
         if self._initialized:
             probe = getattr(self._router.active, "probe_tool_calling", None)
             if callable(probe):
-                return await _maybe_await(probe())
+                result = probe()
+                if inspect.isawaitable(result):
+                    return await result
+                return result
             return None
 
-        active_remote_provider = _active_remote_provider(self._config)
         backend = await self._router.acquire_temporary_backend(
             model_spec=self._config.model,
-            model_name=_active_remote_model_name(self._config),
-            provider=active_remote_provider or self._config.openai_compat.provider,
-            base_url=(
-                self._config.openai_codex.base_url
-                if active_remote_provider == "openai_codex"
-                else self._config.openai_compat.base_url
-            ),
-            api_key=(
-                self._resolve_openai_codex_access_token(self._config.openai_codex.auth_profile_id)
-                if active_remote_provider == "openai_codex"
-                else self._resolve_active_openai_compat_api_key(self._config)
-            ),
+            **self._preinitialized_active_backend_kwargs(),
         )
         try:
             probe = getattr(backend, "probe_tool_calling", None)
             if callable(probe):
-                return await _maybe_await(probe())
+                result = probe()
+                if inspect.isawaitable(result):
+                    result = await result
+                self._cache_preinitialized_model_info(backend)
+                return result
             return None
         finally:
             await backend.close()
@@ -1123,6 +1202,7 @@ class AgentEngine:
     ) -> ModelInfo:
         """以指定 Ollama endpoint 與模型切換活躍後端。"""
         backend = await self._router.switch_ollama(model=model, base_url=base_url)
+        self._clear_preinitialized_model_info_cache()
         self._config.model = f"ollama:{model.strip()}"
         if base_url:
             self._config.ollama.base_url = base_url.strip().rstrip("/")
@@ -1155,6 +1235,7 @@ class AgentEngine:
             access_token=access_token,
             auth_profile_id=resolved_profile_id,
         )
+        self._clear_preinitialized_model_info_cache()
         self._config.model = normalized_base_url
         self._config.openai_codex.base_url = normalized_base_url
         self._config.openai_codex.model = model.strip()
@@ -1184,6 +1265,7 @@ class AgentEngine:
             api_key=api_key,
             provider=provider,
         )
+        self._clear_preinitialized_model_info_cache()
         normalized_base_url = base_url.strip().rstrip("/")
         self._config.model = normalized_base_url
         self._config.openai_compat.base_url = normalized_base_url
@@ -1305,6 +1387,7 @@ class AgentEngine:
             self._config.workspace_dir,
         )
         await self._close_tool_registries(self._tool_registry_factory.list_cached_registries())
+        self._clear_preinitialized_model_info_cache()
         self._config = config
         self._prompt_builder = PromptBuilder(config.agent.system_prompt)
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
@@ -1476,6 +1559,7 @@ class AgentEngine:
 
     async def close(self) -> None:
         """釋放所有資源。"""
+        self._clear_preinitialized_model_info_cache()
         await self._close_tool_registries(self._tool_registry_factory.list_cached_registries())
         await self._router.close()
         if self._initialized:
@@ -2026,6 +2110,41 @@ class AgentEngine:
         if isinstance(event, ErrorEvent):
             return "error", {"message": event.message, "code": event.code}
         return None, {}
+
+    async def _route_tool_intent_for_exposure(
+        self,
+        *,
+        message: str,
+        session_bound_workspace: bool,
+        attachment_count: int,
+        workspace_attachment_count: int,
+        active_backend: BaseLLMBackend,
+        execution_profile: str,
+        tool_mode: str,
+    ) -> ToolIntentRoute:
+        classifier = (
+            BackendToolIntentClassifier(active_backend)
+            if self._should_enable_tool_intent_classifier(
+                execution_profile=execution_profile,
+                tool_mode=tool_mode,
+            )
+            else None
+        )
+        return await self._tool_intent_router.route(
+            user_message=message,
+            session_bound_workspace=session_bound_workspace,
+            attachment_count=attachment_count,
+            workspace_attachment_count=workspace_attachment_count,
+            classifier=classifier,
+        )
+
+    @staticmethod
+    def _should_enable_tool_intent_classifier(
+        *,
+        execution_profile: str,
+        tool_mode: str,
+    ) -> bool:
+        return execution_profile == "chat" and tool_mode != "disabled"
 
     def _build_tool_planner_message(
         self,

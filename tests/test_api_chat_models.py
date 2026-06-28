@@ -2160,6 +2160,114 @@ def test_models_probe_tool_calling_returns_probe_payload() -> None:
     assert payload["active_model"]["metadata"]["tool_call_mode"] == "simulated_fallback"
 
 
+def test_models_probe_tool_calling_returns_post_probe_active_model_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:qwen2.5",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    app, _fake_engine = _build_app()
+    real_engine = AgentEngine(config)
+
+    class _ProbeBackend:
+        def __init__(self) -> None:
+            self.metadata = {
+                "tool_call_mode": "simulated_fallback",
+                "native_tool_calling_status": "native_tool_calls_missing",
+            }
+            self.probe_calls = 0
+            self.closed = False
+            self.close_calls = 0
+
+        async def probe_tool_calling(self) -> dict[str, Any] | None:
+            self.probe_calls += 1
+            self.metadata.update(
+                {
+                    "tool_call_mode": "native",
+                    "native_tool_calling_status": "supported",
+                }
+            )
+            return {
+                "status": "supported",
+                "message": "native structured tool calling succeeded",
+                "metadata": dict(self.metadata),
+            }
+
+        def get_model_info(self) -> ModelInfo:
+            supports_tool_calling = not (
+                self.metadata.get("tool_call_mode") == "unavailable"
+                or self.metadata.get("tool_calling_blocked") is True
+            )
+            return ModelInfo(
+                name="qwen2.5",
+                provider="ollama",
+                backend_type="ollama",
+                supports_tool_calling=supports_tool_calling,
+                metadata=dict(self.metadata),
+            )
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+
+    class _StaleInfoBackend:
+        def __init__(self) -> None:
+            self.get_model_info_calls = 0
+
+        def get_model_info(self) -> ModelInfo:
+            self.get_model_info_calls += 1
+            return ModelInfo(
+                name="qwen2.5",
+                provider="ollama",
+                backend_type="ollama",
+                supports_tool_calling=True,
+                metadata={
+                    "tool_call_mode": "simulated_fallback",
+                    "native_tool_calling_status": "native_tool_calls_missing",
+                },
+            )
+
+    probe_backend = _ProbeBackend()
+    stale_info_backend = _StaleInfoBackend()
+    resolve_calls = 0
+
+    async def fake_acquire_temporary_backend(*, model_spec: str, **kwargs: Any) -> _ProbeBackend:
+        del model_spec, kwargs
+        return probe_backend
+
+    def fake_resolve(model_spec: str, **kwargs: Any) -> _StaleInfoBackend:
+        nonlocal resolve_calls
+        del model_spec, kwargs
+        resolve_calls += 1
+        return stale_info_backend
+
+    monkeypatch.setattr(real_engine._router, "acquire_temporary_backend", fake_acquire_temporary_backend)  # noqa: SLF001
+    monkeypatch.setattr(real_engine._router, "_resolve", fake_resolve)  # noqa: SLF001
+    app.state.engine = real_engine
+
+    with TestClient(app) as client:
+        response = client.post("/v1/models/probe-tool-calling")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["type"] == "tool_calling_probe"
+    assert payload["probe"]["status"] == "supported"
+    assert payload["active_model"]["metadata"]["tool_call_mode"] == "native"
+    assert payload["active_model"]["metadata"]["native_tool_calling_status"] == "supported"
+    assert payload["active_model"]["supports_tool_calling"] is True
+    assert probe_backend.probe_calls == 1
+    assert probe_backend.close_calls == 1
+    assert probe_backend.closed is True
+    assert resolve_calls == 0
+    assert stale_info_backend.get_model_info_calls == 0
+
+
 def test_models_test_connection_route_validates_explicit_remote_payload_without_switching() -> None:
     app, fake_engine = _build_app()
 

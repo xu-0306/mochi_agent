@@ -19,7 +19,10 @@ from mochi.backends.inference_capabilities import (
     resolve_model_inference_capabilities,
 )
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
+from mochi.backends.simulated_tool_protocol import SimulatedToolProtocol
+from mochi.backends.tool_call_contract import validate_tool_turn_result
 from mochi.backends.tool_call_simulator import ToolCallSimulator
+from mochi.backends.tool_call_state import ToolCallingState
 from mochi.backends.types import (
     GenerationResult,
     Message,
@@ -89,8 +92,9 @@ class OpenAICompatBackend(BaseLLMBackend):
         self.model = model
         self.api_key = api_key
         self.provider = provider
-        self._tool_calling_enabled = True
+        self._tool_state = ToolCallingState()
         self._tool_call_simulator = ToolCallSimulator()
+        self._simulated_tool_protocol = SimulatedToolProtocol(self._tool_call_simulator)
         self._native_tool_probe: dict[str, Any] | None = None
         self._tool_protocol_probe: dict[str, Any] | None = None
         self._tool_calling_blocked = False
@@ -130,6 +134,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         Returns:
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
+        tools_requested = bool(tools)
         prepared_messages = self._prepare_messages(messages, tools)
         use_chat_transport = self._uses_chat_completions_transport()
         chat_payload = self._build_chat_completions_payload(
@@ -150,7 +155,8 @@ class OpenAICompatBackend(BaseLLMBackend):
             self._responses_reasoning_summary_received = False
             if stream:
                 return self._stream_generate(chat_payload, request_url=self._chat_completions_url)
-            return await self._blocking_generate(chat_payload, request_url=self._chat_completions_url)
+            result = await self._blocking_generate(chat_payload, request_url=self._chat_completions_url)
+            return self._finalize_tool_result(result, tools_requested=tools_requested)
 
         responses_payload = self._build_responses_payload(
             prepared_messages,
@@ -166,26 +172,32 @@ class OpenAICompatBackend(BaseLLMBackend):
 
         if stream:
             return self._stream_generate(responses_payload, request_url=self._responses_url)
-        return await self._blocking_generate_with_responses_alias_fallback(
+        result = await self._blocking_generate_with_responses_alias_fallback(
             responses_payload,
             chat_payload,
             responses_url=self._responses_url,
             chat_url=self._chat_completions_url,
         )
+        return self._finalize_tool_result(result, tools_requested=tools_requested)
 
     def supports_tool_calling(self) -> bool:
         """OpenAI-compatible 端點通常支援 tool calling。"""
-        return not self._tool_calling_blocked and self._tool_calling_enabled
+        return not self._tool_calling_blocked and self._tool_state.supports_tool_calling()
 
     def _tool_call_mode(self) -> str:
         if self._tool_calling_blocked:
             return "unavailable"
-        return "native" if self._tool_calling_enabled else "simulated_fallback"
+        return self._tool_state.active_mode
 
     def _uses_chat_completions_transport(self) -> bool:
         return not self._should_use_responses_transport()
 
     def _should_use_responses_transport(self) -> bool:
+        pinned_protocol = self._pinned_tool_protocol()
+        if pinned_protocol == "chat_completions":
+            return False
+        if pinned_protocol == "responses":
+            return True
         if self._responses_chat_completions_alias:
             return False
         if self._api_mode == "responses":
@@ -204,15 +216,43 @@ class OpenAICompatBackend(BaseLLMBackend):
         protocol_results = self._tool_protocol_probe.get("protocol_results")
         if not isinstance(protocol_results, list):
             return False
+        rejected_statuses = {
+            "http_400",
+            "http_401",
+            "http_403",
+            "http_404",
+            "http_405",
+            "http_409",
+            "http_415",
+            "http_422",
+            "http_429",
+            "invalid_json",
+            "native_tools_rejected_by_provider",
+            "rejected_missing_parser",
+            "no_tool_calls",
+            "text_tool_call_only",
+        }
         for item in protocol_results:
             if not isinstance(item, dict):
                 continue
             if item.get("protocol") != "responses":
                 continue
             status = item.get("status")
-            if isinstance(status, str) and status.startswith("http_"):
+            if isinstance(status, str) and (
+                status.startswith("http_") or status in rejected_statuses
+            ):
                 return True
         return False
+
+    def _pinned_tool_protocol(self) -> ApiMode | None:
+        if not isinstance(self._tool_protocol_probe, dict):
+            return None
+        if self._tool_protocol_probe.get("status") != "supported":
+            return None
+        selected_protocol = self._tool_protocol_probe.get("selected_protocol")
+        if selected_protocol in {"chat_completions", "responses"}:
+            return cast(ApiMode, selected_protocol)
+        return None
 
     def _is_openai_native_reasoning_model(self) -> bool:
         normalized_provider = (self.provider or "").strip().lower()
@@ -239,15 +279,16 @@ class OpenAICompatBackend(BaseLLMBackend):
                 name=self.model,
                 provider=self.provider,
                 backend_type="openai_compat",
-                supports_tool_calling=not self._tool_calling_blocked and self._tool_calling_enabled,
+                supports_tool_calling=self.supports_tool_calling(),
                 metadata={"api_mode": self._api_mode},
             )
         )
+        probe = self._native_tool_probe if isinstance(self._native_tool_probe, dict) else {}
         return ModelInfo(
             name=self.model,
             provider=self.provider,
             backend_type="openai_compat",
-            supports_tool_calling=not self._tool_calling_blocked and self._tool_calling_enabled,
+            supports_tool_calling=self.supports_tool_calling(),
             metadata={
                 "base_url": self.base_url,
                 "api_url": self._chat_completions_url
@@ -266,15 +307,10 @@ class OpenAICompatBackend(BaseLLMBackend):
                 "reasoning_items_replayed": self._responses_last_replayed_items,
                 "responses_continuity_mode": self._responses_last_continuity_mode,
                 "tool_call_mode": self._tool_call_mode(),
-                "native_tool_calling_status": self._native_tool_probe.get("status")
-                if isinstance(self._native_tool_probe, dict)
-                else "unknown",
-                "native_tool_calling_message": self._native_tool_probe.get("message")
-                if isinstance(self._native_tool_probe, dict)
-                else None,
-                "native_tool_calling_checked_at": self._native_tool_probe.get("checked_at")
-                if isinstance(self._native_tool_probe, dict)
-                else None,
+                "native_tool_calling_status": probe.get("status", self._tool_state.native_status),
+                "native_tool_calling_message": probe.get("message"),
+                "native_tool_calling_checked_at": probe.get("checked_at"),
+                "fallback_validation_status": self._tool_state.fallback_validation_status,
                 "fallback_diagnostics": list(self._fallback_diagnostics),
                 "tool_calling_blocked": self._tool_calling_blocked,
                 "tool_calling_protocol": self._api_mode,
@@ -512,7 +548,19 @@ class OpenAICompatBackend(BaseLLMBackend):
             )
         ):
             return
+        self._record_provider_blocked_simulated_retry(
+            http_status=exc.response.status_code,
+            response_text=response_text,
+        )
+
+    def _record_provider_blocked_simulated_retry(
+        self,
+        *,
+        http_status: int,
+        response_text: str,
+    ) -> None:
         self._tool_calling_blocked = True
+        self._tool_state.mark_unavailable("simulated_protocol_rejected")
         self._tool_protocol_probe = {
             "status": "all_tool_protocols_rejected_by_provider",
             "selected_protocol": None,
@@ -520,12 +568,20 @@ class OpenAICompatBackend(BaseLLMBackend):
                 {
                     "protocol": self._api_mode,
                     "url": self._request_url,
-                    "status": f"http_{exc.response.status_code}",
-                    "http_status": exc.response.status_code,
+                    "status": f"http_{http_status}",
+                    "http_status": http_status,
                     "response_text": response_text[:1000],
                 }
             ],
             "checked_at": datetime.now(UTC).isoformat(),
+        }
+        self._native_tool_probe = {
+            "status": "all_tool_protocols_rejected_by_provider",
+            "message": "Provider rejected prompt-simulated tool calling after native tool fallback.",
+            "checked_at": datetime.now(UTC).isoformat(),
+            "http_status": http_status,
+            "response_text": response_text[:1000],
+            "protocol_results": self._tool_protocol_probe["protocol_results"],
         }
         append_fallback_diagnostic(
             self._fallback_diagnostics,
@@ -539,7 +595,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             metadata={
                 "provider": self.provider,
                 "model": self.model,
-                "http_status": exc.response.status_code,
+                "http_status": http_status,
             },
         )
 
@@ -551,7 +607,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         extra: dict[str, Any] | None = None,
         enable_native: bool | None = None,
     ) -> dict[str, Any]:
-        previous_tool_calling_enabled = self._tool_calling_enabled
+        previous_mode = self._tool_state.active_mode
         payload: dict[str, Any] = {
             "status": status,
             "message": message,
@@ -560,8 +616,11 @@ class OpenAICompatBackend(BaseLLMBackend):
         if extra:
             payload.update(extra)
         if enable_native is not None:
-            self._tool_calling_enabled = enable_native
-        if enable_native is not None and enable_native != previous_tool_calling_enabled:
+            if enable_native:
+                self._tool_state.recover_native(status)
+            else:
+                self._tool_state.enter_simulated(status)
+        if enable_native is not None and self._tool_state.active_mode != previous_mode:
             append_fallback_diagnostic(
                 self._fallback_diagnostics,
                 category="tool_calling",
@@ -573,8 +632,8 @@ class OpenAICompatBackend(BaseLLMBackend):
                 reason=status,
                 kind="recovery" if enable_native else "fallback",
                 severity="info" if enable_native else "warning",
-                from_state="simulated_fallback" if enable_native else "native",
-                to_state="native" if enable_native else "simulated_fallback",
+                from_state=previous_mode,
+                to_state=self._tool_state.active_mode,
                 metadata={
                     "provider": self.provider,
                     "model": self.model,
@@ -674,6 +733,15 @@ class OpenAICompatBackend(BaseLLMBackend):
             "protocol_results": protocol_results,
             "checked_at": datetime.now(UTC).isoformat(),
         }
+        if blocked:
+            self._tool_state.mark_unavailable(status)
+            self._native_tool_probe = {
+                "status": status,
+                "message": message,
+                "checked_at": datetime.now(UTC).isoformat(),
+                "protocol_results": protocol_results,
+            }
+            return self._native_tool_probe
         return self._record_native_tool_probe(
             status=status,
             message=message,
@@ -849,29 +917,10 @@ class OpenAICompatBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
     ) -> list[Message]:
         prepared = [Message(**message.__dict__) for message in messages]
-        if self._tool_calling_enabled or not tools or not self._uses_chat_completions_transport():
+        if self._tool_state.active_mode == "native" or not tools or not self._uses_chat_completions_transport():
             return prepared
 
-        prepared = self._flatten_simulated_tool_messages(prepared)
-        injected = False
-        for message in prepared:
-            if message.role == "system":
-                message.content = self._tool_call_simulator.inject_tools_into_prompt(
-                    message.content,
-                    tools,
-                )
-                injected = True
-                break
-
-        if not injected:
-            prepared.insert(
-                0,
-                Message(
-                    role="system",
-                    content=self._tool_call_simulator.inject_tools_into_prompt("", tools).strip(),
-                ),
-            )
-        return prepared
+        return self._simulated_tool_protocol.prepare_messages(messages=prepared, tools=tools)
 
     def _flatten_simulated_tool_messages(self, messages: list[Message]) -> list[Message]:
         flattened: list[Message] = []
@@ -913,10 +962,8 @@ class OpenAICompatBackend(BaseLLMBackend):
         content, thinking = self._normalize_chat_message_parts(message)
 
         tool_calls = self._parse_tool_calls(message.get("tool_calls", []))
-        if not tool_calls and not self._tool_calling_enabled and content:
-            tool_calls = self._tool_call_simulator.parse_tool_calls(content)
-            if tool_calls:
-                content = self._tool_call_simulator.extract_text_response(content)
+        if not tool_calls and self._tool_state.active_mode == "simulated_fallback" and content:
+            content, tool_calls = self._simulated_tool_protocol.parse_assistant_content(content)
         usage = data.get("usage", {})
         finish_reason = choice0.get("finish_reason")
         if tool_calls:
@@ -1027,21 +1074,10 @@ class OpenAICompatBackend(BaseLLMBackend):
                     retry_result = await self._blocking_generate(retry_payload, request_url=request_url)
                 except BackendRequestError as retry_exc:
                     if retry_exc.metadata.get("status_code") in {403, 429}:
-                        self._tool_calling_blocked = True
-                        self._tool_protocol_probe = {
-                            "status": "all_tool_protocols_rejected_by_provider",
-                            "selected_protocol": None,
-                            "protocol_results": [
-                                {
-                                    "protocol": self._api_mode,
-                                    "url": self._request_url,
-                                    "status": f"http_{retry_exc.metadata.get('status_code')}",
-                                    "http_status": retry_exc.metadata.get("status_code"),
-                                    "response_text": str(retry_exc.metadata.get("response_text") or "")[:1000],
-                                }
-                            ],
-                            "checked_at": datetime.now(UTC).isoformat(),
-                        }
+                        self._record_provider_blocked_simulated_retry(
+                            http_status=cast(int, retry_exc.metadata.get("status_code")),
+                            response_text=str(retry_exc.metadata.get("response_text") or ""),
+                        )
                     raise
                 if retry_result.content:
                     yield StreamChunk(delta=retry_result.content)
@@ -1281,7 +1317,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             payload["frequency_penalty"] = frequency_penalty
         if "presence_penalty" in supported:
             payload["presence_penalty"] = presence_penalty
-        if tools and self._tool_calling_enabled:
+        if tools and self._tool_state.active_mode == "native":
             payload["tools"] = [t.to_dict() for t in tools]
             payload["tool_choice"] = "auto"
         if (
@@ -1327,9 +1363,14 @@ class OpenAICompatBackend(BaseLLMBackend):
             payload["frequency_penalty"] = frequency_penalty
         if "presence_penalty" in supported:
             payload["presence_penalty"] = presence_penalty
+        if tools and self._tool_state.active_mode == "simulated_fallback":
+            instructions = self._simulated_tool_protocol.inject_tools_into_prompt(
+                instructions,
+                tools,
+            )
         if instructions:
             payload["instructions"] = instructions
-        if tools and self._tool_calling_enabled:
+        if tools and self._tool_state.active_mode == "native":
             payload["tools"] = [
                 {
                     "type": "function",
@@ -1475,6 +1516,8 @@ class OpenAICompatBackend(BaseLLMBackend):
                 content = self._extract_responses_output_text(item)
                 if content:
                     break
+        if not tool_calls and self._tool_state.active_mode == "simulated_fallback" and content:
+            content, tool_calls = self._simulated_tool_protocol.parse_assistant_content(content)
 
         usage = data.get("usage", {})
         finish_reason = data.get("finish_reason")
@@ -2005,6 +2048,67 @@ class OpenAICompatBackend(BaseLLMBackend):
 
         return tool_calls
 
+    def _finalize_tool_result(
+        self,
+        result: GenerationResult,
+        *,
+        tools_requested: bool,
+    ) -> GenerationResult:
+        if not tools_requested or self._tool_state.active_mode != "simulated_fallback":
+            return result
+
+        verdict = validate_tool_turn_result(result=result, tools_requested=True)
+        if verdict.is_valid:
+            self._tool_state.validate_simulated()
+            return result
+
+        self._mark_simulated_protocol_unavailable(
+            status="simulated_protocol_rejected",
+            message="Prompt-simulated tool calling returned an invalid tool-eligible turn.",
+            metadata={"tool_turn_reason": verdict.reason},
+        )
+        raise BackendRequestError(
+            "Prompt-simulated tool calling returned an invalid tool-eligible turn.",
+            metadata={
+                "backend_name": "openai_compat",
+                "api_mode": self._api_mode,
+                "model": self.model,
+                "tool_turn_reason": verdict.reason,
+            },
+        )
+
+    def _mark_simulated_protocol_unavailable(
+        self,
+        *,
+        status: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        previous_mode = self._tool_state.active_mode
+        changed = self._tool_state.mark_unavailable(status)
+        self._native_tool_probe = {
+            "status": status,
+            "message": message,
+            "checked_at": datetime.now(UTC).isoformat(),
+            **(metadata or {}),
+        }
+        if changed:
+            append_fallback_diagnostic(
+                self._fallback_diagnostics,
+                category="tool_calling",
+                name="tool_calling_unavailable",
+                reason=status,
+                kind="fallback",
+                severity="warning",
+                from_state=previous_mode,
+                to_state="unavailable",
+                metadata={
+                    "provider": self.provider,
+                    "model": self.model,
+                    **(metadata or {}),
+                },
+            )
+
     def _has_generation_output(self, result: GenerationResult) -> bool:
         return bool(result.tool_calls or result.content.strip() or result.thinking.strip())
 
@@ -2068,13 +2172,13 @@ class OpenAICompatBackend(BaseLLMBackend):
             return retry_payload
 
         if isinstance(retry_payload.get("messages"), list):
-            retry_payload["messages"] = self._inject_simulated_tools_into_chat_messages(
-                retry_payload["messages"],
-                tool_schemas,
+            retry_payload["messages"] = self._simulated_tool_protocol.prepare_chat_payload_messages(
+                raw_messages=retry_payload["messages"],
+                tools=tool_schemas,
             )
         elif isinstance(retry_payload.get("input"), list):
             instructions = _coerce_text(retry_payload.get("instructions"))
-            retry_payload["instructions"] = self._tool_call_simulator.inject_tools_into_prompt(
+            retry_payload["instructions"] = self._simulated_tool_protocol.inject_tools_into_prompt(
                 instructions,
                 tool_schemas,
             )

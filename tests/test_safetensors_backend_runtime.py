@@ -46,6 +46,12 @@ class _FakeTokenizer:
         return list(range(len(text.split())))
 
 
+class _FailingChatTemplateTokenizer(_FakeTokenizer):
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls.append({"messages": messages, **kwargs})
+        raise TypeError("Can only get item pairs from a mapping.")
+
+
 @pytest.mark.asyncio
 async def test_safetensors_generate_with_injected_pipeline(tmp_path: Path) -> None:
     """SafetensorsBackend 應可透過注入 pipeline 執行最小 non-stream 推理。"""
@@ -112,6 +118,35 @@ async def test_safetensors_prefers_usage_metadata_for_token_accounting(tmp_path:
 
     assert result.input_tokens == 33
     assert result.output_tokens == 7
+
+
+@pytest.mark.asyncio
+async def test_safetensors_falls_back_when_chat_template_raises_mapping_error(tmp_path: Path) -> None:
+    model_dir = tmp_path / "hf-model"
+    model_dir.mkdir()
+    fake_pipeline = _FakePipeline("fallback result")
+    fake_tokenizer = _FailingChatTemplateTokenizer()
+    fake_pipeline.tokenizer = fake_tokenizer
+
+    backend = SafetensorsBackend(
+        model_dir=str(model_dir),
+        pipeline_factory=lambda: fake_pipeline,
+    )
+    backend._dependency_error = None  # noqa: SLF001
+
+    result = await backend.generate(
+        [
+            Message(role="user", content="今天天氣如何"),
+            Message(role="assistant", content="", thinking="Use web_search first."),
+            Message(role="tool", content='[{"title":"中央氣象署","url":"https://www.cwa.gov.tw/"}]'),
+        ],
+        stream=False,
+    )
+
+    assert result.content == "fallback result"
+    assert "user: 今天天氣如何" in fake_pipeline.calls[0]["prompt"]
+    assert "tool: [{\"title\":\"中央氣象署\"" in fake_pipeline.calls[0]["prompt"]
+    assert fake_tokenizer.calls[0]["add_generation_prompt"] is True
 
 
 @pytest.mark.asyncio

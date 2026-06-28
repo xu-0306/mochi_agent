@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -369,6 +370,120 @@ async def test_generate_nonstream_thinking_blocks_are_separated_from_answer(
 
     assert result.content == "Final answer"
     assert result.thinking == "first block\n\nsecond block"
+
+
+@pytest.mark.asyncio
+async def test_simulated_fallback_content_marks_protocol_validated() -> None:
+    backend = OpenAICompatBackend(
+        base_url="http://localhost:8000/v1",
+        model="gpt-test",
+        api_key="test-key",
+    )
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    response_data = {
+        "id": "chatcmpl-simulated-content",
+        "model": "gpt-test",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Final answer"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    mock_resp = _mock_response(response_data)
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+            result = await backend.generate(
+                messages=[Message(role="user", content="hi")],
+                tools=[
+                    ToolSchema(
+                        name="web_search",
+                        description="Search the web",
+                        parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+                    )
+                ],
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert result.content == "Final answer"
+    assert backend.get_model_info().metadata["tool_call_mode"] == "simulated_fallback"
+    assert backend.get_model_info().metadata["fallback_validation_status"] == "validated"
+
+
+@pytest.mark.asyncio
+async def test_simulated_fallback_thinking_only_marks_backend_unavailable() -> None:
+    backend = OpenAICompatBackend(
+        base_url="http://localhost:8000/v1",
+        model="gpt-test",
+        api_key="test-key",
+    )
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    response_data = {
+        "id": "chatcmpl-simulated-thinking",
+        "model": "gpt-test",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "still deciding",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    mock_resp = _mock_response(response_data)
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+            with pytest.raises(BackendRequestError, match="invalid tool-eligible turn"):
+                await backend.generate(
+                    messages=[Message(role="user", content="hi")],
+                    tools=[
+                        ToolSchema(
+                            name="web_search",
+                            description="Search the web",
+                            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+                        )
+                    ],
+                    stream=False,
+                )
+    finally:
+        await backend.close()
+
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "unavailable"
+    assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
+
+
+def test_blocked_simulated_retry_overwrites_stale_supported_probe_status() -> None:
+    backend = OpenAICompatBackend(
+        base_url="https://api.example.com/v1",
+        model="gpt-5.4",
+        api_key="test-key",
+        provider="openai_compat",
+    )
+    backend._native_tool_probe = {"status": "supported", "message": "ok"}  # noqa: SLF001
+    request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    response = httpx.Response(403, request=request, text="tool permission_error")
+    exc = httpx.HTTPStatusError("403", request=request, response=response)
+
+    try:
+        backend._record_tool_calling_blocked_from_retry(exc)  # noqa: SLF001
+        metadata = backend.get_model_info().metadata
+    finally:
+        asyncio.run(backend.close())
+
+    assert metadata["tool_call_mode"] == "unavailable"
+    assert metadata["tool_calling_blocked"] is True
+    assert metadata["native_tool_calling_status"] == "all_tool_protocols_rejected_by_provider"
 
 
 def test_chat_completions_payload_serializes_tool_call_arguments_as_json(
@@ -1198,6 +1313,137 @@ async def test_probe_tool_calling_supports_responses_alias_endpoint() -> None:
         and item["reason"] == "responses_probe_returned_native_chat_tool_calls"
         for item in diagnostics
     )
+
+
+@pytest.mark.asyncio
+async def test_probe_selected_chat_completions_pins_next_generate_to_chat_transport() -> None:
+    backend = OpenAICompatBackend(
+        base_url="https://api.example.com/v1",
+        model="gpt-5.4",
+        api_key="test-key",
+        provider="openai_compat",
+    )
+    probe_response = _mock_response(
+        {
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "probe-call-1",
+                                "function": {
+                                    "name": "mochi_tool_probe",
+                                    "arguments": '{"value":"ok"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+    generate_response = _mock_response(
+        {
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "chat tool route pinned"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4},
+        }
+    )
+    tool = ToolSchema(
+        name="web_search",
+        description="Search the web",
+        parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            side_effect=[probe_response, generate_response],
+        ) as post:
+            probe_result = await backend.probe_tool_calling()
+            result = await backend.generate(
+                messages=[Message(role="user", content="search Mochi")],
+                tools=[tool],
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert probe_result is not None
+    assert probe_result["status"] == "supported"
+    assert result.content == "chat tool route pinned"
+    assert post.await_args_list[0].args[0] == "https://api.example.com/v1/chat/completions"
+    assert post.await_args_list[1].args[0] == "https://api.example.com/v1/chat/completions"
+    second_payload = post.await_args_list[1].kwargs["json"]
+    assert "messages" in second_payload
+    assert "input" not in second_payload
+    metadata = backend.get_model_info().metadata
+    assert metadata["request_shape"] == "chat_completions"
+    assert metadata["tool_protocol_probe"]["selected_protocol"] == "chat_completions"
+
+
+@pytest.mark.asyncio
+async def test_stream_blocked_simulated_retry_overwrites_stale_supported_probe_status() -> None:
+    backend = OpenAICompatBackend(
+        base_url="http://localhost:8000/v1",
+        model="google/gemma-4-26B-A4B-it",
+        api_key="test-key",
+        provider="vllm",
+    )
+    backend._native_tool_probe = {"status": "supported", "message": "ok"}  # noqa: SLF001
+    request = httpx.Request("POST", "http://localhost:8000/v1/chat/completions")
+    response = httpx.Response(
+        400,
+        request=request,
+        stream=httpx.ByteStream(
+            b'{"error":{"message":"\\"auto\\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}}'
+        ),
+    )
+    initial_error = httpx.HTTPStatusError("bad request", request=request, response=response)
+    mock_stream = _MockStreamContext([])
+    mock_stream.raise_for_status = MagicMock(side_effect=initial_error)
+    retry_error = httpx.HTTPStatusError(
+        "forbidden",
+        request=request,
+        response=httpx.Response(403, request=request, text="tool permission_error"),
+    )
+    tool = ToolSchema(
+        name="web_search",
+        description="Search the web",
+        parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+
+    try:
+        with (
+            patch.object(backend._client, "stream", new=MagicMock(return_value=mock_stream)),
+            patch.object(backend._client, "post", new_callable=AsyncMock, side_effect=retry_error),
+        ):
+            stream_iter = await backend.generate(
+                messages=[Message(role="user", content="search Mochi")],
+                tools=[tool],
+                stream=True,
+            )
+
+            with pytest.raises(BackendRequestError):
+                async for _chunk in stream_iter:
+                    pass
+    finally:
+        await backend.close()
+
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "unavailable"
+    assert metadata["tool_calling_blocked"] is True
+    assert metadata["native_tool_calling_status"] == "all_tool_protocols_rejected_by_provider"
 
 
 @pytest.mark.asyncio
