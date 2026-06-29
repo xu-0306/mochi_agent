@@ -68,9 +68,27 @@ class _FakeLocalBackend(SafetensorsBackend):
 async def test_router_resolves_ollama_backend() -> None:
     """router 應能解析 ollama: 前綴。"""
     router = BackendRouter()
-    backend = await router.load("ollama:qwen2.5")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        prime_calls: list[str] = []
+
+        async def _prime(self: OllamaBackend) -> None:
+            prime_calls.append(self.model)
+
+        monkeypatch.setattr(OllamaBackend, "prime_model_info", _prime)
+        backend = await router.load("ollama:qwen2.5")
     assert isinstance(backend, OllamaBackend)
     assert backend.model == "qwen2.5"
+    assert prime_calls == ["qwen2.5"]
+
+
+@pytest.mark.asyncio
+async def test_router_passes_configured_ollama_num_ctx_to_backend() -> None:
+    router = BackendRouter(ollama_num_ctx=24576)
+    backend = router._resolve("ollama:qwen2.5")  # noqa: SLF001
+
+    assert isinstance(backend, OllamaBackend)
+    assert backend.get_model_info().context_length == 24576
+    await backend.close()
 
 
 @pytest.mark.asyncio

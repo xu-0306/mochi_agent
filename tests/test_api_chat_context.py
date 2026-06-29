@@ -99,6 +99,7 @@ def test_chat_context_preview_returns_budget_and_compaction_snapshot(tmp_path) -
                 "model": "gpt-test",
                 "system_prompt": "You are Mochi.",
                 "max_tokens": 512,
+                "reserve_output_tokens": 768,
                 "reasoning_effort": "high",
                 "selected_skill_ids": ["skill-a"],
                 "attachments": [
@@ -124,6 +125,7 @@ def test_chat_context_preview_returns_budget_and_compaction_snapshot(tmp_path) -
     assert payload["remaining_tokens"] == 2384
     assert payload["compaction_triggered"] is True
     assert payload["reasoning_effort"] == "high"
+    assert engine.preview_calls[0]["inference_overrides"]["reserve_output_tokens"] == 768
     assert engine.preview_calls[0]["selected_skill_ids"] == ["skill-a"]
     assert engine.preview_calls[0]["attachments"] == [
         AttachmentRef(
@@ -138,6 +140,33 @@ def test_chat_context_preview_returns_budget_and_compaction_snapshot(tmp_path) -
             note="Summarize only this section.",
         )
     ]
+
+
+def test_chat_context_preview_preserves_explicit_auto_token_overrides(tmp_path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "gpt-test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+        }
+    )
+    app = _create_test_app(config=config, session_store=SessionStore(tmp_path / "sessions"))
+    engine = _ContextPreviewEngine()
+    app.state.engine = engine
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/context",
+            json={
+                "message": "Use auto token budgeting.",
+                "max_tokens": None,
+                "reserve_output_tokens": None,
+            },
+        )
+
+    assert response.status_code == 200
+    assert engine.preview_calls[0]["inference_overrides"]["max_tokens"] is None
+    assert engine.preview_calls[0]["inference_overrides"]["reserve_output_tokens"] is None
 
 
 def test_chat_context_preview_rejects_invalid_reasoning_effort(tmp_path) -> None:

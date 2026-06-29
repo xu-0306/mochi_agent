@@ -10,7 +10,7 @@ import pytest
 from mochi.agents import engine as engine_module
 from mochi.agents.context import ContextManager
 from mochi.agents.engine import AgentEngine
-from mochi.agents.events import AgentEvent, FinalAnswerEvent
+from mochi.agents.events import AgentEvent, ErrorEvent, FinalAnswerEvent
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest
 from mochi.agents.tool_exposure import ToolExposurePlan
 from mochi.agents.tool_intent_router import ToolIntentRoute
@@ -32,6 +32,7 @@ class FakeBackend(BaseLLMBackend):
     ) -> None:
         self.calls: list[list[Message]] = []
         self.tool_calls_seen: list[list[str]] = []
+        self.generation_kwargs: list[dict[str, object]] = []
         self.closed = False
         self.backend_type = backend_type
         self.metadata = metadata or {}
@@ -50,10 +51,25 @@ class FakeBackend(BaseLLMBackend):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repeat_penalty: float = 1.0,
+        reasoning_effort: str | None = None,
         stream: bool = False,
     ) -> GenerationResult | AsyncIterator[StreamChunk]:
         self.calls.append(messages)
         self.tool_calls_seen.append([tool.name for tool in tools or []])
+        self.generation_kwargs.append(
+            {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "min_p": min_p,
+                "top_k": top_k,
+                "frequency_penalty": frequency_penalty,
+                "presence_penalty": presence_penalty,
+                "repeat_penalty": repeat_penalty,
+                "reasoning_effort": reasoning_effort,
+                "stream": stream,
+            }
+        )
         return GenerationResult(content="fake reply")
 
     def supports_tool_calling(self) -> bool:
@@ -179,6 +195,89 @@ async def test_engine_preflight_probe_retries_recoverable_fallback_state(
 
 
 @pytest.mark.asyncio
+async def test_engine_preflight_skips_native_probe_for_ollama_prompt_guided_default(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="ollama",
+        metadata={
+            "tool_call_mode": "simulated_fallback",
+            "tool_calling_protocol": "prompt_guided",
+            "native_tool_calling_status": "prompt_guided_default",
+        },
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 0
+    assert filtered.tool_names == ["web_search"]
+    stages = filtered.exposure_metadata()["diagnostics"]["stages"]
+    assert stages[-1]["stage"] == "preflight"
+    assert stages[-1]["action"] == "skip"
+    assert stages[-1]["reason"] == "prompt_guided_ollama"
+    assert stages[-1]["backend"]["metadata"]["tool_calling_protocol"] == "prompt_guided"
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_keeps_tools_for_ollama_prompt_guided_rejected_turn(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="ollama",
+        metadata={
+            "tool_call_mode": "unavailable",
+            "tool_calling_protocol": "prompt_guided",
+            "native_tool_calling_status": "simulated_protocol_rejected",
+        },
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 0
+    assert filtered.tool_names == ["web_search"]
+    assert filtered.limit == 10
+    stages = filtered.exposure_metadata()["diagnostics"]["stages"]
+    assert stages[-1]["stage"] == "preflight"
+    assert stages[-1]["action"] == "skip"
+    assert stages[-1]["reason"] == "prompt_guided_ollama"
+    assert stages[-1]["backend"]["metadata"]["tool_call_mode"] == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_engine_preflight_probe_calls_capable_backend_for_unresolved_state(
     tmp_path: Path,
 ) -> None:
@@ -246,7 +345,7 @@ async def test_engine_preflight_probe_skips_resolved_supported_state_without_rep
 
 
 @pytest.mark.asyncio
-async def test_engine_preflight_probe_skips_terminal_state_without_reprobe(
+async def test_engine_preflight_probe_retries_terminal_ollama_state(
     tmp_path: Path,
 ) -> None:
     config = MochiConfig.model_validate(
@@ -263,6 +362,41 @@ async def test_engine_preflight_probe_skips_terminal_state_without_reprobe(
         metadata={
             "tool_call_mode": "unavailable",
             "native_tool_calling_status": "simulated_protocol_rejected",
+        },
+        probe_result={
+            "status": "supported",
+            "metadata": {
+                "tool_call_mode": "native",
+                "native_tool_calling_status": "supported",
+            },
+        },
+    )
+    plan = ToolExposurePlan(tool_names=["web_search"], matched_groups=["web"], limit=10)
+
+    filtered = await engine._probe_tool_calling_before_exposure(backend, plan)  # noqa: SLF001
+
+    assert backend.probe_calls == 1
+    assert filtered.tool_names == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_engine_preflight_probe_skips_terminal_non_ollama_state_without_reprobe(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "https://api.example.com/v1",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(
+        backend_type="openai_compat",
+        metadata={
+            "tool_call_mode": "unavailable",
+            "native_tool_calling_status": "all_tool_protocols_rejected_by_provider",
             "tool_calling_blocked": True,
         },
         probe_result={
@@ -341,6 +475,153 @@ async def test_engine_preview_and_chat_invoke_share_classifier_first_tool_intent
     )
 
     assert route_calls == [True, True]
+    await engine.close()
+
+
+def test_engine_resolve_inference_params_accepts_max_output_tokens_alias(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+
+    resolved = engine._resolve_inference_params(  # noqa: SLF001
+        {
+            "max_output_tokens": 2048,
+            "reserve_output_tokens": 512,
+        }
+    )
+
+    assert resolved["max_output_tokens"] == 2048
+    assert resolved["max_tokens"] == 2048
+    assert resolved["reserve_output_tokens"] == 512
+
+
+def test_engine_resolve_inference_params_derives_auto_tokens_from_context_hint(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "ollama": {"num_ctx": 262144},
+        }
+    )
+    engine = AgentEngine(config)
+
+    resolved = engine._resolve_inference_params(  # noqa: SLF001
+        {
+            "max_output_tokens": None,
+            "reserve_output_tokens": None,
+        }
+    )
+
+    assert resolved["max_output_tokens"] == 8192
+    assert resolved["max_tokens"] == 8192
+    assert resolved["reserve_output_tokens"] == 2816
+
+
+def test_engine_resolve_inference_params_uses_conservative_auto_fallback_without_context_hint(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "https://api.example.com/v1",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "openai_compat": {
+                "provider": "openai_compat",
+                "base_url": "https://api.example.com/v1",
+                "model": "gpt-test",
+            },
+        }
+    )
+    engine = AgentEngine(config)
+
+    resolved = engine._resolve_inference_params(  # noqa: SLF001
+        {
+            "max_output_tokens": None,
+            "reserve_output_tokens": None,
+        }
+    )
+
+    assert resolved["max_output_tokens"] == 4096
+    assert resolved["max_tokens"] == 4096
+    assert resolved["reserve_output_tokens"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_engine_preview_runtime_and_backend_payload_keep_output_cap_and_reserve_separate(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "https://api.example.com/v1",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {
+                "db_path": str(tmp_path / "memory.db"),
+                "max_short_term_messages": 20,
+                "max_short_term_tokens": 256,
+                "semantic_keep_recent_messages": 4,
+            },
+            "security": {
+                "require_approval_for_exec": False,
+                "require_approval_for_file_write": False,
+            },
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(backend_type="openai_compat", metadata={"api_mode": "responses"})
+    backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
+        name="gpt-5.2",
+        provider="openai_compat",
+        backend_type="openai_compat",
+        context_length=8192,
+        supports_tool_calling=True,
+        metadata={"api_mode": "responses"},
+    )
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = backend  # noqa: SLF001
+        return backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    await engine.initialize()
+    context = await engine._get_context("reserve-preview")  # noqa: SLF001
+    for index in range(8):
+        context.add_message(Message(role="user", content=f"user turn {index}"))
+
+    preview = await engine.preview_chat_context(
+        "please summarize the state",
+        session_id="reserve-preview",
+        inference_overrides={"max_tokens": 8192},
+    )
+
+    assert preview["reserved_output_tokens"] == 2816
+    assert preview["compaction_triggered"] is True
+    assert preview["compaction_reason"] == "token_budget"
+    assert context.summary is None
+
+    await engine.invoke(
+        AgentInvocationRequest(
+            message="please summarize the state",
+            session_id="reserve-preview",
+            inference_overrides={"max_tokens": 8192},
+            persist_session=False,
+        )
+    )
+
+    assert backend.generation_kwargs[-1]["max_tokens"] == 8192
+    assert "Conversation summary:" in backend.calls[-1][0].content
+    assert context.summary is not None
+
     await engine.close()
 
 
@@ -1107,10 +1388,20 @@ async def test_engine_restricted_profiles_use_hard_readonly_allowlists(
 
     blocked_memory_tools = {"memory_save", "memory_update", "memory_delete"}
     for profile in ("subagent_readonly", "judge", "verifier"):
+        session_id = f"profile-{profile}"
+        context = engine._get_tool_execution_context(  # noqa: SLF001
+            session_id=session_id,
+            workspace_dir=str(tmp_path),
+        )
+        context.tool_result_references["file_read-profile-ref"] = {
+            "reference_id": "file_read-profile-ref",
+            "artifact_path": str(tmp_path / f"{profile}-artifact.txt"),
+            "source_path": str(tmp_path / f"{profile}-source.txt"),
+        }
         result = await engine.invoke(
             AgentInvocationRequest(
-                message="search memory, remember this, update memory, delete memory",
-                session_id=f"profile-{profile}",
+                message="inspect repo files, search memory, and continue reading prior tool output if needed",
+                session_id=session_id,
                 tool_mode="auto",
                 execution_profile=profile,  # type: ignore[arg-type]
                 persist_session=False,
@@ -1118,7 +1409,112 @@ async def test_engine_restricted_profiles_use_hard_readonly_allowlists(
         )
         exposed = set(result.diagnostics.exposed_tools)
         assert "memory_search" in exposed
+        assert "tool_result_read" in exposed
         assert not (exposed & blocked_memory_tools)
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_followup_open_world_turn_preserves_tool_result_read_only_with_references(
+    tmp_path: Path,
+) -> None:
+    fake_backend = FakeBackend()
+    fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
+        name="remote-model",
+        backend_type="openai_compat",
+        supports_tool_calling=True,
+    )
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+            "security": {"autonomy_mode": "auto_review"},
+        }
+    )
+    engine = AgentEngine(config)
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+
+    session_id = "continuation-open-world"
+    context = engine._get_tool_execution_context(  # noqa: SLF001
+        session_id=session_id,
+        workspace_dir=str(tmp_path),
+    )
+    context.tool_result_references["file_read-abc123"] = {
+        "reference_id": "file_read-abc123",
+        "artifact_path": str(tmp_path / "artifact.txt"),
+        "source_path": str(tmp_path / "source.txt"),
+    }
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message="find recent papers about weather forecast model fine-tuning",
+            session_id=session_id,
+            workspace_dir=str(tmp_path),
+            tool_mode="auto",
+            execution_profile="subagent_research",
+            persist_session=False,
+        )
+    )
+
+    exposed = set(result.diagnostics.exposed_tools)
+    assert "tool_result_read" in exposed
+    assert "tool_result_read" in set(fake_backend.tool_calls_seen[-1])
+    assert {"arxiv_search", "semantic_scholar_search", "web_search"} & exposed
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_followup_open_world_turn_does_not_preserve_tool_result_read_without_references(
+    tmp_path: Path,
+) -> None:
+    fake_backend = FakeBackend()
+    fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
+        name="remote-model",
+        backend_type="openai_compat",
+        supports_tool_calling=True,
+    )
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+            "security": {"autonomy_mode": "auto_review"},
+        }
+    )
+    engine = AgentEngine(config)
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message="find recent papers about weather forecast model fine-tuning",
+            session_id="no-continuation-open-world",
+            workspace_dir=str(tmp_path),
+            tool_mode="auto",
+            execution_profile="subagent_research",
+            persist_session=False,
+        )
+    )
+
+    exposed = set(result.diagnostics.exposed_tools)
+    assert "tool_result_read" not in exposed
+    assert "tool_result_read" not in set(fake_backend.tool_calls_seen[-1])
 
     await engine.close()
 
@@ -1276,3 +1672,39 @@ async def test_engine_uses_higher_default_max_iterations_for_local_backends(
     assert seen_iterations == [15]
 
     await engine.close()
+
+
+def test_turn_event_payload_preserves_error_metadata(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    phase, payload = engine._turn_event_payload(  # noqa: SLF001
+        ErrorEvent(
+            message="tool turn failed",
+            metadata={
+                "backend": {
+                    "backend_type": "ollama",
+                    "tool_turn_reason": "thinking_only",
+                }
+            },
+        )
+    )
+
+    assert phase == "error"
+    assert payload == {
+        "message": "tool turn failed",
+        "code": "AGENT_ERROR",
+        "metadata": {
+            "backend": {
+                "backend_type": "ollama",
+                "tool_turn_reason": "thinking_only",
+            }
+        },
+    }

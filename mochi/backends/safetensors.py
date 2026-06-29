@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -32,6 +33,9 @@ PipelineFactory = Callable[[], Any]
 
 class SafetensorsBackend(BaseLLMBackend):
     """HuggingFace transformers family 後端。"""
+
+    _CONTEXT_LENGTH_FALLBACK = 4096
+    _CONTEXT_LENGTH_SENTINEL_LIMIT = 10_000_000
 
     def __init__(
         self,
@@ -157,16 +161,21 @@ class SafetensorsBackend(BaseLLMBackend):
 
     def get_model_info(self) -> ModelInfo:
         """回傳後端模型資訊。"""
+        context_length, context_length_source = self._resolve_context_length_metadata()
         return ModelInfo(
             name=self.model_dir,
             backend_type="safetensors",
             provider="local",
-            context_length=4096,
+            context_length=context_length,
             supports_tool_calling=False,
             metadata={
                 "model_dir": self.model_dir,
                 "dependency_ready": self._dependency_error is None,
                 "dependency_error": self._dependency_error,
+                "context_length_source": context_length_source,
+                "context_length_fallback": (
+                    None if context_length is not None else self._CONTEXT_LENGTH_FALLBACK
+                ),
                 "loaded": self._pipeline is not None,
                 "device": self.device,
                 "torch_dtype": self.torch_dtype,
@@ -264,6 +273,88 @@ class SafetensorsBackend(BaseLLMBackend):
             self._summarize_pipeline_kwargs(kwargs),
         )
         return pipeline(**kwargs)
+
+    def _resolve_context_length_metadata(self) -> tuple[int | None, str]:
+        pipeline = self._pipeline
+        if pipeline is not None:
+            loaded = self._extract_context_length_from_loaded_pipeline(pipeline)
+            if loaded is not None:
+                return loaded
+
+        model_dir = Path(self.model_dir)
+        for file_name, keys in (
+            (
+                "config.json",
+                (
+                    "max_position_embeddings",
+                    "text_config.max_position_embeddings",
+                    "n_positions",
+                    "max_seq_len",
+                    "max_sequence_length",
+                    "seq_length",
+                ),
+            ),
+            ("tokenizer_config.json", ("model_max_length",)),
+        ):
+            payload = self._read_json_object(model_dir / file_name)
+            if payload is None:
+                continue
+            for key in keys:
+                candidate = self._normalize_context_length_candidate(self._nested_lookup(payload, key))
+                if candidate is not None:
+                    return candidate, f"{file_name}:{key}"
+
+        return None, "fallback_default"
+
+    def _extract_context_length_from_loaded_pipeline(self, pipeline: Any) -> tuple[int, str] | None:
+        model = getattr(pipeline, "model", None)
+        config = getattr(model, "config", None)
+        if config is not None:
+            for attr in (
+                "max_position_embeddings",
+                "n_positions",
+                "max_seq_len",
+                "max_sequence_length",
+                "seq_length",
+            ):
+                candidate = self._normalize_context_length_candidate(getattr(config, attr, None))
+                if candidate is not None:
+                    return candidate, f"loaded_model_config.{attr}"
+
+        tokenizer = self._resolve_chat_template_source()
+        if tokenizer is None:
+            return None
+        candidate = self._normalize_context_length_candidate(getattr(tokenizer, "model_max_length", None))
+        if candidate is not None:
+            return candidate, "loaded_tokenizer.model_max_length"
+        return None
+
+    def _read_json_object(self, path: Path) -> dict[str, Any] | None:
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _nested_lookup(payload: dict[str, Any], key: str) -> Any:
+        current: Any = payload
+        for part in key.split("."):
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current
+
+    def _normalize_context_length_candidate(self, value: Any) -> int | None:
+        try:
+            candidate = int(value)
+        except (TypeError, ValueError):
+            return None
+        if candidate <= 0 or candidate > self._CONTEXT_LENGTH_SENTINEL_LIMIT:
+            return None
+        return candidate
 
     def _resolve_torch_dtype(self) -> Any | None:
         """將字串 torch_dtype 解析為 torch 型別。"""

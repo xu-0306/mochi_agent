@@ -443,7 +443,7 @@ async def test_simulated_fallback_thinking_only_marks_backend_unavailable() -> N
 
     try:
         with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp):
-            with pytest.raises(BackendRequestError, match="invalid tool-eligible turn"):
+            with pytest.raises(BackendRequestError, match="invalid tool-eligible turn") as exc_info:
                 await backend.generate(
                     messages=[Message(role="user", content="hi")],
                     tools=[
@@ -458,9 +458,67 @@ async def test_simulated_fallback_thinking_only_marks_backend_unavailable() -> N
     finally:
         await backend.close()
 
+    assert exc_info.value.metadata["tool_turn_reason"] == "thinking_only"
+    assert exc_info.value.metadata["rejected_thinking"] == "still deciding"
     metadata = backend.get_model_info().metadata
     assert metadata["tool_call_mode"] == "unavailable"
     assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
+
+
+@pytest.mark.asyncio
+async def test_simulated_fallback_post_tool_thinking_only_stays_recoverable() -> None:
+    backend = OpenAICompatBackend(
+        base_url="http://localhost:8000/v1",
+        model="gpt-test",
+        api_key="test-key",
+    )
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    response_data = {
+        "id": "chatcmpl-post-tool-thinking",
+        "model": "gpt-test",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "still deciding",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    mock_resp = _mock_response(response_data)
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+            result = await backend.generate(
+                messages=[
+                    Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=[ToolCall(id="call-1", name="web_search", arguments={"query": "台中天氣"})],
+                    ),
+                    Message(role="tool", content='{"ok": true}', tool_call_id="call-1", name="web_search"),
+                ],
+                tools=[
+                    ToolSchema(
+                        name="web_search",
+                        description="Search the web",
+                        parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+                    )
+                ],
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert result.content == ""
+    assert result.thinking == "still deciding"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "simulated_fallback"
+    assert metadata["fallback_validation_status"] == "not_attempted"
 
 
 def test_blocked_simulated_retry_overwrites_stale_supported_probe_status() -> None:

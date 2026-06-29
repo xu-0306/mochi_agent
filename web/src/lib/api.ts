@@ -388,7 +388,8 @@ export interface SendMessageOptions {
   selectedSkillIds?: string[]
   attachments?: ChatAttachment[]
   temperature?: number
-  maxTokens?: number
+  maxTokens?: number | null
+  reserveOutputTokens?: number | null
   systemPrompt?: string
   topP?: number
   minP?: number
@@ -533,7 +534,8 @@ export interface PostChatPayload {
   attachments?: ChatAttachment[]
   system_prompt?: string
   temperature?: number
-  max_tokens?: number
+  max_tokens?: number | null
+  reserve_output_tokens?: number | null
   top_p?: number
   min_p?: number
   top_k?: number
@@ -1398,6 +1400,7 @@ export async function sendMessage(
       system_prompt: options.systemPrompt,
       temperature: options.temperature,
       max_tokens: options.maxTokens,
+      reserve_output_tokens: options.reserveOutputTokens,
       top_p: options.topP,
       min_p: options.minP,
       top_k: options.topK,
@@ -1432,6 +1435,7 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       system_prompt: payload.system_prompt,
       temperature: payload.temperature,
       max_tokens: payload.max_tokens,
+      reserve_output_tokens: payload.reserve_output_tokens,
       top_p: payload.top_p,
       min_p: payload.min_p,
       top_k: payload.top_k,
@@ -1460,6 +1464,7 @@ export async function fetchChatContextPreview(
         system_prompt: payload.system_prompt,
         temperature: payload.temperature,
         max_tokens: payload.max_tokens,
+        reserve_output_tokens: payload.reserve_output_tokens,
         top_p: payload.top_p,
         min_p: payload.min_p,
         top_k: payload.top_k,
@@ -1671,6 +1676,7 @@ async function requestStreamResponse(
         system_prompt: options.systemPrompt,
         temperature: options.temperature,
         max_tokens: options.maxTokens,
+        reserve_output_tokens: options.reserveOutputTokens,
         top_p: options.topP,
         min_p: options.minP,
         top_k: options.topK,
@@ -4189,6 +4195,7 @@ interface BackendSettings {
   learning: Record<string, ApiValue>
   tools?: Record<string, ApiValue>
   local_models?: Record<string, ApiValue>
+  ollama?: Record<string, ApiValue>
   gguf?: Record<string, ApiValue>
   vllm?: Record<string, ApiValue>
   channels: Record<string, ApiValue>
@@ -4202,7 +4209,8 @@ export interface InferencePreset {
   name: string
   system_prompt: string
   temperature: number
-  max_tokens: number
+  max_tokens: number | null
+  reserve_output_tokens: number | null
   top_p: number
   min_p: number
   top_k: number
@@ -4215,7 +4223,8 @@ export interface InferencePreset {
 export interface AgentSettings {
   system_prompt: string
   temperature: number
-  max_tokens: number
+  max_tokens: number | null
+  reserve_output_tokens: number | null
   top_p: number
   min_p: number
   top_k: number
@@ -4258,6 +4267,10 @@ export interface CommandRule {
 export interface LocalModelSettings {
   idle_unload_enabled: boolean
   idle_unload_seconds: number | null
+}
+
+export interface OllamaSettings {
+  num_ctx: number | null
 }
 
 export interface GGUFSettings {
@@ -4353,6 +4366,7 @@ export interface Settings {
   learning: Record<string, ApiValue>
   tools?: ToolsSettings
   local_models?: LocalModelSettings
+  ollama?: OllamaSettings
   gguf?: GGUFSettings
   vllm?: VLLMSettings
   channels: Record<string, ApiValue>
@@ -4924,6 +4938,7 @@ export async function fetchSettings(): Promise<Settings> {
     learning: payload.learning,
     tools: isRecord(payload.tools) ? payload.tools as ToolsSettings : undefined,
     local_models: normalizeLocalModelSettings(payload.local_models),
+    ollama: normalizeOllamaSettings(payload.ollama),
     gguf: normalizeGgufSettings(payload.gguf),
     vllm: normalizeVllmSettings(payload.vllm),
     channels: payload.channels,
@@ -5087,7 +5102,8 @@ export interface InferencePresetInput {
   name: string
   system_prompt: string
   temperature: number
-  max_tokens: number
+  max_tokens: number | null
+  reserve_output_tokens: number | null
   top_p: number
   min_p: number
   top_k: number
@@ -5100,7 +5116,8 @@ export interface InferencePresetInput {
 export interface AgentSettingsUpdate {
   system_prompt?: string
   temperature?: number
-  max_tokens?: number
+  max_tokens?: number | null
+  reserve_output_tokens?: number | null
   top_p?: number
   min_p?: number
   top_k?: number
@@ -5148,6 +5165,7 @@ export interface UpdateSettingsInput {
   learning?: LearningSettingsUpdate
   tools?: ToolsSettingsUpdate
   local_models?: Partial<LocalModelSettings>
+  ollama?: Partial<OllamaSettings>
   gguf?: Partial<GGUFSettings>
   vllm?: Partial<VLLMSettings>
   security?: SecuritySettingsUpdate
@@ -5191,7 +5209,8 @@ function normalizeInferencePreset(value: unknown): InferencePreset | null {
     name,
     system_prompt: getString(value.system_prompt) ?? '',
     temperature: getNumber(value.temperature) ?? 0.7,
-    max_tokens: getNumber(value.max_tokens) ?? 4096,
+    max_tokens: getNumber(value.max_tokens) ?? null,
+    reserve_output_tokens: getNumber(value.reserve_output_tokens) ?? null,
     top_p: getNumber(value.top_p) ?? 1.0,
     min_p: getNumber(value.min_p) ?? 0.0,
     top_k: getNumber(value.top_k) ?? 0,
@@ -5217,7 +5236,8 @@ function normalizeAgentSettings(value: unknown): AgentSettings | undefined {
   return {
     system_prompt: getString(value.system_prompt) ?? '',
     temperature: getNumber(value.temperature) ?? 0.7,
-    max_tokens: getNumber(value.max_tokens) ?? 4096,
+    max_tokens: getNumber(value.max_tokens) ?? null,
+    reserve_output_tokens: getNumber(value.reserve_output_tokens) ?? null,
     top_p: getNumber(value.top_p) ?? 1.0,
     min_p: getNumber(value.min_p) ?? 0.0,
     top_k: getNumber(value.top_k) ?? 0,
@@ -5326,6 +5346,16 @@ function normalizeLocalModelSettings(value: unknown): LocalModelSettings | undef
   }
 }
 
+function normalizeOllamaSettings(value: unknown): OllamaSettings | undefined {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  return {
+    num_ctx: getNumber(value.num_ctx),
+  }
+}
+
 function normalizeGgufSettings(value: unknown): GGUFSettings | undefined {
   if (!isRecord(value)) {
     return undefined
@@ -5370,6 +5400,9 @@ export async function updateSettings(input: UpdateSettingsInput): Promise<Settin
     learning: payload.learning,
     tools: isRecord(payload.tools) ? payload.tools as ToolsSettings : undefined,
     local_models: normalizeLocalModelSettings(payload.local_models),
+    ollama: normalizeOllamaSettings(payload.ollama),
+    gguf: normalizeGgufSettings(payload.gguf),
+    vllm: normalizeVllmSettings(payload.vllm),
     channels: payload.channels,
     web: payload.web,
     security: normalizeSecuritySettings(payload.security),
@@ -5407,6 +5440,11 @@ export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> 
     voice: normalizeVoiceSettings(payload.voice),
     memory: payload.memory,
     learning: payload.learning,
+    tools: isRecord(payload.tools) ? payload.tools as ToolsSettings : undefined,
+    local_models: normalizeLocalModelSettings(payload.local_models),
+    ollama: normalizeOllamaSettings(payload.ollama),
+    gguf: normalizeGgufSettings(payload.gguf),
+    vllm: normalizeVllmSettings(payload.vllm),
     channels: payload.channels,
     web: payload.web,
     security: normalizeSecuritySettings(payload.security),

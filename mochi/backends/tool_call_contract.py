@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from mochi.backends.types import GenerationResult
 
@@ -32,3 +32,19 @@ def validate_tool_turn_result(
     if tools_requested and result.thinking.strip():
         return ToolTurnVerdict(is_valid=False, reason="thinking_only")
     return ToolTurnVerdict(is_valid=not tools_requested, reason="empty")
+
+
+def build_invalid_tool_turn_metadata(
+    *,
+    result: GenerationResult,
+    reason: ToolTurnReason,
+) -> dict[str, Any]:
+    """Serialize rejected tool-turn details for diagnostics and recovery."""
+
+    return {
+        "tool_turn_reason": reason,
+        "rejected_content": result.content,
+        "rejected_thinking": result.thinking,
+        "rejected_finish_reason": result.finish_reason,
+        "rejected_tool_call_count": len(result.tool_calls),
+    }

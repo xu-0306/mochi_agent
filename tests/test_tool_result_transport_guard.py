@@ -206,8 +206,9 @@ def test_transport_guard_persists_large_file_read_with_resumable_followup_contra
     assert outcome.diagnostics["summary_applied"] is True
     assert outcome.diagnostics["overflow_persisted"] is True
     assert reference_id
-    assert f'tool-result://{reference_id}' in outcome.content
-    assert 'file_read(path="tool-result://' in outcome.content
+    assert f'reference_id="{reference_id}"' in outcome.content
+    assert 'tool_result_read(reference_id="' in outcome.content
+    assert 'file_read(path="tool-result://' not in outcome.content
     assert "offset=1, limit=200, line_numbers=True" in outcome.content
 
     reference = context.tool_result_references[reference_id]
@@ -222,6 +223,11 @@ def test_transport_guard_persists_large_file_read_with_resumable_followup_contra
 def test_transport_guard_preserves_original_file_read_encoding_in_reference_metadata(
     tmp_path: Path,
 ) -> None:
+    source_path = tmp_path / "huge-utf16.log"
+    source_path.write_text(
+        "".join(f"line {idx}\n" for idx in range(1, 101)),
+        encoding="utf-16",
+    )
     context = ToolExecutionContext(
         session_id="session-large-file-read-utf16",
         tool_result_store_dir=str(tmp_path),
@@ -233,7 +239,7 @@ def test_transport_guard_preserves_original_file_read_encoding_in_reference_meta
         result=ToolResult(
             output="\n".join(f"{idx}: line {idx}" for idx in range(1, 101)),
             metadata={
-                "path": str(tmp_path / "huge-utf16.log"),
+                "path": str(source_path),
                 "line_numbers": True,
                 "encoding": "utf-16",
             },
@@ -247,7 +253,7 @@ def test_transport_guard_preserves_original_file_read_encoding_in_reference_meta
 
     reference = context.tool_result_references[outcome.diagnostics["reference_id"]]
     assert reference["encoding"] == "utf-16"
-    assert reference["artifact_encoding"] == "utf-8"
+    assert reference["artifact_encoding"] == "utf-16"
 
 
 def test_transport_guard_persists_file_read_when_formatted_text_exceeds_backend_cap(
@@ -277,4 +283,6 @@ def test_transport_guard_persists_file_read_when_formatted_text_exceeds_backend_
     assert len(text) > 220
     assert outcome.diagnostics["overflow_persisted"] is True
     assert reference_id
-    assert f'tool-result://{reference_id}' in outcome.content
+    assert f'reference_id="{reference_id}"' in outcome.content
+    assert 'tool_result_read(reference_id="' in outcome.content
+    assert 'file_read(path="tool-result://' not in outcome.content

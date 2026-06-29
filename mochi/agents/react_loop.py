@@ -210,6 +210,8 @@ class AsyncReActLoop:
         last_tool_signature: tuple[str, ...] | None = None
         repeated_tool_rounds = 0
         empty_final_recovery_attempts = 0
+        invalid_tool_turn_recovery_attempts = 0
+        force_plain_answer_without_tools = False
         web_fetch_guard_state: dict[str, Any] = {
             "last_failed_url": None,
             "failure_streak": 0,
@@ -226,6 +228,8 @@ class AsyncReActLoop:
             "abstract_hits": 0,
             "fetched_docs": 0,
             "fetched_chars": 0,
+            "search_tools": set(),
+            "search_queries": set(),
             "summary_ready": False,
             "prompt_injected": False,
         }
@@ -247,6 +251,7 @@ class AsyncReActLoop:
                     yield progress_event
 
                 started_at = time.perf_counter()
+                iteration_tools = [] if force_plain_answer_without_tools else tools
                 try:
                     streamed_generation = False
                     held_stream_text = ""
@@ -254,12 +259,12 @@ class AsyncReActLoop:
                         streamed_generation = True
                         hold_visible_stream = self._should_hold_visible_stream(
                             evidence_guard_state,
-                            tools,
+                            iteration_tools,
                         )
                         stream_result = await self._backend.generate(
                             **self._build_generate_kwargs(
                                 messages=messages,
-                                tools=tools,
+                                tools=iteration_tools,
                                 temperature=temperature,
                                 max_tokens=max_tokens,
                                 top_p=top_p,
@@ -338,7 +343,7 @@ class AsyncReActLoop:
                         result = await self._backend.generate(
                             **self._build_generate_kwargs(
                                 messages=messages,
-                                tools=tools,
+                                tools=iteration_tools,
                                 temperature=temperature,
                                 max_tokens=max_tokens,
                                 top_p=top_p,
@@ -352,6 +357,37 @@ class AsyncReActLoop:
                             )
                         )
                 except Exception as exc:
+                    recovery_mode = self._invalid_tool_turn_recovery_mode(
+                        exc=exc,
+                        messages=messages,
+                        retry_count=invalid_tool_turn_recovery_attempts,
+                    )
+                    if recovery_mode is not None:
+                        rejected_thinking = self._extract_invalid_tool_turn_thinking(exc)
+                        if rejected_thinking:
+                            yield ThinkingEvent(
+                                content=rejected_thinking,
+                                metadata={
+                                    "source": "model_summary",
+                                    "recovery": "invalid_tool_turn",
+                                },
+                            )
+                        invalid_tool_turn_recovery_attempts += 1
+                        force_plain_answer_without_tools = (
+                            recovery_mode == "plain_answer_without_tools"
+                        )
+                        recovery_prompt = (
+                            self._build_empty_final_response_prompt()
+                            if force_plain_answer_without_tools
+                            else self._build_invalid_tool_turn_repair_prompt()
+                        )
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=recovery_prompt,
+                            )
+                        )
+                        continue
                     logger.exception(f"ReAct loop backend error: {exc}")
                     yield ErrorEvent(
                         message=str(exc),
@@ -367,6 +403,7 @@ class AsyncReActLoop:
                 total_input_tokens += result.input_tokens
                 total_output_tokens += result.output_tokens
                 finish_reason = result.finish_reason or finish_reason
+                force_plain_answer_without_tools = False
 
                 if result.tool_calls:
                     current_tool_signature = self._build_tool_call_signature(result.tool_calls)
@@ -615,6 +652,7 @@ class AsyncReActLoop:
                         retry_count=empty_final_recovery_attempts,
                     ):
                         empty_final_recovery_attempts += 1
+                        force_plain_answer_without_tools = True
                         messages.append(
                             Message(
                                 role="user",
@@ -1173,6 +1211,44 @@ class AsyncReActLoop:
             "Do not call tools again unless another tool is strictly necessary."
         )
 
+    @staticmethod
+    def _build_invalid_tool_turn_repair_prompt() -> str:
+        return (
+            "Your last response was invalid for a tool-capable turn. "
+            "Reply correctly on the next turn. If you need external information, "
+            "call one of the available tools now. If no tool is needed, answer "
+            "directly in plain assistant text for the user, using the user's "
+            "language. If you cannot call a tool correctly, say that plainly "
+            "instead of guessing. Do not output hidden reasoning only. Do not "
+            "output placeholder text such as 'I'll check' or 'searching'."
+        )
+
+    @staticmethod
+    def _invalid_tool_turn_recovery_mode(
+        *,
+        exc: Exception,
+        messages: list[Message],
+        retry_count: int,
+    ) -> str | None:
+        if retry_count >= 1 or not isinstance(exc, BackendRequestError):
+            return None
+        tool_turn_reason = str(exc.metadata.get("tool_turn_reason") or "").strip().lower()
+        if tool_turn_reason not in {"thinking_only", "empty"}:
+            return None
+        if any(message.role == "tool" for message in messages):
+            return "plain_answer_without_tools"
+        backend_name = str(exc.metadata.get("backend_name") or "").strip().lower()
+        if backend_name == "ollama":
+            return "repair_tool_turn"
+        return None
+
+    @staticmethod
+    def _extract_invalid_tool_turn_thinking(exc: Exception) -> str:
+        if not isinstance(exc, BackendRequestError):
+            return ""
+        rejected_thinking = exc.metadata.get("rejected_thinking")
+        return rejected_thinking if isinstance(rejected_thinking, str) else ""
+
     def _build_backend_error_metadata(self, exc: Exception) -> dict[str, Any]:
         backend_info = self._backend.get_model_info()
         backend_metadata: dict[str, Any] = {
@@ -1609,6 +1685,15 @@ class AsyncReActLoop:
                     for field in ("abstract", "summary")
                 )
             )
+            if output:
+                search_tools = literature_state.setdefault("search_tools", set())
+                if isinstance(search_tools, set):
+                    search_tools.add(tool_call.name)
+                query = tool_call.arguments.get("query")
+                if isinstance(query, str) and query.strip():
+                    search_queries = literature_state.setdefault("search_queries", set())
+                    if isinstance(search_queries, set):
+                        search_queries.add(self._normalize_text(query))
         elif tool_call.name == "web_fetch":
             url = str(tool_call.arguments.get("url", ""))
             if literature_state["research_mode"] or self._looks_like_academic_url(url):
@@ -1665,8 +1750,13 @@ class AsyncReActLoop:
         abstract_hits = int(literature_state["abstract_hits"])
         fetched_docs = int(literature_state["fetched_docs"])
         fetched_chars = int(literature_state["fetched_chars"])
+        search_tools = literature_state.get("search_tools")
+        search_queries = literature_state.get("search_queries")
+        distinct_search_tools = len(search_tools) if isinstance(search_tools, set) else 0
+        distinct_search_queries = len(search_queries) if isinstance(search_queries, set) else 0
+        has_corroborated_search = distinct_search_tools >= 2 or distinct_search_queries >= 2
         return (
-            (paper_hits >= 3 and abstract_hits >= 2)
+            (has_corroborated_search and paper_hits >= 3 and abstract_hits >= 2)
             or (paper_hits >= 2 and fetched_docs >= 1 and (abstract_hits >= 1 or fetched_chars >= 2500))
             or (paper_hits >= 2 and fetched_docs >= 2)
         )

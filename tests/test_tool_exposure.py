@@ -225,6 +225,54 @@ def test_parse_tool_intent_classifier_result_normalizes_legacy_workspace_aliases
     assert write_route.intent == "workspace_write"
 
 
+def test_tool_exposure_keeps_literature_tools_for_ollama_prompt_guided_rejection() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read"],
+            "web": ["web_search", "web_fetch"],
+            "literature": ["arxiv_search", "semantic_scholar_search"],
+            "tool_discovery": ["tool_search"],
+        }
+    )
+    available_tools = [
+        "arxiv_search",
+        "semantic_scholar_search",
+        "web_search",
+        "web_fetch",
+        "file_read",
+        "tool_search",
+    ]
+    plan = planner.plan(
+        message="\u5e6b\u6211\u67e5\u8a62\u5929\u6c23\u9810\u6e2c\u76f8\u95dc\u6a21\u578b\u5fae\u8abf\u7684\u6587\u737b",
+        user_intent_message="\u5e6b\u6211\u67e5\u8a62\u5929\u6c23\u9810\u6e2c\u76f8\u95dc\u6a21\u578b\u5fae\u8abf\u7684\u6587\u737b",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(
+            backend_type="ollama",
+            metadata={
+                "tool_call_mode": "unavailable",
+                "tool_calling_protocol": "prompt_guided",
+                "native_tool_calling_status": "simulated_protocol_rejected",
+            },
+        ),
+        session_bound_workspace=True,
+        preferred_tool_names=[],
+        tool_capabilities=_tool_capabilities(*available_tools),
+        routed_intent="literature_research",
+        intent_confidence=0.88,
+        intent_source="fallback_keyword",
+        intent_rationale="Matched literature research language.",
+    )
+
+    assert "arxiv_search" in plan.tool_names
+    assert "semantic_scholar_search" in plan.tool_names
+    assert "web_search" in plan.tool_names
+    assert plan.tool_names
+    metadata = plan.exposure_metadata()
+    assert metadata["diagnostics"]["available_tool_count"] == len(available_tools)
+    assert metadata["diagnostics"]["backend"]["backend_type"] == "ollama"
+    assert metadata["diagnostics"]["backend"]["metadata"]["tool_calling_protocol"] == "prompt_guided"
+
+
 async def test_tool_intent_router_routes_tool_discovery_queries() -> None:
     route = await ToolIntentRouter().route(
         user_message="which tool should I use to inspect notebook outputs?",
@@ -376,6 +424,83 @@ def test_tool_exposure_uses_routed_literature_intent_for_chinese_research_in_wor
     assert (
         {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"} & set(plan.tool_names)
     )
+    assert not {"file_read", "glob_search", "grep_search"} & set(plan.tool_names)
+
+
+def test_tool_exposure_literature_request_does_not_add_workspace_baseline() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search", "csv_read", "pdf_read"],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+            "literature": ["arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"],
+        }
+    )
+    available_tools = [
+        "arxiv_search",
+        "semantic_scholar_search",
+        "crossref_search",
+        "pubmed_search",
+        "web_search",
+        "web_fetch",
+        "get_current_time",
+        "file_read",
+        "glob_search",
+        "grep_search",
+        "csv_read",
+        "pdf_read",
+        "tool_search",
+    ]
+
+    plan = planner.plan(
+        message="幫我查詢小型多模態模型醫療影像微調的相關論文",
+        user_intent_message="幫我查詢小型多模態模型醫療影像微調的相關論文",
+        available_tool_names=available_tools,
+        backend=_FakeBackend(backend_type="ollama"),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(*available_tools),
+        routed_intent="literature_research",
+        intent_confidence=0.88,
+        intent_source="fallback_keyword",
+        intent_rationale="Matched literature research language.",
+    )
+
+    assert plan.matched_groups == ["literature", "web"]
+    assert {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"} & set(
+        plan.tool_names
+    )
+    assert {"web_search", "web_fetch"} <= set(plan.tool_names)
+    assert "tool_search" in plan.tool_names
+    assert not {"file_read", "glob_search", "grep_search", "csv_read", "pdf_read"} & set(
+        plan.tool_names
+    )
+
+
+def test_tool_exposure_workspace_readonly_baseline_keeps_tool_result_read() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "tool_result_read", "glob_search", "grep_search", "file_write"],
+        }
+    )
+
+    plan = planner.plan(
+        message="inspect the repo and continue reading prior tool output if needed",
+        user_intent_message="inspect the repo and continue reading prior tool output if needed",
+        available_tool_names=["file_read", "tool_result_read", "glob_search", "grep_search", "file_write"],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities(),
+        routed_intent="workspace_read",
+        intent_confidence=0.91,
+        intent_source="classifier",
+        intent_rationale="Explicit workspace inspection.",
+    )
+
+    assert {"file_read", "tool_result_read", "glob_search", "grep_search"} <= set(plan.tool_names)
+    assert "file_write" in plan.tool_names
+
+
 
 
 def test_tool_exposure_routed_workspace_read_stays_workspace_focused() -> None:
@@ -608,12 +733,11 @@ def test_tool_exposure_uses_web_tools_for_weather_in_workspace() -> None:
     )
 
     assert plan.matched_groups == ["web"]
-    assert {"file_read", "grep_search", "web_search", "web_fetch", "get_current_time"} <= set(
-        plan.tool_names
-    )
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    assert not {"file_read", "grep_search"} & set(plan.tool_names)
 
 
-def test_tool_exposure_keeps_full_workspace_baseline_and_weather_tools() -> None:
+def test_tool_exposure_keeps_weather_tools_without_workspace_baseline() -> None:
     planner = ToolExposurePlanner(
         tool_groups={
             "workspace": [
@@ -649,7 +773,8 @@ def test_tool_exposure_keeps_full_workspace_baseline_and_weather_tools() -> None
         autonomy_mode="auto_review",
     )
 
-    assert {
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    assert not {
         "file_read",
         "glob_search",
         "grep_search",
@@ -657,8 +782,7 @@ def test_tool_exposure_keeps_full_workspace_baseline_and_weather_tools() -> None
         "pdf_read",
         "docx_read",
         "notebook_read",
-    } <= set(plan.tool_names)
-    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    } & set(plan.tool_names)
 
 
 def test_tool_exposure_surfaces_discourse_collector_for_direct_topic_collection_requests() -> None:
@@ -876,7 +1000,7 @@ def test_tool_exposure_includes_specialized_workspace_readers_for_chinese_prompt
     )
 
 
-def test_tool_exposure_keeps_full_workspace_baseline_under_web_heuristics() -> None:
+def test_tool_exposure_keeps_web_focus_under_web_heuristics() -> None:
     planner = ToolExposurePlanner(
         tool_groups={
             "workspace": [
@@ -912,7 +1036,8 @@ def test_tool_exposure_keeps_full_workspace_baseline_under_web_heuristics() -> N
         autonomy_mode="auto_review",
     )
 
-    assert {
+    assert {"web_search", "web_fetch", "get_current_time"} <= set(plan.tool_names)
+    assert not {
         "file_read",
         "glob_search",
         "grep_search",
@@ -920,7 +1045,7 @@ def test_tool_exposure_keeps_full_workspace_baseline_under_web_heuristics() -> N
         "pdf_read",
         "docx_read",
         "notebook_read",
-    } <= set(plan.tool_names)
+    } & set(plan.tool_names)
 
 
 def test_tool_exposure_keeps_general_web_tools_for_chinese_weather_queries_in_workspace() -> None:
@@ -1080,8 +1205,8 @@ def test_tool_exposure_uses_group_signals_for_ranking_without_hiding_other_group
         tool_capabilities=_tool_capabilities(*available_tools),
     )
 
-    assert set(plan.tool_names) == set(available_tools)
-    assert plan.tool_names.index("web_search") < plan.tool_names.index("file_read")
+    assert {"web_search", "web_fetch", "get_current_time", "arxiv_search"} <= set(plan.tool_names)
+    assert not {"file_read", "glob_search", "grep_search"} & set(plan.tool_names)
     assert plan.tool_names.index("web_fetch") < plan.tool_names.index("arxiv_search")
 
 

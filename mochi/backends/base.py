@@ -65,6 +65,10 @@ class BaseLLMBackend(ABC):
         """Optionally verify native tool calling for this backend."""
         return None
 
+    async def prime_model_info(self) -> None:
+        """Optionally prefetch model metadata used by synchronous get_model_info()."""
+        return None
+
     async def close(self) -> None:
         """Release backend resources such as HTTP clients."""
         return None

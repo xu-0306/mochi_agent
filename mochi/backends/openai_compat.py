@@ -20,7 +20,10 @@ from mochi.backends.inference_capabilities import (
 )
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.simulated_tool_protocol import SimulatedToolProtocol
-from mochi.backends.tool_call_contract import validate_tool_turn_result
+from mochi.backends.tool_call_contract import (
+    build_invalid_tool_turn_metadata,
+    validate_tool_turn_result,
+)
 from mochi.backends.tool_call_simulator import ToolCallSimulator
 from mochi.backends.tool_call_state import ToolCallingState
 from mochi.backends.types import (
@@ -135,6 +138,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
         tools_requested = bool(tools)
+        post_tool_continuation = self._is_post_tool_continuation(messages)
         prepared_messages = self._prepare_messages(messages, tools)
         use_chat_transport = self._uses_chat_completions_transport()
         chat_payload = self._build_chat_completions_payload(
@@ -156,7 +160,11 @@ class OpenAICompatBackend(BaseLLMBackend):
             if stream:
                 return self._stream_generate(chat_payload, request_url=self._chat_completions_url)
             result = await self._blocking_generate(chat_payload, request_url=self._chat_completions_url)
-            return self._finalize_tool_result(result, tools_requested=tools_requested)
+            return self._finalize_tool_result(
+                result,
+                tools_requested=tools_requested,
+                allow_incomplete_final=post_tool_continuation,
+            )
 
         responses_payload = self._build_responses_payload(
             prepared_messages,
@@ -178,7 +186,11 @@ class OpenAICompatBackend(BaseLLMBackend):
             responses_url=self._responses_url,
             chat_url=self._chat_completions_url,
         )
-        return self._finalize_tool_result(result, tools_requested=tools_requested)
+        return self._finalize_tool_result(
+            result,
+            tools_requested=tools_requested,
+            allow_incomplete_final=post_tool_continuation,
+        )
 
     def supports_tool_calling(self) -> bool:
         """OpenAI-compatible 端點通常支援 tool calling。"""
@@ -2053,6 +2065,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         result: GenerationResult,
         *,
         tools_requested: bool,
+        allow_incomplete_final: bool = False,
     ) -> GenerationResult:
         if not tools_requested or self._tool_state.active_mode != "simulated_fallback":
             return result
@@ -2061,11 +2074,14 @@ class OpenAICompatBackend(BaseLLMBackend):
         if verdict.is_valid:
             self._tool_state.validate_simulated()
             return result
+        if allow_incomplete_final and verdict.reason == "thinking_only":
+            return result
 
+        error_metadata = build_invalid_tool_turn_metadata(result=result, reason=verdict.reason)
         self._mark_simulated_protocol_unavailable(
             status="simulated_protocol_rejected",
             message="Prompt-simulated tool calling returned an invalid tool-eligible turn.",
-            metadata={"tool_turn_reason": verdict.reason},
+            metadata=error_metadata,
         )
         raise BackendRequestError(
             "Prompt-simulated tool calling returned an invalid tool-eligible turn.",
@@ -2073,9 +2089,13 @@ class OpenAICompatBackend(BaseLLMBackend):
                 "backend_name": "openai_compat",
                 "api_mode": self._api_mode,
                 "model": self.model,
-                "tool_turn_reason": verdict.reason,
+                **error_metadata,
             },
         )
+
+    @staticmethod
+    def _is_post_tool_continuation(messages: list[Message]) -> bool:
+        return any(message.role == "tool" for message in messages)
 
     def _mark_simulated_protocol_unavailable(
         self,

@@ -251,7 +251,8 @@ interface ApiCompat {
       attachments?: ChatAttachment[]
       systemPrompt?: string
       temperature?: number
-      maxTokens?: number
+      maxTokens?: number | null
+      reserveOutputTokens?: number | null
       topP?: number
       minP?: number
       topK?: number
@@ -273,7 +274,8 @@ interface ApiCompat {
     attachments?: ChatAttachment[]
     system_prompt?: string
     temperature?: number
-    max_tokens?: number
+    max_tokens?: number | null
+    reserve_output_tokens?: number | null
     top_p?: number
     min_p?: number
     top_k?: number
@@ -1286,7 +1288,8 @@ async function requestChat(
   inference: {
     systemPrompt: string
     temperature: number
-    maxTokens: number
+    maxTokens: number | null
+    reserveOutputTokens: number | null
     topP: number
     minP: number
     topK: number
@@ -1312,6 +1315,7 @@ async function requestChat(
       system_prompt: inference.systemPrompt,
       temperature: inference.temperature,
       max_tokens: inference.maxTokens,
+      reserve_output_tokens: inference.reserveOutputTokens,
       top_p: inference.topP,
       min_p: inference.minP,
       top_k: inference.topK,
@@ -1333,6 +1337,7 @@ async function requestChat(
       systemPrompt: inference.systemPrompt,
       temperature: inference.temperature,
       maxTokens: inference.maxTokens,
+      reserveOutputTokens: inference.reserveOutputTokens,
       topP: inference.topP,
       minP: inference.minP,
       topK: inference.topK,
@@ -4112,6 +4117,7 @@ export default function ChatPage() {
             systemPrompt: effectiveInference.systemPrompt,
             temperature: effectiveInference.temperature,
             maxTokens: effectiveInference.maxTokens,
+            reserveOutputTokens: effectiveInference.reserveOutputTokens,
             topP: effectiveInference.topP,
             minP: effectiveInference.minP,
             topK: effectiveInference.topK,
@@ -4944,6 +4950,7 @@ export default function ChatPage() {
       systemPrompt: preset.system_prompt,
       temperature: preset.temperature,
       maxTokens: preset.max_tokens,
+      reserveOutputTokens: preset.reserve_output_tokens,
       topP: preset.top_p,
       minP: preset.min_p,
       topK: preset.top_k,
@@ -4980,6 +4987,7 @@ export default function ChatPage() {
             system_prompt: effectiveInference.systemPrompt,
             temperature: effectiveInference.temperature,
             max_tokens: effectiveInference.maxTokens,
+            reserve_output_tokens: effectiveInference.reserveOutputTokens,
             top_p: effectiveInference.topP,
             min_p: effectiveInference.minP,
             top_k: effectiveInference.topK,
@@ -5000,6 +5008,7 @@ export default function ChatPage() {
             system_prompt: preset.system_prompt,
             temperature: preset.temperature,
             max_tokens: preset.max_tokens,
+            reserve_output_tokens: preset.reserve_output_tokens,
             top_p: preset.top_p,
             min_p: preset.min_p,
             top_k: preset.top_k,
@@ -5665,6 +5674,7 @@ export default function ChatPage() {
           disabledReason={disabledReason}
           agent={activeAgentSettings}
           settings={settings}
+          activeModelInfo={activeModelInfo}
           onSettingsUpdated={setSettings}
         />
       </div>

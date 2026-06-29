@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mochi.tools.base import ToolResult
 from mochi.tools.literature_search import (
     ArxivSearchTool,
     CrossrefSearchTool,
@@ -259,3 +260,150 @@ async def test_literature_search_tools_reject_empty_queries() -> None:
     finally:
         for tool in tools:
             await tool.close()
+
+
+def test_arxiv_search_formats_results_for_model_as_citation_first_plain_text() -> None:
+    tool = ArxivSearchTool()
+    rendered = tool.format_result_for_model(
+        ToolResult(
+            output=[
+                {
+                    "id": "1706.03762v7",
+                    "title": "Attention Is All You Need",
+                    "authors": ["Ashish Vaswani", "Noam Shazeer"],
+                    "summary": "We propose a new simple network architecture.",
+                    "published": "2017-06-12T17:57:34Z",
+                    "updated": "2023-08-02T00:00:00Z",
+                    "categories": ["cs.CL", "cs.LG"],
+                    "primary_category": "cs.CL",
+                    "url": "http://arxiv.org/abs/1706.03762v7",
+                    "pdf_url": "http://arxiv.org/pdf/1706.03762v7",
+                }
+            ]
+        ),
+        max_chars=500,
+    )
+    assert not rendered.lstrip().startswith("{")
+    assert "Attention Is All You Need" in rendered
+    assert "Ashish Vaswani" in rendered
+    assert "http://arxiv.org/abs/1706.03762v7" in rendered
+
+
+def test_arxiv_search_small_budget_preserves_identifiers_before_abstract() -> None:
+    tool = ArxivSearchTool()
+    rendered = tool.format_result_for_model(
+        ToolResult(
+            output=[
+                {
+                    "id": "1706.03762v7",
+                    "title": "Attention Is All You Need",
+                    "authors": ["Ashish Vaswani", "Noam Shazeer"],
+                    "summary": (
+                        "We propose a new simple network architecture that relies entirely on attention "
+                        "mechanisms and replaces recurrence and convolutions while improving translation "
+                        "quality and parallelization."
+                    ),
+                    "published": "2017-06-12T17:57:34Z",
+                    "updated": "2023-08-02T00:00:00Z",
+                    "categories": ["cs.CL", "cs.LG"],
+                    "primary_category": "cs.CL",
+                    "url": "http://arxiv.org/abs/1706.03762v7",
+                    "pdf_url": "http://arxiv.org/pdf/1706.03762v7",
+                }
+            ]
+        ),
+        max_chars=220,
+    )
+    assert not rendered.lstrip().startswith("{")
+    assert "Attention Is All You Need" in rendered
+    assert "arXiv 1706.03762v7" in rendered
+    assert "http://arxiv.org/abs/1706.03762v7" in rendered
+    assert "Abstract:" not in rendered or "...[truncated]" in rendered
+
+
+def test_semantic_scholar_search_formats_results_for_model_as_citation_first_plain_text() -> None:
+    tool = SemanticScholarSearchTool()
+    rendered = tool.format_result_for_model(
+        ToolResult(
+            output=[
+                {
+                    "paper_id": "abc123",
+                    "title": "Attention Is All You Need",
+                    "authors": [{"name": "Ashish Vaswani", "author_id": "1"}],
+                    "abstract": "We propose a new simple network architecture.",
+                    "year": 2017,
+                    "venue": "NeurIPS",
+                    "publication_date": "2017-12-01",
+                    "citation_count": 1000,
+                    "influential_citation_count": 100,
+                    "url": "https://www.semanticscholar.org/paper/abc123",
+                    "pdf_url": "https://example.com/attention.pdf",
+                    "doi": "10.5555/attention",
+                    "arxiv_id": "1706.03762",
+                    "external_ids": {"DOI": "10.5555/attention", "ArXiv": "1706.03762"},
+                }
+            ]
+        ),
+        max_chars=500,
+    )
+    assert not rendered.lstrip().startswith("{")
+    assert "Attention Is All You Need" in rendered
+    assert "Ashish Vaswani" in rendered
+    assert "10.5555/attention" in rendered
+    assert "1706.03762" in rendered
+
+
+def test_crossref_search_formats_results_for_model_as_citation_first_plain_text() -> None:
+    tool = CrossrefSearchTool()
+    rendered = tool.format_result_for_model(
+        ToolResult(
+            output=[
+                {
+                    "doi": "10.1038/nature12373",
+                    "title": "Direct observations of the cosmic web",
+                    "authors": ["J. Smith"],
+                    "container_title": "Nature",
+                    "published": "2014-01-02",
+                    "type": "journal-article",
+                    "publisher": "Springer Science and Business Media LLC",
+                    "citation_count": 42,
+                    "url": "https://doi.org/10.1038/nature12373",
+                    "abstract": "Observed structure.",
+                }
+            ]
+        ),
+        max_chars=500,
+    )
+    assert not rendered.lstrip().startswith("{")
+    assert "Direct observations of the cosmic web" in rendered
+    assert "J. Smith" in rendered
+    assert "10.1038/nature12373" in rendered
+    assert "https://doi.org/10.1038/nature12373" in rendered
+
+
+def test_pubmed_search_formats_results_for_model_as_citation_first_plain_text() -> None:
+    tool = PubMedSearchTool()
+    rendered = tool.format_result_for_model(
+        ToolResult(
+            output=[
+                {
+                    "pmid": "31452104",
+                    "title": "A biomedical article",
+                    "authors": ["Lee A", "Chen B"],
+                    "journal": "Journal of Tests",
+                    "pubdate": "2019 Oct",
+                    "epubdate": "2019 Sep 1",
+                    "doi": "10.1000/test",
+                    "url": "https://pubmed.ncbi.nlm.nih.gov/31452104/",
+                    "abstract": "This is the abstract.",
+                }
+            ]
+        ),
+        max_chars=500,
+    )
+    assert not rendered.lstrip().startswith("{")
+    assert "A biomedical article" in rendered
+    assert "Lee A" in rendered
+    assert "31452104" in rendered
+    assert "10.1000/test" in rendered
+    assert "https://pubmed.ncbi.nlm.nih.gov/31452104/" in rendered

@@ -42,6 +42,7 @@ class ChatRequest(BaseModel):
     system_prompt: str | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=131072)
+    reserve_output_tokens: int | None = Field(default=None, ge=0, le=131072)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     min_p: float | None = Field(default=None, ge=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=0)
@@ -349,19 +350,25 @@ def _serialize_event(
 
 def _build_inference_overrides(payload: ChatRequest) -> dict[str, Any]:
     """從 chat payload 擷取推理參數覆蓋。"""
-    overrides = {
-        "system_prompt": payload.system_prompt,
-        "temperature": payload.temperature,
-        "max_tokens": payload.max_tokens,
-        "top_p": payload.top_p,
-        "min_p": payload.min_p,
-        "top_k": payload.top_k,
-        "frequency_penalty": payload.frequency_penalty,
-        "presence_penalty": payload.presence_penalty,
-        "repeat_penalty": payload.repeat_penalty,
-        "reasoning_effort": payload.reasoning_effort,
+    field_map = {
+        "system_prompt": "system_prompt",
+        "temperature": "temperature",
+        "max_tokens": "max_tokens",
+        "reserve_output_tokens": "reserve_output_tokens",
+        "top_p": "top_p",
+        "min_p": "min_p",
+        "top_k": "top_k",
+        "frequency_penalty": "frequency_penalty",
+        "presence_penalty": "presence_penalty",
+        "repeat_penalty": "repeat_penalty",
+        "reasoning_effort": "reasoning_effort",
     }
-    return {key: value for key, value in overrides.items() if value is not None}
+    overrides: dict[str, Any] = {}
+    for field_name, override_key in field_map.items():
+        if field_name not in payload.model_fields_set:
+            continue
+        overrides[override_key] = getattr(payload, field_name)
+    return overrides
 
 
 def _resolve_chat_attachments(payload: ChatRequest) -> list[AttachmentRef]:

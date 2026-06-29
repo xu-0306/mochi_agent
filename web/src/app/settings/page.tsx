@@ -59,6 +59,7 @@ import {
   getActivePreset,
   inferencePresetToParams,
   resolveEffectiveInferenceParams,
+  resolveInferenceTokenControls,
   type InferenceParams,
 } from '@/lib/stores/inference-store'
 import {
@@ -69,6 +70,12 @@ import {
 } from '@/lib/voice-settings'
 import {
   buildContextLengthSettingsUpdate,
+  contextLengthSettingsBadge,
+  contextLengthSettingsDescription,
+  contextLengthSettingsFieldLabel,
+  contextLengthSettingsPlaceholder,
+  contextLengthSettingsRuntimeHint,
+  contextLengthSettingsTitle,
   resolveContextLengthSettingsTarget,
 } from '@/lib/model-context-settings'
 
@@ -1576,9 +1583,13 @@ type FormMessage = { type: 'success' | 'error'; text: string } | null
 
 function InferenceSettingsForm({
   agent,
+  settings,
+  activeModelInfo,
   onUpdated,
 }: {
   agent: api.AgentSettings | undefined
+  settings: api.Settings | null
+  activeModelInfo: api.ModelInfo | null
   onUpdated: (settings: api.Settings) => void
 }) {
   const { t } = useI18n()
@@ -1590,6 +1601,10 @@ function InferenceSettingsForm({
   const [presetNameDraft, setPresetNameDraft] = React.useState('')
   const [submitting, setSubmitting] = React.useState(false)
   const [message, setMessage] = React.useState<FormMessage>(null)
+  const tokenControls = React.useMemo(
+    () => resolveInferenceTokenControls(params, settings, activeModelInfo),
+    [activeModelInfo, params, settings]
+  )
 
   React.useEffect(() => {
     setParams(resolveEffectiveInferenceParams(undefined, agent))
@@ -1613,6 +1628,7 @@ function InferenceSettingsForm({
     system_prompt: params.systemPrompt,
     temperature: params.temperature,
     max_tokens: params.maxTokens,
+    reserve_output_tokens: params.reserveOutputTokens,
     top_p: params.topP,
     min_p: params.minP,
     top_k: params.topK,
@@ -1652,6 +1668,7 @@ function InferenceSettingsForm({
         system_prompt: params.systemPrompt,
         temperature: params.temperature,
         max_tokens: params.maxTokens,
+        reserve_output_tokens: params.reserveOutputTokens,
         top_p: params.topP,
         min_p: params.minP,
         top_k: params.topK,
@@ -1788,6 +1805,7 @@ function InferenceSettingsForm({
         <InferenceControls
           value={params}
           onChange={setParam}
+          tokenControls={tokenControls}
           supportsReasoningEffort
           reasoningEffortOptions={['none', 'minimal', 'low', 'medium', 'high', 'xhigh']}
         />
@@ -2440,8 +2458,8 @@ function ModelConnectionForm({
     [activeModelInfo]
   )
   const contextLengthTarget = React.useMemo(
-    () => resolveContextLengthSettingsTarget(settings),
-    [settings]
+    () => resolveContextLengthSettingsTarget(settings, activeModelInfo),
+    [activeModelInfo, settings]
   )
   const [baseUrl, setBaseUrl] = React.useState(configuredBaseUrl(initialProvider, modelConfig))
   const [model, setModel] = React.useState(configuredModelName(initialProvider, configuredModel, modelConfig))
@@ -3178,7 +3196,10 @@ function ModelConnectionForm({
       if (!Number.isInteger(parsed) || parsed <= 0) {
         setContextSettingsMessage({
           type: 'error',
-          text: 'vLLM max model length must be a positive integer or left blank for auto.',
+          text:
+            contextLengthTarget.kind === 'ollama'
+              ? 'Ollama num_ctx must be a positive integer or left blank for server default.'
+              : 'vLLM max model length must be a positive integer or left blank for auto.',
         })
         return
       }
@@ -3197,9 +3218,14 @@ function ModelConnectionForm({
       setSettings(nextSettings)
       setContextSettingsMessage({
         type: 'success',
-        text: contextLengthTarget.kind === 'gguf'
-          ? 'Saved GGUF context window.'
-          : 'Saved vLLM max model length.',
+        text:
+          contextLengthTarget.kind === 'gguf'
+            ? 'Saved GGUF context window.'
+            : contextLengthTarget.kind === 'ollama'
+              ? (parsedValue === null
+                ? 'Cleared Ollama context override. The server default will be used.'
+                : 'Saved Ollama context window override.')
+              : 'Saved vLLM max model length.',
       })
     } catch (updateError) {
       setContextSettingsMessage({
@@ -3945,31 +3971,35 @@ function ModelConnectionForm({
             <div className="flex items-start justify-between gap-3">
               <div>
                 <p className="text-xs font-semibold text-foreground">
-                  {contextLengthTarget.kind === 'gguf' ? 'GGUF Context Window' : 'vLLM Max Model Length'}
+                  {contextLengthSettingsTitle(contextLengthTarget.kind)}
                 </p>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  {contextLengthTarget.kind === 'gguf'
-                    ? 'Adjusts `gguf.n_ctx` for the active GGUF model.'
-                    : 'Sets the managed vLLM startup override for `vllm.max_model_len`. Leave blank to use vLLM auto sizing.'}
+                  {contextLengthSettingsDescription(contextLengthTarget)}
                 </p>
               </div>
               <Badge variant="neutral">
-                {contextLengthTarget.kind === 'gguf' ? 'gguf.n_ctx' : 'vllm.max_model_len'}
+                {contextLengthSettingsBadge(contextLengthTarget.kind)}
               </Badge>
             </div>
 
             <label className="block space-y-1.5">
               <span className="text-xs font-medium text-muted-foreground">
-                {contextLengthTarget.kind === 'gguf' ? 'Context length' : 'Max model length'}
+                {contextLengthSettingsFieldLabel(contextLengthTarget.kind)}
               </span>
               <Input
                 value={contextLengthInput}
                 onChange={(event) => setContextLengthInput(event.target.value)}
                 inputMode="numeric"
-                placeholder={contextLengthTarget.kind === 'gguf' ? '4096' : 'auto'}
+                placeholder={contextLengthSettingsPlaceholder(contextLengthTarget)}
                 className="font-mono text-xs"
               />
             </label>
+
+            {contextLengthSettingsRuntimeHint(contextLengthTarget) ? (
+              <p className="rounded-md border border-border bg-surface-layer px-3 py-2 text-xs text-muted-foreground">
+                {contextLengthSettingsRuntimeHint(contextLengthTarget)}
+              </p>
+            ) : null}
 
             <div className="flex flex-wrap justify-end gap-2">
               <Button
@@ -6608,6 +6638,8 @@ export default function SettingsPage() {
             <TabsContent value="inference" className="mt-0">
               <InferenceSettingsForm
                 agent={agentSection}
+                settings={settings}
+                activeModelInfo={activeConfiguredModel(settings, models)}
                 onUpdated={(updatedSettings) => setSettings(updatedSettings)}
               />
             </TabsContent>

@@ -192,7 +192,7 @@ function StepDiagnostics({
           <div className="grid gap-2 sm:grid-cols-2">
             {formatBooleanFlag(transport.summaryApplied) ? (
               <div className="rounded-xl border border-border/70 bg-black/10 px-2.5 py-2">
-                <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Summarized</p>
+                <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Context-safe preview</p>
                 <p className="mt-1 text-xs text-foreground/90">
                   {formatBooleanFlag(transport.summaryApplied)}
                 </p>
@@ -200,7 +200,7 @@ function StepDiagnostics({
             ) : null}
             {formatBooleanFlag(transport.overflowPersisted) ? (
               <div className="rounded-xl border border-border/70 bg-black/10 px-2.5 py-2">
-                <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Overflow persisted</p>
+                <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Full result saved</p>
                 <p className="mt-1 text-xs text-foreground/90">
                   {formatBooleanFlag(transport.overflowPersisted)}
                 </p>

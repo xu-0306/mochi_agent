@@ -26,6 +26,7 @@ from mochi.config.schema import (
     LocaleDefaultsConfig,
     MemoryConfig,
     MochiConfig,
+    OllamaConfig,
     RegisteredTTSVoiceConfig,
     SecurityConfig,
     TelegramPlatformConfig,
@@ -209,6 +210,7 @@ class AgentSettingsPatch(BaseModel):
     system_prompt: str | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=131072)
+    reserve_output_tokens: int | None = Field(default=None, ge=0, le=131072)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     min_p: float | None = Field(default=None, ge=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=0)
@@ -276,6 +278,12 @@ class GGUFSettingsPatch(BaseModel):
     n_ctx: int | None = Field(default=None, ge=1, le=262_144)
 
 
+class OllamaSettingsPatch(BaseModel):
+    """Ollama runtime settings patch."""
+
+    num_ctx: int | None = Field(default=None, ge=1, le=1_048_576)
+
+
 class VLLMSettingsPatch(BaseModel):
     """vLLM runtime settings patch."""
 
@@ -339,6 +347,7 @@ class UpdateSettingsRequest(BaseModel):
     security: SecuritySettingsPatch | None = None
     tools: ToolsSettingsPatch | None = None
     local_models: LocalModelSettingsPatch | None = None
+    ollama: OllamaSettingsPatch | None = None
     gguf: GGUFSettingsPatch | None = None
     vllm: VLLMSettingsPatch | None = None
     download_missing_models: bool = False
@@ -514,6 +523,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "system_prompt": config.agent.system_prompt,
             "temperature": config.agent.temperature,
             "max_tokens": config.agent.max_tokens,
+            "reserve_output_tokens": config.agent.reserve_output_tokens,
             "top_p": config.agent.top_p,
             "min_p": config.agent.min_p,
             "top_k": config.agent.top_k,
@@ -614,6 +624,9 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "idle_unload_enabled": config.local_models.idle_unload_enabled,
             "idle_unload_seconds": config.local_models.idle_unload_seconds,
         },
+        "ollama": {
+            "num_ctx": config.ollama.num_ctx,
+        },
         "gguf": {
             "n_ctx": config.gguf.n_ctx,
         },
@@ -709,6 +722,14 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
             {
                 **config.learning.model_dump(),
                 **payload.learning.model_dump(exclude_unset=True),
+            }
+        )
+
+    if payload.ollama is not None:
+        updates["ollama"] = OllamaConfig.model_validate(
+            {
+                **config.ollama.model_dump(),
+                **payload.ollama.model_dump(exclude_unset=True),
             }
         )
 

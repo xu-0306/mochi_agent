@@ -32,6 +32,8 @@ from mochi.tools.web_search_providers import normalize_web_search_provider
 # ---------------------------------------------------------------------------
 
 T = TypeVar("T")
+_LEGACY_AUTO_MAX_TOKENS = 4096
+_LEGACY_AUTO_RESERVE_OUTPUT_TOKENS = 1024
 
 
 def _empty_list_typed(item_type: type[T]) -> list[T]:
@@ -47,6 +49,9 @@ class OllamaConfig(BaseModel):
 
     timeout: float = 120.0
     """HTTP 請求逾時秒數。"""
+
+    num_ctx: int | None = Field(default=None, ge=1, le=1_048_576)
+    """Optional Ollama runtime `num_ctx` override. `None` keeps the server default."""
 
 
 class GGUFConfig(BaseModel):
@@ -651,8 +656,11 @@ class InferencePreset(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     """採樣溫度（0.0–2.0）。"""
 
-    max_tokens: int = Field(default=4096, ge=1, le=131072)
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
     """最大輸出 token 數。"""
+
+    reserve_output_tokens: int | None = Field(default=None, ge=0, le=131072)
+    """本地 context 壓縮時預留的輸出 token 預算。"""
 
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     """Top-p 取樣機率。"""
@@ -672,7 +680,6 @@ class InferencePreset(BaseModel):
     repeat_penalty: float = Field(default=1.0, ge=0.0, le=2.0)
     reasoning_effort: ReasoningEffort | None = None
     """Repeat penalty。"""
-
 
 class CommandRuleConfig(BaseModel):
     """Persisted exec command rule."""
@@ -934,8 +941,11 @@ class AgentConfig(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     """採樣溫度（0.0–2.0）。"""
 
-    max_tokens: int = Field(default=4096, ge=1, le=131072)
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
     """最大輸出 token 數。"""
+
+    reserve_output_tokens: int | None = Field(default=None, ge=0, le=131072)
+    """本地 context 壓縮時預留的輸出 token 預算。"""
 
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     """Top-p 取樣機率。"""
@@ -964,6 +974,45 @@ class AgentConfig(BaseModel):
 
     active_preset: str = "default"
     """目前啟用的 preset 名稱。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_default_token_pair(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+
+        max_tokens = value.get("max_tokens")
+        reserve_output_tokens = value.get("reserve_output_tokens")
+        if max_tokens != _LEGACY_AUTO_MAX_TOKENS or reserve_output_tokens not in {
+            None,
+            _LEGACY_AUTO_RESERVE_OUTPUT_TOKENS,
+        }:
+            return value
+
+        migrated = dict(value)
+        migrated["max_tokens"] = None
+        migrated["reserve_output_tokens"] = None
+        raw_presets = migrated.get("presets")
+        if isinstance(raw_presets, list):
+            next_presets: list[Any] = []
+            for preset in raw_presets:
+                if (
+                    isinstance(preset, dict)
+                    and preset.get("name") in {None, "default"}
+                    and preset.get("max_tokens") == _LEGACY_AUTO_MAX_TOKENS
+                    and preset.get("reserve_output_tokens") in {
+                        None,
+                        _LEGACY_AUTO_RESERVE_OUTPUT_TOKENS,
+                    }
+                ):
+                    normalized_preset = dict(preset)
+                    normalized_preset["max_tokens"] = None
+                    normalized_preset["reserve_output_tokens"] = None
+                    next_presets.append(normalized_preset)
+                else:
+                    next_presets.append(preset)
+            migrated["presets"] = next_presets
+        return migrated
 
 
 # ---------------------------------------------------------------------------

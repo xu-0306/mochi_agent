@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from mochi.agents.compaction import ConversationCompactor
 from mochi.agents.context import ContextManager
 from mochi.backends.types import Message
 from mochi.memory.conversation import ConversationMemory
@@ -99,3 +100,42 @@ def test_prepare_prompt_context_tolerates_memory_error() -> None:
     context = asyncio.run(manager.prepare_prompt_context("query"))
     assert [m.content for m in context.history] == ["x"]
     assert context.memory_context is None
+
+
+def test_preview_prompt_context_simulates_compaction_without_mutating_session() -> None:
+    manager = ContextManager(
+        conversation_memory=ConversationMemory(max_messages=20),
+        compactor=ConversationCompactor.from_settings(
+            max_messages=20,
+            max_input_tokens=24,
+            keep_recent_messages=4,
+        ),
+        history_window=20,
+        max_short_term_tokens=24,
+    )
+    for index in range(8):
+        manager.add_message(Message(role="user", content=f"user turn {index}"))
+
+    preview = asyncio.run(
+        manager.preview_prompt_context(
+            "next question",
+            reserve_output_tokens=1024,
+        )
+    )
+
+    assert preview.summary is not None
+    assert preview.compaction_diagnostics is not None
+    assert preview.compaction_diagnostics.reason == "token_budget"
+    assert len(preview.history) <= 4
+    assert manager.summary is None
+    assert len(manager.get_recent_history()) == 8
+
+    runtime = asyncio.run(
+        manager.prepare_prompt_context(
+            "next question",
+            reserve_output_tokens=1024,
+        )
+    )
+    assert runtime.summary == preview.summary
+    assert runtime.compaction_diagnostics is not None
+    assert runtime.compaction_diagnostics.reason == "token_budget"

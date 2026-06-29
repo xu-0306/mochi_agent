@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from mochi.agents.compaction import (
     CompactionDiagnostics,
+    CompactionResult,
     ContextBudget,
     ConversationCompactor,
     ConversationStateSummary,
@@ -93,14 +94,7 @@ class ContextManager:
         memory_top_k: int | None = None,
         reserve_output_tokens: int | None = None,
     ) -> PromptContext:
-        self._compact_history_if_needed(
-            budget=ContextBudget(
-                max_input_tokens=self._max_short_term_tokens,
-                reserve_output_tokens=(
-                    self._reserve_output_tokens if reserve_output_tokens is None else reserve_output_tokens
-                ),
-            )
-        )
+        self._compact_history_if_needed(budget=self._build_context_budget(reserve_output_tokens))
         history = self.get_recent_history(history_limit)
         memory_context = await self._retrieve_memory_context(
             query=user_message,
@@ -120,34 +114,63 @@ class ContextManager:
         *,
         history_limit: int | None = None,
         memory_top_k: int | None = None,
+        reserve_output_tokens: int | None = None,
     ) -> PromptContext:
-        history = self.get_recent_history(history_limit)
+        preview_result = self._simulate_compaction(
+            budget=self._build_context_budget(reserve_output_tokens)
+        )
+        if preview_result is None:
+            history = self.get_recent_history(history_limit)
+            summary = self._summary
+            summary_state = self._summary_state
+            diagnostics = self._compaction_diagnostics
+        else:
+            history = list(preview_result.retained_history)
+            if history_limit is not None:
+                history = history[-history_limit:]
+            summary = preview_result.summary
+            summary_state = preview_result.summary_state
+            diagnostics = preview_result.diagnostics
         memory_context = await self._retrieve_memory_context(
             query=user_message,
             top_k=memory_top_k or self._memory_top_k,
         )
         return PromptContext(
             history=history,
-            summary=self._summary,
+            summary=summary,
             memory_context=memory_context,
-            summary_state=self._summary_state,
-            compaction_diagnostics=self._compaction_diagnostics,
+            summary_state=summary_state,
+            compaction_diagnostics=diagnostics,
         )
 
     def _compact_history_if_needed(self, *, budget: ContextBudget | None = None) -> None:
-        if self._compactor is None:
+        result = self._simulate_compaction(budget=budget)
+        if result is None:
             return
 
+        self._apply_compaction_result(result)
+
+    def _build_context_budget(self, reserve_output_tokens: int | None) -> ContextBudget:
+        return ContextBudget(
+            max_input_tokens=self._max_short_term_tokens,
+            reserve_output_tokens=(
+                self._reserve_output_tokens if reserve_output_tokens is None else reserve_output_tokens
+            ),
+        )
+
+    def _simulate_compaction(self, *, budget: ContextBudget | None = None) -> CompactionResult | None:
+        if self._compactor is None:
+            return None
+
         history = self._conversation.get_history()
-        result = self._compactor.compact(
+        return self._compactor.compact(
             history,
             previous_summary=self._summary,
             previous_state=self._summary_state,
             budget=budget,
         )
-        if result is None:
-            return
 
+    def _apply_compaction_result(self, result: CompactionResult) -> None:
         self._summary = result.summary
         self._summary_state = result.summary_state
         self._compaction_diagnostics = result.diagnostics

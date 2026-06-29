@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -18,7 +19,10 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.simulated_tool_protocol import SimulatedToolProtocol
-from mochi.backends.tool_call_contract import validate_tool_turn_result
+from mochi.backends.tool_call_contract import (
+    build_invalid_tool_turn_metadata,
+    validate_tool_turn_result,
+)
 from mochi.backends.tool_call_simulator import ToolCallSimulator
 from mochi.backends.tool_call_state import ToolCallingState
 from mochi.backends.types import (
@@ -31,24 +35,76 @@ from mochi.backends.types import (
 )
 from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 
+_IN_PROGRESS_MARKERS = (
+    "searching",
+    "looking up",
+    "checking",
+    "querying",
+    "fetching",
+    "please wait",
+    "one moment",
+    "\u67e5\u8a62\u4e2d",
+    "\u67e5\u8be2\u4e2d",
+    "\u641c\u5c0b\u4e2d",
+    "\u641c\u7d22\u4e2d",
+    "\u6aa2\u7d22\u4e2d",
+    "\u68c0\u7d22\u4e2d",
+    "\u6b63\u5728\u67e5\u8a62",
+    "\u6b63\u5728\u67e5\u8be2",
+    "\u6b63\u5728\u641c\u5c0b",
+    "\u6b63\u5728\u641c\u7d22",
+    "\u7a0d\u7b49",
+    "\u8acb\u7a0d\u5019",
+    "\u8bf7\u7a0d\u5019",
+)
+_TOOL_USAGE_PHRASES = (
+    "let me check",
+    "i'll check",
+    "i will check",
+    "i need to use",
+    "i should use",
+    "call the tool",
+    "using the tool",
+    "\u6211\u4f86\u5e6b\u60a8\u67e5\u8a62",
+    "\u6211\u6765\u5e2e\u60a8\u67e5\u8be2",
+    "\u6211\u4f86\u67e5\u8a62",
+    "\u6211\u6765\u67e5\u8be2",
+    "\u6211\u6703\u4f7f\u7528",
+    "\u6211\u4f1a\u4f7f\u7528",
+    "\u6211\u9700\u8981\u4f7f\u7528",
+)
+_PLACEHOLDER_SUFFIXES = (":", "\uff1a", "...", "\u2026")
+
 
 class OllamaBackend(BaseLLMBackend):
     """Backend for Ollama's `/api/chat` endpoint."""
+
+    _CONTEXT_LENGTH_FALLBACK = 4096
 
     def __init__(
         self,
         model: str,
         base_url: str = "http://localhost:11434",
         timeout: float = 120.0,
+        num_ctx: int | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self._configured_num_ctx = self._normalize_context_length(num_ctx)
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
         self._tool_call_simulator = ToolCallSimulator()
         self._simulated_tool_protocol = SimulatedToolProtocol(self._tool_call_simulator)
         self._tool_state = ToolCallingState()
+        self._tool_state.recover_native("native_default")
         self._native_tool_probe: dict[str, Any] | None = None
         self._fallback_diagnostics: list[dict[str, Any]] = []
+        self._context_length: int | None = None
+        self._context_length_source = "unknown"
+        self._runtime_context_length: int | None = None
+        self._runtime_context_length_source = "unknown"
+        self._model_max_context_length: int | None = None
+        self._model_max_context_length_source = "unknown"
+        self._apply_configured_num_ctx()
 
     def supports_tool_calling(self) -> bool:
         return self._tool_state.supports_tool_calling()
@@ -56,19 +112,38 @@ class OllamaBackend(BaseLLMBackend):
     def _tool_call_mode(self) -> str:
         return self._tool_state.active_mode
 
+    def _tool_calling_protocol(self) -> str:
+        if self._tool_state.active_mode == "native":
+            return "native"
+        if self._tool_state.active_mode == "unavailable":
+            return "unavailable"
+        return "prompt_guided"
+
     def get_model_info(self) -> ModelInfo:
         supports_reasoning_effort = self._supports_reasoning_effort_model(self.model)
         probe = self._native_tool_probe if isinstance(self._native_tool_probe, dict) else {}
+        context_length = self._context_length
         return ModelInfo(
             name=self.model,
             backend_type="ollama",
             provider="ollama",
-            context_length=4096,
+            context_length=context_length,
             supports_tool_calling=self.supports_tool_calling(),
             metadata={
                 "supports_reasoning_effort": supports_reasoning_effort,
                 "reasoning_effort_param": "think" if supports_reasoning_effort else None,
+                "context_length_source": self._context_length_source,
+                "context_length_fallback": (
+                    None if context_length is not None else self._CONTEXT_LENGTH_FALLBACK
+                ),
+                "configured_num_ctx": self._configured_num_ctx,
+                "runtime_context_length": self._runtime_context_length,
+                "runtime_context_length_source": self._runtime_context_length_source,
+                "model_max_context_length": self._model_max_context_length,
+                "model_max_context_length_source": self._model_max_context_length_source,
                 "tool_call_mode": self._tool_call_mode(),
+                "tool_calling_protocol": self._tool_calling_protocol(),
+                "tool_calling_style": self._tool_calling_protocol(),
                 "native_tool_calling_status": probe.get("status", self._tool_state.native_status),
                 "native_tool_calling_message": probe.get("message"),
                 "native_tool_calling_checked_at": probe.get("checked_at"),
@@ -84,6 +159,30 @@ class OllamaBackend(BaseLLMBackend):
         except Exception as exc:
             logger.debug(f"Ollama health check failed: {exc}")
             return False
+
+    async def prime_model_info(self) -> None:
+        try:
+            resp = await self._client.post("/api/show", json={"model": self.model})
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.debug("Ollama model-info prime failed for '{}': {}", self.model, exc)
+            return
+        except Exception as exc:
+            logger.debug("Ollama model-info prime failed for '{}': {}", self.model, exc)
+            return
+
+        data = resp.json()
+        if not isinstance(data, dict):
+            return
+
+        metadata = self._extract_context_metadata_from_show_payload(data)
+        self._runtime_context_length = metadata["runtime_context_length"]
+        self._runtime_context_length_source = metadata["runtime_context_length_source"]
+        self._model_max_context_length = metadata["model_max_context_length"]
+        self._model_max_context_length_source = metadata["model_max_context_length_source"]
+        self._context_length = metadata["context_length"]
+        self._context_length_source = metadata["context_length_source"]
+        self._apply_configured_num_ctx()
 
     async def generate(
         self,
@@ -109,9 +208,12 @@ class OllamaBackend(BaseLLMBackend):
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
         }
+        if self._configured_num_ctx is not None:
+            options["num_ctx"] = self._configured_num_ctx
         think_value = self._reasoning_effort_to_think_value(reasoning_effort)
         tools_requested = bool(tools)
-        use_native_tools = tools_requested and self._tool_state.active_mode == "native"
+        post_tool_continuation = self._is_post_tool_continuation(messages)
+        use_native_tools = self._tool_state.active_mode == "native"
         prepared_messages = self._prepare_messages(
             messages,
             tools,
@@ -136,7 +238,7 @@ class OllamaBackend(BaseLLMBackend):
             )
         except BackendRequestError:
             if tools_requested and self._tool_state.active_mode == "simulated_fallback" and not use_native_tools:
-                self._mark_simulated_protocol_unavailable(
+                self._record_simulated_protocol_rejection(
                     status="simulated_protocol_error",
                     reason="Prompt-simulated tool retry failed before returning a valid turn.",
                 )
@@ -146,47 +248,34 @@ class OllamaBackend(BaseLLMBackend):
             return result
 
         if use_native_tools:
-            verdict = validate_tool_turn_result(result=result, tools_requested=True)
-            if verdict.reason != "thinking_only":
+            retry_trigger = self._native_tool_retry_trigger(
+                result=result,
+                tools=tools,
+            )
+            if retry_trigger is None:
+                return result
+            if post_tool_continuation:
                 return result
 
-            self._switch_to_simulated_tool_mode(
-                reason="Ollama returned thinking without structured tool calls; retrying with prompt-simulated tool mode.",
-                metadata={
-                    "trigger": "thinking_without_native_tool_calls",
-                    "tool_count": len(tools or []),
-                },
+            self._record_native_tool_turn_rejection(
+                status=str(retry_trigger["metadata"].get("trigger") or "native_tool_turn_invalid"),
+                reason=str(retry_trigger["reason"]),
+                result=result,
+                metadata=retry_trigger["metadata"],
             )
-            retry_messages = self._prepare_messages(
-                messages,
-                tools,
-                use_native_tools=False,
-            )
-            retry_payload = self._build_request_payload(
-                messages=retry_messages,
-                tools=None,
-                options=options,
-                stream=False,
-                think_value=think_value,
-            )
-            try:
-                retry_result = await self._blocking_generate(
-                    retry_payload,
-                    tools=tools,
-                    use_native_tools=False,
-                )
-            except BackendRequestError:
-                self._mark_simulated_protocol_unavailable(
-                    status="simulated_protocol_error",
-                    reason="Prompt-simulated tool retry failed before returning a valid turn.",
-                )
-                raise
-            return self._finalize_simulated_tool_result(retry_result)
 
-        if self._tool_state.active_mode == "simulated_fallback":
-            return self._finalize_simulated_tool_result(result)
+        if not use_native_tools:
+            return self._finalize_simulated_tool_result(
+                result,
+                allow_incomplete_final=post_tool_continuation,
+            )
 
         return result
+
+    def _ensure_prompt_guided_tool_mode(self) -> None:
+        if self._tool_state.active_mode == "unavailable":
+            return
+        self._tool_state.enter_simulated("prompt_guided_default")
 
     async def _blocking_generate(
         self,
@@ -223,7 +312,7 @@ class OllamaBackend(BaseLLMBackend):
             self._record_native_tool_probe(
                 status="supported",
                 message="Ollama returned structured native tool calls.",
-                activate_native=True,
+                activate_native=None,
             )
         return result
 
@@ -265,10 +354,15 @@ class OllamaBackend(BaseLLMBackend):
                 )
             )
 
-        if not tool_calls and tools and not use_native_tools and content:
+        if (
+            not tool_calls
+            and tools
+            and content
+            and (not use_native_tools or "<tool_call" in content.lower())
+        ):
             content, tool_calls = self._simulated_tool_protocol.parse_assistant_content(content)
 
-        if not tool_calls and not content.strip() and not thinking.strip():
+        if not tool_calls and not content.strip() and not thinking.strip() and not tools:
             logger.warning("Ollama returned an empty non-tool response.")
             raise BackendRequestError(
                 "Ollama returned an empty response with no content or tool calls.",
@@ -324,25 +418,239 @@ class OllamaBackend(BaseLLMBackend):
             payload["tools"] = self._serialize_tools(tools)
         return payload
 
-    def _finalize_simulated_tool_result(self, result: GenerationResult) -> GenerationResult:
+    def _finalize_simulated_tool_result(
+        self,
+        result: GenerationResult,
+        *,
+        allow_incomplete_final: bool = False,
+    ) -> GenerationResult:
         verdict = validate_tool_turn_result(result=result, tools_requested=True)
         if verdict.is_valid:
             self._tool_state.validate_simulated()
             return result
+        if allow_incomplete_final and verdict.reason == "thinking_only":
+            return result
 
-        self._mark_simulated_protocol_unavailable(
+        error_metadata = build_invalid_tool_turn_metadata(result=result, reason=verdict.reason)
+        self._record_simulated_protocol_rejection(
             status="simulated_protocol_rejected",
             reason="Ollama returned an invalid tool-eligible turn from prompt-simulated tool calling.",
-            metadata={"tool_turn_reason": verdict.reason},
+            metadata=error_metadata,
         )
         raise BackendRequestError(
             "Ollama returned an invalid tool-eligible turn.",
             metadata={
                 "backend_name": "ollama",
-                "tool_turn_reason": verdict.reason,
                 "model": self.model,
+                **error_metadata,
             },
         )
+
+    @staticmethod
+    def _is_post_tool_continuation(messages: list[Message]) -> bool:
+        seen_tool = False
+        for message in reversed(messages):
+            if message.role == "tool":
+                seen_tool = True
+                continue
+            if not seen_tool:
+                if message.role == "assistant" and not message.tool_calls:
+                    return False
+                continue
+            if message.role == "assistant":
+                return bool(message.tool_calls)
+            if message.role == "user":
+                return True
+        return seen_tool
+
+    def _native_tool_retry_trigger(
+        self,
+        *,
+        result: GenerationResult,
+        tools: list[ToolSchema] | None,
+    ) -> dict[str, Any] | None:
+        verdict = validate_tool_turn_result(result=result, tools_requested=True)
+        if verdict.reason in {"thinking_only", "empty"}:
+            trigger = (
+                "empty_native_tool_turn"
+                if verdict.reason == "empty"
+                else "thinking_without_native_tool_calls"
+            )
+            return {
+                "reason": (
+                    "Ollama returned no structured tool calls; retrying with "
+                    "prompt-simulated tool mode."
+                ),
+                "metadata": {
+                    "trigger": trigger,
+                    "tool_count": len(tools or []),
+                },
+            }
+        if verdict.reason == "content" and self._looks_like_incomplete_tool_intent(
+            content=result.content,
+            tools=tools,
+        ):
+            return {
+                "reason": (
+                    "Ollama returned placeholder tool-intent text without structured tool "
+                    "calls; retrying with prompt-simulated tool mode."
+                ),
+                "metadata": {
+                    "trigger": "contentful_tool_intent_without_native_tool_calls",
+                    "tool_count": len(tools or []),
+                    "content_preview": self._truncate_preview(result.content),
+                },
+            }
+        return None
+
+    def _looks_like_incomplete_tool_intent(
+        self,
+        *,
+        content: str,
+        tools: list[ToolSchema] | None,
+    ) -> bool:
+        stripped = content.strip()
+        if not stripped:
+            return False
+
+        lowered = stripped.lower()
+        if any(marker in lowered for marker in _IN_PROGRESS_MARKERS[:6]):
+            return True
+        if any(marker in stripped for marker in _IN_PROGRESS_MARKERS[6:]):
+            return True
+
+        tool_name_mentions = any(
+            isinstance(tool.name, str) and tool.name and tool.name.lower() in lowered
+            for tool in tools or []
+        )
+        uses_tool_word = " tool" in lowered or "tools" in lowered or "\u5de5\u5177" in stripped
+        usage_phrase = any(phrase in lowered for phrase in _TOOL_USAGE_PHRASES[:7]) or any(
+            phrase in stripped for phrase in _TOOL_USAGE_PHRASES[7:]
+        )
+        ends_like_placeholder = stripped.endswith(_PLACEHOLDER_SUFFIXES)
+        fenced_placeholder = "```" in stripped and ends_like_placeholder
+
+        if tool_name_mentions:
+            return True
+        if uses_tool_word and (usage_phrase or ends_like_placeholder):
+            return True
+        if usage_phrase and (ends_like_placeholder or fenced_placeholder):
+            return True
+        return False
+
+    def _extract_context_metadata_from_show_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, int | str | None]:
+        runtime_context_length, runtime_context_length_source = self._extract_runtime_context_length(
+            payload
+        )
+        model_max_context_length, model_max_context_length_source = self._extract_model_max_context_length(
+            payload
+        )
+
+        effective_context_length = runtime_context_length
+        effective_context_length_source = runtime_context_length_source
+        if effective_context_length is None:
+            effective_context_length = model_max_context_length
+            effective_context_length_source = model_max_context_length_source
+
+        return {
+            "context_length": effective_context_length,
+            "context_length_source": effective_context_length_source,
+            "runtime_context_length": runtime_context_length,
+            "runtime_context_length_source": runtime_context_length_source,
+            "model_max_context_length": model_max_context_length,
+            "model_max_context_length_source": model_max_context_length_source,
+        }
+
+    def _apply_configured_num_ctx(self) -> None:
+        if self._configured_num_ctx is None:
+            return
+        self._runtime_context_length = self._configured_num_ctx
+        self._runtime_context_length_source = "config.num_ctx"
+        self._context_length = self._configured_num_ctx
+        self._context_length_source = "config.num_ctx"
+
+    def _extract_runtime_context_length(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[int | None, str]:
+        for key in ("num_ctx",):
+            candidate = self._normalize_context_length(payload.get(key))
+            if candidate is not None:
+                return candidate, f"api_show.{key}"
+
+        details = payload.get("details")
+        if isinstance(details, dict):
+            candidate = self._normalize_context_length(details.get("num_ctx"))
+            if candidate is not None:
+                return candidate, "api_show.details.num_ctx"
+
+        for field_name in ("parameters", "modelfile"):
+            text = payload.get(field_name)
+            if not isinstance(text, str):
+                continue
+            parsed = self._extract_context_length_from_text(text)
+            if parsed is not None:
+                return parsed, f"api_show.{field_name}:num_ctx"
+
+        model_info = payload.get("model_info")
+        if isinstance(model_info, dict):
+            for key, value in model_info.items():
+                candidate = self._normalize_context_length(value)
+                if candidate is None:
+                    continue
+                lowered = key.strip().lower()
+                if lowered.endswith(".num_ctx") or lowered == "num_ctx":
+                    return candidate, f"api_show.model_info.{key}"
+
+        return None, "unknown"
+
+    def _extract_model_max_context_length(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[int | None, str]:
+        for key in ("context_length", "context_window"):
+            candidate = self._normalize_context_length(payload.get(key))
+            if candidate is not None:
+                return candidate, f"api_show.{key}"
+
+        details = payload.get("details")
+        if isinstance(details, dict):
+            for key in ("context_length", "context_window"):
+                candidate = self._normalize_context_length(details.get(key))
+                if candidate is not None:
+                    return candidate, f"api_show.details.{key}"
+
+        model_info = payload.get("model_info")
+        if isinstance(model_info, dict):
+            for key, value in model_info.items():
+                candidate = self._normalize_context_length(value)
+                if candidate is None:
+                    continue
+                if key in {"context_length", "context_window"}:
+                    return candidate, f"api_show.model_info.{key}"
+                lowered = key.strip().lower()
+                if lowered.endswith((".context_length", ".context_window")):
+                    return candidate, f"api_show.model_info.{key}"
+
+        return None, "unknown"
+
+    @staticmethod
+    def _extract_context_length_from_text(text: str) -> int | None:
+        match = re.search(r"(?im)^\s*(?:parameter\s+)?num_ctx\s+(\d+)\s*$", text)
+        if match is None:
+            return None
+        return OllamaBackend._normalize_context_length(match.group(1))
+
+    @staticmethod
+    def _normalize_context_length(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
 
     def _record_native_tool_probe(
         self,
@@ -431,6 +739,73 @@ class OllamaBackend(BaseLLMBackend):
                 metadata={"model": self.model, **(metadata or {})},
             )
 
+    def _record_simulated_protocol_rejection(
+        self,
+        *,
+        status: str,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        previous_mode = self._tool_state.active_mode
+        changed = self._tool_state.enter_simulated(status)
+        self._native_tool_probe = {
+            "status": status,
+            "message": reason,
+            "checked_at": self._build_probe_timestamp(),
+            **(metadata or {}),
+        }
+        append_fallback_diagnostic(
+            self._fallback_diagnostics,
+            category="tool_calling",
+            name="prompt_guided_tool_turn_rejected",
+            reason=status,
+            kind="fallback",
+            severity="warning",
+            from_state=previous_mode,
+            to_state=self._tool_state.active_mode,
+            metadata={"model": self.model, **(metadata or {})},
+        )
+
+    def _record_native_tool_turn_rejection(
+        self,
+        *,
+        status: str,
+        reason: str,
+        result: GenerationResult,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        error_metadata = build_invalid_tool_turn_metadata(
+            result=result,
+            reason=validate_tool_turn_result(result=result, tools_requested=True).reason,
+        )
+        self._native_tool_probe = {
+            "status": status,
+            "message": reason,
+            "checked_at": self._build_probe_timestamp(),
+            **(metadata or {}),
+            **error_metadata,
+        }
+        append_fallback_diagnostic(
+            self._fallback_diagnostics,
+            category="tool_calling",
+            name="native_tool_turn_rejected",
+            reason=status,
+            kind="native",
+            severity="warning",
+            from_state=self._tool_state.active_mode,
+            to_state=self._tool_state.active_mode,
+            metadata={"model": self.model, **(metadata or {}), **error_metadata},
+        )
+        raise BackendRequestError(
+            "Ollama returned an invalid native tool-eligible turn.",
+            metadata={
+                "backend_name": "ollama",
+                "model": self.model,
+                **(metadata or {}),
+                **error_metadata,
+            },
+        )
+
     async def probe_tool_calling(self) -> dict[str, Any] | None:
         probe_tool = ToolSchema(
             name="mochi_tool_probe",
@@ -472,7 +847,7 @@ class OllamaBackend(BaseLLMBackend):
         if verdict.reason == "tool_calls":
             return self._record_native_tool_probe(
                 status="supported",
-                message="Native structured tool calling succeeded.",
+                message="Native structured tool calling succeeded; using native Ollama tools.",
                 activate_native=True,
                 extra={"tool_calls": len(result.tool_calls)},
             )

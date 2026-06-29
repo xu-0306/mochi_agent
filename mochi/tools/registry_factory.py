@@ -44,6 +44,7 @@ from mochi.tools.process_service import ProcessService
 from mochi.tools.read_session import ReadSessionTool
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.tool_search import ToolSearchTool
+from mochi.tools.tool_result_read import ToolResultReadTool
 from mochi.tools.web_crawl import WebCrawlTool
 from mochi.tools.web_fetch import WebFetchTool
 from mochi.tools.web_search import WebSearchTool
@@ -166,6 +167,7 @@ class ToolRegistryFactory:
             BuiltInToolSpec("kill_session", "workspace", "workspace", self._build_kill_session),
             BuiltInToolSpec("list_sessions", "workspace", "workspace", self._build_list_sessions),
             BuiltInToolSpec("file_read", "workspace", "workspace", self._build_file_read),
+            BuiltInToolSpec("tool_result_read", "workspace", "workspace", self._build_tool_result_read),
             BuiltInToolSpec("glob_search", "workspace", "workspace", self._build_glob_search),
             BuiltInToolSpec("grep_search", "workspace", "workspace", self._build_grep_search),
             BuiltInToolSpec("repo_map", "workspace", "workspace", self._build_repo_map),
@@ -283,6 +285,14 @@ class ToolRegistryFactory:
         del services
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileReadTool(
+            workspace_dir=workspace_dir,
+            path_scope=runtime_policy.file_ops_scope,
+        )
+
+    def _build_tool_result_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
+        del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
+        return ToolResultReadTool(
             workspace_dir=workspace_dir,
             path_scope=runtime_policy.file_ops_scope,
         )

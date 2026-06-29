@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from mochi.backends.base import BackendRequestError
 from mochi.backends.ollama import OllamaBackend
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.router import BackendRouter
@@ -56,6 +57,48 @@ def test_validate_tool_turn_rejects_thinking_only_output() -> None:
 
     assert verdict.is_valid is False
     assert verdict.reason == "thinking_only"
+
+
+def test_ollama_incomplete_tool_intent_detector_flags_placeholder_content() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="get_current_time",
+            description="Get the current date and time",
+            parameters={"type": "object", "properties": {}},
+        )
+    ]
+
+    try:
+        assert backend._looks_like_incomplete_tool_intent(  # noqa: SLF001
+            content="Okay, I'll use get_current_time to confirm the date.\n\nChecking weather...",
+            tools=tools,
+        )
+    finally:
+        import asyncio
+
+        asyncio.run(backend.close())
+
+
+def test_ollama_incomplete_tool_intent_detector_allows_final_content() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+    ]
+
+    try:
+        assert backend._looks_like_incomplete_tool_intent(  # noqa: SLF001
+            content="Taichung today is cloudy with a high of 32C and brief afternoon showers.",
+            tools=tools,
+        ) is False
+    finally:
+        import asyncio
+
+        asyncio.run(backend.close())
 
 
 def test_simulated_tool_protocol_flattens_prior_tool_messages() -> None:
@@ -237,9 +280,134 @@ async def test_generate_with_tool_calls(backend: OllamaBackend) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ollama_falls_back_to_simulated_tool_mode_when_native_response_has_only_thinking(
+async def test_ollama_tool_generate_defaults_to_native_payload() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="get_current_time",
+            description="Get the current date and time",
+            parameters={"type": "object", "properties": {}},
+        ),
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        ),
+    ]
+    response = _mock_response(
+        {
+            "model": "llama3.2",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-weather",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": {"query": "Taichung weather 2026-06-28"},
+                            },
+                        }
+                    ],
+                },
+                "done": True,
+                "done_reason": "tool_calls",
+            }
+        )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as post:
+            result = await backend.generate(
+                messages=[Message(role="user", content="Confirm today's date, then check Taichung weather.")],
+                tools=tools,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert post.await_count == 1
+    payload = post.await_args.kwargs["json"]
+    assert len(payload["tools"]) == 2
+    assert payload["messages"][0]["role"] == "user"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "web_search"
+    assert result.tool_calls[0].arguments == {"query": "Taichung weather 2026-06-28"}
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
+    assert metadata["native_tool_calling_status"] == "supported"
+
+
+@pytest.mark.asyncio
+async def test_ollama_native_generate_keeps_structured_tool_calls() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    call_id = str(uuid.uuid4())
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {"query": "Mochi AI"},
+                        },
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response) as post:
+            result = await backend.generate(
+                messages=[Message(role="user", content="Search Mochi AI")],
+                tools=tools,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    payload = post.await_args.kwargs["json"]
+    assert "tools" in payload
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].id == call_id
+    assert result.tool_calls[0].name == "web_search"
+    assert result.tool_calls[0].arguments == {"query": "Mochi AI"}
+    assert result.finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_ollama_prompt_guided_tool_mode_rejects_thinking_only_response(
     backend: OllamaBackend,
 ) -> None:
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    backend._tool_state.native_status = "native_tool_calls_missing"  # noqa: SLF001
     tools = [
         ToolSchema(
             name="arxiv_search",
@@ -265,50 +433,70 @@ async def test_ollama_falls_back_to_simulated_tool_mode_when_native_response_has
             "eval_count": 7,
         }
     )
-    simulated_response = _mock_response(
-        {
-            "model": "llama3.2",
-            "message": {
-                "role": "assistant",
-                "content": (
-                    "<tool_call>\n"
-                    '{"name": "arxiv_search", "arguments": {"query": "ESG LLM fine-tuning"}}\n'
-                    "</tool_call>"
-                ),
-            },
-            "done": True,
-            "done_reason": "stop",
-            "prompt_eval_count": 24,
-            "eval_count": 11,
-        }
-    )
+    with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=native_response) as post:
+        with pytest.raises(BackendRequestError, match="invalid tool-eligible turn") as exc_info:
+            await backend.generate(
+                messages=[Message(role="user", content="Find ESG LLM fine-tuning papers.")],
+                tools=tools,
+                stream=False,
+            )
 
-    with patch.object(
-        backend._client,
-        "post",
-        new_callable=AsyncMock,
-        side_effect=[native_response, simulated_response],
-    ) as post:
-        result = await backend.generate(
-            messages=[Message(role="user", content="Find ESG LLM fine-tuning papers.")],
-            tools=tools,
-            stream=False,
-        )
-
-    assert len(result.tool_calls) == 1
-    assert result.tool_calls[0].name == "arxiv_search"
-    assert result.tool_calls[0].arguments == {"query": "ESG LLM fine-tuning"}
+    assert exc_info.value.metadata["tool_turn_reason"] == "thinking_only"
     metadata = backend.get_model_info().metadata
     assert metadata["tool_call_mode"] == "simulated_fallback"
-    assert metadata["native_tool_calling_status"] == "native_tool_calls_missing"
+    assert metadata["tool_calling_protocol"] == "prompt_guided"
+    assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
     assert metadata["fallback_diagnostics"]
 
-    first_payload = post.await_args_list[0].kwargs["json"]
-    second_payload = post.await_args_list[1].kwargs["json"]
-    assert "tools" in first_payload
-    assert "tools" not in second_payload
-    assert second_payload["messages"][0]["role"] == "system"
-    assert "## Tool Use Instructions" in second_payload["messages"][0]["content"]
+    payload = post.await_args.kwargs["json"]
+    assert "tools" not in payload
+    assert payload["messages"][0]["role"] == "system"
+    assert "## Tool Use Instructions" in payload["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_prompt_guided_tool_mode_rejects_empty_response() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
+    backend._tool_state.native_status = "native_tool_calls_missing"  # noqa: SLF001
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    native_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=native_response) as post:
+            with pytest.raises(BackendRequestError, match="invalid tool-eligible turn") as exc_info:
+                await backend.generate(
+                    messages=[Message(role="user", content="Search Mochi AI")],
+                    tools=tools,
+                    stream=False,
+                )
+    finally:
+        await backend.close()
+
+    assert post.await_count == 1
+    assert exc_info.value.metadata["tool_turn_reason"] == "empty"
+    payload = post.await_args.kwargs["json"]
+    assert "tools" not in payload
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "simulated_fallback"
+    assert metadata["tool_calling_protocol"] == "prompt_guided"
+    assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
 
 
 @pytest.mark.asyncio
@@ -390,15 +578,7 @@ async def test_ollama_retry_that_returns_only_thinking_raises_backend_error() ->
             },
         )
     ]
-    native_response = _mock_response(
-        {
-            "model": "llama3.2",
-            "message": {"role": "assistant", "content": "", "thinking": "Need web context."},
-            "done": True,
-            "done_reason": "stop",
-        }
-    )
-    retry_response = _mock_response(
+    response = _mock_response(
         {
             "model": "llama3.2",
             "message": {"role": "assistant", "content": "", "thinking": "Still deciding."},
@@ -412,9 +592,9 @@ async def test_ollama_retry_that_returns_only_thinking_raises_backend_error() ->
             backend._client,
             "post",
             new_callable=AsyncMock,
-            side_effect=[native_response, retry_response],
+            return_value=response,
         ):
-            with pytest.raises(RuntimeError, match="invalid tool-eligible turn"):
+            with pytest.raises(BackendRequestError, match="invalid native tool-eligible turn") as exc_info:
                 await backend.generate(
                     messages=[Message(role="user", content="Search Mochi AI")],
                     tools=tools,
@@ -423,13 +603,190 @@ async def test_ollama_retry_that_returns_only_thinking_raises_backend_error() ->
     finally:
         await backend.close()
 
+    assert exc_info.value.metadata["tool_turn_reason"] == "thinking_only"
+    assert exc_info.value.metadata["rejected_thinking"] == "Still deciding."
     metadata = backend.get_model_info().metadata
-    assert metadata["tool_call_mode"] == "unavailable"
-    assert metadata["native_tool_calling_status"] == "simulated_protocol_rejected"
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
+    assert metadata["native_tool_calling_status"] == "thinking_without_native_tool_calls"
 
 
 @pytest.mark.asyncio
-async def test_ollama_probe_reenables_native_mode_after_fallback() -> None:
+async def test_ollama_native_empty_tool_turn_stays_recoverable() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=response,
+        ):
+            with pytest.raises(BackendRequestError, match="invalid native tool-eligible turn") as exc_info:
+                await backend.generate(
+                    messages=[Message(role="user", content="Search Mochi AI")],
+                    tools=tools,
+                    stream=False,
+                )
+    finally:
+        await backend.close()
+
+    assert exc_info.value.metadata["tool_turn_reason"] == "empty"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
+    assert metadata["native_tool_calling_status"] == "empty_native_tool_turn"
+
+
+@pytest.mark.asyncio
+async def test_ollama_post_tool_thinking_only_response_stays_recoverable() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "", "thinking": "I can answer now."},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response) as post:
+            result = await backend.generate(
+                messages=[
+                    Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=[ToolCall(id="call-1", name="web_search", arguments={"query": "台中天氣"})],
+                    ),
+                    Message(
+                        role="tool",
+                        content="Tool web_search result:\nfound weather data",
+                        tool_call_id="call-1",
+                        name="web_search",
+                    ),
+                ],
+                tools=tools,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert result.content == ""
+    assert result.thinking == "I can answer now."
+    assert post.await_count == 1
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
+
+
+@pytest.mark.asyncio
+async def test_ollama_old_tool_history_does_not_mask_new_tool_turn() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    response = _mock_response(
+        {
+            "model": "llama3.2",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "new-call",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": {"query": "最新消息"},
+                            },
+                        }
+                    ],
+                },
+                "done": True,
+                "done_reason": "tool_calls",
+            }
+        )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as post:
+            result = await backend.generate(
+                messages=[
+                    Message(role="user", content="old ask"),
+                    Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=[ToolCall(id="old-call", name="web_search", arguments={"query": "舊資料"})],
+                    ),
+                    Message(
+                        role="tool",
+                        content="Tool web_search result:\nold result",
+                        tool_call_id="old-call",
+                        name="web_search",
+                    ),
+                    Message(role="assistant", content="old final answer"),
+                    Message(role="user", content="new ask that needs web search"),
+                ],
+                tools=tools,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert post.await_count == 1
+    payload = post.await_args.kwargs["json"]
+    assert "tools" in payload
+    assert payload["messages"][0]["role"] == "user"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "web_search"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+
+
+@pytest.mark.asyncio
+async def test_ollama_probe_records_native_support_and_recovers_native_mode() -> None:
     backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
     backend._tool_state.active_mode = "simulated_fallback"  # noqa: SLF001
     backend._tool_state.native_status = "native_tool_calls_missing"  # noqa: SLF001
@@ -462,11 +819,12 @@ async def test_ollama_probe_reenables_native_mode_after_fallback() -> None:
     assert result["status"] == "supported"
     metadata = backend.get_model_info().metadata
     assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
     assert metadata["native_tool_calling_status"] == "supported"
 
 
 @pytest.mark.asyncio
-async def test_ollama_simulated_retry_http_error_marks_backend_unavailable() -> None:
+async def test_ollama_native_http_error_does_not_mark_backend_unavailable() -> None:
     backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
     tools = [
         ToolSchema(
@@ -479,14 +837,6 @@ async def test_ollama_simulated_retry_http_error_marks_backend_unavailable() -> 
             },
         )
     ]
-    native_response = _mock_response(
-        {
-            "model": "llama3.2",
-            "message": {"role": "assistant", "content": "", "thinking": "Need web context."},
-            "done": True,
-            "done_reason": "stop",
-        }
-    )
     request = httpx.Request("POST", "http://localhost:11434/api/chat")
     simulated_error = httpx.HTTPStatusError(
         "EOF",
@@ -499,7 +849,7 @@ async def test_ollama_simulated_retry_http_error_marks_backend_unavailable() -> 
             backend._client,
             "post",
             new_callable=AsyncMock,
-            side_effect=[native_response, simulated_error],
+            side_effect=simulated_error,
         ):
             with pytest.raises(RuntimeError, match="EOF|500"):
                 await backend.generate(
@@ -510,7 +860,9 @@ async def test_ollama_simulated_retry_http_error_marks_backend_unavailable() -> 
     finally:
         await backend.close()
 
-    assert backend.get_model_info().metadata["tool_call_mode"] == "unavailable"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["native_tool_calling_status"] == "native_default"
 
 
 @pytest.mark.asyncio
@@ -563,7 +915,7 @@ async def test_ollama_failed_reprobe_after_validated_fallback_stays_in_simulated
 
 
 @pytest.mark.asyncio
-async def test_ollama_manual_probe_can_recover_from_unavailable_state() -> None:
+async def test_ollama_manual_probe_recovers_availability_and_enables_native_default() -> None:
     backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
     backend._tool_state.active_mode = "unavailable"  # noqa: SLF001
     backend._tool_state.native_status = "simulated_protocol_rejected"  # noqa: SLF001
@@ -594,7 +946,90 @@ async def test_ollama_manual_probe_can_recover_from_unavailable_state() -> None:
 
     assert result is not None
     assert result["status"] == "supported"
-    assert backend.get_model_info().metadata["tool_call_mode"] == "native"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
+    assert metadata["native_tool_calling_status"] == "supported"
+
+
+@pytest.mark.asyncio
+async def test_ollama_generate_after_successful_probe_uses_native_payload() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search the web",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+    ]
+    probe_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "probe-call-1",
+                        "function": {"name": "mochi_tool_probe", "arguments": {"value": "ok"}},
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }
+    )
+    generate_response = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {"query": "Mochi AI"},
+                        },
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+        }
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            side_effect=[probe_response, generate_response],
+        ) as post:
+            probe = await backend.probe_tool_calling()
+            result = await backend.generate(
+                messages=[Message(role="user", content="Search Mochi AI")],
+                tools=tools,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert probe is not None
+    assert probe["status"] == "supported"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "web_search"
+    generate_payload = post.await_args_list[1].kwargs["json"]
+    assert "tools" in generate_payload
+    assert generate_payload["messages"][0]["role"] == "user"
+    metadata = backend.get_model_info().metadata
+    assert metadata["tool_call_mode"] == "native"
+    assert metadata["tool_calling_protocol"] == "native"
 
 
 def test_ollama_supports_tool_calling_false_when_mode_is_unavailable() -> None:
@@ -727,7 +1162,87 @@ def test_model_info(backend: OllamaBackend) -> None:
     assert info.name == "llama3.2"
     assert info.backend_type == "ollama"
     assert info.supports_tool_calling is True
+    assert info.context_length is None
     assert info.metadata["supports_reasoning_effort"] is False
+    assert info.metadata["context_length_source"] == "unknown"
+    assert info.metadata["context_length_fallback"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_ollama_prime_model_info_reads_context_length_from_show_model_info() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    response = _mock_response(
+        {
+            "model_info": {
+                "llama.context_length": 32768,
+            }
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response) as post:
+            await backend.prime_model_info()
+    finally:
+        await backend.close()
+
+    post.assert_awaited_once()
+    assert post.await_args.args[0] == "/api/show"
+    assert post.await_args.kwargs["json"] == {"model": "llama3.2"}
+    info = backend.get_model_info()
+    assert info.context_length == 32768
+    assert info.metadata["context_length_source"] == "api_show.model_info.llama.context_length"
+    assert info.metadata["context_length_fallback"] is None
+    assert info.metadata["runtime_context_length"] is None
+    assert info.metadata["model_max_context_length"] == 32768
+    assert info.metadata["model_max_context_length_source"] == "api_show.model_info.llama.context_length"
+
+
+@pytest.mark.asyncio
+async def test_ollama_prime_model_info_reads_context_length_from_parameters() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    response = _mock_response(
+        {
+            "parameters": "temperature 0.7\nnum_ctx 8192\nstop </s>",
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response):
+            await backend.prime_model_info()
+    finally:
+        await backend.close()
+
+    info = backend.get_model_info()
+    assert info.context_length == 8192
+    assert info.metadata["context_length_source"] == "api_show.parameters:num_ctx"
+    assert info.metadata["runtime_context_length"] == 8192
+    assert info.metadata["runtime_context_length_source"] == "api_show.parameters:num_ctx"
+
+
+@pytest.mark.asyncio
+async def test_ollama_prime_model_info_prefers_runtime_num_ctx_over_model_max() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    response = _mock_response(
+        {
+            "parameters": "temperature 0.7\nnum_ctx 16384\nstop </s>",
+            "model_info": {
+                "llama.context_length": 262144,
+            },
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response):
+            await backend.prime_model_info()
+    finally:
+        await backend.close()
+
+    info = backend.get_model_info()
+    assert info.context_length == 16384
+    assert info.metadata["context_length_source"] == "api_show.parameters:num_ctx"
+    assert info.metadata["runtime_context_length"] == 16384
+    assert info.metadata["model_max_context_length"] == 262144
+    assert info.metadata["model_max_context_length_source"] == "api_show.model_info.llama.context_length"
 
 
 def test_supports_tool_calling(backend: OllamaBackend) -> None:
@@ -772,6 +1287,58 @@ async def test_ollama_generate_maps_reasoning_effort_to_think() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_generate_keeps_output_cap_on_num_predict_only() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    mock_resp = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp) as post:
+            await backend.generate(
+                messages=[Message(role="user", content="hi")],
+                max_tokens=2048,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    options = post.await_args.kwargs["json"]["options"]
+    assert options["num_predict"] == 2048
+    assert "num_ctx" not in options
+
+
+@pytest.mark.asyncio
+async def test_ollama_generate_includes_configured_num_ctx_override() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434", num_ctx=32768)
+    mock_resp = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp) as post:
+            await backend.generate(
+                messages=[Message(role="user", content="hi")],
+                max_tokens=2048,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    options = post.await_args.kwargs["json"]["options"]
+    assert options["num_predict"] == 2048
+    assert options["num_ctx"] == 32768
+
+
+@pytest.mark.asyncio
 async def test_ollama_generate_omits_reasoning_effort_for_unknown_models() -> None:
     """Unknown Ollama models should not receive unsupported think levels."""
     backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
@@ -801,7 +1368,10 @@ async def test_ollama_generate_omits_reasoning_effort_for_unknown_models() -> No
 async def test_backend_router_ollama() -> None:
     """BackendRouter 應能解析 ollama: 前綴並回傳 OllamaBackend。"""
     router = BackendRouter()
-    with patch.object(OllamaBackend, "health_check", new_callable=AsyncMock, return_value=True):
+    with (
+        patch.object(OllamaBackend, "health_check", new_callable=AsyncMock, return_value=True),
+        patch.object(OllamaBackend, "prime_model_info", new_callable=AsyncMock),
+    ):
         backend_inst = await router.load("ollama:qwen2.5")
 
     assert isinstance(backend_inst, OllamaBackend)

@@ -265,12 +265,11 @@ class ToolResultTransportGuard:
         target_dir = self._resolve_store_dir(context)
         target_dir.mkdir(parents=True, exist_ok=True)
         reference_id = f"{tool_name}-{uuid4().hex[:10]}"
-        persisted_text = raw_payload
-        persisted_encoding = "utf-8"
-        suffix = ".json" if raw_payload.lstrip().startswith(("{", "[")) else ".txt"
-        if result is not None and result.error is None and isinstance(result.output, str):
-            persisted_text = result.output
-            suffix = ".txt"
+        persisted_text, persisted_encoding, suffix = self._build_persisted_artifact(
+            tool_name=tool_name,
+            raw_payload=raw_payload,
+            result=result,
+        )
         target_path = target_dir / f"{reference_id}{suffix}"
         target_path.write_text(persisted_text, encoding=persisted_encoding)
         return (
@@ -279,6 +278,46 @@ class ToolResultTransportGuard:
             persisted_encoding,
             self._build_reference_metadata(tool_name=tool_name, result=result),
         )
+
+    def _build_persisted_artifact(
+        self,
+        *,
+        tool_name: str,
+        raw_payload: str,
+        result: ToolResult | None,
+    ) -> tuple[str, str, str]:
+        if result is not None and result.error is None and tool_name == "file_read":
+            source_snapshot = self._load_file_read_source_snapshot(result)
+            if source_snapshot is not None:
+                persisted_text, persisted_encoding = source_snapshot
+                return persisted_text, persisted_encoding, ".txt"
+
+        if result is not None and result.error is None and isinstance(result.output, str):
+            return result.output, "utf-8", ".txt"
+
+        suffix = ".json" if raw_payload.lstrip().startswith(("{", "[")) else ".txt"
+        return raw_payload, "utf-8", suffix
+
+    @staticmethod
+    def _load_file_read_source_snapshot(result: ToolResult) -> tuple[str, str] | None:
+        if not isinstance(result.metadata, dict):
+            return None
+
+        source_path = result.metadata.get("source_path") or result.metadata.get("path")
+        if not isinstance(source_path, str) or not source_path.strip() or source_path.startswith("tool-result://"):
+            return None
+
+        encoding = result.metadata.get("encoding")
+        active_encoding = encoding if isinstance(encoding, str) and encoding.strip() else "utf-8"
+        target = Path(source_path)
+        if not target.exists() or not target.is_file():
+            return None
+
+        try:
+            persisted_text = target.read_text(encoding=active_encoding)
+        except Exception:
+            return None
+        return persisted_text, active_encoding
 
     def _resolve_store_dir(self, context: ToolExecutionContext | None) -> Path:
         if context is not None and context.tool_result_store_dir:
@@ -300,7 +339,7 @@ class ToolResultTransportGuard:
             message += preview_text + "\n"
         message += (
             f"Reference: {reference_id}\n"
-            f'To continue reading, call: file_read(path="tool-result://{reference_id}", '
+            f'To continue reading, call: tool_result_read(reference_id="{reference_id}", '
             'offset=1, limit=200, line_numbers=True)'
         )
         return message.strip()

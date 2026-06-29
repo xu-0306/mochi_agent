@@ -103,6 +103,17 @@ from mochi.voice.session_manager import VoiceSessionManager
 from mochi.voice.status import build_voice_runtime_status
 from mochi.voice.voice_session import VoiceSession
 
+_DEFAULT_CONTEXT_LENGTH_FALLBACK = 4096
+_AUTO_MAX_OUTPUT_TOKENS_FALLBACK = 4096
+_AUTO_RESERVE_OUTPUT_TOKENS_FALLBACK = 1024
+_AUTO_MAX_OUTPUT_TOKENS_MIN = 2048
+_AUTO_MAX_OUTPUT_TOKENS_MAX = 8192
+_AUTO_RESERVE_OUTPUT_TOKENS_MIN = 768
+_AUTO_RESERVE_OUTPUT_TOKENS_MAX = 3072
+_AUTO_OUTPUT_CONTEXT_RATIO = 0.10
+_AUTO_RESERVE_OUTPUT_RATIO = 0.33
+_AUTO_TOKEN_ROUNDING = 256
+
 
 def _active_remote_provider(config: MochiConfig) -> str | None:
     if not config.model.startswith(("http://", "https://")):
@@ -259,6 +270,7 @@ class AgentEngine:
         initial_remote_provider = _active_remote_provider(config)
         self._router = BackendRouter(
             ollama_base_url=config.ollama.base_url,
+            ollama_num_ctx=config.ollama.num_ctx,
             openai_default_model=config.openai_compat.model,
             openai_api_key=self._resolve_active_openai_compat_api_key(config),
             openai_codex_default_model=config.openai_codex.model,
@@ -426,17 +438,18 @@ class AgentEngine:
         session_key = session_id or "default"
         context = await self._get_context(session_key)
         resolved = self._resolve_inference_params(inference_overrides)
+        reserve_output_tokens = int(resolved["reserve_output_tokens"])
         prompt_context = await context.preview_prompt_context(
             message,
             history_limit=self._config.memory.max_short_term_messages,
             memory_top_k=self._config.memory.fts_top_k,
+            reserve_output_tokens=reserve_output_tokens,
         )
         skill_selection = await self._select_skills(
             message,
             selected_skill_ids=selected_skill_ids,
         )
         skills_context = self._render_skills_context(skill_selection)
-        model_info = self.get_model_info()
         scope = await self._execution_scope_resolver.resolve(
             session_id=session_key,
             project_id=project_id,
@@ -449,8 +462,12 @@ class AgentEngine:
         available_tools = workspace_registry.list_tools()
 
         active_backend = self._router.active
+        model_info = active_backend.get_model_info()
         capabilities = self._inference_capabilities_for_backend(active_backend)
-        sanitized = sanitize_inference_params_for_capabilities(resolved, capabilities)
+        sanitized = sanitize_inference_params_for_capabilities(
+            self._provider_inference_params(resolved),
+            capabilities,
+        )
         reasoning_effort = sanitized.get("reasoning_effort")
         planner_message = self._build_tool_planner_message(message, attachments)
         attachment_count = self._attachment_count(attachments)
@@ -566,12 +583,11 @@ class AgentEngine:
             + draft_estimate.tokens
             + tool_estimate.tokens
         )
-        reserved_output_tokens = int(sanitized.get("max_tokens") or 0)
-        context_length = max(1, int(model_info.context_length))
-        remaining_tokens = max(context_length - estimated_prompt_tokens - reserved_output_tokens, 0)
+        context_length = self._snapshot_context_length(model_info)
+        remaining_tokens = max(context_length - estimated_prompt_tokens - reserve_output_tokens, 0)
         usage_ratio = min(
             1.0,
-            max(0.0, (estimated_prompt_tokens + reserved_output_tokens) / context_length),
+            max(0.0, (estimated_prompt_tokens + reserve_output_tokens) / context_length),
         )
 
         snapshot = ChatContextSnapshot(
@@ -581,7 +597,7 @@ class AgentEngine:
             backend_type=model_info.backend_type,
             context_length=context_length,
             estimated_prompt_tokens=estimated_prompt_tokens,
-            reserved_output_tokens=reserved_output_tokens,
+            reserved_output_tokens=reserve_output_tokens,
             remaining_tokens=remaining_tokens,
             usage_ratio=usage_ratio,
             summary_tokens=summary_estimate.tokens,
@@ -590,11 +606,11 @@ class AgentEngine:
             skills_tokens=skills_estimate.tokens,
             tool_tokens=tool_estimate.tokens,
             draft_tokens=draft_estimate.tokens,
-            compaction_triggered=context.summary is not None,
+            compaction_triggered=prompt_context.summary is not None,
             compaction_reason=(
                 prompt_context.compaction_diagnostics.reason
                 if prompt_context.compaction_diagnostics is not None
-                else ("history_window" if context.summary is not None else None)
+                else ("history_window" if prompt_context.summary is not None else None)
             ),
             compaction_mode=(
                 prompt_context.compaction_diagnostics.compaction_mode
@@ -670,11 +686,12 @@ class AgentEngine:
         session_key = request.session_id or "default"
         context = await self._get_context(session_key)
         resolved = self._resolve_inference_params(request.inference_overrides)
+        reserve_output_tokens = int(resolved["reserve_output_tokens"])
         prompt_context = await context.prepare_prompt_context(
             request.message,
             history_limit=self._config.memory.max_short_term_messages,
             memory_top_k=self._config.memory.fts_top_k,
-            reserve_output_tokens=int(resolved.get("max_tokens") or 0),
+            reserve_output_tokens=reserve_output_tokens,
         )
         skill_selection = await self._select_skills(
             request.message,
@@ -711,7 +728,10 @@ class AgentEngine:
         else:
             active_backend = self._router.active
         capabilities = self._inference_capabilities_for_backend(active_backend)
-        sanitized = sanitize_inference_params_for_capabilities(resolved, capabilities)
+        sanitized = sanitize_inference_params_for_capabilities(
+            self._provider_inference_params(resolved),
+            capabilities,
+        )
         reasoning_effort = sanitized.get("reasoning_effort")
         attachment_count = self._attachment_count(request.attachments)
         workspace_attachment_count = self._workspace_attachment_count(request.attachments)
@@ -745,6 +765,32 @@ class AgentEngine:
             intent_source=tool_intent_route.source,
             intent_rationale=tool_intent_route.rationale,
         )
+        exposure_plan = self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "engine_input",
+            {
+                "available_tool_count": len(available_tools),
+                "session_bound_workspace": session_bound_workspace,
+                "execution_profile": request.execution_profile,
+                "tool_mode": request.tool_mode,
+                "tool_names_override_count": (
+                    len(request.tool_names_override)
+                    if request.tool_names_override is not None
+                    else None
+                ),
+                "tool_allowlist_count": (
+                    len(request.tool_allowlist)
+                    if request.tool_allowlist is not None
+                    else None
+                ),
+                "tool_denylist_count": (
+                    len(request.tool_denylist)
+                    if request.tool_denylist is not None
+                    else None
+                ),
+            },
+        )
+        before_overrides_count = len(exposure_plan.tool_names)
         exposure_plan = self._apply_invocation_tool_overrides(
             exposure_plan,
             available_tool_names=[tool.name for tool in available_tools],
@@ -752,10 +798,40 @@ class AgentEngine:
             tool_allowlist=request.tool_allowlist,
             tool_denylist=request.tool_denylist,
         )
+        exposure_plan = self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "after_invocation_overrides",
+            {
+                "before_tool_count": before_overrides_count,
+                "after_tool_count": len(exposure_plan.tool_names),
+                "cleared_tools": before_overrides_count > 0 and not exposure_plan.tool_names,
+            },
+        )
+        before_profile_count = len(exposure_plan.tool_names)
         exposure_plan = self._apply_execution_profile(exposure_plan, request.execution_profile)
+        exposure_plan = self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "after_execution_profile",
+            {
+                "execution_profile": request.execution_profile,
+                "before_tool_count": before_profile_count,
+                "after_tool_count": len(exposure_plan.tool_names),
+                "cleared_tools": before_profile_count > 0 and not exposure_plan.tool_names,
+            },
+        )
+        before_preflight_count = len(exposure_plan.tool_names)
         exposure_plan = await self._probe_tool_calling_before_exposure(
             active_backend,
             exposure_plan,
+        )
+        exposure_plan = self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "after_preflight",
+            {
+                "before_tool_count": before_preflight_count,
+                "after_tool_count": len(exposure_plan.tool_names),
+                "cleared_tools": before_preflight_count > 0 and not exposure_plan.tool_names,
+            },
         )
         attachment_context = self._build_attachment_prompt_context(
             attachments=request.attachments,
@@ -775,7 +851,7 @@ class AgentEngine:
                 summary=prompt_context.summary,
             ),
             attachment_context=attachment_context,
-            base_prompt=resolved["system_prompt"],
+            base_prompt=str(sanitized.get("system_prompt") or resolved["system_prompt"]),
             task_workspace_dir=request.task_workspace_dir,
             system_prompt_addendum=system_prompt_addendum,
         )
@@ -801,6 +877,22 @@ class AgentEngine:
             workspace_dir=effective_workspace_dir,
             task_workspace_dir=request.task_workspace_dir,
             permission_policy_override=request.permission_policy,
+        )
+        before_continuation_count = len(exposure_plan.tool_names)
+        exposure_plan = self._preserve_tool_result_read_for_continuation(
+            exposure_plan,
+            available_tool_names=[tool.name for tool in available_tools],
+            tool_execution_context=tool_execution_context,
+        )
+        exposure_plan = self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "after_continuation_preservation",
+            {
+                "before_tool_count": before_continuation_count,
+                "after_tool_count": len(exposure_plan.tool_names),
+                "preserved_tool_result_read": len(exposure_plan.tool_names) > before_continuation_count,
+                "reference_count": len(tool_execution_context.tool_result_references),
+            },
         )
         tool_registry = workspace_registry.create_view(
             exposure_plan.tool_names,
@@ -851,7 +943,7 @@ class AgentEngine:
                 history=prompt_context.history,
                 user_message=request.message,
                 temperature=cast(float, sanitized.get("temperature", resolved["temperature"])),
-                max_tokens=cast(int, sanitized.get("max_tokens", resolved["max_tokens"])),
+                max_tokens=cast(int, resolved["max_output_tokens"]),
                 top_p=cast(float, sanitized.get("top_p", resolved["top_p"])),
                 min_p=cast(float, sanitized.get("min_p", resolved["min_p"])),
                 top_k=cast(int, sanitized.get("top_k", resolved["top_k"])),
@@ -923,20 +1015,73 @@ class AgentEngine:
             return exposure_plan
         backend_info = backend.get_model_info()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
-        if self._tool_calling_state_is_terminal(metadata):
-            return self._disable_tool_exposure_plan(exposure_plan)
-        if not self._should_probe_tool_calling_preflight(metadata):
-            return exposure_plan
+        should_probe_terminal = self._should_retry_terminal_tool_calling_preflight(
+            backend_info=backend_info,
+            metadata=metadata,
+        )
+        if self._uses_prompt_guided_default_tool_protocol(
+            backend_info=backend_info,
+            metadata=metadata,
+        ):
+            return self._with_tool_exposure_diagnostic(
+                exposure_plan,
+                "preflight",
+                {
+                    "action": "skip",
+                    "reason": "prompt_guided_ollama",
+                    "backend": self._tool_preflight_backend_diagnostics(backend_info, metadata),
+                },
+            )
+        if self._tool_calling_state_is_terminal(metadata) and not should_probe_terminal:
+            disabled = self._with_tool_exposure_diagnostic(
+                exposure_plan,
+                "preflight",
+                {
+                    "action": "disable",
+                    "reason": "terminal_backend_tool_state",
+                    "backend": self._tool_preflight_backend_diagnostics(backend_info, metadata),
+                },
+            )
+            return self._disable_tool_exposure_plan(disabled)
+        if not should_probe_terminal and not self._should_probe_tool_calling_preflight(
+            backend_info=backend_info,
+            metadata=metadata,
+        ):
+            return self._with_tool_exposure_diagnostic(
+                exposure_plan,
+                "preflight",
+                {
+                    "action": "skip",
+                    "reason": "not_needed",
+                    "backend": self._tool_preflight_backend_diagnostics(backend_info, metadata),
+                },
+            )
         probe = getattr(backend, "probe_tool_calling", None)
         if not callable(probe):
-            return exposure_plan
+            return self._with_tool_exposure_diagnostic(
+                exposure_plan,
+                "preflight",
+                {
+                    "action": "skip",
+                    "reason": "probe_not_available",
+                    "backend": self._tool_preflight_backend_diagnostics(backend_info, metadata),
+                },
+            )
         try:
             probe_result = probe()
             if inspect.isawaitable(probe_result):
                 await cast(Awaitable[Any], probe_result)
         except Exception as exc:
             logger.warning("Tool-calling preflight probe failed: %s", exc)
-            return exposure_plan
+            return self._with_tool_exposure_diagnostic(
+                exposure_plan,
+                "preflight",
+                {
+                    "action": "probe_failed",
+                    "reason": type(exc).__name__,
+                    "backend": self._tool_preflight_backend_diagnostics(backend_info, metadata),
+                },
+            )
         refreshed = backend.get_model_info()
         refreshed_metadata = refreshed.metadata if isinstance(refreshed.metadata, dict) else {}
         if self._tool_calling_state_is_terminal(refreshed_metadata):
@@ -945,8 +1090,28 @@ class AgentEngine:
                 refreshed.provider,
                 refreshed.name,
             )
-            return self._disable_tool_exposure_plan(exposure_plan)
-        return exposure_plan
+            disabled = self._with_tool_exposure_diagnostic(
+                exposure_plan,
+                "preflight",
+                {
+                    "action": "disable",
+                    "reason": "terminal_state_after_probe",
+                    "backend": self._tool_preflight_backend_diagnostics(
+                        refreshed,
+                        refreshed_metadata,
+                    ),
+                },
+            )
+            return self._disable_tool_exposure_plan(disabled)
+        return self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "preflight",
+            {
+                "action": "probe_ok",
+                "reason": "refreshed_non_terminal",
+                "backend": self._tool_preflight_backend_diagnostics(refreshed, refreshed_metadata),
+            },
+        )
 
     @staticmethod
     def _tool_calling_state_is_terminal(metadata: dict[str, Any]) -> bool:
@@ -955,9 +1120,43 @@ class AgentEngine:
             or metadata.get("tool_call_mode") == "unavailable"
         )
 
+    @staticmethod
+    def _tool_preflight_backend_diagnostics(
+        backend_info: ModelInfo,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        keys = (
+            "tool_call_mode",
+            "tool_calling_protocol",
+            "tool_calling_style",
+            "tool_calling_blocked",
+            "native_tool_calling_status",
+            "fallback_validation_status",
+        )
+        return {
+            "backend_type": backend_info.backend_type,
+            "provider": backend_info.provider,
+            "model": backend_info.name,
+            "metadata": {
+                key: metadata.get(key)
+                for key in keys
+                if key in metadata
+            },
+        }
+
     @classmethod
-    def _should_probe_tool_calling_preflight(cls, metadata: dict[str, Any]) -> bool:
+    def _should_probe_tool_calling_preflight(
+        cls,
+        *,
+        backend_info: ModelInfo,
+        metadata: dict[str, Any],
+    ) -> bool:
         if cls._tool_calling_state_is_terminal(metadata):
+            return False
+        if cls._uses_prompt_guided_default_tool_protocol(
+            backend_info=backend_info,
+            metadata=metadata,
+        ):
             return False
         if metadata.get("tool_call_mode") == "simulated_fallback":
             return True
@@ -969,6 +1168,33 @@ class AgentEngine:
         }
 
     @staticmethod
+    def _should_retry_terminal_tool_calling_preflight(
+        *,
+        backend_info: ModelInfo,
+        metadata: dict[str, Any],
+    ) -> bool:
+        return (
+            backend_info.backend_type == "ollama"
+            and metadata.get("tool_call_mode") == "unavailable"
+            and not AgentEngine._uses_prompt_guided_default_tool_protocol(
+                backend_info=backend_info,
+                metadata=metadata,
+            )
+            and metadata.get("tool_calling_blocked") is not True
+        )
+
+    @staticmethod
+    def _uses_prompt_guided_default_tool_protocol(
+        *,
+        backend_info: ModelInfo,
+        metadata: dict[str, Any],
+    ) -> bool:
+        if backend_info.backend_type != "ollama":
+            return False
+        protocol = metadata.get("tool_calling_protocol") or metadata.get("tool_calling_style")
+        return protocol == "prompt_guided"
+
+    @staticmethod
     def _disable_tool_exposure_plan(exposure_plan: ToolExposurePlan) -> ToolExposurePlan:
         return ToolExposurePlan(
             tool_names=[],
@@ -978,6 +1204,30 @@ class AgentEngine:
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
             intent_route=copy.deepcopy(exposure_plan.intent_route),
+            diagnostics=copy.deepcopy(exposure_plan.diagnostics),
+        )
+
+    @staticmethod
+    def _with_tool_exposure_diagnostic(
+        exposure_plan: ToolExposurePlan,
+        stage: str,
+        details: dict[str, Any],
+    ) -> ToolExposurePlan:
+        diagnostics = copy.deepcopy(exposure_plan.diagnostics)
+        stages = diagnostics.setdefault("stages", [])
+        if isinstance(stages, list):
+            stages.append({"stage": stage, **details})
+        else:
+            diagnostics["stages"] = [{"stage": stage, **details}]
+        return ToolExposurePlan(
+            tool_names=list(exposure_plan.tool_names),
+            matched_groups=list(exposure_plan.matched_groups),
+            limit=exposure_plan.limit,
+            discoverable_tool_names=list(exposure_plan.discoverable_tool_names),
+            workspace_bound=exposure_plan.workspace_bound,
+            attachment_count=exposure_plan.attachment_count,
+            intent_route=copy.deepcopy(exposure_plan.intent_route),
+            diagnostics=diagnostics,
         )
 
     def _apply_execution_profile(
@@ -987,6 +1237,7 @@ class AgentEngine:
     ) -> ToolExposurePlan:
         readonly_allowed = {
             "file_read",
+            "tool_result_read",
             "glob_search",
             "grep_search",
             "repo_map",
@@ -1033,6 +1284,7 @@ class AgentEngine:
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
                 intent_route=copy.deepcopy(exposure_plan.intent_route),
+                diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         if execution_profile == "subagent_execution_request":
             return ToolExposurePlan(
@@ -1045,6 +1297,7 @@ class AgentEngine:
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
                 intent_route=copy.deepcopy(exposure_plan.intent_route),
+                diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         if execution_profile == "controller_exec":
             controller_tools = list(exposure_plan.tool_names)
@@ -1061,6 +1314,7 @@ class AgentEngine:
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
                 intent_route=copy.deepcopy(exposure_plan.intent_route),
+                diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         if execution_profile in {"subagent_research", "judge", "verifier"}:
             return ToolExposurePlan(
@@ -1073,8 +1327,38 @@ class AgentEngine:
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
                 intent_route=copy.deepcopy(exposure_plan.intent_route),
+                diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         return exposure_plan
+
+    def _preserve_tool_result_read_for_continuation(
+        self,
+        exposure_plan: ToolExposurePlan,
+        *,
+        available_tool_names: list[str],
+        tool_execution_context: ToolExecutionContext,
+    ) -> ToolExposurePlan:
+        if "tool_result_read" in exposure_plan.tool_names:
+            return exposure_plan
+        if "tool_result_read" not in available_tool_names:
+            return exposure_plan
+        if not tool_execution_context.tool_result_references:
+            return exposure_plan
+
+        tool_names = [*exposure_plan.tool_names, "tool_result_read"]
+        discoverable_tool_names = list(exposure_plan.discoverable_tool_names)
+        if "tool_result_read" not in discoverable_tool_names:
+            discoverable_tool_names.append("tool_result_read")
+        return ToolExposurePlan(
+            tool_names=tool_names,
+            matched_groups=exposure_plan.matched_groups,
+            limit=max(exposure_plan.limit, len(tool_names)),
+            discoverable_tool_names=discoverable_tool_names,
+            workspace_bound=exposure_plan.workspace_bound,
+            attachment_count=exposure_plan.attachment_count,
+            intent_route=copy.deepcopy(exposure_plan.intent_route),
+            diagnostics=copy.deepcopy(exposure_plan.diagnostics),
+        )
 
     @staticmethod
     def _apply_invocation_tool_overrides(
@@ -1114,6 +1398,7 @@ class AgentEngine:
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
             intent_route=copy.deepcopy(exposure_plan.intent_route),
+            diagnostics=copy.deepcopy(exposure_plan.diagnostics),
         )
 
     async def switch_model(self, model_spec: str) -> ModelInfo:
@@ -1416,6 +1701,7 @@ class AgentEngine:
         next_remote_provider = _active_remote_provider(config)
         self._router.apply_settings(
             ollama_base_url=config.ollama.base_url,
+            ollama_num_ctx=config.ollama.num_ctx,
             openai_default_model=config.openai_compat.model,
             openai_api_key=self._resolve_active_openai_compat_api_key(config),
             openai_codex_default_model=config.openai_codex.model,
@@ -1607,6 +1893,8 @@ class AgentEngine:
             "system_prompt": agent.system_prompt,
             "temperature": agent.temperature,
             "max_tokens": agent.max_tokens,
+            "max_output_tokens": agent.max_tokens,
+            "reserve_output_tokens": agent.reserve_output_tokens,
             "top_p": agent.top_p,
             "min_p": agent.min_p,
             "top_k": agent.top_k,
@@ -1625,6 +1913,8 @@ class AgentEngine:
                 {
                     "temperature": preset.temperature,
                     "max_tokens": preset.max_tokens,
+                    "max_output_tokens": preset.max_tokens,
+                    "reserve_output_tokens": preset.reserve_output_tokens,
                     "top_p": preset.top_p,
                     "min_p": preset.min_p,
                     "top_k": preset.top_k,
@@ -1641,7 +1931,143 @@ class AgentEngine:
             for key, value in overrides.items():
                 resolved[key] = value
 
+        output_cap_candidate = resolved.get("max_output_tokens")
+        if overrides:
+            if "max_output_tokens" in overrides:
+                output_cap_candidate = overrides.get("max_output_tokens")
+            elif "max_tokens" in overrides:
+                output_cap_candidate = overrides.get("max_tokens")
+
+        output_cap = self._positive_int_or_none(output_cap_candidate)
+        reserve_output_tokens = self._nonnegative_int_or_none(
+            resolved.get("reserve_output_tokens"),
+        )
+        context_length_hint = self._auto_inference_context_length_hint()
+        if output_cap is None:
+            output_cap = self._derive_auto_max_output_tokens(context_length_hint)
+        if reserve_output_tokens is None:
+            reserve_output_tokens = self._derive_auto_reserve_output_tokens(
+                context_length_hint,
+                output_cap=output_cap,
+            )
+        reserve_output_tokens = min(output_cap, reserve_output_tokens)
+        resolved["max_output_tokens"] = output_cap
+        resolved["max_tokens"] = output_cap
+        resolved["reserve_output_tokens"] = reserve_output_tokens
         return resolved
+
+    @staticmethod
+    def _positive_int_or_none(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return max(1, parsed)
+
+    @staticmethod
+    def _nonnegative_int_or_none(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0, parsed)
+
+    def _auto_inference_context_length_hint(self) -> int | None:
+        model_info: ModelInfo | None = None
+        if self._initialized:
+            try:
+                model_info = self._router.active.get_model_info()
+            except Exception:
+                model_info = None
+        elif self._preinitialized_model_info_cache is not None:
+            model_info = self._preinitialized_model_info_cache
+
+        hinted = self._reliable_context_length_hint(model_info)
+        if hinted is not None:
+            return hinted
+
+        configured_model = self._config.model.strip().lower()
+        active_remote_provider = _active_remote_provider(self._config)
+        if self._config.ollama.num_ctx is not None:
+            return self._config.ollama.num_ctx
+        if configured_model.endswith(".gguf"):
+            return self._config.gguf.n_ctx
+        if active_remote_provider == "vllm" and self._config.vllm.max_model_len is not None:
+            return self._config.vllm.max_model_len
+        return None
+
+    @staticmethod
+    def _reliable_context_length_hint(model_info: ModelInfo | None) -> int | None:
+        if model_info is None:
+            return None
+        if not isinstance(model_info.context_length, int) or model_info.context_length <= 0:
+            return None
+        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
+        source = metadata.get("context_length_source")
+        fallback = metadata.get("context_length_fallback")
+        if source == "unknown" and isinstance(fallback, int) and fallback > 0:
+            return None
+        return model_info.context_length
+
+    @staticmethod
+    def _round_up_token_bucket(value: int) -> int:
+        if value <= 0:
+            return _AUTO_TOKEN_ROUNDING
+        return ((value + _AUTO_TOKEN_ROUNDING - 1) // _AUTO_TOKEN_ROUNDING) * _AUTO_TOKEN_ROUNDING
+
+    @staticmethod
+    def _clamp_token_value(value: int, *, minimum: int, maximum: int) -> int:
+        return max(minimum, min(value, maximum))
+
+    @classmethod
+    def _derive_auto_max_output_tokens(cls, context_length: int | None) -> int:
+        if context_length is None or context_length <= 0:
+            return _AUTO_MAX_OUTPUT_TOKENS_FALLBACK
+        scaled = cls._round_up_token_bucket(int(context_length * _AUTO_OUTPUT_CONTEXT_RATIO))
+        return cls._clamp_token_value(
+            scaled,
+            minimum=_AUTO_MAX_OUTPUT_TOKENS_MIN,
+            maximum=_AUTO_MAX_OUTPUT_TOKENS_MAX,
+        )
+
+    @classmethod
+    def _derive_auto_reserve_output_tokens(
+        cls,
+        context_length: int | None,
+        *,
+        output_cap: int,
+    ) -> int:
+        if context_length is None or context_length <= 0:
+            return min(output_cap, _AUTO_RESERVE_OUTPUT_TOKENS_FALLBACK)
+        scaled = cls._round_up_token_bucket(int(output_cap * _AUTO_RESERVE_OUTPUT_RATIO))
+        return min(
+            output_cap,
+            cls._clamp_token_value(
+                scaled,
+                minimum=_AUTO_RESERVE_OUTPUT_TOKENS_MIN,
+                maximum=_AUTO_RESERVE_OUTPUT_TOKENS_MAX,
+            ),
+        )
+
+    @staticmethod
+    def _provider_inference_params(resolved: dict[str, Any]) -> dict[str, Any]:
+        provider_params = {
+            key: value
+            for key, value in resolved.items()
+            if key not in {"max_output_tokens", "reserve_output_tokens"}
+        }
+        provider_params["max_tokens"] = resolved["max_output_tokens"]
+        return provider_params
+
+    @staticmethod
+    def _snapshot_context_length(model_info: ModelInfo) -> int:
+        if isinstance(model_info.context_length, int) and model_info.context_length > 0:
+            return model_info.context_length
+        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
+        fallback = metadata.get("context_length_fallback")
+        if isinstance(fallback, int) and fallback > 0:
+            return fallback
+        return _DEFAULT_CONTEXT_LENGTH_FALLBACK
 
     async def _build_skills_context(self, message: str) -> str:
         """搜尋相關技能並格式化為 system prompt context。"""
@@ -2108,7 +2534,11 @@ class AgentEngine:
                 "trajectory_id": event.trajectory_id,
             }
         if isinstance(event, ErrorEvent):
-            return "error", {"message": event.message, "code": event.code}
+            return "error", {
+                "message": event.message,
+                "code": event.code,
+                "metadata": copy.deepcopy(event.metadata),
+            }
         return None, {}
 
     async def _route_tool_intent_for_exposure(

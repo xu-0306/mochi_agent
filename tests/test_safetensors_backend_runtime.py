@@ -195,3 +195,46 @@ def test_safetensors_summarize_device_map_limits_log_size() -> None:
 
     assert "layer_0" in summary
     assert "+2 more" in summary
+
+
+def test_safetensors_model_info_uses_config_context_length(tmp_path: Path) -> None:
+    model_dir = tmp_path / "hf-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"max_position_embeddings": 32768}', encoding="utf-8")
+
+    backend = SafetensorsBackend(model_dir=str(model_dir))
+
+    info = backend.get_model_info()
+
+    assert info.context_length == 32768
+    assert info.metadata["context_length_source"] == "config.json:max_position_embeddings"
+
+
+def test_safetensors_model_info_uses_tokenizer_context_length_when_config_missing(tmp_path: Path) -> None:
+    model_dir = tmp_path / "hf-model"
+    model_dir.mkdir()
+    (model_dir / "tokenizer_config.json").write_text('{"model_max_length": 8192}', encoding="utf-8")
+
+    backend = SafetensorsBackend(model_dir=str(model_dir))
+
+    info = backend.get_model_info()
+
+    assert info.context_length == 8192
+    assert info.metadata["context_length_source"] == "tokenizer_config.json:model_max_length"
+
+
+def test_safetensors_model_info_marks_fallback_when_context_length_is_unknown(tmp_path: Path) -> None:
+    model_dir = tmp_path / "hf-model"
+    model_dir.mkdir()
+    (model_dir / "tokenizer_config.json").write_text(
+        '{"model_max_length": 1000000000000000000000}',
+        encoding="utf-8",
+    )
+
+    backend = SafetensorsBackend(model_dir=str(model_dir))
+
+    info = backend.get_model_info()
+
+    assert info.context_length is None
+    assert info.metadata["context_length_source"] == "fallback_default"
+    assert info.metadata["context_length_fallback"] == 4096

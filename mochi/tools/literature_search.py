@@ -62,6 +62,154 @@ def _as_str(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _year_from_text(value: Any) -> str:
+    text = _as_str(value).strip()
+    if not text:
+        return ""
+    match = re.search(r"\b(\d{4})\b", text)
+    return match.group(1) if match else ""
+
+
+def _join_authors(authors: Any, *, limit: int = 4) -> str:
+    names: list[str] = []
+    for author in _as_list(authors):
+        if isinstance(author, str):
+            name = _clean_text(author)
+        elif isinstance(author, dict):
+            name = _clean_text(_as_str(author.get("name")))
+        else:
+            name = ""
+        if name:
+            names.append(name)
+    if not names:
+        return ""
+    if len(names) <= limit:
+        return ", ".join(names)
+    return f"{', '.join(names[:limit])}, et al."
+
+
+def _append_line(lines: list[str], label: str, value: str) -> None:
+    text = _clean_text(value)
+    if text:
+        lines.append(f"   {label}: {text}")
+
+
+def _truncate_plain_text(value: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(value) <= max_chars:
+        return value
+    suffix = "...[truncated]"
+    if max_chars <= len(suffix):
+        return suffix[:max_chars]
+    return value[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def _literature_entry_lines(item: dict[str, Any], index: int) -> list[str]:
+    title = _clean_text(
+        _as_str(item.get("title")) or _as_str(item.get("container_title")) or _as_str(item.get("journal"))
+    ) or "Untitled"
+    year = (
+        _year_from_text(item.get("year"))
+        or _year_from_text(item.get("published"))
+        or _year_from_text(item.get("publication_date"))
+        or _year_from_text(item.get("pubdate"))
+        or _year_from_text(item.get("epubdate"))
+    )
+    heading = f"{index}. {title}"
+    if year:
+        heading += f" ({year})"
+    lines = [heading]
+
+    authors = _join_authors(item.get("authors"))
+    _append_line(lines, "Authors", authors)
+
+    source_parts: list[str] = []
+    arxiv_id = _as_str(item.get("id")) or _as_str(item.get("arxiv_id"))
+    if arxiv_id:
+        source_parts.append(f"arXiv {arxiv_id}")
+    pmid = _as_str(item.get("pmid"))
+    if pmid:
+        source_parts.append(f"PubMed {pmid}")
+    doi = _as_str(item.get("doi"))
+    if doi:
+        source_parts.append(f"DOI {doi}")
+    venue = _as_str(item.get("venue")) or _as_str(item.get("container_title")) or _as_str(item.get("journal"))
+    if venue:
+        source_parts.append(venue)
+    source_text = " | ".join(part for part in source_parts if part)
+    _append_line(lines, "Source", source_text)
+
+    summary = _as_str(item.get("summary")) or _as_str(item.get("abstract"))
+    _append_line(lines, "Abstract", summary)
+
+    url = _as_str(item.get("url"))
+    _append_line(lines, "URL", url)
+
+    pdf_url = _as_str(item.get("pdf_url"))
+    if pdf_url and pdf_url != url:
+        _append_line(lines, "PDF", pdf_url)
+    return lines
+
+
+def _trim_abstract_lines(lines: list[str], *, max_chars: int) -> list[str]:
+    shortened: list[str] = []
+    for line in lines:
+        if line.startswith("   Abstract: "):
+            shortened.append(_truncate_plain_text(line, max_chars))
+        else:
+            shortened.append(line)
+    return shortened
+
+
+def _drop_lines_with_prefixes(lines: list[str], prefixes: tuple[str, ...]) -> list[str]:
+    return [line for line in lines if not any(line.startswith(prefix) for prefix in prefixes)]
+
+
+def _render_literature_lines(entries: list[dict[str, Any]], *, abstract_chars: int | None, omit_pdf: bool) -> str:
+    lines = ["Top literature matches:"]
+    for index, item in enumerate(entries, start=1):
+        item_lines = _literature_entry_lines(item, index)
+        if abstract_chars is not None:
+            item_lines = _trim_abstract_lines(item_lines, max_chars=abstract_chars)
+        if abstract_chars is None:
+            item_lines = _drop_lines_with_prefixes(item_lines, ("   Abstract: ",))
+        if omit_pdf:
+            item_lines = _drop_lines_with_prefixes(item_lines, ("   PDF: ",))
+        lines.extend(item_lines)
+    return "\n".join(lines)
+
+
+def _format_literature_result_for_model(result: ToolResult, *, max_chars: int) -> str | None:
+    if result.error is not None:
+        return None
+    output = result.output
+    if not isinstance(output, list):
+        return None
+    entries = [_as_dict(item) for item in output if isinstance(item, dict)]
+    if not entries:
+        return "Top literature matches:\n(none)"
+
+    max_items = min(5, len(entries))
+    min_items = min(2, max_items)
+    best_render = "Top literature matches:\n(none)"
+    for count in range(max_items, min_items - 1, -1):
+        active_entries = entries[:count]
+        candidates = (
+            _render_literature_lines(active_entries, abstract_chars=320, omit_pdf=False),
+            _render_literature_lines(active_entries, abstract_chars=160, omit_pdf=False),
+            _render_literature_lines(active_entries, abstract_chars=80, omit_pdf=False),
+            _render_literature_lines(active_entries, abstract_chars=None, omit_pdf=False),
+            _render_literature_lines(active_entries, abstract_chars=None, omit_pdf=True),
+        )
+        for candidate in candidates:
+            if len(candidate) <= max_chars:
+                return candidate
+            best_render = candidate
+
+    return _truncate_plain_text(best_render, max_chars)
+
+
 class ArxivSearchTool(BaseTool):
     """Search arXiv papers through the official arXiv API."""
 
@@ -144,6 +292,17 @@ class ArxivSearchTool(BaseTool):
             "required": ["query"],
             "additionalProperties": False,
         }
+
+    def format_result_for_model(
+        self,
+        result: ToolResult,
+        *,
+        max_chars: int = 2000,
+    ) -> str:
+        rendered = _format_literature_result_for_model(result, max_chars=max_chars)
+        if rendered is not None:
+            return rendered
+        return super().format_result_for_model(result, max_chars=max_chars)
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """執行 arXiv 搜尋。"""
@@ -317,6 +476,17 @@ class SemanticScholarSearchTool(BaseTool):
             "additionalProperties": False,
         }
 
+    def format_result_for_model(
+        self,
+        result: ToolResult,
+        *,
+        max_chars: int = 2000,
+    ) -> str:
+        rendered = _format_literature_result_for_model(result, max_chars=max_chars)
+        if rendered is not None:
+            return rendered
+        return super().format_result_for_model(result, max_chars=max_chars)
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         """執行 Semantic Scholar 搜尋。"""
         query = str(kwargs.get("query", ""))
@@ -472,6 +642,17 @@ class CrossrefSearchTool(BaseTool):
             "required": ["query"],
             "additionalProperties": False,
         }
+
+    def format_result_for_model(
+        self,
+        result: ToolResult,
+        *,
+        max_chars: int = 2000,
+    ) -> str:
+        rendered = _format_literature_result_for_model(result, max_chars=max_chars)
+        if rendered is not None:
+            return rendered
+        return super().format_result_for_model(result, max_chars=max_chars)
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """執行 Crossref 搜尋。"""
@@ -635,6 +816,17 @@ class PubMedSearchTool(BaseTool):
             "required": ["query"],
             "additionalProperties": False,
         }
+
+    def format_result_for_model(
+        self,
+        result: ToolResult,
+        *,
+        max_chars: int = 2000,
+    ) -> str:
+        rendered = _format_literature_result_for_model(result, max_chars=max_chars)
+        if rendered is not None:
+            return rendered
+        return super().format_result_for_model(result, max_chars=max_chars)
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """執行 PubMed 搜尋。"""

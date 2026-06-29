@@ -726,7 +726,8 @@ def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> N
     assert payload["agent"] == {
         "system_prompt": config.agent.system_prompt,
         "temperature": 0.7,
-        "max_tokens": 4096,
+        "max_tokens": None,
+        "reserve_output_tokens": None,
         "top_p": 1.0,
         "min_p": 0.0,
         "top_k": 0,
@@ -740,7 +741,8 @@ def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> N
                 "name": "default",
                 "system_prompt": "",
                 "temperature": 0.7,
-                "max_tokens": 4096,
+                "max_tokens": None,
+                "reserve_output_tokens": None,
                 "top_p": 1.0,
                 "min_p": 0.0,
                 "top_k": 0,
@@ -999,12 +1001,15 @@ def test_settings_route_reports_managed_vllm_launch_mode() -> None:
     assert payload["model_config"]["vllm_launch_mode"] == "managed"
 
 
-def test_settings_get_and_patch_support_gguf_and_vllm_context_length(tmp_path: Path) -> None:
-    """`/v1/settings` 應回傳並更新 GGUF 與 vLLM 的 context length 設定。"""
+def test_settings_get_and_patch_support_ollama_gguf_and_vllm_context_length(tmp_path: Path) -> None:
+    """`/v1/settings` should expose and patch provider-specific context length settings."""
     config = MochiConfig.model_validate(
         {
             "workspace_dir": str(tmp_path / "workspace"),
-            "model": str(tmp_path / "models" / "demo.gguf"),
+            "model": "ollama:qwen2.5",
+            "ollama": {
+                "num_ctx": 16384,
+            },
             "gguf": {
                 "n_ctx": 4096,
             },
@@ -1018,12 +1023,16 @@ def test_settings_get_and_patch_support_gguf_and_vllm_context_length(tmp_path: P
     with TestClient(app) as client:
         before = client.get("/v1/settings")
         assert before.status_code == 200
+        assert before.json()["ollama"] == {"num_ctx": 16384}
         assert before.json()["gguf"] == {"n_ctx": 4096}
         assert before.json()["vllm"] == {"max_model_len": 8192}
 
         response = client.patch(
             "/v1/settings",
             json={
+                "ollama": {
+                    "num_ctx": 32768,
+                },
                 "gguf": {
                     "n_ctx": 16384,
                 },
@@ -1035,12 +1044,14 @@ def test_settings_get_and_patch_support_gguf_and_vllm_context_length(tmp_path: P
 
         assert response.status_code == 200
         payload = response.json()
+        assert payload["ollama"] == {"num_ctx": 32768}
         assert payload["gguf"] == {"n_ctx": 16384}
         assert payload["vllm"] == {"max_model_len": 32768}
 
         followup = client.get("/v1/settings")
 
     assert followup.status_code == 200
+    assert followup.json()["ollama"] == {"num_ctx": 32768}
     assert followup.json()["gguf"] == {"n_ctx": 16384}
     assert followup.json()["vllm"] == {"max_model_len": 32768}
 
@@ -1222,6 +1233,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
                     "system_prompt": "你是 Mochi inference 測試代理。",
                     "temperature": 0.25,
                     "max_tokens": 8192,
+                    "reserve_output_tokens": 1536,
                     "top_p": 0.9,
                     "min_p": 0.05,
                     "top_k": 32,
@@ -1236,6 +1248,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
                             "system_prompt": "default prompt",
                             "temperature": 0.4,
                             "max_tokens": 4096,
+                            "reserve_output_tokens": 1024,
                             "top_p": 0.95,
                             "min_p": 0.0,
                             "top_k": 0,
@@ -1249,6 +1262,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
                             "system_prompt": "focused prompt",
                             "temperature": 0.2,
                             "max_tokens": 2048,
+                            "reserve_output_tokens": 768,
                             "top_p": 0.8,
                             "min_p": 0.1,
                             "top_k": 24,
@@ -1288,6 +1302,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
             "system_prompt": "你是 Mochi inference 測試代理。",
             "temperature": 0.25,
             "max_tokens": 8192,
+            "reserve_output_tokens": 1536,
             "top_p": 0.9,
             "min_p": 0.05,
             "top_k": 32,
@@ -1302,6 +1317,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
                     "system_prompt": "default prompt",
                     "temperature": 0.4,
                     "max_tokens": 4096,
+                    "reserve_output_tokens": 1024,
                     "top_p": 0.95,
                     "min_p": 0.0,
                     "top_k": 0,
@@ -1315,6 +1331,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
                     "system_prompt": "focused prompt",
                     "temperature": 0.2,
                     "max_tokens": 2048,
+                    "reserve_output_tokens": 768,
                     "top_p": 0.8,
                     "min_p": 0.1,
                     "top_k": 24,
@@ -1369,6 +1386,78 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
     assert followup_payload["security"]["exec_session_output_limit"] == 16384
     assert followup_payload["security"]["file_ops_scope"] == "any"
     assert followup_payload["security"]["file_undo_max_size_mb"] == 1.5
+
+
+def test_settings_patch_persists_auto_output_token_mode(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(tmp_path / "workspace"),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "skills_dir": str(tmp_path / "skills"),
+            "plugins_dir": str(tmp_path / "plugins"),
+            "agent": {
+                "max_tokens": 8192,
+                "reserve_output_tokens": 2048,
+                "presets": [
+                    {
+                        "name": "default",
+                        "system_prompt": "",
+                        "temperature": 0.7,
+                        "max_tokens": 8192,
+                        "reserve_output_tokens": 2048,
+                        "top_p": 1.0,
+                        "min_p": 0.0,
+                        "top_k": 0,
+                        "frequency_penalty": 0.0,
+                        "presence_penalty": 0.0,
+                        "repeat_penalty": 1.0,
+                        "reasoning_effort": None,
+                    }
+                ],
+            },
+        }
+    )
+    app = _create_test_app(config=config)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/v1/settings",
+            json={
+                "agent": {
+                    "max_tokens": None,
+                    "reserve_output_tokens": None,
+                    "presets": [
+                        {
+                            "name": "default",
+                            "system_prompt": "",
+                            "temperature": 0.7,
+                            "max_tokens": None,
+                            "reserve_output_tokens": None,
+                            "top_p": 1.0,
+                            "min_p": 0.0,
+                            "top_k": 0,
+                            "frequency_penalty": 0.0,
+                            "presence_penalty": 0.0,
+                            "repeat_penalty": 1.0,
+                            "reasoning_effort": None,
+                        }
+                    ],
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["agent"]["max_tokens"] is None
+        assert payload["agent"]["reserve_output_tokens"] is None
+        assert payload["agent"]["presets"][0]["max_tokens"] is None
+        assert payload["agent"]["presets"][0]["reserve_output_tokens"] is None
+
+        followup = client.get("/v1/settings")
+
+    assert followup.status_code == 200
+    assert followup.json()["agent"]["max_tokens"] is None
+    assert followup.json()["agent"]["reserve_output_tokens"] is None
 
 
 def test_settings_patch_applies_autonomy_mode_defaults(tmp_path: Path) -> None:

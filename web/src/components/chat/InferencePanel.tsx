@@ -8,9 +8,18 @@ import type { AgentSettings, InferencePreset } from '@/lib/api'
 import { InferenceControls } from '@/components/chat/InferenceControls'
 import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
 import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
-import type { InferenceParams } from '@/lib/stores/inference-store'
+import {
+  resolveInferenceTokenControls,
+  type InferenceParams,
+} from '@/lib/stores/inference-store'
 import {
   buildContextLengthSettingsUpdate,
+  contextLengthSettingsBadge,
+  contextLengthSettingsDescription,
+  contextLengthSettingsFieldLabel,
+  contextLengthSettingsPlaceholder,
+  contextLengthSettingsRuntimeHint,
+  contextLengthSettingsTitle,
   resolveContextLengthSettingsTarget,
 } from '@/lib/model-context-settings'
 
@@ -36,6 +45,7 @@ interface InferencePanelProps {
   disabledReason?: string | null
   agent?: AgentSettings
   settings?: api.Settings | null
+  activeModelInfo?: Record<string, unknown> | null
   onSettingsUpdated?: (settings: api.Settings) => void
 }
 
@@ -56,14 +66,19 @@ function PanelBody({
   disabledKeys,
   disabledReason,
   settings,
+  activeModelInfo,
   onSettingsUpdated,
   onClose,
 }: Omit<InferencePanelProps, 'open' | 'mobileOpen' | 'onOpenChange' | 'onMobileOpenChange' | 'agent'> & {
   onClose?: () => void
 }) {
   const contextLengthTarget = React.useMemo(
-    () => resolveContextLengthSettingsTarget(settings),
-    [settings]
+    () => resolveContextLengthSettingsTarget(settings, activeModelInfo),
+    [activeModelInfo, settings]
+  )
+  const tokenControls = React.useMemo(
+    () => resolveInferenceTokenControls(value, settings, activeModelInfo),
+    [activeModelInfo, settings, value]
   )
   const [contextLengthInput, setContextLengthInput] = React.useState(
     contextLengthTarget.value === null ? '' : String(contextLengthTarget.value)
@@ -94,7 +109,11 @@ function PanelBody({
     } else if (trimmed.length > 0) {
       const parsed = Number.parseInt(trimmed, 10)
       if (!Number.isInteger(parsed) || parsed <= 0) {
-        setContextSettingsMessage('vLLM max model length must be a positive integer or left blank for auto.')
+        setContextSettingsMessage(
+          contextLengthTarget.kind === 'ollama'
+            ? 'Ollama num_ctx must be a positive integer or left blank for server default.'
+            : 'vLLM max model length must be a positive integer or left blank for auto.'
+        )
         return
       }
       parsedValue = parsed
@@ -111,7 +130,11 @@ function PanelBody({
       setContextSettingsMessage(
         contextLengthTarget.kind === 'gguf'
           ? 'Saved GGUF context window.'
-          : 'Saved vLLM max model length.'
+          : contextLengthTarget.kind === 'ollama'
+            ? (parsedValue === null
+              ? 'Cleared Ollama context override. The server default will be used.'
+              : 'Saved Ollama context window override.')
+            : 'Saved vLLM max model length.'
       )
     } catch (error) {
       setContextSettingsMessage(
@@ -198,30 +221,26 @@ function PanelBody({
 
           {contextLengthTarget.kind ? (
             <PanelSectionCard
-              title={contextLengthTarget.kind === 'gguf' ? 'Context window' : 'Max model length'}
-              description={
-                contextLengthTarget.kind === 'gguf'
-                  ? 'Writes to `gguf.n_ctx` for the active GGUF model.'
-                  : 'Writes the managed vLLM startup override for `vllm.max_model_len`. Leave blank to use auto sizing.'
-              }
+              title={contextLengthSettingsTitle(contextLengthTarget.kind)}
+              description={contextLengthSettingsDescription(contextLengthTarget)}
             >
               <div className="space-y-3">
                 <label className="space-y-1.5">
                   <span className="text-xs font-medium text-muted-foreground">
-                    {contextLengthTarget.kind === 'gguf' ? 'Context length' : 'Max model length'}
+                    {contextLengthSettingsFieldLabel(contextLengthTarget.kind)}
                   </span>
                   <input
                     value={contextLengthInput}
                     onChange={(event) => setContextLengthInput(event.target.value)}
                     inputMode="numeric"
-                    placeholder={contextLengthTarget.kind === 'gguf' ? '4096' : 'auto'}
+                    placeholder={contextLengthSettingsPlaceholder(contextLengthTarget)}
                     className="h-10 w-full rounded-xl border border-white/10 bg-surface-layer/85 px-3 font-mono text-sm text-foreground shadow-inner"
                   />
                 </label>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="inline-flex items-center gap-1 rounded-full border border-white/8 bg-surface-layer/70 px-2.5 py-1 text-[11px] text-muted-foreground">
                     <Sparkles className="h-3 w-3 text-primary-300" />
-                    Runtime-specific override
+                    {contextLengthSettingsBadge(contextLengthTarget.kind)}
                   </div>
                   <Button
                     type="button"
@@ -234,6 +253,11 @@ function PanelBody({
                     Save Context Setting
                   </Button>
                 </div>
+                {contextLengthSettingsRuntimeHint(contextLengthTarget) ? (
+                  <p className="rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-2 text-xs text-muted-foreground">
+                    {contextLengthSettingsRuntimeHint(contextLengthTarget)}
+                  </p>
+                ) : null}
                 {contextSettingsMessage ? (
                   <p className="rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-2 text-xs text-muted-foreground">
                     {contextSettingsMessage}
@@ -250,6 +274,7 @@ function PanelBody({
             <InferenceControls
               value={value}
               onChange={onChange}
+              tokenControls={tokenControls}
               supportsReasoningEffort={supportsReasoningEffort}
               showReasoningEffort={showReasoningEffort}
               reasoningEffortOptions={reasoningEffortOptions}

@@ -21,6 +21,7 @@ class ToolExposurePlan:
     workspace_bound: bool = False
     attachment_count: int = 0
     intent_route: dict[str, Any] | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def exposure_metadata(self) -> dict[str, Any]:
         payload = {
@@ -30,6 +31,8 @@ class ToolExposurePlan:
         }
         if self.intent_route is not None:
             payload["intent_route"] = dict(self.intent_route)
+        if self.diagnostics:
+            payload["diagnostics"] = dict(self.diagnostics)
         return payload
 
 
@@ -37,6 +40,7 @@ class ToolExposurePlanner:
     """Select a smaller, intent-matched tool subset for one turn."""
     _CORE_WORKSPACE_READ_ONLY_TOOLS: tuple[str, ...] = (
         "file_read",
+        "tool_result_read",
         "glob_search",
         "grep_search",
         "csv_read",
@@ -468,11 +472,24 @@ class ToolExposurePlanner:
                 workspace_bound=session_bound_workspace,
                 attachment_count=max(0, attachment_count),
                 intent_route=intent_route_metadata,
+                diagnostics={
+                    "stage": "planner",
+                    "disable_reason": "tool_mode_disabled",
+                    "available_tool_count": len(available_tool_names),
+                    "tool_mode": tool_mode,
+                },
             )
 
         backend_info = backend.get_model_info()
         metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
-        if metadata.get("tool_calling_blocked") is True or metadata.get("tool_call_mode") == "unavailable":
+        prompt_guided_ollama = (
+            backend_info.backend_type == "ollama"
+            and (metadata.get("tool_calling_protocol") or metadata.get("tool_calling_style"))
+            == "prompt_guided"
+        )
+        if metadata.get("tool_calling_blocked") is True or (
+            metadata.get("tool_call_mode") == "unavailable" and not prompt_guided_ollama
+        ):
             return ToolExposurePlan(
                 tool_names=[],
                 matched_groups=[],
@@ -481,6 +498,16 @@ class ToolExposurePlanner:
                 workspace_bound=session_bound_workspace,
                 attachment_count=max(0, attachment_count),
                 intent_route=intent_route_metadata,
+                diagnostics={
+                    "stage": "planner",
+                    "disable_reason": (
+                        "backend_tool_calling_blocked"
+                        if metadata.get("tool_calling_blocked") is True
+                        else "backend_tool_calling_unavailable"
+                    ),
+                    "available_tool_count": len(available_tool_names),
+                    "backend": self._backend_diagnostics(backend_info, metadata),
+                },
             )
 
         lowered = message.lower()
@@ -682,6 +709,11 @@ class ToolExposurePlanner:
                 )
             )
         )
+        open_world_focus_request = (
+            session_bound_workspace
+            and (research_request or web_request)
+            and not explicit_workspace_request
+        )
         non_workspace_attachment_request = (
             normalized_attachment_count > 0
             and normalized_workspace_attachment_count == 0
@@ -700,6 +732,8 @@ class ToolExposurePlanner:
             ):
                 continue
             if non_workspace_attachment_request and tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS:
+                continue
+            if open_world_focus_request and tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS:
                 continue
             if tool_name in self._CONTEXTUAL_TOOLS and not self._matches_any_keyword(
                 lowered,
@@ -732,7 +766,14 @@ class ToolExposurePlanner:
         workspace_baseline = [
             tool_name
             for tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS
-            if session_bound_workspace and tool_name in available
+            if session_bound_workspace
+            and tool_name in available
+            and (
+                workspace_focus_request
+                or file_browse_request
+                or attached_workspace_files
+                or attachment_processing_request
+            )
         ]
         general_web_baseline = [
             tool_name
@@ -773,11 +814,39 @@ class ToolExposurePlanner:
             workspace_bound=session_bound_workspace,
             attachment_count=normalized_attachment_count,
             intent_route=intent_route_metadata,
+            diagnostics={
+                "stage": "planner",
+                "available_tool_count": len(available_tool_names),
+                "filtered_tool_count": len(filtered),
+                "final_tool_count": len(final_tool_names),
+                "backend": self._backend_diagnostics(backend_info, metadata),
+            },
         )
 
     @staticmethod
     def _normalize_routed_intent(routed_intent: ToolIntent | str | None) -> ToolIntent | None:
         return normalize_tool_intent_name(routed_intent)
+
+    @staticmethod
+    def _backend_diagnostics(backend_info: Any, metadata: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "tool_call_mode",
+            "tool_calling_protocol",
+            "tool_calling_style",
+            "tool_calling_blocked",
+            "native_tool_calling_status",
+            "fallback_validation_status",
+        )
+        return {
+            "backend_type": getattr(backend_info, "backend_type", None),
+            "provider": getattr(backend_info, "provider", None),
+            "model": getattr(backend_info, "name", None),
+            "metadata": {
+                key: metadata.get(key)
+                for key in keys
+                if key in metadata
+            },
+        }
 
     @classmethod
     def _intent_route_metadata(

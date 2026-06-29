@@ -227,6 +227,6 @@ class ModelInfo:
     name: str
     backend_type: str
     provider: str | None = None
-    context_length: int = 4096
+    context_length: int | None = None
     supports_tool_calling: bool = False
     metadata: dict[str, Any] = field(default_factory=partial(dict[str, Any]))

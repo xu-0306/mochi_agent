@@ -27,7 +27,8 @@ def test_default_config_is_valid() -> None:
     assert cfg.agent.max_react_iterations == 10
     assert cfg.agent.system_prompt
     assert cfg.agent.temperature == 0.7
-    assert cfg.agent.max_tokens == 4096
+    assert cfg.agent.max_tokens is None
+    assert cfg.agent.reserve_output_tokens is None
     assert cfg.agent.top_p == 1.0
     assert cfg.agent.min_p == 0.0
     assert cfg.agent.top_k == 0
@@ -37,7 +38,10 @@ def test_default_config_is_valid() -> None:
     assert cfg.agent.show_token_stats is False
     assert len(cfg.agent.presets) == 1
     assert cfg.agent.presets[0].name == "default"
+    assert cfg.agent.presets[0].max_tokens is None
+    assert cfg.agent.presets[0].reserve_output_tokens is None
     assert cfg.agent.active_preset == "default"
+    assert cfg.ollama.num_ctx is None
     assert cfg.model_setup.mode == "configured_or_setup"
     assert cfg.model_setup.default_provider == "ollama"
     assert cfg.model_setup.default_model == "llama3.2"
@@ -141,7 +145,8 @@ def test_default_yaml_parseable() -> None:
 
     assert cfg.model == "ollama:llama3.2"
     assert cfg.agent.temperature == 0.7
-    assert cfg.agent.max_tokens == 4096
+    assert cfg.agent.max_tokens is None
+    assert cfg.agent.reserve_output_tokens is None
     assert cfg.agent.top_p == 1.0
     assert cfg.agent.min_p == 0.0
     assert cfg.agent.top_k == 0
@@ -150,7 +155,10 @@ def test_default_yaml_parseable() -> None:
     assert cfg.agent.repeat_penalty == 1.0
     assert cfg.agent.show_token_stats is False
     assert [preset.name for preset in cfg.agent.presets] == ["default"]
+    assert cfg.agent.presets[0].max_tokens is None
+    assert cfg.agent.presets[0].reserve_output_tokens is None
     assert cfg.agent.active_preset == "default"
+    assert cfg.ollama.num_ctx is None
     assert cfg.model_setup.mode == "configured_or_setup"
     assert cfg.model_setup.default_provider == "ollama"
     assert cfg.model_setup.default_model == "llama3.2"
@@ -228,6 +236,36 @@ def test_default_yaml_parseable() -> None:
     assert cfg.security.require_approval_for_file_write is False
     assert cfg.security.file_ops_scope == "workspace"
     assert cfg.security.file_undo_max_size_mb == 2.0
+
+
+def test_legacy_default_output_token_pair_migrates_to_auto() -> None:
+    cfg = MochiConfig.model_validate(
+        {
+            "agent": {
+                "max_tokens": 4096,
+                "reserve_output_tokens": 1024,
+                "presets": [
+                    {
+                        "name": "default",
+                        "max_tokens": 4096,
+                        "reserve_output_tokens": 1024,
+                    },
+                    {
+                        "name": "manual-legacy",
+                        "max_tokens": 4096,
+                        "reserve_output_tokens": 1024,
+                    },
+                ],
+            }
+        }
+    )
+
+    assert cfg.agent.max_tokens is None
+    assert cfg.agent.reserve_output_tokens is None
+    assert cfg.agent.presets[0].max_tokens is None
+    assert cfg.agent.presets[0].reserve_output_tokens is None
+    assert cfg.agent.presets[1].max_tokens == 4096
+    assert cfg.agent.presets[1].reserve_output_tokens == 1024
 
 
 def test_default_paths_are_project_local_on_windows(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 
 try:
@@ -32,6 +33,7 @@ class BackendRouter:
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
+        ollama_num_ctx: int | None = None,
         openai_default_model: str = "auto",
         openai_api_key: str = "",
         openai_codex_default_model: str | None = None,
@@ -44,6 +46,7 @@ class BackendRouter:
         local_model_idle_unload_seconds: int | None = None,
     ) -> None:
         self._ollama_base_url = ollama_base_url
+        self._ollama_num_ctx = ollama_num_ctx
         self._openai_compat_default_model = openai_default_model
         self._openai_compat_api_key = openai_api_key
         self._openai_codex_default_model = openai_codex_default_model or openai_default_model
@@ -61,6 +64,7 @@ class BackendRouter:
         self,
         *,
         ollama_base_url: str,
+        ollama_num_ctx: int | None,
         openai_default_model: str,
         openai_api_key: str,
         openai_codex_default_model: str | None = None,
@@ -73,6 +77,7 @@ class BackendRouter:
         local_model_idle_unload_seconds: int | None,
     ) -> None:
         self._ollama_base_url = ollama_base_url
+        self._ollama_num_ctx = ollama_num_ctx
         self._openai_compat_default_model = openai_default_model
         self._openai_compat_api_key = openai_api_key
         self._openai_codex_default_model = openai_codex_default_model or openai_default_model
@@ -91,6 +96,7 @@ class BackendRouter:
         if self._active is not None:
             await self._active.close()
         self._active = backend
+        await self._prime_backend_model_info(backend)
         self._schedule_idle_unload_if_needed(backend)
         logger.info("Loaded backend: {} for '{}'", type(backend).__name__, model_spec)
         return backend
@@ -111,7 +117,13 @@ class BackendRouter:
         normalized_base_url = (base_url or self._ollama_base_url).strip().rstrip("/")
         if not normalized_base_url:
             raise ValueError("Ollama base_url must not be empty.")
-        backend = OllamaBackend(model=normalized_model, base_url=normalized_base_url)
+        backend_kwargs = {
+            "model": normalized_model,
+            "base_url": normalized_base_url,
+        }
+        if self._ollama_num_ctx is not None:
+            backend_kwargs["num_ctx"] = self._ollama_num_ctx
+        backend = OllamaBackend(**backend_kwargs)
         active_backend = await self._switch_to_backend(backend, f"ollama:{normalized_model}")
         self._ollama_base_url = normalized_base_url
         return active_backend
@@ -187,6 +199,7 @@ class BackendRouter:
         )
         try:
             await self._ensure_backend_ready(backend, model_spec)
+            await self._prime_backend_model_info(backend)
         except Exception:
             await backend.close()
             raise
@@ -205,9 +218,21 @@ class BackendRouter:
                 await previous.close()
             except Exception as exc:
                 logger.warning("Failed to close previous backend after switch: {}", exc)
+        await self._prime_backend_model_info(backend)
         self._schedule_idle_unload_if_needed(backend)
         logger.info("Switched backend: {} for '{}'", type(backend).__name__, model_spec)
         return backend
+
+    async def _prime_backend_model_info(self, backend: BaseLLMBackend) -> None:
+        prime = getattr(backend, "prime_model_info", None)
+        if not callable(prime):
+            return
+        try:
+            result = prime()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.debug("Backend model-info prime skipped after runtime error: {}", exc)
 
     def _build_unhealthy_backend_error(
         self,
@@ -284,7 +309,13 @@ class BackendRouter:
             if not resolved_model_name:
                 raise ValueError("Ollama model spec must be 'ollama:<model_name>'.")
             resolved_base_url = (base_url or self._ollama_base_url).strip().rstrip("/")
-            return OllamaBackend(model=resolved_model_name, base_url=resolved_base_url)
+            backend_kwargs = {
+                "model": resolved_model_name,
+                "base_url": resolved_base_url,
+            }
+            if self._ollama_num_ctx is not None:
+                backend_kwargs["num_ctx"] = self._ollama_num_ctx
+            return OllamaBackend(**backend_kwargs)
 
         if model_spec.startswith(("http://", "https://")):
             resolved_base_url = (base_url or model_spec).strip().rstrip("/")

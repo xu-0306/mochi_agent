@@ -293,6 +293,20 @@ class FileReadTool(BaseTool):
         if not reference_id:
             return ToolResult(error="`tool-result://` path must include a reference id.")
 
+        return self._resolve_tool_result_reference_id(reference_id=reference_id, context=context)
+
+    def _resolve_tool_result_reference_id(
+        self,
+        *,
+        reference_id: str,
+        context: ToolExecutionContext | None,
+    ) -> ToolResult:
+        if context is None:
+            return ToolResult(error="Tool result reads require an execution context.")
+
+        if not reference_id.strip():
+            return ToolResult(error="`reference_id` must not be empty.")
+
         reference = context.tool_result_references.get(reference_id)
         if not isinstance(reference, dict):
             return ToolResult(error=f"Unknown tool result reference: {reference_id}")
