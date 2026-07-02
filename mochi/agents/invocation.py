@@ -8,6 +8,7 @@ from typing import Any, Literal
 from mochi.agents.events import AgentEvent
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.types import AttachmentRef
+from mochi.tools.base import ActiveToolController, RunCancellationContext
 
 ToolMode = Literal["disabled", "auto", "required"]
 ExecutionProfile = Literal[
@@ -46,6 +47,9 @@ class AgentInvocationRequest:
     persist_session: bool = True
     persist_turn_events: bool | None = None
     persist_learning: bool | None = None
+    turn_id: str | None = None
+    active_tool_controller: ActiveToolController | None = None
+    cancellation_context: RunCancellationContext | None = None
 
 
 @dataclass

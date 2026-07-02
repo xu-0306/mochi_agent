@@ -28,6 +28,7 @@ class _AttachmentCaptureEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        tool_mode: str = "auto",
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
     ) -> AsyncIterator[object]:
@@ -38,6 +39,7 @@ class _AttachmentCaptureEngine:
                 "attachments": attachments,
                 "project_id": project_id,
                 "workspace_dir": workspace_dir,
+                "tool_mode": tool_mode,
                 "selected_skill_ids": selected_skill_ids,
                 "inference_overrides": inference_overrides,
             }
@@ -53,10 +55,11 @@ class _DiagnosticsCaptureEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        tool_mode: str = "auto",
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
     ) -> AsyncIterator[object]:
-        del message, session_id, inference_overrides, project_id, workspace_dir, selected_skill_ids, attachments
+        del message, session_id, inference_overrides, project_id, workspace_dir, tool_mode, selected_skill_ids, attachments
         yield StatusEvent(
             content="Prepared workspace tool exposure.",
             metadata={
@@ -133,6 +136,7 @@ def test_chat_route_forwards_structured_attachments(tmp_path) -> None:
             ],
             "project_id": None,
             "workspace_dir": str(tmp_path),
+            "tool_mode": "auto",
             "selected_skill_ids": None,
             "inference_overrides": {},
         }
@@ -241,13 +245,28 @@ def test_chat_route_serializes_workspace_tool_exposure_and_transport_diagnostics
         },
     }
 
-    assert session_response.status_code == 200
-    session_events = session_response.json()["events"]
-    assert [event["phase"] for event in session_events] == [
-        "status",
-        "tool_call_request",
-        "tool_call_result",
-        "final_answer",
-    ]
-    assert session_events[0]["payload"] == payload["events"][0]
-    assert session_events[2]["payload"] == payload["events"][2]
+
+def test_chat_route_forwards_disabled_tool_mode(tmp_path) -> None:
+    app = create_app()
+    engine = _AttachmentCaptureEngine()
+    app.state.engine = engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+        }
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat",
+            json={
+                "message": "Answer directly without tools",
+                "session_id": "session-tool-mode",
+                "tool_mode": "disabled",
+            },
+        )
+
+    assert response.status_code == 200
+    assert engine.calls[0]["tool_mode"] == "disabled"

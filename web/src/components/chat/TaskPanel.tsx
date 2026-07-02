@@ -633,6 +633,7 @@ interface TaskPanelProps {
   onOpenChange: (open: boolean) => void
   mode?: TaskPanelMode
   focusedTaskId?: string | null
+  focusedApprovalIds?: string[] | null
   workflowRunId?: string | null
   onOpenWorkflowRun?: (runId: string) => void
 }
@@ -666,6 +667,7 @@ function TaskPanelBody({
   workflowLoading,
   workflowNativeContext,
   mode,
+  focusedApprovalIds,
   onOpenWorkflowRun,
   onClose,
 }: {
@@ -714,10 +716,24 @@ function TaskPanelBody({
   workflowLoading: boolean
   workflowNativeContext: boolean
   mode: TaskPanelMode
+  focusedApprovalIds?: string[] | null
   onOpenWorkflowRun?: (runId: string) => void
   onClose?: () => void
 }) {
-  const pendingApprovals = approvals.filter((item) => item.status === 'pending')
+  const focusedApprovalIdSet = React.useMemo(
+    () => new Set((focusedApprovalIds ?? []).filter((item) => item.trim().length > 0)),
+    [focusedApprovalIds]
+  )
+  const hasFocusedApprovals = focusedApprovalIdSet.size > 0
+  const allPendingApprovals = approvals.filter((item) => item.status === 'pending')
+  const pendingApprovals = hasFocusedApprovals
+    ? allPendingApprovals.filter((item) => focusedApprovalIdSet.has(item.approval_id))
+    : allPendingApprovals
+  const missingFocusedApprovalCount = hasFocusedApprovals
+    ? Array.from(focusedApprovalIdSet).filter(
+        (approvalId) => !allPendingApprovals.some((approval) => approval.approval_id === approvalId)
+      ).length
+    : 0
   const subagentFocusedMode = mode === 'subagent'
   const delegatedTaskCount = tasks.filter((task) => resolveDelegatedSubagentView({ task }) !== null).length
   const selectedSubagentView = selectedTaskDetail
@@ -905,17 +921,29 @@ function TaskPanelBody({
           {showPendingApprovalsSection ? (
             <div className={cn(subagentFocusedMode ? 'order-3' : 'order-2')}>
               <PanelSectionCard
-                title="Pending approvals"
+                title={hasFocusedApprovals ? 'Focused approvals' : 'Pending approvals'}
                 description={
+                  hasFocusedApprovals
+                    ? 'Approvals linked from the selected subagent drawer. Resolve them here using the existing review flow.'
+                    :
                   subagentFocusedMode
                     ? 'Kept visible here only when approvals are still blocking progress.'
                     : 'Decisions that need confirmation before a task can continue.'
                 }
               >
             <div className="max-h-[42rem] space-y-3 overflow-y-auto pr-1">
+              {hasFocusedApprovals ? (
+                <div className="rounded-xl border border-primary-500/20 bg-primary-500/10 px-3 py-2 text-xs text-muted-foreground">
+                  Showing {pendingApprovals.length} of {focusedApprovalIdSet.size} linked approval
+                  {focusedApprovalIdSet.size === 1 ? '' : 's'}.
+                  {missingFocusedApprovalCount > 0
+                    ? ` ${missingFocusedApprovalCount} linked approval${missingFocusedApprovalCount === 1 ? '' : 's'} no longer pending or not loaded.`
+                    : ''}
+                </div>
+              ) : null}
               {pendingApprovals.length === 0 ? (
                 <p className="rounded-xl border border-dashed border-white/10 bg-surface-layer/50 px-3 py-4 text-center text-xs text-muted-foreground">
-                  No pending approvals.
+                  {hasFocusedApprovals ? 'No matching pending approvals.' : 'No pending approvals.'}
                 </p>
               ) : (
                 pendingApprovals.map((approval) => (
@@ -1213,6 +1241,7 @@ export function TaskPanel({
   onOpenChange,
   mode = 'default',
   focusedTaskId = null,
+  focusedApprovalIds = null,
   workflowRunId,
   onOpenWorkflowRun,
 }: TaskPanelProps) {
@@ -1340,6 +1369,8 @@ export function TaskPanel({
       desktopSide="right"
       desktopWidthClass="w-[23rem]"
       desktopBreakpoint="lg"
+      mobileTitle={mode === 'subagent' ? 'Subagent conversation' : 'Background activity'}
+      mobileDescription="Review active tasks, pending approvals, and recoverable runs without moving the chat."
     >
       <TaskPanelBody
         isLoading={isLoading}
@@ -1370,6 +1401,7 @@ export function TaskPanel({
         workflowLoading={workflowLoading}
         workflowNativeContext={workflowNativeContext}
         mode={mode}
+        focusedApprovalIds={focusedApprovalIds}
         onOpenWorkflowRun={onOpenWorkflowRun}
         onClose={() => onOpenChange(false)}
       />

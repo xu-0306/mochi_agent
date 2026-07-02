@@ -78,6 +78,7 @@ from mochi.runtime.recovery import (
     build_resource_exhaustion_report,
     classify_agent_run_recovery_issue,
 )
+from mochi.tools.base import ActiveToolController, RunCancellationContext, cancel_asyncio_task
 
 RunState = Literal[
     "queued",
@@ -94,6 +95,18 @@ RunState = Literal[
 RunEventType = Literal[
     "state_changed",
     "guidance",
+    "subagent_prompt",
+    "subagent_thinking",
+    "subagent_message_accepted",
+    "subagent_message_applied",
+    "subagent_message_cancelled",
+    "subagent_message_deferred",
+    "subagent_interrupted",
+    "subagent_tool_call",
+    "subagent_tool_cancel_requested",
+    "subagent_tool_cancelled",
+    "subagent_tool_cancel_deferred",
+    "subagent_tool_result",
     "role_started",
     "role_progress",
     "role_completed",
@@ -174,6 +187,22 @@ class RoleProgressPayload:
     stage: str | None = None
     model_id: str | None = None
     detail: str | None = None
+    title: str | None = None
+    subagent_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SubagentPromptPayload:
+    """Prompt payload captured before a role invocation starts."""
+
+    subagent_id: str
+    role_id: str
+    title: str
+    model_id: str | None
+    system_prompt: str
+    user_prompt: str
+    stage: str
+    execution_profile: str
 
 
 @dataclass(frozen=True)
@@ -308,6 +337,7 @@ class MultiAgentRunRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     runtime_event_callback: Any | None = None
     event_callback: Any | None = None
+    subagent_message_provider: Any | None = None
 
 
 @dataclass
@@ -455,6 +485,8 @@ class MultiAgentOrchestrator:
         self._permission_policy: dict[str, Any] | None = None
         self._emit_runtime_event: Any | None = None
         self._collector_artifact_callback: Any | None = None
+        self._current_run_id: str | None = None
+        self._subagent_message_provider: Any | None = None
 
     def _configure_run_policy(self, run_policy: Mapping[str, Any] | None) -> None:
         self._run_policy = dict(run_policy or {})
@@ -472,6 +504,8 @@ class MultiAgentOrchestrator:
         self._permission_policy = None
         self._emit_runtime_event = None
         self._collector_artifact_callback = None
+        self._current_run_id = None
+        self._subagent_message_provider = None
         max_wall_clock_sec = self._run_policy.get("max_wall_clock_sec")
         try:
             max_wall_clock = int(max_wall_clock_sec)
@@ -525,6 +559,18 @@ class MultiAgentOrchestrator:
         lines.extend(f"- {item}" for item in role_guidance)
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _append_live_subagent_guidance_to_prompt(
+        *,
+        prompt: str,
+        guidance_messages: list[str],
+    ) -> str:
+        if not guidance_messages:
+            return prompt
+        lines = [prompt.rstrip(), "", "Live subagent guidance:"]
+        lines.extend(f"- {item}" for item in guidance_messages)
+        return "\n".join(lines).strip()
+
     def _emit_role_progress(
         self,
         event_type: Literal["role_started", "role_progress", "role_completed", "role_error"],
@@ -535,6 +581,8 @@ class MultiAgentOrchestrator:
         stage: str | None = None,
         model_id: str | None = None,
         detail: str | None = None,
+        title: str | None = None,
+        subagent_id: str | None = None,
     ) -> None:
         if self._emit_runtime_event is None:
             return
@@ -548,9 +596,701 @@ class MultiAgentOrchestrator:
                     stage=stage,
                     model_id=model_id,
                     detail=detail,
+                    title=title,
+                    subagent_id=subagent_id,
                 )
             ),
         )
+
+    def _visible_role_identity(self, role_id: str, role_title: str, stage: str) -> tuple[str, str]:
+        normalized_role_id = str(role_id or "").strip() or "subagent"
+        normalized_stage = str(stage or f"role::{normalized_role_id}").strip() or normalized_role_id
+        if normalized_stage == "autonomous_single_agent" and normalized_role_id == "agent":
+            return "primary", "Primary agent"
+        return normalized_role_id, role_title
+
+    def _subagent_id_for_role(self, *, role_id: str, stage: str) -> str:
+        run_id = str(self._current_run_id or "").strip() or "run"
+        return f"{run_id}:{_slugify(role_id or 'subagent')}:{_slugify(stage or role_id)}"
+
+    async def _call_subagent_message_provider(
+        self,
+        method_name: str,
+        **kwargs: Any,
+    ) -> Any:
+        provider = self._subagent_message_provider
+        if provider is None:
+            return None
+        method = getattr(provider, method_name, None)
+        if method is None and callable(provider) and method_name == "poll_messages":
+            method = provider
+        if method is None:
+            return None
+        result = method(**kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def _emit_subagent_message_delivery(
+        self,
+        event_type: Literal[
+            "subagent_message_accepted",
+            "subagent_message_applied",
+            "subagent_message_deferred",
+        ],
+        *,
+        message: Mapping[str, Any],
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        reason: str | None = None,
+    ) -> None:
+        if self._emit_runtime_event is None:
+            return
+        content = str(message.get("content") or "").strip()
+        message_id = str(message.get("message_id") or "").strip()
+        delivery_mode = str(message.get("delivery_mode") or "").strip() or "inject_now"
+        delivery_status = event_type.removeprefix("subagent_message_")
+        payload = {
+            "subagent_id": subagent_id,
+            "role_id": role_id,
+            "stage": stage,
+            "message_id": message_id or None,
+            "delivery_mode": delivery_mode,
+            "delivery_status": delivery_status,
+            "content": content or None,
+            "reason": reason,
+            "summary": (
+                f"Subagent message {delivery_status}"
+                + (f": {reason}" if reason else ".")
+            ),
+            "status": "running",
+        }
+        self._emit_runtime_event(event_type, {key: value for key, value in payload.items() if value is not None})
+
+    def _emit_subagent_control_event(
+        self,
+        event_type: Literal[
+            "subagent_interrupted",
+            "subagent_tool_cancel_requested",
+            "subagent_tool_cancelled",
+            "subagent_tool_cancel_deferred",
+        ],
+        *,
+        message: Mapping[str, Any],
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        reason: str | None = None,
+        tool_call_id: str | None = None,
+        tool_name: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        if self._emit_runtime_event is None:
+            return
+        message_id = str(message.get("message_id") or "").strip()
+        delivery_mode = str(message.get("delivery_mode") or "").strip() or "inject_now"
+        content = str(message.get("content") or "").strip()
+        event_status = (
+            str(status or "").strip()
+            or ("cancelled" if event_type == "subagent_tool_cancelled" else "running")
+        )
+        default_summaries = {
+            "subagent_interrupted": "Subagent interrupt requested.",
+            "subagent_tool_cancel_requested": "Subagent tool cancellation requested.",
+            "subagent_tool_cancelled": "Subagent tool cancellation completed.",
+            "subagent_tool_cancel_deferred": "Subagent tool cancellation deferred.",
+        }
+        if (
+            event_type == "subagent_tool_cancelled"
+            and not str(tool_call_id or "").strip()
+            and not str(tool_name or "").strip()
+        ):
+            default_summaries["subagent_tool_cancelled"] = "Subagent runtime cancellation completed."
+        payload = {
+            "subagent_id": subagent_id,
+            "role_id": role_id,
+            "stage": stage,
+            "message_id": message_id or None,
+            "delivery_mode": delivery_mode,
+            "delivery_status": (
+                "cancelled" if event_type == "subagent_tool_cancelled" else message.get("delivery_status")
+            ),
+            "delivery_reason": reason or message.get("delivery_reason"),
+            "content": content or None,
+            "reason": reason,
+            "interrupt": bool(message.get("interrupt")),
+            "cancel_current_tool": bool(message.get("cancel_current_tool")),
+            "summary": default_summaries[event_type] + (f" Reason: {reason}." if reason else ""),
+            "status": event_status,
+            "tool_call_id": str(tool_call_id or "").strip() or None,
+            "tool_name": str(tool_name or "").strip() or None,
+        }
+        self._emit_runtime_event(
+            event_type,
+            {key: value for key, value in payload.items() if value is not None},
+        )
+
+    @staticmethod
+    def _tool_cancel_deferred_reason(
+        *,
+        safe_point: str,
+        delivery: Literal["apply", "defer"],
+        reason: str | None,
+    ) -> str:
+        if reason == "approval_pending":
+            return "approval_pending"
+        if safe_point == "during_active_tool":
+            return reason or "tool_in_progress"
+        if delivery == "defer":
+            return "tool_in_progress" if reason == "tool_in_progress" else "no_active_tool"
+        if safe_point == "before_model_invocation":
+            return "no_active_tool"
+        if safe_point == "after_tool_result":
+            return "tool_already_completed"
+        return reason or "no_active_tool"
+
+    def _supports_mid_generation_runtime_cancel(
+        self,
+        *,
+        model_id: str | None,
+    ) -> bool:
+        engine = self._engine
+        if engine is None:
+            return False
+        capability_probe = getattr(engine, "supports_mid_generation_cancellation", None)
+        if callable(capability_probe):
+            try:
+                return bool(capability_probe(model_id=model_id))
+            except TypeError:
+                return bool(capability_probe())
+        model_info_getter = getattr(engine, "get_model_info", None)
+        if not callable(model_info_getter):
+            return False
+        try:
+            model_info = model_info_getter()
+        except Exception:
+            return False
+        backend_type = str(getattr(model_info, "backend_type", "") or "").strip().lower()
+        provider = str(getattr(model_info, "provider", "") or "").strip().lower()
+        metadata = getattr(model_info, "metadata", None)
+        if backend_type in {"openai_compat", "openai_codex", "ollama"}:
+            return True
+        if provider in {"openai_compat", "openai_codex", "ollama"}:
+            return True
+        if backend_type == "gguf" and isinstance(metadata, Mapping):
+            return bool(str(metadata.get("base_url") or "").strip())
+        return False
+
+    @staticmethod
+    async def _cancel_inflight_model_invocation(
+        *,
+        invoke_task: asyncio.Task[Any],
+    ) -> Literal["cancelled", "completed", "pending"]:
+        return await cancel_asyncio_task(invoke_task)
+
+    async def _finalize_pending_mid_generation_messages(
+        self,
+        *,
+        pending_messages: list[dict[str, Any]],
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        cancelled: bool,
+    ) -> list[str]:
+        if not pending_messages:
+            return []
+        guidance_messages: list[str] = []
+        handled_message_ids: list[str] = []
+        for message in pending_messages:
+            message_id = str(message.get("message_id") or "").strip()
+            if message_id:
+                handled_message_ids.append(message_id)
+            if cancelled:
+                if bool(message.get("cancel_current_tool")):
+                    self._emit_subagent_control_event(
+                        "subagent_tool_cancelled",
+                        message=message,
+                        role_id=role_id,
+                        subagent_id=subagent_id,
+                        stage=stage,
+                        reason="model_invocation_cancelled",
+                        status="running",
+                    )
+                self._emit_subagent_message_delivery(
+                    "subagent_message_applied",
+                    message=message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                )
+                content = str(message.get("content") or "").strip()
+                if content:
+                    guidance_messages.append(content)
+                continue
+
+            self._emit_subagent_message_delivery(
+                "subagent_message_deferred",
+                message=message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+                reason="generation_in_progress",
+            )
+            if bool(message.get("cancel_current_tool")):
+                self._emit_subagent_control_event(
+                    "subagent_tool_cancel_deferred",
+                    message=message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason=self._tool_cancel_deferred_reason(
+                        safe_point="during_model_invocation",
+                        delivery="defer",
+                        reason="generation_in_progress",
+                    ),
+                )
+        if handled_message_ids:
+            await self._call_subagent_message_provider(
+                "mark_messages_handled",
+                message_ids=handled_message_ids,
+                status=("applied" if cancelled else "deferred"),
+                reason=(None if cancelled else "generation_in_progress"),
+            )
+        return guidance_messages
+
+    async def _flush_applied_active_tool_messages(
+        self,
+        *,
+        active_tool_controller: ActiveToolController,
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        inflight_message_ids: set[str],
+    ) -> None:
+        applied_messages = await active_tool_controller.drain_applied_post_tool_messages()
+        if not applied_messages:
+            return
+        handled_message_ids: list[str] = []
+        for message in applied_messages:
+            content = str(message.get("content") or "").strip()
+            if content:
+                self._role_guidance_messages[role_id] = _merge_guidance_messages(
+                    self._role_guidance_messages.get(role_id, []),
+                    [content],
+                )
+            self._emit_subagent_message_delivery(
+                "subagent_message_applied",
+                message=message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+            )
+            message_id = str(message.get("message_id") or "").strip()
+            if message_id:
+                handled_message_ids.append(message_id)
+        if handled_message_ids:
+            inflight_message_ids.difference_update(handled_message_ids)
+            await self._call_subagent_message_provider(
+                "mark_messages_handled",
+                message_ids=handled_message_ids,
+                status="applied",
+            )
+
+    async def _poll_active_tool_cancel_requests(
+        self,
+        *,
+        active_tool_controller: ActiveToolController,
+        run_cancellation_context: RunCancellationContext,
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        inflight_message_ids: set[str],
+    ) -> None:
+        if self._subagent_message_provider is None:
+            return
+        snapshot = await active_tool_controller.snapshot()
+        if not snapshot.get("active"):
+            return
+        raw_messages = await self._call_subagent_message_provider(
+            "poll_messages",
+            task_id=self._current_run_id,
+            subagent_id=subagent_id,
+            role_id=role_id,
+            stage=stage,
+            safe_point="during_active_tool",
+        )
+        if not isinstance(raw_messages, list):
+            return
+
+        for raw_message in raw_messages:
+            if not isinstance(raw_message, Mapping):
+                continue
+            message_id = str(raw_message.get("message_id") or "").strip()
+            if message_id and message_id in inflight_message_ids:
+                continue
+            if not bool(raw_message.get("cancel_current_tool")):
+                continue
+            self._emit_subagent_message_delivery(
+                "subagent_message_accepted",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+            )
+            if bool(raw_message.get("interrupt")):
+                self._emit_subagent_control_event(
+                    "subagent_interrupted",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason="operator_interrupt",
+                    tool_call_id=snapshot.get("tool_call_id"),
+                    tool_name=snapshot.get("tool_name"),
+                )
+            self._emit_subagent_control_event(
+                "subagent_tool_cancel_requested",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+                reason="operator_request",
+                tool_call_id=snapshot.get("tool_call_id"),
+                tool_name=snapshot.get("tool_name"),
+            )
+            cancel_result = await run_cancellation_context.request_active_tool_cancel()
+            tool_result = cancel_result.tool_result
+            tool_call_id = (
+                tool_result.tool_call_id
+                if tool_result is not None and tool_result.tool_call_id
+                else snapshot.get("tool_call_id")
+            )
+            tool_name = (
+                tool_result.tool_name
+                if tool_result is not None and tool_result.tool_name
+                else snapshot.get("tool_name")
+            )
+            if cancel_result.cancelled:
+                self._emit_subagent_control_event(
+                    "subagent_tool_cancelled",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason=cancel_result.reason or "tool_cancelled",
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                )
+                content = str(raw_message.get("content") or "").strip()
+                if content and message_id:
+                    inflight_message_ids.add(message_id)
+                    await active_tool_controller.queue_post_tool_message(raw_message)
+                elif message_id:
+                    await self._call_subagent_message_provider(
+                        "mark_messages_handled",
+                        message_ids=[message_id],
+                        status="applied",
+                    )
+                    self._emit_subagent_message_delivery(
+                        "subagent_message_applied",
+                        message=raw_message,
+                        role_id=role_id,
+                        subagent_id=subagent_id,
+                        stage=stage,
+                    )
+                continue
+
+            deferred_reason = cancel_result.reason or self._tool_cancel_deferred_reason(
+                safe_point="during_active_tool",
+                delivery="defer",
+                reason="tool_in_progress",
+            )
+            if message_id:
+                await self._call_subagent_message_provider(
+                    "mark_messages_handled",
+                    message_ids=[message_id],
+                    status="deferred",
+                    reason=deferred_reason,
+                )
+            self._emit_subagent_message_delivery(
+                "subagent_message_deferred",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+                reason=deferred_reason,
+            )
+            self._emit_subagent_control_event(
+                "subagent_tool_cancel_deferred",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+                reason=deferred_reason,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+            )
+
+    async def _poll_subagent_messages_for_role(
+        self,
+        *,
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        safe_point: str,
+        delivery: Literal["apply", "defer"],
+        reason: str | None = None,
+        delivery_modes: set[str] | None = None,
+    ) -> list[str]:
+        if self._subagent_message_provider is None:
+            return []
+        raw_messages = await self._call_subagent_message_provider(
+            "poll_messages",
+            task_id=self._current_run_id,
+            subagent_id=subagent_id,
+            role_id=role_id,
+            stage=stage,
+            safe_point=safe_point,
+        )
+        if not isinstance(raw_messages, list):
+            return []
+        applied_contents: list[str] = []
+        handled_message_ids: list[str] = []
+        for raw_message in raw_messages:
+            if not isinstance(raw_message, Mapping):
+                continue
+            delivery_mode = str(raw_message.get("delivery_mode") or "").strip() or "inject_now"
+            if delivery_modes is not None and delivery_mode not in delivery_modes:
+                continue
+            content = str(raw_message.get("content") or "").strip()
+            if not content:
+                continue
+            message_id = str(raw_message.get("message_id") or "").strip()
+            self._emit_subagent_message_delivery(
+                "subagent_message_accepted",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+            )
+            if bool(raw_message.get("interrupt")):
+                self._emit_subagent_control_event(
+                    "subagent_interrupted",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason="operator_interrupt",
+                )
+            if bool(raw_message.get("cancel_current_tool")):
+                self._emit_subagent_control_event(
+                    "subagent_tool_cancel_requested",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason="operator_request",
+                )
+            if delivery == "apply":
+                applied_contents.append(content)
+                if message_id:
+                    handled_message_ids.append(message_id)
+                self._emit_subagent_message_delivery(
+                    "subagent_message_applied",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                )
+                if bool(raw_message.get("cancel_current_tool")):
+                    self._emit_subagent_control_event(
+                        "subagent_tool_cancel_deferred",
+                        message=raw_message,
+                        role_id=role_id,
+                        subagent_id=subagent_id,
+                        stage=stage,
+                        reason=self._tool_cancel_deferred_reason(
+                            safe_point=safe_point,
+                            delivery=delivery,
+                            reason=reason,
+                        ),
+                    )
+            else:
+                if message_id:
+                    handled_message_ids.append(message_id)
+                self._emit_subagent_message_delivery(
+                    "subagent_message_deferred",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason=reason or "generation_in_progress",
+                )
+                if bool(raw_message.get("cancel_current_tool")):
+                    self._emit_subagent_control_event(
+                        "subagent_tool_cancel_deferred",
+                        message=raw_message,
+                        role_id=role_id,
+                        subagent_id=subagent_id,
+                        stage=stage,
+                        reason=self._tool_cancel_deferred_reason(
+                            safe_point=safe_point,
+                            delivery=delivery,
+                            reason=reason,
+                        ),
+                    )
+        if handled_message_ids:
+            await self._call_subagent_message_provider(
+                "mark_messages_handled",
+                message_ids=handled_message_ids,
+                status=("applied" if delivery == "apply" else "deferred"),
+                reason=reason,
+            )
+        return applied_contents
+
+    async def _settle_generation_cancel_request(
+        self,
+        *,
+        run_cancellation_context: RunCancellationContext,
+        timeout_seconds: float = 0.5,
+        poll_interval_seconds: float = 0.05,
+    ) -> Any:
+        result = await run_cancellation_context.request_generation_cancel()
+        if result.state != "pending":
+            return result
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_seconds, 0.0)
+        while result.state == "pending":
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return result
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
+            result = await run_cancellation_context.request_generation_cancel()
+        return result
+
+    async def _poll_mid_generation_subagent_messages(
+        self,
+        *,
+        active_tool_controller: ActiveToolController,
+        run_cancellation_context: RunCancellationContext,
+        role_id: str,
+        subagent_id: str,
+        stage: str,
+        model_id: str | None,
+    ) -> list[str]:
+        if self._subagent_message_provider is None:
+            return []
+        snapshot = await active_tool_controller.snapshot()
+        if snapshot.get("active"):
+            return []
+        raw_messages = await self._call_subagent_message_provider(
+            "poll_messages",
+            task_id=self._current_run_id,
+            subagent_id=subagent_id,
+            role_id=role_id,
+            stage=stage,
+            safe_point="during_model_invocation",
+        )
+        if not isinstance(raw_messages, list):
+            return []
+        runtime_cancel_supported = self._supports_mid_generation_runtime_cancel(model_id=model_id)
+        for raw_message in raw_messages:
+            if not isinstance(raw_message, Mapping):
+                continue
+            delivery_mode = str(raw_message.get("delivery_mode") or "").strip() or "inject_now"
+            if delivery_mode not in {"inject_now", "next_checkpoint"}:
+                continue
+            content = str(raw_message.get("content") or "").strip()
+            if not content:
+                continue
+            message_id = str(raw_message.get("message_id") or "").strip()
+            interrupt = bool(raw_message.get("interrupt"))
+            cancel_current_tool = bool(raw_message.get("cancel_current_tool"))
+            self._emit_subagent_message_delivery(
+                "subagent_message_accepted",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+            )
+            if interrupt:
+                self._emit_subagent_control_event(
+                    "subagent_interrupted",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason="operator_interrupt",
+                )
+            if cancel_current_tool:
+                self._emit_subagent_control_event(
+                    "subagent_tool_cancel_requested",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason="operator_request",
+                )
+            if runtime_cancel_supported and (interrupt or cancel_current_tool):
+                cancel_result = await self._settle_generation_cancel_request(
+                    run_cancellation_context=run_cancellation_context,
+                )
+                if cancel_result.cancelled:
+                    if cancel_current_tool:
+                        self._emit_subagent_control_event(
+                            "subagent_tool_cancelled",
+                            message=raw_message,
+                            role_id=role_id,
+                            subagent_id=subagent_id,
+                            stage=stage,
+                            reason="model_invocation_cancelled",
+                            status="running",
+                        )
+                    if message_id:
+                        await self._call_subagent_message_provider(
+                            "mark_messages_handled",
+                            message_ids=[message_id],
+                            status="applied",
+                        )
+                    self._emit_subagent_message_delivery(
+                        "subagent_message_applied",
+                        message=raw_message,
+                        role_id=role_id,
+                        subagent_id=subagent_id,
+                        stage=stage,
+                    )
+                    return [content]
+            if message_id:
+                await self._call_subagent_message_provider(
+                    "mark_messages_handled",
+                    message_ids=[message_id],
+                    status="deferred",
+                    reason="generation_in_progress",
+                )
+            self._emit_subagent_message_delivery(
+                "subagent_message_deferred",
+                message=raw_message,
+                role_id=role_id,
+                subagent_id=subagent_id,
+                stage=stage,
+                reason="generation_in_progress",
+            )
+            if cancel_current_tool:
+                self._emit_subagent_control_event(
+                    "subagent_tool_cancel_deferred",
+                    message=raw_message,
+                    role_id=role_id,
+                    subagent_id=subagent_id,
+                    stage=stage,
+                    reason=self._tool_cancel_deferred_reason(
+                        safe_point="during_model_invocation",
+                        delivery="defer",
+                        reason="generation_in_progress",
+                    ),
+                )
+        return []
 
     def _emit_live_subagent_runtime_artifact(self) -> None:
         if self._emit_runtime_event is None or not self._invocation_traces:
@@ -564,6 +1304,69 @@ class MultiAgentOrchestrator:
                 )
             ),
         )
+
+    def _emit_invocation_tool_runtime_events(
+        self,
+        *,
+        events: list[Any],
+        role_id: str | None,
+        title: str | None,
+        model_id: str | None,
+        stage: str | None,
+        subagent_id: str | None,
+    ) -> None:
+        if self._emit_runtime_event is None:
+            return
+        effective_role_id = str(role_id or "").strip() or None
+        effective_title = str(title or "").strip() or None
+        effective_stage = str(stage or "").strip() or None
+        effective_subagent_id = str(subagent_id or "").strip() or None
+        for event in events:
+            event_type = getattr(event, "type", None)
+            if event_type == "tool_call_request":
+                self._emit_runtime_event(
+                    "subagent_tool_call",
+                    {
+                        "subagent_id": effective_subagent_id,
+                        "role_id": effective_role_id,
+                        "title": effective_title,
+                        "model_id": model_id,
+                        "stage": effective_stage,
+                        "tool_call_id": getattr(event, "call_id", ""),
+                        "tool_name": getattr(event, "tool_name", ""),
+                        "arguments_preview": _tool_arguments_preview(
+                            getattr(event, "arguments", {}) or {}
+                        ),
+                        "summary": f"{effective_title or effective_role_id or 'Subagent'} requested tool {getattr(event, 'tool_name', '')}.",
+                    },
+                )
+                continue
+            if event_type != "tool_call_result":
+                continue
+            metadata = getattr(event, "metadata", {}) or {}
+            if not isinstance(metadata, Mapping):
+                metadata = {}
+            error = getattr(event, "error", None)
+            status = str(metadata.get("status") or ("failed" if error else "completed"))
+            self._emit_runtime_event(
+                "subagent_tool_result",
+                {
+                    "subagent_id": effective_subagent_id,
+                    "role_id": effective_role_id,
+                    "title": effective_title,
+                    "model_id": model_id,
+                    "stage": effective_stage,
+                    "tool_call_id": getattr(event, "call_id", ""),
+                    "tool_name": getattr(event, "tool_name", ""),
+                    "status": status,
+                    "summary": _tool_result_summary(
+                        tool_name=str(getattr(event, "tool_name", "") or ""),
+                        status=status,
+                        error=error,
+                    ),
+                    "metadata": _tool_result_runtime_metadata(metadata),
+                },
+            )
 
     def _record_subagent_failure(
         self,
@@ -1321,6 +2124,7 @@ class MultiAgentOrchestrator:
     async def run(self, request: MultiAgentRunRequest) -> MultiAgentRunResult:
         """Run one multi-agent orchestration."""
         run_id = request.run_id or str(uuid4())
+        self._current_run_id = run_id
         protocol_config = parse_protocol_config(request.protocol)
         execution_policy = parse_subagent_execution_policy(
             _resolve_execution_policy_payload(request.protocol, request.metadata),
@@ -1395,6 +2199,8 @@ class MultiAgentOrchestrator:
         )
 
         self._configure_run_policy(request.run_policy)
+        self._current_run_id = run_id
+        self._subagent_message_provider = request.subagent_message_provider
         self._emit_runtime_event = emit
         self._default_reasoning_effort = request.reasoning_effort
         requested_guidance_messages = [item.strip() for item in request.guidance_messages if item.strip()]
@@ -1751,6 +2557,19 @@ class MultiAgentOrchestrator:
                     protocol_artifacts=precomputed_artifacts,
                 )
             if not _resume_stage_covers(resume_stage, "protocol_completed"):
+                if _is_goal_linked_metadata(effective_metadata) and not self._can_use_model_backed_execution(
+                    selected_models_roles
+                ):
+                    raise RunPolicyStop(
+                        status="awaiting_resources",
+                        action="pause",
+                        reason=(
+                            "Goal-linked autonomous execution requires at least one selected model role; "
+                            "refusing to complete with a placeholder response."
+                        ),
+                        stage="model_selection",
+                        checkpoint=self._latest_checkpoint,
+                    )
                 protocol_metadata = dict(effective_metadata)
                 candidates, protocol_artifacts = await self._run_protocol(
                     request.task_input,
@@ -2853,6 +3672,27 @@ class MultiAgentOrchestrator:
         prompt_override: str | None = None,
         stage: str | None = None,
     ) -> CandidateOutput:
+        role_stage = stage or f"role::{role_id}"
+        visible_role_id, visible_title = self._visible_role_identity(role_id, role_title, role_stage)
+        subagent_id = self._subagent_id_for_role(role_id=visible_role_id, stage=role_stage)
+        injected_guidance = await self._poll_subagent_messages_for_role(
+            role_id=visible_role_id,
+            subagent_id=subagent_id,
+            stage=role_stage,
+            safe_point="before_model_invocation",
+            delivery="apply",
+            delivery_modes={"inject_now", "next_checkpoint"},
+        )
+        if injected_guidance:
+            self._role_guidance_messages[role_id] = _merge_guidance_messages(
+                self._role_guidance_messages.get(role_id, []),
+                injected_guidance,
+            )
+            if visible_role_id != role_id:
+                self._role_guidance_messages[visible_role_id] = _merge_guidance_messages(
+                    self._role_guidance_messages.get(visible_role_id, []),
+                    injected_guidance,
+                )
         effective_guidance_messages = self._guidance_messages_for_role(role_id, guidance_messages)
         prompt = (
             prompt_override
@@ -2873,14 +3713,31 @@ class MultiAgentOrchestrator:
         role_runtime_context = self._build_role_runtime_context(role_id)
         if role_runtime_context:
             prompt = f"{prompt}\n\nRole runtime context:\n{role_runtime_context}"
-        role_stage = stage or f"role::{role_id}"
+        if self._emit_runtime_event is not None:
+            self._emit_runtime_event(
+                "subagent_prompt",
+                asdict(
+                    SubagentPromptPayload(
+                        subagent_id=subagent_id,
+                        role_id=visible_role_id,
+                        title=visible_title,
+                        model_id=model_id,
+                        system_prompt=role_instruction,
+                        user_prompt=prompt,
+                        stage=role_stage,
+                        execution_profile="subagent_readonly",
+                    )
+                ),
+            )
         self._emit_role_progress(
             "role_started",
-            role_id=role_id,
+            role_id=visible_role_id,
             status="thinking",
-            current_action=f"{role_title} is preparing a response.",
+            current_action=f"{visible_title} is preparing a response.",
             stage=role_stage,
             model_id=model_id,
+            title=visible_title,
+            subagent_id=subagent_id,
         )
         try:
             content, diagnostics = await self._await_subagent_operation(
@@ -2898,48 +3755,70 @@ class MultiAgentOrchestrator:
                         f"Role instruction: {role_instruction}"
                     ),
                     session_scope=f"role::{role_id}",
+                    runtime_role_id=visible_role_id,
+                    runtime_title=visible_title,
+                    runtime_stage=role_stage,
+                    runtime_subagent_id=subagent_id,
                 ),
                 role_id=role_id,
                 model_id=model_id,
                 stage=role_stage,
             )
+            await self._poll_subagent_messages_for_role(
+                role_id=visible_role_id,
+                subagent_id=subagent_id,
+                stage=role_stage,
+                safe_point="after_model_invocation",
+                delivery="defer",
+                reason="generation_in_progress",
+            )
         except Exception as exc:
             self._emit_role_progress(
                 "role_error",
-                role_id=role_id,
+                role_id=visible_role_id,
                 status="error",
-                current_action=f"{role_title} failed during this step.",
+                current_action=f"{visible_title} failed during this step.",
                 stage=role_stage,
                 model_id=model_id,
                 detail=str(exc),
+                title=visible_title,
+                subagent_id=subagent_id,
             )
             raise
         candidate = CandidateOutput(
-            candidate_id=role_id,
-            role_id=role_id,
+            candidate_id=visible_role_id,
+            role_id=visible_role_id,
             content=content,
-            metadata={"model_id": model_id, "diagnostics": diagnostics},
+            metadata={
+                "model_id": model_id,
+                "diagnostics": diagnostics,
+                "subagent_id": subagent_id,
+                "title": visible_title,
+                "stage": role_stage,
+            },
         )
         self._mark_role_task_completed(
-            role_id=role_id,
+            role_id=visible_role_id,
             model_id=model_id,
             stage=role_stage,
             candidate=candidate,
         )
         self._mark_task_completed(
             task_key=role_stage,
-            role_id=role_id,
+            role_id=visible_role_id,
             model_id=model_id,
             stage=role_stage,
             candidate=candidate,
         )
         self._emit_role_progress(
             "role_completed",
-            role_id=role_id,
+            role_id=visible_role_id,
             status="done",
-            current_action=f"{role_title} produced an output.",
+            current_action=f"{visible_title} produced an output.",
             stage=role_stage,
             model_id=model_id,
+            title=visible_title,
+            subagent_id=subagent_id,
         )
         return candidate
 
@@ -3020,77 +3899,290 @@ class MultiAgentOrchestrator:
         session_scope: str,
         reasoning_effort: str | None = None,
         fallback_generate: Any | None = None,
+        runtime_role_id: str | None = None,
+        runtime_title: str | None = None,
+        runtime_stage: str | None = None,
+        runtime_subagent_id: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        effective_runtime_role_id = (
+            str(runtime_role_id or "").strip()
+            or _role_id_from_session_scope(session_scope)
+        )
+        effective_runtime_stage = str(runtime_stage or session_scope or "").strip()
+        effective_runtime_subagent_id = str(runtime_subagent_id or "").strip()
+        if effective_runtime_role_id and not effective_runtime_subagent_id:
+            effective_runtime_subagent_id = self._subagent_id_for_role(
+                role_id=effective_runtime_role_id,
+                stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+            )
+        base_user_prompt = user_prompt
+        live_guidance_messages: list[str] = []
+        if effective_runtime_role_id and effective_runtime_subagent_id:
+            injected_guidance = await self._poll_subagent_messages_for_role(
+                role_id=effective_runtime_role_id,
+                subagent_id=effective_runtime_subagent_id,
+                stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                safe_point="before_model_invocation",
+                delivery="apply",
+                delivery_modes={"inject_now", "next_checkpoint"},
+            )
+            if injected_guidance:
+                self._role_guidance_messages[effective_runtime_role_id] = _merge_guidance_messages(
+                    self._role_guidance_messages.get(effective_runtime_role_id, []),
+                    injected_guidance,
+                )
+                live_guidance_messages = _merge_guidance_messages(
+                    live_guidance_messages,
+                    injected_guidance,
+                )
+        user_prompt = self._append_live_subagent_guidance_to_prompt(
+            prompt=base_user_prompt,
+            guidance_messages=live_guidance_messages,
+        )
+
         invoke = getattr(self._engine, "invoke", None)
         if callable(invoke):
-            session_id = f"multi-agent::{session_scope}::{uuid4()}"
-            result = await invoke(
-                AgentInvocationRequest(
-                    message=user_prompt,
-                    session_id=session_id,
-                    inference_overrides={
-                        "model": model_id,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        "reasoning_effort": reasoning_effort,
-                    },
-                    tool_mode=tool_mode,  # type: ignore[arg-type]
-                    execution_profile=execution_profile,  # type: ignore[arg-type]
-                    system_prompt_addendum=system_prompt_addendum,
-                    permission_policy=(
-                        dict(self._permission_policy)
-                        if self._permission_policy is not None
-                        else None
-                    ),
-                    tool_allowlist=(
-                        list(self._tool_allowlist)
-                        if self._tool_allowlist is not None
-                        else None
-                    ),
-                    tool_denylist=(
-                        list(self._tool_denylist)
-                        if self._tool_denylist is not None
-                        else None
-                    ),
-                    persist_session=False,
+            while True:
+                session_id = f"multi-agent::{session_scope}::{uuid4()}"
+                active_tool_controller = ActiveToolController()
+                run_cancellation_context = RunCancellationContext(
+                    run_id=str(self._current_run_id or effective_runtime_subagent_id or role_id or session_id)
                 )
-            )
-            content = result.content.strip() if isinstance(result.content, str) else ""
-            diagnostics = result.diagnostics.to_dict()
-            self._invocation_traces.append(
-                _build_invocation_trace(
-                    session_scope=session_scope,
-                    session_id=session_id,
-                    model_id=model_id,
-                    execution_profile=execution_profile,
-                    tool_mode=tool_mode,
-                    diagnostics=diagnostics,
-                    events=result.events,
-                    fallback=False,
+                await run_cancellation_context.bind_active_tool_controller(active_tool_controller)
+                invoke_task = asyncio.create_task(
+                    invoke(
+                        AgentInvocationRequest(
+                            message=user_prompt,
+                            session_id=session_id,
+                            inference_overrides={
+                                "model": model_id,
+                                "temperature": temperature,
+                                "max_tokens": max_tokens,
+                                "reasoning_effort": reasoning_effort,
+                            },
+                            tool_mode=tool_mode,  # type: ignore[arg-type]
+                            execution_profile=execution_profile,  # type: ignore[arg-type]
+                            system_prompt_addendum=system_prompt_addendum,
+                            permission_policy=(
+                                dict(self._permission_policy)
+                                if self._permission_policy is not None
+                                else None
+                            ),
+                            tool_allowlist=(
+                                list(self._tool_allowlist)
+                                if self._tool_allowlist is not None
+                                else None
+                            ),
+                            tool_denylist=(
+                                list(self._tool_denylist)
+                                if self._tool_denylist is not None
+                                else None
+                            ),
+                            persist_session=False,
+                            active_tool_controller=active_tool_controller,
+                            cancellation_context=run_cancellation_context,
+                        )
+                    )
                 )
-            )
-            self._emit_live_subagent_runtime_artifact()
-            collector_artifact_callback = self._collector_artifact_callback
-            if collector_artifact_callback is not None:
-                for event in result.events:
-                    if getattr(event, "type", None) != "tool_call_result":
+                await run_cancellation_context.bind_generation_cancel_callback(
+                    lambda task=invoke_task: cancel_asyncio_task(task)
+                )
+                # Let the invocation enter the runtime before polling "during_model_invocation".
+                await asyncio.sleep(0)
+                inflight_message_ids: set[str] = set()
+                restart_guidance: list[str] = []
+                while not invoke_task.done():
+                    if effective_runtime_role_id and effective_runtime_subagent_id:
+                        await self._flush_applied_active_tool_messages(
+                            active_tool_controller=active_tool_controller,
+                            role_id=effective_runtime_role_id,
+                            subagent_id=effective_runtime_subagent_id,
+                            stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                            inflight_message_ids=inflight_message_ids,
+                        )
+                        await self._poll_active_tool_cancel_requests(
+                            active_tool_controller=active_tool_controller,
+                            run_cancellation_context=run_cancellation_context,
+                            role_id=effective_runtime_role_id,
+                            subagent_id=effective_runtime_subagent_id,
+                            stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                            inflight_message_ids=inflight_message_ids,
+                        )
+                        restart_guidance = await self._poll_mid_generation_subagent_messages(
+                            active_tool_controller=active_tool_controller,
+                            run_cancellation_context=run_cancellation_context,
+                            role_id=effective_runtime_role_id,
+                            subagent_id=effective_runtime_subagent_id,
+                            stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                            model_id=model_id,
+                        )
+                        if restart_guidance:
+                            break
+                    try:
+                        await asyncio.wait_for(asyncio.shield(invoke_task), timeout=0.05)
+                    except TimeoutError:
                         continue
-                    collector_artifact_callback(event)
-            return content, diagnostics
+                    except asyncio.CancelledError:
+                        if invoke_task.done() and invoke_task.cancelled():
+                            continue
+                        raise
+                if restart_guidance:
+                    if effective_runtime_role_id:
+                        self._role_guidance_messages[effective_runtime_role_id] = _merge_guidance_messages(
+                            self._role_guidance_messages.get(effective_runtime_role_id, []),
+                            restart_guidance,
+                        )
+                    live_guidance_messages = _merge_guidance_messages(
+                        live_guidance_messages,
+                        restart_guidance,
+                    )
+                    user_prompt = self._append_live_subagent_guidance_to_prompt(
+                        prompt=base_user_prompt,
+                        guidance_messages=live_guidance_messages,
+                    )
+                    continue
+                if effective_runtime_role_id and effective_runtime_subagent_id:
+                    await self._flush_applied_active_tool_messages(
+                        active_tool_controller=active_tool_controller,
+                        role_id=effective_runtime_role_id,
+                        subagent_id=effective_runtime_subagent_id,
+                        stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                        inflight_message_ids=inflight_message_ids,
+                    )
+                result = await invoke_task
+                content = result.content.strip() if isinstance(result.content, str) else ""
+                diagnostics = result.diagnostics.to_dict()
+                self._emit_invocation_tool_runtime_events(
+                    events=result.events,
+                    role_id=runtime_role_id,
+                    title=runtime_title,
+                    model_id=model_id,
+                    stage=runtime_stage or session_scope,
+                    subagent_id=runtime_subagent_id,
+                )
+                self._invocation_traces.append(
+                    _build_invocation_trace(
+                        session_scope=session_scope,
+                        session_id=session_id,
+                        model_id=model_id,
+                        execution_profile=execution_profile,
+                        tool_mode=tool_mode,
+                        diagnostics=diagnostics,
+                        events=result.events,
+                        fallback=False,
+                    )
+                )
+                self._emit_live_subagent_runtime_artifact()
+                collector_artifact_callback = self._collector_artifact_callback
+                if collector_artifact_callback is not None:
+                    for event in result.events:
+                        if getattr(event, "type", None) != "tool_call_result":
+                            continue
+                        collector_artifact_callback(event)
+                if effective_runtime_role_id and effective_runtime_subagent_id:
+                    has_tool_result = any(
+                        getattr(event, "type", None) == "tool_call_result"
+                        for event in result.events
+                    )
+                    has_pending_approval = _events_include_pending_approval(result.events)
+                    after_tool_guidance = await self._poll_subagent_messages_for_role(
+                        role_id=effective_runtime_role_id,
+                        subagent_id=effective_runtime_subagent_id,
+                        stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                        safe_point="after_tool_result" if has_tool_result else "after_model_invocation",
+                        delivery="apply" if has_tool_result and not has_pending_approval else "defer",
+                        reason=(
+                            "approval_pending"
+                            if has_pending_approval
+                            else None
+                            if has_tool_result
+                            else "tool_not_reached"
+                        ),
+                        delivery_modes={"after_current_tool"},
+                    )
+                    if after_tool_guidance and not has_pending_approval:
+                        self._role_guidance_messages[effective_runtime_role_id] = _merge_guidance_messages(
+                            self._role_guidance_messages.get(effective_runtime_role_id, []),
+                            after_tool_guidance,
+                        )
+                    await self._poll_subagent_messages_for_role(
+                        role_id=effective_runtime_role_id,
+                        subagent_id=effective_runtime_subagent_id,
+                        stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                        safe_point="after_model_invocation",
+                        delivery="defer",
+                        reason=(
+                            "approval_pending"
+                            if has_pending_approval
+                            else "generation_in_progress"
+                        ),
+                        delivery_modes={"inject_now", "next_checkpoint"},
+                    )
+                return content, diagnostics
 
         generate = fallback_generate or getattr(self._engine, "generate_with_configured_model", None)
         if not callable(generate):
             raise RuntimeError("Configured-model generation is unavailable.")
-        result = await generate(
-            model_id=model_id,
-            messages=[
-                Message(role="system", content=system_prompt),
-                Message(role="user", content=user_prompt),
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-        )
+        while True:
+            active_tool_controller = ActiveToolController()
+            run_cancellation_context = RunCancellationContext(
+                run_id=str(self._current_run_id or effective_runtime_subagent_id or role_id or model_id or "configured-model")
+            )
+            await run_cancellation_context.bind_active_tool_controller(active_tool_controller)
+            generate_task = asyncio.create_task(
+                generate(
+                    model_id=model_id,
+                    messages=[
+                        Message(role="system", content=system_prompt),
+                        Message(role="user", content=user_prompt),
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            )
+            await run_cancellation_context.bind_generation_cancel_callback(
+                lambda task=generate_task: cancel_asyncio_task(task)
+            )
+            await asyncio.sleep(0)
+            restart_guidance: list[str] = []
+            while not generate_task.done():
+                if effective_runtime_role_id and effective_runtime_subagent_id:
+                    restart_guidance = await self._poll_mid_generation_subagent_messages(
+                        active_tool_controller=active_tool_controller,
+                        run_cancellation_context=run_cancellation_context,
+                        role_id=effective_runtime_role_id,
+                        subagent_id=effective_runtime_subagent_id,
+                        stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                        model_id=model_id,
+                    )
+                    if restart_guidance:
+                        break
+                try:
+                    await asyncio.wait_for(asyncio.shield(generate_task), timeout=0.05)
+                except TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    if generate_task.done() and generate_task.cancelled():
+                        continue
+                    raise
+            if restart_guidance:
+                if effective_runtime_role_id:
+                    self._role_guidance_messages[effective_runtime_role_id] = _merge_guidance_messages(
+                        self._role_guidance_messages.get(effective_runtime_role_id, []),
+                        restart_guidance,
+                    )
+                live_guidance_messages = _merge_guidance_messages(
+                    live_guidance_messages,
+                    restart_guidance,
+                )
+                user_prompt = self._append_live_subagent_guidance_to_prompt(
+                    prompt=base_user_prompt,
+                    guidance_messages=live_guidance_messages,
+                )
+                continue
+            result = await generate_task
+            break
         content = result.content.strip() if isinstance(result.content, str) else ""
         diagnostics = {
             "execution_profile": execution_profile,
@@ -3112,6 +4204,16 @@ class MultiAgentOrchestrator:
             )
         )
         self._emit_live_subagent_runtime_artifact()
+        if effective_runtime_role_id and effective_runtime_subagent_id:
+            await self._poll_subagent_messages_for_role(
+                role_id=effective_runtime_role_id,
+                subagent_id=effective_runtime_subagent_id,
+                stage=effective_runtime_stage or f"role::{effective_runtime_role_id}",
+                safe_point="after_model_invocation",
+                delivery="defer",
+                reason="generation_in_progress",
+                delivery_modes={"inject_now", "next_checkpoint", "after_current_tool"},
+            )
         return content, diagnostics
 
     async def _run_model_backed_debate(
@@ -4798,6 +5900,15 @@ def _resolve_selected_model_roles(metadata: Mapping[str, Any] | None) -> dict[st
     return resolved
 
 
+def _is_goal_linked_metadata(metadata: Mapping[str, Any] | None) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    summary = metadata.get("summary")
+    return isinstance(summary, Mapping) and isinstance(summary.get("goal_id"), str) and bool(
+        summary.get("goal_id", "").strip()
+    )
+
+
 def _resolve_execution_policy_payload(
     protocol: Mapping[str, Any] | ProtocolConfig | None,
     metadata: Mapping[str, Any] | None,
@@ -5989,6 +7100,93 @@ def _normalize_domain_list(value: Any) -> list[str]:
     return normalized
 
 
+_TOOL_PREVIEW_SENSITIVE_KEY_PARTS = {
+    "api_key",
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+}
+
+
+def _tool_arguments_preview(arguments: Any, *, max_chars: int = 240) -> str | None:
+    if not isinstance(arguments, Mapping):
+        return None
+    redacted = _redact_tool_preview_value(arguments)
+    try:
+        preview = json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        preview = str(redacted)
+    if len(preview) <= max_chars:
+        return preview
+    return preview[: max_chars - 1].rstrip() + "..."
+
+
+def _redact_tool_preview_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if any(part in key_text.lower() for part in _TOOL_PREVIEW_SENSITIVE_KEY_PARTS):
+                redacted[key_text] = "[redacted]"
+            else:
+                redacted[key_text] = _redact_tool_preview_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_tool_preview_value(item) for item in value[:20]]
+    if isinstance(value, tuple):
+        return [_redact_tool_preview_value(item) for item in value[:20]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _tool_result_runtime_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    safe_keys = {
+        "allowed_decisions",
+        "approval_id",
+        "approval_ids",
+        "approval_kind",
+        "approval_scope",
+        "approval_status",
+        "pending_approvals",
+        "policy_source",
+        "reason",
+        "recommended_action",
+        "replay_safe",
+        "requires_approval",
+        "security_decision",
+        "status",
+        "tool_names",
+    }
+    return {str(key): value for key, value in metadata.items() if str(key) in safe_keys}
+
+
+def _tool_result_summary(*, tool_name: str, status: str, error: Any) -> str:
+    label = tool_name or "tool"
+    if error:
+        return f"{label} failed: {str(error).strip()}"
+    normalized_status = status.replace("_", " ").strip() or "completed"
+    return f"{label} {normalized_status}."
+
+
+def _events_include_pending_approval(events: list[Any]) -> bool:
+    for event in events:
+        if getattr(event, "type", None) != "tool_call_result":
+            continue
+        metadata = getattr(event, "metadata", {}) or {}
+        if not isinstance(metadata, Mapping):
+            continue
+        if (
+            metadata.get("status") == "approval_pending"
+            or metadata.get("requires_approval") is True
+            or isinstance(metadata.get("approval_id"), str)
+        ):
+            return True
+    return False
+
+
 def _merge_domain_lists(*domain_lists: list[str]) -> list[str]:
     merged: list[str] = []
     for domain_list in domain_lists:
@@ -6259,6 +7457,20 @@ def _remaining_run_steps(*, stage: str, research_enabled: bool) -> list[str]:
     if stage not in completed_stages and not remaining:
         remaining.append("resume from the latest checkpoint")
     return remaining
+
+
+def _slugify(value: str) -> str:
+    pieces: list[str] = []
+    pending_dash = False
+    for char in str(value or "").lower():
+        if char.isalnum():
+            if pending_dash and pieces:
+                pieces.append("-")
+            pieces.append(char)
+            pending_dash = False
+        else:
+            pending_dash = True
+    return "".join(pieces) or "item"
 
 
 def _safe_float(value: Any) -> float | None:

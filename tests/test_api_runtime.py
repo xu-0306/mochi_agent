@@ -2293,6 +2293,7 @@ def test_create_delegated_subagent_task_defaults_to_generic_protocol_with_execut
     created = asyncio.run(
         runtime_service.create_delegated_subagent_task(
             objective="Summarize the strongest deployment guidance.",
+            protocol="teacher_student_distill",
             session_id="chat-session-42",
             suggested_roles=["teacher", "student"],
             suggested_models={"teacher": "teacher-model", "student": "student-model"},
@@ -2353,6 +2354,37 @@ def test_create_delegated_subagent_task_defaults_to_generic_protocol_with_execut
     refreshed_task = asyncio.run(runtime_service._store.get_task_run(created["task_id"]))
     assert refreshed_task is not None
     assert refreshed_task["metadata"]["delegated_subagent"]["status"] == "running"
+
+
+def test_create_delegated_subagent_task_defaults_missing_protocol_to_autonomous_agent(
+    tmp_path: Path,
+) -> None:
+    runtime_service = RuntimeService(
+        engine=_RuntimeFakeEngine(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+    )
+
+    created = asyncio.run(
+        runtime_service.create_delegated_subagent_task(
+            objective="Continue this as a direct delegated worker.",
+            session_id="chat-session-43",
+            execution_budget={
+                "max_execution_requests": 2,
+                "max_commands_per_request": 1,
+            },
+        )
+    )
+    task = asyncio.run(runtime_service._store.get_task_run(created["task_id"]))
+
+    assert task is not None
+    metadata = task["metadata"]
+    assert metadata["protocol"] == "autonomous_single_agent"
+    assert metadata["protocol_config"] == {}
+    assert metadata["execution_policy"]["mode"] == "controlled"
+
+    payload = asyncio.run(runtime_service.get_task(created["task_id"]))
+    assert payload is not None
+    assert payload["metadata"]["protocol"] == "autonomous_single_agent"
 
 
 def test_delegated_task_message_appends_guidance_only_transcript(tmp_path: Path) -> None:

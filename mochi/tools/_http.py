@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import random
 import time
 from typing import Any
@@ -15,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
     logger = logging.getLogger(__name__)
 
-from mochi.tools.base import ToolResult
+from mochi.tools.base import ToolCancellationResult, ToolExecutionContext, ToolResult
 
 # ---------------------------------------------------------------------------
 # \u5171\u7528\u5e38\u6578
@@ -26,6 +27,83 @@ DEFAULT_USER_AGENT = (
 )
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+@dataclass
+class BoundHttpToolCancellation:
+    """Bind active-tool cancellation to the current HTTP tool task."""
+
+    task: asyncio.Task[Any] | None
+    requested: bool = False
+    acknowledged: bool = False
+
+    @classmethod
+    async def bind(
+        cls,
+        *,
+        context: ToolExecutionContext | None,
+    ) -> BoundHttpToolCancellation:
+        handle = cls(task=asyncio.current_task())
+        controller = context.active_tool_controller if context is not None else None
+        if controller is None or handle.task is None:
+            return handle
+
+        async def _cancel_active_task() -> ToolCancellationResult:
+            task = handle.task
+            if task is None or task.done():
+                return ToolCancellationResult(
+                    cancelled=False,
+                    reason="tool_already_completed",
+                )
+
+            handle.requested = True
+            if context is not None:
+                context.cancellation_requested = True
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                handle.acknowledged = True
+            except Exception:
+                return ToolCancellationResult(
+                    cancelled=False,
+                    reason="tool_cancel_not_confirmed",
+                )
+
+            if not handle.acknowledged:
+                return ToolCancellationResult(
+                    cancelled=False,
+                    reason="tool_completed_before_cancellation",
+                )
+
+            return ToolCancellationResult(
+                cancelled=True,
+                reason="tool_cancelled",
+            )
+
+        await controller.bind_cancel_callback(
+            session_id=None,
+            callback=_cancel_active_task,
+        )
+        return handle
+
+    def raise_if_requested(self) -> None:
+        if not self.requested:
+            return
+        self.acknowledged = True
+        raise asyncio.CancelledError
+
+    def cancelled_result(
+        self,
+        *,
+        output: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        self.acknowledged = True
+        payload = dict(metadata or {})
+        payload["status"] = "cancelled"
+        payload["cancelled"] = True
+        return ToolResult(output=output, metadata=payload)
 
 # ---------------------------------------------------------------------------
 # \u7d50\u69cb\u5316 HTTP \u932f\u8aa4

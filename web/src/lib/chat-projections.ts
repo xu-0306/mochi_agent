@@ -254,7 +254,9 @@ export function buildProjectedDisplayMessages(input: {
       return message
     }
 
-    const shouldMarkSuperseded = latestGoalCardIndexByGoalId.get(goalCard.goalId) !== index
+    const shouldMarkSuperseded =
+      goalCard.kind !== 'started' &&
+      latestGoalCardIndexByGoalId.get(goalCard.goalId) !== index
     if (!shouldMarkSuperseded && !goalCard.superseded) {
       return message
     }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from mochi.agents.multi_agent.execution_policy import (
     LEGACY_CONTROLLED_SUBAGENT_PROTOCOL,
     parse_subagent_execution_policy,
@@ -22,6 +24,16 @@ def test_parse_autonomous_single_agent_protocol_defaults() -> None:
     assert resolved.protocol == "autonomous_single_agent"
     assert resolved.agent_role_id == "agent"
     assert resolved.guidance_required is False
+
+
+def test_parse_protocol_config_none_requires_explicit_protocol() -> None:
+    with pytest.raises(ValueError, match="protocol config is required"):
+        parse_protocol_config(None)
+
+
+def test_parse_protocol_config_empty_mapping_requires_explicit_protocol() -> None:
+    with pytest.raises(ValueError, match="requires a protocol"):
+        parse_protocol_config({})
 
 
 def test_parse_teacher_student_protocol_defaults() -> None:

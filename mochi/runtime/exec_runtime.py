@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import signal
@@ -61,6 +62,7 @@ class ExecRuntime:
         approval_state: str = "not_required",
         log_path: str | Path | None = None,
         checkpoint_dir: str | Path | None = None,
+        session_started_callback: Callable[[SessionPollResult], Awaitable[None] | None] | None = None,
     ) -> SessionPollResult:
         """Start a command and optionally keep it as a detached background session."""
         normalized_command = command.strip()
@@ -166,6 +168,12 @@ class ExecRuntime:
             )
         self._sessions[session.session_id] = session
         self._persist_session_state(session)
+        if session_started_callback is not None:
+            callback_result = session_started_callback(
+                self._build_poll_result(session, stdout="", stderr="")
+            )
+            if inspect.isawaitable(callback_result):
+                await callback_result
 
         if background:
             return self._build_poll_result(session, stdout="", stderr="")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlparse
@@ -15,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
     logger = logging.getLogger(__name__)
 
 from mochi.tools._http import (
+    BoundHttpToolCancellation,
     ToolHttpError,
     error_to_tool_result,
     http_request,
@@ -237,6 +239,10 @@ class WebFetchTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def search_hint(self) -> str | None:
         return "Use this after search when you need the content of one known URL."
 
@@ -294,26 +300,39 @@ class WebFetchTool(BaseTool):
         if effective_max_bytes <= 0:
             return ToolResult(error="`max_bytes` must be greater than 0.")
 
-        # Layer 1: \u76f4\u63a5 HTTP \u64f7\u53d6 + trafilatura/htmlparser
-        result = await self._fetch_direct(
-            clean_url,
-            output_format=output_format,
-            max_bytes=effective_max_bytes,
-        )
-        if result.error is None and result.output:
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
+        try:
+            result = await self._fetch_direct(
+                clean_url,
+                output_format=output_format,
+                max_bytes=effective_max_bytes,
+            )
+            cancellation.raise_if_requested()
+            if result.error is None and result.output:
+                return result
+
+            if self._jina_api_key or self._extractor == "jina_reader":
+                cancellation.raise_if_requested()
+                jina_result = await self._fetch_via_jina(clean_url)
+                cancellation.raise_if_requested()
+                if jina_result.error is None:
+                    return jina_result
+
+            cancellation.raise_if_requested()
+            if result.error is None:
+                return result
+
             return result
-
-        # Layer 2: Jina Reader API fallback (\u53ef\u8655\u7406 JS-rendered \u9801\u9762)
-        if self._jina_api_key or self._extractor == "jina_reader":
-            jina_result = await self._fetch_via_jina(clean_url)
-            if jina_result.error is None:
-                return jina_result
-
-        # Layer 3: \u82e5\u76f4\u63a5\u64f7\u53d6\u6709\u5167\u5bb9\u4f46\u54c1\u8cea\u5dee\uff0c\u4ecd\u56de\u50b3
-        if result.error is None:
-            return result
-
-        return result
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    metadata={
+                        "url": clean_url,
+                        "output_format": output_format,
+                        "max_bytes": effective_max_bytes,
+                    }
+                )
+            raise
 
     async def _fetch_direct(
         self,

@@ -1,38 +1,34 @@
-"""API 路由集合。"""
+"""API route package exports."""
 
 from __future__ import annotations
 
-from mochi.api.routes.agent_runs import router as agent_runs_router
-from mochi.api.routes.approvals import router as approvals_router
-from mochi.api.routes.chat import router as chat_router
-from mochi.api.routes.file_ops import router as file_ops_router
-from mochi.api.routes.filesystem import router as filesystem_router
-from mochi.api.routes.goals import router as goals_router
-from mochi.api.routes.model_auth import router as model_auth_router
-from mochi.api.routes.models import router as models_router
-from mochi.api.routes.projects import router as projects_router
-from mochi.api.routes.skills import router as skills_router
-from mochi.api.routes.tasks import router as tasks_router
-from mochi.api.routes.voice import router as voice_router
-from mochi.api.routes.workspace import router as workspace_router
+from importlib import import_module
+from typing import Any
 
-from .sessions import router as sessions_router
-from .settings import router as settings_router
+_ROUTER_MODULES = {
+    "agent_runs_router": "mochi.api.routes.agent_runs",
+    "approvals_router": "mochi.api.routes.approvals",
+    "chat_router": "mochi.api.routes.chat",
+    "file_ops_router": "mochi.api.routes.file_ops",
+    "filesystem_router": "mochi.api.routes.filesystem",
+    "goals_router": "mochi.api.routes.goals",
+    "model_auth_router": "mochi.api.routes.model_auth",
+    "models_router": "mochi.api.routes.models",
+    "projects_router": "mochi.api.routes.projects",
+    "sessions_router": "mochi.api.routes.sessions",
+    "settings_router": "mochi.api.routes.settings",
+    "skills_router": "mochi.api.routes.skills",
+    "tasks_router": "mochi.api.routes.tasks",
+    "voice_router": "mochi.api.routes.voice",
+    "workspace_router": "mochi.api.routes.workspace",
+}
 
-__all__ = [
-    "agent_runs_router",
-    "approvals_router",
-    "chat_router",
-    "file_ops_router",
-    "filesystem_router",
-    "goals_router",
-    "model_auth_router",
-    "models_router",
-    "projects_router",
-    "sessions_router",
-    "settings_router",
-    "skills_router",
-    "tasks_router",
-    "voice_router",
-    "workspace_router",
-]
+__all__ = list(_ROUTER_MODULES)
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _ROUTER_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    module = import_module(module_name)
+    return getattr(module, "router")

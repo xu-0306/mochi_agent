@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mochi.tools.base import ToolExecutionContext
+from mochi.tools.base import ActiveToolController, ToolExecutionContext
 from mochi.tools.web_search import WebSearchTool
 
 
@@ -522,4 +523,68 @@ async def test_web_search_falls_back_after_non_retryable_provider_http_error() -
         item["provider"] == "duckduckgo_html" and item["status"] == "succeeded"
         for item in diagnostics
     )
+    await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_web_search_foreground_cancellation_reports_cancelled_status() -> None:
+    tool = WebSearchTool(engine="duckduckgo_html")
+    controller = ActiveToolController()
+    context = ToolExecutionContext(active_tool_controller=controller)
+    await controller.activate_tool(
+        tool_call_id="tool-call-web-search-cancel",
+        tool_name="web_search",
+        cancellable=False,
+    )
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _slow_request(method: str, url: str, **kwargs: Any) -> MagicMock:  # noqa: ARG001
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _mock_response("<html><body>never</body></html>")
+
+    with patch.object(
+        tool._client,
+        "request",
+        new_callable=AsyncMock,
+        side_effect=_slow_request,
+    ):
+        task = asyncio.create_task(tool.execute(query="mochi", context=context))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            for _ in range(100):
+                snapshot = await controller.snapshot()
+                if snapshot["active"] and snapshot["cancellable"]:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("controller never observed a cancellable web_search run")
+
+            cancel_result = await controller.request_cancel()
+            assert cancel_result.cancelled is True
+            assert cancelled.is_set() is True
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert result.error is None
+    assert result.output == {
+        "query": "mochi",
+        "provider": "duckduckgo_html",
+        "results": [],
+        "warnings": [],
+        "attempted_providers": ["duckduckgo_html"],
+    }
+    assert result.metadata["status"] == "cancelled"
+    assert result.metadata["cancelled"] is True
+    assert result.metadata["query"] == "mochi"
+    assert result.metadata["attempted_providers"] == ["duckduckgo_html"]
+
     await tool.close()

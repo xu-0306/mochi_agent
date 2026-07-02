@@ -258,19 +258,7 @@ def parse_goal_command(value: str) -> GoalCommand | None:
 
 
 def is_natural_language_goal_request(value: str) -> bool:
-    normalized = re.sub(r"\s+", " ", value.strip().lower())
-    if not normalized:
-        return False
-    patterns = (
-        r"\b(?:in the background|background task|background run)\b",
-        r"\b(?:keep working on this|continue working on this|keep going on this)\b",
-        r"\b(?:make progress while i(?:'m| am) away|work on this while i(?:'m| am) away)\b",
-        r"\b(?:retry until|checkpointed|with checkpoints|save checkpoints)\b",
-        r"\b(?:spend|work for|run for|continue for|for the next)\s+\d+\s*(?:min(?:ute)?s?|hours?|hrs?)\b",
-        r"\b\d+\s*(?:min(?:ute)?s?|hours?|hrs?)\b.*\b(?:background|keep working|continue working|come back)\b",
-        r"\b(?:keep at it|stay on this|come back with progress)\b",
-    )
-    return any(re.search(pattern, normalized) for pattern in patterns)
+    return False
 
 
 def resolve_goal_workflow_routing(
@@ -290,20 +278,8 @@ def resolve_goal_workflow_routing(
     )
     workflow_mode_requested = mode_command is not None and mode_command.mode == "workflow"
     workflow_proposal_requested = workflow_mode_requested and len(request_text) > 0
-    natural_language_goal_requested = (
-        goal_command is None
-        and mode_command is None
-        and not has_pending_proposal
-        and is_natural_language_goal_request(request_text)
-    )
-    active_goal_follow_up_requested = (
-        goal_command is None
-        and mode_command is None
-        and not has_pending_proposal
-        and has_active_goal
-        and len(request_text.strip()) > 0
-        and not natural_language_goal_requested
-    )
+    natural_language_goal_requested = False
+    active_goal_follow_up_requested = False
     pending_proposal_follow_up_requested = (
         goal_command is None
         and mode_command is None

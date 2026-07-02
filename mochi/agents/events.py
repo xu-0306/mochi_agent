@@ -35,6 +35,73 @@ class StatusEvent:
 
 
 @dataclass
+class SubagentStartedEvent:
+    """UI-safe delegated subagent lifecycle start event."""
+
+    type: Literal["subagent_started"] = field(default="subagent_started", init=False)
+    subagent_id: str = ""
+    parent_type: str | None = None
+    parent_id: str | None = None
+    role_id: str | None = None
+    title: str | None = None
+    model_id: str | None = None
+    prompt_preview: str | None = None
+    status: str | None = None
+    summary: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SubagentPromptEvent:
+    """UI-safe delegated subagent prompt event."""
+
+    type: Literal["subagent_prompt"] = field(default="subagent_prompt", init=False)
+    subagent_id: str = ""
+    parent_type: str | None = None
+    parent_id: str | None = None
+    role_id: str | None = None
+    title: str | None = None
+    model_id: str | None = None
+    system_prompt: str | None = None
+    user_prompt: str | None = None
+    prompt_preview: str | None = None
+    status: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SubagentProgressEvent:
+    """UI-safe delegated subagent progress event."""
+
+    type: Literal["subagent_progress"] = field(default="subagent_progress", init=False)
+    subagent_id: str = ""
+    parent_type: str | None = None
+    parent_id: str | None = None
+    role_id: str | None = None
+    title: str | None = None
+    content: str = ""
+    status: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SubagentCompletedEvent:
+    """UI-safe delegated subagent completion event."""
+
+    type: Literal["subagent_completed"] = field(default="subagent_completed", init=False)
+    subagent_id: str = ""
+    parent_type: str | None = None
+    parent_id: str | None = None
+    role_id: str | None = None
+    title: str | None = None
+    model_id: str | None = None
+    status: str | None = None
+    summary: str | None = None
+    content: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ToolCallRequestEvent:
     """Agent 請求呼叫工具。"""
 
@@ -112,6 +179,10 @@ AgentEvent = (
     TextChunkEvent
     | ThinkingEvent
     | StatusEvent
+    | SubagentStartedEvent
+    | SubagentPromptEvent
+    | SubagentProgressEvent
+    | SubagentCompletedEvent
     | ToolCallRequestEvent
     | ToolCallResultEvent
     | FinalAnswerEvent

@@ -1,4 +1,4 @@
-"""execute_code 工具 — 受控執行 Python 程式碼（deny-by-default）。"""
+"""execute_code tool with approval, timeout, and background-process support."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 
 from mochi.config import defaults
 from mochi.security import require_approval_decision
-from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from mochi.tools.base import BaseTool, ToolCancellationResult, ToolExecutionContext, ToolResult
 from mochi.tools.process_service import ProcessService
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
 
@@ -19,7 +19,7 @@ CodeRunner = Callable[[str, Path, int, str], Awaitable[tuple[int, str, str]]]
 
 
 class ExecuteCodeTool(BaseTool):
-    """受控 Python 程式碼執行工具。"""
+    """Run Python code in a controlled subprocess."""
 
     def __init__(
         self,
@@ -31,35 +31,24 @@ class ExecuteCodeTool(BaseTool):
         runner: CodeRunner | None = None,
         process_service: ProcessService | None = None,
     ) -> None:
-        """初始化 execute_code 工具。
-
-        Args:
-            workspace_dir: 允許執行的工作目錄根路徑。
-            require_approval: 是否要求傳入 approved=True 才執行。
-            default_timeout_sec: 預設逾時秒數。
-            python_executable: 指定 Python 執行檔路徑。
-            runner: 可注入執行器（便於測試）。
-        """
         self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         self._require_approval = require_approval
         self._default_timeout_sec = default_timeout_sec
         self._python_executable = python_executable or sys.executable
         self._runner = runner or self._default_runner
+        self._uses_default_runner = runner is None
         self._process_service = process_service
 
     @property
     def name(self) -> str:
-        """工具名稱。"""
         return "execute_code"
 
     @property
     def description(self) -> str:
-        """工具用途描述。"""
         return "Run Python code in a controlled subprocess with timeout and approval controls."
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
-        """JSON Schema 格式參數。"""
         return {
             "type": "object",
             "properties": {
@@ -96,8 +85,11 @@ class ExecuteCodeTool(BaseTool):
 
     @property
     def requires_approval(self) -> bool:
-        """此工具是否預設需要審批。"""
         return self._require_approval
+
+    @property
+    def is_cancellable(self) -> bool:
+        return True
 
     async def execute(
         self,
@@ -110,7 +102,6 @@ class ExecuteCodeTool(BaseTool):
         process_label: str | None = None,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
-        """執行 Python 程式碼。"""
         if not code.strip():
             return ToolResult(error="`code` must not be empty.")
 
@@ -162,13 +153,25 @@ class ExecuteCodeTool(BaseTool):
             return ToolResult(output=payload, metadata=payload)
 
         try:
-            returncode, stdout, stderr = await self._runner(
-                code,
-                working_dir,
-                effective_timeout,
-                self._python_executable,
-            )
-        except Exception as exc:  # pragma: no cover - 防禦性保護
+            if self._uses_default_runner:
+                runner_result = await self._execute_default_runner(
+                    code=code,
+                    cwd=working_dir,
+                    timeout_sec=effective_timeout,
+                    python_executable=self._python_executable,
+                    context=context,
+                )
+                if isinstance(runner_result, ToolResult):
+                    return runner_result
+                returncode, stdout, stderr = runner_result
+            else:
+                returncode, stdout, stderr = await self._runner(
+                    code,
+                    working_dir,
+                    effective_timeout,
+                    self._python_executable,
+                )
+        except Exception as exc:  # pragma: no cover
             return ToolResult(
                 error=f"Code execution failed: {exc}",
                 metadata={"cwd": str(working_dir)},
@@ -208,7 +211,6 @@ class ExecuteCodeTool(BaseTool):
         timeout_sec: int,
         python_executable: str,
     ) -> tuple[int, str, str]:
-        """預設 subprocess 執行器。"""
         try:
             process = await asyncio.create_subprocess_exec(
                 python_executable,
@@ -244,13 +246,92 @@ class ExecuteCodeTool(BaseTool):
             )
 
     @staticmethod
+    async def _execute_default_runner(
+        *,
+        code: str,
+        cwd: Path,
+        timeout_sec: int,
+        python_executable: str,
+        context: ToolExecutionContext | None,
+    ) -> ToolResult | tuple[int, str, str]:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                python_executable,
+                "-I",
+                "-c",
+                code,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            return await asyncio.to_thread(
+                ExecuteCodeTool._run_sync_fallback,
+                code,
+                cwd,
+                timeout_sec,
+                python_executable,
+            )
+
+        cancellation_seen = False
+
+        async def _cancel_active_process() -> ToolCancellationResult:
+            nonlocal cancellation_seen
+            if process.returncode is not None:
+                return ToolCancellationResult(
+                    cancelled=False,
+                    reason="tool_already_completed",
+                    metadata={"returncode": process.returncode},
+                )
+            cancellation_seen = True
+            process.kill()
+            await process.wait()
+            return ToolCancellationResult(
+                cancelled=True,
+                reason="tool_cancelled",
+                metadata={"returncode": process.returncode},
+            )
+
+        if context is not None and context.active_tool_controller is not None:
+            await context.active_tool_controller.bind_cancel_callback(
+                session_id=None,
+                callback=_cancel_active_process,
+            )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_sec,
+            )
+        except TimeoutError:
+            process.kill()
+            await process.communicate()
+            return 124, "", f"Execution timed out after {timeout_sec} seconds."
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        returncode = process.returncode or 0
+
+        if cancellation_seen:
+            metadata = {
+                "cwd": str(cwd),
+                "returncode": returncode,
+                "status": "cancelled",
+                "cancelled": True,
+            }
+            if stderr:
+                metadata["stderr"] = stderr
+            return ToolResult(output=stdout, metadata=metadata)
+
+        return returncode, stdout, stderr
+
+    @staticmethod
     def _run_sync_fallback(
         code: str,
         cwd: Path,
         timeout_sec: int,
         python_executable: str,
     ) -> tuple[int, str, str]:
-        """當 async subprocess 不可用時的同步 fallback。"""
         try:
             completed = subprocess.run(
                 [python_executable, "-I", "-c", code],

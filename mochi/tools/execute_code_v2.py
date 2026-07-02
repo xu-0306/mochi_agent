@@ -12,7 +12,7 @@ from typing import Any
 
 from mochi.config import defaults
 from mochi.security import require_approval_decision
-from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from mochi.tools.base import BaseTool, ToolCancellationResult, ToolExecutionContext, ToolResult
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
 
 ExecuteCodeV2Runner = Callable[
@@ -154,6 +154,7 @@ class ExecuteCodeV2Tool(BaseTool):
         self._default_timeout_sec = default_timeout_sec
         self._python_executable = python_executable or sys.executable
         self._runner = runner or self._default_runner
+        self._uses_default_runner = runner is None
 
     @property
     def name(self) -> str:
@@ -201,6 +202,10 @@ class ExecuteCodeV2Tool(BaseTool):
     @property
     def requires_approval(self) -> bool:
         return self._require_approval
+
+    @property
+    def is_cancellable(self) -> bool:
+        return True
 
     async def execute(
         self,
@@ -254,14 +259,28 @@ class ExecuteCodeV2Tool(BaseTool):
             )
 
         try:
-            payload = await self._runner(
-                code,
-                working_dir,
-                effective_timeout,
-                self._python_executable,
-                workspace_root,
-                effective_allowed_tools,
-            )
+            if self._uses_default_runner:
+                runner_result = await self._execute_default_runner(
+                    code=code,
+                    cwd=working_dir,
+                    timeout_sec=effective_timeout,
+                    python_executable=self._python_executable,
+                    workspace_dir=workspace_root,
+                    allowed_tools=effective_allowed_tools,
+                    context=context,
+                )
+                if isinstance(runner_result, ToolResult):
+                    return runner_result
+                payload = runner_result
+            else:
+                payload = await self._runner(
+                    code,
+                    working_dir,
+                    effective_timeout,
+                    self._python_executable,
+                    workspace_root,
+                    effective_allowed_tools,
+                )
         except Exception as exc:  # pragma: no cover
             return ToolResult(
                 error=f"Code execution failed: {exc}",
@@ -359,6 +378,113 @@ class ExecuteCodeV2Tool(BaseTool):
                 workspace_dir,
                 allowed_tools,
             )
+
+    @staticmethod
+    async def _execute_default_runner(
+        *,
+        code: str,
+        cwd: Path,
+        timeout_sec: int,
+        python_executable: str,
+        workspace_dir: Path,
+        allowed_tools: list[str],
+        context: ToolExecutionContext | None,
+    ) -> ToolResult | dict[str, Any]:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                python_executable,
+                "-c",
+                _BOOTSTRAP,
+                str(Path(__file__).resolve().parents[2]),
+                str(workspace_dir),
+                json.dumps(allowed_tools),
+                code,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            return await asyncio.to_thread(
+                ExecuteCodeV2Tool._run_sync_fallback,
+                code,
+                cwd,
+                timeout_sec,
+                python_executable,
+                workspace_dir,
+                allowed_tools,
+            )
+
+        cancellation_seen = False
+
+        async def _cancel_active_process() -> ToolCancellationResult:
+            nonlocal cancellation_seen
+            if process.returncode is not None:
+                return ToolCancellationResult(
+                    cancelled=False,
+                    reason="tool_already_completed",
+                    metadata={"returncode": process.returncode},
+                )
+            cancellation_seen = True
+            process.kill()
+            await process.wait()
+            return ToolCancellationResult(
+                cancelled=True,
+                reason="tool_cancelled",
+                metadata={"returncode": process.returncode},
+            )
+
+        if context is not None and context.active_tool_controller is not None:
+            await context.active_tool_controller.bind_cancel_callback(
+                session_id=None,
+                callback=_cancel_active_process,
+            )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_sec,
+            )
+        except TimeoutError:
+            process.kill()
+            await process.communicate()
+            return {
+                "stdout": "",
+                "result": None,
+                "tool_calls": [],
+                "error": f"Execution timed out after {timeout_sec} seconds.",
+                "traceback": "",
+            }
+
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+
+        if cancellation_seen:
+            return ToolResult(
+                output={
+                    "stdout": stdout,
+                    "result": None,
+                    "tool_calls": [],
+                },
+                metadata={
+                    "cwd": str(cwd),
+                    "allowed_tools": allowed_tools,
+                    "tool_call_count": 0,
+                    "status": "cancelled",
+                    "cancelled": True,
+                    "returncode": process.returncode,
+                },
+            )
+
+        if process.returncode not in {0, None}:
+            return {
+                "stdout": "",
+                "result": None,
+                "tool_calls": [],
+                "error": stderr or f"Process exited with non-zero status: {process.returncode}",
+                "traceback": "",
+            }
+
+        return json.loads(stdout or "{}")
 
     @staticmethod
     def _run_sync_fallback(

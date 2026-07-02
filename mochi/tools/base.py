@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Literal
 
 
 @dataclass
@@ -32,6 +34,306 @@ class FileReadState:
 
 
 @dataclass
+class ToolCancellationResult:
+    """Normalized cancellation outcome for one active tool invocation."""
+
+    cancelled: bool
+    reason: str | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    session_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+TaskCancellationOutcome = Literal["cancelled", "completed", "pending"]
+
+
+async def cancel_asyncio_task(
+    task: asyncio.Task[Any] | None,
+) -> TaskCancellationOutcome:
+    """Best-effort task cancellation with a truthful immediate outcome."""
+    if task is None:
+        return "completed"
+    if task.done():
+        return "cancelled" if task.cancelled() else "completed"
+    task.cancel()
+    await asyncio.sleep(0)
+    if not task.done():
+        return "pending"
+    return "cancelled" if task.cancelled() else "completed"
+
+
+@dataclass
+class RunCancellationResult:
+    """Normalized run-level cancellation outcome."""
+
+    cancelled: bool
+    state: Literal["cancelled", "completed", "pending"]
+    boundary: Literal["generation", "tool"] | None = None
+    reason: str | None = None
+    tool_result: ToolCancellationResult | None = None
+
+
+class RunCancellationContext:
+    """Coordinate truthful run-level and tool-level cancellation boundaries."""
+
+    def __init__(self, *, run_id: str) -> None:
+        self.run_id = str(run_id or "").strip() or "run"
+        self._lock = asyncio.Lock()
+        self._state: Literal["running", "cancelling", "cancelled", "completed"] = "running"
+        self._cancel_requested = False
+        self._cancel_confirmed = False
+        self._active_tool_controller: ActiveToolController | None = None
+        self._generation_cancel_callback: Callable[[], Awaitable[TaskCancellationOutcome]] | None = None
+
+    async def bind_active_tool_controller(
+        self,
+        controller: "ActiveToolController" | None,
+    ) -> None:
+        async with self._lock:
+            self._active_tool_controller = controller
+
+    async def bind_generation_cancel_callback(
+        self,
+        callback: Callable[[], Awaitable[TaskCancellationOutcome]] | None,
+    ) -> None:
+        async with self._lock:
+            self._generation_cancel_callback = callback
+
+    async def mark_completed(self) -> None:
+        async with self._lock:
+            if self._state != "cancelled":
+                self._state = "completed"
+
+    async def mark_cancelled(self) -> None:
+        async with self._lock:
+            self._cancel_requested = True
+            self._cancel_confirmed = True
+            self._state = "cancelled"
+
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            controller = self._active_tool_controller
+            state = self._state
+            cancel_requested = self._cancel_requested
+            cancel_confirmed = self._cancel_confirmed
+            generation_bound = self._generation_cancel_callback is not None
+        tool_snapshot = await controller.snapshot() if controller is not None else None
+        return {
+            "run_id": self.run_id,
+            "state": state,
+            "cancel_requested": cancel_requested,
+            "cancel_confirmed": cancel_confirmed,
+            "generation_bound": generation_bound,
+            "active_tool": tool_snapshot,
+        }
+
+    async def request_generation_cancel(self) -> RunCancellationResult:
+        async with self._lock:
+            if self._state == "completed":
+                return RunCancellationResult(cancelled=False, state="completed", boundary="generation")
+            if self._state == "cancelled":
+                return RunCancellationResult(cancelled=True, state="cancelled", boundary="generation")
+            self._cancel_requested = True
+            self._state = "cancelling"
+            cancel_callback = self._generation_cancel_callback
+        if cancel_callback is None:
+            return RunCancellationResult(
+                cancelled=False,
+                state="pending",
+                boundary="generation",
+                reason="generation_not_bound",
+            )
+        outcome = await cancel_callback()
+        if outcome == "cancelled":
+            await self.mark_cancelled()
+            return RunCancellationResult(cancelled=True, state="cancelled", boundary="generation")
+        if outcome == "completed":
+            await self.mark_completed()
+            return RunCancellationResult(cancelled=False, state="completed", boundary="generation")
+        return RunCancellationResult(
+            cancelled=False,
+            state="pending",
+            boundary="generation",
+            reason="generation_in_progress",
+        )
+
+    async def request_active_tool_cancel(self) -> RunCancellationResult:
+        async with self._lock:
+            controller = self._active_tool_controller
+        if controller is None:
+            return RunCancellationResult(
+                cancelled=False,
+                state="pending",
+                boundary="tool",
+                reason="no_active_tool",
+            )
+        tool_result = await controller.request_cancel()
+        if tool_result.cancelled:
+            return RunCancellationResult(
+                cancelled=True,
+                state="cancelled",
+                boundary="tool",
+                reason=tool_result.reason,
+                tool_result=tool_result,
+            )
+        return RunCancellationResult(
+            cancelled=False,
+            state="pending",
+            boundary="tool",
+            reason=tool_result.reason or "tool_in_progress",
+            tool_result=tool_result,
+        )
+
+    async def request_run_cancel(self) -> RunCancellationResult:
+        async with self._lock:
+            if self._state not in {"completed", "cancelled"}:
+                self._cancel_requested = True
+                self._state = "cancelling"
+        snapshot = await self.snapshot()
+        state = str(snapshot.get("state") or "running")
+        if state == "completed":
+            return RunCancellationResult(cancelled=False, state="completed")
+        if state == "cancelled":
+            return RunCancellationResult(cancelled=True, state="cancelled")
+
+        active_tool = snapshot.get("active_tool")
+        if isinstance(active_tool, Mapping) and bool(active_tool.get("active")):
+            tool_result = await self.request_active_tool_cancel()
+            if not tool_result.cancelled:
+                return tool_result
+
+        generation_result = await self.request_generation_cancel()
+        if generation_result.cancelled:
+            return generation_result
+        if generation_result.state == "completed":
+            if isinstance(active_tool, Mapping) and bool(active_tool.get("active")):
+                return RunCancellationResult(
+                    cancelled=False,
+                    state="completed",
+                    boundary="tool",
+                    reason="run_completed_before_cancellation",
+                )
+            return generation_result
+        return generation_result
+
+
+class ActiveToolController:
+    """Track the currently running tool and coordinate live cancellation/apply hooks."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._tool_call_id: str | None = None
+        self._tool_name: str | None = None
+        self._session_id: str | None = None
+        self._active = False
+        self._cancellable = False
+        self._cancel_requested = False
+        self._cancel_callback: Callable[[], Awaitable[ToolCancellationResult]] | None = None
+        self._pending_post_tool_messages: list[dict[str, Any]] = []
+        self._applied_post_tool_messages: list[dict[str, Any]] = []
+
+    async def activate_tool(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        cancellable: bool = False,
+    ) -> None:
+        async with self._lock:
+            self._tool_call_id = str(tool_call_id or "").strip() or None
+            self._tool_name = str(tool_name or "").strip() or None
+            self._session_id = None
+            self._active = True
+            self._cancellable = bool(cancellable)
+            self._cancel_requested = False
+            self._cancel_callback = None
+
+    async def bind_cancel_callback(
+        self,
+        *,
+        session_id: str | None,
+        callback: Callable[[], Awaitable[ToolCancellationResult]],
+    ) -> None:
+        async with self._lock:
+            if not self._active:
+                return
+            self._session_id = str(session_id or "").strip() or None
+            self._cancel_callback = callback
+            self._cancellable = True
+
+    async def finish_tool(self) -> None:
+        async with self._lock:
+            self._tool_call_id = None
+            self._tool_name = None
+            self._session_id = None
+            self._active = False
+            self._cancellable = False
+            self._cancel_requested = False
+            self._cancel_callback = None
+
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            return {
+                "active": self._active,
+                "tool_call_id": self._tool_call_id,
+                "tool_name": self._tool_name,
+                "session_id": self._session_id,
+                "cancellable": self._cancellable and self._cancel_callback is not None,
+                "cancel_requested": self._cancel_requested,
+            }
+
+    async def request_cancel(self) -> ToolCancellationResult:
+        async with self._lock:
+            if not self._active:
+                return ToolCancellationResult(cancelled=False, reason="no_active_tool")
+            tool_call_id = self._tool_call_id
+            tool_name = self._tool_name
+            session_id = self._session_id
+            if not self._cancellable or self._cancel_callback is None:
+                return ToolCancellationResult(
+                    cancelled=False,
+                    reason="tool_in_progress",
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    session_id=session_id,
+                )
+            self._cancel_requested = True
+            cancel_callback = self._cancel_callback
+
+        result = await cancel_callback()
+        if result.tool_call_id is None:
+            result.tool_call_id = tool_call_id
+        if result.tool_name is None:
+            result.tool_name = tool_name
+        if result.session_id is None:
+            result.session_id = session_id
+        return result
+
+    async def queue_post_tool_message(self, message: Mapping[str, Any]) -> None:
+        payload = {str(key): value for key, value in dict(message).items()}
+        async with self._lock:
+            self._pending_post_tool_messages.append(payload)
+
+    async def consume_post_tool_messages(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            if not self._pending_post_tool_messages:
+                return []
+            messages = [dict(item) for item in self._pending_post_tool_messages]
+            self._pending_post_tool_messages.clear()
+            self._applied_post_tool_messages.extend(messages)
+            return messages
+
+    async def drain_applied_post_tool_messages(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            if not self._applied_post_tool_messages:
+                return []
+            messages = [dict(item) for item in self._applied_post_tool_messages]
+            self._applied_post_tool_messages.clear()
+            return messages
+
+
+@dataclass
 class ToolExecutionContext:
     """Shared execution context for one tool run."""
 
@@ -47,6 +349,7 @@ class ToolExecutionContext:
     state: dict[str, Any] = field(default_factory=dict)
     progress_callback: Any | None = None
     cancellation_requested: bool = False
+    active_tool_controller: ActiveToolController | None = None
 
 
 class BaseTool(ABC):
@@ -88,6 +391,10 @@ class BaseTool(ABC):
 
     @property
     def is_open_world(self) -> bool:
+        return False
+
+    @property
+    def is_cancellable(self) -> bool:
         return False
 
     @property

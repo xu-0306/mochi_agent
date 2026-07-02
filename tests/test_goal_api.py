@@ -11,11 +11,16 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mochi.agents.multi_agent.orchestrator import MultiAgentRunResult
 from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
+from mochi.runtime.goal_strategy_registry import (
+    GoalStrategyRegistryEntryData,
+    registered_goal_strategy_entries_for_test,
+)
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.service import RuntimeService
@@ -199,8 +204,8 @@ def test_goal_proposal_assistant_copy_route_uses_bounded_engine_invoke(tmp_path:
             self.requests.append(request)
             return SimpleNamespace(
                 content=(
-                    "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd\u53ef\u4ee5\u76f4\u63a5\u555f\u52d5\u7684 goal \u63d0\u6848\u3002 "
-                    "\u76ee\u524d\u6703\u4ee5 autonomous_single_agent \u4f5c\u70ba\u57f7\u884c\u65b9\u5f0f\u3002"
+                    "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd goal \u8349\u7a3f\uff0c\u4f5c\u70ba\u9019\u500b\u4efb\u52d9\u7684\u57f7\u884c\u5951\u7d04\u3002 "
+                    "\u76ee\u524d\u9078\u5b9a\u7684\u57f7\u884c\u7b56\u7565\u662f autonomous_single_agent\uff0c\u78ba\u8a8d\u555f\u52d5\u5f8c\u624d\u6703\u958b\u59cb\u57f7\u884c\u3002"
                 )
             )
 
@@ -229,7 +234,7 @@ def test_goal_proposal_assistant_copy_route_uses_bounded_engine_invoke(tmp_path:
     payload = response.json()
     assert payload == {
         "type": "goal_proposal_assistant_copy",
-        "explanation": "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd\u53ef\u4ee5\u76f4\u63a5\u555f\u52d5\u7684 goal \u63d0\u6848\u3002 \u76ee\u524d\u6703\u4ee5 autonomous_single_agent \u4f5c\u70ba\u57f7\u884c\u65b9\u5f0f\u3002",
+        "explanation": "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd goal \u8349\u7a3f\uff0c\u4f5c\u70ba\u9019\u500b\u4efb\u52d9\u7684\u57f7\u884c\u5951\u7d04\u3002 \u76ee\u524d\u9078\u5b9a\u7684\u57f7\u884c\u7b56\u7565\u662f autonomous_single_agent\uff0c\u78ba\u8a8d\u555f\u52d5\u5f8c\u624d\u6703\u958b\u59cb\u57f7\u884c\u3002",
         "source": "model",
     }
     assert len(fake_engine.requests) == 1
@@ -239,6 +244,7 @@ def test_goal_proposal_assistant_copy_route_uses_bounded_engine_invoke(tmp_path:
     assert request.persist_session is False
     assert "Latest user request" in request.message
     assert "\u5e6b\u6211\u67e5\u8a62 ESG LLM \u5fae\u8abf\u76f8\u95dc\u8ad6\u6587" in request.message
+    assert "launch directly" not in payload["explanation"]
 
 def test_pending_goal_proposal_intent_route_uses_deterministic_chinese_start_rule(
     tmp_path: Path,
@@ -263,6 +269,50 @@ def test_pending_goal_proposal_intent_route_uses_deterministic_chinese_start_rul
             "/v1/goals/pending-proposal-intent",
             json={
                 "message": "\u958b\u59cb",
+                "proposal_objective": "Research ESG LLM fine-tuning methods",
+                "execution_mode": "single_agent",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"] == "confirm_start"
+    assert payload["confidence"] == 1.0
+    assert len(fake_engine.requests) == 0
+
+
+@pytest.mark.parametrize(
+    ("message",),
+    [
+        ("\u597d \u958b\u59cb",),
+        ("\u53ef\u4ee5\uff0c\u555f\u52d5",),
+        ("ok start",),
+    ],
+)
+def test_pending_goal_proposal_intent_route_accepts_mixed_affirmation_start_phrases(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def invoke(self, request: Any) -> Any:
+            self.requests.append(request)
+            raise AssertionError("affirmation-plus-start phrases should bypass bounded invoke")
+
+    app = create_app()
+    fake_engine = _FakeEngine()
+    app.state.engine_factory = lambda: fake_engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/pending-proposal-intent",
+            json={
+                "message": message,
                 "proposal_objective": "Research ESG LLM fine-tuning methods",
                 "execution_mode": "single_agent",
             },
@@ -302,6 +352,326 @@ def test_goal_proposal_assistant_copy_route_falls_back_to_chinese_copy(
     payload = response.json()
     assert payload["source"] == "fallback"
     assert "\u555f\u52d5" in payload["explanation"] or "\u57f7\u884c" in payload["explanation"]
+
+
+def test_goal_follow_up_assistant_copy_route_uses_bounded_engine_invoke(tmp_path: Path) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def invoke(self, request: Any) -> Any:
+            self.requests.append(request)
+            return SimpleNamespace(
+                content=(
+                    "\u76ee\u524d\u9019\u500b goal \u9084\u5361\u5728 exec_command \u7684\u6838\u51c6\u3002 "
+                    "\u5148\u8655\u7406\u6838\u51c6\u5f8c\uff0c\u6211\u624d\u80fd\u7e7c\u7e8c\u5957\u7528\u4f60\u7684\u65b0\u65b9\u5411\u3002"
+                )
+            )
+
+    app = create_app()
+    fake_engine = _FakeEngine()
+    app.state.engine_factory = lambda: fake_engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/follow-up-assistant-copy",
+            json={
+                "message": "\u9019\u662f\u4ec0\u9ebc\u610f\u601d",
+                "kind": "manual_resolution_required",
+                "goal_objective": "Research ESG LLM fine-tuning methods",
+                "goal_status": "waiting_approval",
+                "linked_run_status": "blocked",
+                "continuation_action": "manual_resolution_required",
+                "continuation_summary": "Goal is waiting on operator approval before it can continue.",
+                "approval_count": 1,
+                "tool_names": ["exec_command"],
+                "recommended_action": "resolve_approval",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "type": "goal_follow_up_assistant_copy",
+        "explanation": (
+            "\u76ee\u524d\u9019\u500b goal \u9084\u5361\u5728 exec_command \u7684\u6838\u51c6\u3002 "
+            "\u5148\u8655\u7406\u6838\u51c6\u5f8c\uff0c\u6211\u624d\u80fd\u7e7c\u7e8c\u5957\u7528\u4f60\u7684\u65b0\u65b9\u5411\u3002"
+        ),
+        "source": "model",
+    }
+    assert len(fake_engine.requests) == 1
+    request = fake_engine.requests[0]
+    assert request.tool_mode == "disabled"
+    assert request.execution_profile == "judge"
+    assert request.persist_session is False
+    assert "Goal follow-up outcome" in request.message
+    assert "manual_resolution_required" in request.message
+
+
+def test_goal_follow_up_assistant_copy_route_falls_back_to_chinese_copy(
+    tmp_path: Path,
+) -> None:
+    app = create_app()
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/follow-up-assistant-copy",
+            json={
+                "message": "\u8acb\u7e7c\u7e8c\u8655\u7406",
+                "kind": "manual_resolution_required",
+                "goal_objective": "Research ESG LLM fine-tuning methods",
+                "goal_status": "waiting_approval",
+                "continuation_summary": "The active goal needs approval handling before it can continue.",
+                "approval_count": 1,
+                "tool_names": ["exec_command"],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["type"] == "goal_follow_up_assistant_copy"
+    assert payload["source"] == "fallback"
+    assert "The active goal needs approval handling" not in payload["explanation"]
+    assert "\u5f85\u6838\u51c6\u5de5\u5177" in payload["explanation"]
+    assert "Goal Console" in payload["explanation"]
+
+
+def test_goal_follow_up_assistant_copy_route_supports_queued_after_resolution(
+    tmp_path: Path,
+) -> None:
+    app = create_app()
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/follow-up-assistant-copy",
+            json={
+                "message": "Please continue after approval",
+                "kind": "queued_after_resolution",
+                "goal_objective": "Research ESG LLM fine-tuning methods",
+                "goal_status": "waiting_approval",
+                "continuation_summary": (
+                    "Goal is waiting on operator approval, but the current attempt can queue "
+                    "your follow-up guidance and resume with it once approval is resolved."
+                ),
+                "approval_count": 1,
+                "tool_names": ["exec_command"],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["type"] == "goal_follow_up_assistant_copy"
+    assert payload["source"] == "fallback"
+    assert "restating it" in payload["explanation"]
+
+
+def test_goal_turn_decision_route_classifies_blocked_explanation_question(
+    tmp_path: Path,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id="goal-turn-decision-blocked-1",
+            objective="Explain why the goal is blocked.",
+            summary={"phase": "operator_review"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id="goal-turn-decision-blocked-attempt-1",
+            goal_id="goal-turn-decision-blocked-1",
+            attempt_index=1,
+            status="waiting_approval",
+            trigger="manual_start",
+            summary={
+                "linked_approval_state": {
+                    "status": "waiting_approval",
+                    "pending_count": 1,
+                    "approval_ids": ["exec-approval-turn-decision-1"],
+                    "tool_names": ["exec_command"],
+                }
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            "goal-turn-decision-blocked-1",
+            "waiting_approval",
+            current_attempt_id="goal-turn-decision-blocked-attempt-1",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/goal-turn-decision-blocked-1/turn-decision",
+            json={"message": "why is this blocked?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["lane"] == "active_goal_turn"
+    assert payload["kind"] == "explain_goal_state"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
+    assert payload["goal_status"] == "waiting_approval"
+    assert payload["recommended_action"] == "resolve_approval"
+
+
+def test_goal_turn_decision_route_classifies_progress_question_as_explanatory(
+    tmp_path: Path,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id="goal-turn-decision-progress-1",
+            objective="Summarize current progress.",
+            summary={"phase": "running"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id="goal-turn-decision-progress-attempt-1",
+            goal_id="goal-turn-decision-progress-1",
+            attempt_index=1,
+            status="running",
+            trigger="manual_start",
+            agent_run_id="goal-turn-decision-progress-run-1",
+            summary={},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id="goal-turn-decision-progress-run-1",
+            protocol_id="autonomous_single_agent",
+            title="Progress monitor run",
+            topic="Summarize current progress.",
+            summary={},
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status("goal-turn-decision-progress-run-1", "running"))
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            "goal-turn-decision-progress-1",
+            "running",
+            current_attempt_id="goal-turn-decision-progress-attempt-1",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/goal-turn-decision-progress-1/turn-decision",
+            json={"message": "what happened so far?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] in {"answer_question", "explain_goal_state"}
+    assert payload["kind"] != "steer"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["recommended_action"] == "monitor"
+
+
+def test_goal_turn_decision_route_does_not_treat_explanation_question_as_steering(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Explain implementation choices clearly."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "why did you use python for this?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] in {"answer_question", "explain_goal_state"}
+    assert payload["kind"] != "steer"
+    assert payload["selection_source"] == "bounded_fallback"
+
+
+def test_goal_turn_decision_route_classifies_steering_instruction(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Keep researching the topic."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "focus on benchmark comparisons next"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "steer"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
+
+
+def test_goal_turn_decision_route_classifies_replan_instruction(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Work this through the current approach."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "replan this and take a different approach"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "replan"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
+
+
+def test_goal_turn_decision_route_classifies_lifecycle_command(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Pause and resume lifecycle coverage."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "resume this goal"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "lifecycle"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
 
 
 def _build_goal_linked_exec_approval_orchestrator(
@@ -519,19 +889,28 @@ def test_goal_create_preserves_explicit_protocol_for_single_agent_lane_goals(
         assert created["execution_mode"] == "single_agent"
         assert created["interaction_mode"] == "goal"
         assert created["execution_topology"] == "multi_agent"
+        assert created["strategy_id"] == "multi_agent_debate"
+        assert created["selection_source"] == "explicit_override"
+        assert created["selection_reason"] == "Strategy explicitly set to multi_agent_debate."
         assert created["protocol_id"] == "multi_agent_debate"
         assert created["bound_run_id"] is None
         assert created["protocol_selection"] == "multi_agent_debate"
-        assert created["selection_rationale"] is None
+        assert created["selection_rationale"] == "Strategy explicitly set to multi_agent_debate."
 
         list_response = client.get("/v1/goals")
         assert list_response.status_code == 200
         assert list_response.json()[0]["execution_mode"] == "single_agent"
+        assert list_response.json()[0]["strategy_id"] == "multi_agent_debate"
+        assert list_response.json()[0]["selection_source"] == "explicit_override"
+        assert list_response.json()[0]["selection_reason"] == "Strategy explicitly set to multi_agent_debate."
         assert list_response.json()[0]["protocol_id"] == "multi_agent_debate"
 
         get_response = client.get(f"/v1/goals/{goal_id}")
         assert get_response.status_code == 200
         assert get_response.json()["execution_mode"] == "single_agent"
+        assert get_response.json()["strategy_id"] == "multi_agent_debate"
+        assert get_response.json()["selection_source"] == "explicit_override"
+        assert get_response.json()["selection_reason"] == "Strategy explicitly set to multi_agent_debate."
         assert get_response.json()["protocol_id"] == "multi_agent_debate"
 
         health_response = client.get(f"/v1/goals/{goal_id}/health")
@@ -540,10 +919,13 @@ def test_goal_create_preserves_explicit_protocol_for_single_agent_lane_goals(
         assert health_payload["execution_mode"] == "single_agent"
         assert health_payload["interaction_mode"] == "goal"
         assert health_payload["execution_topology"] == "multi_agent"
+        assert health_payload["strategy_id"] == "multi_agent_debate"
+        assert health_payload["selection_source"] == "explicit_override"
+        assert health_payload["selection_reason"] == "Strategy explicitly set to multi_agent_debate."
         assert health_payload["protocol_id"] == "multi_agent_debate"
         assert health_payload["bound_run_id"] is None
         assert health_payload["protocol_selection"] == "multi_agent_debate"
-        assert health_payload["selection_rationale"] is None
+        assert health_payload["selection_rationale"] == "Strategy explicitly set to multi_agent_debate."
 
         start_response = client.post(f"/v1/goals/{goal_id}/start")
         assert start_response.status_code == 200
@@ -551,24 +933,116 @@ def test_goal_create_preserves_explicit_protocol_for_single_agent_lane_goals(
         assert started["execution_mode"] == "single_agent"
         assert started["interaction_mode"] == "goal"
         assert started["execution_topology"] == "multi_agent"
+        assert started["strategy_id"] == "multi_agent_debate"
+        assert started["selection_source"] == "explicit_override"
+        assert started["selection_reason"] == "Strategy explicitly set to multi_agent_debate."
         assert started["protocol_id"] == "multi_agent_debate"
         assert started["protocol_selection"] == "multi_agent_debate"
-        assert started["selection_rationale"] is None
+        assert started["selection_rationale"] == "Strategy explicitly set to multi_agent_debate."
 
         completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
         assert completed_goal["execution_mode"] == "single_agent"
         assert completed_goal["interaction_mode"] == "goal"
         assert completed_goal["execution_topology"] == "multi_agent"
+        assert completed_goal["strategy_id"] == "multi_agent_debate"
+        assert completed_goal["selection_source"] == "explicit_override"
+        assert completed_goal["selection_reason"] == "Strategy explicitly set to multi_agent_debate."
         assert completed_goal["protocol_id"] == "multi_agent_debate"
         linked_run_id = completed_goal["attempts"][0]["agent_run_id"]
         assert linked_run_id is not None
         assert completed_goal["bound_run_id"] == linked_run_id
         assert completed_goal["protocol_selection"] == "multi_agent_debate"
-        assert completed_goal["selection_rationale"] is None
+        assert completed_goal["selection_rationale"] == "Strategy explicitly set to multi_agent_debate."
 
         linked_run_response = client.get(f"/v1/agent-runs/{linked_run_id}")
         assert linked_run_response.status_code == 200
         assert linked_run_response.json()["protocol_id"] == "multi_agent_debate"
+
+
+def test_goal_strategy_registry_endpoint_exposes_default_and_descriptions(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        response = client.get("/v1/goals/strategies")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["type"] == "goal_strategy_registry"
+    assert payload["default_strategy_id"] == "autonomous_single_agent"
+
+    entries = {entry["id"]: entry for entry in payload["entries"]}
+    assert "autonomous_single_agent" in entries
+    assert "multi_agent_debate" in entries
+    assert entries["autonomous_single_agent"]["is_default"] is True
+    assert entries["autonomous_single_agent"]["available"] is True
+    assert "availability_reason" in entries["autonomous_single_agent"]
+    assert entries["autonomous_single_agent"]["description"]
+    assert entries["autonomous_single_agent"]["when_to_use"]
+    assert entries["autonomous_single_agent"]["when_not_to_use"]
+    assert entries["autonomous_single_agent"]["description"] != "autonomous_single_agent"
+    assert entries["multi_agent_debate"]["description"]
+    assert entries["multi_agent_debate"]["when_to_use"]
+    assert entries["multi_agent_debate"]["available"] is True
+
+    if "teacher_student_distill" in entries:
+        assert entries["teacher_student_distill"]["is_default"] is False
+        assert payload["default_strategy_id"] != "teacher_student_distill"
+        assert entries["teacher_student_distill"]["requires_confirmation"] is True
+        assert entries["teacher_student_distill"]["available"] is True
+        assert entries["teacher_student_distill"]["availability_reason"]
+
+
+def test_goal_strategy_registry_route_is_not_captured_as_goal_id(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        strategy_response = client.get("/v1/goals/strategies")
+        missing_goal_response = client.get("/v1/goals/not-a-real-goal-id")
+
+    assert strategy_response.status_code == 200
+    assert strategy_response.json()["type"] == "goal_strategy_registry"
+    assert missing_goal_response.status_code == 404
+    assert missing_goal_response.json()["detail"] == "Goal not found"
+
+
+def test_goal_strategy_registry_endpoint_includes_test_injected_entries(
+    tmp_path: Path,
+) -> None:
+    injected = GoalStrategyRegistryEntryData(
+        id="test_registry_strategy",
+        name="Test registry strategy",
+        display_name="Test registry strategy",
+        description="A test-only strategy with natural-language registry guidance.",
+        when_to_use="Use only in tests that prove routes read from the registry.",
+        when_not_to_use="Never use for production Goal execution.",
+        execution_topology="single_agent",
+        protocol_id=None,
+        required_capabilities=("test_registry",),
+        approval_profile="test_only",
+        control_scope="goal",
+        success_signals=("The injected entry appears in the API response.",),
+        failure_modes=("The route hardcodes production strategy ids.",),
+        available=True,
+        availability_reason="Injected only while this test context manager is active.",
+        override_label="Test strategy",
+        selection_guidance="Injected strategy used for route registry tests.",
+    )
+
+    with registered_goal_strategy_entries_for_test((injected,)):
+        with _create_goal_test_client(tmp_path) as client:
+            response = client.get("/v1/goals/strategies")
+
+    assert response.status_code == 200
+    entries = {entry["id"]: entry for entry in response.json()["entries"]}
+    assert "test_registry_strategy" in entries
+    assert entries["test_registry_strategy"]["description"] == (
+        "A test-only strategy with natural-language registry guidance."
+    )
+    assert entries["test_registry_strategy"]["protocol_id"] is None
+    assert entries["test_registry_strategy"]["available"] is True
+    assert entries["test_registry_strategy"]["availability_reason"] == (
+        "Injected only while this test context manager is active."
+    )
 
 
 def test_goal_create_defaults_missing_single_agent_protocol_to_autonomous_agent(
@@ -589,9 +1063,476 @@ def test_goal_create_defaults_missing_single_agent_protocol_to_autonomous_agent(
         assert created["execution_mode"] == "single_agent"
         assert created["interaction_mode"] == "goal"
         assert created["execution_topology"] == "single_agent"
+        assert created["strategy_id"] == "autonomous_single_agent"
+        assert created["selection_source"] == "safe_default"
+        assert created["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
         assert created["protocol_id"] == "autonomous_single_agent"
         assert created["protocol_selection"] == "autonomous_single_agent"
-        assert created["selection_rationale"] is None
+        assert created["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+
+def test_goal_create_defaults_missing_execution_mode_and_protocol_to_autonomous_agent(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Handle this with the default goal execution path.",
+                "title": "Default Goal",
+            },
+        )
+        assert create_response.status_code == 200
+        created = create_response.json()
+        goal_id = created["goal_id"]
+
+        assert created["execution_mode"] == "single_agent"
+        assert created["interaction_mode"] == "goal"
+        assert created["execution_topology"] == "single_agent"
+        assert created["strategy_id"] == "autonomous_single_agent"
+        assert created["selection_source"] == "safe_default"
+        assert created["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+        assert created["protocol_id"] == "autonomous_single_agent"
+        assert created["protocol_selection"] == "autonomous_single_agent"
+        assert created["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+        get_response = client.get(f"/v1/goals/{goal_id}")
+        assert get_response.status_code == 200
+        fetched = get_response.json()
+        assert fetched["execution_mode"] == "single_agent"
+        assert fetched["strategy_id"] == "autonomous_single_agent"
+        assert fetched["selection_source"] == "safe_default"
+        assert fetched["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+        assert fetched["protocol_id"] == "autonomous_single_agent"
+        assert fetched["protocol_selection"] == "autonomous_single_agent"
+        
+        list_response = client.get("/v1/goals")
+        assert list_response.status_code == 200
+        listed = list_response.json()[0]
+        assert listed["strategy_id"] == "autonomous_single_agent"
+        assert listed["selection_source"] == "safe_default"
+        assert listed["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+        health_response = client.get(f"/v1/goals/{goal_id}/health")
+        assert health_response.status_code == 200
+        health_payload = health_response.json()
+        assert health_payload["strategy_id"] == "autonomous_single_agent"
+        assert health_payload["selection_source"] == "safe_default"
+        assert health_payload["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+        started = start_response.json()
+        assert started["strategy_id"] == "autonomous_single_agent"
+        assert started["selection_source"] == "safe_default"
+        assert started["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+
+def test_goal_start_refuses_placeholder_success_when_no_model_role_selected(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Research this for 20 minutes and report findings.",
+                "execution_mode": "single_agent",
+            },
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+
+        goal_payload = _wait_goal_until(
+            client,
+            goal_id,
+            {"awaiting_resources"},
+            timeout_seconds=4.0,
+        )
+        assert goal_payload["status"] == "awaiting_resources"
+        linked_run_id = goal_payload["attempts"][0]["agent_run_id"]
+        assert linked_run_id is not None
+
+        linked_run_response = client.get(f"/v1/agent-runs/{linked_run_id}")
+        assert linked_run_response.status_code == 200
+        linked_run = linked_run_response.json()
+        assert linked_run["status"] == "awaiting_resources"
+        assert "placeholder" not in str(linked_run.get("summary", {}).get("final_answer", "")).lower()
+        assert "requires at least one selected model role" in linked_run["latest_error"]
+
+
+def test_goal_start_passes_selected_model_roles_to_linked_agent_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_requests: list[Any] = []
+
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        captured_requests.append(request)
+        return MultiAgentRunResult(
+            run_id=request.run_id or "goal-model-run",
+            protocol="autonomous_single_agent",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Model-backed goal completed."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Research this with the selected chat model.",
+                "execution_mode": "single_agent",
+                "selected_models_roles": {
+                    "by_role": {"agent": "ollama:qwen3.5:9b"},
+                    "entries": [{"role": "agent", "model_id": "ollama:qwen3.5:9b"}],
+                },
+            },
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+        linked_run_id = completed_goal["attempts"][0]["agent_run_id"]
+        assert linked_run_id is not None
+
+        linked_run_response = client.get(f"/v1/agent-runs/{linked_run_id}")
+        assert linked_run_response.status_code == 200
+        linked_run = linked_run_response.json()
+        assert linked_run["selected_models_roles"]["by_role"] == {
+            "agent": "ollama:qwen3.5:9b",
+        }
+        assert captured_requests
+        assert captured_requests[0].metadata["selected_models_roles"]["by_role"] == {
+            "agent": "ollama:qwen3.5:9b",
+        }
+        assert captured_requests[0].metadata["summary"]["selected_models_roles"]["by_role"] == {
+            "agent": "ollama:qwen3.5:9b",
+        }
+
+
+def test_goal_api_prefers_canonical_goal_fields_over_stale_legacy_summary_metadata(
+    tmp_path: Path,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Handle this with the default goal execution path.",
+                "title": "Canonical Goal",
+            },
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        asyncio.run(
+            runtime_service._store.update_goal_metadata(  # noqa: SLF001
+                goal_id,
+                summary={
+                    "interaction_mode": "workflow",
+                    "execution_topology": "multi_agent",
+                    "protocol_selection": "teacher_student_distill",
+                    "selection_rationale": "Stale legacy summary still claims distill mode.",
+                    "strategy_id": "teacher_student_distill",
+                },
+            )
+        )
+
+        get_response = client.get(f"/v1/goals/{goal_id}")
+        assert get_response.status_code == 200
+        fetched = get_response.json()
+        assert fetched["execution_mode"] == "single_agent"
+        assert fetched["interaction_mode"] == "goal"
+        assert fetched["execution_topology"] == "single_agent"
+        assert fetched["strategy_id"] == "autonomous_single_agent"
+        assert fetched["selection_source"] == "safe_default"
+        assert fetched["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+        assert fetched["protocol_id"] == "autonomous_single_agent"
+        assert fetched["protocol_selection"] == "autonomous_single_agent"
+        assert fetched["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+        list_response = client.get("/v1/goals")
+        assert list_response.status_code == 200
+        listed = list_response.json()[0]
+        assert listed["interaction_mode"] == "goal"
+        assert listed["execution_topology"] == "single_agent"
+        assert listed["protocol_selection"] == "autonomous_single_agent"
+        assert listed["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+        health_response = client.get(f"/v1/goals/{goal_id}/health")
+        assert health_response.status_code == 200
+        health_payload = health_response.json()
+        assert health_payload["interaction_mode"] == "goal"
+        assert health_payload["execution_topology"] == "single_agent"
+        assert health_payload["protocol_selection"] == "autonomous_single_agent"
+        assert health_payload["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+        started = start_response.json()
+        assert started["interaction_mode"] == "goal"
+        assert started["execution_topology"] == "single_agent"
+        assert started["protocol_selection"] == "autonomous_single_agent"
+        assert started["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+
+
+def test_goal_api_legacy_workflow_without_strategy_does_not_default_to_distill(
+    tmp_path: Path,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Legacy workflow-shaped goal without strategy metadata.",
+                "title": "Legacy Workflow Goal",
+                "execution_mode": "workflow",
+            },
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        asyncio.run(runtime_service._store.initialize())  # noqa: SLF001
+        with sqlite3.connect(runtime_service._store._db_path) as conn:  # noqa: SLF001
+            conn.execute(
+                """
+                UPDATE goals
+                SET strategy_id=NULL,
+                    selection_source=NULL,
+                    selection_reason=NULL,
+                    protocol_id=NULL,
+                    summary_json=?
+                WHERE id=?
+                """,
+                (
+                    '{"interaction_mode":"workflow","execution_topology":"multi_agent"}',
+                    goal_id,
+                ),
+            )
+            conn.commit()
+
+        get_response = client.get(f"/v1/goals/{goal_id}")
+        assert get_response.status_code == 200
+        fetched = get_response.json()
+        assert fetched["execution_mode"] == "workflow"
+        assert fetched["strategy_id"] == "autonomous_single_agent"
+        assert fetched["selection_source"] == "safe_default"
+        assert fetched["selection_reason"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+        assert fetched["protocol_id"] == "autonomous_single_agent"
+        assert fetched["protocol_selection"] == "autonomous_single_agent"
+        assert fetched["selection_rationale"] == (
+            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+        )
+        assert fetched["protocol_id"] != "teacher_student_distill"
+
+
+def test_goal_create_selects_injected_registry_strategy_from_semantic_registry_evidence(
+    tmp_path: Path,
+) -> None:
+    injected = GoalStrategyRegistryEntryData(
+        id="panorama_synthesis",
+        name="Panorama synthesis",
+        display_name="Panorama synthesis",
+        description=(
+            "Coordinates a panorama synthesis pass that merges overlapping field notes into one reconciled map."
+        ),
+        when_to_use=(
+            "Use when the objective is to merge overlapping field notes into one reconciled panorama map."
+        ),
+        when_not_to_use="Do not use for ordinary execution or debate tasks.",
+        execution_topology="multi_agent",
+        kind="protocol",
+        protocol_id="panorama_synthesis_protocol",
+        required_capabilities=("merge_pass",),
+        approval_profile="standard_goal_policy",
+        control_scope="goal",
+        success_signals=("A reconciled panorama map is produced.",),
+        failure_modes=("Merge evidence is missing.",),
+        available=True,
+        selection_guidance=(
+            "Select for objectives that explicitly ask to merge overlapping field notes into a reconciled panorama map."
+        ),
+    )
+
+    with registered_goal_strategy_entries_for_test((injected,)):
+        with _create_goal_test_client(tmp_path) as client:
+            create_response = client.post(
+                "/v1/goals",
+                json={
+                    "objective": "Merge overlapping field notes into a reconciled panorama map for this expedition.",
+                },
+            )
+
+    assert create_response.status_code == 200
+    created = create_response.json()
+    assert created["strategy_id"] == "panorama_synthesis"
+    assert created["protocol_id"] == "panorama_synthesis_protocol"
+    assert created["selection_source"] == "semantic_registry_selector"
+    assert "panorama_synthesis" in created["selection_reason"]
+    assert "registry" in created["selection_reason"]
+
+
+def test_goal_create_does_not_semantically_select_confirmation_gated_distill_strategy(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Use teacher student generation and compression to distill this into a smaller output.",
+            },
+        )
+
+    assert create_response.status_code == 200
+    created = create_response.json()
+    assert created["strategy_id"] == "autonomous_single_agent"
+    assert created["protocol_id"] == "autonomous_single_agent"
+    assert created["selection_source"] == "safe_default"
+    assert "teacher_student_distill" in created["selection_reason"]
+    assert "requires explicit confirmation" in created["selection_reason"]
+
+
+def test_goal_create_explicit_teacher_student_distill_preserves_override_metadata_and_linked_run_protocol(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    captured_requests: list[Any] = []
+
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        del self
+        captured_requests.append(request)
+        return MultiAgentRunResult(
+            run_id=request.run_id or "goal-distill-run",
+            protocol="teacher_student_distill",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Distill goal completed."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Run the explicit distillation protocol.",
+                "protocol_id": "teacher_student_distill",
+            },
+        )
+        assert create_response.status_code == 200
+        created = create_response.json()
+        goal_id = created["goal_id"]
+        assert created["strategy_id"] == "teacher_student_distill"
+        assert created["protocol_id"] == "teacher_student_distill"
+        assert created["selection_source"] == "explicit_override"
+        assert created["selection_reason"] == "Strategy explicitly set to teacher_student_distill."
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+        assert completed_goal["strategy_id"] == "teacher_student_distill"
+        assert completed_goal["protocol_id"] == "teacher_student_distill"
+        assert completed_goal["selection_source"] == "explicit_override"
+        assert captured_requests
+        assert captured_requests[0].protocol["protocol"] == "teacher_student_distill"
+
+
+def test_goal_create_rejects_conflicting_strategy_and_protocol_ids(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Run with conflicting strategy and protocol.",
+                "strategy_id": "multi_agent_debate",
+                "protocol_id": "teacher_student_distill",
+            },
+        )
+
+    assert create_response.status_code == 422
+    assert "Conflicting strategy_id/protocol_id" in create_response.text
+
+
+def test_goal_create_accepts_first_class_strategy_metadata(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Run this through the debate strategy.",
+                "strategy_id": "multi_agent_debate",
+                "selection_source": "explicit_override",
+                "selection_reason": "User selected debate mode from the goal composer.",
+            },
+        )
+        assert create_response.status_code == 200
+        created = create_response.json()
+        goal_id = created["goal_id"]
+
+        assert created["strategy_id"] == "multi_agent_debate"
+        assert created["selection_source"] == "explicit_override"
+        assert created["selection_reason"] == "User selected debate mode from the goal composer."
+        assert created["protocol_id"] == "multi_agent_debate"
+        assert created["protocol_selection"] == "multi_agent_debate"
+        assert created["selection_rationale"] == "User selected debate mode from the goal composer."
+
+        get_response = client.get(f"/v1/goals/{goal_id}")
+        assert get_response.status_code == 200
+        fetched = get_response.json()
+        assert fetched["strategy_id"] == "multi_agent_debate"
+        assert fetched["selection_source"] == "explicit_override"
+        assert fetched["selection_reason"] == "User selected debate mode from the goal composer."
+        assert fetched["protocol_id"] == "multi_agent_debate"
 
 
 def test_goal_create_explicit_runtime_policy_duration_overrides_prompt_duration(
@@ -3506,6 +4447,411 @@ def test_goal_resume_reuses_awaiting_resources_linked_run_without_new_attempt(
     assert latest_generation["rollover_reason"] == "manual_refresh"
 
 
+def test_goal_resume_uses_summary_guidance_and_role_guidance_messages(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    captured_requests: list[Any] = []
+
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        del self
+        captured_requests.append(request)
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="teacher_student_distill",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Summary-backed guidance resume completed."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    app = create_app()
+    runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+    )
+    runtime_service.set_scheduler_poll_interval(0.05)
+    app.state.runtime_service = runtime_service
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    goal_id = "goal-summary-guidance-resume-1"
+    attempt_id = "goal-summary-guidance-resume-attempt-1"
+    run_id = "linked-summary-guidance-run-1"
+
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id=goal_id,
+            objective="Resume the linked run using persisted summary guidance.",
+            protocol_id="teacher_student_distill",
+            summary={"phase": "manual_resume"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id=attempt_id,
+            goal_id=goal_id,
+            attempt_index=1,
+            status="stalled",
+            trigger="manual_start",
+            agent_run_id=run_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            goal_id,
+            "stalled",
+            current_attempt_id=attempt_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id=run_id,
+            protocol_id="teacher_student_distill",
+            title="Summary guidance linked run",
+            topic="summary guidance",
+            summary={
+                "goal_id": goal_id,
+                "goal_attempt_id": attempt_id,
+                "objective": "Resume the linked run using persisted summary guidance.",
+                "task_input": "Resume the linked run using persisted summary guidance.",
+                "guidance_messages": [
+                    "Resume from the stored summary guidance.",
+                    "Preserve the existing teacher output.",
+                ],
+                "role_guidance_messages": {
+                    "teacher": ["Teacher: keep the original evidence structure."],
+                    "student": ["Student: condense the answer for final delivery."],
+                },
+                "recovery_state": {
+                    "status": "stalled",
+                    "action": "resume",
+                    "reason": "Operator requested resume.",
+                    "stage": "teacher_generation",
+                    "checkpoint": {
+                        "checkpoint_index": 2,
+                        "stage": "teacher_generation",
+                    },
+                    "resume_payload": {
+                        "version": 1,
+                        "executor": "continue_from_checkpoint",
+                        "strategy_default": "continue_from_checkpoint",
+                        "stage": "teacher_generation",
+                        "checkpoint": {
+                            "checkpoint_index": 2,
+                            "stage": "teacher_generation",
+                        },
+                        "guidance_messages": [],
+                        "role_guidance_messages": {},
+                        "metadata_state": {},
+                        "precomputed_artifacts": {},
+                        "protocol_artifacts": {},
+                        "candidates": [],
+                        "evidence_packets": [],
+                        "verifications": [],
+                        "role_task_snapshot": {},
+                    },
+                },
+            },
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status(run_id, "stalled"))
+    asyncio.run(
+        runtime_service._store.create_goal_worker_generation(
+            goal_id=goal_id,
+            attempt_id=attempt_id,
+            agent_run_id=run_id,
+            generation_index=1,
+            status="running",
+            started_at=(datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+        )
+    )
+
+    with TestClient(app) as client:
+        resume_response = client.post(
+            f"/v1/goals/{goal_id}/resume",
+            json={"strategy": "continue_from_checkpoint"},
+        )
+        assert resume_response.status_code == 200
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+
+    assert len(completed_goal["attempts"]) == 1
+    assert len(captured_requests) == 1
+    assert captured_requests[0].metadata["resume_strategy"] == "restart_attempt"
+    assert captured_requests[0].metadata["resume_payload"] == {
+        "guidance_messages": [
+            "Resume from the stored summary guidance.",
+            "Preserve the existing teacher output.",
+        ],
+        "role_guidance_messages": {
+            "teacher": ["Teacher: keep the original evidence structure."],
+            "student": ["Student: condense the answer for final delivery."],
+        },
+    }
+    assert captured_requests[0].guidance_messages == [
+        "Resume from the stored summary guidance.",
+        "Preserve the existing teacher output.",
+    ]
+    assert captured_requests[0].role_guidance_messages == {
+        "teacher": ["Teacher: keep the original evidence structure."],
+        "student": ["Student: condense the answer for final delivery."],
+    }
+
+
+def test_goal_resume_carries_follow_up_guidance_inside_resume_payload(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    captured_requests: list[Any] = []
+
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        del self
+        captured_requests.append(request)
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="teacher_student_distill",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Follow-up guidance reached the resumed run."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    app = create_app()
+    runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+    )
+    runtime_service.set_scheduler_poll_interval(0.05)
+    app.state.runtime_service = runtime_service
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    goal_id = "goal-follow-up-resume-payload-1"
+    attempt_id = "goal-follow-up-resume-payload-attempt-1"
+    run_id = "linked-follow-up-resume-payload-run-1"
+    follow_up = "Continue in this direction and keep the comparison grounded in the earlier evidence."
+
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id=goal_id,
+            objective="Resume the linked run with follow-up guidance embedded in the resume payload.",
+            protocol_id="teacher_student_distill",
+            summary={"phase": "manual_resume"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id=attempt_id,
+            goal_id=goal_id,
+            attempt_index=1,
+            status="stalled",
+            trigger="manual_start",
+            agent_run_id=run_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            goal_id,
+            "stalled",
+            current_attempt_id=attempt_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id=run_id,
+            protocol_id="teacher_student_distill",
+            title="Goal follow-up resume payload run",
+            topic="goal follow-up resume payload",
+            summary={
+                "goal_id": goal_id,
+                "goal_attempt_id": attempt_id,
+                "objective": "Resume the linked run with follow-up guidance embedded in the resume payload.",
+                "task_input": "Resume the linked run with follow-up guidance embedded in the resume payload.",
+                "recovery_state": {
+                    "status": "stalled",
+                    "action": "resume",
+                    "reason": "Operator requested follow-up.",
+                    "stage": "research_context_prepared",
+                    "checkpoint": {
+                        "checkpoint_index": 1,
+                        "stage": "research_context_prepared",
+                    },
+                    "resume_payload": {
+                        "version": 1,
+                        "executor": "continue_from_checkpoint",
+                        "strategy_default": "continue_from_checkpoint",
+                        "supported_actions": [
+                            "restart_attempt",
+                            "continue_from_checkpoint",
+                        ],
+                        "stage": "research_context_prepared",
+                        "checkpoint": {
+                            "checkpoint_index": 1,
+                            "stage": "research_context_prepared",
+                        },
+                        "guidance_messages": [],
+                        "role_guidance_messages": {},
+                        "metadata_state": {},
+                        "precomputed_artifacts": {},
+                        "protocol_artifacts": {},
+                        "candidates": [],
+                        "evidence_packets": [],
+                        "verifications": [],
+                        "role_task_snapshot": {},
+                    },
+                },
+            },
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status(run_id, "stalled"))
+
+    with TestClient(app) as client:
+        message_response = client.post(
+            f"/v1/agent-runs/{run_id}/messages",
+            json={
+                "role": "user",
+                "content": follow_up,
+                "metadata": {"channel": "goal-chat"},
+            },
+        )
+        assert message_response.status_code == 200
+        message_payload = message_response.json()
+        assert message_payload["summary"]["guidance_messages"] == [follow_up]
+        assert (
+            message_payload["summary"]["recovery_state"]["resume_payload"]["guidance_messages"]
+            == [follow_up]
+        )
+
+        resume_response = client.post(
+            f"/v1/goals/{goal_id}/resume",
+            json={"strategy": "continue_from_checkpoint"},
+        )
+        assert resume_response.status_code == 200
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+
+    assert completed_goal["status"] == "completed"
+    assert len(captured_requests) == 1
+    assert captured_requests[0].guidance_messages == [follow_up]
+    assert follow_up in captured_requests[0].metadata["resume_payload"]["guidance_messages"]
+
+
+def test_goal_resume_new_attempt_seeds_follow_up_guidance_into_linked_run(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    captured_requests: list[Any] = []
+    follow_up = "Resume with the updated operator direction after reopening the goal."
+
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        del self
+        captured_requests.append(request)
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="teacher_student_distill",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Fresh goal attempt consumed queued follow-up guidance."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    app = create_app()
+    runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+    )
+    runtime_service.set_scheduler_poll_interval(0.05)
+    app.state.runtime_service = runtime_service
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    goal_id = "goal-follow-up-new-attempt-1"
+    old_attempt_id = "goal-follow-up-old-attempt-1"
+    old_run_id = "goal-follow-up-old-run-1"
+
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id=goal_id,
+            objective="Resume the goal by reopening a fresh linked run when the previous attempt is no longer resumable.",
+            protocol_id="teacher_student_distill",
+            summary={"phase": "stalled"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id=old_attempt_id,
+            goal_id=goal_id,
+            attempt_index=1,
+            status="stalled",
+            trigger="manual_start",
+            agent_run_id=old_run_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            goal_id,
+            "stalled",
+            current_attempt_id=old_attempt_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id=old_run_id,
+            protocol_id="teacher_student_distill",
+            title="Unresumable linked run",
+            topic="goal restart",
+            summary={
+                "goal_id": goal_id,
+                "goal_attempt_id": old_attempt_id,
+                "objective": "Resume the goal by reopening a fresh linked run when the previous attempt is no longer resumable.",
+                "task_input": "Resume the goal by reopening a fresh linked run when the previous attempt is no longer resumable.",
+            },
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status(old_run_id, "completed"))
+
+    with TestClient(app) as client:
+        resume_response = client.post(
+            f"/v1/goals/{goal_id}/resume",
+            json={
+                "strategy": "continue_from_checkpoint",
+                "guidance_message": follow_up,
+            },
+        )
+        assert resume_response.status_code == 200
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+
+    assert completed_goal["status"] == "completed"
+    assert len(completed_goal["attempts"]) == 2
+    assert completed_goal["current_attempt_id"] != old_attempt_id
+    assert len(captured_requests) == 1
+    assert captured_requests[0].guidance_messages == [follow_up]
+    assert captured_requests[0].metadata["summary"]["guidance_messages"] == [follow_up]
+
+
 def test_goal_operator_audit_log_can_filter_to_selected_goal(tmp_path: Path) -> None:
     app, runtime_service = _create_goal_test_app(tmp_path)
 
@@ -4992,6 +6338,91 @@ def test_goal_maps_orchestrator_awaiting_approval_into_agent_run_and_goal_health
             health_payload["linked_agent_run"]["approval_state"]["approval_wait_timeout_sec"] == 300
         )
         assert health_payload["recovery_state"]["status"] == "awaiting_approval"
+
+
+def test_goal_subagent_transcript_preserves_pending_approval_metadata(tmp_path: Path) -> None:
+    runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+    )
+
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id="goal-approval-run-1",
+            protocol_id="controlled_subagent_execution",
+            title="Goal approval transcript",
+            topic="approval transcript",
+            summary={"goal_id": "goal-approval-1"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.upsert_subagent_transcript(
+            subagent_id="goal-approval-run-1:controller:approval",
+            parent_type="agent_run",
+            parent_id="goal-approval-run-1",
+            goal_id="goal-approval-1",
+            agent_run_id="goal-approval-run-1",
+            role_id="controller",
+            title="Controller",
+            model_id="gpt-5.4",
+            status="blocked",
+            summary="Waiting for approval.",
+        )
+    )
+    asyncio.run(
+        runtime_service._store.append_subagent_transcript_event(
+            "goal-approval-run-1:controller:approval",
+            {
+                "type": "runtime_blocked",
+                "parent_type": "agent_run",
+                "parent_id": "goal-approval-run-1",
+                "subagent_id": "goal-approval-run-1:controller:approval",
+                "role_id": "controller",
+                "status": "blocked",
+                "blocker_type": "approval",
+                "summary": "Controller is waiting for approval.",
+                "approval_ids": ["exec-approval-goal-1"],
+                "tool_names": ["exec_command"],
+                "recommended_action": "resolve_approval",
+                "pending_approvals": [
+                    {
+                        "approval_id": "exec-approval-goal-1",
+                        "tool_name": "exec_command",
+                        "reason": "Exec command requires approval.",
+                        "approval_kind": "exec",
+                        "approval_scope": "workspace",
+                        "replay_safe": False,
+                        "security_decision": "require_approval",
+                        "policy_source": "runtime_policy",
+                        "allowed_decisions": ["approve_once", "reject"],
+                    }
+                ],
+            },
+        )
+    )
+
+    detail = asyncio.run(
+        runtime_service.get_agent_run_subagent(
+            "goal-approval-run-1",
+            "goal-approval-run-1:controller:approval",
+        )
+    )
+
+    assert detail is not None
+    assert detail["subagent_id"] == "goal-approval-run-1:controller:approval"
+    assert detail["events"][0]["type"] == "runtime_blocked"
+    assert detail["events"][0]["approval_ids"] == ["exec-approval-goal-1"]
+    assert detail["events"][0]["pending_approvals"][0] == {
+        "approval_id": "exec-approval-goal-1",
+        "tool_name": "exec_command",
+        "reason": "Exec command requires approval.",
+        "approval_kind": "exec",
+        "approval_scope": "workspace",
+        "replay_safe": False,
+        "security_decision": "require_approval",
+        "policy_source": "runtime_policy",
+        "allowed_decisions": ["approve_once", "reject"],
+    }
 
 
 def test_goal_resume_endpoint_resolves_exec_approval_on_linked_agent_run_without_creating_new_attempt(
@@ -6619,6 +8050,175 @@ def test_goal_auto_resumes_when_generic_exec_approval_is_resolved(
     assert resolved.execution_result is not None
 
 
+def test_goal_resume_with_approval_id_preserves_guidance_message(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    approval_id = "exec-approval-goal-resume-guidance-1"
+    captured_requests: list[Any] = []
+    follow_up = "After approving this command, continue with the operator's updated constraint."
+
+    async def _approval_then_success_run(self: Any, request: Any) -> MultiAgentRunResult:
+        captured_requests.append(request)
+        approval = self._exec_approval_store.get(approval_id)
+        if approval is None or approval.status == "pending":
+            if approval is None:
+                self._exec_approval_store.create(
+                    approval_id=approval_id,
+                    command="print('goal approval resume guidance')",
+                    shell="test",
+                    scope="dangerous_command",
+                    reason="Exec command requires approval.",
+                    command_payload={
+                        "command": "print('goal approval resume guidance')",
+                        "shell": "test",
+                        "workdir": str(tmp_path),
+                        "env": None,
+                        "timeout_sec": 5.0,
+                        "background": False,
+                        "tty": False,
+                        "approval_state": "approved",
+                    },
+                )
+            return MultiAgentRunResult(
+                run_id=request.run_id,
+                protocol="controlled_subagent_execution",
+                state="awaiting_approval",
+                task_input=request.task_input,
+                candidates=[],
+                selected_candidate_id=None,
+                evaluation={},
+                artifacts={
+                    "final_answer": None,
+                    "controlled_execution_runtime": {"approval_pending_count": 1},
+                },
+                events=[],
+                metadata={
+                    "approval_state": {
+                        "status": "awaiting_approval",
+                        "pending_count": 1,
+                        "approval_ids": [approval_id],
+                        "pending_approvals": [
+                            {
+                                "approval_id": approval_id,
+                                "tool_name": "exec_command",
+                                "request_id": "req-1",
+                                "task_key": "controlled_execution_exec:req-1",
+                                "source": "controlled_execution",
+                            }
+                        ],
+                    },
+                    "recovery_state": {
+                        "status": "awaiting_approval",
+                        "action": "await_approval",
+                        "reason": "Execution approval required",
+                        "stage": "controlled_execution_exec:req-1",
+                        "checkpoint": {
+                            "checkpoint_index": 4,
+                            "stage": "controlled_execution_controller:req-1",
+                        },
+                        "resume_payload": {
+                            "version": 1,
+                            "executor": "continue_from_checkpoint",
+                            "strategy_default": "continue_from_checkpoint",
+                            "supported_actions": [
+                                "restart_attempt",
+                                "continue_from_checkpoint",
+                            ],
+                            "stage": "controlled_execution_exec:req-1",
+                            "checkpoint": {
+                                "checkpoint_index": 4,
+                                "stage": "controlled_execution_controller:req-1",
+                            },
+                            "guidance_messages": [],
+                            "role_guidance_messages": {},
+                            "metadata_state": {},
+                            "precomputed_artifacts": {},
+                            "protocol_artifacts": {},
+                            "candidates": [],
+                            "evidence_packets": [],
+                            "verifications": [],
+                            "role_task_snapshot": {},
+                        },
+                    },
+                },
+            )
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="controlled_subagent_execution",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Goal approval guidance resume completed."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _approval_then_success_run)
+
+    app = create_app()
+    exec_approval_store = InMemoryApprovalStore()
+    runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+        exec_approval_store=exec_approval_store,
+        exec_runtime=ExecRuntime(
+            providers={"test": _GoalApiPythonDirectProvider()},
+            default_shell="test",
+        ),
+    )
+    runtime_service.set_scheduler_poll_interval(0.05)
+    app.state.runtime_service = runtime_service
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Resolve a linked exec approval and carry follow-up guidance.",
+                "title": "Goal approval guidance resume",
+                "protocol_id": "controlled_subagent_execution",
+            },
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        start_response = client.post(f"/v1/goals/{goal_id}/start")
+        assert start_response.status_code == 200
+
+        waiting_goal = _wait_goal_until(client, goal_id, {"waiting_approval"}, timeout_seconds=4.0)
+        linked_run_id = waiting_goal["attempts"][0]["agent_run_id"]
+        assert linked_run_id is not None
+
+        resume_response = client.post(
+            f"/v1/goals/{goal_id}/resume",
+            json={
+                "approval_id": approval_id,
+                "decision": "approve_once",
+                "reason": "allow linked goal resume with guidance",
+                "guidance_message": follow_up,
+            },
+        )
+        assert resume_response.status_code == 200
+
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+        linked_run_response = client.get(f"/v1/agent-runs/{linked_run_id}")
+        assert linked_run_response.status_code == 200
+
+    assert completed_goal["attempts"][0]["agent_run_id"] == linked_run_id
+    assert len(captured_requests) >= 2
+    assert captured_requests[-1].guidance_messages == [follow_up]
+    assert follow_up in captured_requests[-1].metadata["resume_payload"]["guidance_messages"]
+    linked_run = linked_run_response.json()
+    assert linked_run["summary"]["guidance_messages"] == [follow_up]
+    assert follow_up in linked_run["summary"]["recovery_state"]["resume_payload"]["guidance_messages"]
+
+
 def test_goal_linked_exec_approval_restart_resolve_reuses_existing_attempt(
     tmp_path: Path,
     monkeypatch: Any,
@@ -7337,7 +8937,7 @@ def test_goal_startup_recovery_takes_over_stale_lease(tmp_path: Path) -> None:
         assert health_response.status_code == 200
         payload = health_response.json()
 
-    assert payload["status"] == "running"
+    assert payload["status"] in {"running", "awaiting_resources"}
     assert payload["lease"]["owner_id"] != "runtime-stale-owner"
     assert payload["lease"]["owned_by_runtime"] is True
     assert payload["lease"]["stale"] is False
@@ -8460,6 +10060,8 @@ def test_goal_supervisor_suppresses_context_handoff_due_while_waiting_approval(
         "action": "resolve_approval",
         "summary": "Goal is waiting on operator approval before it can continue.",
         "blocking": True,
+        "blocker_type": "approval",
+        "approval_count": 0,
         "run_id": run_id,
     }
     assert "context_handoff_due" not in [
@@ -9693,8 +11295,11 @@ def test_goal_supervisor_opens_and_resolves_approval_wait_timeout_report_only(
         "action": "resolve_approval",
         "summary": "Goal has been waiting on operator approval longer than the configured approval wait timeout.",
         "blocking": True,
+        "blocker_type": "approval",
+        "approval_count": 1,
         "run_id": "linked-approval-timeout-run-1",
         "approval_ids": ["exec-approval-timeout-1"],
+        "tool_names": ["exec_command"],
         "finding_code": "approval_wait_timeout",
         "approval_wait_elapsed_sec": health_payload["approval_state"]["approval_wait_elapsed_sec"],
         "approval_wait_timeout_sec": 60,
@@ -9771,8 +11376,11 @@ def test_goal_supervisor_opens_and_resolves_approval_wait_timeout_report_only(
         "action": "resolve_approval",
         "summary": "Goal is waiting on operator approval before it can continue.",
         "blocking": True,
+        "blocker_type": "approval",
+        "approval_count": 1,
         "run_id": "linked-approval-timeout-run-1",
         "approval_ids": ["exec-approval-timeout-1"],
+        "tool_names": ["exec_command"],
     }
     assert findings_after_resolve == []
 

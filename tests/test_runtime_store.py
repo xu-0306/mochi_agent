@@ -7,6 +7,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from mochi.runtime.store import RuntimeStore
 
 
@@ -166,10 +168,20 @@ def test_runtime_store_defaults_missing_single_agent_goal_protocol_to_autonomous
     )
 
     assert goal["execution_mode"] == "single_agent"
+    assert goal["strategy_id"] == "autonomous_single_agent"
+    assert goal["selection_source"] == "safe_default"
+    assert goal["selection_reason"] == (
+        "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+    )
     assert goal["protocol_id"] == "autonomous_single_agent"
 
     saved_goal = asyncio.run(store.get_goal("goal-default-protocol-1"))
     assert saved_goal is not None
+    assert saved_goal["strategy_id"] == "autonomous_single_agent"
+    assert saved_goal["selection_source"] == "safe_default"
+    assert saved_goal["selection_reason"] == (
+        "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+    )
     assert saved_goal["protocol_id"] == "autonomous_single_agent"
 
 
@@ -688,6 +700,286 @@ def test_runtime_store_round_trips_packet_c_runtime_policy_fields(tmp_path: Path
     assert goals[0]["run_policy"] == run_policy
 
 
+def test_runtime_store_persists_subagent_transcripts_and_events(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    asyncio.run(
+        store.create_agent_run(
+            run_id="run-subagent-1",
+            protocol_id="autonomous_single_agent",
+            title="Subagent run",
+            topic="subagent transcripts",
+        )
+    )
+    transcript = asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-1",
+            parent_type="agent_run",
+            parent_id="run-subagent-1",
+            agent_run_id="run-subagent-1",
+            role_id="researcher",
+            title="Researcher",
+            model_id="gpt-5.4",
+            status="running",
+            system_prompt="System",
+            user_prompt="User",
+            prompt_preview="User",
+            metadata={"lane": "a"},
+        )
+    )
+
+    assert transcript["subagent_id"] == "sub-1"
+    assert transcript["agent_run_id"] == "run-subagent-1"
+    assert transcript["status"] == "running"
+    assert transcript["metadata"]["lane"] == "a"
+
+    asyncio.run(
+        store.append_subagent_transcript_event(
+            "sub-1",
+            {
+                "type": "subagent_started",
+                "subagent_id": "sub-1",
+                "role_id": "researcher",
+            },
+        )
+    )
+    asyncio.run(
+        store.append_subagent_transcript_event(
+            "sub-1",
+            {
+                "type": "subagent_completed",
+                "subagent_id": "sub-1",
+                "status": "completed",
+                "summary": "Done",
+            },
+        )
+    )
+    asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-1",
+            parent_type="agent_run",
+            parent_id="run-subagent-1",
+            agent_run_id="run-subagent-1",
+            status="completed",
+            summary="Done",
+        )
+    )
+    asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-2",
+            parent_type="agent_run",
+            parent_id="run-subagent-2",
+            agent_run_id="run-subagent-2",
+            role_id="reviewer",
+            status="running",
+        )
+    )
+
+    transcripts = asyncio.run(
+        store.list_subagent_transcripts(agent_run_id="run-subagent-1")
+    )
+    assert len(transcripts) == 1
+    assert transcripts[0]["subagent_id"] == "sub-1"
+    assert transcripts[0]["event_count"] == 2
+    assert transcripts[0]["summary"] == "Done"
+
+    detail = asyncio.run(store.get_subagent_transcript("sub-1"))
+    assert detail is not None
+    assert detail["subagent_id"] == "sub-1"
+    assert detail["system_prompt"] == "System"
+    assert detail["user_prompt"] == "User"
+    assert [event["type"] for event in detail["events"]] == [
+        "subagent_started",
+        "subagent_completed",
+    ]
+
+
+def test_runtime_store_lists_subagent_transcripts_by_agent_run_id(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-filter-1",
+            parent_type="agent_run",
+            parent_id="run-filter-1",
+            agent_run_id="run-filter-1",
+            role_id="researcher",
+            status="running",
+        )
+    )
+    asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-filter-2",
+            parent_type="agent_run",
+            parent_id="run-filter-2",
+            agent_run_id="run-filter-2",
+            role_id="reviewer",
+            status="running",
+        )
+    )
+
+    filtered = asyncio.run(store.list_subagent_transcripts(agent_run_id="run-filter-1"))
+
+    assert [item["subagent_id"] for item in filtered] == ["sub-filter-1"]
+
+
+def test_runtime_store_hydrates_subagent_message_delivery_metadata(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-delivery-1",
+            parent_type="session",
+            parent_id="session-delivery-1",
+            session_id="session-delivery-1",
+            role_id="researcher",
+            status="running",
+        )
+    )
+    asyncio.run(
+        store.append_subagent_transcript_event(
+            "sub-delivery-1",
+            {
+                "type": "subagent_message",
+                "subagent_id": "sub-delivery-1",
+                "target_role_id": "researcher",
+                "content": "Inspect the cache before continuing.",
+                "metadata": {
+                    "source": "session_subagent_message_api",
+                    "message_id": "message-delivery-1",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "interrupt_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": False,
+                },
+            },
+        )
+    )
+
+    detail = asyncio.run(store.get_subagent_transcript("sub-delivery-1"))
+
+    assert detail is not None
+    event = detail["events"][0]
+    assert event["message_id"] == "message-delivery-1"
+    assert event["delivery_mode"] == "inject_now"
+    assert event["delivery_status"] == "queued"
+    assert event["delivery_reason"] == "interrupt_pending"
+    assert event["interrupt"] is True
+    assert event["cancel_current_tool"] is False
+    assert event["metadata"]["message_id"] == "message-delivery-1"
+
+
+def test_runtime_store_persists_subagent_tool_cancellation_state_across_reload(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(
+        store.upsert_subagent_transcript(
+            subagent_id="sub-cancelled-1",
+            parent_type="session",
+            parent_id="session-cancelled-1",
+            session_id="session-cancelled-1",
+            role_id="researcher",
+            status="running",
+        )
+    )
+    asyncio.run(
+        store.append_subagent_transcript_event(
+            "sub-cancelled-1",
+            {
+                "type": "subagent_message",
+                "subagent_id": "sub-cancelled-1",
+                "message_id": "cancelled-message-1",
+                "target_role_id": "researcher",
+                "content": "Stop the current command.",
+                "delivery_mode": "inject_now",
+                "delivery_status": "queued",
+                "interrupt": True,
+                "cancel_current_tool": True,
+            },
+        )
+    )
+    asyncio.run(
+        store.append_subagent_transcript_event(
+            "sub-cancelled-1",
+            {
+                "type": "subagent_tool_cancel_requested",
+                "subagent_id": "sub-cancelled-1",
+                "role_id": "researcher",
+                "message_id": "cancelled-message-1",
+                "tool_call_id": "tool-call-cancelled-1",
+                "tool_name": "exec_command",
+                "delivery_mode": "inject_now",
+                "interrupt": True,
+                "cancel_current_tool": True,
+            },
+        )
+    )
+    asyncio.run(
+        store.append_subagent_transcript_event(
+            "sub-cancelled-1",
+            {
+                "type": "subagent_tool_cancelled",
+                "subagent_id": "sub-cancelled-1",
+                "role_id": "researcher",
+                "message_id": "cancelled-message-1",
+                "tool_call_id": "tool-call-cancelled-1",
+                "tool_name": "exec_command",
+                "delivery_mode": "inject_now",
+                "delivery_status": "cancelled",
+                "delivery_reason": "tool_cancelled",
+                "interrupt": True,
+                "cancel_current_tool": True,
+            },
+        )
+    )
+
+    reloaded = RuntimeStore(db_path)
+    detail = asyncio.run(reloaded.get_subagent_transcript("sub-cancelled-1"))
+
+    assert detail is not None
+    assert [event["type"] for event in detail["events"]] == [
+        "subagent_message",
+        "subagent_tool_cancel_requested",
+        "subagent_tool_cancelled",
+    ]
+    cancelled_event = detail["events"][-1]
+    assert cancelled_event["status"] == "cancelled"
+    assert cancelled_event["tool_call_id"] == "tool-call-cancelled-1"
+    assert cancelled_event["delivery_reason"] == "tool_cancelled"
+
+
+def test_agent_run_runtime_blocked_without_subagent_id_does_not_create_fake_subagent(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    asyncio.run(
+        store.create_agent_run(
+            run_id="run-blocked-1",
+            protocol_id="controlled_subagent_execution",
+            title="Blocked run",
+            topic="runtime blocked",
+        )
+    )
+    asyncio.run(
+        store.append_agent_run_event(
+            "run-blocked-1",
+            {
+                "type": "runtime_blocked",
+                "blocker_type": "approval",
+                "summary": "Waiting for approval.",
+                "approval_ids": ["approval-1"],
+            },
+        )
+    )
+
+    events = asyncio.run(store.get_agent_run_events("run-blocked-1"))
+    transcripts = asyncio.run(store.list_subagent_transcripts(agent_run_id="run-blocked-1"))
+
+    assert [event["type"] for event in events] == ["runtime_blocked"]
+    assert events[0]["approval_ids"] == ["approval-1"]
+    assert transcripts == []
+
+
 def test_runtime_store_reads_legacy_goal_rows_without_packet_c_fields(tmp_path: Path) -> None:
     store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
     asyncio.run(
@@ -708,6 +1000,95 @@ def test_runtime_store_reads_legacy_goal_rows_without_packet_c_fields(tmp_path: 
     assert len(goals) == 1
     assert goals[0]["run_policy"]["max_wall_clock_sec"] == 18_000
     assert "requested_duration_sec" not in goals[0]["run_policy"]
+
+
+def test_runtime_store_goal_strategy_metadata_defaults_and_round_trips(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+
+    default_goal = asyncio.run(
+        store.create_goal(
+            goal_id="goal-strategy-default-1",
+            objective="Default goal strategy metadata should be observable.",
+        )
+    )
+    explicit_goal = asyncio.run(
+        store.create_goal(
+            goal_id="goal-strategy-explicit-1",
+            objective="Explicit goal strategy metadata should round-trip.",
+            strategy_id="multi_agent_debate",
+            selection_source="explicit_override",
+            selection_reason="User selected debate mode from the composer.",
+        )
+    )
+
+    assert default_goal["strategy_id"] == "autonomous_single_agent"
+    assert default_goal["protocol_id"] == "autonomous_single_agent"
+    assert default_goal["selection_source"] == "safe_default"
+    assert default_goal["selection_reason"] == (
+        "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+    )
+
+    assert explicit_goal["strategy_id"] == "multi_agent_debate"
+    assert explicit_goal["protocol_id"] == "multi_agent_debate"
+    assert explicit_goal["selection_source"] == "explicit_override"
+    assert explicit_goal["selection_reason"] == "User selected debate mode from the composer."
+
+
+def test_runtime_store_create_goal_with_explicit_protocol_id_is_explicit_override(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+
+    goal = asyncio.run(
+        store.create_goal(
+            goal_id="goal-explicit-protocol-1",
+            objective="Run direct store creation with explicit distill protocol.",
+            protocol_id="teacher_student_distill",
+        )
+    )
+
+    assert goal["strategy_id"] == "teacher_student_distill"
+    assert goal["protocol_id"] == "teacher_student_distill"
+    assert goal["selection_source"] == "explicit_override"
+    assert goal["selection_reason"] == "Strategy explicitly set to teacher_student_distill."
+
+    saved_goal = asyncio.run(store.get_goal("goal-explicit-protocol-1"))
+    assert saved_goal is not None
+    assert saved_goal["strategy_id"] == "teacher_student_distill"
+    assert saved_goal["protocol_id"] == "teacher_student_distill"
+    assert saved_goal["selection_source"] == "explicit_override"
+    assert saved_goal["selection_reason"] == "Strategy explicitly set to teacher_student_distill."
+
+
+def test_runtime_store_rejects_conflicting_strategy_and_protocol_ids(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+
+    with pytest.raises(ValueError, match="Conflicting strategy_id/protocol_id"):
+        asyncio.run(
+            store.create_goal(
+                goal_id="goal-conflict-1",
+                objective="Conflicting direct store create.",
+                strategy_id="multi_agent_debate",
+                protocol_id="teacher_student_distill",
+            )
+        )
+
+
+def test_runtime_store_rejects_invalid_selection_source_on_create(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+
+    with pytest.raises(ValueError, match="Invalid selection_source for create_goal"):
+        asyncio.run(
+            store.create_goal(
+                goal_id="goal-invalid-selection-source-create-1",
+                objective="Reject invalid selection source on fresh create.",
+                selection_source="totally_invalid_source",
+            )
+        )
 
 
 def test_runtime_store_reads_legacy_goal_rows_without_execution_mode_column(
@@ -747,8 +1128,142 @@ def test_runtime_store_reads_legacy_goal_rows_without_execution_mode_column(
 
     saved_goal = asyncio.run(store.get_goal("goal-legacy-execution-mode-1"))
     assert saved_goal is not None
-    assert saved_goal["execution_mode"] == "workflow"
+    assert saved_goal["execution_mode"] == "single_agent"
+    assert saved_goal["strategy_id"] == "autonomous_single_agent"
+    assert saved_goal["protocol_id"] == "autonomous_single_agent"
+    assert saved_goal["selection_source"] == "safe_default"
+    assert saved_goal["selection_reason"] == (
+        "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+    )
 
     goals = asyncio.run(store.list_goals())
     assert len(goals) == 1
-    assert goals[0]["execution_mode"] == "workflow"
+    assert goals[0]["execution_mode"] == "single_agent"
+    assert goals[0]["strategy_id"] == "autonomous_single_agent"
+    assert goals[0]["selection_source"] == "safe_default"
+
+
+def test_runtime_store_maps_legacy_protocol_only_goal_to_autonomous_single_agent_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO goals (
+                id, objective, title, goal_type, execution_mode, strategy_id, selection_source,
+                selection_reason, protocol_id, topic, project_id, workspace_dir, status,
+                current_attempt_id, run_policy_json, capability_policy_json, source_manifest_json,
+                summary_json, metadata_json, latest_error, started_at, finished_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "goal-legacy-migration-1",
+                "Load a legacy workflow goal with protocol-only history.",
+                None,
+                None,
+                "workflow",
+                None,
+                None,
+                None,
+                "teacher_student_distill",
+                None,
+                None,
+                None,
+                "created",
+                None,
+                "{}",
+                "{}",
+                "{}",
+                '{"interaction_mode":"workflow","execution_topology":"multi_agent"}',
+                "{}",
+                None,
+                None,
+                None,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    goal = asyncio.run(store.get_goal("goal-legacy-migration-1"))
+    assert goal is not None
+    assert goal["execution_mode"] == "workflow"
+    assert goal["strategy_id"] == "autonomous_single_agent"
+    assert goal["protocol_id"] == "teacher_student_distill"
+    assert goal["selection_source"] == "legacy_migration"
+    assert goal["selection_reason"] == (
+        "Legacy goal metadata mapped to autonomous_single_agent during strategy migration."
+    )
+
+
+def test_runtime_store_clamps_invalid_selection_source_to_legacy_migration_on_read(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO goals (
+                id, objective, title, goal_type, execution_mode, strategy_id, selection_source,
+                selection_reason, protocol_id, topic, project_id, workspace_dir, status,
+                current_attempt_id, run_policy_json, capability_policy_json, source_manifest_json,
+                summary_json, metadata_json, latest_error, started_at, finished_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "goal-invalid-selection-source-1",
+                "Read a goal with invalid stored selection source.",
+                None,
+                None,
+                "single_agent",
+                None,
+                "totally_invalid_source",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "created",
+                None,
+                "{}",
+                "{}",
+                "{}",
+                "{}",
+                "{}",
+                None,
+                None,
+                None,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    goal = asyncio.run(store.get_goal("goal-invalid-selection-source-1"))
+    assert goal is not None
+    assert goal["selection_source"] == "legacy_migration"
+
+
+def test_runtime_store_explicit_strategy_without_reason_uses_fallback_reason_on_read(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+
+    goal = asyncio.run(
+        store.create_goal(
+            goal_id="goal-explicit-no-reason-1",
+            objective="Explicit debate without custom reason.",
+            strategy_id="multi_agent_debate",
+            selection_reason=None,
+        )
+    )
+
+    assert goal["selection_source"] == "explicit_override"
+    assert goal["selection_reason"] == "Strategy explicitly set to multi_agent_debate."

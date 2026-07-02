@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import json
+from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from mochi.api.routes.approvals import _get_runtime_service
@@ -17,9 +21,16 @@ from mochi.runtime.models import (
     AgentRunMessageRequest,
     AgentRunSubagentMessageRequest,
     AgentRunResponse,
+    ExecutionTranscriptEvent,
+    SubagentTranscriptDetail,
+    SubagentTranscriptSummary,
 )
 
 router = APIRouter(prefix="/v1/agent-runs")
+
+_AGENT_RUN_EVENTS_STREAM_POLL_INTERVAL_SEC = 0.25
+_AGENT_RUN_EVENTS_STREAM_HEARTBEAT_SEC = 1.0
+_AGENT_RUN_EVENTS_STREAM_TIMEOUT_SEC = 5.0
 
 
 class AgentRunResumeRequest(BaseModel):
@@ -57,6 +68,72 @@ async def get_agent_run(request: Request, run_id: str) -> AgentRunResponse:
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return AgentRunResponse.model_validate(run)
+
+
+@router.get("/{run_id}/events", response_model=list[dict[str, Any]])
+async def list_agent_run_events(
+    request: Request,
+    run_id: str,
+    after_seq: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    service = await _get_runtime_service(request.app)
+    events = await service.list_agent_run_events(run_id, after_seq=after_seq, limit=limit)
+    if events is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    return [dict(event) for event in events]
+
+
+@router.get("/{run_id}/events/stream")
+async def stream_agent_run_events(
+    request: Request,
+    run_id: str,
+    after_seq: int | None = None,
+    limit: int | None = None,
+) -> StreamingResponse:
+    service = await _get_runtime_service(request.app)
+    probe = await service.list_agent_run_events(run_id, after_seq=after_seq, limit=0)
+    if probe is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    return StreamingResponse(
+        _stream_agent_run_events(
+            request,
+            service,
+            run_id,
+            after_seq=after_seq,
+            limit=limit,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/{run_id}/subagents", response_model=list[SubagentTranscriptSummary])
+async def list_agent_run_subagents(
+    request: Request,
+    run_id: str,
+) -> list[SubagentTranscriptSummary]:
+    service = await _get_runtime_service(request.app)
+    items = await service.list_agent_run_subagents(run_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    return [SubagentTranscriptSummary.model_validate(item) for item in items]
+
+
+@router.get("/{run_id}/subagents/{subagent_id}", response_model=SubagentTranscriptDetail)
+async def get_agent_run_subagent(
+    request: Request,
+    run_id: str,
+    subagent_id: str,
+) -> SubagentTranscriptDetail:
+    service = await _get_runtime_service(request.app)
+    item = await service.get_agent_run_subagent(run_id, subagent_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Agent run subagent not found")
+    return SubagentTranscriptDetail.model_validate(item)
 
 
 @router.get("/{run_id}/exec/{session_id}")
@@ -282,3 +359,39 @@ async def append_agent_run_subagent_message(
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
     return AgentRunResponse.model_validate(run)
+
+
+async def _stream_agent_run_events(
+    request: Request,
+    service: Any,
+    run_id: str,
+    *,
+    after_seq: int | None = None,
+    limit: int | None = None,
+) -> AsyncIterator[str]:
+    deadline = asyncio.get_running_loop().time() + _AGENT_RUN_EVENTS_STREAM_TIMEOUT_SEC
+    next_after_seq = after_seq
+    last_heartbeat_at = asyncio.get_running_loop().time()
+
+    while True:
+        if await request.is_disconnected():
+            return
+
+        events = await service.list_agent_run_events(run_id, after_seq=next_after_seq, limit=limit)
+        if events is None:
+            return
+        if events:
+            for event in events:
+                seq = event.get("seq")
+                if isinstance(seq, int):
+                    next_after_seq = seq
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            continue
+
+        now = asyncio.get_running_loop().time()
+        if now >= deadline:
+            return
+        if now - last_heartbeat_at >= _AGENT_RUN_EVENTS_STREAM_HEARTBEAT_SEC:
+            last_heartbeat_at = now
+            yield ": keep-alive\n\n"
+        await asyncio.sleep(_AGENT_RUN_EVENTS_STREAM_POLL_INTERVAL_SEC)

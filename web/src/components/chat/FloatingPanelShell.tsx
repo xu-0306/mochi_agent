@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { Sheet, SheetContent } from '@/components/ui/sheet'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
 
 type FloatingPanelBreakpoint = 'md' | 'lg'
@@ -31,6 +31,8 @@ interface FloatingPanelShellProps {
   desktopClassName?: string
   mobileSide?: 'left' | 'right'
   mobileClassName?: string
+  mobileTitle?: string
+  mobileDescription?: string
   renderDesktop?: boolean
   renderMobile?: boolean
 }
@@ -71,6 +73,8 @@ export function FloatingPanelShell({
   desktopClassName,
   mobileSide = 'right',
   mobileClassName,
+  mobileTitle = 'Panel',
+  mobileDescription = 'Auxiliary panel content.',
   renderDesktop = true,
   renderMobile = true,
 }: FloatingPanelShellProps) {
@@ -84,7 +88,7 @@ export function FloatingPanelShell({
       {renderDesktop ? (
         <aside
           className={cn(
-            'absolute top-3 bottom-3 z-30 hidden overflow-hidden rounded-[28px] border border-white/10 bg-surface-layer/92 shadow-[0_28px_80px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-all duration-300 ease-out-smooth',
+            'fixed top-3 bottom-3 z-30 hidden overflow-hidden rounded-[28px] border border-white/10 bg-surface-layer/92 shadow-[0_28px_80px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-all duration-300 ease-out-smooth',
             desktopSide === 'left' ? 'left-3' : 'right-3',
             DESKTOP_VISIBILITY_CLASSES[desktopBreakpoint],
             desktopWidthClass,
@@ -105,6 +109,10 @@ export function FloatingPanelShell({
             side={mobileSide}
             className={cn('w-full max-w-md p-0', MOBILE_HIDDEN_CLASSES[desktopBreakpoint], mobileClassName)}
           >
+            <SheetHeader className="sr-only">
+              <SheetTitle>{mobileTitle}</SheetTitle>
+              <SheetDescription>{mobileDescription}</SheetDescription>
+            </SheetHeader>
             {children}
           </SheetContent>
         </Sheet>

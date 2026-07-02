@@ -7,6 +7,7 @@ import inspect
 import json
 import re
 import sqlite3
+from hashlib import sha1
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -22,6 +23,10 @@ from mochi.api.routes.chat import _serialize_event
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config.manager import save_config
 from mochi.config.schema import CommandRuleConfig, MochiConfig, SecurityConfig
+from mochi.goal_intent import (
+    GoalStrategySelectionResult,
+    select_goal_strategy_from_registry,
+)
 from mochi.learning.dataset_exporter import (
     export_run_to_dataset_records,
     normalize_collector_dataset_record_for_run,
@@ -49,8 +54,16 @@ from mochi.runtime.collector_contracts import (
     collector_shard_manifests_from_result,
 )
 from mochi.runtime.delegate import set_delegate_subagent_task_launcher
+from mochi.runtime.execution_transcript import normalize_subagent_event
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.runtime.goal_strategy_registry import (
+    DEFAULT_GOAL_STRATEGY_ID,
+    get_goal_strategy_entry,
+    list_goal_strategy_entries,
+)
 from mochi.runtime.models import (
+    ActiveGoalTurnDecision,
+    ActiveGoalTurnDecisionRequest,
     AgentRunCreateRequest,
     AgentRunGuidanceRequest,
     AgentRunMessageRequest,
@@ -72,6 +85,14 @@ from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileWriteTool
 from mochi.tools.file_mutations import summarize_file_change_payload
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
+DELEGATED_TASK_RESUMABLE_STATUS = {
+    "awaiting_guidance",
+    "awaiting_resources",
+    "cancelled",
+    "failed",
+    "partial",
+    "stalled",
+}
 GOAL_ACTIVE_STATUS = {"queued", "running"}
 GOAL_TERMINAL_STATUS = {"completed", "failed", "cancelled"}
 GOAL_RESUMABLE_STATUS = {
@@ -85,7 +106,7 @@ GOAL_RESUMABLE_STATUS = {
 GOAL_EXECUTION_MODES = {"single_agent", "workflow"}
 GOAL_INTERACTION_MODES = {"goal", "workflow"}
 GOAL_EXECUTION_TOPOLOGIES = {"single_agent", "multi_agent"}
-DEFAULT_GOAL_EXECUTION_MODE = "workflow"
+DEFAULT_GOAL_EXECUTION_MODE = "single_agent"
 DEFAULT_GOAL_INTERACTION_MODE = "workflow"
 AUTONOMOUS_SINGLE_AGENT_PROTOCOL = "autonomous_single_agent"
 AGENT_RUN_TERMINAL_STATUS = {"cancelled", "failed", "succeeded"}
@@ -150,6 +171,46 @@ _GOAL_CHECKPOINT_PROMOTABLE_ARTIFACT_TYPES = {
     "verification_chunk_summary",
     "verification_summary",
 }
+
+
+def _goal_selection_from_create_payload(payload: GoalCreateRequest) -> GoalStrategySelectionResult:
+    explicit_strategy_id = str(payload.strategy_id or payload.protocol_selection or "").strip()
+    explicit_selection_source = str(payload.selection_source or "").strip()
+    explicit_selection_reason = str(payload.selection_reason or "").strip()
+    explicit_protocol_id = str(payload.protocol_id or "").strip()
+    if not explicit_strategy_id and explicit_protocol_id:
+        explicit_strategy_id = explicit_protocol_id
+    if explicit_strategy_id:
+        entry = get_goal_strategy_entry(explicit_strategy_id)
+        protocol_id = explicit_protocol_id
+        if not protocol_id:
+            protocol_id = (
+                str((entry.protocol_id if entry is not None else explicit_strategy_id) or "").strip()
+                or explicit_strategy_id
+            )
+        return GoalStrategySelectionResult(
+            strategy_id=explicit_strategy_id,
+            protocol_id=protocol_id,
+            selection_source="explicit_override",
+            selection_reason=(
+                explicit_selection_reason
+                or f"Strategy explicitly set to {explicit_strategy_id}."
+            ),
+        )
+    if explicit_selection_source == "explicit_override":
+        return GoalStrategySelectionResult(
+            strategy_id=DEFAULT_GOAL_STRATEGY_ID,
+            protocol_id=AUTONOMOUS_SINGLE_AGENT_PROTOCOL,
+            selection_source="explicit_override",
+            selection_reason=(
+                explicit_selection_reason
+                or "Strategy selection was marked explicit without a strategy id; defaulted to autonomous_single_agent."
+            ),
+        )
+    return select_goal_strategy_from_registry(
+        objective=payload.objective,
+        entries=list_goal_strategy_entries(),
+    )
 _DELEGATED_SUBAGENT_DISPLAY_NAMES = (
     "Ada",
     "Bohr",
@@ -166,6 +227,216 @@ _DELEGATED_SUBAGENT_DISPLAY_NAMES = (
     "Pascal",
     "Turing",
 )
+
+
+class _DelegatedSubagentLiveSubscription:
+    """Best-effort process-local queue for delegated subagent runtime events."""
+
+    def __init__(
+        self,
+        *,
+        service: "RuntimeService",
+        session_id: str,
+        task_ids: set[str] | None = None,
+        max_queue_size: int = 100,
+    ) -> None:
+        self._service = service
+        self.session_id = session_id
+        self._task_ids = {str(task_id) for task_id in task_ids or set() if str(task_id).strip()}
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max_queue_size)
+        self._closed = False
+
+    async def get(self) -> dict[str, Any]:
+        return await self._queue.get()
+
+    def publish(self, envelope: dict[str, Any]) -> None:
+        if self._closed:
+            return
+        task_id = str(envelope.get("task_id") or "").strip()
+        if self._task_ids and task_id not in self._task_ids:
+            return
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._queue.put_nowait(dict(envelope))
+        except asyncio.QueueFull:
+            pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._service._unsubscribe_delegated_subagent_runtime_events(self)
+
+
+class _DelegatedSubagentMessageProvider:
+    """Transcript-backed inbox for active delegated subagent messages."""
+
+    def __init__(
+        self,
+        *,
+        service: "RuntimeService",
+        session_id: str,
+        task_id: str,
+    ) -> None:
+        self._service = service
+        self._session_id = session_id
+        self._task_id = task_id
+        self._local_status_by_message_id: dict[str, str] = {}
+
+    async def poll_messages(
+        self,
+        *,
+        task_id: str | None,
+        subagent_id: str,
+        role_id: str | None,
+        stage: str | None = None,
+        safe_point: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if str(task_id or "").strip() != self._task_id:
+            return []
+        target_subagent_id = str(subagent_id or "").strip()
+        target_role_id = str(role_id or "").strip()
+        transcripts = await self._service._store.list_subagent_transcripts(
+            session_id=self._session_id
+        )
+        messages: list[dict[str, Any]] = []
+        for transcript in transcripts:
+            transcript_subagent_id = str(transcript.get("subagent_id") or "").strip()
+            transcript_role_id = str(transcript.get("role_id") or "").strip()
+            if target_subagent_id and transcript_subagent_id == target_subagent_id:
+                linked = True
+            else:
+                linked = _subagent_transcript_links_task(transcript, self._task_id)
+            if not linked:
+                continue
+            if (
+                target_role_id
+                and transcript_role_id
+                and transcript_role_id != target_role_id
+                and transcript_subagent_id != target_subagent_id
+            ):
+                continue
+            detail = (
+                await self._service._store.get_subagent_transcript(transcript_subagent_id)
+                if transcript_subagent_id
+                else None
+            )
+            if not isinstance(detail, Mapping):
+                continue
+            messages.extend(
+                self._pending_messages_from_transcript(
+                    detail,
+                    target_subagent_id=target_subagent_id,
+                    target_role_id=target_role_id,
+                    stage=stage,
+                    safe_point=safe_point,
+                )
+            )
+        return messages
+
+    async def mark_messages_handled(
+        self,
+        *,
+        message_ids: list[str],
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        _ = reason
+        normalized_status = str(status or "").strip() or "applied"
+        for message_id in message_ids:
+            normalized_id = str(message_id or "").strip()
+            if normalized_id:
+                self._local_status_by_message_id[normalized_id] = normalized_status
+
+    def _pending_messages_from_transcript(
+        self,
+        transcript: Mapping[str, Any],
+        *,
+        target_subagent_id: str,
+        target_role_id: str,
+        stage: str | None,
+        safe_point: str | None,
+    ) -> list[dict[str, Any]]:
+        events = transcript.get("events")
+        if not isinstance(events, list):
+            return []
+        transcript_subagent_id = str(transcript.get("subagent_id") or "").strip()
+        transcript_role_id = str(transcript.get("role_id") or "").strip()
+        durable_status_by_message_id: dict[str, str] = {}
+        raw_messages: list[tuple[str, Mapping[str, Any]]] = []
+        for event in events:
+            if not isinstance(event, Mapping):
+                continue
+            event_type = str(event.get("type") or "").strip()
+            if event_type == "subagent_message":
+                message_id = _session_subagent_message_id(
+                    event,
+                    subagent_id=transcript_subagent_id,
+                )
+                raw_messages.append((message_id, event))
+                continue
+            if not event_type.startswith("subagent_message_"):
+                continue
+            message_id = str(event.get("message_id") or "").strip()
+            if not message_id:
+                continue
+            durable_status_by_message_id[message_id] = (
+                str(event.get("delivery_status") or event_type.removeprefix("subagent_message_")).strip()
+            )
+        pending: list[dict[str, Any]] = []
+        for message_id, event in raw_messages:
+            local_status = self._local_status_by_message_id.get(message_id)
+            durable_status = durable_status_by_message_id.get(message_id)
+            if local_status in {"applied", "deferred", "cancelled", "rejected"}:
+                continue
+            if durable_status in {"applied", "deferred", "cancelled", "rejected"}:
+                continue
+            content = str(event.get("content") or "").strip()
+            if not content:
+                continue
+            event_role_id = (
+                str(event.get("target_role_id") or event.get("role_id") or transcript_role_id).strip()
+            )
+            event_subagent_id = str(event.get("subagent_id") or transcript_subagent_id).strip()
+            if target_subagent_id and event_subagent_id and event_subagent_id != target_subagent_id:
+                if target_role_id and event_role_id != target_role_id:
+                    continue
+            elif target_role_id and event_role_id and event_role_id != target_role_id:
+                continue
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+            delivery_mode = (
+                str(event.get("delivery_mode") or metadata.get("delivery_mode") or "").strip()
+                or "inject_now"
+            )
+            if delivery_mode == "resume_only":
+                continue
+            pending.append(
+                {
+                    "message_id": message_id,
+                    "subagent_id": event_subagent_id or target_subagent_id,
+                    "role_id": event_role_id or target_role_id,
+                    "content": content,
+                    "delivery_mode": delivery_mode,
+                    "delivery_status": event.get("delivery_status")
+                    or metadata.get("delivery_status"),
+                    "delivery_reason": event.get("delivery_reason")
+                    or metadata.get("delivery_reason"),
+                    "interrupt": bool(event.get("interrupt") or metadata.get("interrupt")),
+                    "cancel_current_tool": bool(
+                        event.get("cancel_current_tool")
+                        or metadata.get("cancel_current_tool")
+                    ),
+                    "created_at": event.get("created_at"),
+                    "stage": stage,
+                    "safe_point": safe_point,
+                }
+            )
+            self._local_status_by_message_id.setdefault(message_id, "accepted")
+        return pending
 
 
 class RuntimeService:
@@ -198,6 +469,7 @@ class RuntimeService:
         self._scheduler_task: asyncio.Task[None] | None = None
         self._goal_supervision_lock = asyncio.Lock()
         self._runtime_owner_id = f"runtime-{uuid4()}"
+        self._delegated_subagent_live_subscribers: dict[str, set[_DelegatedSubagentLiveSubscription]] = {}
         set_delegate_subagent_task_launcher(self.create_delegated_subagent_task)
 
     def set_runtime_tasks_root(self, root_dir: Path) -> None:
@@ -373,7 +645,7 @@ class RuntimeService:
         execution_policy: dict[str, Any] | None = None,
         expected_artifacts: list[str] | None = None,
     ) -> dict[str, Any]:
-        effective_protocol = str(protocol or "teacher_student_distill").strip() or "teacher_student_distill"
+        effective_protocol = str(protocol or AUTONOMOUS_SINGLE_AGENT_PROTOCOL).strip() or AUTONOMOUS_SINGLE_AGENT_PROTOCOL
         raw_protocol_config = dict(protocol_config or {})
         raw_execution_policy = dict(execution_policy or {})
         if effective_protocol == "controlled_subagent_execution" and not raw_protocol_config:
@@ -416,6 +688,53 @@ class RuntimeService:
         )
         return await self.create_task(payload)
 
+    def subscribe_delegated_subagent_runtime_events(
+        self,
+        *,
+        session_id: str,
+        task_ids: set[str] | None = None,
+    ) -> "_DelegatedSubagentLiveSubscription":
+        """Subscribe to best-effort in-process delegated subagent runtime events."""
+
+        subscription = _DelegatedSubagentLiveSubscription(
+            service=self,
+            session_id=session_id,
+            task_ids=task_ids,
+        )
+        self._delegated_subagent_live_subscribers.setdefault(session_id, set()).add(subscription)
+        return subscription
+
+    def _unsubscribe_delegated_subagent_runtime_events(
+        self,
+        subscription: "_DelegatedSubagentLiveSubscription",
+    ) -> None:
+        subscribers = self._delegated_subagent_live_subscribers.get(subscription.session_id)
+        if subscribers is None:
+            return
+        subscribers.discard(subscription)
+        if not subscribers:
+            self._delegated_subagent_live_subscribers.pop(subscription.session_id, None)
+
+    def _publish_delegated_subagent_runtime_event(
+        self,
+        *,
+        session_id: str | None,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        if not session_id:
+            return
+        subscribers = self._delegated_subagent_live_subscribers.get(session_id)
+        if not subscribers:
+            return
+        envelope = {
+            "session_id": session_id,
+            "task_id": task_id,
+            "event": dict(event),
+        }
+        for subscription in list(subscribers):
+            subscription.publish(envelope)
+
     async def create_goal(self, payload: GoalCreateRequest) -> dict[str, Any]:
         goal_id = str(uuid4())
         run_policy = _normalize_goal_run_policy(
@@ -424,6 +743,7 @@ class RuntimeService:
         )
         capability_policy = _normalize_goal_capability_policy(payload.capability_policy)
         summary = dict(payload.summary)
+        selected_strategy = _goal_selection_from_create_payload(payload)
         interaction_mode = _normalize_goal_interaction_mode(
             payload.interaction_mode,
             execution_mode=payload.execution_mode,
@@ -431,25 +751,34 @@ class RuntimeService:
         execution_topology = _normalize_goal_execution_topology(
             payload.execution_topology,
             execution_mode=payload.execution_mode,
-            protocol_id=payload.protocol_id,
+            protocol_id=selected_strategy.protocol_id,
         )
         summary.setdefault("interaction_mode", interaction_mode)
         summary.setdefault("execution_topology", execution_topology)
-        if isinstance(payload.protocol_selection, str) and payload.protocol_selection.strip():
-            summary["protocol_selection"] = payload.protocol_selection.strip()
-        if isinstance(payload.selection_rationale, str) and payload.selection_rationale.strip():
-            summary["selection_rationale"] = payload.selection_rationale.strip()
+        summary["strategy_id"] = selected_strategy.strategy_id
+        summary["selection_source"] = selected_strategy.selection_source
+        summary["selection_reason"] = selected_strategy.selection_reason
+        summary["protocol_selection"] = selected_strategy.strategy_id
+        summary["selection_rationale"] = selected_strategy.selection_reason
         if payload.project_id is not None:
             summary.setdefault("project_id", payload.project_id)
         if payload.workspace_dir is not None:
             summary.setdefault("workspace_dir", payload.workspace_dir)
+        selected_models_roles = _normalize_selected_models_roles_payload(
+            payload.selected_models_roles,
+        )
+        if selected_models_roles:
+            summary["selected_models_roles"] = selected_models_roles
         goal = await self._store.create_goal(
             goal_id=goal_id,
             objective=payload.objective,
             title=payload.title,
             goal_type=payload.goal_type,
             execution_mode=payload.execution_mode,
-            protocol_id=payload.protocol_id,
+            strategy_id=selected_strategy.strategy_id,
+            selection_source=selected_strategy.selection_source,
+            selection_reason=selected_strategy.selection_reason,
+            protocol_id=selected_strategy.protocol_id,
             topic=payload.topic,
             project_id=payload.project_id,
             workspace_dir=payload.workspace_dir,
@@ -593,6 +922,9 @@ class RuntimeService:
             "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
             "interaction_mode": _goal_effective_interaction_mode(goal),
             "execution_topology": _goal_effective_execution_topology(goal),
+            "strategy_id": _goal_strategy_id(goal),
+            "selection_source": _goal_selection_source(goal),
+            "selection_reason": _goal_selection_reason(goal),
             "protocol_id": _goal_effective_protocol_id(goal),
             "bound_run_id": _goal_bound_run_id(goal),
             "protocol_selection": _goal_protocol_selection(goal),
@@ -634,6 +966,22 @@ class RuntimeService:
                 open_findings=open_finding_payloads,
             ),
         }
+
+    async def decide_active_goal_turn(
+        self,
+        goal_id: str,
+        payload: ActiveGoalTurnDecisionRequest,
+    ) -> ActiveGoalTurnDecision | None:
+        goal = await self._store.get_goal(goal_id)
+        if goal is None:
+            return None
+        health = await self.get_goal_health(goal_id)
+        decision_payload = _classify_active_goal_turn_decision(
+            payload.message,
+            goal=goal,
+            health=health or {},
+        )
+        return ActiveGoalTurnDecision.model_validate(decision_payload)
 
     async def list_goal_audit_findings(
         self,
@@ -881,10 +1229,12 @@ class RuntimeService:
         goal_id: str,
         *,
         strategy: str | None = None,
+        guidance_message: str | None = None,
     ) -> dict[str, Any] | None:
         goal = await self._store.get_goal(goal_id)
         if goal is None:
             return None
+        queued_guidance_message = str(guidance_message or "").strip() or None
         current_status = str(goal.get("status") or "created")
         if current_status == "created":
             return await self.start_goal(goal_id)
@@ -903,18 +1253,22 @@ class RuntimeService:
         resumed_goal = await self._maybe_resume_existing_goal_attempt(
             goal,
             strategy=strategy,
+            guidance_message=queued_guidance_message,
         )
         if resumed_goal is not None:
             return resumed_goal
 
         attempt_id = str(uuid4())
+        attempt_summary: dict[str, Any] = {"queued_from_status": current_status}
+        if queued_guidance_message:
+            attempt_summary["guidance_messages"] = [queued_guidance_message]
         await self._store.create_goal_attempt(
             attempt_id=attempt_id,
             goal_id=goal_id,
             attempt_index=_next_goal_attempt_index(goal),
             status="queued",
             trigger="manual_resume",
-            summary={"queued_from_status": current_status},
+            summary=attempt_summary,
         )
         await self._store.update_goal_status(
             goal_id,
@@ -1097,6 +1451,7 @@ class RuntimeService:
         goal: dict[str, Any],
         *,
         strategy: str | None,
+        guidance_message: str | None = None,
     ) -> dict[str, Any] | None:
         goal_id = str(goal.get("id") or "").strip()
         current_status = str(goal.get("status") or "").strip()
@@ -1113,6 +1468,14 @@ class RuntimeService:
         run = await self._store.get_agent_run(agent_run_id)
         if not isinstance(run, dict):
             return None
+        queued_guidance_message = str(guidance_message or "").strip() or None
+        if queued_guidance_message:
+            updated_run = await self._queue_agent_run_guidance_message(
+                agent_run_id,
+                queued_guidance_message,
+            )
+            if isinstance(updated_run, dict):
+                run = updated_run
         run_status = str(run.get("status") or "").strip()
         expected_run_status = {
             "paused": "paused",
@@ -1257,6 +1620,58 @@ class RuntimeService:
         payload = _agent_run_summary(run)
         payload["events"] = await self._store.get_agent_run_events(run_id)
         return payload
+
+    async def list_agent_run_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]] | None:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return None
+        events = await self._store.get_agent_run_events(run_id)
+        items = [_agent_run_event_with_seq(event, seq=index) for index, event in enumerate(events, start=1)]
+        if after_seq is not None:
+            items = [item for item in items if int(item.get("seq") or 0) > after_seq]
+        if limit is not None:
+            items = items[: max(0, limit)]
+        return items
+
+    async def list_agent_run_subagents(self, run_id: str) -> list[dict[str, Any]] | None:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return None
+        transcripts = await self._list_agent_run_subagent_transcripts(run_id)
+        return [_subagent_transcript_summary_payload(item) for item in transcripts]
+
+    async def list_session_subagents(self, session_id: str) -> list[dict[str, Any]] | None:
+        transcripts = await self._list_session_subagent_transcripts(session_id)
+        return [_subagent_transcript_summary_payload(item) for item in transcripts]
+
+    async def get_agent_run_subagent(
+        self,
+        run_id: str,
+        subagent_id: str,
+    ) -> dict[str, Any] | None:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return None
+        transcript = await self._get_agent_run_subagent_transcript(run_id, subagent_id)
+        if transcript is None:
+            return None
+        return _subagent_transcript_detail_payload(transcript)
+
+    async def get_session_subagent(
+        self,
+        session_id: str,
+        subagent_id: str,
+    ) -> dict[str, Any] | None:
+        transcript = await self._get_session_subagent_transcript(session_id, subagent_id)
+        if transcript is None:
+            return None
+        return _subagent_transcript_detail_payload(transcript)
 
     async def get_agent_run_attempt_package(
         self,
@@ -1532,8 +1947,34 @@ class RuntimeService:
                 "metadata": payload.metadata,
             },
         )
-        updated = await self._store.get_agent_run(run_id)
+        updated = await self._queue_agent_run_guidance_message(run_id, payload.guidance)
         return await self._agent_run_response_with_events(updated)
+
+    async def _queue_agent_run_guidance_message(
+        self,
+        run_id: str,
+        guidance_message: str,
+    ) -> dict[str, Any] | None:
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return None
+
+        cleaned_guidance_message = str(guidance_message or "").strip()
+        if not cleaned_guidance_message:
+            return run
+
+        summary = dict(run.get("summary") or {})
+        summary["guidance_messages"] = _merge_unique_text_items(
+            [
+                str(item).strip()
+                for item in summary.get("guidance_messages", [])
+                if isinstance(item, str) and str(item).strip()
+            ],
+            [cleaned_guidance_message],
+        )
+        summary = _inject_summary_guidance_into_recovery_state(summary)
+        await self._store.update_agent_run_metadata(run_id, summary=summary)
+        return await self._store.get_agent_run(run_id)
 
     async def append_agent_run_message(
         self,
@@ -1559,10 +2000,13 @@ class RuntimeService:
                 "metadata": message_payload["metadata"],
             },
         )
-
+        refreshed_for_context = await self._queue_agent_run_guidance_message(
+            run_id,
+            message_payload["content"],
+        )
         await self._maybe_update_agent_run_message_context(
             run_id,
-            run,
+            refreshed_for_context or run,
             project_id=message_payload["project_id"],
             workspace_dir=message_payload["workspace_dir"],
             task_input=message_payload["content"],
@@ -1602,6 +2046,12 @@ class RuntimeService:
             return None
 
         message_payload = _normalize_agent_run_message_payload(payload)
+        transcript = await self._resolve_agent_run_subagent_transcript(run_id, role_id)
+        subagent_id = (
+            str(transcript.get("subagent_id") or "").strip()
+            if isinstance(transcript, dict)
+            else ""
+        )
         await self._store.append_agent_run_event(
             run_id,
             {
@@ -1609,6 +2059,7 @@ class RuntimeService:
                 "role": message_payload["role"],
                 "source_role": message_payload["source_role"],
                 "target_role_id": role_id,
+                **({"subagent_id": subagent_id} if subagent_id else {}),
                 "content": message_payload["content"],
                 "project_id": message_payload["project_id"],
                 "workspace_dir": message_payload["workspace_dir"],
@@ -1618,17 +2069,147 @@ class RuntimeService:
                     "source": "workflow_subagent_message_api",
                     "delivery": "guidance_only",
                     "target_role_id": role_id,
+                    **({"subagent_id": subagent_id} if subagent_id else {}),
                 },
             },
         )
+        summary = dict(run.get("summary") or {})
+        existing_role_guidance = (
+            summary.get("role_guidance_messages")
+            if isinstance(summary.get("role_guidance_messages"), Mapping)
+            else {}
+        )
+        normalized_role_guidance: dict[str, list[str]] = {}
+        for existing_role_id, messages in existing_role_guidance.items():
+            role_key = str(existing_role_id or "").strip()
+            if not role_key or not isinstance(messages, list):
+                continue
+            cleaned = [
+                str(item).strip()
+                for item in messages
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if cleaned:
+                normalized_role_guidance[role_key] = cleaned
+        normalized_role_guidance[role_id] = _merge_unique_text_items(
+            normalized_role_guidance.get(role_id, []),
+            [message_payload["content"]],
+        )
+        summary["role_guidance_messages"] = normalized_role_guidance
+        summary = _inject_summary_guidance_into_recovery_state(summary)
+        await self._store.update_agent_run_metadata(run_id, summary=summary)
+        refreshed_for_context = await self._store.get_agent_run(run_id)
         await self._maybe_update_agent_run_message_context(
             run_id,
-            run,
+            refreshed_for_context or run,
             project_id=message_payload["project_id"],
             workspace_dir=message_payload["workspace_dir"],
         )
         updated = await self._store.get_agent_run(run_id)
         return await self._agent_run_response_with_events(updated)
+
+    async def append_session_subagent_message(
+        self,
+        session_id: str,
+        subagent_id: str,
+        payload: AgentRunMessageRequest,
+    ) -> dict[str, Any] | None:
+        transcript = await self._get_session_subagent_transcript(session_id, subagent_id)
+        if transcript is None:
+            return None
+
+        message_payload = _normalize_agent_run_message_payload(payload)
+        normalized_subagent_id = str(transcript.get("subagent_id") or "").strip() or subagent_id
+        role_id = str(transcript.get("role_id") or "").strip() or None
+        metadata = (
+            message_payload.get("metadata")
+            if isinstance(message_payload.get("metadata"), Mapping)
+            else {}
+        )
+        message_id = str(metadata.get("message_id") or "").strip() or str(uuid4())
+        raw_delivery_mode = metadata.get("delivery_mode")
+        delivery_mode = str(raw_delivery_mode or "inject_now").strip() or "inject_now"
+        delivery_status = str(metadata.get("delivery_status") or "queued").strip() or "queued"
+        delivery_reason = str(metadata.get("delivery_reason") or "").strip()
+        interrupt = bool(metadata.get("interrupt", False))
+        cancel_current_tool = bool(metadata.get("cancel_current_tool", False))
+        event = {
+            "type": "subagent_message",
+            "message_id": message_id,
+            "subagent_id": normalized_subagent_id,
+            "role": message_payload["role"],
+            "source_role": message_payload["source_role"],
+            "content": message_payload["content"],
+            "delivery_mode": delivery_mode,
+            "delivery_status": delivery_status,
+            "interrupt": interrupt,
+            "cancel_current_tool": cancel_current_tool,
+            "project_id": message_payload["project_id"],
+            "workspace_dir": message_payload["workspace_dir"],
+            "attachments": message_payload["attachments"],
+            "metadata": {
+                **message_payload["metadata"],
+                "source": "session_subagent_message_api",
+                "delivery": "guidance_only",
+                "delivery_mode": delivery_mode,
+                "delivery_status": delivery_status,
+                "message_id": message_id,
+                "interrupt": interrupt,
+                "cancel_current_tool": cancel_current_tool,
+                "resume_requested": True,
+                "session_id": session_id,
+            },
+            "created_context": {
+                "source": "session_subagent_message_api",
+                "delivery": "guidance_only",
+                "resume_requested": True,
+                "session_id": session_id,
+                **({"role_id": role_id} if role_id else {}),
+            },
+            "created_at": _now_iso_utc(),
+        }
+        if delivery_reason:
+            event["delivery_reason"] = delivery_reason
+            event["metadata"]["delivery_reason"] = delivery_reason
+        if role_id:
+            event["target_role_id"] = role_id
+
+        await self._store.append_subagent_transcript_event(normalized_subagent_id, event)
+        if cancel_current_tool:
+            cancel_event = {
+                "type": "subagent_tool_cancel_requested",
+                "message_id": message_id,
+                "subagent_id": normalized_subagent_id,
+                "role_id": role_id,
+                "content": message_payload["content"],
+                "summary": "Tool cancellation requested for subagent message.",
+                "status": "running",
+                "delivery_mode": delivery_mode,
+                "delivery_status": delivery_status,
+                "delivery_reason": delivery_reason or "tool_cancel_pending",
+                "interrupt": interrupt,
+                "cancel_current_tool": True,
+                "metadata": {
+                    **message_payload["metadata"],
+                    "source": "session_subagent_message_api",
+                    "message_id": message_id,
+                    "delivery_mode": delivery_mode,
+                    "delivery_status": delivery_status,
+                    "delivery_reason": delivery_reason or "tool_cancel_pending",
+                    "interrupt": interrupt,
+                    "cancel_current_tool": True,
+                    "session_id": session_id,
+                },
+                "created_at": _now_iso_utc(),
+            }
+            await self._store.append_subagent_transcript_event(
+                normalized_subagent_id,
+                cancel_event,
+            )
+        refreshed = await self._get_session_subagent_transcript(session_id, normalized_subagent_id)
+        if refreshed is None:
+            return None
+        return _subagent_transcript_detail_payload(refreshed)
 
     async def _maybe_update_agent_run_message_context(
         self,
@@ -1665,6 +2246,146 @@ class RuntimeService:
         response = _agent_run_summary(run)
         response["events"] = await self._store.get_agent_run_events(run["id"])
         return response
+
+    async def _resolve_agent_run_subagent_transcript(
+        self,
+        run_id: str,
+        role_or_subagent_id: str,
+    ) -> dict[str, Any] | None:
+        normalized = str(role_or_subagent_id or "").strip()
+        if not normalized:
+            return None
+        transcript = await self._get_agent_run_subagent_transcript(run_id, normalized)
+        if transcript is not None:
+            return transcript
+        transcripts = await self._list_agent_run_subagent_transcripts(run_id)
+        for item in transcripts:
+            if str(item.get("role_id") or "").strip() == normalized:
+                return item
+        return None
+
+    async def _get_agent_run_subagent_transcript(
+        self,
+        run_id: str,
+        subagent_id: str,
+    ) -> dict[str, Any] | None:
+        get_transcript = getattr(self._store, "get_subagent_transcript", None)
+        if callable(get_transcript):
+            transcript = await get_transcript(subagent_id)
+            if transcript is not None and str(transcript.get("agent_run_id") or "").strip() == run_id:
+                return transcript
+        for item in await self._derive_agent_run_subagent_details(run_id):
+            if str(item.get("subagent_id") or "").strip() == subagent_id:
+                return item
+        return None
+
+    async def _list_agent_run_subagent_transcripts(self, run_id: str) -> list[dict[str, Any]]:
+        list_transcripts = getattr(self._store, "list_subagent_transcripts", None)
+        transcripts: list[dict[str, Any]] = []
+        if callable(list_transcripts):
+            transcripts = await list_transcripts(agent_run_id=run_id)
+        if transcripts:
+            return transcripts
+        return await self._derive_agent_run_subagent_summaries(run_id)
+
+    async def _session_exists(self, session_id: str) -> bool:
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return False
+        session_exists = getattr(self._store, "session_exists", None)
+        if callable(session_exists):
+            try:
+                return bool(await session_exists(normalized))
+            except TypeError:
+                pass
+        list_transcripts = getattr(self._store, "list_subagent_transcripts", None)
+        if callable(list_transcripts):
+            transcripts = await list_transcripts(session_id=normalized)
+            if transcripts:
+                return True
+        return False
+
+    async def _get_session_subagent_transcript(
+        self,
+        session_id: str,
+        subagent_id: str,
+    ) -> dict[str, Any] | None:
+        get_transcript = getattr(self._store, "get_subagent_transcript", None)
+        if not callable(get_transcript):
+            return None
+        transcript = await get_transcript(subagent_id)
+        if transcript is None:
+            return None
+        if str(transcript.get("session_id") or "").strip() != session_id:
+            return None
+        return transcript
+
+    async def _list_session_subagent_transcripts(self, session_id: str) -> list[dict[str, Any]]:
+        list_transcripts = getattr(self._store, "list_subagent_transcripts", None)
+        if not callable(list_transcripts):
+            return []
+        return await list_transcripts(session_id=session_id)
+
+    async def _derive_agent_run_subagent_summaries(self, run_id: str) -> list[dict[str, Any]]:
+        details = await self._derive_agent_run_subagent_details(run_id)
+        summaries: list[dict[str, Any]] = []
+        for item in details:
+            summary = dict(item)
+            summary.pop("system_prompt", None)
+            summary.pop("user_prompt", None)
+            summary.pop("events", None)
+            summaries.append(summary)
+        return summaries
+
+    async def _derive_agent_run_subagent_details(self, run_id: str) -> list[dict[str, Any]]:
+        events = await self.list_agent_run_events(run_id)
+        if not events:
+            return []
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for event in events:
+            normalized = _normalize_agent_run_transcript_event(event, run_id=run_id)
+            if normalized is None:
+                continue
+            subagent_id = str(normalized.get("subagent_id") or "").strip()
+            if not subagent_id:
+                continue
+            grouped.setdefault(subagent_id, []).append(normalized)
+        details: list[dict[str, Any]] = []
+        for subagent_id, subagent_events in grouped.items():
+            first_event = subagent_events[0]
+            last_event = subagent_events[-1]
+            details.append(
+                {
+                    "subagent_id": subagent_id,
+                    "parent_type": "agent_run",
+                    "parent_id": run_id,
+                    "session_id": None,
+                    "goal_id": None,
+                    "agent_run_id": run_id,
+                    "parent_turn_id": None,
+                    "role_id": first_event.get("role_id"),
+                    "title": first_event.get("title"),
+                    "model_id": first_event.get("model_id"),
+                    "status": str(last_event.get("status") or "running"),
+                    "prompt_preview": None,
+                    "summary": last_event.get("summary") or last_event.get("content"),
+                    "event_count": len(subagent_events),
+                    "metadata": {},
+                    "created_at": first_event.get("created_at"),
+                    "updated_at": last_event.get("created_at") or first_event.get("created_at"),
+                    "system_prompt": None,
+                    "user_prompt": None,
+                    "events": subagent_events,
+                }
+            )
+        details.sort(
+            key=lambda item: (
+                str(item.get("updated_at") or ""),
+                str(item.get("subagent_id") or ""),
+            ),
+            reverse=True,
+        )
+        return details
 
     async def finalize_agent_run_partial(self, run_id: str) -> dict[str, Any] | tuple[str, str | None]:
         run = await self._store.get_agent_run(run_id)
@@ -2125,9 +2846,42 @@ class RuntimeService:
             "task_input": goal.get("objective"),
             "interaction_mode": _goal_effective_interaction_mode(goal),
             "execution_topology": _goal_effective_execution_topology(goal),
+            "strategy_id": _goal_strategy_id(goal),
+            "selection_source": _goal_selection_source(goal),
+            "selection_reason": _goal_selection_reason(goal),
             "protocol_selection": _goal_protocol_selection(goal),
             "selection_rationale": _goal_selection_rationale(goal),
         }
+        attempt_record = _current_goal_attempt(goal)
+        if not isinstance(attempt_record, dict) or str(attempt_record.get("id") or "").strip() != attempt_id:
+            attempts = goal.get("attempts")
+            if isinstance(attempts, list):
+                attempt_record = next(
+                    (
+                        item
+                        for item in attempts
+                        if isinstance(item, Mapping)
+                        and str(item.get("id") or "").strip() == attempt_id
+                    ),
+                    None,
+                )
+        attempt_summary = (
+            attempt_record.get("summary")
+            if isinstance(attempt_record, Mapping)
+            and isinstance(attempt_record.get("summary"), Mapping)
+            else None
+        )
+        queued_guidance_messages = _summary_guidance_messages(attempt_summary)
+        if queued_guidance_messages:
+            summary["guidance_messages"] = queued_guidance_messages
+        goal_summary = goal.get("summary") if isinstance(goal.get("summary"), Mapping) else {}
+        selected_models_roles = _normalize_selected_models_roles_payload(
+            goal.get("selected_models_roles")
+            if isinstance(goal.get("selected_models_roles"), Mapping)
+            else goal_summary.get("selected_models_roles"),
+        )
+        if selected_models_roles:
+            summary["selected_models_roles"] = selected_models_roles
         if goal_capability_policy:
             summary["goal_capability_policy"] = goal_capability_policy
         return AgentRunCreateRequest(
@@ -2138,6 +2892,7 @@ class RuntimeService:
             workspace_dir=(
                 goal.get("workspace_dir") if isinstance(goal.get("workspace_dir"), str) else None
             ),
+            selected_models_roles=selected_models_roles,
             run_policy=linked_run_policy,
             summary=summary,
         )
@@ -4354,6 +5109,20 @@ class RuntimeService:
         run = await self.get_agent_run(run_id)
         if run is None:
             return
+        active_resume_strategy = _resolve_agent_run_resume_strategy(None, run)
+        normalized_summary = _ensure_agent_run_resume_payload(
+            run=run,
+            summary=dict(run.get("summary") or {}),
+            strategy=active_resume_strategy,
+        )
+        if normalized_summary != (run.get("summary") or {}):
+            await self._store.update_agent_run_metadata(
+                run_id,
+                summary=normalized_summary,
+            )
+            refreshed_run = await self.get_agent_run(run_id)
+            if refreshed_run is not None:
+                run = refreshed_run
         schedule = run.get("schedule") if isinstance(run.get("schedule"), dict) else {}
         active_resume_runtime = _resume_runtime_from_run(run)
         active_resume_lease_id = (
@@ -4361,12 +5130,7 @@ class RuntimeService:
             if isinstance(active_resume_runtime.get("lease_id"), str) and active_resume_runtime.get("lease_id")
             else None
         )
-        active_resume_strategy = _resolve_agent_run_resume_strategy(None, run)
-        active_resume_payload = (
-            _resume_payload_from_run(run)
-            if active_resume_strategy == "continue_from_checkpoint"
-            else None
-        )
+        active_resume_payload = _resume_payload_from_run(run)
         attempt_id = (
             str(schedule.get("current_attempt_id"))
             if isinstance(schedule.get("current_attempt_id"), str) and schedule.get("current_attempt_id")
@@ -4460,9 +5224,72 @@ class RuntimeService:
                 nonlocal live_collector_shard_manifests
                 nonlocal live_collector_record_provenance
                 nonlocal persisted_collector_dataset_records
-                if str(getattr(event, "type", "") or "") != "artifact":
-                    return
+                event_type = str(getattr(event, "type", "") or "")
                 payload = getattr(event, "payload", None)
+                if event_type in {
+                    "subagent_prompt",
+                    "subagent_thinking",
+                    "subagent_tool_call",
+                    "subagent_tool_result",
+                    "subagent_message_accepted",
+                    "subagent_message_applied",
+                    "subagent_message_cancelled",
+                    "subagent_message_deferred",
+                    "subagent_message_queued",
+                    "subagent_interrupted",
+                    "subagent_tool_cancel_requested",
+                    "subagent_tool_cancelled",
+                    "subagent_tool_cancel_deferred",
+                    "role_started",
+                    "role_progress",
+                    "role_completed",
+                    "role_error",
+                    "runtime_blocked",
+                }:
+                    if not isinstance(payload, dict):
+                        return
+                    try:
+                        transcript_event = normalize_subagent_event(
+                            {**payload, "type": event_type},
+                            parent_type="agent_run",
+                            parent_id=run_id,
+                        )
+                    except ValueError:
+                        return
+                    subagent_id = str(transcript_event.get("subagent_id") or "").strip()
+                    if not subagent_id:
+                        return
+                    await self._store.upsert_subagent_transcript(
+                        subagent_id=subagent_id,
+                        parent_type="agent_run",
+                        parent_id=run_id,
+                        goal_id=(
+                            str((run.get("summary") or {}).get("goal_id") or "").strip() or None
+                        ),
+                        agent_run_id=run_id,
+                        role_id=str(transcript_event.get("role_id") or "").strip() or None,
+                        title=str(transcript_event.get("title") or "").strip() or None,
+                        model_id=str(transcript_event.get("model_id") or "").strip() or None,
+                        status=str(transcript_event.get("status") or "running"),
+                        system_prompt=transcript_event.get("system_prompt"),
+                        user_prompt=transcript_event.get("user_prompt"),
+                        prompt_preview=(
+                            transcript_event.get("prompt_preview")
+                            or transcript_event.get("user_prompt")
+                        ),
+                        summary=str(transcript_event.get("summary") or "").strip() or None,
+                        metadata={
+                            "source_event": event_type,
+                            "run_event_seq": int(getattr(event, "seq", 0) or 0),
+                        },
+                    )
+                    await self._store.append_subagent_transcript_event(
+                        subagent_id,
+                        transcript_event,
+                    )
+                    return
+                if event_type != "artifact":
+                    return
                 if not isinstance(payload, dict):
                     return
                 artifact_name = str(payload.get("name") or "")
@@ -4637,7 +5464,10 @@ class RuntimeService:
                     "workspace_dir": _agent_run_workspace_dir(run),
                     "task_workspace_dir": str(task_workspace_dir) if task_workspace_dir is not None else None,
                     "resume_strategy": active_resume_strategy,
-                    "resume_payload": dict(active_resume_payload or {}),
+                    "resume_payload": _agent_run_request_resume_payload(
+                        active_resume_payload,
+                        strategy=active_resume_strategy,
+                    ),
                     "resume_runtime": dict(active_resume_runtime or {}),
                     "goal_handoff": (
                         dict(handoff_context.get("metadata") or {})
@@ -5168,6 +5998,17 @@ class RuntimeService:
             }
 
     async def _collect_guidance_messages(self, run_id: str) -> list[str]:
+        run = await self._store.get_agent_run(run_id)
+        if isinstance(run, dict):
+            summary = run.get("summary")
+            if isinstance(summary, dict):
+                summary_messages = [
+                    str(item).strip()
+                    for item in summary.get("guidance_messages", [])
+                    if isinstance(item, str) and str(item).strip()
+                ]
+                if summary_messages:
+                    return summary_messages
         events = await self._store.get_agent_run_events(run_id)
         messages: list[str] = []
         for event in events:
@@ -5191,6 +6032,29 @@ class RuntimeService:
         return messages
 
     async def _collect_role_guidance_messages(self, run_id: str) -> dict[str, list[str]]:
+        run = await self._store.get_agent_run(run_id)
+        if isinstance(run, dict):
+            summary = run.get("summary")
+            role_guidance = (
+                summary.get("role_guidance_messages")
+                if isinstance(summary, dict)
+                else None
+            )
+            if isinstance(role_guidance, Mapping):
+                normalized: dict[str, list[str]] = {}
+                for role_id, messages in role_guidance.items():
+                    role_key = str(role_id or "").strip()
+                    if not role_key or not isinstance(messages, list):
+                        continue
+                    cleaned = [
+                        str(item).strip()
+                        for item in messages
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    if cleaned:
+                        normalized[role_key] = cleaned
+                if normalized:
+                    return normalized
         events = await self._store.get_agent_run_events(run_id)
         messages_by_role: dict[str, list[str]] = {}
         for event in events:
@@ -5202,6 +6066,69 @@ class RuntimeService:
                 continue
             messages_by_role.setdefault(role_id, []).append(content.strip())
         return messages_by_role
+
+    async def _collect_delegated_session_subagent_guidance(
+        self,
+        *,
+        session_id: str | None,
+        task_id: str,
+    ) -> tuple[list[str], dict[str, list[str]]]:
+        """Collect durable session-subagent messages for a delegated task resume."""
+
+        if not session_id:
+            return [], {}
+        transcripts = await self._store.list_subagent_transcripts(session_id=session_id)
+        guidance_messages: list[str] = []
+        role_guidance_messages: dict[str, list[str]] = {}
+        for transcript in transcripts:
+            if not _subagent_transcript_links_task(transcript, task_id):
+                continue
+            subagent_id = str(transcript.get("subagent_id") or "").strip()
+            detail = await self._store.get_subagent_transcript(subagent_id) if subagent_id else None
+            if not isinstance(detail, dict):
+                continue
+            role_id = str(detail.get("role_id") or transcript.get("role_id") or "").strip()
+            events = detail.get("events") or []
+            latest_delivery_by_message_id: dict[str, tuple[str | None, str | None]] = {}
+            for event in events:
+                if not isinstance(event, Mapping):
+                    continue
+                event_type = str(event.get("type") or "").strip()
+                if not event_type.startswith("subagent_message_"):
+                    continue
+                message_id = str(event.get("message_id") or "").strip()
+                if not message_id:
+                    continue
+                latest_delivery_by_message_id[message_id] = (
+                    str(event.get("delivery_status") or "").strip() or None,
+                    str(event.get("delivery_reason") or event.get("reason") or "").strip() or None,
+                )
+            for event in events:
+                if not isinstance(event, Mapping):
+                    continue
+                if str(event.get("type") or "").strip() != "subagent_message":
+                    continue
+                content = str(event.get("content") or "").strip()
+                if not content:
+                    continue
+                message_id = str(event.get("message_id") or "").strip()
+                delivery_status, delivery_reason = latest_delivery_by_message_id.get(
+                    message_id,
+                    (None, None),
+                )
+                guidance_content = content
+                if delivery_status == "deferred" and delivery_reason == "approval_pending":
+                    guidance_content = f"Approval-resume guidance: {content}"
+                target_role_id = (
+                    str(event.get("target_role_id") or event.get("role_id") or role_id).strip()
+                )
+                if target_role_id:
+                    existing = role_guidance_messages.setdefault(target_role_id, [])
+                    if guidance_content not in existing:
+                        existing.append(guidance_content)
+                elif guidance_content not in guidance_messages:
+                    guidance_messages.append(guidance_content)
+        return guidance_messages, role_guidance_messages
 
     async def list_tasks(self) -> list[dict[str, Any]]:
         tasks = await self._store.list_task_runs()
@@ -5283,6 +6210,19 @@ class RuntimeService:
 
         approval = await self._store.get_pending_approval_for_task(task_id)
         if approval is None:
+            if (
+                str(task.get("task_type") or "").strip() == DELEGATED_MULTI_AGENT_TASK_TYPE
+                and str(task.get("status") or "").strip() in DELEGATED_TASK_RESUMABLE_STATUS
+            ):
+                active = self._active_jobs.get(task_id)
+                if active is not None and not active.done():
+                    return _task_summary(task)
+                await self._store.update_task_status(task_id, "resumed", error=None)
+                self._active_jobs[task_id] = asyncio.create_task(
+                    self._run_task(task_id=task_id),
+                    name=f"runtime-task-resume-{task_id}",
+                )
+                return _task_summary((await self._store.get_task_run(task_id)) or task)
             return _task_summary(task)
 
         resolved = await self.resolve_approval(
@@ -6496,10 +7436,113 @@ class RuntimeService:
 
     async def _run_delegated_multi_agent_task(self, *, task: dict[str, Any], task_id: str) -> None:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        delegated_subagent = _delegated_subagent_payload(
+            metadata,
+            task_type=task.get("task_type"),
+            input_message=str(task.get("input") or ""),
+            session_id=task.get("session_id"),
+            status=task.get("status"),
+        )
+        parent_session_id = (
+            _clean_text((delegated_subagent or {}).get("parent_session_id"))
+            or _clean_text(task.get("session_id"))
+        )
+        parent_turn_id = (
+            _clean_text((delegated_subagent or {}).get("parent_turn_id"))
+            or _clean_text(metadata.get("parent_turn_id"))
+            or _clean_text(metadata.get("chat_turn_id"))
+        )
+        parent_type = "chat_turn" if parent_turn_id else "delegated_task"
+        parent_id = parent_turn_id or task_id
+        delegated_runtime_event_lock = asyncio.Lock()
+
+        async def _persist_delegated_runtime_event(event: Any) -> None:
+            event_type = str(getattr(event, "type", "") or "")
+            if event_type not in {
+                "subagent_prompt",
+                "subagent_thinking",
+                "subagent_tool_call",
+                "subagent_tool_result",
+                "subagent_message_accepted",
+                "subagent_message_applied",
+                "subagent_message_cancelled",
+                "subagent_message_deferred",
+                "subagent_message_queued",
+                "subagent_interrupted",
+                "subagent_tool_cancel_requested",
+                "subagent_tool_cancelled",
+                "subagent_tool_cancel_deferred",
+                "role_started",
+                "role_progress",
+                "role_completed",
+                "role_error",
+                "runtime_blocked",
+            }:
+                return
+            payload = getattr(event, "payload", None)
+            if not isinstance(payload, dict):
+                return
+            raw_payload = dict(payload)
+            raw_payload.setdefault("created_at", str(getattr(event, "timestamp", "") or "") or None)
+            raw_payload.update(
+                {
+                    "type": event_type,
+                    "source": "delegate_subagent_task_runtime",
+                    "task_id": task_id,
+                    "task_event_seq": int(getattr(event, "seq", 0) or 0),
+                }
+            )
+            async with delegated_runtime_event_lock:
+                try:
+                    transcript_event = normalize_subagent_event(
+                        raw_payload,
+                        parent_type=parent_type,
+                        parent_id=parent_id,
+                    )
+                except ValueError:
+                    return
+                subagent_id = str(transcript_event.get("subagent_id") or "").strip()
+                if not subagent_id:
+                    return
+                await self._store.upsert_subagent_transcript(
+                    subagent_id=subagent_id,
+                    parent_type=parent_type,
+                    parent_id=parent_id,
+                    session_id=parent_session_id,
+                    parent_turn_id=parent_turn_id,
+                    role_id=str(transcript_event.get("role_id") or "").strip() or None,
+                    title=str(transcript_event.get("title") or "").strip() or None,
+                    model_id=str(transcript_event.get("model_id") or "").strip() or None,
+                    status=str(transcript_event.get("status") or "running").strip() or "running",
+                    system_prompt=transcript_event.get("system_prompt"),
+                    user_prompt=transcript_event.get("user_prompt"),
+                    prompt_preview=(
+                        transcript_event.get("prompt_preview")
+                        or transcript_event.get("user_prompt")
+                        or transcript_event.get("content")
+                    ),
+                    summary=transcript_event.get("summary") or transcript_event.get("content"),
+                    metadata={
+                        **dict(transcript_event.get("metadata") or {}),
+                        "source": "delegate_subagent_task_runtime",
+                        "task_id": task_id,
+                        "task_event_seq": int(getattr(event, "seq", 0) or 0),
+                    },
+                )
+                await self._store.append_subagent_transcript_event(
+                    subagent_id,
+                    transcript_event,
+                )
+                self._publish_delegated_subagent_runtime_event(
+                    session_id=parent_session_id,
+                    task_id=task_id,
+                    event=transcript_event,
+                )
+
         legacy_protocol = (
             "controlled_subagent_execution"
             if str(task.get("task_type") or "") == "controlled_subagent_execution"
-            else "teacher_student_distill"
+            else AUTONOMOUS_SINGLE_AGENT_PROTOCOL
         )
         protocol_config = (
             metadata.get("protocol_config") if isinstance(metadata.get("protocol_config"), dict) else {}
@@ -6527,13 +7570,29 @@ class RuntimeService:
             controlled_exec_allowed_env_vars=security_config.exec_allowed_env_vars,
             controlled_exec_default_shell=security_config.exec_default_shell,
         )
+        delegated_guidance_messages, delegated_role_guidance_messages = (
+            await self._collect_delegated_session_subagent_guidance(
+                session_id=parent_session_id,
+                task_id=task_id,
+            )
+        )
+        subagent_message_provider = (
+            _DelegatedSubagentMessageProvider(
+                service=self,
+                session_id=parent_session_id,
+                task_id=task_id,
+            )
+            if parent_session_id
+            else None
+        )
         result = await orchestrator.run(
             MultiAgentRunRequest(
                 run_id=task_id,
                 task_input=str(task.get("input") or ""),
                 protocol={"protocol": protocol_id, **protocol_config, "execution_policy": execution_policy},
                 reasoning_effort=_coerce_reasoning_effort(metadata.get("reasoning_effort")),
-                guidance_messages=[],
+                guidance_messages=delegated_guidance_messages,
+                role_guidance_messages=delegated_role_guidance_messages,
                 metadata={
                     "reasoning_effort": _coerce_reasoning_effort(metadata.get("reasoning_effort")),
                     "selected_models_roles": selected_models_roles,
@@ -6542,6 +7601,10 @@ class RuntimeService:
                     "workspace_dir": task.get("project_workspace_dir") or task.get("workspace_dir"),
                     "task_workspace_dir": task.get("task_workspace_dir"),
                 },
+                runtime_event_callback=(
+                    _persist_delegated_runtime_event if parent_session_id else None
+                ),
+                subagent_message_provider=subagent_message_provider,
             )
         )
         for event in result.events:
@@ -7055,6 +8118,9 @@ def _goal_response(goal: dict[str, Any]) -> dict[str, Any]:
         "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
         "interaction_mode": _goal_effective_interaction_mode(goal),
         "execution_topology": _goal_effective_execution_topology(goal),
+        "strategy_id": _goal_strategy_id(goal),
+        "selection_source": _goal_selection_source(goal),
+        "selection_reason": _goal_selection_reason(goal),
         "protocol_id": _goal_effective_protocol_id(goal),
         "bound_run_id": _goal_bound_run_id(goal),
         "protocol_selection": _goal_protocol_selection(goal),
@@ -7160,40 +8226,137 @@ def _goal_requested_protocol_id(goal: Mapping[str, Any]) -> str | None:
     return normalized or None
 
 
-def _goal_has_explicit_distill_intent(goal: Mapping[str, Any]) -> bool:
-    explicit_selection = _goal_summary_text(goal, "protocol_selection")
-    if explicit_selection == "teacher_student_distill":
-        return True
-    selection_rationale = _goal_summary_text(goal, "selection_rationale")
-    if isinstance(selection_rationale, str) and "distill" in selection_rationale.lower():
-        return True
-    return False
+def _goal_summary_selection_source(goal: Mapping[str, Any]) -> str | None:
+    return _goal_summary_text(goal, "selection_source")
+
+
+def _goal_stored_selection_source(goal: Mapping[str, Any]) -> str | None:
+    direct = str(goal.get("selection_source") or "").strip()
+    if direct in {"explicit_override", "semantic_registry_selector", "safe_default", "legacy_migration"}:
+        return direct
+    summary_source = _goal_summary_selection_source(goal)
+    if summary_source in {"explicit_override", "semantic_registry_selector", "safe_default", "legacy_migration"}:
+        return summary_source
+    if direct or summary_source:
+        return "legacy_migration"
+    return None
+
+
+def _goal_explicit_selection_reason(goal: Mapping[str, Any], explicit_strategy_id: str) -> str:
+    direct = str(goal.get("selection_reason") or "").strip()
+    if direct:
+        return direct
+    summary_value = _goal_summary_text(goal, "selection_reason")
+    if summary_value:
+        return summary_value
+    legacy_summary_value = _goal_summary_text(goal, "selection_rationale")
+    if legacy_summary_value:
+        return legacy_summary_value
+    return f"Strategy explicitly set to {explicit_strategy_id}."
+
+
+def _goal_explicit_strategy_or_protocol(goal: Mapping[str, Any]) -> str | None:
+    direct_strategy = str(goal.get("strategy_id") or "").strip()
+    if direct_strategy:
+        return direct_strategy
+    summary_selection_source = _goal_summary_selection_source(goal)
+    if summary_selection_source in {"explicit_override", "semantic_registry_selector"}:
+        summary_strategy = _goal_summary_text(goal, "strategy_id")
+        if summary_strategy:
+            return summary_strategy
+        summary_protocol_selection = _goal_summary_text(goal, "protocol_selection")
+        if summary_protocol_selection:
+            return summary_protocol_selection
+    if summary_selection_source == "explicit_override":
+        requested_protocol = _goal_requested_protocol_id(goal)
+        if requested_protocol is not None:
+            return requested_protocol
+    return None
+
+
+def _goal_resolved_strategy_selection(goal: Mapping[str, Any]) -> GoalStrategySelectionResult:
+    explicit = _goal_explicit_strategy_or_protocol(goal)
+    if explicit:
+        entry = get_goal_strategy_entry(explicit)
+        protocol_id = (
+            str(goal.get("protocol_id") or "").strip()
+            or str((entry.protocol_id if entry is not None else explicit) or "").strip()
+            or explicit
+        )
+        return GoalStrategySelectionResult(
+            strategy_id=explicit,
+            protocol_id=protocol_id,
+            selection_source="explicit_override",
+            selection_reason=_goal_explicit_selection_reason(goal, explicit),
+        )
+    return select_goal_strategy_from_registry(
+        objective=str(goal.get("objective") or ""),
+        entries=list_goal_strategy_entries(),
+    )
+
+
+def _goal_strategy_id(goal: Mapping[str, Any]) -> str | None:
+    return _goal_resolved_strategy_selection(goal).strategy_id
+
+
+def _goal_selection_source(goal: Mapping[str, Any]) -> str | None:
+    direct = _goal_stored_selection_source(goal)
+    if direct:
+        return direct
+    return _goal_resolved_strategy_selection(goal).selection_source
+
+
+def _goal_selection_reason(goal: Mapping[str, Any]) -> str | None:
+    direct = str(goal.get("selection_reason") or "").strip()
+    if direct:
+        return direct
+    summary_value = _goal_summary_text(goal, "selection_reason")
+    if summary_value:
+        return summary_value
+    legacy_summary_value = _goal_summary_text(goal, "selection_rationale")
+    if legacy_summary_value:
+        return legacy_summary_value
+    return _goal_resolved_strategy_selection(goal).selection_reason
+
+
+def _goal_effective_protocol_id(goal: Mapping[str, Any]) -> str | None:
+    return _goal_resolved_strategy_selection(goal).protocol_id
 
 
 def _goal_effective_interaction_mode(goal: Mapping[str, Any]) -> str:
+    direct = str(goal.get("interaction_mode") or "").strip()
+    if direct:
+        return _normalize_goal_interaction_mode(
+            direct,
+            execution_mode=goal.get("execution_mode"),
+        )
+    if str(goal.get("execution_mode") or "").strip():
+        return _normalize_goal_interaction_mode(
+            None,
+            execution_mode=goal.get("execution_mode"),
+        )
     return _normalize_goal_interaction_mode(
         _goal_summary_text(goal, "interaction_mode"),
         execution_mode=goal.get("execution_mode"),
     )
-
-
-def _goal_effective_protocol_id(goal: Mapping[str, Any]) -> str | None:
-    execution_mode = _normalize_goal_execution_mode(goal.get("execution_mode"))
-    requested_protocol = _goal_requested_protocol_id(goal)
-    if requested_protocol is not None:
-        if (
-            requested_protocol == "teacher_student_distill"
-            and execution_mode == "single_agent"
-            and not _goal_has_explicit_distill_intent(goal)
-        ):
-            return AUTONOMOUS_SINGLE_AGENT_PROTOCOL
-        return requested_protocol
-    if execution_mode == "single_agent":
-        return AUTONOMOUS_SINGLE_AGENT_PROTOCOL
-    return "teacher_student_distill"
-
-
 def _goal_effective_execution_topology(goal: Mapping[str, Any]) -> str:
+    direct = str(goal.get("execution_topology") or "").strip()
+    if direct:
+        return _normalize_goal_execution_topology(
+            direct,
+            execution_mode=goal.get("execution_mode"),
+            protocol_id=_goal_effective_protocol_id(goal),
+        )
+    if (
+        str(goal.get("execution_mode") or "").strip()
+        or str(goal.get("strategy_id") or "").strip()
+        or str(goal.get("protocol_id") or "").strip()
+    ):
+        return _normalize_goal_execution_topology(
+            None,
+            execution_mode=goal.get("execution_mode"),
+            protocol_id=_goal_effective_protocol_id(goal),
+        )
     return _normalize_goal_execution_topology(
         _goal_summary_text(goal, "execution_topology"),
         execution_mode=goal.get("execution_mode"),
@@ -7210,11 +8373,17 @@ def _goal_bound_run_id(goal: Mapping[str, Any]) -> str | None:
 
 
 def _goal_protocol_selection(goal: Mapping[str, Any]) -> str | None:
-    return _goal_summary_text(goal, "protocol_selection") or _goal_effective_protocol_id(goal)
+    strategy_id = _goal_strategy_id(goal)
+    if strategy_id:
+        return strategy_id
+    summary_selection = _goal_summary_text(goal, "protocol_selection")
+    if summary_selection:
+        return summary_selection
+    return _goal_effective_protocol_id(goal)
 
 
 def _goal_selection_rationale(goal: Mapping[str, Any]) -> str | None:
-    return _goal_summary_text(goal, "selection_rationale")
+    return _goal_selection_reason(goal) or _goal_summary_text(goal, "selection_rationale")
 
 
 def _goal_recovery_state_from_agent_run(run: dict[str, Any]) -> dict[str, Any]:
@@ -8296,6 +9465,28 @@ def _goal_recommended_next_action(
         else ""
     )
     if goal_status == "waiting_approval" or approval_status in {"waiting_approval", "awaiting_approval"}:
+        tool_names: list[str] = []
+        if isinstance(approval_state, dict):
+            tool_names = sorted(
+                {
+                    str(item).strip()
+                    for item in approval_state.get("tool_names", [])
+                    if isinstance(item, str) and str(item).strip()
+                }
+            )
+            if not tool_names:
+                pending = (
+                    approval_state.get("pending_approvals")
+                    if isinstance(approval_state.get("pending_approvals"), list)
+                    else []
+                )
+                tool_names = sorted(
+                    {
+                        str(item.get("tool_name") or "").strip()
+                        for item in pending
+                        if isinstance(item, dict) and str(item.get("tool_name") or "").strip()
+                    }
+                )
         payload = {
             "action": "resolve_approval",
             "summary": (
@@ -8304,11 +9495,15 @@ def _goal_recommended_next_action(
                 else "Goal is waiting on operator approval before it can continue."
             ),
             "blocking": True,
+            "blocker_type": "approval",
+            "approval_count": len(approval_ids),
         }
         if run_id:
             payload["run_id"] = run_id
         if approval_ids:
             payload["approval_ids"] = approval_ids
+        if tool_names:
+            payload["tool_names"] = tool_names
         if "approval_wait_timeout" in finding_codes:
             payload["finding_code"] = "approval_wait_timeout"
             if isinstance(approval_state, dict):
@@ -8326,17 +9521,22 @@ def _goal_recommended_next_action(
         "runtime_budget_exhausted" in finding_codes
         or budget_status in {"retry_limit_reached", "hard_stop_reached", "duration_exhausted"}
     ):
-        return {
+        payload = {
             "action": "inspect_runtime_budget",
             "summary": "Goal cannot safely continue until its runtime budget or retry policy is adjusted.",
             "blocking": True,
+            "blocker_type": "runtime_budget",
             "budget_status": budget_status or None,
         }
+        if run_id:
+            payload["run_id"] = run_id
+        return payload
     if "collector_shard_stuck" in finding_codes:
         payload = {
             "action": "inspect_collector_shards",
             "summary": "One or more collector shards have not advanced within the configured stall timeout.",
             "blocking": False,
+            "blocker_type": "collector",
             "finding_code": "collector_shard_stuck",
         }
         if run_id:
@@ -8409,12 +9609,20 @@ def _goal_recommended_next_action(
             "action": "capture_checkpoint",
             "summary": "Linked run should persist a fresh durable checkpoint before continuing unattended execution.",
             "blocking": False,
+            "blocker_type": "checkpoint",
             "finding_code": finding_code,
         }
         if run_id:
             payload["run_id"] = run_id
         return payload
     if goal_status in {"paused", "stalled", "awaiting_resources", "awaiting_operator"}:
+        blocker_type = (
+            "operator_control"
+            if goal_status == "awaiting_operator"
+            else "runtime_budget"
+            if goal_status == "awaiting_resources"
+            else "unknown"
+        )
         payload = {
             "action": "resume_goal",
             "summary": (
@@ -8423,6 +9631,7 @@ def _goal_recommended_next_action(
                 else "Goal is resumable but not actively progressing."
             ),
             "blocking": goal_status not in {"paused", "awaiting_operator"},
+            "blocker_type": blocker_type,
         }
         if run_id:
             payload["run_id"] = run_id
@@ -8437,6 +9646,426 @@ def _goal_recommended_next_action(
             payload["run_id"] = run_id
         return payload
     return None
+
+
+def _classify_active_goal_turn_decision(
+    message: str,
+    *,
+    goal: Mapping[str, Any],
+    health: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = _normalize_active_goal_turn_message(message)
+    goal_status = str(health.get("status") or goal.get("status") or "").strip() or None
+    linked_agent_run = health.get("linked_agent_run") if isinstance(health.get("linked_agent_run"), Mapping) else {}
+    linked_run_status = (
+        str(linked_agent_run.get("status") or "").strip() or None
+        if isinstance(linked_agent_run, Mapping)
+        else None
+    )
+    recommended_next_action = (
+        health.get("recommended_next_action")
+        if isinstance(health.get("recommended_next_action"), Mapping)
+        else {}
+    )
+    recommended_action = (
+        str(recommended_next_action.get("action") or "").strip() or None
+        if isinstance(recommended_next_action, Mapping)
+        else None
+    )
+
+    if _is_active_goal_turn_exit_to_chat(normalized):
+        return _active_goal_turn_decision_payload(
+            kind="exit_to_chat",
+            confidence=0.99,
+            selection_reason="Detected explicit request to leave the active-goal lane and continue as direct chat.",
+            requires_confirmation=False,
+            goal_status=goal_status,
+            linked_run_status=linked_run_status,
+            recommended_action=recommended_action,
+        )
+    if _is_active_goal_turn_lifecycle(normalized):
+        return _active_goal_turn_decision_payload(
+            kind="lifecycle",
+            confidence=0.98,
+            selection_reason="Detected explicit goal lifecycle command language such as start, pause, resume, cancel, or stop.",
+            requires_confirmation=False,
+            goal_status=goal_status,
+            linked_run_status=linked_run_status,
+            recommended_action=recommended_action,
+        )
+    if _is_active_goal_turn_replan(normalized):
+        return _active_goal_turn_decision_payload(
+            kind="replan",
+            confidence=0.97,
+            selection_reason="Detected explicit request to revise the plan, strategy, or approach for the active goal.",
+            requires_confirmation=False,
+            goal_status=goal_status,
+            linked_run_status=linked_run_status,
+            recommended_action=recommended_action,
+        )
+    if _is_active_goal_turn_steer(normalized):
+        return _active_goal_turn_decision_payload(
+            kind="steer",
+            confidence=0.95,
+            selection_reason="Detected forward-looking operator instruction that steers how the active goal should continue.",
+            requires_confirmation=False,
+            goal_status=goal_status,
+            linked_run_status=linked_run_status,
+            recommended_action=recommended_action,
+        )
+    if _is_active_goal_turn_explain_state(normalized, health=health):
+        return _active_goal_turn_decision_payload(
+            kind="explain_goal_state",
+            confidence=0.96,
+            selection_reason="Detected a question about the current goal state, blocker, or health status that should be answered in-lane.",
+            requires_confirmation=False,
+            goal_status=goal_status,
+            linked_run_status=linked_run_status,
+            recommended_action=recommended_action,
+        )
+    if _is_active_goal_turn_question(normalized):
+        return _active_goal_turn_decision_payload(
+            kind="answer_question",
+            confidence=0.9,
+            selection_reason="Detected a goal follow-up question that asks for explanation or status rather than new direction.",
+            requires_confirmation=False,
+            goal_status=goal_status,
+            linked_run_status=linked_run_status,
+            recommended_action=recommended_action,
+        )
+    return _active_goal_turn_decision_payload(
+        kind="clarify",
+        confidence=0.55,
+        selection_reason="Message did not clearly match explanatory, steering, replanning, lifecycle, or exit patterns in the bounded fallback classifier.",
+        requires_confirmation=True,
+        goal_status=goal_status,
+        linked_run_status=linked_run_status,
+        recommended_action=recommended_action,
+    )
+
+
+def _active_goal_turn_decision_payload(
+    *,
+    kind: str,
+    confidence: float,
+    selection_reason: str,
+    requires_confirmation: bool,
+    goal_status: str | None,
+    linked_run_status: str | None,
+    recommended_action: str | None,
+) -> dict[str, Any]:
+    return {
+        "lane": "active_goal_turn",
+        "kind": kind,
+        "confidence": confidence,
+        "selection_source": "bounded_fallback",
+        "selection_reason": selection_reason,
+        "requires_confirmation": requires_confirmation,
+        "goal_status": goal_status,
+        "linked_run_status": linked_run_status,
+        "recommended_action": recommended_action,
+    }
+
+
+def _normalize_active_goal_turn_message(message: str) -> str:
+    return re.sub(r"\s+", " ", str(message or "").strip().lower())
+
+
+def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _is_active_goal_turn_exit_to_chat(text: str) -> bool:
+    return _contains_any_phrase(
+        text,
+        (
+            "exit to chat",
+            "switch to chat",
+            "leave goal mode",
+            "leave this goal",
+            "just chat",
+            "normal chat",
+        ),
+    )
+
+
+def _is_active_goal_turn_lifecycle(text: str) -> bool:
+    lifecycle_prefixes = (
+        "resume goal",
+        "pause goal",
+        "cancel goal",
+        "stop goal",
+        "start goal",
+        "restart goal",
+    )
+    if text in {"resume", "pause", "cancel", "stop", "start", "restart"}:
+        return True
+    if text.startswith(lifecycle_prefixes):
+        return True
+    return _contains_any_phrase(
+        text,
+        (
+            "resume this goal",
+            "pause this goal",
+            "cancel this goal",
+            "stop this goal",
+            "restart this goal",
+            "continue the goal",
+        ),
+    )
+
+
+def _is_active_goal_turn_replan(text: str) -> bool:
+    return _contains_any_phrase(
+        text,
+        (
+            "replan",
+            "revise the plan",
+            "change the plan",
+            "new plan",
+            "different plan",
+            "adjust the plan",
+            "change strategy",
+            "switch strategy",
+            "different approach",
+            "take a different approach",
+            "start over with",
+        ),
+    )
+
+
+def _is_active_goal_turn_steer(text: str) -> bool:
+    if _is_active_goal_turn_question(text):
+        return False
+    if _contains_any_phrase(
+        text,
+        (
+            "focus on",
+            "prioritize",
+            "continue with",
+            "go deeper on",
+            "keep going on",
+            "proceed with",
+            "use ",
+            "avoid ",
+            "include ",
+            "exclude ",
+            "next, ",
+        ),
+    ):
+        return True
+    return text.startswith(("please ", "continue ", "keep ", "go ", "use ", "avoid "))
+
+
+def _is_active_goal_turn_explain_state(text: str, *, health: Mapping[str, Any]) -> bool:
+    if _contains_any_phrase(
+        text,
+        (
+            "what happened",
+            "why is this blocked",
+            "why blocked",
+            "what does this state mean",
+            "what does this mean",
+            "why is it blocked",
+            "why is the goal blocked",
+            "why is this waiting",
+            "why is it waiting",
+            "what state is this",
+            "why did this stop",
+        ),
+    ):
+        return True
+    if not _is_active_goal_turn_question(text):
+        return False
+    goal_status = str(health.get("status") or "").strip().lower()
+    recommended_next_action = (
+        health.get("recommended_next_action")
+        if isinstance(health.get("recommended_next_action"), Mapping)
+        else {}
+    )
+    blocker_type = (
+        str(recommended_next_action.get("blocker_type") or "").strip().lower()
+        if isinstance(recommended_next_action, Mapping)
+        else ""
+    )
+    explanatory_terms = (
+        "status",
+        "state",
+        "blocked",
+        "blocking",
+        "wait",
+        "waiting",
+        "approval",
+        "paused",
+        "stalled",
+        "progress",
+        "happened",
+        "mean",
+    )
+    if any(term in text for term in explanatory_terms):
+        return True
+    return goal_status in {"waiting_approval", "awaiting_resources", "awaiting_operator", "stalled", "paused"} or blocker_type in {
+        "approval",
+        "runtime_budget",
+        "checkpoint",
+        "operator_control",
+        "collector",
+    }
+
+
+def _is_active_goal_turn_question(text: str) -> bool:
+    if "?" in text:
+        return True
+    return _contains_any_phrase(
+        text,
+        (
+            "what ",
+            "what's",
+            "whats ",
+            "why ",
+            "how ",
+            "when ",
+            "where ",
+            "which ",
+            "explain",
+            "help me understand",
+            "status",
+            "progress",
+        ),
+    )
+
+
+def _agent_run_event_with_seq(event: Mapping[str, Any], *, seq: int) -> dict[str, Any]:
+    payload = dict(event)
+    payload.setdefault("seq", seq)
+    return payload
+
+
+def _normalize_agent_run_transcript_event(
+    event: Mapping[str, Any],
+    *,
+    run_id: str,
+) -> dict[str, Any] | None:
+    event_type = str(event.get("type") or "").strip()
+    if not event_type:
+        return None
+    raw_payload = dict(event)
+    if event_type == "subagent_message":
+        role_id = str(raw_payload.get("target_role_id") or raw_payload.get("role_id") or "").strip()
+        subagent_id = str(raw_payload.get("subagent_id") or "").strip() or None
+        payload = {
+            "type": "subagent_progress",
+            "subagent_id": subagent_id,
+            "role_id": role_id or None,
+            "content": raw_payload.get("content"),
+            "summary": raw_payload.get("content"),
+            "status": "running",
+            "message_id": raw_payload.get("message_id"),
+            "delivery_mode": raw_payload.get("delivery_mode"),
+            "delivery_status": raw_payload.get("delivery_status"),
+            "delivery_reason": raw_payload.get("delivery_reason"),
+            "interrupt": raw_payload.get("interrupt"),
+            "cancel_current_tool": raw_payload.get("cancel_current_tool"),
+            "created_at": raw_payload.get("created_at"),
+            "metadata": {
+                "source_type": "subagent_message",
+                "attachments": raw_payload.get("attachments") or [],
+                "message_id": raw_payload.get("message_id"),
+                "delivery_mode": raw_payload.get("delivery_mode"),
+                "delivery_status": raw_payload.get("delivery_status"),
+                "delivery_reason": raw_payload.get("delivery_reason"),
+                "interrupt": raw_payload.get("interrupt"),
+                "cancel_current_tool": raw_payload.get("cancel_current_tool"),
+            },
+        }
+    else:
+        try:
+            payload = normalize_subagent_event(
+                raw_payload,
+                parent_type="agent_run",
+                parent_id=run_id,
+            )
+        except ValueError:
+            return None
+    if "seq" in raw_payload and "seq" not in payload:
+        payload["seq"] = raw_payload.get("seq")
+    return payload
+
+
+def _subagent_transcript_summary_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    item = dict(payload)
+    item.pop("system_prompt", None)
+    item.pop("user_prompt", None)
+    item.pop("events", None)
+    return item
+
+
+def _subagent_transcript_detail_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    item = dict(payload)
+    events = item.get("events")
+    if isinstance(events, list):
+        parent_type = str(item.get("parent_type") or "").strip() or "session"
+        parent_id = str(item.get("parent_id") or "").strip()
+        normalized_events: list[dict[str, Any]] = []
+        for event in events:
+            if not isinstance(event, Mapping):
+                continue
+            raw_event = dict(event)
+            if parent_type == "agent_run":
+                normalized = _normalize_agent_run_transcript_event(raw_event, run_id=parent_id)
+            elif str(raw_event.get("type") or "").strip() == "subagent_message":
+                role_id = (
+                    str(raw_event.get("target_role_id") or raw_event.get("role_id") or "").strip()
+                    or None
+                )
+                normalized = {
+                    "type": "subagent_progress",
+                    "parent_type": parent_type,
+                    "parent_id": parent_id,
+                    "subagent_id": str(raw_event.get("subagent_id") or "").strip() or None,
+                    "role_id": role_id,
+                    "content": raw_event.get("content"),
+                    "summary": raw_event.get("content"),
+                    "status": "running",
+                    "message_id": raw_event.get("message_id"),
+                    "delivery_mode": raw_event.get("delivery_mode"),
+                    "delivery_status": raw_event.get("delivery_status"),
+                    "delivery_reason": raw_event.get("delivery_reason"),
+                    "interrupt": raw_event.get("interrupt"),
+                    "cancel_current_tool": raw_event.get("cancel_current_tool"),
+                    "metadata": {
+                        "source_type": "subagent_message",
+                        "attachments": raw_event.get("attachments") or [],
+                        "message_id": raw_event.get("message_id"),
+                        "delivery_mode": raw_event.get("delivery_mode"),
+                        "delivery_status": raw_event.get("delivery_status"),
+                        "delivery_reason": raw_event.get("delivery_reason"),
+                        "interrupt": raw_event.get("interrupt"),
+                        "cancel_current_tool": raw_event.get("cancel_current_tool"),
+                        **(
+                            dict(raw_event.get("metadata"))
+                            if isinstance(raw_event.get("metadata"), Mapping)
+                            else {}
+                        ),
+                    },
+                    "created_at": raw_event.get("created_at"),
+                }
+            else:
+                try:
+                    normalized = normalize_subagent_event(
+                        raw_event,
+                        parent_type=parent_type,
+                        parent_id=parent_id,
+                    )
+                except ValueError:
+                    normalized = None
+            if normalized is None:
+                continue
+            if "seq" in raw_event and "seq" not in normalized:
+                normalized["seq"] = raw_event.get("seq")
+            normalized_events.append(normalized)
+        item["events"] = normalized_events
+    return item
 
 
 def _goal_checkpoint_record_response(record: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -10984,7 +12613,7 @@ def _resolve_protocol_payload(run: dict[str, Any]) -> dict[str, Any]:
         if isinstance(rounds, int) and rounds > 0:
             payload["rounds"] = rounds
         return payload
-    return {"protocol": "teacher_student_distill"}
+    return {"protocol": AUTONOMOUS_SINGLE_AGENT_PROTOCOL}
 
 
 def _controlled_execution_protocol_config(execution_budget: dict[str, Any]) -> dict[str, Any]:
@@ -11235,6 +12864,56 @@ def _normalize_goal_capability_policy(
     if "allowed_tools" in payload:
         normalized["allowed_tools"] = _normalized_string_list(payload.get("allowed_tools"))
     return normalized
+
+
+def _normalize_selected_models_roles_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+
+    by_role: dict[str, str] = {}
+    raw_by_role = payload.get("by_role")
+    if isinstance(raw_by_role, Mapping):
+        for role_id, model_id in raw_by_role.items():
+            role_text = str(role_id or "").strip()
+            model_text = str(model_id or "").strip()
+            if role_text and model_text:
+                by_role[role_text] = model_text
+
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        raw_entries = payload.get("subagents")
+    if isinstance(raw_entries, list):
+        for item in raw_entries:
+            if not isinstance(item, Mapping):
+                continue
+            role_text = str(item.get("role") or item.get("role_id") or "").strip()
+            model_text = str(item.get("model_id") or item.get("model") or "").strip()
+            if role_text and model_text:
+                by_role.setdefault(role_text, model_text)
+
+    for role_id, value in payload.items():
+        if role_id in {"by_role", "entries", "subagents"}:
+            continue
+        role_text = str(role_id or "").strip()
+        if not role_text:
+            continue
+        if isinstance(value, str):
+            model_text = value.strip()
+        elif isinstance(value, Mapping):
+            model_text = str(value.get("model_id") or value.get("model") or "").strip()
+        else:
+            model_text = ""
+        if model_text:
+            by_role.setdefault(role_text, model_text)
+
+    if not by_role:
+        return {}
+    entries = [{"role": role, "model_id": model_id} for role, model_id in by_role.items()]
+    return {
+        "by_role": by_role,
+        "entries": entries,
+        "subagents": entries,
+    }
 
 
 def _normalize_goal_operator_controls(
@@ -11499,6 +13178,38 @@ def _delegated_subagent_payload(
         "parent_session_id": parent_session_id,
         "status": _clean_text(status) or _clean_text(payload.get("status")) or "queued",
     }
+
+
+def _subagent_transcript_links_task(transcript: Mapping[str, Any], task_id: str) -> bool:
+    expected = str(task_id or "").strip()
+    if not expected:
+        return False
+    metadata = transcript.get("metadata") if isinstance(transcript.get("metadata"), Mapping) else {}
+    metadata_task_id = str(metadata.get("task_id") or "").strip()
+    if metadata_task_id == expected:
+        return True
+    parent_type = str(transcript.get("parent_type") or "").strip()
+    parent_id = str(transcript.get("parent_id") or "").strip()
+    return parent_type == "delegated_task" and parent_id == expected
+
+
+def _session_subagent_message_id(event: Mapping[str, Any], *, subagent_id: str) -> str:
+    explicit = str(event.get("message_id") or "").strip()
+    if explicit:
+        return explicit
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+    metadata_id = str(metadata.get("message_id") or "").strip()
+    if metadata_id:
+        return metadata_id
+    fingerprint = "|".join(
+        [
+            str(subagent_id or "").strip(),
+            str(event.get("seq") or "").strip(),
+            str(event.get("created_at") or "").strip(),
+            str(event.get("content") or "").strip(),
+        ]
+    )
+    return f"subagent-message-{sha1(fingerprint.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _build_delegated_subagent_metadata(
@@ -11779,6 +13490,131 @@ def _protocol_artifacts_from_run_summary(run_summary: dict[str, Any]) -> dict[st
     }
 
 
+def _summary_guidance_messages(summary: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(summary, Mapping):
+        return []
+    return [
+        str(item).strip()
+        for item in summary.get("guidance_messages", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+
+
+def _summary_role_guidance_messages(
+    summary: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    if not isinstance(summary, Mapping):
+        return {}
+    role_guidance = (
+        summary.get("role_guidance_messages")
+        if isinstance(summary.get("role_guidance_messages"), Mapping)
+        else {}
+    )
+    normalized: dict[str, list[str]] = {}
+    for role_id, messages in role_guidance.items():
+        role_key = str(role_id or "").strip()
+        if not role_key or not isinstance(messages, list):
+            continue
+        cleaned = [
+            str(item).strip()
+            for item in messages
+            if isinstance(item, str) and str(item).strip()
+        ]
+        if cleaned:
+            normalized[role_key] = cleaned
+    return normalized
+
+
+def _merge_role_guidance_messages(
+    base: Mapping[str, Any] | None,
+    extra: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    for source in (base, extra):
+        if not isinstance(source, Mapping):
+            continue
+        for role_id, messages in source.items():
+            role_key = str(role_id or "").strip()
+            if not role_key or not isinstance(messages, list):
+                continue
+            cleaned = [
+                str(item).strip()
+                for item in messages
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if not cleaned:
+                continue
+            merged[role_key] = _merge_unique_text_items(
+                merged.get(role_key, []),
+                cleaned,
+            )
+    return merged
+
+
+def _inject_summary_guidance_into_recovery_state(summary: dict[str, Any]) -> dict[str, Any]:
+    recovery_state = (
+        dict(summary.get("recovery_state"))
+        if isinstance(summary.get("recovery_state"), dict)
+        else {}
+    )
+    resume_payload = (
+        dict(recovery_state.get("resume_payload"))
+        if isinstance(recovery_state.get("resume_payload"), dict)
+        else None
+    )
+    if resume_payload is None:
+        return summary
+    resume_payload["guidance_messages"] = _merge_unique_text_items(
+        [
+            str(item).strip()
+            for item in resume_payload.get("guidance_messages", [])
+            if isinstance(item, str) and str(item).strip()
+        ],
+        _summary_guidance_messages(summary),
+    )
+    resume_payload["role_guidance_messages"] = _merge_role_guidance_messages(
+        (
+            resume_payload.get("role_guidance_messages")
+            if isinstance(resume_payload.get("role_guidance_messages"), Mapping)
+            else {}
+        ),
+        _summary_role_guidance_messages(summary),
+    )
+    recovery_state["resume_payload"] = resume_payload
+    summary["recovery_state"] = recovery_state
+    return summary
+
+
+def _agent_run_request_resume_payload(
+    payload: dict[str, Any] | None,
+    *,
+    strategy: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    if _normalize_agent_run_resume_strategy(strategy) == "continue_from_checkpoint":
+        return dict(payload)
+    guidance_messages = [
+        str(item).strip()
+        for item in payload.get("guidance_messages", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    role_guidance_messages = _merge_role_guidance_messages(
+        None,
+        (
+            payload.get("role_guidance_messages")
+            if isinstance(payload.get("role_guidance_messages"), Mapping)
+            else {}
+        ),
+    )
+    if not guidance_messages and not role_guidance_messages:
+        return {}
+    return {
+        "guidance_messages": guidance_messages,
+        "role_guidance_messages": role_guidance_messages,
+    }
+
+
 def _build_agent_run_resume_payload(
     *,
     run: dict[str, Any],
@@ -11847,6 +13683,8 @@ def _build_agent_run_resume_payload(
         }
     candidate_snapshots = _candidate_snapshots_from_events(run.get("events"))
     summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    summary_guidance_messages = _summary_guidance_messages(summary)
+    summary_role_guidance_messages = _summary_role_guidance_messages(summary)
     provided_packets = (
         summary.get("evidence_packets")
         if isinstance(summary.get("evidence_packets"), list)
@@ -11919,7 +13757,8 @@ def _build_agent_run_resume_payload(
         ),
         "stage": stage,
         "checkpoint": checkpoint,
-        "guidance_messages": [],
+        "guidance_messages": summary_guidance_messages,
+        "role_guidance_messages": summary_role_guidance_messages,
         "metadata_state": {},
         "precomputed_artifacts": {},
         "protocol_artifacts": protocol_artifacts,
@@ -11962,7 +13801,7 @@ def _ensure_agent_run_resume_payload(
             strategy=strategy,
         )
     summary["recovery_state"] = recovery_state
-    return summary
+    return _inject_summary_guidance_into_recovery_state(summary)
 
 
 def _build_runtime_resource_recovery_summary(

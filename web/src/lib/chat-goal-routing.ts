@@ -16,11 +16,9 @@ export type ChatGoalWorkflowRoute =
   | { kind: 'goal_help'; raw: string }
   | { kind: 'goal_proposal'; content: string; raw: string }
   | { kind: 'workflow_proposal'; requestText: string }
-  | { kind: 'natural_language_goal_proposal'; requestText: string }
   | { kind: 'goal_pending_follow_up'; requestText: string; raw: string }
   | { kind: 'goal_confirmation'; requestText: string; raw: string }
   | { kind: 'goal_revision'; requestText: string }
-  | { kind: 'goal_follow_up'; requestText: string }
   | { kind: 'goal_lifecycle'; action: 'status' | 'pause' | 'resume' | 'stop'; raw: string }
 
 export interface ChatGoalWorkflowRoutingDecision {
@@ -81,23 +79,6 @@ export function parseGoalCommand(value: string): GoalCommand | null {
   }
 }
 
-export function isNaturalLanguageGoalRequest(value: string): boolean {
-  const normalized = value.trim().toLowerCase().replace(/\s+/g, ' ')
-  if (!normalized) {
-    return false
-  }
-
-  return (
-    /\b(?:in the background|background task|background run)\b/.test(normalized) ||
-    /\b(?:keep working on this|continue working on this|keep going on this)\b/.test(normalized) ||
-    /\b(?:make progress while i(?:'m| am) away|work on this while i(?:'m| am) away)\b/.test(normalized) ||
-    /\b(?:retry until|checkpointed|with checkpoints|save checkpoints)\b/.test(normalized) ||
-    /\b(?:spend|work for|run for|continue for|for the next)\s+\d+\s*(?:min(?:ute)?s?|hours?|hrs?)\b/.test(normalized) ||
-    /\b\d+\s*(?:min(?:ute)?s?|hours?|hrs?)\b.*\b(?:background|keep working|continue working|come back)\b/.test(normalized) ||
-    /\b(?:keep at it|stay on this|come back with progress)\b/.test(normalized)
-  )
-}
-
 export function resolveChatGoalWorkflowRouting(
   input: ResolveChatGoalWorkflowRoutingInput
 ): ChatGoalWorkflowRoutingDecision {
@@ -111,19 +92,6 @@ export function resolveChatGoalWorkflowRouting(
         : input.text
   const workflowModeRequested = modeCommand?.mode === 'workflow'
   const workflowProposalRequested = workflowModeRequested && requestText.length > 0
-  const naturalLanguageGoalRequested =
-    !goalCommand &&
-    !modeCommand &&
-    !input.hasPendingProposal &&
-    input.attachmentCount === 0 &&
-    isNaturalLanguageGoalRequest(requestText)
-  const activeGoalFollowUpRequested =
-    !goalCommand &&
-    !modeCommand &&
-    !input.hasPendingProposal &&
-    input.hasActiveGoal &&
-    (requestText.trim().length > 0 || input.attachmentCount > 0) &&
-    !naturalLanguageGoalRequested
   const pendingProposalFollowUpRequested =
     !goalCommand &&
     !modeCommand &&
@@ -164,11 +132,6 @@ export function resolveChatGoalWorkflowRouting(
       content: goalCommand.content,
       raw: goalCommand.raw,
     }
-  } else if (naturalLanguageGoalRequested) {
-    route = {
-      kind: 'natural_language_goal_proposal',
-      requestText,
-    }
   } else if (pendingProposalFollowUpRequested) {
     route = {
       kind: 'goal_pending_follow_up',
@@ -178,11 +141,6 @@ export function resolveChatGoalWorkflowRouting(
   } else if (proposalRevisionRequested) {
     route = {
       kind: 'goal_revision',
-      requestText,
-    }
-  } else if (activeGoalFollowUpRequested) {
-    route = {
-      kind: 'goal_follow_up',
       requestText,
     }
   }

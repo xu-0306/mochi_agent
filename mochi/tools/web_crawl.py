@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from html.parser import HTMLParser
 from typing import Any
@@ -9,7 +10,13 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from mochi.tools._http import ToolHttpError, error_to_tool_result, http_request, make_default_client
+from mochi.tools._http import (
+    BoundHttpToolCancellation,
+    ToolHttpError,
+    error_to_tool_result,
+    http_request,
+    make_default_client,
+)
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.tools.web_fetch import (
     _blocked_domains_from_context,
@@ -134,6 +141,10 @@ class WebCrawlTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def search_hint(self) -> str | None:
         return "Use this to collect a few related pages from one site before summarizing or extracting evidence."
 
@@ -169,63 +180,82 @@ class WebCrawlTool(BaseTool):
         pages: list[dict[str, Any]] = []
         truncated = False
         blocked_urls: list[str] = []
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
+        try:
+            while queue and len(pages) < max_pages:
+                cancellation.raise_if_requested()
+                current_url, depth = queue.popleft()
+                if current_url in visited:
+                    continue
+                visited.add(current_url)
+                if _url_matches_blocked_domain(current_url, blocked_domains):
+                    blocked_urls.append(current_url)
+                    continue
 
-        while queue and len(pages) < max_pages:
-            current_url, depth = queue.popleft()
-            if current_url in visited:
-                continue
-            visited.add(current_url)
-            if _url_matches_blocked_domain(current_url, blocked_domains):
-                blocked_urls.append(current_url)
-                continue
+                fetched = await self._fetch_page(current_url, max_bytes=max_bytes)
+                cancellation.raise_if_requested()
+                if fetched.error is not None:
+                    if not pages:
+                        return fetched
+                    continue
 
-            fetched = await self._fetch_page(current_url, max_bytes=max_bytes)
-            if fetched.error is not None:
-                if not pages:
-                    return fetched
-                continue
+                page_output = fetched.output if isinstance(fetched.output, dict) else {}
+                pages.append(
+                    {
+                        "url": current_url,
+                        "text": str(page_output.get("text", "")),
+                    }
+                )
+                if depth >= max_depth:
+                    continue
 
-            page_output = fetched.output if isinstance(fetched.output, dict) else {}
-            pages.append(
-                {
-                    "url": current_url,
-                    "text": str(page_output.get("text", "")),
-                }
+                links = page_output.get("links", [])
+                if not isinstance(links, list):
+                    continue
+                for link in links:
+                    if not isinstance(link, str) or not _is_supported_url(link):
+                        continue
+                    if same_domain_only and (urlparse(link).hostname or "").lower() != origin_host:
+                        continue
+                    if _url_matches_blocked_domain(link, blocked_domains):
+                        blocked_urls.append(link)
+                        continue
+                    if link in visited:
+                        continue
+                    queue.append((link, depth + 1))
+
+            cancellation.raise_if_requested()
+            if queue:
+                truncated = True
+
+            return ToolResult(
+                output={"pages": pages},
+                metadata={
+                    "start_url": url,
+                    "pages_crawled": len(pages),
+                    "visited_urls": [page["url"] for page in pages],
+                    "max_depth": max_depth,
+                    "same_domain_only": same_domain_only,
+                    "truncated": truncated,
+                    "blocked_domains": blocked_domains,
+                    "blocked_urls": blocked_urls,
+                },
             )
-            if depth >= max_depth:
-                continue
-
-            links = page_output.get("links", [])
-            if not isinstance(links, list):
-                continue
-            for link in links:
-                if not isinstance(link, str) or not _is_supported_url(link):
-                    continue
-                if same_domain_only and (urlparse(link).hostname or "").lower() != origin_host:
-                    continue
-                if _url_matches_blocked_domain(link, blocked_domains):
-                    blocked_urls.append(link)
-                    continue
-                if link in visited:
-                    continue
-                queue.append((link, depth + 1))
-
-        if queue:
-            truncated = True
-
-        return ToolResult(
-            output={"pages": pages},
-            metadata={
-                "start_url": url,
-                "pages_crawled": len(pages),
-                "visited_urls": [page["url"] for page in pages],
-                "max_depth": max_depth,
-                "same_domain_only": same_domain_only,
-                "truncated": truncated,
-                "blocked_domains": blocked_domains,
-                "blocked_urls": blocked_urls,
-            },
-        )
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    output={"pages": pages},
+                    metadata={
+                        "start_url": url,
+                        "pages_crawled": len(pages),
+                        "visited_urls": [page["url"] for page in pages],
+                        "max_depth": max_depth,
+                        "same_domain_only": same_domain_only,
+                        "blocked_domains": blocked_domains,
+                        "blocked_urls": blocked_urls,
+                    },
+                )
+            raise
 
     async def _fetch_page(self, url: str, *, max_bytes: int) -> ToolResult:
         try:

@@ -33,6 +33,10 @@ import {
 } from '@/lib/reasoning'
 import { getReasoningStepSource } from '@/lib/reasoning-trace'
 import { buildReasoningStepId, mergeReasoningStep } from '@/lib/reasoning-steps'
+import {
+  deriveSubagentEventStatus,
+  deriveSubagentMessageDeliveryStatus,
+} from '@/lib/subagent-protocol-events'
 
 const API_BASE = '/v1'
 const LOCAL_DEV_API_ORIGIN = 'http://127.0.0.1:8000'
@@ -385,6 +389,7 @@ export interface SendMessageOptions {
   sessionId?: string
   projectId?: string | null
   model?: string
+  toolMode?: 'disabled' | 'auto' | 'required'
   selectedSkillIds?: string[]
   attachments?: ChatAttachment[]
   temperature?: number
@@ -529,6 +534,7 @@ export interface PostChatPayload {
   project_id?: string | null
   projectId?: string | null
   model?: string
+  tool_mode?: 'disabled' | 'auto' | 'required'
   selected_skill_ids?: string[]
   selectedSkillIds?: string[]
   attachments?: ChatAttachment[]
@@ -570,14 +576,31 @@ export type StreamChatEvent =
 
 export interface StreamChatOptions extends SendMessageOptions {
   onSessionId?: (sessionId: string) => void
+  onResponseMeta?: (meta: StreamChatResponseMeta) => void
 }
 
 export interface StreamChatChunk {
   event: Message | null
+  rawEvent?: StreamChatEvent | null
   sessionId?: string
   trajectoryId?: string | null
   model?: string | null
   done?: boolean
+}
+
+export interface StreamChatResponseMeta {
+  sessionId?: string
+  turnId?: string | null
+  chatRunId?: string | null
+}
+
+export interface ChatCancelResponse {
+  status: 'cancel_requested' | 'already_completed' | 'not_found'
+  session_id: string
+  turn_id?: string | null
+  run_state?: 'running' | 'cancelling' | 'cancelled' | 'completed' | null
+  cancel_outcome?: 'cancelled' | 'completed' | 'pending' | null
+  cancel_reason?: string | null
 }
 
 interface NormalizedMessageEvent {
@@ -1395,6 +1418,7 @@ export async function sendMessage(
       session_id: options.sessionId,
       project_id: options.projectId,
       model: options.model,
+      tool_mode: options.toolMode,
       selected_skill_ids: options.selectedSkillIds,
       attachments: serializeChatAttachments(options.attachments),
       system_prompt: options.systemPrompt,
@@ -1430,6 +1454,7 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       session_id: payload.session_id ?? payload.sessionId,
       project_id: payload.project_id ?? payload.projectId,
       model: payload.model,
+      tool_mode: payload.tool_mode,
       selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
       attachments: serializeChatAttachments(payload.attachments),
       system_prompt: payload.system_prompt,
@@ -1459,6 +1484,7 @@ export async function fetchChatContextPreview(
         session_id: payload.session_id ?? payload.sessionId,
         project_id: payload.project_id ?? payload.projectId,
         model: payload.model,
+        tool_mode: payload.tool_mode,
         selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
         attachments: serializeChatAttachments(payload.attachments),
         system_prompt: payload.system_prompt,
@@ -1671,6 +1697,7 @@ async function requestStreamResponse(
         session_id: options.sessionId,
         project_id: options.projectId,
         model: options.model,
+        tool_mode: options.toolMode,
         selected_skill_ids: options.selectedSkillIds,
         attachments: serializeChatAttachments(options.attachments),
         system_prompt: options.systemPrompt,
@@ -1746,9 +1773,16 @@ export async function* streamChatMessages(
     throw new ApiError(0, 'Streaming response body is unavailable.')
   }
   const responseSessionId = response.headers.get('X-Session-ID') ?? undefined
+  const responseTurnId = response.headers.get('X-Turn-ID') ?? undefined
+  const responseChatRunId = response.headers.get('X-Chat-Run-ID') ?? responseTurnId ?? undefined
   if (responseSessionId) {
     options.onSessionId?.(responseSessionId)
   }
+  options.onResponseMeta?.({
+    sessionId: responseSessionId,
+    turnId: responseTurnId ?? null,
+    chatRunId: responseChatRunId ?? null,
+  })
 
   const contentType = response.headers.get('content-type') ?? ''
   const stream =
@@ -1780,6 +1814,7 @@ export async function* streamChatMessages(
       emittedDone = true
       yield {
         event: null,
+        rawEvent,
         sessionId: nextSessionId,
         model,
         trajectoryId,
@@ -1796,6 +1831,7 @@ export async function* streamChatMessages(
     for (const message of messages) {
       yield {
         event: message,
+        rawEvent,
         sessionId: nextSessionId,
         model,
         trajectoryId,
@@ -1806,10 +1842,27 @@ export async function* streamChatMessages(
   if (!emittedDone) {
     yield {
       event: null,
+      rawEvent: null,
       sessionId: seenSessionId,
       done: true,
     }
   }
+}
+
+export async function cancelChatRun(
+  sessionId: string,
+  input?: { turnId?: string | null }
+): Promise<ChatCancelResponse> {
+  return requestJson<ChatCancelResponse>(
+    `/chat/${encodeURIComponent(sessionId)}/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        turn_id: input?.turnId ?? null,
+      }),
+    },
+    resolveChatStreamTarget()
+  )
 }
 
 interface BackendSkill {
@@ -1961,6 +2014,9 @@ export interface SessionGoalSummary {
   execution_mode?: GoalExecutionMode | null
   interaction_mode?: GoalInteractionMode | null
   execution_topology?: GoalExecutionTopology | null
+  strategy_id?: string | null
+  selection_source?: string | null
+  selection_reason?: string | null
   protocol_id?: string | null
   bound_run_id?: string | null
   protocol_selection?: string | null
@@ -1986,6 +2042,9 @@ export interface SessionGoalState {
   execution_mode?: GoalExecutionMode | null
   interaction_mode?: GoalInteractionMode | null
   execution_topology?: GoalExecutionTopology | null
+  strategy_id?: string | null
+  selection_source?: string | null
+  selection_reason?: string | null
   bound_run_id?: string | null
   protocol_selection?: string | null
   selection_rationale?: string | null
@@ -2073,10 +2132,13 @@ function normalizeSessionGoalSummary(value: unknown): SessionGoalSummary | null 
     execution_mode: normalizeGoalExecutionMode(value.execution_mode),
     interaction_mode: normalizeGoalInteractionModeValue(value.interaction_mode),
     execution_topology: normalizeGoalExecutionTopologyValue(value.execution_topology),
+    strategy_id: getNullableString(value.strategy_id),
+    selection_source: getNullableString(value.selection_source),
+    selection_reason: getNullableString(value.selection_reason) ?? getNullableString(value.selection_rationale),
     protocol_id: getNullableString(value.protocol_id),
     bound_run_id: getNullableString(value.bound_run_id),
-    protocol_selection: getNullableString(value.protocol_selection),
-    selection_rationale: getNullableString(value.selection_rationale),
+    protocol_selection: getNullableString(value.protocol_selection) ?? getNullableString(value.strategy_id),
+    selection_rationale: getNullableString(value.selection_rationale) ?? getNullableString(value.selection_reason),
     models: getStringArray(value.models),
     role_summary: getNullableString(value.role_summary),
     runtime_mode: getNullableString(value.runtime_mode),
@@ -2117,9 +2179,12 @@ function normalizeSessionGoalState(value: unknown): SessionGoalState | null {
     execution_mode: normalizeGoalExecutionMode(value.execution_mode),
     interaction_mode: normalizeGoalInteractionModeValue(value.interaction_mode),
     execution_topology: normalizeGoalExecutionTopologyValue(value.execution_topology),
+    strategy_id: getNullableString(value.strategy_id),
+    selection_source: getNullableString(value.selection_source),
+    selection_reason: getNullableString(value.selection_reason) ?? getNullableString(value.selection_rationale),
     bound_run_id: getNullableString(value.bound_run_id),
-    protocol_selection: getNullableString(value.protocol_selection),
-    selection_rationale: getNullableString(value.selection_rationale),
+    protocol_selection: getNullableString(value.protocol_selection) ?? getNullableString(value.strategy_id),
+    selection_rationale: getNullableString(value.selection_rationale) ?? getNullableString(value.selection_reason),
     default_route:
       value.default_route === 'goal' || value.default_route === 'workflow' || value.default_route === 'chat'
         ? value.default_route
@@ -5856,6 +5921,55 @@ export async function stopApprovalExecSession(
   return normalizeApprovalExecSessionPayload(payload)
 }
 
+export interface ExecutionTranscriptEvent {
+  type: string
+  seq?: number
+  eventId?: string | null
+  dedupeKey?: string | null
+  visibility?: string | null
+  durability?: string | null
+  projectionLane?: string | null
+  parentType?: string | null
+  parentId?: string | null
+  subagentId?: string | null
+  roleId?: string | null
+  title?: string | null
+  modelId?: string | null
+  status?: string | null
+  content?: string | null
+  summary?: string | null
+  metadata: Record<string, unknown>
+  createdAt?: string | null
+  messageId?: string | null
+  deliveryMode?: string | null
+  deliveryStatus?: string | null
+  deliveryReason?: string | null
+}
+
+export interface SubagentTranscriptSummary {
+  subagentId: string
+  parentType: string
+  parentId: string
+  sessionId?: string | null
+  agentRunId?: string | null
+  roleId?: string | null
+  title?: string | null
+  modelId?: string | null
+  status: string
+  promptPreview?: string | null
+  summary?: string | null
+  outputPreview?: string | null
+  eventCount: number
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface SubagentTranscriptDetail extends SubagentTranscriptSummary {
+  systemPrompt?: string | null
+  userPrompt?: string | null
+  events: ExecutionTranscriptEvent[]
+}
+
 export type AgentRunProtocolId =
   | 'teacher_student_distill'
   | 'multi_agent_debate'
@@ -6037,6 +6151,15 @@ export interface AgentRunSubagentMessageInput {
   workspaceDir?: string | null
   attachments?: ChatAttachment[]
   metadata?: Record<string, unknown>
+  deliveryMode?: 'inject_now' | 'after_current_tool' | 'next_checkpoint' | 'resume_only' | (string & {})
+  delivery_mode?: 'inject_now' | 'after_current_tool' | 'next_checkpoint' | 'resume_only' | (string & {})
+  interrupt?: boolean
+  cancelCurrentTool?: boolean
+  cancel_current_tool?: boolean
+}
+
+export interface SessionSubagentResumeInput {
+  guidance?: string | null
 }
 
 export interface AgentRunExecLease {
@@ -6081,6 +6204,334 @@ export interface AgentRunExecSessionPayload {
   stop_status?: string
   reattached?: boolean
   reattach_status?: string
+}
+
+function mergeExecutionTranscriptMetadata(
+  record: Record<string, unknown>,
+  metadataCandidate: Record<string, unknown>
+): Record<string, unknown> {
+  const metadata = { ...metadataCandidate }
+
+  const assignStringField = (targetKey: string, sourceKeys: string[]) => {
+    if (getString(metadata[targetKey])) {
+      return
+    }
+    for (const key of sourceKeys) {
+      const value = getString(record[key]) ?? getString(metadata[key])
+      if (value) {
+        metadata[targetKey] = value
+        return
+      }
+    }
+  }
+
+  const assignStringArrayField = (targetKey: string, sourceKeys: string[]) => {
+    const currentValue = getStringArray(metadata[targetKey])
+    if (currentValue.length > 0) {
+      return
+    }
+    for (const key of sourceKeys) {
+      const recordValue = getStringArray(record[key])
+      if (recordValue.length > 0) {
+        metadata[targetKey] = recordValue
+        return
+      }
+      const metadataValue = getStringArray(metadata[key])
+      if (metadataValue.length > 0) {
+        metadata[targetKey] = metadataValue
+        return
+      }
+    }
+  }
+
+  assignStringField('blocker_type', ['blocker_type', 'blockerType'])
+  assignStringField('message_id', ['message_id', 'messageId'])
+  assignStringField('event_id', ['event_id', 'eventId'])
+  assignStringField('dedupe_key', ['dedupe_key', 'dedupeKey'])
+  assignStringField('visibility', ['visibility'])
+  assignStringField('durability', ['durability'])
+  assignStringField('projection_lane', ['projection_lane', 'projectionLane'])
+  assignStringField('delivery_mode', ['delivery_mode', 'deliveryMode'])
+  assignStringField('delivery_status', ['delivery_status', 'deliveryStatus'])
+  assignStringField('delivery_reason', ['delivery_reason', 'deliveryReason'])
+  assignStringArrayField('approval_ids', ['approval_ids', 'approvalIds'])
+  assignStringArrayField('tool_names', ['tool_names', 'toolNames'])
+  assignStringField('recommended_action', ['recommended_action', 'recommendedAction'])
+
+  return metadata
+}
+
+function deliveryStatusFromEventType(type: string): string | null {
+  return deriveSubagentMessageDeliveryStatus(type)
+}
+
+function mapRuntimeTranscriptEventType(type: string): string {
+  if (type === 'role_started') {
+    return 'subagent_started'
+  }
+  if (type === 'role_progress') {
+    return 'subagent_progress'
+  }
+  if (type === 'role_completed' || type === 'role_error') {
+    return 'subagent_completed'
+  }
+  return type
+}
+
+function normalizeExecutionTranscriptEvent(payload: unknown): ExecutionTranscriptEvent | null {
+  const record = isRecord(payload) ? payload : {}
+  const rawType =
+    getString(record.type) ??
+    getString(record.event_type) ??
+    getString(record.kind)
+  if (!rawType) {
+    return null
+  }
+  const type = mapRuntimeTranscriptEventType(rawType)
+
+  const metadataCandidate = {
+    ...(isRecord(record.details) ? record.details : {}),
+    ...(isRecord(record.metadata) ? record.metadata : {}),
+  }
+  const metadata = mergeExecutionTranscriptMetadata(record, metadataCandidate)
+  const deliveryStatus =
+    getNullableString(record.delivery_status) ??
+    getNullableString(record.deliveryStatus) ??
+    getNullableString(metadata.delivery_status) ??
+    deliveryStatusFromEventType(type)
+  if (deliveryStatus && !getNullableString(metadata.delivery_status)) {
+    metadata.delivery_status = deliveryStatus
+  }
+  const messageId =
+    getNullableString(record.message_id) ??
+    getNullableString(record.messageId) ??
+    getNullableString(metadata.message_id) ??
+    null
+  const deliveryMode =
+    getNullableString(record.delivery_mode) ??
+    getNullableString(record.deliveryMode) ??
+    getNullableString(metadata.delivery_mode) ??
+    null
+  const deliveryReason =
+    getNullableString(record.delivery_reason) ??
+    getNullableString(record.deliveryReason) ??
+    getNullableString(metadata.delivery_reason) ??
+    null
+  const eventId =
+    getNullableString(record.event_id) ??
+    getNullableString(record.eventId) ??
+    getNullableString(metadata.event_id) ??
+    getNullableString(metadata.eventId) ??
+    null
+  const dedupeKey =
+    getNullableString(record.dedupe_key) ??
+    getNullableString(record.dedupeKey) ??
+    getNullableString(metadata.dedupe_key) ??
+    getNullableString(metadata.dedupeKey) ??
+    null
+  const visibility =
+    getNullableString(record.visibility) ??
+    getNullableString(metadata.visibility) ??
+    null
+  const durability =
+    getNullableString(record.durability) ??
+    getNullableString(metadata.durability) ??
+    null
+  const projectionLane =
+    getNullableString(record.projection_lane) ??
+    getNullableString(record.projectionLane) ??
+    getNullableString(metadata.projection_lane) ??
+    getNullableString(metadata.projectionLane) ??
+    null
+  const seq =
+    getNumber(record.seq) ??
+    getNumber(record.sequence) ??
+    getNumber(record.event_seq) ??
+    undefined
+  const status = deriveSubagentEventStatus(
+    type,
+    getNullableString(record.status) ??
+      getNullableString(metadata.status) ??
+      deliveryStatus ??
+      (rawType === 'role_error' ? 'failed' : null)
+  )
+  if (status && !getNullableString(metadata.status)) {
+    metadata.status = status
+  }
+
+  return {
+    type,
+    seq,
+    parentType:
+      getNullableString(record.parent_type) ??
+      getNullableString(record.parentType) ??
+      getNullableString(record.scope) ??
+      null,
+    parentId:
+      getNullableString(record.parent_id) ??
+      getNullableString(record.parentId) ??
+      getNullableString(record.run_id) ??
+      getNullableString(record.goal_id) ??
+      null,
+    subagentId:
+      getNullableString(record.subagent_id) ??
+      getNullableString(record.subagentId) ??
+      getNullableString(record.role_id) ??
+      getNullableString(record.roleId) ??
+      null,
+    roleId:
+      getNullableString(record.role_id) ??
+      getNullableString(record.roleId) ??
+      getNullableString(record.subagent_role_id) ??
+      null,
+    title:
+      getNullableString(record.title) ??
+      getNullableString(record.name) ??
+      getNullableString(record.role_title) ??
+      null,
+    modelId:
+      getNullableString(record.model_id) ??
+      getNullableString(record.modelId) ??
+      null,
+    status,
+    content:
+      getNullableString(record.content) ??
+      getNullableString(record.message) ??
+      getNullableString(record.text) ??
+      getNullableString(record.current_action) ??
+      null,
+    summary:
+      getNullableString(record.summary) ??
+      getNullableString(record.output_preview) ??
+      getNullableString(record.outputPreview) ??
+      getNullableString(record.prompt_preview) ??
+      getNullableString(record.promptPreview) ??
+      null,
+    metadata,
+    createdAt:
+      getNullableString(record.created_at) ??
+      getNullableString(record.createdAt) ??
+      getNullableString(record.timestamp) ??
+      null,
+    eventId,
+    dedupeKey,
+    visibility,
+    durability,
+    projectionLane,
+    messageId,
+    deliveryMode,
+    deliveryStatus,
+    deliveryReason,
+  }
+}
+
+function normalizeSubagentTranscriptSummary(payload: unknown): SubagentTranscriptSummary | null {
+  const record = isRecord(payload) ? payload : {}
+  const subagentId =
+    getString(record.subagent_id) ??
+    getString(record.subagentId) ??
+    getString(record.role_id) ??
+    getString(record.roleId)
+  if (!subagentId) {
+    return null
+  }
+
+  const metadata = isRecord(record.metadata) ? record.metadata : {}
+
+  return {
+    subagentId,
+    parentType:
+      getString(record.parent_type) ??
+      getString(record.parentType) ??
+      getString(record.scope) ??
+      'agent_run',
+    parentId:
+      getString(record.parent_id) ??
+      getString(record.parentId) ??
+      getString(record.agent_run_id) ??
+      getString(record.agentRunId) ??
+      '',
+    sessionId:
+      getNullableString(record.session_id) ??
+      getNullableString(record.sessionId) ??
+      null,
+    agentRunId:
+      getNullableString(record.agent_run_id) ??
+      getNullableString(record.agentRunId) ??
+      null,
+    roleId:
+      getNullableString(record.role_id) ??
+      getNullableString(record.roleId) ??
+      null,
+    title:
+      getNullableString(record.title) ??
+      getNullableString(record.name) ??
+      getNullableString(record.role_title) ??
+      null,
+    modelId:
+      getNullableString(record.model_id) ??
+      getNullableString(record.modelId) ??
+      null,
+    status:
+      getString(record.status) ??
+      getString(metadata.status) ??
+      'running',
+    promptPreview:
+      getNullableString(record.prompt_preview) ??
+      getNullableString(record.promptPreview) ??
+      null,
+    summary:
+      getNullableString(record.summary) ??
+      getNullableString(record.last_action) ??
+      getNullableString(record.lastAction) ??
+      null,
+    outputPreview:
+      getNullableString(record.output_preview) ??
+      getNullableString(record.outputPreview) ??
+      null,
+    eventCount:
+      getNumber(record.event_count) ??
+      getNumber(record.eventCount) ??
+      0,
+    createdAt:
+      getNullableString(record.created_at) ??
+      getNullableString(record.createdAt) ??
+      null,
+    updatedAt:
+      getNullableString(record.updated_at) ??
+      getNullableString(record.updatedAt) ??
+      getNullableString(record.created_at) ??
+      getNullableString(record.createdAt) ??
+      null,
+  }
+}
+
+function normalizeSubagentTranscriptDetail(payload: unknown): SubagentTranscriptDetail | null {
+  const summary = normalizeSubagentTranscriptSummary(payload)
+  if (!summary) {
+    return null
+  }
+
+  const record = isRecord(payload) ? payload : {}
+  const eventsSource =
+    (Array.isArray(record.events) ? record.events : null) ??
+    (Array.isArray(record.items) ? record.items : null) ??
+    []
+
+  return {
+    ...summary,
+    systemPrompt:
+      getNullableString(record.system_prompt) ??
+      getNullableString(record.systemPrompt) ??
+      null,
+    userPrompt:
+      getNullableString(record.user_prompt) ??
+      getNullableString(record.userPrompt) ??
+      null,
+    events: eventsSource
+      .map((item) => normalizeExecutionTranscriptEvent(item))
+      .filter((item): item is ExecutionTranscriptEvent => item !== null),
+  }
 }
 
 function normalizeAgentRunArtifact(payload: unknown): AgentRunArtifact | null {
@@ -6286,6 +6737,212 @@ export async function fetchAgentRun(runId: string): Promise<AgentRunDetail> {
   return normalizeAgentRunDetail(payload)
 }
 
+export async function fetchAgentRunEvents(
+  runId: string,
+  options?: { afterSeq?: number | null; limit?: number | null }
+): Promise<ExecutionTranscriptEvent[]> {
+  const search = new URLSearchParams()
+  if (typeof options?.afterSeq === 'number' && Number.isFinite(options.afterSeq)) {
+    search.set('after_seq', String(options.afterSeq))
+  }
+  if (typeof options?.limit === 'number' && Number.isFinite(options.limit)) {
+    search.set('limit', String(options.limit))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/events${query}`
+  )
+  const items = Array.isArray(payload)
+    ? payload
+    : isRecord(payload) && Array.isArray(payload.events)
+      ? payload.events
+      : isRecord(payload) && Array.isArray(payload.items)
+        ? payload.items
+        : []
+  return items
+    .map((item) => normalizeExecutionTranscriptEvent(item))
+    .filter((item): item is ExecutionTranscriptEvent => item !== null)
+}
+
+export interface StreamAgentRunEventsOptions {
+  afterSeq?: number | null
+  limit?: number | null
+  signal?: AbortSignal
+}
+
+export async function* streamAgentRunEvents(
+  runId: string,
+  options: StreamAgentRunEventsOptions = {}
+): AsyncGenerator<ExecutionTranscriptEvent, void, unknown> {
+  let response: Response
+  const search = new URLSearchParams()
+  if (typeof options.afterSeq === 'number' && Number.isFinite(options.afterSeq)) {
+    search.set('after_seq', String(options.afterSeq))
+  }
+  if (typeof options.limit === 'number' && Number.isFinite(options.limit)) {
+    search.set('limit', String(options.limit))
+  }
+  const query = search.size > 0 ? `?${search.toString()}` : ''
+
+  try {
+    response = await fetch(resolveApiUrl(`/agent-runs/${encodeURIComponent(runId)}/events/stream${query}`, 'direct'), {
+      method: 'GET',
+      headers: {
+        Accept: 'text/event-stream, application/json',
+      },
+      signal: options.signal,
+      cache: 'no-store',
+    })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Network request failed'
+    throw new ApiError(0, message, error)
+  }
+
+  if (!response.ok) {
+    const payload = await parseResponseBody(response)
+    throw new ApiError(
+      response.status,
+      getApiMessage(payload, response.statusText || 'Request failed'),
+      payload
+    )
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('text/event-stream')) {
+    const payload = await parseResponseBody(response)
+    const items = Array.isArray(payload)
+      ? payload
+      : isRecord(payload) && Array.isArray(payload.events)
+        ? payload.events
+        : isRecord(payload) && Array.isArray(payload.items)
+          ? payload.items
+          : payload === null
+            ? []
+            : [payload]
+    for (const item of items) {
+      const normalized = normalizeExecutionTranscriptEvent(item)
+      if (normalized) {
+        yield normalized
+      }
+    }
+    return
+  }
+
+  const body = response.body
+  if (!body) {
+    throw new ApiError(0, 'Streaming response body is unavailable.')
+  }
+
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) {
+      break
+    }
+    buffer += decoder.decode(value, { stream: true })
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() ?? ''
+
+    for (const frame of frames) {
+      const data = frame
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trim())
+        .join('\n')
+        .trim()
+
+      if (!data || data === '[DONE]') {
+        continue
+      }
+
+      const normalized = normalizeExecutionTranscriptEvent(JSON.parse(data))
+      if (normalized) {
+        yield normalized
+      }
+    }
+  }
+
+  const finalFrame = buffer.trim()
+  if (!finalFrame) {
+    return
+  }
+
+  const data = finalFrame
+    .split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+    .join('\n')
+    .trim()
+
+  if (!data || data === '[DONE]') {
+    return
+  }
+
+  const normalized = normalizeExecutionTranscriptEvent(JSON.parse(data))
+  if (normalized) {
+    yield normalized
+  }
+}
+
+export async function fetchAgentRunSubagents(
+  runId: string
+): Promise<SubagentTranscriptSummary[]> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/subagents`
+  )
+  const items = Array.isArray(payload)
+    ? payload
+    : isRecord(payload) && Array.isArray(payload.subagents)
+      ? payload.subagents
+      : isRecord(payload) && Array.isArray(payload.items)
+        ? payload.items
+        : []
+  return items
+    .map((item) => normalizeSubagentTranscriptSummary(item))
+    .filter((item): item is SubagentTranscriptSummary => item !== null)
+}
+
+export async function fetchAgentRunSubagent(
+  runId: string,
+  subagentId: string
+): Promise<SubagentTranscriptDetail | null> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/subagents/${encodeURIComponent(subagentId)}`
+  )
+  return normalizeSubagentTranscriptDetail(payload)
+}
+
+export async function fetchSessionSubagents(
+  sessionId: string
+): Promise<SubagentTranscriptSummary[]> {
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/subagents`
+  )
+  const items = Array.isArray(payload)
+    ? payload
+    : isRecord(payload) && Array.isArray(payload.subagents)
+      ? payload.subagents
+      : isRecord(payload) && Array.isArray(payload.items)
+        ? payload.items
+        : []
+  return items
+    .map((item) => normalizeSubagentTranscriptSummary(item))
+    .filter((item): item is SubagentTranscriptSummary => item !== null)
+}
+
+export async function fetchSessionSubagent(
+  sessionId: string,
+  subagentId: string
+): Promise<SubagentTranscriptDetail | null> {
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagentId)}`
+  )
+  return normalizeSubagentTranscriptDetail(payload)
+}
+
 export async function fetchAgentRunHealth(
   runId: string
 ): Promise<AgentRunHealthSummary> {
@@ -6405,6 +7062,29 @@ export async function appendAgentRunMessage(
   return normalizeAgentRunDetail(payload)
 }
 
+function serializeSubagentMessageInput(input: AgentRunSubagentMessageInput): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    role: 'operator',
+    content: input.content,
+    project_id: input.projectId ?? null,
+    workspace_dir: input.workspaceDir ?? null,
+    attachments: serializeChatAttachments(input.attachments) ?? [],
+    metadata: input.metadata ?? {},
+  }
+  const deliveryMode = input.deliveryMode ?? input.delivery_mode
+  const cancelCurrentTool = input.cancelCurrentTool ?? input.cancel_current_tool
+  if (deliveryMode) {
+    body.delivery_mode = deliveryMode
+  }
+  if (typeof input.interrupt === 'boolean') {
+    body.interrupt = input.interrupt
+  }
+  if (typeof cancelCurrentTool === 'boolean') {
+    body.cancel_current_tool = cancelCurrentTool
+  }
+  return body
+}
+
 export async function appendAgentRunSubagentMessage(
   runId: string,
   roleId: string,
@@ -6414,17 +7094,82 @@ export async function appendAgentRunSubagentMessage(
     `/agent-runs/${encodeURIComponent(runId)}/subagents/${encodeURIComponent(roleId)}/messages`,
     {
       method: 'POST',
-      body: JSON.stringify({
-        role: 'operator',
-        content: input.content,
-        project_id: input.projectId ?? null,
-        workspace_dir: input.workspaceDir ?? null,
-        attachments: serializeChatAttachments(input.attachments) ?? [],
-        metadata: input.metadata ?? {},
-      }),
+      body: JSON.stringify(serializeSubagentMessageInput(input)),
     }
   )
   return normalizeAgentRunDetail(payload)
+}
+
+export async function sendAgentRunSubagentMessage(
+  runId: string,
+  subagentId: string,
+  input: AgentRunSubagentMessageInput
+): Promise<AgentRunDetail> {
+  const payload = await requestJson<unknown>(
+    `/agent-runs/${encodeURIComponent(runId)}/subagents/${encodeURIComponent(subagentId)}/messages`,
+    {
+      method: 'POST',
+      body: JSON.stringify(serializeSubagentMessageInput(input)),
+    }
+  )
+  return normalizeAgentRunDetail(payload)
+}
+
+export async function sendSessionSubagentMessage(
+  sessionId: string,
+  subagentId: string,
+  input: AgentRunSubagentMessageInput
+): Promise<SubagentTranscriptDetail | null> {
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagentId)}/messages`,
+    {
+      method: 'POST',
+      body: JSON.stringify(serializeSubagentMessageInput(input)),
+    }
+  )
+  return normalizeSessionSubagentActionTranscript(payload)
+}
+
+function normalizeSessionSubagentActionTranscript(payload: unknown): SubagentTranscriptDetail | null {
+  if (isRecord(payload) && isRecord(payload.transcript)) {
+    return normalizeSubagentTranscriptDetail(payload.transcript)
+  }
+  return normalizeSubagentTranscriptDetail(payload)
+}
+
+export async function cancelSessionSubagent(
+  sessionId: string,
+  subagentId: string
+): Promise<SubagentTranscriptDetail | null> {
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagentId)}/cancel`,
+    {
+      method: 'POST',
+    }
+  )
+  return normalizeSessionSubagentActionTranscript(payload)
+}
+
+export async function resumeSessionSubagent(
+  sessionId: string,
+  subagentId: string,
+  input: SessionSubagentResumeInput = {}
+): Promise<SubagentTranscriptDetail | null> {
+  const guidance = input.guidance?.trim() ?? ''
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagentId)}/resume`,
+    {
+      method: 'POST',
+      ...(guidance.length > 0
+        ? {
+            body: JSON.stringify({
+              guidance,
+            }),
+          }
+        : {}),
+    }
+  )
+  return normalizeSessionSubagentActionTranscript(payload)
 }
 
 export async function startAgentRun(runId: string): Promise<AgentRunSummary> {
@@ -6539,6 +7284,9 @@ export interface GoalSummary {
   execution_mode: GoalExecutionMode
   interaction_mode: GoalInteractionMode
   execution_topology: GoalExecutionTopology
+  strategy_id: string | null
+  selection_source: string | null
+  selection_reason: string | null
   protocol_id: string | null
   bound_run_id: string | null
   protocol_selection: string | null
@@ -6675,11 +7423,52 @@ export interface GoalOperatorAuditEntry {
   created_at: string | null
 }
 
+export type GoalStrategyExecutionTopology = 'single_agent' | 'multi_agent'
+export type GoalStrategyRegistryPolicy = string | Record<string, unknown> | null
+
+export interface GoalStrategyRegistryEntry {
+  id: string
+  name: string | null
+  display_name: string
+  description: string | null
+  when_to_use: string | null
+  when_not_to_use: string | null
+  execution_topology: GoalStrategyExecutionTopology
+  kind: string | null
+  protocol_id: string | null
+  required_capabilities: string[]
+  approval_profile: GoalStrategyRegistryPolicy
+  control_scope: GoalStrategyRegistryPolicy
+  interrupt_policy: GoalStrategyRegistryPolicy
+  resume_policy: GoalStrategyRegistryPolicy
+  event_contract: GoalStrategyRegistryPolicy
+  success_signals: string[]
+  failure_modes: string[]
+  fallback_strategy_ids: string[]
+  requires_confirmation: boolean
+  is_default: boolean
+  available: boolean
+  availability_reason: string | null
+  deprecated: boolean
+  override_label: string | null
+  selection_guidance: string | null
+  raw: Record<string, unknown>
+}
+
+export interface GoalStrategyRegistryResponse {
+  type: 'goal_strategy_registry'
+  default_strategy_id: string | null
+  entries: GoalStrategyRegistryEntry[]
+}
+
 export interface GoalHealthSummary {
   goal_id: string
   execution_mode: GoalExecutionMode
   interaction_mode: GoalInteractionMode
   execution_topology: GoalExecutionTopology
+  strategy_id: string | null
+  selection_source: string | null
+  selection_reason: string | null
   protocol_id: string | null
   bound_run_id: string | null
   protocol_selection: string | null
@@ -6715,6 +7504,9 @@ export interface CreateGoalInput {
   execution_mode?: GoalExecutionMode
   interaction_mode?: GoalInteractionMode | null
   execution_topology?: GoalExecutionTopology | null
+  strategy_id?: string | null
+  selection_source?: string | null
+  selection_reason?: string | null
   protocol_id?: string | null
   bound_run_id?: string | null
   protocol_selection?: string | null
@@ -6724,6 +7516,7 @@ export interface CreateGoalInput {
   workspaceDir?: string | null
   run_policy?: Record<string, unknown>
   capability_policy?: Record<string, unknown>
+  selected_models_roles?: Record<string, unknown>
   source_manifest?: Record<string, unknown>
   summary?: Record<string, unknown>
   metadata?: Record<string, unknown>
@@ -6762,8 +7555,99 @@ export interface GoalProposalAssistantCopyResult {
   source: 'model' | 'fallback'
 }
 
+export type ActiveGoalTurnLane = 'active_goal_turn'
+
+export type ActiveGoalTurnDecisionKind =
+  | 'answer_question'
+  | 'explain_goal_state'
+  | 'steer'
+  | 'replan'
+  | 'lifecycle'
+  | 'exit_to_chat'
+  | 'clarify'
+
+export type ActiveGoalTurnSelectionSource = 'bounded_fallback'
+
+export interface DecideActiveGoalTurnInput {
+  message: string
+}
+
+export interface ActiveGoalTurnDecision {
+  lane: ActiveGoalTurnLane
+  kind: ActiveGoalTurnDecisionKind
+  confidence: number
+  selection_source: ActiveGoalTurnSelectionSource
+  selection_reason: string
+  requires_confirmation: boolean
+  goal_status?: string | null
+  linked_run_status?: string | null
+  recommended_action?: string | null
+}
+
+export type GoalFollowUpAssistantCopyKind =
+  | 'queued_after_resolution'
+  | 'manual_resolution_required'
+  | 'blocked'
+  | 'no_live_attempt'
+  | 'restarted_forwarded'
+  | 'refreshed_forwarded'
+  | 'resumed_forwarded'
+  | 'forwarded'
+
+export interface GenerateGoalFollowUpAssistantCopyInput {
+  message: string
+  kind: GoalFollowUpAssistantCopyKind
+  goalObjective: string
+  goalStatus: string
+  linkedRunStatus?: string | null
+  continuationAction?: string | null
+  continuationSummary?: string | null
+  approvalCount?: number
+  toolNames?: string[]
+  operatorControlHint?: string | null
+  recommendedAction?: string | null
+  latestError?: string | null
+}
+
+export interface GoalFollowUpAssistantCopyResult {
+  explanation: string
+  source: 'model' | 'fallback'
+}
+
+function normalizeActiveGoalTurnDecision(payload: unknown): ActiveGoalTurnDecision {
+  const record = isRecord(payload) ? payload : {}
+  const rawKind = getString(record.kind)
+  const kind: ActiveGoalTurnDecisionKind =
+    rawKind === 'answer_question' ||
+    rawKind === 'explain_goal_state' ||
+    rawKind === 'steer' ||
+    rawKind === 'replan' ||
+    rawKind === 'lifecycle' ||
+    rawKind === 'exit_to_chat' ||
+    rawKind === 'clarify'
+      ? rawKind
+      : 'clarify'
+
+  return {
+    lane: record.lane === 'active_goal_turn' ? 'active_goal_turn' : 'active_goal_turn',
+    kind,
+    confidence: getNumber(record.confidence) ?? 0,
+    selection_source:
+      record.selection_source === 'bounded_fallback'
+        ? 'bounded_fallback'
+        : 'bounded_fallback',
+    selection_reason:
+      getNonEmptyString(record.selection_reason) ?? 'No active-goal turn selection reason provided.',
+    requires_confirmation: getBoolean(record.requires_confirmation) ?? false,
+    goal_status: getString(record.goal_status) ?? null,
+    linked_run_status: getString(record.linked_run_status) ?? null,
+    recommended_action: getString(record.recommended_action) ?? null,
+  }
+}
+
 export interface ResumeGoalInput {
   strategy?: 'continue_from_checkpoint' | 'restart_attempt'
+  guidanceMessage?: string | null
   approval_id?: string | null
   decision?: 'approve_once' | 'approve_and_save_rule' | 'reject'
   reason?: string | null
@@ -6790,6 +7674,73 @@ export interface GoalEstopUpdateInput {
 function normalizeGoalExecutionMode(value: unknown): GoalExecutionMode {
   return value === 'single_agent' ? 'single_agent' : 'workflow'
 }
+
+function normalizeGoalStrategyExecutionTopology(value: unknown): GoalStrategyExecutionTopology {
+  return value === 'multi_agent' ? 'multi_agent' : 'single_agent'
+}
+
+function normalizeGoalStrategyRegistryPolicy(value: unknown): GoalStrategyRegistryPolicy {
+  if (typeof value === 'string') {
+    return value
+  }
+  return isRecord(value) ? value : null
+}
+
+function normalizeGoalStrategyRegistryEntry(payload: unknown): GoalStrategyRegistryEntry | null {
+  const record = isRecord(payload) ? payload : null
+  if (!record) {
+    return null
+  }
+  const id = getNonEmptyString(record.id)
+  if (!id) {
+    return null
+  }
+  return {
+    id,
+    name: getNullableString(record.name),
+    display_name:
+      getNonEmptyString(record.display_name) ??
+      getNonEmptyString(record.name) ??
+      id,
+    description: getNullableString(record.description),
+    when_to_use: getNullableString(record.when_to_use),
+    when_not_to_use: getNullableString(record.when_not_to_use),
+    execution_topology: normalizeGoalStrategyExecutionTopology(record.execution_topology),
+    kind: getNullableString(record.kind),
+    protocol_id: getNullableString(record.protocol_id),
+    required_capabilities: getStringArray(record.required_capabilities),
+    approval_profile: normalizeGoalStrategyRegistryPolicy(record.approval_profile),
+    control_scope: normalizeGoalStrategyRegistryPolicy(record.control_scope),
+    interrupt_policy: normalizeGoalStrategyRegistryPolicy(record.interrupt_policy),
+    resume_policy: normalizeGoalStrategyRegistryPolicy(record.resume_policy),
+    event_contract: normalizeGoalStrategyRegistryPolicy(record.event_contract),
+    success_signals: getStringArray(record.success_signals),
+    failure_modes: getStringArray(record.failure_modes),
+    fallback_strategy_ids: getStringArray(record.fallback_strategy_ids),
+    requires_confirmation: getBoolean(record.requires_confirmation) ?? false,
+    is_default: getBoolean(record.is_default) ?? false,
+    available: getBoolean(record.available) ?? true,
+    availability_reason: getNullableString(record.availability_reason),
+    deprecated: getBoolean(record.deprecated) ?? false,
+    override_label: getNullableString(record.override_label),
+    selection_guidance: getNullableString(record.selection_guidance),
+    raw: record,
+  }
+}
+
+function normalizeGoalStrategyRegistryResponse(payload: unknown): GoalStrategyRegistryResponse {
+  const record = isRecord(payload) ? payload : {}
+  return {
+    type: 'goal_strategy_registry',
+    default_strategy_id: getNullableString(record.default_strategy_id),
+    entries: getRecordArray(record.entries)
+      .map((item) => normalizeGoalStrategyRegistryEntry(item))
+      .filter((item): item is GoalStrategyRegistryEntry => item !== null),
+  }
+}
+
+let goalStrategiesCache: GoalStrategyRegistryResponse | null = null
+let goalStrategiesInFlight: Promise<GoalStrategyRegistryResponse> | null = null
 
 function normalizeGoalAttemptSummary(payload: unknown): GoalAttemptSummary | null {
   const record = isRecord(payload) ? payload : {}
@@ -6824,12 +7775,18 @@ function normalizeGoalSummary(payload: unknown): GoalSummary {
     title: getNullableString(record.title),
     goal_type: getNullableString(record.goal_type),
     execution_mode: normalizeGoalExecutionMode(record.execution_mode),
-    interaction_mode: normalizeGoalInteractionModeValue(record.interaction_mode) ?? 'workflow',
-    execution_topology: normalizeGoalExecutionTopologyValue(record.execution_topology) ?? 'multi_agent',
+    interaction_mode: normalizeGoalInteractionModeValue(record.interaction_mode) ?? 'goal',
+    execution_topology: normalizeGoalExecutionTopologyValue(record.execution_topology) ?? 'single_agent',
+    strategy_id: getNullableString(record.strategy_id) ?? getNullableString(record.protocol_selection),
+    selection_source: getNullableString(record.selection_source),
+    selection_reason: getNullableString(record.selection_reason) ?? getNullableString(record.selection_rationale),
     protocol_id: getNullableString(record.protocol_id),
     bound_run_id: getNullableString(record.bound_run_id),
-    protocol_selection: getNullableString(record.protocol_selection) ?? getNullableString(record.protocol_id),
-    selection_rationale: getNullableString(record.selection_rationale),
+    protocol_selection:
+      getNullableString(record.protocol_selection) ??
+      getNullableString(record.strategy_id) ??
+      getNullableString(record.protocol_id),
+    selection_rationale: getNullableString(record.selection_rationale) ?? getNullableString(record.selection_reason),
     topic: getNullableString(record.topic),
     project_id: getNullableString(record.project_id),
     workspace_dir: getNullableString(record.workspace_dir),
@@ -7024,12 +7981,18 @@ function normalizeGoalHealthSummary(payload: unknown): GoalHealthSummary {
   return {
     goal_id: getString(record.goal_id) ?? '',
     execution_mode: normalizeGoalExecutionMode(record.execution_mode),
-    interaction_mode: normalizeGoalInteractionModeValue(record.interaction_mode) ?? 'workflow',
-    execution_topology: normalizeGoalExecutionTopologyValue(record.execution_topology) ?? 'multi_agent',
+    interaction_mode: normalizeGoalInteractionModeValue(record.interaction_mode) ?? 'goal',
+    execution_topology: normalizeGoalExecutionTopologyValue(record.execution_topology) ?? 'single_agent',
+    strategy_id: getNullableString(record.strategy_id) ?? getNullableString(record.protocol_selection),
+    selection_source: getNullableString(record.selection_source),
+    selection_reason: getNullableString(record.selection_reason) ?? getNullableString(record.selection_rationale),
     protocol_id: getNullableString(record.protocol_id),
     bound_run_id: getNullableString(record.bound_run_id),
-    protocol_selection: getNullableString(record.protocol_selection) ?? getNullableString(record.protocol_id),
-    selection_rationale: getNullableString(record.selection_rationale),
+    protocol_selection:
+      getNullableString(record.protocol_selection) ??
+      getNullableString(record.strategy_id) ??
+      getNullableString(record.protocol_id),
+    selection_rationale: getNullableString(record.selection_rationale) ?? getNullableString(record.selection_reason),
     status: getString(record.status) ?? 'unknown',
     current_attempt_id: getNullableString(record.current_attempt_id),
     attempt_count: getNumber(record.attempt_count) ?? 0,
@@ -7075,6 +8038,26 @@ export async function fetchGoal(goalId: string): Promise<GoalSummary> {
 export async function fetchGoalHealth(goalId: string): Promise<GoalHealthSummary> {
   const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/health`)
   return normalizeGoalHealthSummary(payload)
+}
+
+export async function fetchGoalStrategies(): Promise<GoalStrategyRegistryResponse> {
+  if (goalStrategiesCache) {
+    return goalStrategiesCache
+  }
+  if (goalStrategiesInFlight) {
+    return goalStrategiesInFlight
+  }
+
+  goalStrategiesInFlight = requestJson<unknown>('/goals/strategies')
+    .then((payload) => {
+      const registry = normalizeGoalStrategyRegistryResponse(payload)
+      goalStrategiesCache = registry
+      return registry
+    })
+    .finally(() => {
+      goalStrategiesInFlight = null
+    })
+  return goalStrategiesInFlight
 }
 
 export async function fetchGoalCheckpoints(
@@ -7196,18 +8179,22 @@ export async function createGoal(input: CreateGoalInput): Promise<GoalSummary> {
       objective: input.objective,
       title: input.title ?? null,
       goal_type: input.goal_type ?? null,
-      execution_mode: input.execution_mode ?? 'workflow',
+      execution_mode: input.execution_mode ?? 'single_agent',
       interaction_mode: input.interaction_mode ?? null,
       execution_topology: input.execution_topology ?? null,
+      strategy_id: input.strategy_id ?? input.protocol_selection ?? null,
+      selection_source: input.selection_source ?? null,
+      selection_reason: input.selection_reason ?? input.selection_rationale ?? null,
       protocol_id: input.protocol_id ?? null,
       bound_run_id: input.bound_run_id ?? null,
-      protocol_selection: input.protocol_selection ?? null,
-      selection_rationale: input.selection_rationale ?? null,
+      protocol_selection: input.protocol_selection ?? input.strategy_id ?? null,
+      selection_rationale: input.selection_rationale ?? input.selection_reason ?? null,
       topic: input.topic ?? null,
       project_id: input.projectId ?? null,
       workspace_dir: input.workspaceDir ?? null,
       run_policy: input.run_policy ?? {},
       capability_policy: input.capability_policy ?? {},
+      selected_models_roles: input.selected_models_roles ?? {},
       source_manifest: input.source_manifest ?? {},
       summary: input.summary ?? {},
       metadata: input.metadata ?? {},
@@ -7266,6 +8253,50 @@ export async function generateGoalProposalAssistantCopy(
   }
 }
 
+export async function generateGoalFollowUpAssistantCopy(
+  input: GenerateGoalFollowUpAssistantCopyInput
+): Promise<GoalFollowUpAssistantCopyResult> {
+  const payload = await requestJson<Record<string, ApiValue>>('/goals/follow-up-assistant-copy', {
+    method: 'POST',
+    body: JSON.stringify({
+      message: input.message,
+      kind: input.kind,
+      goal_objective: input.goalObjective,
+      goal_status: input.goalStatus,
+      linked_run_status: input.linkedRunStatus ?? null,
+      continuation_action: input.continuationAction ?? null,
+      continuation_summary: input.continuationSummary ?? null,
+      approval_count: input.approvalCount ?? 0,
+      tool_names: input.toolNames ?? [],
+      operator_control_hint: input.operatorControlHint ?? null,
+      recommended_action: input.recommendedAction ?? null,
+      latest_error: input.latestError ?? null,
+    }),
+  })
+
+  return {
+    explanation: getNonEmptyString(payload.explanation) ?? '',
+    source: payload.source === 'fallback' ? 'fallback' : 'model',
+  }
+}
+
+export async function fetchGoalTurnDecision(
+  goalId: string,
+  input: DecideActiveGoalTurnInput
+): Promise<ActiveGoalTurnDecision> {
+  const payload = await requestJson<unknown>(
+    `/goals/${encodeURIComponent(goalId)}/turn-decision`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        message: input.message,
+      }),
+    }
+  )
+
+  return normalizeActiveGoalTurnDecision(payload)
+}
+
 export async function startGoal(goalId: string): Promise<GoalSummary> {
   const payload = await requestJson<unknown>(`/goals/${encodeURIComponent(goalId)}/start`, {
     method: 'POST',
@@ -7288,6 +8319,7 @@ export async function resumeGoal(
     method: 'POST',
     body: JSON.stringify({
       strategy: input?.strategy ?? 'continue_from_checkpoint',
+      guidance_message: input?.guidanceMessage ?? null,
       approval_id: input?.approval_id ?? null,
       decision: input?.decision ?? 'approve_once',
       reason: input?.reason ?? null,

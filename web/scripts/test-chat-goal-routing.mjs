@@ -119,18 +119,40 @@ assert.deepEqual(
   }
 )
 
-assert.deepEqual(
-  resolveChatGoalWorkflowRouting({
-    text: 'Keep working on this in the background for the next 30 minutes.',
-    attachmentCount: 0,
-    hasPendingProposal: false,
-    hasActiveGoal: false,
-  }).route,
-  {
-    kind: 'natural_language_goal_proposal',
-    requestText: 'Keep working on this in the background for the next 30 minutes.',
-  }
-)
+for (const text of [
+  'research this for 20 minutes',
+  'Keep working on this in the background for the next 30 minutes.',
+  'Resume the migration and come back with progress.',
+  'Investiga este tema durante 20 minutos y resume los hallazgos.',
+  'Is vishay par 20 minute research karke summary do.',
+  'what is the goal doing right now?',
+  'Prioritize the failing login test first and keep the patch minimal',
+  '\u8acb\u7814\u7a76\u9019\u500b\u4e3b\u984c 20\u5206\u9418\uff0c\u6574\u7406\u91cd\u9ede\u7d66\u6211\u3002',
+  '\u76ee\u524d\u9032\u5ea6\u5982\u4f55',
+  '\u5148\u67e5\u6587\u737b\u518d\u5be6\u4f5c',
+]) {
+  assert.deepEqual(
+    resolveChatGoalWorkflowRouting({
+      text,
+      attachmentCount: 0,
+      hasPendingProposal: false,
+      hasActiveGoal: false,
+    }).route,
+    { kind: 'direct_chat' },
+    `expected ordinary natural language without an active goal to stay direct_chat: ${text}`
+  )
+
+  assert.deepEqual(
+    resolveChatGoalWorkflowRouting({
+      text,
+      attachmentCount: 0,
+      hasPendingProposal: false,
+      hasActiveGoal: true,
+    }).route,
+    { kind: 'direct_chat' },
+    `expected ordinary natural language with an active goal to stay direct_chat: ${text}`
+  )
+}
 
 assert.deepEqual(
   resolveChatGoalWorkflowRouting({
@@ -148,29 +170,29 @@ assert.deepEqual(
 
 assert.deepEqual(
   resolveChatGoalWorkflowRouting({
-    text: '開始',
+    text: '\u540c\u610f',
     attachmentCount: 0,
     hasPendingProposal: true,
     hasActiveGoal: false,
   }).route,
   {
     kind: 'goal_pending_follow_up',
-    requestText: '開始',
-    raw: '開始',
+    requestText: '\u540c\u610f',
+    raw: '\u540c\u610f',
   }
 )
 
 assert.deepEqual(
   resolveChatGoalWorkflowRouting({
-    text: '시작해줘',
+    text: '\u8abf\u6574\u7bc4\u570d',
     attachmentCount: 0,
     hasPendingProposal: true,
     hasActiveGoal: false,
   }).route,
   {
     kind: 'goal_pending_follow_up',
-    requestText: '시작해줘',
-    raw: '시작해줘',
+    requestText: '\u8abf\u6574\u7bc4\u570d',
+    raw: '\u8abf\u6574\u7bc4\u570d',
   }
 )
 
@@ -190,14 +212,14 @@ assert.deepEqual(
 
 assert.deepEqual(
   resolveChatGoalWorkflowRouting({
-    text: 'Please also capture a checkpoint after the first pass.',
-    attachmentCount: 0,
-    hasPendingProposal: false,
-    hasActiveGoal: true,
+    text: 'yes',
+    attachmentCount: 1,
+    hasPendingProposal: true,
+    hasActiveGoal: false,
   }).route,
   {
-    kind: 'goal_follow_up',
-    requestText: 'Please also capture a checkpoint after the first pass.',
+    kind: 'goal_revision',
+    requestText: 'yes',
   }
 )
 

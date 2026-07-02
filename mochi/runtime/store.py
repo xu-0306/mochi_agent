@@ -7,12 +7,14 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from mochi.runtime.goal_strategy_registry import DEFAULT_GOAL_STRATEGY_ID, get_goal_strategy_entry
 
 _UNSET = object()
-_DEFAULT_GOAL_EXECUTION_MODE = "workflow"
+_DEFAULT_GOAL_EXECUTION_MODE = "single_agent"
 _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL = "autonomous_single_agent"
-_GOAL_EXECUTION_MODES = {"single_agent", _DEFAULT_GOAL_EXECUTION_MODE}
+_GOAL_EXECUTION_MODES = {"single_agent", "workflow"}
 _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
     "cancelled",
     "completed",
@@ -152,12 +154,51 @@ class RuntimeStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS subagent_transcripts (
+                    id TEXT PRIMARY KEY,
+                    parent_type TEXT NOT NULL,
+                    parent_id TEXT NOT NULL,
+                    session_id TEXT,
+                    goal_id TEXT,
+                    agent_run_id TEXT,
+                    parent_turn_id TEXT,
+                    role_id TEXT,
+                    title TEXT,
+                    model_id TEXT,
+                    status TEXT NOT NULL,
+                    system_prompt TEXT,
+                    user_prompt TEXT,
+                    prompt_preview TEXT,
+                    summary TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subagent_transcript_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subagent_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(subagent_id) REFERENCES subagent_transcripts(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS goals (
                     id TEXT PRIMARY KEY,
                     objective TEXT NOT NULL,
                     title TEXT,
                     goal_type TEXT,
-                    execution_mode TEXT NOT NULL DEFAULT 'workflow',
+                    execution_mode TEXT NOT NULL DEFAULT 'single_agent',
+                    strategy_id TEXT,
+                    selection_source TEXT,
+                    selection_reason TEXT,
                     protocol_id TEXT,
                     topic TEXT,
                     project_id TEXT,
@@ -343,6 +384,36 @@ class RuntimeStore:
                 """
             )
             conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subagent_transcripts_parent
+                ON subagent_transcripts(parent_type, parent_id, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subagent_transcripts_session_id
+                ON subagent_transcripts(session_id, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subagent_transcripts_goal_id
+                ON subagent_transcripts(goal_id, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subagent_transcripts_agent_run_id
+                ON subagent_transcripts(agent_run_id, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subagent_transcript_events_subagent_id_seq
+                ON subagent_transcript_events(subagent_id, seq)
+                """
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_goals_created_at ON goals(created_at)"
             )
             conn.execute(
@@ -409,14 +480,34 @@ class RuntimeStore:
             _ensure_column(conn, "agent_runs", "evidence_status_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "agent_runs", "run_policy_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "agent_run_artifacts", "artifact_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "session_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "goal_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "agent_run_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "parent_turn_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "role_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "title", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "model_id", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "system_prompt", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "user_prompt", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "prompt_preview", "TEXT")
+            _ensure_column(conn, "subagent_transcripts", "summary", "TEXT")
+            _ensure_column(
+                conn,
+                "subagent_transcripts",
+                "metadata_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
             _ensure_column(conn, "goals", "title", "TEXT")
             _ensure_column(conn, "goals", "goal_type", "TEXT")
             _ensure_column(
                 conn,
                 "goals",
                 "execution_mode",
-                "TEXT NOT NULL DEFAULT 'workflow'",
+                "TEXT NOT NULL DEFAULT 'single_agent'",
             )
+            _ensure_column(conn, "goals", "strategy_id", "TEXT")
+            _ensure_column(conn, "goals", "selection_source", "TEXT")
+            _ensure_column(conn, "goals", "selection_reason", "TEXT")
             _ensure_column(conn, "goals", "protocol_id", "TEXT")
             _ensure_column(conn, "goals", "topic", "TEXT")
             _ensure_column(conn, "goals", "project_id", "TEXT")
@@ -837,6 +928,9 @@ class RuntimeStore:
         title: str | None = None,
         goal_type: str | None = None,
         execution_mode: str = _DEFAULT_GOAL_EXECUTION_MODE,
+        strategy_id: str | None = None,
+        selection_source: str | None = None,
+        selection_reason: str | None = None,
         protocol_id: str | None = None,
         topic: str | None = None,
         project_id: str | None = None,
@@ -851,9 +945,32 @@ class RuntimeStore:
         await self.initialize()
         now = _now_iso()
         normalized_execution_mode = _normalize_goal_execution_mode(execution_mode)
+        explicit_strategy_hint = str(strategy_id or "").strip()
+        explicit_protocol_hint = str(protocol_id or "").strip()
+        _validate_goal_strategy_protocol_inputs(
+            strategy_id=explicit_strategy_hint or None,
+            protocol_id=explicit_protocol_hint or None,
+        )
+        _validate_goal_selection_source_input(selection_source)
+        normalized_strategy_id = _normalize_goal_strategy_id(
+            strategy_id=strategy_id,
+            protocol_id=protocol_id,
+            selection_source="explicit_override" if explicit_protocol_hint else None,
+        )
         normalized_protocol_id = _normalize_goal_protocol_id(
-            normalized_execution_mode,
+            normalized_strategy_id,
             protocol_id,
+        )
+        normalized_selection_source = _normalize_goal_selection_source(
+            selection_source=selection_source,
+            strategy_id=explicit_strategy_hint,
+            protocol_id=explicit_protocol_hint,
+            treat_protocol_as_explicit=bool(explicit_protocol_hint),
+        )
+        normalized_selection_reason = _normalize_goal_selection_reason(
+            selection_reason=selection_reason,
+            selection_source=normalized_selection_source,
+            strategy_id=normalized_strategy_id,
         )
 
         def _op() -> None:
@@ -861,11 +978,12 @@ class RuntimeStore:
                 conn.execute(
                     """
                     INSERT INTO goals (
-                        id, objective, title, goal_type, execution_mode, protocol_id, topic, project_id,
+                        id, objective, title, goal_type, execution_mode, strategy_id, selection_source,
+                        selection_reason, protocol_id, topic, project_id,
                         workspace_dir, status, current_attempt_id, run_policy_json,
                         capability_policy_json, source_manifest_json, summary_json,
                         metadata_json, latest_error, started_at, finished_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         goal_id,
@@ -873,6 +991,9 @@ class RuntimeStore:
                         title,
                         goal_type,
                         normalized_execution_mode,
+                        normalized_strategy_id,
+                        normalized_selection_source,
+                        normalized_selection_reason,
                         normalized_protocol_id,
                         topic,
                         project_id,
@@ -1270,6 +1391,9 @@ class RuntimeStore:
         *,
         summary: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        strategy_id: str | None | object = _UNSET,
+        selection_source: str | None | object = _UNSET,
+        selection_reason: str | None | object = _UNSET,
         project_id: str | None | object = _UNSET,
         workspace_dir: str | None | object = _UNSET,
         latest_error: str | None | object = _UNSET,
@@ -1282,7 +1406,8 @@ class RuntimeStore:
             with sqlite3.connect(self._db_path) as conn:
                 existing = conn.execute(
                     """
-                    SELECT summary_json, metadata_json, latest_error, project_id, workspace_dir, current_attempt_id
+                    SELECT summary_json, metadata_json, strategy_id, selection_source, selection_reason,
+                           latest_error, project_id, workspace_dir, current_attempt_id
                     FROM goals
                     WHERE id=?
                     """,
@@ -1292,15 +1417,21 @@ class RuntimeStore:
                     return
                 current_summary = json.loads(str(existing[0] or "{}"))
                 current_metadata = json.loads(str(existing[1] or "{}"))
-                current_latest_error = existing[2]
-                current_project_id = existing[3]
-                current_workspace_dir = existing[4]
-                current_current_attempt_id = existing[5]
+                current_strategy_id = existing[2]
+                current_selection_source = existing[3]
+                current_selection_reason = existing[4]
+                current_latest_error = existing[5]
+                current_project_id = existing[6]
+                current_workspace_dir = existing[7]
+                current_current_attempt_id = existing[8]
                 conn.execute(
                     """
                     UPDATE goals
                     SET summary_json=?,
                         metadata_json=?,
+                        strategy_id=?,
+                        selection_source=?,
+                        selection_reason=?,
                         project_id=?,
                         workspace_dir=?,
                         latest_error=?,
@@ -1311,6 +1442,9 @@ class RuntimeStore:
                     (
                         json.dumps(current_summary if summary is None else summary, ensure_ascii=False),
                         json.dumps(current_metadata if metadata is None else metadata, ensure_ascii=False),
+                        current_strategy_id if strategy_id is _UNSET else strategy_id,
+                        current_selection_source if selection_source is _UNSET else selection_source,
+                        current_selection_reason if selection_reason is _UNSET else selection_reason,
                         current_project_id if project_id is _UNSET else project_id,
                         current_workspace_dir if workspace_dir is _UNSET else workspace_dir,
                         current_latest_error if latest_error is _UNSET else latest_error,
@@ -2722,6 +2856,230 @@ class RuntimeStore:
 
         return await asyncio.to_thread(_op)
 
+    async def upsert_subagent_transcript(
+        self,
+        *,
+        subagent_id: str,
+        parent_type: str,
+        parent_id: str,
+        session_id: str | None = None,
+        goal_id: str | None = None,
+        agent_run_id: str | None = None,
+        parent_turn_id: str | None = None,
+        role_id: str | None = None,
+        title: str | None = None,
+        model_id: str | None = None,
+        status: str = "running",
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        prompt_preview: str | None = None,
+        summary: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.initialize()
+        now = _now_iso()
+
+        def _op() -> dict[str, Any] | None:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO subagent_transcripts(
+                        id, parent_type, parent_id, session_id, goal_id, agent_run_id,
+                        parent_turn_id, role_id, title, model_id, status, system_prompt,
+                        user_prompt, prompt_preview, summary, metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        subagent_id,
+                        parent_type,
+                        parent_id,
+                        session_id,
+                        goal_id,
+                        agent_run_id,
+                        parent_turn_id,
+                        role_id,
+                        title,
+                        model_id,
+                        status,
+                        system_prompt,
+                        user_prompt,
+                        prompt_preview,
+                        summary,
+                        json.dumps(metadata or {}, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                existing = conn.execute(
+                    "SELECT * FROM subagent_transcripts WHERE id=?",
+                    (subagent_id,),
+                ).fetchone()
+                payload = _row_to_subagent_transcript_payload(existing, conn=conn)
+                if payload is not None:
+                    next_metadata = payload["metadata"] if metadata is None else metadata
+                    conn.execute(
+                        """
+                        UPDATE subagent_transcripts
+                        SET parent_type=?,
+                            parent_id=?,
+                            session_id=?,
+                            goal_id=?,
+                            agent_run_id=?,
+                            parent_turn_id=?,
+                            role_id=?,
+                            title=?,
+                            model_id=?,
+                            status=?,
+                            system_prompt=?,
+                            user_prompt=?,
+                            prompt_preview=?,
+                            summary=?,
+                            metadata_json=?,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            parent_type or payload["parent_type"],
+                            parent_id or payload["parent_id"],
+                            payload["session_id"] if session_id is None else session_id,
+                            payload["goal_id"] if goal_id is None else goal_id,
+                            payload["agent_run_id"] if agent_run_id is None else agent_run_id,
+                            payload["parent_turn_id"]
+                            if parent_turn_id is None
+                            else parent_turn_id,
+                            payload["role_id"] if role_id is None else role_id,
+                            payload["title"] if title is None else title,
+                            payload["model_id"] if model_id is None else model_id,
+                            status or payload["status"],
+                            payload["system_prompt"]
+                            if system_prompt is None
+                            else system_prompt,
+                            payload["user_prompt"] if user_prompt is None else user_prompt,
+                            payload["prompt_preview"]
+                            if prompt_preview is None
+                            else prompt_preview,
+                            payload["summary"] if summary is None else summary,
+                            json.dumps(next_metadata, ensure_ascii=False),
+                            now,
+                            subagent_id,
+                        ),
+                    )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM subagent_transcripts WHERE id=?",
+                    (subagent_id,),
+                ).fetchone()
+                return _row_to_subagent_transcript_payload(row, conn=conn)
+
+        return await asyncio.to_thread(_op) or {}
+
+    async def append_subagent_transcript_event(
+        self,
+        subagent_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        await self.initialize()
+        now = _now_iso()
+
+        def _op() -> None:
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(seq), 0) + 1
+                    FROM subagent_transcript_events
+                    WHERE subagent_id=?
+                    """,
+                    (subagent_id,),
+                ).fetchone()
+                seq = int(row[0]) if row else 1
+                conn.execute(
+                    """
+                    INSERT INTO subagent_transcript_events(subagent_id, seq, event_json, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (subagent_id, seq, json.dumps(event, ensure_ascii=False), now),
+                )
+                conn.execute(
+                    "UPDATE subagent_transcripts SET updated_at=? WHERE id=?",
+                    (now, subagent_id),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_op)
+
+    async def list_subagent_transcripts(
+        self,
+        *,
+        parent_type: str | None = None,
+        parent_id: str | None = None,
+        session_id: str | None = None,
+        goal_id: str | None = None,
+        agent_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        await self.initialize()
+
+        def _op() -> list[dict[str, Any]]:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if parent_type is not None:
+                clauses.append("t.parent_type=?")
+                params.append(parent_type)
+            if parent_id is not None:
+                clauses.append("t.parent_id=?")
+                params.append(parent_id)
+            if session_id is not None:
+                clauses.append("t.session_id=?")
+                params.append(session_id)
+            if goal_id is not None:
+                clauses.append("t.goal_id=?")
+                params.append(goal_id)
+            if agent_run_id is not None:
+                clauses.append("t.agent_run_id=?")
+                params.append(agent_run_id)
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            query = f"""
+                SELECT t.*, COALESCE(COUNT(e.id), 0) AS event_count
+                FROM subagent_transcripts AS t
+                LEFT JOIN subagent_transcript_events AS e
+                    ON e.subagent_id = t.id
+                {where_sql}
+                GROUP BY t.id
+                ORDER BY datetime(t.updated_at) DESC, t.id ASC
+            """
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(query, tuple(params)).fetchall()
+                return [_row_to_subagent_transcript_summary_payload(row) for row in rows]
+
+        return await asyncio.to_thread(_op)
+
+    async def get_subagent_transcript(self, subagent_id: str) -> dict[str, Any] | None:
+        await self.initialize()
+
+        def _op() -> dict[str, Any] | None:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """
+                    SELECT t.*, COALESCE(COUNT(e.id), 0) AS event_count
+                    FROM subagent_transcripts AS t
+                    LEFT JOIN subagent_transcript_events AS e
+                        ON e.subagent_id = t.id
+                    WHERE t.id=?
+                    GROUP BY t.id
+                    """,
+                    (subagent_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                payload = _row_to_subagent_transcript_payload(row, conn=conn)
+                payload["event_count"] = int(row["event_count"] or 0)
+                payload["events"] = _load_subagent_transcript_events(conn, subagent_id)
+                return payload
+
+        return await asyncio.to_thread(_op)
+
     async def append_agent_run_artifact(
         self,
         run_id: str,
@@ -2874,15 +3232,40 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     payload = dict(row)
     payload["execution_mode"] = _normalize_goal_execution_mode(payload.get("execution_mode"))
+    summary = json.loads(payload.pop("summary_json") or "{}")
+    metadata = json.loads(payload.pop("metadata_json") or "{}")
+    raw_strategy_id = payload.get("strategy_id")
+    raw_protocol_id = payload.get("protocol_id")
+    normalized_strategy_id = _normalize_goal_strategy_id(
+        strategy_id=raw_strategy_id,
+        protocol_id=raw_protocol_id,
+        selection_source=payload.get("selection_source"),
+        summary=summary,
+        metadata=metadata,
+    )
+    payload["strategy_id"] = normalized_strategy_id
     payload["protocol_id"] = _normalize_goal_protocol_id(
-        payload["execution_mode"],
-        payload.get("protocol_id"),
+        normalized_strategy_id,
+        raw_protocol_id,
+    )
+    normalized_selection_source = _normalize_goal_selection_source(
+        selection_source=payload.get("selection_source"),
+        strategy_id=raw_strategy_id,
+        protocol_id=raw_protocol_id,
+        summary=summary,
+        metadata=metadata,
+    )
+    payload["selection_source"] = normalized_selection_source
+    payload["selection_reason"] = _normalize_goal_selection_reason(
+        selection_reason=payload.get("selection_reason"),
+        selection_source=normalized_selection_source,
+        strategy_id=normalized_strategy_id,
     )
     payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
     payload["capability_policy"] = json.loads(payload.pop("capability_policy_json") or "{}")
     payload["source_manifest"] = json.loads(payload.pop("source_manifest_json") or "{}")
-    payload["summary"] = json.loads(payload.pop("summary_json") or "{}")
-    payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
+    payload["summary"] = summary
+    payload["metadata"] = metadata
     return payload
 
 
@@ -3017,6 +3400,90 @@ def _load_agent_run_artifacts(conn: sqlite3.Connection, run_id: str) -> list[dic
     return artifacts
 
 
+def _load_subagent_transcript_events(
+    conn: sqlite3.Connection,
+    subagent_id: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT seq, event_json, created_at
+        FROM subagent_transcript_events
+        WHERE subagent_id=?
+        ORDER BY seq ASC
+        """,
+        (subagent_id,),
+    ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        payload = json.loads(str(row[1] or "{}"))
+        if "seq" not in payload:
+            payload["seq"] = int(row[0])
+        if "created_at" not in payload:
+            payload["created_at"] = row[2]
+        events.append(_hydrate_subagent_message_delivery_fields(payload))
+    return events
+
+
+def _hydrate_subagent_message_delivery_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("type") == "subagent_tool_cancelled" and "status" not in payload:
+        payload["status"] = "cancelled"
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return payload
+    for key in (
+        "message_id",
+        "delivery_mode",
+        "delivery_status",
+        "delivery_reason",
+        "interrupt",
+        "cancel_current_tool",
+    ):
+        if key not in payload and key in metadata:
+            payload[key] = metadata[key]
+    return payload
+
+
+def _row_to_subagent_transcript_payload(
+    row: sqlite3.Row | None,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["subagent_id"] = payload.pop("id")
+    payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
+    event_count = payload.get("event_count")
+    if event_count is not None:
+        try:
+            payload["event_count"] = int(event_count)
+        except (TypeError, ValueError):
+            payload["event_count"] = 0
+    elif conn is not None:
+        payload["event_count"] = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM subagent_transcript_events
+                WHERE subagent_id=?
+                """,
+                (payload["subagent_id"],),
+            ).fetchone()[0]
+        )
+    else:
+        payload["event_count"] = 0
+    return payload
+
+
+def _row_to_subagent_transcript_summary_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+    payload = _row_to_subagent_transcript_payload(row)
+    if payload is None:
+        return {}
+    payload.pop("system_prompt", None)
+    payload.pop("user_prompt", None)
+    return payload
+
+
 def _normalize_goal_execution_mode(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in _GOAL_EXECUTION_MODES:
@@ -3024,13 +3491,126 @@ def _normalize_goal_execution_mode(value: Any) -> str:
     return _DEFAULT_GOAL_EXECUTION_MODE
 
 
-def _normalize_goal_protocol_id(execution_mode: Any, protocol_id: Any) -> str | None:
+def _validate_goal_strategy_protocol_inputs(
+    *,
+    strategy_id: str | None,
+    protocol_id: str | None,
+) -> None:
+    normalized_strategy_id = str(strategy_id or "").strip()
+    normalized_protocol_id = str(protocol_id or "").strip()
+    if not normalized_strategy_id or not normalized_protocol_id:
+        return
+    entry = get_goal_strategy_entry(normalized_strategy_id)
+    expected_protocol_id = (
+        str((entry.protocol_id if entry is not None else normalized_strategy_id) or "").strip()
+        or normalized_strategy_id
+    )
+    if expected_protocol_id != normalized_protocol_id:
+        raise ValueError(
+            f"Conflicting strategy_id/protocol_id: strategy {normalized_strategy_id} requires protocol {expected_protocol_id}, not {normalized_protocol_id}."
+        )
+
+
+def _validate_goal_selection_source_input(selection_source: Any) -> None:
+    normalized = str(selection_source or "").strip()
+    if not normalized:
+        return
+    if normalized in {"explicit_override", "semantic_registry_selector", "safe_default", "legacy_migration"}:
+        return
+    raise ValueError(f"Invalid selection_source for create_goal: {normalized}.")
+
+
+def _normalize_goal_protocol_id(strategy_id: Any, protocol_id: Any) -> str:
     normalized = str(protocol_id or "").strip()
     if normalized:
         return normalized
-    if _normalize_goal_execution_mode(execution_mode) == "single_agent":
-        return _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL
-    return None
+    normalized_strategy_id = str(strategy_id or "").strip()
+    if normalized_strategy_id:
+        entry = get_goal_strategy_entry(normalized_strategy_id)
+        if entry is not None and str(entry.protocol_id or "").strip():
+            return str(entry.protocol_id or "").strip()
+        return normalized_strategy_id
+    return _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL
+
+
+def _normalize_goal_strategy_id(
+    *,
+    strategy_id: Any,
+    protocol_id: Any,
+    selection_source: Any = None,
+    summary: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
+    normalized = str(strategy_id or "").strip()
+    if normalized:
+        return normalized
+    normalized_selection_source = str(selection_source or "").strip()
+    if normalized_selection_source in {"explicit_override", "semantic_registry_selector"}:
+        for source in (summary or {}, metadata or {}):
+            summary_strategy = str(source.get("strategy_id") or "").strip()
+            if summary_strategy:
+                return summary_strategy
+            protocol_selection = str(source.get("protocol_selection") or "").strip()
+            if protocol_selection:
+                return protocol_selection
+    protocol = str(protocol_id or "").strip()
+    if protocol and normalized_selection_source == "explicit_override":
+        return protocol
+    return DEFAULT_GOAL_STRATEGY_ID
+
+
+def _normalize_goal_selection_source(
+    *,
+    selection_source: Any,
+    strategy_id: Any,
+    protocol_id: Any,
+    summary: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    treat_protocol_as_explicit: bool = False,
+) -> str:
+    normalized = str(selection_source or "").strip()
+    if normalized in {"explicit_override", "semantic_registry_selector", "safe_default", "legacy_migration"}:
+        return normalized
+    if str(strategy_id or "").strip():
+        return "explicit_override"
+    if treat_protocol_as_explicit and str(protocol_id or "").strip():
+        return "explicit_override"
+    for source in (summary or {}, metadata or {}):
+        summary_selection_source = str(source.get("selection_source") or "").strip()
+        if summary_selection_source in {"explicit_override", "semantic_registry_selector"}:
+            return summary_selection_source
+    if str(protocol_id or "").strip():
+        return "legacy_migration"
+    for source in (summary or {}, metadata or {}):
+        if str(source.get("strategy_id") or "").strip():
+            return "legacy_migration"
+        if str(source.get("protocol_selection") or "").strip():
+            return "legacy_migration"
+        if str(source.get("selection_rationale") or "").strip():
+            return "legacy_migration"
+    if normalized:
+        return "legacy_migration"
+    return "safe_default"
+
+
+def _normalize_goal_selection_reason(
+    *,
+    selection_reason: Any,
+    selection_source: Any,
+    strategy_id: Any,
+) -> str:
+    normalized = str(selection_reason or "").strip()
+    if normalized:
+        return normalized
+    resolved_strategy_id = _normalize_goal_strategy_id(
+        strategy_id=strategy_id,
+        protocol_id=None,
+    )
+    if str(selection_source or "").strip() == "explicit_override":
+        return f"Strategy explicitly set to {resolved_strategy_id}."
+    if str(selection_source or "").strip() == "legacy_migration":
+        return f"Legacy goal metadata mapped to {resolved_strategy_id} during strategy migration."
+    return f"Defaulted to {resolved_strategy_id} because no explicit strategy was provided."
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

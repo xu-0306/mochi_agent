@@ -80,7 +80,7 @@ ProtocolConfig = (
 def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) -> ProtocolConfig:
     """將 API-style payload 正規化為協議 dataclass。"""
     if payload is None:
-        return TeacherStudentDistillProtocol()
+        raise ValueError("Multi-agent protocol config is required")
     if isinstance(
         payload,
         (
@@ -93,7 +93,9 @@ def parse_protocol_config(payload: Mapping[str, Any] | ProtocolConfig | None) ->
     ):
         return payload
 
-    raw_protocol = str(payload.get("protocol", "teacher_student_distill")).strip()
+    raw_protocol = str(payload.get("protocol") or "").strip()
+    if not raw_protocol:
+        raise ValueError("Multi-agent protocol config requires a protocol")
     if raw_protocol == "autonomous_single_agent":
         return AutonomousSingleAgentProtocol(
             agent_role_id=_clean_role_id(payload.get("agent_role_id"), default="agent"),

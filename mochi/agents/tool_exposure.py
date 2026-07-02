@@ -433,6 +433,30 @@ class ToolExposurePlanner:
         "\u8fd1\u5e74",
         "\u6700\u65b0\u8ad6\u6587",
     )
+    _EXPLICIT_SUBAGENT_DELEGATION_KEYWORDS: tuple[str, ...] = (
+        "subagent",
+        "subagents",
+        "\u526f\u4ee3\u7406",
+        "\u5b50\u4ee3\u7406",
+        "\u5b50\u4ee3\u7406\u4eba",
+        "delegate",
+        "delegated",
+        "\u59d4\u6d3e",
+        "\u5206\u6d3e",
+        "\u6d3e\u7d66",
+        "\u4ea4\u7d66",
+        "\u958b subagent",
+        "\u958bsubagent",
+        "\u958b \u5b50\u4ee3\u7406",
+        "\u958b\u5b50\u4ee3\u7406",
+        "\u30b5\u30d6\u30a8\u30fc\u30b8\u30a7\u30f3\u30c8",
+        "parallel research",
+        "independent comparison",
+        "multi-perspective",
+        "multiple perspectives",
+        "research a and b",
+        "compare approach a and approach b",
+    )
     _DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[-._;()/:a-z0-9]+\b", re.IGNORECASE)
 
     def __init__(self, *, tool_groups: dict[str, list[str]]) -> None:
@@ -722,9 +746,15 @@ class ToolExposurePlanner:
         )
         filtered: list[str] = []
         risky_count = 0
+        explicit_subagent_delegation = self._matches_any_keyword(
+            lowered_primary_intent,
+            self._EXPLICIT_SUBAGENT_DELEGATION_KEYWORDS,
+        )
         for tool_name in selected:
             capabilities = normalized_capabilities.get(tool_name, {})
             domains = set(capabilities.get("domains", ()))
+            if tool_name == "delegate_subagent_task" and not explicit_subagent_delegation:
+                continue
             if (
                 workspace_focus_request
                 and bool(capabilities.get("open_world", False))

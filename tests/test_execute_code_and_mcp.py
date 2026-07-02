@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from mochi.tools.base import ToolExecutionContext
+from mochi.tools.base import ActiveToolController, ToolExecutionContext
 from mochi.tools.execute_code import ExecuteCodeTool
 from mochi.tools.execute_code_v2 import ExecuteCodeV2Tool
 from mochi.tools.mcp_client import MCPCallTool
@@ -145,6 +145,47 @@ def test_execute_code_background_returns_process_metadata(tmp_path: Path) -> Non
     asyncio.run(_run())
 
 
+def test_execute_code_foreground_cancellation_reports_cancelled_status(tmp_path: Path) -> None:
+    async def _run() -> None:
+        tool = ExecuteCodeTool(workspace_dir=tmp_path, require_approval=False)
+        controller = ActiveToolController()
+        context = ToolExecutionContext(active_tool_controller=controller)
+        await controller.activate_tool(
+            tool_call_id="tool-call-execute-code-cancel",
+            tool_name="execute_code",
+            cancellable=False,
+        )
+
+        task = asyncio.create_task(
+            tool.execute(
+                code="import time; print('started', flush=True); time.sleep(10)",
+                context=context,
+            )
+        )
+        try:
+            for _ in range(100):
+                snapshot = await controller.snapshot()
+                if snapshot["active"] and snapshot["cancellable"]:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("controller never observed a cancellable execute_code run")
+
+            cancel_result = await controller.request_cancel()
+            assert cancel_result.cancelled is True
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+        assert result.error is None
+        assert result.metadata["status"] == "cancelled"
+        assert result.metadata["cancelled"] is True
+        assert isinstance(result.output, str)
+
+    asyncio.run(_run())
+
+
 def test_execute_code_v2_requires_approval_by_default(tmp_path: Path) -> None:
     tool = ExecuteCodeV2Tool(workspace_dir=tmp_path)
 
@@ -152,6 +193,48 @@ def test_execute_code_v2_requires_approval_by_default(tmp_path: Path) -> None:
 
     assert result.error is not None
     assert "approval" in result.error.lower()
+
+
+def test_execute_code_v2_foreground_cancellation_reports_cancelled_status(tmp_path: Path) -> None:
+    async def _run() -> None:
+        tool = ExecuteCodeV2Tool(workspace_dir=tmp_path, require_approval=False)
+        controller = ActiveToolController()
+        context = ToolExecutionContext(active_tool_controller=controller)
+        await controller.activate_tool(
+            tool_call_id="tool-call-execute-code-v2-cancel",
+            tool_name="execute_code_v2",
+            cancellable=False,
+        )
+
+        task = asyncio.create_task(
+            tool.execute(
+                code="import time; print('started', flush=True); time.sleep(10)",
+                context=context,
+            )
+        )
+        try:
+            for _ in range(100):
+                snapshot = await controller.snapshot()
+                if snapshot["active"] and snapshot["cancellable"]:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("controller never observed a cancellable execute_code_v2 run")
+
+            cancel_result = await controller.request_cancel()
+            assert cancel_result.cancelled is True
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+        assert result.error is None
+        assert result.metadata["status"] == "cancelled"
+        assert result.metadata["cancelled"] is True
+        assert result.output["result"] is None
+        assert result.output["tool_calls"] == []
+
+    asyncio.run(_run())
 
 
 def test_execute_code_v2_supports_injected_runner(tmp_path: Path) -> None:

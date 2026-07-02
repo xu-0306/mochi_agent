@@ -7,7 +7,6 @@ const moduleUrl = pathToFileURL(
 ).href
 
 const {
-  isNaturalLanguageGoalRequest,
   parseGoalCommand,
   resolveChatGoalWorkflowRouting,
 } = await import(moduleUrl)
@@ -46,41 +45,42 @@ assert.equal(workflowProposal.workflowModeRequested, true)
 assert.equal(workflowProposal.route.kind, 'workflow_proposal')
 assert.equal(workflowProposal.shouldHandleGoalWorkflowRouting, true)
 
-for (const request of [
+for (const text of [
+  '\u8acb\u7814\u7a76\u9019\u500b\u4e3b\u984c 20\u5206\u9418\uff0c\u6574\u7406\u91cd\u9ede\u7d66\u6211\u3002',
+  'research this for 20 minutes',
   'Keep working on this in the background for 30 minutes and come back with progress',
-  'Please continue working on this while I am away',
-  'Run for 2 hours with checkpoints and retry until it passes',
+  'What does this blocked state mean?',
+  'Prioritize the failing login test first and keep the patch minimal',
+  '\u6211\u554f\u7684\u662f\u4f60\u7684\u9032\u5ea6\u5982\u4f55',
 ]) {
-  assert.equal(
-    isNaturalLanguageGoalRequest(request),
-    true,
-    `expected ${request} to be treated as natural-language goal intent`
-  )
+  const idleNaturalLanguage = resolveChatGoalWorkflowRouting({
+    text,
+    attachmentCount: 0,
+    hasPendingProposal: false,
+    hasActiveGoal: false,
+  })
+  assert.equal(idleNaturalLanguage.route.kind, 'direct_chat')
+  assert.equal(idleNaturalLanguage.shouldHandleGoalWorkflowRouting, false)
+
+  const activeGoalNaturalLanguage = resolveChatGoalWorkflowRouting({
+    text,
+    attachmentCount: 0,
+    hasPendingProposal: false,
+    hasActiveGoal: true,
+  })
+  assert.equal(activeGoalNaturalLanguage.route.kind, 'direct_chat')
+  assert.equal(activeGoalNaturalLanguage.shouldHandleGoalWorkflowRouting, false)
 }
 
-assert.equal(
-  isNaturalLanguageGoalRequest('What models are available right now?'),
-  false
-)
-
-const naturalLanguageProposal = resolveChatGoalWorkflowRouting({
-  text: 'Keep working on this in the background for 30 minutes and come back with progress',
+const explicitGoalProposal = resolveChatGoalWorkflowRouting({
+  text: '/goal research this for 20 minutes',
   attachmentCount: 0,
   hasPendingProposal: false,
   hasActiveGoal: false,
 })
-assert.equal(naturalLanguageProposal.route.kind, 'natural_language_goal_proposal')
-assert.equal(naturalLanguageProposal.shouldHandleGoalWorkflowRouting, true)
-assert.equal(naturalLanguageProposal.requestText, 'Keep working on this in the background for 30 minutes and come back with progress')
-
-const activeGoalFollowUp = resolveChatGoalWorkflowRouting({
-  text: 'Prioritize the failing login test first and keep the patch minimal',
-  attachmentCount: 0,
-  hasPendingProposal: false,
-  hasActiveGoal: true,
-})
-assert.equal(activeGoalFollowUp.route.kind, 'goal_follow_up')
-assert.equal(activeGoalFollowUp.shouldHandleGoalWorkflowRouting, true)
+assert.equal(explicitGoalProposal.route.kind, 'goal_proposal')
+assert.equal(explicitGoalProposal.route.content, 'research this for 20 minutes')
+assert.equal(explicitGoalProposal.shouldHandleGoalWorkflowRouting, true)
 
 const pendingConfirmation = resolveChatGoalWorkflowRouting({
   text: 'go ahead',

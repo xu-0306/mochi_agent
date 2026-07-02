@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -323,6 +325,9 @@ def test_agent_run_messages_append_operator_and_assistant_events(tmp_path: Path)
         assert f"Workspace: {tmp_path / 'workspace-beta'}." in assistant_event["content"]
         assert "Current run status: created." in assistant_event["content"]
         assert "existing orchestrator boundaries" in assistant_event["content"]
+        assert payload["summary"]["guidance_messages"] == [
+            "Please focus on the deployment checklist."
+        ]
 
 
 def test_agent_run_subagent_messages_append_targeted_event(tmp_path: Path) -> None:
@@ -337,6 +342,19 @@ def test_agent_run_subagent_messages_append_targeted_event(tmp_path: Path) -> No
         )
         assert create_response.status_code == 200
         run_id = create_response.json()["run_id"]
+        runtime_service = client.app.state.runtime_service
+        transcript = asyncio.run(
+            runtime_service._store.upsert_subagent_transcript(
+                subagent_id="subagent-verifier-1",
+                parent_type="agent_run",
+                parent_id=run_id,
+                agent_run_id=run_id,
+                role_id="verifier",
+                title="Verifier",
+                status="running",
+            )
+        )
+        assert transcript["subagent_id"] == "subagent-verifier-1"
 
         attachment = {
             "name": "claims.md",
@@ -365,6 +383,7 @@ def test_agent_run_subagent_messages_append_targeted_event(tmp_path: Path) -> No
         assert subagent_event["role"] == "operator"
         assert subagent_event["source_role"] == "user"
         assert subagent_event["target_role_id"] == "verifier"
+        assert subagent_event["subagent_id"] == "subagent-verifier-1"
         assert subagent_event["content"] == "Please verify claim 2 more strictly."
         assert subagent_event["project_id"] == "project-subagent"
         assert subagent_event["workspace_dir"] == str(tmp_path / "workspace-subagent")
@@ -373,6 +392,7 @@ def test_agent_run_subagent_messages_append_targeted_event(tmp_path: Path) -> No
             "source": "workflow_subagent_message_api",
             "delivery": "guidance_only",
             "target_role_id": "verifier",
+            "subagent_id": "subagent-verifier-1",
         }
         assert subagent_event["attachments"] == [
             {
@@ -392,6 +412,280 @@ def test_agent_run_subagent_messages_append_targeted_event(tmp_path: Path) -> No
         assert detail_response.status_code == 200
         detail_payload = detail_response.json()
         assert detail_payload["events"][-1] == subagent_event
+        assert detail_payload["summary"]["role_guidance_messages"] == {
+            "verifier": ["Please verify claim 2 more strictly."]
+        }
+
+
+def test_agent_run_subagent_transcript_persists_prompt_and_lifecycle_from_live_runtime(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        callback = request.runtime_event_callback
+        assert callback is not None
+
+        class _Event:
+            def __init__(self, seq: int, event_type: str, payload: dict[str, Any]) -> None:
+                self.seq = seq
+                self.type = event_type
+                self.payload = payload
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "seq": self.seq,
+                    "type": self.type,
+                    "payload": dict(self.payload),
+                }
+
+        subagent_id = f"{request.run_id}:primary:autonomous-single-agent"
+        await callback(
+            _Event(
+                1,
+                "subagent_prompt",
+                {
+                    "subagent_id": subagent_id,
+                    "role_id": "primary",
+                    "title": "Primary agent",
+                    "model_id": "gpt-test",
+                    "system_prompt": "System instruction",
+                    "user_prompt": "User task prompt",
+                    "stage": "autonomous_single_agent",
+                    "execution_profile": "subagent_readonly",
+                },
+            )
+        )
+        await callback(
+            _Event(
+                2,
+                "role_started",
+                {
+                    "role_id": "primary",
+                    "title": "Primary agent",
+                    "subagent_id": subagent_id,
+                    "status": "thinking",
+                    "current_action": "Primary agent is preparing a response.",
+                    "stage": "autonomous_single_agent",
+                    "model_id": "gpt-test",
+                },
+            )
+        )
+        await callback(
+            _Event(
+                3,
+                "role_completed",
+                {
+                    "role_id": "primary",
+                    "title": "Primary agent",
+                    "subagent_id": subagent_id,
+                    "status": "done",
+                    "current_action": "Primary agent produced an output.",
+                    "stage": "autonomous_single_agent",
+                    "model_id": "gpt-test",
+                    "summary": "Completed primary answer.",
+                },
+            )
+        )
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="autonomous_single_agent",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "done"},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    with _create_operator_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/agent-runs",
+            json={
+                "protocol_id": "autonomous_single_agent",
+                "title": "Live transcript run",
+                "topic": "deployment verification",
+            },
+        )
+        assert create_response.status_code == 200
+        run_id = create_response.json()["run_id"]
+
+        start_response = client.post(f"/v1/agent-runs/{run_id}/start")
+        assert start_response.status_code == 200
+        _wait_agent_run_until(client, run_id, {"succeeded"})
+
+        list_response = client.get(f"/v1/agent-runs/{run_id}/subagents")
+        assert list_response.status_code == 200
+        summaries = list_response.json()
+        assert len(summaries) == 1
+        assert summaries[0]["role_id"] == "primary"
+        assert summaries[0]["title"] == "Primary agent"
+        assert summaries[0]["model_id"] == "gpt-test"
+
+        detail_response = client.get(
+            f"/v1/agent-runs/{run_id}/subagents/{run_id}:primary:autonomous-single-agent"
+        )
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["role_id"] == "primary"
+        assert detail["title"] == "Primary agent"
+        assert detail["model_id"] == "gpt-test"
+        assert detail["system_prompt"] == "System instruction"
+        assert detail["user_prompt"] == "User task prompt"
+        assert [event["type"] for event in detail["events"]] == [
+            "subagent_prompt",
+            "subagent_started",
+            "subagent_completed",
+        ]
+
+
+def test_agent_run_events_endpoint_supports_after_seq_and_limit(tmp_path: Path) -> None:
+    with _create_operator_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/agent-runs",
+            json={
+                "protocol_id": "teacher_student_distill",
+                "title": "Events run",
+                "topic": "deployment verification",
+            },
+        )
+        assert create_response.status_code == 200
+        run_id = create_response.json()["run_id"]
+        runtime_service = client.app.state.runtime_service
+        asyncio.run(
+            runtime_service._store.append_agent_run_event(
+                run_id,
+                {"type": "role_started", "role_id": "verifier", "current_action": "Preparing checks."},
+            )
+        )
+        asyncio.run(
+            runtime_service._store.append_agent_run_event(
+                run_id,
+                {"type": "role_progress", "role_id": "verifier", "content": "Inspecting evidence."},
+            )
+        )
+
+        response = client.get(f"/v1/agent-runs/{run_id}/events?after_seq=1&limit=2")
+        assert response.status_code == 200
+        payload = response.json()
+        assert [item["seq"] for item in payload] == [2, 3]
+        assert payload[0]["type"] == "role_started"
+        assert payload[1]["type"] == "role_progress"
+
+
+def test_agent_run_events_stream_returns_sse_frames(tmp_path: Path) -> None:
+    with _create_operator_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/agent-runs",
+            json={
+                "protocol_id": "teacher_student_distill",
+                "title": "Events stream run",
+                "topic": "deployment verification",
+            },
+        )
+        assert create_response.status_code == 200
+        run_id = create_response.json()["run_id"]
+        runtime_service = client.app.state.runtime_service
+        asyncio.run(
+            runtime_service._store.append_agent_run_event(
+                run_id,
+                {
+                    "type": "role_progress",
+                    "role_id": "verifier",
+                    "content": "Streaming evidence update.",
+                },
+            )
+        )
+
+        with client.stream("GET", f"/v1/agent-runs/{run_id}/events/stream?after_seq=1") as response:
+            assert response.status_code == 200
+            data_line = next(
+                line for line in response.iter_lines() if line.startswith("data: ")
+            )
+
+        payload = json.loads(data_line.removeprefix("data: "))
+        assert payload["seq"] == 2
+        assert payload["type"] == "role_progress"
+        assert payload["role_id"] == "verifier"
+
+
+def test_agent_run_subagent_transcript_endpoint_returns_detail(tmp_path: Path) -> None:
+    with _create_operator_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/agent-runs",
+            json={
+                "protocol_id": "teacher_student_distill",
+                "title": "Transcript run",
+                "topic": "deployment verification",
+            },
+        )
+        assert create_response.status_code == 200
+        run_id = create_response.json()["run_id"]
+        runtime_service = client.app.state.runtime_service
+        asyncio.run(
+            runtime_service._store.upsert_subagent_transcript(
+                subagent_id="subagent-verifier-2",
+                parent_type="agent_run",
+                parent_id=run_id,
+                agent_run_id=run_id,
+                role_id="verifier",
+                title="Verifier",
+                model_id="gpt-test",
+                status="running",
+                system_prompt="System prompt",
+                user_prompt="User prompt",
+                prompt_preview="User prompt",
+            )
+        )
+        asyncio.run(
+            runtime_service._store.append_subagent_transcript_event(
+                "subagent-verifier-2",
+                {
+                    "type": "subagent_started",
+                    "parent_type": "agent_run",
+                    "parent_id": run_id,
+                    "subagent_id": "subagent-verifier-2",
+                    "role_id": "verifier",
+                    "status": "running",
+                },
+            )
+        )
+        asyncio.run(
+            runtime_service._store.append_subagent_transcript_event(
+                "subagent-verifier-2",
+                {
+                    "type": "subagent_completed",
+                    "parent_type": "agent_run",
+                    "parent_id": run_id,
+                    "subagent_id": "subagent-verifier-2",
+                    "role_id": "verifier",
+                    "status": "completed",
+                    "summary": "Verification complete.",
+                },
+            )
+        )
+
+        list_response = client.get(f"/v1/agent-runs/{run_id}/subagents")
+        assert list_response.status_code == 200
+        summaries = list_response.json()
+        assert len(summaries) == 1
+        assert summaries[0]["subagent_id"] == "subagent-verifier-2"
+        assert summaries[0]["role_id"] == "verifier"
+        assert summaries[0]["event_count"] == 2
+
+        detail_response = client.get(f"/v1/agent-runs/{run_id}/subagents/subagent-verifier-2")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["subagent_id"] == "subagent-verifier-2"
+        assert detail["system_prompt"] == "System prompt"
+        assert detail["user_prompt"] == "User prompt"
+        assert [event["type"] for event in detail["events"]] == [
+            "subagent_started",
+            "subagent_completed",
+        ]
 
 
 def test_agent_run_subagent_message_not_found_returns_404(tmp_path: Path) -> None:

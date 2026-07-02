@@ -692,6 +692,107 @@ def test_tool_exposure_contextual_exec_session_tools_require_session_context() -
     assert "read_session" in with_session.tool_names
 
 
+def test_tool_exposure_includes_delegate_subagent_for_explicit_subagent_request() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "delegate_subagent_task", "glob_search", "grep_search"],
+            "web": ["web_search", "web_fetch"],
+        }
+    )
+
+    plan = planner.plan(
+        message="Use two subagents to research A and B independently, then compare them.",
+        user_intent_message="Use two subagents to research A and B independently, then compare them.",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "delegate_subagent_task",
+            "web_search",
+            "web_fetch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities("web_search", "web_fetch"),
+        routed_intent="workspace_read",
+        intent_confidence=0.78,
+        intent_source="fallback_keyword",
+        intent_rationale="Explicit subagent delegation request.",
+    )
+
+    assert "delegate_subagent_task" in plan.tool_names
+
+
+def test_tool_exposure_includes_delegate_subagent_for_explicit_chinese_request() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "delegate_subagent_task", "glob_search", "grep_search"],
+            "web": ["web_search", "web_fetch"],
+        }
+    )
+
+    message = (
+        "\u8acb\u958b\u5169\u500b\u5b50\u4ee3\u7406\u5206\u982d\u7814\u7a76 A \u8ddf B\uff0c"
+        "\u6700\u5f8c\u4ea4\u7d66\u4e3b\u4ee3\u7406\u6bd4\u8f03\u5dee\u7570\u3002"
+    )
+    plan = planner.plan(
+        message=message,
+        user_intent_message=message,
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "delegate_subagent_task",
+            "web_search",
+            "web_fetch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities("web_search", "web_fetch"),
+        routed_intent="workspace_read",
+        intent_confidence=0.8,
+        intent_source="fallback_keyword",
+        intent_rationale="Explicit Chinese subagent delegation request.",
+    )
+
+    assert "delegate_subagent_task" in plan.tool_names
+
+
+def test_tool_exposure_skips_delegate_subagent_for_trivial_chat() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "delegate_subagent_task", "glob_search", "grep_search"],
+            "web": ["web_search", "web_fetch", "get_current_time"],
+        }
+    )
+
+    plan = planner.plan(
+        message="What time is it in Taipei?",
+        user_intent_message="What time is it in Taipei?",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "delegate_subagent_task",
+            "web_search",
+            "web_fetch",
+            "get_current_time",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="auto_review",
+        tool_capabilities=_tool_capabilities("web_search", "web_fetch"),
+        routed_intent="open_world_lookup",
+        intent_confidence=0.91,
+        intent_source="fallback_keyword",
+        intent_rationale="Simple current-time lookup.",
+    )
+
+    assert "delegate_subagent_task" not in plan.tool_names
+
+
 def test_tool_exposure_ignores_stale_preferred_tool_names() -> None:
     planner = ToolExposurePlanner(
         tool_groups={

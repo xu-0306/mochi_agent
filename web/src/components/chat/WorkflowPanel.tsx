@@ -18,9 +18,11 @@ import {
 import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
 import { ThinkingLevelPanelControl } from '@/components/chat/ThinkingLevelControls'
 import { Switch } from '@/components/ui/switch'
+import { fetchGoalStrategies } from '@/lib/api'
 import type {
   AgentRunProtocolId,
   AgentRunRunPolicy,
+  GoalStrategyRegistryResponse,
   ProjectSummary,
   ReasoningEffort,
   SessionWorkflowConfig,
@@ -37,6 +39,23 @@ interface WorkflowProtocolOption {
   value: AgentRunProtocolId
   label: string
   description: string
+  strategyId?: string | null
+  whenToUse?: string | null
+  whenNotToUse?: string | null
+  selectionGuidance?: string | null
+  requiresConfirmation?: boolean
+  available?: boolean
+  availabilityReason?: string | null
+  deprecated?: boolean
+  executionTopology?: 'single_agent' | 'multi_agent'
+  kind?: string | null
+  requiredCapabilities?: string[]
+  successSignals?: string[]
+  failureModes?: string[]
+  fallbackStrategyIds?: string[]
+  interruptPolicy?: string | Record<string, unknown> | null
+  resumePolicy?: string | Record<string, unknown> | null
+  eventContract?: string | Record<string, unknown> | null
 }
 
 interface WorkflowPanelProps {
@@ -392,6 +411,74 @@ function getGoalRuntimeContext(goal: {
   return { executionMode, interactionMode, executionTopology }
 }
 
+function workflowProtocolOptionFromRegistryEntry(
+  entry: GoalStrategyRegistryResponse['entries'][number]
+): WorkflowProtocolOption {
+  return {
+    value: (entry.protocol_id ?? entry.id) as AgentRunProtocolId,
+    label: entry.override_label ?? entry.display_name,
+    description: entry.description ?? entry.selection_guidance ?? '',
+    strategyId: entry.id,
+    whenToUse: entry.when_to_use,
+    whenNotToUse: entry.when_not_to_use,
+    selectionGuidance: entry.selection_guidance,
+    requiresConfirmation: entry.requires_confirmation,
+    available: entry.available,
+    availabilityReason: entry.availability_reason,
+    deprecated: entry.deprecated,
+    executionTopology: entry.execution_topology,
+    kind: entry.kind,
+    requiredCapabilities: entry.required_capabilities,
+    successSignals: entry.success_signals,
+    failureModes: entry.failure_modes,
+    fallbackStrategyIds: entry.fallback_strategy_ids,
+    interruptPolicy: entry.interrupt_policy,
+    resumePolicy: entry.resume_policy,
+    eventContract: entry.event_contract,
+  }
+}
+
+function mergeWorkflowProtocolOptionsWithRegistry(
+  options: WorkflowProtocolOption[],
+  registry: GoalStrategyRegistryResponse | null
+): WorkflowProtocolOption[] {
+  if (!registry) {
+    return options
+  }
+
+  const seenValues = new Set<AgentRunProtocolId>()
+  const merged = options.map((option) => {
+    seenValues.add(option.value)
+    const entry = registry.entries.find((item) => item.protocol_id === option.value || item.id === option.value)
+    if (!entry) {
+      return option
+    }
+    const registryOption = workflowProtocolOptionFromRegistryEntry(entry)
+    return {
+      ...option,
+      ...registryOption,
+      value: option.value,
+      label: registryOption.label || option.label,
+      description: registryOption.description || option.description,
+    }
+  })
+
+  for (const entry of registry.entries) {
+    const value = (entry.protocol_id ?? entry.id) as AgentRunProtocolId
+    if (seenValues.has(value)) {
+      continue
+    }
+    seenValues.add(value)
+    merged.push(workflowProtocolOptionFromRegistryEntry(entry))
+  }
+
+  return merged
+}
+
+function getWorkflowPolicyLabel(value: string | Record<string, unknown> | null | undefined): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
 function WorkflowPanelBody({
   sessionId,
   workflowEnabled,
@@ -458,6 +545,41 @@ function WorkflowPanelBody({
   const selectedRolesSyncRef = React.useRef(roleDraftScopeKey)
   const [roleDrafts, setRoleDrafts] = React.useState<WorkflowRoleDraft[]>(() =>
     buildRoleDraftsFromSelection(workflowConfig.selected_models_roles)
+  )
+  const [goalStrategyRegistry, setGoalStrategyRegistry] =
+    React.useState<GoalStrategyRegistryResponse | null>(null)
+  React.useEffect(() => {
+    let cancelled = false
+    fetchGoalStrategies()
+      .then((registry) => {
+        if (!cancelled) {
+          setGoalStrategyRegistry(registry)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setGoalStrategyRegistry(null)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  const effectiveWorkflowProtocolOptions = React.useMemo(
+    () => mergeWorkflowProtocolOptionsWithRegistry(workflowProtocolOptions, goalStrategyRegistry),
+    [goalStrategyRegistry, workflowProtocolOptions]
+  )
+  const selectedWorkflowProtocolOption = React.useMemo(
+    () => effectiveWorkflowProtocolOptions.find((option) => option.value === workflowProtocolId) ?? null,
+    [effectiveWorkflowProtocolOptions, workflowProtocolId]
+  )
+  const selectedWorkflowPolicyLabels = React.useMemo(
+    () => ({
+      interrupt: getWorkflowPolicyLabel(selectedWorkflowProtocolOption?.interruptPolicy),
+      resume: getWorkflowPolicyLabel(selectedWorkflowProtocolOption?.resumePolicy),
+      eventContract: getWorkflowPolicyLabel(selectedWorkflowProtocolOption?.eventContract),
+    }),
+    [selectedWorkflowProtocolOption]
   )
   const evidenceQueriesText = React.useMemo(
     () => getStringArray(workflowEvidenceConfig.queries).join('\n'),
@@ -623,9 +745,9 @@ function WorkflowPanelBody({
               <Workflow className="h-3.5 w-3.5" />
               Workflow Desk
             </div>
-            <h2 className="text-base font-semibold text-foreground">Workflow controls</h2>
+            <h2 className="text-base font-semibold text-foreground">Advanced workflow desk</h2>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Keep this conversation bound to one orchestrated runtime without leaving the main chat.
+              Inspect the bound workflow runtime and apply explicit overrides when this strategy actually needs them.
             </p>
           </div>
           {onClose ? (
@@ -649,17 +771,17 @@ function WorkflowPanelBody({
           <div className="space-y-4">
             <PanelSectionCard
               title="Workflow override"
-              description="This chat is currently bound to a single-agent goal, so workflow-native controls stay out of the main path."
+              description="This chat is currently bound to a single-agent goal, so workflow-native controls stay outside the main path."
             >
               <div className="space-y-3 rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-3 text-sm text-muted-foreground">
                 <p>
-                  Single-agent goals should stay chat-first. Workflow routing, bound-run controls, and role configuration are hidden until you explicitly prepare a workflow goal.
+                  Single-agent goals should stay chat-first. Workflow routing, bound-run controls, and role configuration stay hidden unless you explicitly switch into a workflow strategy.
                 </p>
                 <p>
-                  Use <code>/workflow &lt;request&gt;</code> when you want to promote the next long-running task into a workflow proposal.
+                  Use <code>/workflow &lt;request&gt;</code> when you intentionally want to promote the next long-running task into a workflow proposal.
                 </p>
                 <p>
-                  The existing workflow settings remain stored for this chat, but they are not active while the current goal stays in single-agent mode.
+                  Stored workflow settings remain available for inspection here, but they are not active while the current goal stays in single-agent mode.
                 </p>
               </div>
             </PanelSectionCard>
@@ -674,23 +796,23 @@ function WorkflowPanelBody({
         ) : (
         <div className="space-y-4">
           <PanelSectionCard
-            title="Workflow mode"
-            description="Route new chat turns into the workflow runtime for this session."
+            title="Workflow override"
+            description="Explicitly route this chat into the workflow runtime when you want an operator-style override."
           >
             <div className="space-y-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-medium text-foreground">Enable workflow</p>
+                  <p className="text-sm font-medium text-foreground">Enable workflow override</p>
                   <p className="text-xs text-muted-foreground">
-                    Switch between direct chat replies and the bound workflow lane.
+                    Switch between ordinary chat replies and the bound workflow lane.
                   </p>
                 </div>
                 <Switch checked={workflowEnabled} onCheckedChange={onWorkflowToggle} />
               </div>
               <div className="rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-2 text-xs text-muted-foreground">
                 {workflowEnabled
-                  ? 'Workflow mode is active for this chat session.'
-                  : 'Workflow mode is off. Use /workflow or this switch to enable it.'}
+                  ? 'Workflow override is active for this chat session.'
+                  : 'Workflow override is off. Use /workflow or this switch only when you intentionally want a workflow run.'}
               </div>
             </div>
           </PanelSectionCard>
@@ -780,7 +902,7 @@ function WorkflowPanelBody({
 
           <PanelSectionCard
             title="Protocol / reasoning"
-            description="Session-scoped defaults applied whenever a new bound run is created."
+            description="Overrides for future workflow runs created from this chat."
           >
             <div className="space-y-3">
               <div className="space-y-2">
@@ -836,16 +958,82 @@ function WorkflowPanelBody({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {workflowProtocolOptions.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
+                    {effectiveWorkflowProtocolOptions.map((option) => (
+                      <SelectItem key={option.value} value={option.value} disabled={option.available === false}>
                         {option.label}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
-                <p className="text-xs text-muted-foreground">
-                  {workflowProtocolOptions.find((option) => option.value === workflowProtocolId)?.description}
-                </p>
+                {selectedWorkflowProtocolOption ? (
+                  <div className="space-y-2 text-xs text-muted-foreground">
+                    {selectedWorkflowProtocolOption.description ? (
+                      <p>{selectedWorkflowProtocolOption.description}</p>
+                    ) : null}
+                    {selectedWorkflowProtocolOption.selectionGuidance ? (
+                      <p>{selectedWorkflowProtocolOption.selectionGuidance}</p>
+                    ) : null}
+                    {selectedWorkflowProtocolOption.whenToUse ? (
+                      <p>
+                        <span className="font-medium text-foreground">Use when: </span>
+                        {selectedWorkflowProtocolOption.whenToUse}
+                      </p>
+                    ) : null}
+                    {selectedWorkflowProtocolOption.whenNotToUse ? (
+                      <p>
+                        <span className="font-medium text-foreground">Avoid when: </span>
+                        {selectedWorkflowProtocolOption.whenNotToUse}
+                      </p>
+                    ) : null}
+                    <div className="flex flex-wrap gap-1.5">
+                      {selectedWorkflowProtocolOption.strategyId ? (
+                        <span className="rounded-full border border-white/10 bg-surface-layer/60 px-2 py-0.5">
+                          Strategy {selectedWorkflowProtocolOption.strategyId}
+                        </span>
+                      ) : null}
+                      {selectedWorkflowProtocolOption.executionTopology ? (
+                        <span className="rounded-full border border-white/10 bg-surface-layer/60 px-2 py-0.5">
+                          {selectedWorkflowProtocolOption.executionTopology === 'multi_agent'
+                            ? 'Multi-agent'
+                            : 'Single-agent'}
+                        </span>
+                      ) : null}
+                      {selectedWorkflowProtocolOption.requiresConfirmation ? (
+                        <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-0.5 text-amber-200">
+                          Confirmation required
+                        </span>
+                      ) : null}
+                      {selectedWorkflowProtocolOption.available === false ? (
+                        <span className="rounded-full border border-rose-400/20 bg-rose-500/10 px-2 py-0.5 text-rose-200">
+                          Unavailable
+                        </span>
+                      ) : null}
+                      {selectedWorkflowProtocolOption.deprecated ? (
+                        <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-0.5 text-amber-200">
+                          Deprecated
+                        </span>
+                      ) : null}
+                      {selectedWorkflowPolicyLabels.interrupt ? (
+                        <span className="rounded-full border border-white/10 bg-surface-layer/60 px-2 py-0.5">
+                          Interrupt {selectedWorkflowPolicyLabels.interrupt}
+                        </span>
+                      ) : null}
+                      {selectedWorkflowPolicyLabels.resume ? (
+                        <span className="rounded-full border border-white/10 bg-surface-layer/60 px-2 py-0.5">
+                          Resume {selectedWorkflowPolicyLabels.resume}
+                        </span>
+                      ) : null}
+                      {selectedWorkflowPolicyLabels.eventContract ? (
+                        <span className="rounded-full border border-white/10 bg-surface-layer/60 px-2 py-0.5">
+                          Events {selectedWorkflowPolicyLabels.eventContract}
+                        </span>
+                      ) : null}
+                    </div>
+                    {selectedWorkflowProtocolOption.availabilityReason ? (
+                      <p>{selectedWorkflowProtocolOption.availabilityReason}</p>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <span className="text-xs font-medium text-muted-foreground">Thinking Level</span>

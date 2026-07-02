@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -15,6 +17,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from starlette.requests import Request as StarletteRequest
 
 from mochi.agents.events import (
     FinalAnswerEvent,
@@ -28,6 +31,8 @@ from mochi.agents.engine import (
     _merge_prompt_addenda,
 )
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest, AgentInvocationResult
+from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunEvent, MultiAgentRunResult
+from mochi.api.routes.chat import _stream_chat_events
 from mochi.api.server import create_app
 from mochi.auth.models import OpenAICodexAuthProfile
 from mochi.auth.openai_codex import (
@@ -37,10 +42,18 @@ from mochi.auth.openai_codex import (
 )
 from mochi.backends.router import BackendRouter
 from mochi.backends.local_models import LocalModelConvertExecutionResult
-from mochi.backends.types import AttachmentRef, ModelInfo
+from mochi.backends.types import AttachmentRef, GenerationResult, ModelInfo
 from mochi.config.manager import load_config
 from mochi.config.schema import MochiConfig
+from mochi.runtime.service import RuntimeService
+from mochi.runtime.store import RuntimeStore
 from mochi.sessions.store import SessionStore
+from mochi.tools.base import (
+    ActiveToolController,
+    RunCancellationContext,
+    ToolCancellationResult,
+    cancel_asyncio_task,
+)
 
 
 class _FakeEngine:
@@ -485,6 +498,456 @@ def test_chat_route_persists_turn_events_and_sessions_route_returns_them(tmp_pat
     assert get_response.json()["events"] == store_events
 
 
+def test_session_subagent_api_lists_details_and_appends_guidance(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    runtime_db = sessions_dir / "runtime.db"
+    app, _engine = _build_app()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    runtime_service = RuntimeService(engine=object(), store=RuntimeStore(runtime_db))
+    app.state.runtime_service = runtime_service
+
+    asyncio.run(
+        app.state.session_store.save_event(
+            "session-subagent-a",
+            {
+                "type": "session_meta",
+                "event": "created",
+                "session_id": "session-subagent-a",
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+    )
+    asyncio.run(
+        app.state.session_store.save_event(
+            "session-subagent-b",
+            {
+                "type": "session_meta",
+                "event": "created",
+                "session_id": "session-subagent-b",
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.upsert_subagent_transcript(
+            subagent_id="subagent-session-1",
+            parent_type="session",
+            parent_id="session-subagent-a",
+            session_id="session-subagent-a",
+            role_id="verifier",
+            title="Verifier",
+            model_id="gpt-5.4",
+            status="running",
+            system_prompt="System prompt",
+            user_prompt="User prompt",
+            prompt_preview="User prompt",
+            summary="Initial summary.",
+            metadata={"lane": "session"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.append_subagent_transcript_event(
+            "subagent-session-1",
+            {
+                "type": "subagent_started",
+                "parent_type": "session",
+                "parent_id": "session-subagent-a",
+                "subagent_id": "subagent-session-1",
+                "role_id": "verifier",
+                "status": "running",
+                "summary": "Initial summary.",
+                "created_at": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.upsert_subagent_transcript(
+            subagent_id="subagent-session-2",
+            parent_type="session",
+            parent_id="session-subagent-b",
+            session_id="session-subagent-b",
+            role_id="reviewer",
+            title="Reviewer",
+            status="running",
+        )
+    )
+
+    with TestClient(app) as client:
+        list_response = client.get("/v1/sessions/session-subagent-a/subagents")
+        assert list_response.status_code == 200
+        list_payload = list_response.json()
+        assert len(list_payload) == 1
+        assert list_payload[0]["subagent_id"] == "subagent-session-1"
+        assert list_payload[0]["session_id"] == "session-subagent-a"
+        assert list_payload[0]["role_id"] == "verifier"
+        assert list_payload[0]["event_count"] == 1
+
+        detail_response = client.get(
+            "/v1/sessions/session-subagent-a/subagents/subagent-session-1"
+        )
+        assert detail_response.status_code == 200
+        detail_payload = detail_response.json()
+        assert detail_payload["subagent_id"] == "subagent-session-1"
+        assert detail_payload["session_id"] == "session-subagent-a"
+        assert detail_payload["system_prompt"] == "System prompt"
+        assert detail_payload["user_prompt"] == "User prompt"
+        assert len(detail_payload["events"]) == 1
+
+        message_response = client.post(
+            "/v1/sessions/session-subagent-a/subagents/subagent-session-1/messages",
+            json={
+                "role": "user",
+                "content": "Please pick this up on the next resume.",
+                "project_id": "project-session",
+                "workspace_dir": str(tmp_path / "workspace-session"),
+                "metadata": {"channel": "session-subagent-chat"},
+            },
+        )
+        assert message_response.status_code == 200
+        message_payload = message_response.json()
+        assert message_payload["subagent_id"] == "subagent-session-1"
+        assert message_payload["event_count"] == 2
+        assert message_payload["message_id"]
+        assert message_payload["delivery_mode"] == "resume_only"
+        assert message_payload["delivery_status"] == "accepted"
+        guidance_event = message_payload["events"][-1]
+        assert guidance_event["type"] == "subagent_progress"
+        assert guidance_event["content"] == "Please pick this up on the next resume."
+        assert guidance_event["subagent_id"] == "subagent-session-1"
+        assert guidance_event["role_id"] == "verifier"
+        assert guidance_event["message_id"] == message_payload["message_id"]
+        assert guidance_event["delivery_mode"] == "resume_only"
+        assert guidance_event["delivery_status"] == "accepted"
+        assert guidance_event["metadata"]["source"] == "session_subagent_message_api"
+        assert guidance_event["metadata"]["source_type"] == "subagent_message"
+        assert guidance_event["metadata"]["resume_requested"] is True
+        assert guidance_event["metadata"]["attachments"] == []
+        assert guidance_event["metadata"]["message_id"] == message_payload["message_id"]
+        assert guidance_event["metadata"]["delivery_mode"] == "resume_only"
+        assert guidance_event["metadata"]["delivery_status"] == "accepted"
+
+        interrupt_response = client.post(
+            "/v1/sessions/session-subagent-a/subagents/subagent-session-1/messages",
+            json={
+                "role": "user",
+                "content": "Stop the current direction and inspect the cache first.",
+                "delivery_mode": "inject_now",
+                "interrupt": True,
+                "cancel_current_tool": True,
+            },
+        )
+        assert interrupt_response.status_code == 200
+        interrupt_payload = interrupt_response.json()
+        assert interrupt_payload["event_count"] == 4
+        assert interrupt_payload["message_id"]
+        assert interrupt_payload["delivery_mode"] == "inject_now"
+        assert interrupt_payload["delivery_status"] == "queued"
+        assert interrupt_payload["delivery_reason"] == "tool_cancel_pending"
+        assert [event["type"] for event in interrupt_payload["events"][-2:]] == [
+            "subagent_progress",
+            "subagent_tool_cancel_requested",
+        ]
+        interrupt_event = interrupt_payload["events"][-1]
+        assert interrupt_event["content"] == "Stop the current direction and inspect the cache first."
+        assert interrupt_event["message_id"] == interrupt_payload["message_id"]
+        assert interrupt_event["delivery_mode"] == "inject_now"
+        assert interrupt_event["delivery_status"] == "queued"
+        assert interrupt_event["delivery_reason"] == "tool_cancel_pending"
+        assert interrupt_event["interrupt"] is True
+        assert interrupt_event["cancel_current_tool"] is True
+        assert interrupt_event["metadata"]["message_id"] == interrupt_payload["message_id"]
+        assert interrupt_event["metadata"]["delivery_mode"] == "inject_now"
+        assert interrupt_event["metadata"]["delivery_status"] == "queued"
+        assert interrupt_event["metadata"]["delivery_reason"] == "tool_cancel_pending"
+        assert interrupt_event["metadata"]["interrupt"] is True
+        assert interrupt_event["metadata"]["cancel_current_tool"] is True
+
+        wrong_session_detail = client.get(
+            "/v1/sessions/session-subagent-b/subagents/subagent-session-1"
+        )
+        assert wrong_session_detail.status_code == 404
+
+        wrong_session_message = client.post(
+            "/v1/sessions/session-subagent-b/subagents/subagent-session-1/messages",
+            json={"role": "user", "content": "This should fail."},
+        )
+        assert wrong_session_message.status_code == 404
+
+
+def test_session_subagent_api_cancel_resume_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    runtime_db = sessions_dir / "runtime.db"
+    app, _engine = _build_app()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    runtime_service = RuntimeService(engine=object(), store=RuntimeStore(runtime_db))
+    app.state.runtime_service = runtime_service
+
+    asyncio.run(
+        app.state.session_store.save_event(
+            "session-subagent-actions",
+            {
+                "type": "session_meta",
+                "event": "created",
+                "session_id": "session-subagent-actions",
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.upsert_subagent_transcript(
+            subagent_id="subagent-cancel-1",
+            parent_type="session",
+            parent_id="session-subagent-actions",
+            session_id="session-subagent-actions",
+            role_id="researcher",
+            title="Researcher",
+            status="running",
+            metadata={"task_id": "delegated-cancel-task"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.upsert_subagent_transcript(
+            subagent_id="subagent-resume-1",
+            parent_type="delegated_task",
+            parent_id="delegated-resume-task",
+            session_id="session-subagent-actions",
+            role_id="reviewer",
+            title="Reviewer",
+            status="running",
+            metadata={},
+        )
+    )
+
+    cancel_calls: list[str] = []
+    resume_calls: list[dict[str, Any]] = []
+
+    async def _cancel_task(task_id: str) -> dict[str, Any] | None:
+        cancel_calls.append(task_id)
+        return {"id": task_id, "status": "cancelled"}
+
+    async def _resume_task(
+        task_id: str,
+        *,
+        decision: str,
+        reason: str | None = None,
+        rule: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        resume_calls.append(
+            {
+                "task_id": task_id,
+                "decision": decision,
+                "reason": reason,
+                "rule": rule,
+            }
+        )
+        return {"id": task_id, "status": "running"}
+
+    monkeypatch.setattr(runtime_service, "cancel_task", _cancel_task)
+    monkeypatch.setattr(runtime_service, "resume_task", _resume_task)
+
+    with TestClient(app) as client:
+        cancel_response = client.post(
+            "/v1/sessions/session-subagent-actions/subagents/subagent-cancel-1/cancel"
+        )
+        resume_response = client.post(
+            "/v1/sessions/session-subagent-actions/subagents/subagent-resume-1/resume",
+            json={
+                "role": "user",
+                "content": "Resume after applying this guidance.",
+                "metadata": {"channel": "session-subagent-action-test"},
+            },
+        )
+
+    assert cancel_response.status_code == 200
+    cancel_payload = cancel_response.json()
+    assert cancel_calls == ["delegated-cancel-task"]
+    assert cancel_payload["type"] == "session_subagent_action"
+    assert cancel_payload["action"] == "cancel"
+    assert cancel_payload["task_id"] == "delegated-cancel-task"
+    assert cancel_payload["task"]["status"] == "cancelled"
+    assert cancel_payload["transcript"]["subagent_id"] == "subagent-cancel-1"
+
+    assert resume_response.status_code == 200
+    resume_payload = resume_response.json()
+    assert resume_calls == [
+        {
+            "task_id": "delegated-resume-task",
+            "decision": "approve_once",
+            "reason": "Session subagent resume requested",
+            "rule": None,
+        }
+    ]
+    assert resume_payload["action"] == "resume"
+    assert resume_payload["task_id"] == "delegated-resume-task"
+    assert resume_payload["task"]["status"] == "running"
+    assert resume_payload["transcript"]["event_count"] == 1
+    guidance_event = resume_payload["transcript"]["events"][-1]
+    assert guidance_event["type"] == "subagent_progress"
+    assert guidance_event["content"] == "Resume after applying this guidance."
+    assert guidance_event["metadata"]["source"] == "session_subagent_message_api"
+    assert guidance_event["metadata"]["resume_requested"] is True
+
+
+def test_session_subagent_api_cancel_resume_requires_task_link(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    runtime_db = sessions_dir / "runtime.db"
+    app, _engine = _build_app()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    runtime_service = RuntimeService(engine=object(), store=RuntimeStore(runtime_db))
+    app.state.runtime_service = runtime_service
+
+    asyncio.run(
+        app.state.session_store.save_event(
+            "session-subagent-unlinked",
+            {
+                "type": "session_meta",
+                "event": "created",
+                "session_id": "session-subagent-unlinked",
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.upsert_subagent_transcript(
+            subagent_id="subagent-unlinked-1",
+            parent_type="session",
+            parent_id="session-subagent-unlinked",
+            session_id="session-subagent-unlinked",
+            role_id="writer",
+            title="Writer",
+            status="running",
+            metadata={},
+        )
+    )
+
+    with TestClient(app) as client:
+        cancel_response = client.post(
+            "/v1/sessions/session-subagent-unlinked/subagents/subagent-unlinked-1/cancel"
+        )
+        resume_response = client.post(
+            "/v1/sessions/session-subagent-unlinked/subagents/subagent-unlinked-1/resume"
+        )
+
+    assert cancel_response.status_code == 409
+    assert cancel_response.json()["detail"] == "Session subagent is not linked to a delegated task"
+    assert resume_response.status_code == 409
+    assert resume_response.json()["detail"] == "Session subagent is not linked to a delegated task"
+
+
+def test_delegated_subagent_resume_replays_session_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_requests: list[Any] = []
+
+    class _GuidanceCapturingOrchestrator:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def run(self, request: Any) -> MultiAgentRunResult:
+            captured_requests.append(request)
+            return MultiAgentRunResult(
+                run_id=request.run_id,
+                protocol="teacher_student_distill",
+                state="succeeded",
+                task_input=request.task_input,
+                candidates=[],
+                selected_candidate_id=None,
+                evaluation=None,
+                artifacts={"final_answer": "Resumed with durable guidance."},
+                events=[],
+            )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator", _GuidanceCapturingOrchestrator)
+    store = RuntimeStore(tmp_path / "runtime-guidance.db")
+    service = RuntimeService(engine=object(), store=store)
+
+    async def _run() -> dict[str, Any] | None:
+        await store.create_task_run(
+            task_id="delegated-guidance-task",
+            input_text="Compare two implementations.",
+            session_id="session-guidance-replay",
+            project_id=None,
+            workspace_dir=None,
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            task_type="delegated_multi_agent",
+            metadata={
+                "protocol": "teacher_student_distill",
+                "delegated_subagent": {
+                    "display_name": "Researcher",
+                    "role": "researcher",
+                    "instruction": "Compare two implementations.",
+                    "objective": "Compare two implementations.",
+                    "parent_session_id": "session-guidance-replay",
+                    "status": "failed",
+                },
+            },
+        )
+        await store.update_task_status("delegated-guidance-task", "failed", error="Needs guidance.")
+        await store.upsert_subagent_transcript(
+            subagent_id="guidance-researcher",
+            parent_type="delegated_task",
+            parent_id="delegated-guidance-task",
+            session_id="session-guidance-replay",
+            role_id="researcher",
+            title="Researcher",
+            status="failed",
+            metadata={"task_id": "delegated-guidance-task"},
+        )
+        await store.append_subagent_transcript_event(
+            "guidance-researcher",
+            {
+                "type": "subagent_message",
+                "subagent_id": "guidance-researcher",
+                "target_role_id": "researcher",
+                "content": "Prefer the simpler implementation unless risk is materially lower.",
+                "metadata": {"source": "session_subagent_message_api"},
+                "created_at": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+        summary = await service.resume_task(
+            "delegated-guidance-task",
+            decision="approve_once",
+            reason="test resume",
+        )
+        job = service._active_jobs.get("delegated-guidance-task")  # noqa: SLF001
+        if job is not None:
+            await job
+        return summary
+
+    summary = asyncio.run(_run())
+
+    assert summary is not None
+    assert captured_requests
+    request = captured_requests[0]
+    assert request.guidance_messages == []
+    assert request.role_guidance_messages == {
+        "researcher": ["Prefer the simpler implementation unless risk is materially lower."]
+    }
+
+
 def test_chat_stream_route_returns_sse_events_incrementally() -> None:
     """`POST /v1/chat/stream` 應以 SSE 逐筆送出 serialized chat events。"""
     app, engine = _build_app()
@@ -545,6 +1008,228 @@ def test_chat_stream_route_returns_sse_events_incrementally() -> None:
         },
     ]
 
+def test_stream_chat_events_close_underlying_stream_on_generator_close(tmp_path: Path) -> None:
+    closed = threading.Event()
+    sessions_dir = tmp_path / "sessions"
+
+    class _DisconnectEngine(_FakeEngine):
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, Any] | None = None,
+            project_id: str | None = None,
+            workspace_dir: str | None = None,
+            selected_skill_ids: list[str] | None = None,
+            attachments: list[AttachmentRef] | None = None,
+        ) -> AsyncIterator[object]:
+            _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids, attachments)
+            self.chat_calls.append((message, session_id))
+            try:
+                yield ThinkingEvent(content="stream-open")
+                await asyncio.Future()
+            finally:
+                closed.set()
+
+    app, engine = _build_app(engine=_DisconnectEngine())
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    app.state.runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(sessions_dir / "runtime-disconnect.db"),
+    )
+
+    async def _receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = StarletteRequest(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/stream",
+            "headers": [],
+            "app": app,
+        },
+        _receive,
+    )
+
+    async def _run() -> None:
+        stream = engine.chat("disconnect me", session_id="session-disconnect")
+        wrapped = _stream_chat_events(
+            request,
+            "session-disconnect",
+            stream,
+            fallback_turn_id="turn-disconnect",
+        )
+        first = await anext(wrapped)
+        assert first["type"] == "thinking"
+        await wrapped.aclose()
+
+    asyncio.run(_run())
+
+    assert engine.chat_calls == [("disconnect me", "session-disconnect")]
+    assert closed.wait(timeout=1.0)
+
+
+def test_agent_engine_cancel_chat_run_cancels_active_run() -> None:
+    engine = AgentEngine.__new__(AgentEngine)
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    async def _fake_invoke(
+        self: AgentEngine,
+        request: AgentInvocationRequest,
+        *,
+        event_callback=None,
+    ) -> AgentInvocationResult:
+        del self, request
+        if event_callback is not None:
+            await event_callback(ThinkingEvent(content="working"))
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return AgentInvocationResult(
+            content="",
+            events=[],
+            diagnostics=AgentInvocationDiagnostics(
+                execution_profile="chat",
+                tool_mode="auto",
+            ),
+        )
+
+    engine._invoke_shared_runtime = _fake_invoke.__get__(engine, AgentEngine)  # type: ignore[attr-defined]
+
+    async def _exercise() -> dict[str, Any]:
+        stream = engine.chat(
+            "cancel me",
+            session_id="session-cancel",
+            turn_id="turn-cancel",
+        )
+        first = await anext(stream)
+        assert isinstance(first, ThinkingEvent)
+        assert started.wait(timeout=1.0)
+        result = await engine.cancel_chat_run("session-cancel", turn_id="turn-cancel")
+        with contextlib.suppress(StopAsyncIteration):
+            await anext(stream)
+        await stream.aclose()
+        return result
+
+    cancel_response = asyncio.run(_exercise())
+
+    assert cancel_response["status"] == "cancel_requested"
+    assert cancel_response["run_state"] == "cancelled"
+    assert cancel_response["cancel_outcome"] == "cancelled"
+    assert cancelled.wait(timeout=1.0)
+
+
+def test_chat_cancel_endpoint_forwards_to_engine() -> None:
+    class _CancelableEngine(_FakeEngine):
+        async def cancel_chat_run(
+            self,
+            session_id: str,
+            *,
+            turn_id: str | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "status": "cancel_requested",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "run_state": "cancelled",
+                "cancel_outcome": "cancelled",
+                "cancel_reason": None,
+            }
+
+    app, _ = _build_app(engine=_CancelableEngine())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/session-endpoint/cancel",
+            json={"turn_id": "turn-endpoint"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "cancel_requested",
+        "session_id": "session-endpoint",
+        "turn_id": "turn-endpoint",
+        "run_state": "cancelled",
+        "cancel_outcome": "cancelled",
+        "cancel_reason": None,
+    }
+
+
+def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_race() -> None:
+    engine = AgentEngine.__new__(AgentEngine)
+    cancelled = threading.Event()
+
+    async def _fake_invoke(
+        self: AgentEngine,
+        request: AgentInvocationRequest,
+        *,
+        event_callback=None,
+    ) -> AgentInvocationResult:
+        del self, request
+        final = FinalAnswerEvent(content="done")
+        if event_callback is not None:
+            await event_callback(ThinkingEvent(content="working"))
+            await event_callback(final)
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return AgentInvocationResult(
+            content="done",
+            events=[final],
+            diagnostics=AgentInvocationDiagnostics(
+                execution_profile="chat",
+                tool_mode="auto",
+            ),
+        )
+
+    engine._invoke_shared_runtime = _fake_invoke.__get__(engine, AgentEngine)  # type: ignore[attr-defined]
+
+    async def _noop_close(self: AgentEngine) -> None:
+        del self
+
+    engine.close = _noop_close.__get__(engine, AgentEngine)  # type: ignore[attr-defined]
+    app, _ = _build_app(engine=engine)  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={"message": "finish first", "session_id": "session-complete-race"},
+        ) as response:
+            seen_final = False
+            for line in response.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line.removeprefix("data: "))
+                if payload.get("type") == "final_answer":
+                    seen_final = True
+                    break
+            assert seen_final is True
+            turn_id = response.headers["x-turn-id"]
+            cancel_response = client.post(
+                "/v1/chat/session-complete-race/cancel",
+                json={"turn_id": turn_id},
+            )
+
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "already_completed"
+    assert cancel_response.json()["run_state"] == "completed"
+    assert cancel_response.json()["cancel_outcome"] == "completed"
+    assert cancelled.is_set() is False
+
 
 def test_agent_engine_chat_yields_events_before_invocation_finishes() -> None:
     """`AgentEngine.chat()` should surface intermediate events before the invocation fully completes."""
@@ -599,6 +1284,2471 @@ def test_agent_engine_chat_yields_events_before_invocation_finishes() -> None:
     assert [event.type for event in events] == ["thinking", "final_answer"]
     assert first_event_elapsed < 0.15
     assert total_elapsed >= 0.25
+
+
+def test_agent_engine_chat_teardown_cancels_worker() -> None:
+    engine = AgentEngine.__new__(AgentEngine)
+    cancelled = threading.Event()
+
+    async def _fake_invoke(
+        self: AgentEngine,
+        request: AgentInvocationRequest,
+        *,
+        event_callback=None,
+    ) -> AgentInvocationResult:
+        del self, request
+        thinking = ThinkingEvent(content="streaming-thought")
+        if event_callback is not None:
+            await event_callback(thinking)
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return AgentInvocationResult(
+            content="",
+            events=[thinking],
+            diagnostics=AgentInvocationDiagnostics(
+                execution_profile="chat",
+                tool_mode="auto",
+            ),
+        )
+
+    engine._invoke_shared_runtime = _fake_invoke.__get__(engine, AgentEngine)  # type: ignore[attr-defined]
+
+    async def _consume_and_close() -> None:
+        stream = engine.chat(
+            "hello",
+            session_id="session-stream-cancel",
+            turn_id="turn-stream-cancel",
+        )
+        first_event = await anext(stream)
+        assert isinstance(first_event, ThinkingEvent)
+        await stream.aclose()
+
+    asyncio.run(_consume_and_close())
+
+    assert cancelled.wait(timeout=1.0)
+
+
+def test_run_cancellation_context_cancels_generation_when_no_tool_is_active() -> None:
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        context = RunCancellationContext(run_id="run-no-tool")
+        task = asyncio.create_task(asyncio.sleep(60))
+        await context.bind_generation_cancel_callback(lambda: cancel_asyncio_task(task))
+        result = await context.request_run_cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return result.__dict__, await context.snapshot()
+
+    result, snapshot = asyncio.run(_run())
+
+    assert result["cancelled"] is True
+    assert result["state"] == "cancelled"
+    assert result["boundary"] == "generation"
+    assert snapshot["state"] == "cancelled"
+    assert snapshot["cancel_confirmed"] is True
+
+
+def test_run_cancellation_context_cancels_cancellable_active_tool_before_stopping_run() -> None:
+    async def _run() -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+        context = RunCancellationContext(run_id="run-cancellable-tool")
+        controller = ActiveToolController()
+        await context.bind_active_tool_controller(controller)
+        task = asyncio.create_task(asyncio.sleep(60))
+        await context.bind_generation_cancel_callback(lambda: cancel_asyncio_task(task))
+        await controller.activate_tool(
+            tool_call_id="call-tool",
+            tool_name="exec_command",
+            cancellable=True,
+        )
+        trace: list[str] = []
+
+        async def _cancel() -> ToolCancellationResult:
+            trace.append("tool")
+            await controller.finish_tool()
+            return ToolCancellationResult(
+                cancelled=True,
+                reason="tool_cancelled",
+                tool_call_id="call-tool",
+                tool_name="exec_command",
+            )
+
+        await controller.bind_cancel_callback(session_id="session-tool", callback=_cancel)
+        result = await context.request_run_cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return result.__dict__, await context.snapshot(), trace
+
+    result, snapshot, trace = asyncio.run(_run())
+
+    assert trace == ["tool"]
+    assert result["cancelled"] is True
+    assert result["state"] == "cancelled"
+    assert result["boundary"] == "generation"
+    assert snapshot["state"] == "cancelled"
+
+
+def test_run_cancellation_context_defers_when_active_tool_is_not_cancellable() -> None:
+    async def _run() -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+        context = RunCancellationContext(run_id="run-non-cancellable-tool")
+        controller = ActiveToolController()
+        await context.bind_active_tool_controller(controller)
+        generation_calls: list[str] = []
+
+        async def _cancel_generation() -> str:
+            generation_calls.append("generation")
+            return "cancelled"
+
+        await context.bind_generation_cancel_callback(_cancel_generation)
+        await controller.activate_tool(
+            tool_call_id="call-tool",
+            tool_name="non_cancellable_tool",
+            cancellable=False,
+        )
+        result = await context.request_run_cancel()
+        return result.__dict__, await context.snapshot(), generation_calls
+
+    result, snapshot, generation_calls = asyncio.run(_run())
+
+    assert result["cancelled"] is False
+    assert result["state"] == "pending"
+    assert result["boundary"] == "tool"
+    assert result["reason"] == "tool_in_progress"
+    assert snapshot["state"] == "cancelling"
+    assert generation_calls == []
+
+
+def test_chat_subagent_stream_synthesizes_and_persists_subagent_events(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+
+    class _FakeSubagentEngine(_FakeEngine):
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, Any] | None = None,
+            project_id: str | None = None,
+            workspace_dir: str | None = None,
+            selected_skill_ids: list[str] | None = None,
+            attachments: list[AttachmentRef] | None = None,
+        ) -> AsyncIterator[object]:
+            _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids, attachments)
+            self.chat_calls.append((message, session_id))
+            yield ThinkingEvent(content="Planning delegation")
+            yield ToolCallRequestEvent(
+                call_id="call-subagent-1",
+                tool_name="delegate_subagent_task",
+                arguments={
+                    "objective": "Research perspective A and perspective B, then compare them.",
+                    "suggested_roles": ["researcher_a", "researcher_b"],
+                    "suggested_models": {"researcher_a": "gpt-5.4", "researcher_b": "gpt-5.4"},
+                    "expected_artifacts": ["comparison memo"],
+                },
+            )
+            yield ToolCallResultEvent(
+                call_id="call-subagent-1",
+                tool_name="delegate_subagent_task",
+                result={
+                    "status": "queued",
+                    "task_id": "subagent-task-1",
+                    "task_type": "delegated_multi_agent",
+                    "display_name": "Delegated comparison",
+                    "parent_session_id": session_id,
+                },
+                metadata={
+                    "status": "queued",
+                    "task_id": "subagent-task-1",
+                    "task_type": "delegated_multi_agent",
+                    "parent_session_id": session_id,
+                },
+            )
+            yield FinalAnswerEvent(content="I delegated the comparison to background subagents.")
+
+    app, engine = _build_app(engine=_FakeSubagentEngine())
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    runtime_service = RuntimeService(engine=object(), store=RuntimeStore(sessions_dir / "runtime.db"))
+    app.state.runtime_service = runtime_service
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={
+                "message": "Use subagents to compare approach A and approach B.",
+                "session_id": "session-subagent-stream",
+            },
+        ) as response:
+            chunks = [
+                line.removeprefix("data: ")
+                for line in response.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+        detail_response = client.get(
+            "/v1/sessions/session-subagent-stream/subagents/subagent-task-1"
+        )
+
+    assert response.status_code == 200
+    assert engine.chat_calls == [
+        ("Use subagents to compare approach A and approach B.", "session-subagent-stream")
+    ]
+
+    events = [json.loads(chunk) for chunk in chunks]
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "thinking",
+        "tool_call_request",
+        "tool_call_result",
+        "subagent_started",
+        "subagent_prompt",
+        "subagent_progress",
+        "final_answer",
+    ]
+    turn_ids = {event["turn_id"] for event in events}
+    assert len(turn_ids) == 1
+    turn_id = next(iter(turn_ids))
+    assert turn_id
+
+    started_event = events[3]
+    prompt_event = events[4]
+    progress_event = events[5]
+    assert started_event["subagent_id"] == "subagent-task-1"
+    assert started_event["parent_type"] == "chat_turn"
+    assert started_event["parent_id"] == turn_id
+    assert started_event["model_id"] == "gpt-5.4"
+    assert started_event["status"] == "queued"
+    assert prompt_event["type"] == "subagent_prompt"
+    assert prompt_event["status"] == "queued"
+    assert prompt_event["user_prompt"] == "Research perspective A and perspective B, then compare them."
+    assert progress_event["type"] == "subagent_progress"
+    assert progress_event["status"] == "queued"
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert detail_payload["subagent_id"] == "subagent-task-1"
+    assert detail_payload["session_id"] == "session-subagent-stream"
+    assert detail_payload["parent_turn_id"] == turn_id
+    assert detail_payload["status"] == "queued"
+    assert [event["type"] for event in detail_payload["events"]] == [
+        "subagent_started",
+        "subagent_prompt",
+        "subagent_progress",
+    ]
+
+
+def test_chat_subagent_stream_projects_live_delegated_runtime_events(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    runtime_service = RuntimeService(engine=object(), store=RuntimeStore(sessions_dir / "runtime.db"))
+
+    class _FakeLiveProjectionEngine(_FakeEngine):
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, Any] | None = None,
+            project_id: str | None = None,
+            workspace_dir: str | None = None,
+            selected_skill_ids: list[str] | None = None,
+            attachments: list[AttachmentRef] | None = None,
+        ) -> AsyncIterator[object]:
+            _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids, attachments)
+            self.chat_calls.append((message, session_id))
+            yield ThinkingEvent(content="Planning delegation")
+            yield ToolCallRequestEvent(
+                call_id="call-live-subagent-1",
+                tool_name="delegate_subagent_task",
+                arguments={"objective": "Track live delegated progress."},
+            )
+            yield ToolCallResultEvent(
+                call_id="call-live-subagent-1",
+                tool_name="delegate_subagent_task",
+                result={
+                    "status": "queued",
+                    "task_id": "subagent-live-task-1",
+                    "task_type": "delegated_multi_agent",
+                    "display_name": "Live delegated task",
+                    "parent_session_id": session_id,
+                },
+                metadata={
+                    "status": "queued",
+                    "task_id": "subagent-live-task-1",
+                    "task_type": "delegated_multi_agent",
+                    "parent_session_id": session_id,
+                },
+            )
+            yield FinalAnswerEvent(content="The live delegated task is running.")
+            await asyncio.sleep(0.01)
+            runtime_service._publish_delegated_subagent_runtime_event(  # noqa: SLF001
+                session_id=session_id,
+                task_id="subagent-live-task-1",
+                event={
+                    "type": "subagent_progress",
+                    "subagent_id": "live-worker-1",
+                    "parent_type": "delegated_task",
+                    "parent_id": "subagent-live-task-1",
+                    "role_id": "researcher",
+                    "title": "Live Researcher",
+                    "status": "running",
+                    "summary": "Live researcher found the first relevant source.",
+                    "metadata": {
+                        "source": "delegate_subagent_task_runtime",
+                        "task_id": "subagent-live-task-1",
+                    },
+                },
+            )
+            runtime_service._publish_delegated_subagent_runtime_event(  # noqa: SLF001
+                session_id=session_id,
+                task_id="subagent-live-task-1",
+                event={
+                    "type": "subagent_completed",
+                    "subagent_id": "live-worker-1",
+                    "parent_type": "delegated_task",
+                    "parent_id": "subagent-live-task-1",
+                    "role_id": "researcher",
+                    "title": "Live Researcher",
+                    "status": "completed",
+                    "summary": "Live researcher completed the delegated work.",
+                    "content": "Live delegated work complete.",
+                    "metadata": {
+                        "source": "delegate_subagent_task_runtime",
+                        "task_id": "subagent-live-task-1",
+                    },
+                },
+            )
+
+    app, engine = _build_app(engine=_FakeLiveProjectionEngine())
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    app.state.runtime_service = runtime_service
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={
+                "message": "Delegate this and keep streaming live status.",
+                "session_id": "session-live-projection",
+            },
+        ) as response:
+            chunks = [
+                line.removeprefix("data: ")
+                for line in response.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+    assert response.status_code == 200
+    assert engine.chat_calls == [
+        ("Delegate this and keep streaming live status.", "session-live-projection")
+    ]
+    events = [json.loads(chunk) for chunk in chunks]
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "thinking",
+        "tool_call_request",
+        "tool_call_result",
+        "subagent_started",
+        "subagent_prompt",
+        "subagent_progress",
+        "final_answer",
+        "subagent_progress",
+        "subagent_completed",
+    ]
+    live_progress = events[-2]
+    live_completed = events[-1]
+    assert live_progress["subagent_id"] == "live-worker-1"
+    assert live_progress["summary"] == "Live researcher found the first relevant source."
+    assert live_completed["subagent_id"] == "live-worker-1"
+    assert live_completed["status"] == "completed"
+    assert live_completed["content"] == "Live delegated work complete."
+    assert live_progress["turn_id"] == live_completed["turn_id"]
+
+
+def test_chat_subagent_stream_projects_live_delegated_control_events(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    runtime_service = RuntimeService(engine=object(), store=RuntimeStore(sessions_dir / "runtime.db"))
+
+    class _FakeLiveControlEngine(_FakeEngine):
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, Any] | None = None,
+            project_id: str | None = None,
+            workspace_dir: str | None = None,
+            selected_skill_ids: list[str] | None = None,
+            attachments: list[AttachmentRef] | None = None,
+        ) -> AsyncIterator[object]:
+            _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids, attachments)
+            self.chat_calls.append((message, session_id))
+            yield ToolCallRequestEvent(
+                call_id="call-live-control-1",
+                tool_name="delegate_subagent_task",
+                arguments={"objective": "Track live delegated control events."},
+            )
+            yield ToolCallResultEvent(
+                call_id="call-live-control-1",
+                tool_name="delegate_subagent_task",
+                result={
+                    "status": "queued",
+                    "task_id": "subagent-live-control-task-1",
+                    "task_type": "delegated_multi_agent",
+                    "display_name": "Live delegated control task",
+                    "parent_session_id": session_id,
+                },
+                metadata={
+                    "status": "queued",
+                    "task_id": "subagent-live-control-task-1",
+                    "task_type": "delegated_multi_agent",
+                    "parent_session_id": session_id,
+                },
+            )
+            yield FinalAnswerEvent(content="The delegated control task is running.")
+            await asyncio.sleep(0.01)
+            runtime_service._publish_delegated_subagent_runtime_event(  # noqa: SLF001
+                session_id=session_id,
+                task_id="subagent-live-control-task-1",
+                event={
+                    "type": "subagent_tool_cancel_requested",
+                    "subagent_id": "live-control-worker-1",
+                    "parent_type": "delegated_task",
+                    "parent_id": "subagent-live-control-task-1",
+                    "role_id": "researcher",
+                    "title": "Live Control Researcher",
+                    "status": "running",
+                    "message_id": "live-control-message-1",
+                    "delivery_mode": "inject_now",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                    "reason": "operator_request",
+                },
+            )
+            runtime_service._publish_delegated_subagent_runtime_event(  # noqa: SLF001
+                session_id=session_id,
+                task_id="subagent-live-control-task-1",
+                event={
+                    "type": "subagent_tool_cancelled",
+                    "subagent_id": "live-control-worker-1",
+                    "parent_type": "delegated_task",
+                    "parent_id": "subagent-live-control-task-1",
+                    "role_id": "researcher",
+                    "title": "Live Control Researcher",
+                    "status": "cancelled",
+                    "message_id": "live-control-message-1",
+                    "tool_call_id": "tool-call-live-control-1",
+                    "tool_name": "exec_command",
+                    "delivery_mode": "inject_now",
+                    "delivery_reason": "tool_cancelled",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                    "reason": "tool_cancelled",
+                },
+            )
+
+    app, engine = _build_app(engine=_FakeLiveControlEngine())
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    app.state.runtime_service = runtime_service
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={
+                "message": "Delegate and stream live control events.",
+                "session_id": "session-subagent-live-control-stream",
+            },
+        ) as response:
+            chunks = [
+                line.removeprefix("data: ")
+                for line in response.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+    assert response.status_code == 200
+    assert engine.chat_calls == [
+        ("Delegate and stream live control events.", "session-subagent-live-control-stream")
+    ]
+    events = [json.loads(chunk) for chunk in chunks]
+    live_events = [
+        event
+        for event in events
+        if event["type"] in {"subagent_tool_cancel_requested", "subagent_tool_cancelled"}
+    ]
+    assert [event["type"] for event in live_events] == [
+        "subagent_tool_cancel_requested",
+        "subagent_tool_cancelled",
+    ]
+    assert live_events[1]["tool_name"] == "exec_command"
+    assert live_events[1]["delivery_reason"] == "tool_cancelled"
+
+
+def test_delegated_subagent_runtime_events_persist_session_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _SlowFirstUpsertRuntimeStore(RuntimeStore):
+        async def upsert_subagent_transcript(self, **kwargs: Any) -> dict[str, Any]:
+            metadata = kwargs.get("metadata")
+            if (
+                kwargs.get("subagent_id") == "live-researcher-1"
+                and isinstance(metadata, dict)
+                and metadata.get("task_event_seq") == 1
+            ):
+                await asyncio.sleep(0.02)
+            return await super().upsert_subagent_transcript(**kwargs)
+
+    class _FakeLiveOrchestrator:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def run(self, request: Any) -> MultiAgentRunResult:
+            assert request.runtime_event_callback is not None
+            events = [
+                MultiAgentRunEvent(
+                    run_id="delegated-live-task",
+                    seq=1,
+                    type="subagent_prompt",
+                    payload={
+                        "subagent_id": "live-researcher-1",
+                        "role_id": "researcher",
+                        "title": "Researcher",
+                        "model_id": "gpt-5.4",
+                        "system_prompt": "Inspect the evidence and report only supported claims.",
+                        "user_prompt": "Compare approach A and approach B.",
+                        "stage": "prompt",
+                    },
+                    timestamp="2026-06-30T01:00:00Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-live-task",
+                    seq=2,
+                    type="role_started",
+                    payload={
+                        "subagent_id": "live-researcher-1",
+                        "role_id": "researcher",
+                        "title": "Researcher",
+                        "model_id": "gpt-5.4",
+                        "summary": "Researcher started.",
+                    },
+                    timestamp="2026-06-30T01:00:01Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-live-task",
+                    seq=3,
+                    type="subagent_tool_call",
+                    payload={
+                        "subagent_id": "live-researcher-1",
+                        "role_id": "researcher",
+                        "title": "Researcher",
+                        "model_id": "gpt-5.4",
+                        "tool_call_id": "tool-call-1",
+                        "tool_name": "web_search",
+                        "arguments_preview": '{"query": "approach A vs approach B"}',
+                        "summary": "Researcher requested web_search.",
+                    },
+                    timestamp="2026-06-30T01:00:02Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-live-task",
+                    seq=4,
+                    type="subagent_tool_result",
+                    payload={
+                        "subagent_id": "live-researcher-1",
+                        "role_id": "researcher",
+                        "title": "Researcher",
+                        "model_id": "gpt-5.4",
+                        "tool_call_id": "tool-call-1",
+                        "tool_name": "web_search",
+                        "status": "completed",
+                        "summary": "web_search completed.",
+                    },
+                    timestamp="2026-06-30T01:00:03Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-live-task",
+                    seq=5,
+                    type="runtime_blocked",
+                    payload={
+                        "role_id": "controller",
+                        "blocker_type": "approval",
+                        "summary": "Controller is waiting for approval.",
+                    },
+                    timestamp="2026-06-30T01:00:04Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-live-task",
+                    seq=6,
+                    type="role_completed",
+                    payload={
+                        "subagent_id": "live-researcher-1",
+                        "role_id": "researcher",
+                        "title": "Researcher",
+                        "model_id": "gpt-5.4",
+                        "summary": "Approach A has lower setup cost; approach B has lower operational risk.",
+                    },
+                    timestamp="2026-06-30T01:00:05Z",
+                ),
+            ]
+            await asyncio.gather(
+                *[
+                    asyncio.create_task(request.runtime_event_callback(event))
+                    for event in events
+                ]
+            )
+            return MultiAgentRunResult(
+                run_id="delegated-live-task",
+                protocol="teacher_student_distill",
+                state="succeeded",
+                task_input=request.task_input,
+                candidates=[],
+                selected_candidate_id=None,
+                evaluation=None,
+                artifacts={"final_answer": "Live delegated comparison complete."},
+                events=events,
+            )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator", _FakeLiveOrchestrator)
+    store = _SlowFirstUpsertRuntimeStore(tmp_path / "runtime-live.db")
+    service = RuntimeService(engine=object(), store=store)
+
+    async def _run() -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+        await store.create_task_run(
+            task_id="delegated-live-task",
+            input_text="Compare approach A and approach B.",
+            session_id="session-live-subagent",
+            project_id=None,
+            workspace_dir=None,
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            task_type="delegated_multi_agent",
+            metadata={
+                "protocol": "teacher_student_distill",
+                "delegated_subagent": {
+                    "display_name": "Delegated Researcher",
+                    "role": "researcher",
+                    "instruction": "Compare approach A and approach B.",
+                    "objective": "Compare approach A and approach B.",
+                    "parent_session_id": "session-live-subagent",
+                    "status": "queued",
+                },
+            },
+        )
+        await service._run_task(task_id="delegated-live-task")  # noqa: SLF001
+        task = await store.get_task_run("delegated-live-task")
+        transcripts = await store.list_subagent_transcripts(session_id="session-live-subagent")
+        detail = await store.get_subagent_transcript("live-researcher-1")
+        return task or {}, transcripts, detail
+
+    task, transcripts, detail = asyncio.run(_run())
+
+    assert task["status"] == "succeeded"
+    assert [item["subagent_id"] for item in transcripts] == ["live-researcher-1"]
+    summary = transcripts[0]
+    assert summary["parent_type"] == "delegated_task"
+    assert summary["parent_id"] == "delegated-live-task"
+    assert summary["session_id"] == "session-live-subagent"
+    assert summary["status"] == "completed"
+    assert summary["event_count"] == 5
+    assert detail is not None
+    assert detail["system_prompt"] == "Inspect the evidence and report only supported claims."
+    assert detail["user_prompt"] == "Compare approach A and approach B."
+    assert detail["metadata"]["source"] == "delegate_subagent_task_runtime"
+    assert detail["metadata"]["task_id"] == "delegated-live-task"
+    assert [event["type"] for event in detail["events"]] == [
+        "subagent_prompt",
+        "subagent_started",
+        "subagent_tool_call",
+        "subagent_tool_result",
+        "subagent_completed",
+    ]
+    assert detail["events"][2]["tool_name"] == "web_search"
+    assert detail["events"][3]["status"] == "completed"
+
+
+def test_delegated_subagent_runtime_interruption_delivery_applies_queued_session_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _InterruptAwareOrchestrator:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def run(self, request: Any) -> MultiAgentRunResult:
+            assert request.subagent_message_provider is not None
+            assert request.runtime_event_callback is not None
+            messages = await request.subagent_message_provider.poll_messages(
+                task_id="delegated-interrupt-task",
+                subagent_id="interrupt-subagent-1",
+                role_id="researcher",
+                stage="role::researcher",
+                safe_point="before_model_invocation",
+            )
+            assert [item["content"] for item in messages] == ["Narrow the analysis to option B."]
+            message_id = messages[0]["message_id"]
+            events = [
+                MultiAgentRunEvent(
+                    run_id="delegated-interrupt-task",
+                    seq=1,
+                    type="subagent_message_accepted",
+                    payload={
+                        "subagent_id": "interrupt-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "delivery_status": "accepted",
+                        "content": messages[0]["content"],
+                    },
+                    timestamp="2026-06-30T02:00:00Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-interrupt-task",
+                    seq=2,
+                    type="subagent_message_applied",
+                    payload={
+                        "subagent_id": "interrupt-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "delivery_status": "applied",
+                        "content": messages[0]["content"],
+                    },
+                    timestamp="2026-06-30T02:00:01Z",
+                ),
+            ]
+            for event in events:
+                await request.runtime_event_callback(event)
+            await request.subagent_message_provider.mark_messages_handled(
+                message_ids=[message_id],
+                status="applied",
+            )
+            assert await request.subagent_message_provider.poll_messages(
+                task_id="delegated-interrupt-task",
+                subagent_id="interrupt-subagent-1",
+                role_id="researcher",
+                stage="role::researcher",
+                safe_point="before_model_invocation",
+            ) == []
+            return MultiAgentRunResult(
+                run_id="delegated-interrupt-task",
+                protocol="teacher_student_distill",
+                state="succeeded",
+                task_input=request.task_input,
+                candidates=[],
+                selected_candidate_id=None,
+                evaluation=None,
+                artifacts={"final_answer": "Applied queued guidance."},
+                events=events,
+            )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator", _InterruptAwareOrchestrator)
+    store = RuntimeStore(tmp_path / "runtime-interrupt.db")
+    service = RuntimeService(engine=object(), store=store)
+
+    async def _run() -> dict[str, Any] | None:
+        await store.create_task_run(
+            task_id="delegated-interrupt-task",
+            input_text="Compare option A and option B.",
+            session_id="session-interrupt-subagent",
+            project_id=None,
+            workspace_dir=None,
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            task_type="delegated_multi_agent",
+            metadata={
+                "protocol": "teacher_student_distill",
+                "delegated_subagent": {
+                    "display_name": "Delegated Researcher",
+                    "role": "researcher",
+                    "instruction": "Compare option A and option B.",
+                    "objective": "Compare option A and option B.",
+                    "parent_session_id": "session-interrupt-subagent",
+                    "status": "queued",
+                },
+            },
+        )
+        await store.upsert_subagent_transcript(
+            subagent_id="interrupt-subagent-1",
+            parent_type="delegated_task",
+            parent_id="delegated-interrupt-task",
+            session_id="session-interrupt-subagent",
+            role_id="researcher",
+            title="Researcher",
+            status="running",
+            metadata={"task_id": "delegated-interrupt-task"},
+        )
+        await store.append_subagent_transcript_event(
+            "interrupt-subagent-1",
+            {
+                "type": "subagent_message",
+                "message_id": "queued-message-1",
+                "subagent_id": "interrupt-subagent-1",
+                "target_role_id": "researcher",
+                "content": "Narrow the analysis to option B.",
+                "delivery_mode": "inject_now",
+                "delivery_status": "queued",
+                "metadata": {"source": "session_subagent_message_api"},
+                "created_at": "2026-06-30T01:59:59Z",
+            },
+        )
+        await service._run_task(task_id="delegated-interrupt-task")  # noqa: SLF001
+        return await store.get_subagent_transcript("interrupt-subagent-1")
+
+    detail = asyncio.run(_run())
+
+    assert detail is not None
+    assert [event["type"] for event in detail["events"]] == [
+        "subagent_message",
+        "subagent_message_accepted",
+        "subagent_message_applied",
+    ]
+    assert detail["events"][1]["message_id"] == "queued-message-1"
+    assert detail["events"][2]["delivery_status"] == "applied"
+
+
+def test_subagent_interrupt_cancel_message_emits_protocol_events() -> None:
+    class _CancelProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+
+        async def poll_messages(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "message_id": "cancel-message-1",
+                    "subagent_id": "run-cancel:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Stop the current tool and inspect the cache.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "tool_cancel_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self.handled.append((message_ids, status, reason))
+
+    provider = _CancelProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=object())
+    orchestrator._current_run_id = "run-cancel"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    applied = asyncio.run(
+        orchestrator._poll_subagent_messages_for_role(  # noqa: SLF001
+            role_id="researcher",
+            subagent_id="run-cancel:researcher:role-researcher",
+            stage="role::researcher",
+            safe_point="after_model_invocation",
+            delivery="defer",
+            reason="generation_in_progress",
+        )
+    )
+
+    assert applied == []
+    assert provider.handled == [(["cancel-message-1"], "deferred", "generation_in_progress")]
+    assert [event_type for event_type, _payload in emitted] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_message_deferred",
+        "subagent_tool_cancel_deferred",
+    ]
+    assert emitted[1][1]["interrupt"] is True
+    assert emitted[2][1]["cancel_current_tool"] is True
+    assert emitted[-1][1]["reason"] == "no_active_tool"
+
+
+def test_subagent_cancel_current_tool_applies_after_true_cancellation() -> None:
+    class _CancellableToolInvocationEngine:
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            controller = request.active_tool_controller
+            assert controller is not None
+            await controller.activate_tool(
+                tool_call_id="tool-call-cancelled",
+                tool_name="exec_command",
+                cancellable=False,
+            )
+            cancelled = asyncio.Event()
+
+            async def _cancel() -> ToolCancellationResult:
+                cancelled.set()
+                return ToolCancellationResult(
+                    cancelled=True,
+                    reason="tool_cancelled",
+                    tool_call_id="tool-call-cancelled",
+                    tool_name="exec_command",
+                    session_id="exec-session-1",
+                )
+
+            await controller.bind_cancel_callback(
+                session_id="exec-session-1",
+                callback=_cancel,
+            )
+
+            applied_messages: list[dict[str, Any]] = []
+            for _ in range(100):
+                if cancelled.is_set():
+                    applied_messages = await controller.consume_post_tool_messages()
+                    if applied_messages:
+                        break
+                await asyncio.sleep(0.01)
+            await controller.finish_tool()
+            return AgentInvocationResult(
+                content=(
+                    str(applied_messages[0].get("content") or "")
+                    if applied_messages
+                    else "Tool was cancelled."
+                ),
+                events=[
+                    ToolCallRequestEvent(
+                        call_id="tool-call-cancelled",
+                        tool_name="exec_command",
+                        arguments={"command": "pytest -q"},
+                    ),
+                    ToolCallResultEvent(
+                        call_id="tool-call-cancelled",
+                        tool_name="exec_command",
+                        result={"status": "cancelled"},
+                        metadata={"status": "cancelled"},
+                    ),
+                ],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _CancelProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_active_tool":
+                return []
+            if "cancel-success-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "cancel-success-1",
+                    "subagent_id": "run-cancel-success:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Stop the current command and inspect the cache.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "tool_cancel_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    provider = _CancelProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=_CancellableToolInvocationEngine())
+    orchestrator._current_run_id = "run-cancel-success"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current command.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-cancel-success:researcher:role-researcher",
+        )
+    )
+
+    assert content == "Stop the current command and inspect the cache."
+    assert provider.handled == [(["cancel-success-1"], "applied", None)]
+    assert [event_type for event_type, _payload in emitted[:5]] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_tool_cancelled",
+        "subagent_message_applied",
+    ]
+    assert emitted[3][1]["tool_name"] == "exec_command"
+    assert emitted[3][1]["tool_call_id"] == "tool-call-cancelled"
+    assert orchestrator._role_guidance_messages["researcher"] == [  # noqa: SLF001
+        "Stop the current command and inspect the cache."
+    ]
+
+
+def test_subagent_interrupt_restarts_after_true_mid_generation_cancellation() -> None:
+    class _InterruptibleInvocationEngine:
+        def __init__(self) -> None:
+            self.invoke_calls = 0
+            self.messages: list[str] = []
+
+        def supports_mid_generation_cancellation(self, *, model_id: str | None = None) -> bool:
+            _ = model_id
+            return True
+
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            self.invoke_calls += 1
+            self.messages.append(request.message)
+            if self.invoke_calls == 1:
+                await asyncio.sleep(5)
+            assert "Live subagent guidance:" in request.message
+            assert "Stop the current direction and inspect the cache first." in request.message
+            return AgentInvocationResult(
+                content="Restarted after the interrupt.",
+                events=[],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _InterruptProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_model_invocation":
+                return []
+            if "midgen-cancel-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "midgen-cancel-1",
+                    "subagent_id": "run-midgen-cancel:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Stop the current direction and inspect the cache first.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "interrupt_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    engine = _InterruptibleInvocationEngine()
+    provider = _InterruptProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=engine)
+    orchestrator._current_run_id = "run-midgen-cancel"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current direction.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-midgen-cancel:researcher:role-researcher",
+        )
+    )
+
+    assert content == "Restarted after the interrupt."
+    assert engine.invoke_calls == 2
+    assert engine.messages[0] == "Inspect the current direction."
+    assert provider.handled == [(["midgen-cancel-1"], "applied", None)]
+    assert [event_type for event_type, _payload in emitted[:5]] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_tool_cancelled",
+        "subagent_message_applied",
+    ]
+    assert emitted[3][1]["reason"] == "model_invocation_cancelled"
+    assert emitted[3][1]["status"] == "running"
+    assert emitted[4][1]["delivery_status"] == "applied"
+    assert orchestrator._role_guidance_messages["researcher"] == [  # noqa: SLF001
+        "Stop the current direction and inspect the cache first."
+    ]
+
+
+def test_subagent_interrupt_restarts_mid_generation_without_tool_cancel_event() -> None:
+    class _InterruptibleInvocationEngine:
+        def __init__(self) -> None:
+            self.invoke_calls = 0
+
+        def supports_mid_generation_cancellation(self, *, model_id: str | None = None) -> bool:
+            _ = model_id
+            return True
+
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            self.invoke_calls += 1
+            if self.invoke_calls == 1:
+                await asyncio.sleep(5)
+            assert "Live subagent guidance:" in request.message
+            assert "Restart with the cache inspection first." in request.message
+            return AgentInvocationResult(
+                content="Restarted after interrupt-only guidance.",
+                events=[],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _InterruptProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_model_invocation":
+                return []
+            if "midgen-interrupt-only-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "midgen-interrupt-only-1",
+                    "subagent_id": "run-midgen-interrupt-only:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Restart with the cache inspection first.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "interrupt_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": False,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    engine = _InterruptibleInvocationEngine()
+    provider = _InterruptProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=engine)
+    orchestrator._current_run_id = "run-midgen-interrupt-only"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current direction.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-midgen-interrupt-only:researcher:role-researcher",
+        )
+    )
+
+    assert content == "Restarted after interrupt-only guidance."
+    assert engine.invoke_calls == 2
+    assert provider.handled == [(["midgen-interrupt-only-1"], "applied", None)]
+    assert [event_type for event_type, _payload in emitted[:3]] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_message_applied",
+    ]
+    assert not any(event_type.startswith("subagent_tool_cancel") for event_type, _payload in emitted)
+
+
+def test_subagent_interrupt_restarts_after_late_mid_generation_cancellation() -> None:
+    class _LateCancelInvocationEngine:
+        def __init__(self) -> None:
+            self.invoke_calls = 0
+
+        def supports_mid_generation_cancellation(self, *, model_id: str | None = None) -> bool:
+            _ = model_id
+            return True
+
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            self.invoke_calls += 1
+            if self.invoke_calls == 1:
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.35)
+                    raise
+            assert "Live subagent guidance:" in request.message
+            assert "Inspect the cache before continuing." in request.message
+            return AgentInvocationResult(
+                content="Restarted after late cancellation.",
+                events=[],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _InterruptProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_model_invocation":
+                return []
+            if "midgen-late-cancel-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "midgen-late-cancel-1",
+                    "subagent_id": "run-midgen-late-cancel:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Inspect the cache before continuing.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "interrupt_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    engine = _LateCancelInvocationEngine()
+    provider = _InterruptProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=engine)
+    orchestrator._current_run_id = "run-midgen-late-cancel"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current direction.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-midgen-late-cancel:researcher:role-researcher",
+        )
+    )
+
+    assert content == "Restarted after late cancellation."
+    assert engine.invoke_calls == 2
+    assert provider.handled == [(["midgen-late-cancel-1"], "applied", None)]
+    assert [event_type for event_type, _payload in emitted[:5]] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_tool_cancelled",
+        "subagent_message_applied",
+    ]
+    assert emitted[3][1]["reason"] == "model_invocation_cancelled"
+
+
+def test_subagent_interrupt_defers_when_mid_generation_cancel_does_not_unwind() -> None:
+    class _StickyInvocationEngine:
+        def __init__(self) -> None:
+            self.invoke_calls = 0
+            self.messages: list[str] = []
+
+        def supports_mid_generation_cancellation(self, *, model_id: str | None = None) -> bool:
+            _ = model_id
+            return True
+
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            self.invoke_calls += 1
+            self.messages.append(request.message)
+            try:
+                await asyncio.sleep(0.15)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+            return AgentInvocationResult(
+                content="The original generation completed.",
+                events=[],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _InterruptProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_model_invocation":
+                return []
+            if "midgen-cancel-fallback-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "midgen-cancel-fallback-1",
+                    "subagent_id": "run-midgen-fallback:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Stop the current direction and inspect the cache first.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "interrupt_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    engine = _StickyInvocationEngine()
+    provider = _InterruptProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=engine)
+    orchestrator._current_run_id = "run-midgen-fallback"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current direction.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-midgen-fallback:researcher:role-researcher",
+        )
+    )
+
+    assert content == "The original generation completed."
+    assert engine.invoke_calls == 1
+    assert engine.messages == ["Inspect the current direction."]
+    assert provider.handled == [
+        (["midgen-cancel-fallback-1"], "deferred", "generation_in_progress")
+    ]
+    protocol_events = [
+        (event_type, payload)
+        for event_type, payload in emitted
+        if event_type
+        in {
+            "subagent_message_accepted",
+            "subagent_interrupted",
+            "subagent_tool_cancel_requested",
+            "subagent_message_deferred",
+            "subagent_tool_cancel_deferred",
+            "subagent_tool_cancelled",
+        }
+    ]
+    assert [event_type for event_type, _payload in protocol_events] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_message_deferred",
+        "subagent_tool_cancel_deferred",
+    ]
+    assert protocol_events[3][1]["reason"] == "generation_in_progress"
+    assert protocol_events[4][1]["reason"] == "no_active_tool"
+    assert "researcher" not in orchestrator._role_guidance_messages  # noqa: SLF001
+
+
+def test_subagent_interrupt_restarts_during_configured_model_fallback() -> None:
+    class _FallbackOnlyEngine:
+        def __init__(self) -> None:
+            self.generate_calls = 0
+
+        def supports_mid_generation_cancellation(self, *, model_id: str | None = None) -> bool:
+            _ = model_id
+            return True
+
+        async def generate_with_configured_model(
+            self,
+            *,
+            model_id: str,
+            messages: list[Any],
+            temperature: float = 0.2,
+            max_tokens: int = 1024,
+            reasoning_effort: str | None = None,
+        ) -> GenerationResult:
+            _ = (model_id, temperature, max_tokens, reasoning_effort)
+            self.generate_calls += 1
+            user_prompt = str(messages[-1].content or "")
+            if self.generate_calls == 1:
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    raise
+            assert "Live subagent guidance:" in user_prompt
+            assert "Restart with the cache check first." in user_prompt
+            return GenerationResult(content="Fallback restarted after interrupt.", model="gpt-test")
+
+    class _InterruptProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_model_invocation":
+                return []
+            if "midgen-fallback-restart-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "midgen-fallback-restart-1",
+                    "subagent_id": "run-midgen-fallback-restart:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Restart with the cache check first.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "delivery_reason": "interrupt_pending",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    provider = _InterruptProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=_FallbackOnlyEngine())
+    orchestrator._current_run_id = "run-midgen-fallback-restart"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current direction.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="disabled",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-midgen-fallback-restart:researcher:role-researcher",
+        )
+    )
+
+    assert content == "Fallback restarted after interrupt."
+    assert provider.handled == [(["midgen-fallback-restart-1"], "applied", None)]
+    assert [event_type for event_type, _payload in emitted[:5]] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_tool_cancelled",
+        "subagent_message_applied",
+    ]
+
+
+def test_subagent_cancel_current_tool_defers_for_non_cancellable_active_tool() -> None:
+    class _BusyToolInvocationEngine:
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            controller = request.active_tool_controller
+            assert controller is not None
+            await controller.activate_tool(
+                tool_call_id="tool-call-busy",
+                tool_name="web_search",
+                cancellable=False,
+            )
+            await asyncio.sleep(0.12)
+            await controller.finish_tool()
+            return AgentInvocationResult(
+                content="Busy tool completed.",
+                events=[
+                    ToolCallRequestEvent(
+                        call_id="tool-call-busy",
+                        tool_name="web_search",
+                        arguments={"query": "option B"},
+                    ),
+                    ToolCallResultEvent(
+                        call_id="tool-call-busy",
+                        tool_name="web_search",
+                        result={"ok": True},
+                        metadata={"status": "completed"},
+                    ),
+                ],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _CancelProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+            self._handled_ids: set[str] = set()
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "during_active_tool":
+                return []
+            if "cancel-busy-1" in self._handled_ids:
+                return []
+            return [
+                {
+                    "message_id": "cancel-busy-1",
+                    "subagent_id": "run-busy-tool:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Stop the current tool and inspect the cache.",
+                    "delivery_mode": "inject_now",
+                    "delivery_status": "queued",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self._handled_ids.update(message_ids)
+            self.handled.append((message_ids, status, reason))
+
+    provider = _CancelProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=_BusyToolInvocationEngine())
+    orchestrator._current_run_id = "run-busy-tool"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Inspect the current tool.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-busy-tool:researcher:role-researcher",
+        )
+    )
+
+    assert provider.handled == [(["cancel-busy-1"], "deferred", "tool_in_progress")]
+    assert [event_type for event_type, _payload in emitted[:5]] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_message_deferred",
+        "subagent_tool_cancel_deferred",
+    ]
+    assert emitted[4][1]["reason"] == "tool_in_progress"
+
+
+def test_delegated_subagent_runtime_persists_interrupt_cancel_protocol_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ProtocolEventOrchestrator:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def run(self, request: Any) -> MultiAgentRunResult:
+            assert request.subagent_message_provider is not None
+            assert request.runtime_event_callback is not None
+            messages = await request.subagent_message_provider.poll_messages(
+                task_id="delegated-cancel-task",
+                subagent_id="cancel-subagent-1",
+                role_id="researcher",
+                stage="role::researcher",
+                safe_point="after_model_invocation",
+            )
+            assert len(messages) == 1
+            message = messages[0]
+            assert message["interrupt"] is True
+            assert message["cancel_current_tool"] is True
+            message_id = message["message_id"]
+            events = [
+                MultiAgentRunEvent(
+                    run_id="delegated-cancel-task",
+                    seq=1,
+                    type="subagent_message_accepted",
+                    payload={
+                        "subagent_id": "cancel-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "delivery_status": "accepted",
+                        "content": message["content"],
+                    },
+                    timestamp="2026-06-30T03:00:00Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-cancel-task",
+                    seq=2,
+                    type="subagent_interrupted",
+                    payload={
+                        "subagent_id": "cancel-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "interrupt": True,
+                        "cancel_current_tool": True,
+                        "reason": "operator_interrupt",
+                        "summary": "Subagent interrupt requested.",
+                    },
+                    timestamp="2026-06-30T03:00:01Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-cancel-task",
+                    seq=3,
+                    type="subagent_tool_cancel_requested",
+                    payload={
+                        "subagent_id": "cancel-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "interrupt": True,
+                        "cancel_current_tool": True,
+                        "reason": "operator_request",
+                        "summary": "Subagent tool cancellation requested.",
+                    },
+                    timestamp="2026-06-30T03:00:02Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-cancel-task",
+                    seq=4,
+                    type="subagent_message_deferred",
+                    payload={
+                        "subagent_id": "cancel-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "delivery_status": "deferred",
+                        "reason": "generation_in_progress",
+                        "content": message["content"],
+                    },
+                    timestamp="2026-06-30T03:00:03Z",
+                ),
+                MultiAgentRunEvent(
+                    run_id="delegated-cancel-task",
+                    seq=5,
+                    type="subagent_tool_cancel_deferred",
+                    payload={
+                        "subagent_id": "cancel-subagent-1",
+                        "role_id": "researcher",
+                        "message_id": message_id,
+                        "delivery_mode": "inject_now",
+                        "delivery_reason": "generation_in_progress",
+                        "interrupt": True,
+                        "cancel_current_tool": True,
+                        "reason": "generation_in_progress",
+                        "summary": "Subagent tool cancellation deferred.",
+                    },
+                    timestamp="2026-06-30T03:00:04Z",
+                ),
+            ]
+            for event in events:
+                await request.runtime_event_callback(event)
+            await request.subagent_message_provider.mark_messages_handled(
+                message_ids=[message_id],
+                status="deferred",
+                reason="generation_in_progress",
+            )
+            return MultiAgentRunResult(
+                run_id="delegated-cancel-task",
+                protocol="teacher_student_distill",
+                state="succeeded",
+                task_input=request.task_input,
+                candidates=[],
+                selected_candidate_id=None,
+                evaluation=None,
+                artifacts={"final_answer": "Deferred cancel protocol events."},
+                events=events,
+            )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator", _ProtocolEventOrchestrator)
+    store = RuntimeStore(tmp_path / "runtime-cancel-protocol.db")
+    service = RuntimeService(engine=object(), store=store)
+
+    async def _run() -> dict[str, Any] | None:
+        await store.create_task_run(
+            task_id="delegated-cancel-task",
+            input_text="Inspect the current task.",
+            session_id="session-cancel-subagent",
+            project_id=None,
+            workspace_dir=None,
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            task_type="delegated_multi_agent",
+            metadata={
+                "protocol": "teacher_student_distill",
+                "delegated_subagent": {
+                    "display_name": "Delegated Researcher",
+                    "role": "researcher",
+                    "instruction": "Inspect the current task.",
+                    "objective": "Inspect the current task.",
+                    "parent_session_id": "session-cancel-subagent",
+                    "status": "queued",
+                },
+            },
+        )
+        await store.upsert_subagent_transcript(
+            subagent_id="cancel-subagent-1",
+            parent_type="delegated_task",
+            parent_id="delegated-cancel-task",
+            session_id="session-cancel-subagent",
+            role_id="researcher",
+            title="Researcher",
+            status="running",
+            metadata={"task_id": "delegated-cancel-task"},
+        )
+        await store.append_subagent_transcript_event(
+            "cancel-subagent-1",
+            {
+                "type": "subagent_message",
+                "message_id": "cancel-message-persist-1",
+                "subagent_id": "cancel-subagent-1",
+                "target_role_id": "researcher",
+                "content": "Stop the current command and inspect the cache.",
+                "delivery_mode": "inject_now",
+                "delivery_status": "queued",
+                "delivery_reason": "tool_cancel_pending",
+                "interrupt": True,
+                "cancel_current_tool": True,
+                "metadata": {
+                    "source": "session_subagent_message_api",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                    "delivery_reason": "tool_cancel_pending",
+                },
+                "created_at": "2026-06-30T02:59:59Z",
+            },
+        )
+        await service._run_task(task_id="delegated-cancel-task")  # noqa: SLF001
+        return await store.get_subagent_transcript("cancel-subagent-1")
+
+    detail = asyncio.run(_run())
+
+    assert detail is not None
+    assert [event["type"] for event in detail["events"]] == [
+        "subagent_message",
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_message_deferred",
+        "subagent_tool_cancel_deferred",
+    ]
+    assert detail["events"][2]["interrupt"] is True
+    assert detail["events"][3]["cancel_current_tool"] is True
+    assert detail["events"][-1]["delivery_reason"] == "generation_in_progress"
+
+
+def test_collect_delegated_session_subagent_guidance_marks_approval_resume_context(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "runtime-approval-guidance.db")
+    service = RuntimeService(engine=object(), store=store)
+
+    async def _run() -> tuple[list[str], dict[str, list[str]]]:
+        await store.upsert_subagent_transcript(
+            subagent_id="approval-guidance-subagent-1",
+            parent_type="delegated_task",
+            parent_id="delegated-approval-guidance-task",
+            session_id="session-approval-guidance",
+            role_id="researcher",
+            title="Researcher",
+            status="running",
+            metadata={"task_id": "delegated-approval-guidance-task"},
+        )
+        await store.append_subagent_transcript_event(
+            "approval-guidance-subagent-1",
+            {
+                "type": "subagent_message",
+                "message_id": "approval-guidance-message-1",
+                "subagent_id": "approval-guidance-subagent-1",
+                "target_role_id": "researcher",
+                "content": "Inspect the failure mode after approval resumes.",
+                "delivery_mode": "inject_now",
+                "delivery_status": "queued",
+            },
+        )
+        await store.append_subagent_transcript_event(
+            "approval-guidance-subagent-1",
+            {
+                "type": "subagent_message_deferred",
+                "message_id": "approval-guidance-message-1",
+                "subagent_id": "approval-guidance-subagent-1",
+                "role_id": "researcher",
+                "delivery_mode": "inject_now",
+                "delivery_status": "deferred",
+                "delivery_reason": "approval_pending",
+                "reason": "approval_pending",
+            },
+        )
+        return await service._collect_delegated_session_subagent_guidance(  # noqa: SLF001
+            session_id="session-approval-guidance",
+            task_id="delegated-approval-guidance-task",
+        )
+
+    guidance_messages, role_guidance_messages = asyncio.run(_run())
+
+    assert guidance_messages == []
+    assert role_guidance_messages == {
+        "researcher": [
+            "Approval-resume guidance: Inspect the failure mode after approval resumes."
+        ]
+    }
+
+
+def test_subagent_after_current_tool_message_applies_after_tool_result() -> None:
+    class _ToolInvocationEngine:
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            assert "Wait for tool completion." not in request.message
+            return AgentInvocationResult(
+                content="Tool-backed response.",
+                events=[
+                    ToolCallRequestEvent(
+                        call_id="tool-call-after-current",
+                        tool_name="web_search",
+                        arguments={"query": "option B"},
+                    ),
+                    ToolCallResultEvent(
+                        call_id="tool-call-after-current",
+                        tool_name="web_search",
+                        result={"ok": True},
+                        metadata={"status": "completed"},
+                    ),
+                ],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _AfterToolProvider:
+        def __init__(self) -> None:
+            self.polls: list[str | None] = []
+            self.handled: list[tuple[list[str], str]] = []
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            self.polls.append(kwargs.get("safe_point"))
+            return [
+                {
+                    "message_id": "after-tool-message-1",
+                    "subagent_id": "run-tool:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Wait for tool completion, then bias toward option B.",
+                    "delivery_mode": "after_current_tool",
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            _ = reason
+            self.handled.append((message_ids, status))
+
+    provider = _AfterToolProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=_ToolInvocationEngine())
+    orchestrator._current_run_id = "run-tool"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    content, _diagnostics = asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Compare options.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-tool:researcher:role-researcher",
+        )
+    )
+
+    assert content == "Tool-backed response."
+    assert provider.polls == ["before_model_invocation", "after_tool_result", "after_model_invocation"]
+    assert provider.handled == [(["after-tool-message-1"], "applied")]
+    delivery_events = [
+        (event_type, payload)
+        for event_type, payload in emitted
+        if event_type.startswith("subagent_message_")
+    ]
+    assert [event_type for event_type, _payload in delivery_events] == [
+        "subagent_message_accepted",
+        "subagent_message_applied",
+    ]
+    assert delivery_events[1][1]["delivery_status"] == "applied"
+    assert orchestrator._role_guidance_messages["researcher"] == [  # noqa: SLF001
+        "Wait for tool completion, then bias toward option B."
+    ]
+
+
+def test_subagent_cancel_current_tool_defers_when_approval_is_pending() -> None:
+    class _ApprovalToolInvocationEngine:
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            assert "Stop the current tool." not in request.message
+            return AgentInvocationResult(
+                content="Approval is pending.",
+                events=[
+                    ToolCallRequestEvent(
+                        call_id="tool-call-approval-cancel",
+                        tool_name="exec_command",
+                        arguments={"command": "pytest -q"},
+                    ),
+                    ToolCallResultEvent(
+                        call_id="tool-call-approval-cancel",
+                        tool_name="exec_command",
+                        result=None,
+                        metadata={
+                            "status": "approval_pending",
+                            "approval_id": "approval-cancel-1",
+                            "requires_approval": True,
+                        },
+                    ),
+                ],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _CancelProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+
+        async def poll_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+            if kwargs.get("safe_point") != "after_model_invocation":
+                return []
+            return [
+                {
+                    "message_id": "approval-cancel-message-1",
+                    "subagent_id": "run-approval-cancel:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Stop the current tool.",
+                    "delivery_mode": "inject_now",
+                    "interrupt": True,
+                    "cancel_current_tool": True,
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self.handled.append((message_ids, status, reason))
+
+    provider = _CancelProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=_ApprovalToolInvocationEngine())
+    orchestrator._current_run_id = "run-approval-cancel"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Run the approved command.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-approval-cancel:researcher:role-researcher",
+        )
+    )
+
+    assert provider.handled == [(["approval-cancel-message-1"], "deferred", "approval_pending")]
+    protocol_events = [
+        (event_type, payload)
+        for event_type, payload in emitted
+        if event_type
+        in {
+            "subagent_message_accepted",
+            "subagent_interrupted",
+            "subagent_tool_cancel_requested",
+            "subagent_message_deferred",
+            "subagent_tool_cancel_deferred",
+        }
+    ]
+    assert [event_type for event_type, _payload in protocol_events] == [
+        "subagent_message_accepted",
+        "subagent_interrupted",
+        "subagent_tool_cancel_requested",
+        "subagent_message_deferred",
+        "subagent_tool_cancel_deferred",
+    ]
+    assert protocol_events[3][1]["reason"] == "approval_pending"
+    assert protocol_events[4][1]["reason"] == "approval_pending"
+
+
+def test_subagent_after_current_tool_message_defers_when_approval_pending() -> None:
+    class _ApprovalToolInvocationEngine:
+        async def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
+            assert "Wait for approval resolution." not in request.message
+            return AgentInvocationResult(
+                content="Approval is pending.",
+                events=[
+                    ToolCallRequestEvent(
+                        call_id="tool-call-approval",
+                        tool_name="exec_command",
+                        arguments={"command": "pytest -q"},
+                    ),
+                    ToolCallResultEvent(
+                        call_id="tool-call-approval",
+                        tool_name="exec_command",
+                        result=None,
+                        metadata={
+                            "status": "approval_pending",
+                            "approval_id": "approval-after-tool-1",
+                            "requires_approval": True,
+                        },
+                    ),
+                ],
+                diagnostics=AgentInvocationDiagnostics(
+                    execution_profile="subagent_readonly",
+                    tool_mode="auto",
+                ),
+            )
+
+    class _AfterToolProvider:
+        def __init__(self) -> None:
+            self.handled: list[tuple[list[str], str, str | None]] = []
+
+        async def poll_messages(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "message_id": "after-tool-approval-message-1",
+                    "subagent_id": "run-approval-tool:researcher:role-researcher",
+                    "role_id": "researcher",
+                    "content": "Wait for approval resolution, then inspect the failure mode.",
+                    "delivery_mode": "after_current_tool",
+                }
+            ]
+
+        async def mark_messages_handled(
+            self,
+            *,
+            message_ids: list[str],
+            status: str,
+            reason: str | None = None,
+        ) -> None:
+            self.handled.append((message_ids, status, reason))
+
+    provider = _AfterToolProvider()
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    orchestrator = MultiAgentOrchestrator(engine=_ApprovalToolInvocationEngine())
+    orchestrator._current_run_id = "run-approval-tool"  # noqa: SLF001
+    orchestrator._subagent_message_provider = provider  # noqa: SLF001
+    orchestrator._emit_runtime_event = lambda event_type, payload: emitted.append(  # noqa: SLF001
+        (event_type, payload)
+    )
+
+    asyncio.run(
+        orchestrator._invoke_configured_text(  # noqa: SLF001
+            model_id="gpt-test",
+            system_prompt="System",
+            user_prompt="Run the approved command.",
+            temperature=0.2,
+            max_tokens=64,
+            execution_profile="subagent_readonly",
+            tool_mode="auto",
+            system_prompt_addendum="System",
+            session_scope="role::researcher",
+            runtime_role_id="researcher",
+            runtime_title="Researcher",
+            runtime_stage="role::researcher",
+            runtime_subagent_id="run-approval-tool:researcher:role-researcher",
+        )
+    )
+
+    assert provider.handled == [(["after-tool-approval-message-1"], "deferred", "approval_pending")]
+    delivery_events = [
+        (event_type, payload)
+        for event_type, payload in emitted
+        if event_type.startswith("subagent_message_")
+    ]
+    assert [event_type for event_type, _payload in delivery_events] == [
+        "subagent_message_accepted",
+        "subagent_message_deferred",
+    ]
+    assert delivery_events[1][1]["delivery_status"] == "deferred"
+    assert delivery_events[1][1]["reason"] == "approval_pending"
+    assert "researcher" not in orchestrator._role_guidance_messages  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("delegate_status", "expected_event_type", "expected_status"),
+    [
+        ("queued", "subagent_progress", "queued"),
+        ("running", "subagent_progress", "running"),
+        ("resumed", "subagent_progress", "running"),
+        ("completed", "subagent_completed", "completed"),
+        ("succeeded", "subagent_completed", "completed"),
+        ("done", "subagent_completed", "completed"),
+        ("failed", "subagent_completed", "failed"),
+        ("error", "subagent_completed", "failed"),
+        ("cancelled", "subagent_completed", "cancelled"),
+    ],
+)
+def test_build_subagent_lifecycle_events_tracks_delegate_result_status(
+    delegate_status: str,
+    expected_event_type: str,
+    expected_status: str,
+    tmp_path: Path,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+
+    class _StatusEngine(_FakeEngine):
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, Any] | None = None,
+            project_id: str | None = None,
+            workspace_dir: str | None = None,
+            selected_skill_ids: list[str] | None = None,
+            attachments: list[AttachmentRef] | None = None,
+        ) -> AsyncIterator[object]:
+            _ = (
+                inference_overrides,
+                project_id,
+                workspace_dir,
+                selected_skill_ids,
+                attachments,
+            )
+            self.chat_calls.append((message, session_id))
+            yield ToolCallRequestEvent(
+                call_id="call-subagent-status",
+                tool_name="delegate_subagent_task",
+                arguments={"objective": "Compare options."},
+            )
+            yield ToolCallResultEvent(
+                call_id="call-subagent-status",
+                tool_name="delegate_subagent_task",
+                result={
+                    "status": delegate_status,
+                    "task_id": "subagent-task-status",
+                    "task_type": "delegated_multi_agent",
+                    "display_name": "Delegated status probe",
+                    "parent_session_id": session_id,
+                },
+                metadata={
+                    "status": delegate_status,
+                    "task_id": "subagent-task-status",
+                    "task_type": "delegated_multi_agent",
+                    "parent_session_id": session_id,
+                },
+            )
+            yield FinalAnswerEvent(content="Delegated.")
+
+    app, _ = _build_app(engine=_StatusEngine())
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    app.state.runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(sessions_dir / "runtime-status.db"),
+    )
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={
+                "message": "Delegate the comparison.",
+                "session_id": f"session-status-{delegate_status}",
+            },
+        ) as response:
+            chunks = [
+                line.removeprefix("data: ")
+                for line in response.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+    assert response.status_code == 200
+    events = [json.loads(chunk) for chunk in chunks]
+    synthesized = [event for event in events if event["type"].startswith("subagent_")]
+    assert [event["type"] for event in synthesized[:2]] == ["subagent_started", "subagent_prompt"]
+    assert synthesized[0]["status"] == ("queued" if expected_status == "queued" else "running")
+    assert synthesized[1]["status"] == ("queued" if expected_status == "queued" else "running")
+    assert synthesized[2]["type"] == expected_event_type
+    assert synthesized[2]["status"] == expected_status
+
+
+def test_chat_subagent_stream_preserves_approval_required_metadata(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+
+    class _ApprovalSubagentEngine(_FakeEngine):
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, Any] | None = None,
+            project_id: str | None = None,
+            workspace_dir: str | None = None,
+            selected_skill_ids: list[str] | None = None,
+            attachments: list[AttachmentRef] | None = None,
+        ) -> AsyncIterator[object]:
+            _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids, attachments)
+            self.chat_calls.append((message, session_id))
+            yield ToolCallRequestEvent(
+                call_id="call-subagent-approval",
+                tool_name="delegate_subagent_task",
+                arguments={"objective": "Run a bounded smoke command after approval."},
+            )
+            yield ToolCallResultEvent(
+                call_id="call-subagent-approval",
+                tool_name="delegate_subagent_task",
+                result={
+                    "status": "awaiting_approval",
+                    "task_id": "subagent-task-approval",
+                    "task_type": "delegated_multi_agent",
+                    "display_name": "Delegated approval probe",
+                    "parent_session_id": session_id,
+                    "approval_state": {
+                        "status": "waiting_approval",
+                        "approval_ids": ["exec-approval-chat-1"],
+                        "tool_names": ["exec_command"],
+                        "pending_approvals": [
+                            {
+                                "approval_id": "exec-approval-chat-1",
+                                "tool_name": "exec_command",
+                                "reason": "Exec command requires approval.",
+                                "approval_kind": "exec",
+                                "approval_scope": "workspace",
+                                "replay_safe": False,
+                                "security_decision": "require_approval",
+                                "policy_source": "runtime_policy",
+                                "allowed_decisions": ["approve_once", "reject"],
+                            }
+                        ],
+                    },
+                },
+                metadata={
+                    "status": "awaiting_approval",
+                    "task_id": "subagent-task-approval",
+                    "task_type": "delegated_multi_agent",
+                    "parent_session_id": session_id,
+                    "approval_state": {
+                        "status": "waiting_approval",
+                        "approval_ids": ["exec-approval-chat-1"],
+                        "tool_names": ["exec_command"],
+                        "pending_approvals": [
+                            {
+                                "approval_id": "exec-approval-chat-1",
+                                "tool_name": "exec_command",
+                                "reason": "Exec command requires approval.",
+                                "approval_kind": "exec",
+                                "approval_scope": "workspace",
+                                "replay_safe": False,
+                                "security_decision": "require_approval",
+                                "policy_source": "runtime_policy",
+                                "allowed_decisions": ["approve_once", "reject"],
+                            }
+                        ],
+                    },
+                },
+            )
+            yield FinalAnswerEvent(content="The delegated subagent is waiting for approval.")
+
+    app, _ = _build_app(engine=_ApprovalSubagentEngine())
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "model": "ollama:configured",
+            "sessions_dir": str(sessions_dir),
+        }
+    )
+    app.state.session_store = SessionStore(sessions_dir)
+    app.state.runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(sessions_dir / "runtime-approval.db"),
+    )
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={
+                "message": "Delegate a task that will need approval.",
+                "session_id": "session-subagent-approval",
+            },
+        ) as response:
+            chunks = [
+                line.removeprefix("data: ")
+                for line in response.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+        detail_response = client.get(
+            "/v1/sessions/session-subagent-approval/subagents/subagent-task-approval"
+        )
+
+    assert response.status_code == 200
+    events = [json.loads(chunk) for chunk in chunks]
+    event_types = [event["type"] for event in events]
+    assert "subagent_tool_result" in event_types
+    assert "runtime_blocked" in event_types
+    tool_result_event = next(event for event in events if event["type"] == "subagent_tool_result")
+    assert tool_result_event["status"] == "approval_required"
+    assert tool_result_event["metadata"]["approval_id"] == "exec-approval-chat-1"
+    assert tool_result_event["metadata"]["approval_scope"] == "workspace"
+    assert tool_result_event["metadata"]["replay_safe"] is False
+    assert tool_result_event["metadata"]["security_decision"] == "require_approval"
+    runtime_blocked = next(event for event in events if event["type"] == "runtime_blocked")
+    assert runtime_blocked["approval_ids"] == ["exec-approval-chat-1"]
+    assert runtime_blocked["tool_names"] == ["exec_command"]
+    assert runtime_blocked["recommended_action"] == "resolve_approval"
+    assert runtime_blocked["pending_approvals"][0]["approval_kind"] == "exec"
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    detail_events = detail_payload["events"]
+    assert [event["type"] for event in detail_events] == [
+        "subagent_started",
+        "subagent_prompt",
+        "subagent_tool_result",
+        "runtime_blocked",
+    ]
+    assert detail_events[2]["metadata"]["approval_scope"] == "workspace"
+    assert detail_events[3]["metadata"]["pending_approvals"][0]["security_decision"] == "require_approval"
 
 
 def test_response_language_addendum_tracks_traditional_chinese_messages() -> None:

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 import pytest
 
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.tools.base import ActiveToolController, ToolExecutionContext
 from mochi.tools.exec_command import ExecCommandTool
 from mochi.tools.kill_session import KillSessionTool
 from mochi.tools.list_sessions import ListSessionsTool
@@ -45,6 +47,7 @@ class _PythonDirectProvider(BaseShellProvider):
 _SCRIPT_BY_COMMAND = {
     "fg": "import sys;print('hello');sys.stderr.write('warn\\n')",
     "bg": "import time;print('started', flush=True);time.sleep(5)",
+    "slow": "import time;print('started', flush=True);time.sleep(10)",
     "interactive": (
         "import sys,time;"
         "print('ready', flush=True);"
@@ -112,6 +115,57 @@ async def test_exec_command_background_returns_session_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exec_command_foreground_cancellation_reports_cancelled_status() -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    tool = ExecCommandTool(
+        runtime=runtime,
+        require_approval=False,
+        workspace_dir="H:/_python/agent_mochi",
+        command_rules=[_allow_rule("slow", shells=["test"])],
+    )
+    controller = ActiveToolController()
+    context = ToolExecutionContext(active_tool_controller=controller)
+    await controller.activate_tool(
+        tool_call_id="tool-call-cancelled",
+        tool_name="exec_command",
+        cancellable=False,
+    )
+
+    async def _run_tool() -> object:
+        return await tool.execute(
+            command="slow",
+            shell="test",
+            context=context,
+        )
+
+    task = asyncio.create_task(_run_tool())
+    try:
+        for _ in range(100):
+            snapshot = await controller.snapshot()
+            if snapshot["active"] and snapshot["cancellable"]:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("controller never observed a cancellable active exec session")
+
+        cancel_result = await controller.request_cancel()
+        assert cancel_result.cancelled is True
+        result = await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await runtime.close()
+
+    assert result.error is None
+    assert result.metadata["status"] == "cancelled"
+    assert result.metadata["runtime_status"] == "killed"
+    assert result.metadata["cancelled"] is True
+
+
+@pytest.mark.asyncio
 async def test_exec_command_returns_approval_pending_metadata() -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
@@ -139,6 +193,74 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
     stored = approvals.get(approval_id)
     assert stored is not None
     assert stored.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_auto_review_allows_policy_ask_without_manual_approval() -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    approvals = InMemoryApprovalStore()
+    tool = ExecCommandTool(
+        runtime=runtime,
+        approval_store=approvals,
+        require_approval=False,
+        workspace_dir="H:/_python/agent_mochi",
+    )
+
+    result = await tool.execute(
+        command="fg",
+        shell="test",
+        context=ToolExecutionContext(
+            permission_policy={
+                "autonomy_mode": "auto_review",
+                "require_approval_for_exec": False,
+            }
+        ),
+    )
+
+    assert result.error is None
+    assert result.metadata["status"] == "completed"
+    assert result.metadata["policy_state"] == "allow"
+    assert result.metadata["auto_reviewed_policy_ask"] is True
+    assert result.metadata["approval_id"] is None
+    assert approvals.list(status="pending") == []
+    assert isinstance(result.output, dict)
+    assert "hello" in result.output["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_exec_command_auto_review_still_requests_manual_approval_for_escalation() -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    approvals = InMemoryApprovalStore()
+    tool = ExecCommandTool(
+        runtime=runtime,
+        approval_store=approvals,
+        require_approval=False,
+        workspace_dir="H:/_python/agent_mochi",
+    )
+
+    result = await tool.execute(
+        command="fg",
+        shell="test",
+        sandbox_permissions="require_escalated",
+        context=ToolExecutionContext(
+            permission_policy={
+                "autonomy_mode": "auto_review",
+                "require_approval_for_exec": False,
+            }
+        ),
+    )
+
+    assert result.error is not None
+    assert result.metadata["status"] == "approval_pending"
+    assert result.metadata["requires_approval"] is True
+    assert result.metadata["approval_id"] is not None
+    assert approvals.list(status="pending") != []
 
 
 @pytest.mark.asyncio

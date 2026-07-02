@@ -7,16 +7,18 @@ import xml.etree.ElementTree as ET
 from email.utils import parseaddr
 from typing import Any, cast
 
+import asyncio
 import httpx
 
 from mochi.tools._http import (
+    BoundHttpToolCancellation,
     TokenBucketRateLimiter,
     ToolHttpError,
     error_to_tool_result,
     http_request,
     make_default_client,
 )
-from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 _ARXIV_NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -242,6 +244,10 @@ class ArxivSearchTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def tool_capabilities(self) -> dict[str, Any]:
         return {
             "domains": ["literature"],
@@ -304,7 +310,12 @@ class ArxivSearchTool(BaseTool):
             return rendered
         return super().format_result_for_model(result, max_chars=max_chars)
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """執行 arXiv 搜尋。"""
         query = str(kwargs.get("query", ""))
         top_k = int(kwargs.get("top_k", 5))
@@ -318,7 +329,9 @@ class ArxivSearchTool(BaseTool):
             return ToolResult(error="`sort_order` must be ascending or descending.")
 
         limit = _clamp_limit(top_k)
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
         try:
+            cancellation.raise_if_requested()
             response = await http_request(
                 self._client,
                 "GET",
@@ -333,24 +346,36 @@ class ArxivSearchTool(BaseTool):
                 },
                 max_retries=2,
             )
+            cancellation.raise_if_requested()
+            root = ET.fromstring(response.text)
+            results = [self._parse_entry(entry) for entry in root.findall("atom:entry", _ARXIV_NS)]
+            cancellation.raise_if_requested()
+            return ToolResult(
+                output=results,
+                metadata={
+                    "query": query.strip(),
+                    "source": "arxiv",
+                    "count": len(results),
+                    "top_k": limit,
+                },
+            )
         except ToolHttpError as exc:
             return error_to_tool_result(
                 exc,
                 extra_metadata={"query": query.strip(), "source": "arxiv"},
                 suggestion="arXiv API may be temporarily unavailable. Try again later.",
             )
-        root = ET.fromstring(response.text)
-        results = [self._parse_entry(entry) for entry in root.findall("atom:entry", _ARXIV_NS)]
-
-        return ToolResult(
-            output=results,
-            metadata={
-                "query": query.strip(),
-                "source": "arxiv",
-                "count": len(results),
-                "top_k": limit,
-            },
-        )
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    output=[],
+                    metadata={
+                        "query": query.strip(),
+                        "source": "arxiv",
+                        "top_k": limit,
+                    },
+                )
+            raise
 
     @staticmethod
     def _parse_entry(entry: ET.Element) -> dict[str, Any]:
@@ -438,6 +463,10 @@ class SemanticScholarSearchTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def tool_capabilities(self) -> dict[str, Any]:
         return {
             "domains": ["literature"],
@@ -487,7 +516,12 @@ class SemanticScholarSearchTool(BaseTool):
             return rendered
         return super().format_result_for_model(result, max_chars=max_chars)
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """執行 Semantic Scholar 搜尋。"""
         query = str(kwargs.get("query", ""))
         top_k = int(kwargs.get("top_k", 5))
@@ -506,7 +540,9 @@ class SemanticScholarSearchTool(BaseTool):
             params["year"] = year.strip()
 
         headers = {"x-api-key": self._api_key} if self._api_key else None
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
         try:
+            cancellation.raise_if_requested()
             response = await http_request(
                 self._client,
                 "GET",
@@ -516,26 +552,38 @@ class SemanticScholarSearchTool(BaseTool):
                 headers=headers,
                 max_retries=2,
             )
+            cancellation.raise_if_requested()
+            payload = _as_dict(response.json())
+            papers = _as_list(payload.get("data"))
+            results = [self._parse_paper(_as_dict(paper)) for paper in papers if isinstance(paper, dict)]
+            cancellation.raise_if_requested()
+            return ToolResult(
+                output=results,
+                metadata={
+                    "query": query.strip(),
+                    "source": "semantic_scholar",
+                    "count": len(results),
+                    "top_k": limit,
+                    "total": payload.get("total"),
+                },
+            )
         except ToolHttpError as exc:
             return error_to_tool_result(
                 exc,
                 extra_metadata={"query": query.strip(), "source": "semantic_scholar"},
                 suggestion="Semantic Scholar API may be rate-limited. Try again in a few seconds.",
             )
-        payload = _as_dict(response.json())
-        papers = _as_list(payload.get("data"))
-
-        results = [self._parse_paper(_as_dict(paper)) for paper in papers if isinstance(paper, dict)]
-        return ToolResult(
-            output=results,
-            metadata={
-                "query": query.strip(),
-                "source": "semantic_scholar",
-                "count": len(results),
-                "top_k": limit,
-                "total": payload.get("total"),
-            },
-        )
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    output=[],
+                    metadata={
+                        "query": query.strip(),
+                        "source": "semantic_scholar",
+                        "top_k": limit,
+                    },
+                )
+            raise
 
     @staticmethod
     def _parse_paper(paper: dict[str, Any]) -> dict[str, Any]:
@@ -603,6 +651,10 @@ class CrossrefSearchTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def tool_capabilities(self) -> dict[str, Any]:
         return {
             "domains": ["literature"],
@@ -654,7 +706,12 @@ class CrossrefSearchTool(BaseTool):
             return rendered
         return super().format_result_for_model(result, max_chars=max_chars)
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """執行 Crossref 搜尋。"""
         query = str(kwargs.get("query", ""))
         top_k = int(kwargs.get("top_k", 5))
@@ -680,27 +737,50 @@ class CrossrefSearchTool(BaseTool):
         if email:
             params["mailto"] = email
 
-        response = await http_request(
-            self._client, "GET", "https://api.crossref.org/works",
-            params=params,
-            rate_limiter=self._rate_limiter,
-            max_retries=2,
-        )
-        payload = _as_dict(response.json())
-        message = _as_dict(payload.get("message"))
-        items = _as_list(message.get("items"))
-
-        results = [self._parse_work(_as_dict(item)) for item in items if isinstance(item, dict)]
-        return ToolResult(
-            output=results,
-            metadata={
-                "query": query.strip(),
-                "source": "crossref",
-                "count": len(results),
-                "top_k": limit,
-                "total": message.get("total-results"),
-            },
-        )
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
+        try:
+            cancellation.raise_if_requested()
+            response = await http_request(
+                self._client,
+                "GET",
+                "https://api.crossref.org/works",
+                params=params,
+                rate_limiter=self._rate_limiter,
+                max_retries=2,
+            )
+            cancellation.raise_if_requested()
+            payload = _as_dict(response.json())
+            message = _as_dict(payload.get("message"))
+            items = _as_list(message.get("items"))
+            results = [self._parse_work(_as_dict(item)) for item in items if isinstance(item, dict)]
+            cancellation.raise_if_requested()
+            return ToolResult(
+                output=results,
+                metadata={
+                    "query": query.strip(),
+                    "source": "crossref",
+                    "count": len(results),
+                    "top_k": limit,
+                    "total": message.get("total-results"),
+                },
+            )
+        except ToolHttpError as exc:
+            return error_to_tool_result(
+                exc,
+                extra_metadata={"query": query.strip(), "source": "crossref"},
+                suggestion="Crossref may be temporarily unavailable. Try again later.",
+            )
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    output=[],
+                    metadata={
+                        "query": query.strip(),
+                        "source": "crossref",
+                        "top_k": limit,
+                    },
+                )
+            raise
 
     @staticmethod
     def _parse_work(item: dict[str, Any]) -> dict[str, Any]:
@@ -771,6 +851,10 @@ class PubMedSearchTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def tool_capabilities(self) -> dict[str, Any]:
         return {
             "domains": ["literature"],
@@ -828,7 +912,12 @@ class PubMedSearchTool(BaseTool):
             return rendered
         return super().format_result_for_model(result, max_chars=max_chars)
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        *,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """執行 PubMed 搜尋。"""
         query = str(kwargs.get("query", ""))
         top_k = int(kwargs.get("top_k", 5))
@@ -852,13 +941,81 @@ class PubMedSearchTool(BaseTool):
         if self._api_key:
             params["api_key"] = self._api_key
 
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
         try:
+            cancellation.raise_if_requested()
             search_response = await http_request(
-                self._client, "GET",
+                self._client,
+                "GET",
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                 params=params,
                 rate_limiter=self._rate_limiter,
                 max_retries=2,
+            )
+            cancellation.raise_if_requested()
+            search_payload = _as_dict(search_response.json())
+            search_result = _as_dict(search_payload.get("esearchresult"))
+            id_list = [str(item) for item in _as_list(search_result.get("idlist"))]
+
+            if not id_list:
+                return ToolResult(
+                    output=[],
+                    metadata={"query": query.strip(), "source": "pubmed", "count": 0, "top_k": limit},
+                )
+
+            # Step 2: esummary for metadata
+            summary_params: dict[str, Any] = {
+                "db": "pubmed",
+                "id": ",".join(id_list),
+                "retmode": "json",
+                "tool": self._tool_name,
+            }
+            if active_email:
+                summary_params["email"] = active_email
+            if self._api_key:
+                summary_params["api_key"] = self._api_key
+
+            cancellation.raise_if_requested()
+            summary_response = await http_request(
+                self._client,
+                "GET",
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                params=summary_params,
+                rate_limiter=self._rate_limiter,
+                max_retries=2,
+            )
+            cancellation.raise_if_requested()
+            summary_payload = _as_dict(summary_response.json())
+            result_map = _as_dict(summary_payload.get("result"))
+            order = [str(uid) for uid in _as_list(result_map.get("uids"))] or id_list
+
+            # Step 3: efetch for abstracts (optional)
+            abstract_map: dict[str, str] = {}
+            if include_abstract:
+                cancellation.raise_if_requested()
+                abstract_map = await self._fetch_abstracts(id_list, active_email)
+                cancellation.raise_if_requested()
+
+            results: list[dict[str, Any]] = []
+            for uid in order:
+                cancellation.raise_if_requested()
+                summary = _as_dict(result_map.get(uid))
+                if summary:
+                    parsed = self._parse_summary(uid, summary)
+                    if include_abstract:
+                        parsed["abstract"] = abstract_map.get(uid, "")
+                    results.append(parsed)
+            cancellation.raise_if_requested()
+            return ToolResult(
+                output=results,
+                metadata={
+                    "query": query.strip(),
+                    "source": "pubmed",
+                    "count": len(results),
+                    "top_k": limit,
+                    "total": search_result.get("count"),
+                    "include_abstract": include_abstract,
+                },
             )
         except ToolHttpError as exc:
             return error_to_tool_result(
@@ -866,69 +1023,18 @@ class PubMedSearchTool(BaseTool):
                 extra_metadata={"query": query.strip(), "source": "pubmed"},
                 suggestion="NCBI E-utilities may be temporarily unavailable.",
             )
-        search_payload = _as_dict(search_response.json())
-        search_result = _as_dict(search_payload.get("esearchresult"))
-        id_list = [str(item) for item in _as_list(search_result.get("idlist"))]
-
-        if not id_list:
-            return ToolResult(
-                output=[],
-                metadata={"query": query.strip(), "source": "pubmed", "count": 0, "top_k": limit},
-            )
-
-        # Step 2: esummary for metadata
-        summary_params: dict[str, Any] = {
-            "db": "pubmed",
-            "id": ",".join(id_list),
-            "retmode": "json",
-            "tool": self._tool_name,
-        }
-        if active_email:
-            summary_params["email"] = active_email
-        if self._api_key:
-            summary_params["api_key"] = self._api_key
-
-        try:
-            summary_response = await http_request(
-                self._client, "GET",
-                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-                params=summary_params,
-                rate_limiter=self._rate_limiter,
-                max_retries=2,
-            )
-        except ToolHttpError as exc:
-            return error_to_tool_result(
-                exc,
-                extra_metadata={"query": query.strip(), "source": "pubmed"},
-            )
-        summary_payload = _as_dict(summary_response.json())
-        result_map = _as_dict(summary_payload.get("result"))
-        order = [str(uid) for uid in _as_list(result_map.get("uids"))] or id_list
-
-        # Step 3: efetch for abstracts (optional)
-        abstract_map: dict[str, str] = {}
-        if include_abstract:
-            abstract_map = await self._fetch_abstracts(id_list, active_email)
-
-        results: list[dict[str, Any]] = []
-        for uid in order:
-            summary = _as_dict(result_map.get(uid))
-            if summary:
-                parsed = self._parse_summary(uid, summary)
-                if include_abstract:
-                    parsed["abstract"] = abstract_map.get(uid, "")
-                results.append(parsed)
-        return ToolResult(
-            output=results,
-            metadata={
-                "query": query.strip(),
-                "source": "pubmed",
-                "count": len(results),
-                "top_k": limit,
-                "total": search_result.get("count"),
-                "include_abstract": include_abstract,
-            },
-        )
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    output=[],
+                    metadata={
+                        "query": query.strip(),
+                        "source": "pubmed",
+                        "top_k": limit,
+                        "include_abstract": include_abstract,
+                    },
+                )
+            raise
 
     async def _fetch_abstracts(
         self,

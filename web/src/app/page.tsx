@@ -24,6 +24,10 @@ import {
   type GoalDrawerBlockerView,
   type GoalHeaderChipView,
 } from '@/components/chat/GoalHeaderChip'
+import { GoalFocusPanel } from '@/components/chat/GoalFocusPanel'
+import { ExecutionTimeline } from '@/components/chat/ExecutionTimeline'
+import { SubagentDrawer } from '@/components/chat/SubagentDrawer'
+import { SubagentTimelineCard } from '@/components/chat/SubagentTimelineCard'
 import { ChatMessage } from '@/components/chat/ChatMessage'
 import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
@@ -40,11 +44,20 @@ import type { ChatAttachment, GoalCardView, Message, ReasoningStep } from '@/lib
 import {
   buildOptimisticConversationTurnMessages,
 } from '@/lib/chat-send-contract'
-import { resolveGoalContinuationDecision } from '@/lib/chat-goal-continuation'
 import {
   resolveChatGoalWorkflowRouting,
   type ChatGoalWorkflowRoute,
 } from '@/lib/chat-goal-routing'
+import {
+  resolveGoalContinuationDecision,
+  type GoalContinuationDecision,
+} from '@/lib/chat-goal-continuation'
+import {
+  layoutShowsEmptyState,
+  layoutShowsExecutionHighlights,
+  resolveGoalConversationBodyLayout,
+} from '@/lib/goal-execution-surface'
+import { buildGoalFocusCallout } from '@/lib/goal-focus-surface'
 import {
   applyGoalProposalModelReadiness,
   buildGoalProposalProbeCandidates,
@@ -65,6 +78,12 @@ import {
   buildLocalGoalProposalAssistantExplanation,
 } from '@/lib/goal-proposal-copy'
 import { resolvePreferredCurrentModelId } from '@/lib/current-model-selection'
+import {
+  mapAgentRunEventToTranscriptEvent,
+  mergeSubagentSummaries,
+  projectGoalSurfaceExecutionEvents,
+  projectWorkflowRunEventToSessionEvent,
+} from '@/lib/execution-transcript'
 import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
@@ -98,6 +117,8 @@ import {
 const MODELS_UPDATED_EVENT = 'mochi:models-updated'
 const DEFAULT_WORKFLOW_PROTOCOL: api.AgentRunProtocolId = 'teacher_student_distill'
 const WORKFLOW_CARD_POLL_MS = 4000
+const EXECUTION_TIMELINE_POLL_MS = 2000
+const EXECUTION_TIMELINE_STREAM_RECOVER_MS = 1500
 type WorkflowTemplate = 'standard' | 'research_debate'
 type WorkflowRunPolicyPreset = 'short' | 'balanced' | 'long' | 'custom'
 const WORKFLOW_PROTOCOL_OPTIONS: Array<{
@@ -247,6 +268,7 @@ interface ApiCompat {
       sessionId?: string
       projectId?: string | null
       model?: string
+      toolMode?: 'disabled' | 'auto' | 'required'
       selectedSkillIds?: string[]
       attachments?: ChatAttachment[]
       systemPrompt?: string
@@ -269,6 +291,7 @@ interface ApiCompat {
     project_id?: string | null
     projectId?: string | null
     model?: string
+    tool_mode?: 'disabled' | 'auto' | 'required'
     selected_skill_ids?: string[]
     selectedSkillIds?: string[]
     attachments?: ChatAttachment[]
@@ -288,10 +311,16 @@ interface ApiCompat {
 
 interface StreamChatChunk {
   event: Message | null
+  rawEvent?: api.StreamChatEvent | null
   sessionId?: string
   trajectoryId?: string | null
   model?: string | null
   done?: boolean
+}
+
+type StreamSubagentEvent = api.ExecutionTranscriptEvent & {
+  sessionId?: string | null
+  agentRunId?: string | null
 }
 
 function createInitialMessages(t: (key: string) => string): Message[] {
@@ -316,6 +345,275 @@ function getStringArray(value: unknown): string[] {
     return []
   }
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+function deliveryStatusFromSubagentMessageType(type: string): string | null {
+  const match = /^subagent_message_(queued|accepted|applied|deferred|cancelled|canceled|rejected)$/.exec(type)
+  if (!match) {
+    return null
+  }
+  return match[1] === 'canceled' ? 'cancelled' : match[1]
+}
+
+function normalizeStreamDeliveryFields(
+  type: string,
+  record: Record<string, unknown>,
+  metadata: Record<string, unknown>
+): {
+  metadata: Record<string, unknown>
+  messageId: string | null
+  deliveryMode: string | null
+  deliveryStatus: string | null
+  deliveryReason: string | null
+} {
+  const normalizedMetadata = { ...metadata }
+  const messageId =
+    getString(record.message_id) ??
+    getString(record.messageId) ??
+    getString(normalizedMetadata.message_id) ??
+    getString(normalizedMetadata.messageId) ??
+    null
+  const deliveryMode =
+    getString(record.delivery_mode) ??
+    getString(record.deliveryMode) ??
+    getString(normalizedMetadata.delivery_mode) ??
+    getString(normalizedMetadata.deliveryMode) ??
+    null
+  const deliveryStatus =
+    getString(record.delivery_status) ??
+    getString(record.deliveryStatus) ??
+    getString(normalizedMetadata.delivery_status) ??
+    getString(normalizedMetadata.deliveryStatus) ??
+    deliveryStatusFromSubagentMessageType(type)
+  const deliveryReason =
+    getString(record.delivery_reason) ??
+    getString(record.deliveryReason) ??
+    getString(normalizedMetadata.delivery_reason) ??
+    getString(normalizedMetadata.deliveryReason) ??
+    null
+
+  if (messageId && !getString(normalizedMetadata.message_id)) {
+    normalizedMetadata.message_id = messageId
+  }
+  if (deliveryMode && !getString(normalizedMetadata.delivery_mode)) {
+    normalizedMetadata.delivery_mode = deliveryMode
+  }
+  if (deliveryStatus && !getString(normalizedMetadata.delivery_status)) {
+    normalizedMetadata.delivery_status = deliveryStatus
+  }
+  if (deliveryReason && !getString(normalizedMetadata.delivery_reason)) {
+    normalizedMetadata.delivery_reason = deliveryReason
+  }
+
+  return {
+    metadata: normalizedMetadata,
+    messageId,
+    deliveryMode,
+    deliveryStatus,
+    deliveryReason,
+  }
+}
+
+function isSubagentTranscriptEventType(type: string | null | undefined): boolean {
+  if (!type) {
+    return false
+  }
+  return type.startsWith('subagent_') || type === 'runtime_blocked'
+}
+
+function normalizeStreamSubagentEvent(value: unknown): StreamSubagentEvent | null {
+  const base = mapAgentRunEventToTranscriptEvent(
+    typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+  )
+  if (!base || !isSubagentTranscriptEventType(base.type)) {
+    return null
+  }
+
+  const record = typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+  const metadata =
+    typeof base.metadata === 'object' && base.metadata !== null ? base.metadata : {}
+  const deliveryFields = normalizeStreamDeliveryFields(base.type, record, metadata as Record<string, unknown>)
+
+  return {
+    ...base,
+    metadata: deliveryFields.metadata,
+    status: base.status ?? deliveryFields.deliveryStatus ?? null,
+    messageId: deliveryFields.messageId,
+    deliveryMode: deliveryFields.deliveryMode,
+    deliveryStatus: deliveryFields.deliveryStatus,
+    deliveryReason: deliveryFields.deliveryReason,
+    sessionId:
+      getString(record.session_id) ??
+      getString(record.sessionId) ??
+      getString(deliveryFields.metadata.session_id) ??
+      getString(deliveryFields.metadata.sessionId) ??
+      null,
+    agentRunId:
+      getString(record.agent_run_id) ??
+      getString(record.agentRunId) ??
+      getString(record.run_id) ??
+      getString(deliveryFields.metadata.agent_run_id) ??
+      getString(deliveryFields.metadata.agentRunId) ??
+      getString(deliveryFields.metadata.run_id) ??
+      null,
+  }
+}
+
+function getStreamSubagentDeliveryStatus(event: api.ExecutionTranscriptEvent): string | null {
+  return (
+    getString(event.deliveryStatus) ??
+    getString(event.metadata.delivery_status) ??
+    getString(event.metadata.deliveryStatus) ??
+    deliveryStatusFromSubagentMessageType(event.type)
+  )
+}
+
+function buildSubagentSummaryFromEvent(
+  event: StreamSubagentEvent
+): api.SubagentTranscriptSummary | null {
+  const subagentId = event.subagentId ?? event.roleId ?? null
+  if (!subagentId) {
+    return null
+  }
+
+  const metadata = event.metadata
+  const deliveryStatus = getStreamSubagentDeliveryStatus(event)
+  const runtimeStatusForDelivery =
+    getString((metadata as Record<string, unknown>).subagent_status) ??
+    getString((metadata as Record<string, unknown>).subagentStatus) ??
+    getString((metadata as Record<string, unknown>).runtime_status) ??
+    getString((metadata as Record<string, unknown>).runtimeStatus) ??
+    null
+  if (deliveryStatus && !runtimeStatusForDelivery) {
+    return null
+  }
+  const statusFromEvent =
+    runtimeStatusForDelivery ??
+    getString(event.status) ??
+    getString((metadata as Record<string, unknown>).status) ??
+    getString((metadata as Record<string, unknown>).state)
+  const promptPreview =
+    getString((metadata as Record<string, unknown>).prompt_preview) ??
+    getString((metadata as Record<string, unknown>).promptPreview) ??
+    event.summary ??
+    null
+  const outputPreview =
+    getString((metadata as Record<string, unknown>).output_preview) ??
+    getString((metadata as Record<string, unknown>).outputPreview) ??
+    null
+
+  let status = statusFromEvent ?? 'running'
+  if (event.type === 'subagent_completed') {
+    status = statusFromEvent ?? 'completed'
+  } else if (event.type === 'runtime_blocked') {
+    status = 'blocked'
+  }
+
+  return {
+    subagentId,
+    parentType: event.parentType ?? (event.agentRunId ? 'agent_run' : 'chat_turn'),
+    parentId: event.parentId ?? event.agentRunId ?? event.sessionId ?? '',
+    sessionId: event.sessionId ?? null,
+    agentRunId: event.agentRunId ?? null,
+    roleId:
+      event.roleId ??
+      getString((metadata as Record<string, unknown>).role_id) ??
+      getString((metadata as Record<string, unknown>).roleId) ??
+      null,
+    title:
+      event.title ??
+      getString((metadata as Record<string, unknown>).title) ??
+      null,
+    modelId:
+      event.modelId ??
+      getString((metadata as Record<string, unknown>).model_id) ??
+      getString((metadata as Record<string, unknown>).modelId) ??
+      null,
+    status,
+    promptPreview,
+    summary: event.content ?? event.summary ?? promptPreview,
+    outputPreview,
+    eventCount: 1,
+    createdAt: event.createdAt ?? null,
+    updatedAt: event.createdAt ?? null,
+  }
+}
+
+function mergeTranscriptEvents(
+  current: api.ExecutionTranscriptEvent[],
+  next: api.ExecutionTranscriptEvent[]
+): api.ExecutionTranscriptEvent[] {
+  const merged = [...current]
+  for (const event of next) {
+    const duplicate = merged.some(
+      (item) =>
+        item.seq === event.seq &&
+        item.type === event.type &&
+        item.subagentId === event.subagentId &&
+        item.createdAt === event.createdAt
+    )
+    if (!duplicate) {
+      merged.push(event)
+    }
+  }
+  return merged.sort((left, right) => {
+    const leftSeq = left.seq ?? Number.MAX_SAFE_INTEGER
+    const rightSeq = right.seq ?? Number.MAX_SAFE_INTEGER
+    if (leftSeq !== rightSeq) {
+      return leftSeq - rightSeq
+    }
+    const leftTime = Date.parse(left.createdAt ?? '') || 0
+    const rightTime = Date.parse(right.createdAt ?? '') || 0
+    return leftTime - rightTime
+  })
+}
+
+function transcriptEventsForSubagent(
+  events: api.ExecutionTranscriptEvent[],
+  subagent: api.SubagentTranscriptSummary
+): api.ExecutionTranscriptEvent[] {
+  return events.filter((event) => {
+    if (event.subagentId && event.subagentId === subagent.subagentId) {
+      return true
+    }
+    if (event.roleId && subagent.roleId && event.roleId === subagent.roleId) {
+      return true
+    }
+    return false
+  })
+}
+
+function isGoalSurfaceSubagentVisible(
+  subagent: api.SubagentTranscriptSummary,
+  recentEvents: api.ExecutionTranscriptEvent[]
+): boolean {
+  const status = subagent.status.trim().toLowerCase()
+  const hasIdentity = Boolean((subagent.title ?? '').trim() || (subagent.roleId ?? '').trim())
+  const hasSummary = Boolean(
+    (subagent.summary ?? '').trim() ||
+    (subagent.promptPreview ?? '').trim() ||
+    (subagent.outputPreview ?? '').trim()
+  )
+
+  if (recentEvents.length > 0) {
+    return true
+  }
+  if (!hasIdentity) {
+    return false
+  }
+  if (
+    status === 'blocked' ||
+    status === 'awaiting_approval' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'interrupted'
+  ) {
+    return true
+  }
+  if (status === 'completed' || status === 'running') {
+    return hasSummary
+  }
+  return hasSummary
 }
 
 function buildDefaultWorkflowState(
@@ -432,6 +730,8 @@ interface GoalConversationAppendInput {
   userContent: string
   assistantContent: string
   goalCard?: GoalCardView
+  userMetadata?: Record<string, unknown>
+  assistantMetadata?: Record<string, unknown>
 }
 
 interface SyncGoalWorkflowStateInput {
@@ -479,8 +779,22 @@ interface DirectChatTurnInput {
   requestText: string
   attachments: ChatAttachment[]
   selectedSkillIds: string[]
+  toolMode?: 'disabled' | 'auto' | 'required'
   normalizedWorkflow: api.SessionWorkflowState
   sessionScope: SendSessionScope
+  systemPromptOverride?: string | null
+}
+
+interface ActiveGoalDirectTurnDecisionInput {
+  sessionId: string
+  requestText: string
+  attachments: ChatAttachment[]
+  activeGoalId: string
+  baseWorkflow: api.SessionWorkflowState
+  latestGoalSummary: GoalSessionSummary | GoalSessionProposal | null
+  selectedSkillIds: string[]
+  sessionScope: SendSessionScope
+  systemPromptOverride?: string | null
 }
 
 function normalizeGoalExecutionMode(value: unknown): api.GoalExecutionMode | null {
@@ -510,8 +824,8 @@ function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null 
     goal_id: getString(value.goal_id) ?? null,
     objective,
     execution_mode: executionMode,
-    interaction_mode: normalizeGoalInteractionMode(value.interaction_mode) ?? 'workflow',
-    execution_topology: normalizeGoalExecutionTopology(value.execution_topology) ?? 'multi_agent',
+    interaction_mode: normalizeGoalInteractionMode(value.interaction_mode) ?? 'goal',
+    execution_topology: normalizeGoalExecutionTopology(value.execution_topology) ?? 'single_agent',
     protocol_id: getString(value.protocol_id) ?? null,
     bound_run_id: getString(value.bound_run_id) ?? null,
     protocol_selection: getString(value.protocol_selection) ?? getString(value.protocol_id) ?? null,
@@ -635,6 +949,74 @@ function isGoalBlockedStatus(status: string | null | undefined): boolean {
     normalized === 'stalled' ||
     normalized === 'partial'
   )
+}
+
+function isAgentRunTerminalStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return (
+    normalized === 'completed' ||
+    normalized === 'done' ||
+    normalized === 'succeeded' ||
+    normalized === 'cancelled' ||
+    normalized === 'canceled' ||
+    normalized === 'failed' ||
+    normalized === 'error' ||
+    normalized === 'partial' ||
+    normalized === 'awaiting_approval' ||
+    normalized === 'awaiting_resources' ||
+    normalized === 'stalled'
+  )
+}
+
+function isSubagentTerminalStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return (
+    normalized === 'completed' ||
+    normalized === 'done' ||
+    normalized === 'succeeded' ||
+    normalized === 'cancelled' ||
+    normalized === 'canceled' ||
+    normalized === 'failed' ||
+    normalized === 'error'
+  )
+}
+
+function isSubagentActiveStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').toLowerCase()
+  return [
+    'active',
+    'created',
+    'in_progress',
+    'pending',
+    'processing',
+    'queued',
+    'resumed',
+    'running',
+    'started',
+    'working',
+  ].includes(normalized)
+}
+
+function getSubagentMessageDeliveryDefaults(
+  status: string | null | undefined
+): Pick<api.AgentRunSubagentMessageInput, 'deliveryMode' | 'interrupt'> {
+  if (isSubagentActiveStatus(status)) {
+    return {
+      deliveryMode: 'inject_now',
+      interrupt: true,
+    }
+  }
+  if (isSubagentTerminalStatus(status)) {
+    return {
+      deliveryMode: 'resume_only',
+      interrupt: false,
+    }
+  }
+  return {}
+}
+
+function isLegacySubagentMessageDeliveryError(error: unknown): boolean {
+  return error instanceof api.ApiError && (error.status === 400 || error.status === 422)
 }
 
 function uniqueStrings(values: Array<string | null | undefined>): string[] {
@@ -821,9 +1203,7 @@ function resolveGoalWorkflowRouteUserContent(
     case 'goal_proposal':
       return route.content
     case 'workflow_proposal':
-    case 'natural_language_goal_proposal':
     case 'goal_revision':
-    case 'goal_follow_up':
     case 'goal_pending_follow_up':
       return requestText
     case 'goal_confirmation':
@@ -835,25 +1215,6 @@ function resolveGoalWorkflowRouteUserContent(
 function getGoalAttemptRunId(goal: api.GoalSummary): string | null {
   const currentAttempt = goal.attempts.find((attempt) => attempt.attempt_id === goal.current_attempt_id)
   return currentAttempt?.agent_run_id ?? goal.attempts.at(-1)?.agent_run_id ?? null
-}
-
-function formatGoalOperatorControlHint(controls: api.GoalOperatorControls | null | undefined): string | null {
-  if (!controls) {
-    return null
-  }
-
-  const segments: string[] = []
-  if (controls.block_network_usage) {
-    segments.push('network access is blocked')
-  }
-  if (controls.blocked_tools.length > 0) {
-    segments.push(`blocked tools: ${controls.blocked_tools.join(', ')}`)
-  }
-  if (controls.blocked_domains.length > 0) {
-    segments.push(`blocked domains: ${controls.blocked_domains.join(', ')}`)
-  }
-
-  return segments.length > 0 ? `Current operator controls: ${segments.join('; ')}.` : null
 }
 
 type WorkflowScheduleType = 'interval' | 'once' | 'cron'
@@ -986,41 +1347,6 @@ function buildWorkflowScheduleConfig(
     max_runs: maxRuns,
     auto_pause_on_failure: autoPauseOnFailure,
   }
-}
-
-function formatWorkflowLifecycleMessage(event: Record<string, unknown>): string {
-  const type = getString(event.type) ?? 'workflow_event'
-  const status = getString(event.status)
-
-  if (type === 'run_created') {
-    return 'Workflow run created.'
-  }
-  if (type === 'run_started') {
-    return 'Workflow run started.'
-  }
-  if (type === 'run_completed') {
-    return 'Workflow run completed.'
-  }
-  if (type === 'run_failed') {
-    return `Workflow run failed${status ? `: ${status}.` : '.'}`
-  }
-  if (type === 'run_paused') {
-    return 'Workflow run paused.'
-  }
-  if (type === 'run_resumed') {
-    return 'Workflow run resumed.'
-  }
-  if (type === 'run_finalized_partial') {
-    return 'Workflow run finalized as partial.'
-  }
-  if (type === 'run_scheduled') {
-    return 'Workflow run scheduled.'
-  }
-  if (type === 'run_status') {
-    return status ? `Workflow status: ${status}.` : 'Workflow status updated.'
-  }
-
-  return type.replaceAll('_', ' ')
 }
 
 function isWorkflowRunSettledForPolling(status: string | null | undefined): boolean {
@@ -1285,6 +1611,7 @@ async function requestChat(
   model: string | null,
   selectedSkillIds: string[],
   attachments: ChatAttachment[],
+  toolMode: 'disabled' | 'auto' | 'required' | undefined,
   inference: {
     systemPrompt: string
     temperature: number
@@ -1309,6 +1636,7 @@ async function requestChat(
       sessionId,
       projectId,
       model: model ?? undefined,
+      tool_mode: toolMode,
       selected_skill_ids: selectedSkillIds,
       selectedSkillIds,
       attachments,
@@ -1332,6 +1660,7 @@ async function requestChat(
       sessionId,
       projectId: projectId ?? undefined,
       model: model ?? undefined,
+      toolMode,
       selectedSkillIds,
       attachments,
       systemPrompt: inference.systemPrompt,
@@ -1500,6 +1829,7 @@ export default function ChatPage() {
   const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
   const [taskPanelMode, setTaskPanelMode] = React.useState<TaskPanelMode>('default')
   const [taskPanelFocusedTaskId, setTaskPanelFocusedTaskId] = React.useState<string | null>(null)
+  const [taskPanelFocusedApprovalIds, setTaskPanelFocusedApprovalIds] = React.useState<string[] | null>(null)
   const [goalDrawerOpen, setGoalDrawerOpen] = React.useState(false)
   const [goalDrawerBusyAction, setGoalDrawerBusyAction] = React.useState<'status' | 'pause' | 'resume' | 'stop' | null>(null)
   const [goalDrawerHealth, setGoalDrawerHealth] = React.useState<api.GoalHealthSummary | null>(null)
@@ -1509,6 +1839,20 @@ export default function ChatPage() {
   const [goalDrawerApprovalsLoading, setGoalDrawerApprovalsLoading] = React.useState(false)
   const [goalDrawerApprovalError, setGoalDrawerApprovalError] = React.useState<string | null>(null)
   const [goalDrawerResolvingApprovalKey, setGoalDrawerResolvingApprovalKey] = React.useState<string | null>(null)
+  const [executionTimelineEvents, setExecutionTimelineEvents] = React.useState<api.ExecutionTranscriptEvent[]>([])
+  const [executionTimelineError, setExecutionTimelineError] = React.useState<string | null>(null)
+  const [sessionSubagents, setSessionSubagents] = React.useState<api.SubagentTranscriptSummary[]>([])
+  const [agentRunSubagents, setAgentRunSubagents] = React.useState<api.SubagentTranscriptSummary[]>([])
+  const [activeSubagentId, setActiveSubagentId] = React.useState<string | null>(null)
+  const [expandedSubagentIds, setExpandedSubagentIds] = React.useState<Set<string>>(() => new Set())
+  const [activeSubagentDetail, setActiveSubagentDetail] = React.useState<api.SubagentTranscriptDetail | null>(null)
+  const [subagentDrawerOpen, setSubagentDrawerOpen] = React.useState(false)
+  const [subagentDrawerLoading, setSubagentDrawerLoading] = React.useState(false)
+  const [subagentDrawerError, setSubagentDrawerError] = React.useState<string | null>(null)
+  const [subagentGuidance, setSubagentGuidance] = React.useState('')
+  const [subagentGuidanceSending, setSubagentGuidanceSending] = React.useState(false)
+  const [subagentBusyAction, setSubagentBusyAction] = React.useState<'cancel' | 'resume' | null>(null)
+  const lastTranscriptSeqRef = React.useRef<number | null>(null)
   const [workflowPanelOpen, setWorkflowPanelOpen] = React.useState(false)
   const [workspaceMobileOpen, setWorkspaceMobileOpen] = React.useState(false)
   const [queuedWorkspaceAttachments, setQueuedWorkspaceAttachments] = React.useState<ChatAttachment[]>([])
@@ -1546,6 +1890,16 @@ export default function ChatPage() {
   const voiceSessionIdRef = React.useRef<string | null>(null)
   const goalProposalModelReadinessRef = React.useRef<GoalProposalModelReadinessById>({})
   const goalProposalModelProbeInFlightRef = React.useRef<Set<string>>(new Set())
+  const activeChatRunRef = React.useRef<{
+    sessionId: string | null
+    turnId: string | null
+    chatRunId: string | null
+  }>({
+    sessionId: null,
+    turnId: null,
+    chatRunId: null,
+  })
+  const pendingChatCancelRef = React.useRef<api.ChatCancelResponse | null>(null)
 
   const {
     sessions,
@@ -1673,6 +2027,41 @@ export default function ChatPage() {
     () => (workflowConfig.run_policy ?? {}) as api.AgentRunRunPolicy,
     [workflowConfig.run_policy]
   )
+  const allVisibleSubagents = React.useMemo(
+    () => mergeSubagentSummaries(sessionSubagents, agentRunSubagents),
+    [agentRunSubagents, sessionSubagents]
+  )
+  const goalSurfaceTimelineEvents = React.useMemo(
+    () => projectGoalSurfaceExecutionEvents(executionTimelineEvents),
+    [executionTimelineEvents]
+  )
+  const goalSurfaceTimelineEventsById = React.useMemo(() => {
+    const grouped = new Map<string, api.ExecutionTranscriptEvent[]>()
+    for (const subagent of allVisibleSubagents) {
+      grouped.set(subagent.subagentId, transcriptEventsForSubagent(goalSurfaceTimelineEvents, subagent))
+    }
+    return grouped
+  }, [allVisibleSubagents, goalSurfaceTimelineEvents])
+  const goalSurfaceSubagents = React.useMemo(
+    () =>
+      allVisibleSubagents.filter((subagent) =>
+        isGoalSurfaceSubagentVisible(
+          subagent,
+          goalSurfaceTimelineEventsById.get(subagent.subagentId) ?? []
+        )
+      ),
+    [allVisibleSubagents, goalSurfaceTimelineEventsById]
+  )
+  const subagentTimelineEventsById = React.useMemo(() => {
+    const grouped = new Map<string, api.ExecutionTranscriptEvent[]>()
+    for (const subagent of goalSurfaceSubagents) {
+      grouped.set(
+        subagent.subagentId,
+        goalSurfaceTimelineEventsById.get(subagent.subagentId) ?? []
+      )
+    }
+    return grouped
+  }, [goalSurfaceSubagents, goalSurfaceTimelineEventsById])
   const workflowExecutionPolicy = React.useMemo(
     () => (workflowConfig.execution_policy ?? {}) as Record<string, unknown>,
     [workflowConfig.execution_policy]
@@ -1681,6 +2070,17 @@ export default function ChatPage() {
     () => (workflowConfig.evidence ?? {}) as Record<string, unknown>,
     [workflowConfig.evidence]
   )
+
+  React.useEffect(() => {
+    setExpandedSubagentIds((current) => {
+      if (current.size === 0) {
+        return current
+      }
+      const validIds = new Set(goalSurfaceSubagents.map((item) => item.subagentId))
+      const next = new Set([...current].filter((id) => validIds.has(id)))
+      return next.size === current.size ? current : next
+    })
+  }, [goalSurfaceSubagents])
   const workflowResearchConfig = React.useMemo(
     () => (workflowConfig.research ?? {}) as Record<string, unknown>,
     [workflowConfig.research]
@@ -1734,18 +2134,51 @@ export default function ChatPage() {
       ),
     [currentSessionId, effectiveProjectId, runtimeTasks]
   )
+  const contextualRuntimeTaskIds = React.useMemo(
+    () => new Set(contextualRuntimeTasks.map((task) => task.task_id)),
+    [contextualRuntimeTasks]
+  )
+  const contextualPendingApprovals = React.useMemo(
+    () =>
+      runtimeApprovals.filter(
+        (approval) =>
+          approval.status === 'pending' &&
+          typeof approval.task_id === 'string' &&
+          contextualRuntimeTaskIds.has(approval.task_id)
+      ),
+    [contextualRuntimeTaskIds, runtimeApprovals]
+  )
   const pendingApprovalCount = React.useMemo(() => {
-    const taskIds = new Set(contextualRuntimeTasks.map((task) => task.task_id))
-    if (taskIds.size === 0) {
+    if (contextualRuntimeTaskIds.size === 0) {
       return 0
     }
-    return runtimeApprovals.filter(
-      (approval) =>
-        approval.status === 'pending' &&
-        typeof approval.task_id === 'string' &&
-        taskIds.has(approval.task_id)
-    ).length
-  }, [contextualRuntimeTasks, runtimeApprovals])
+    return contextualPendingApprovals.length
+  }, [contextualPendingApprovals, contextualRuntimeTaskIds])
+  const pendingGoalApprovalIds = React.useMemo(
+    () =>
+      Array.from(
+        new Set(
+          contextualPendingApprovals
+            .map((approval) => approval.approval_id.trim())
+            .filter((approvalId) => approvalId.length > 0)
+        )
+      ),
+    [contextualPendingApprovals]
+  )
+  const goalHealthPendingApprovalCount = React.useMemo(() => {
+    if (!goalDrawerHealth) {
+      return 0
+    }
+    const pendingCount = goalDrawerHealth.approval_state?.pending_count
+    if (typeof pendingCount === 'number' && Number.isFinite(pendingCount) && pendingCount > 0) {
+      return pendingCount
+    }
+    return getStringArray(goalDrawerHealth.approval_state?.approval_ids).length
+  }, [goalDrawerHealth])
+  const goalSurfacePendingApprovalCount = React.useMemo(
+    () => Math.max(pendingApprovalCount, goalHealthPendingApprovalCount),
+    [goalHealthPendingApprovalCount, pendingApprovalCount]
+  )
   const activeTaskCount = React.useMemo(
     () => contextualRuntimeTasks.filter((task) => isActiveTaskStatus(task.status)).length,
     [contextualRuntimeTasks]
@@ -1766,18 +2199,28 @@ export default function ChatPage() {
     }
     return 'Tasks'
   }, [activeTaskCount, failedTaskCount, pendingApprovalCount])
+  const workflowUiSuppressedInHeader =
+    currentSessionGoalState.interaction_mode === 'goal' &&
+    currentSessionGoalState.execution_topology === 'single_agent'
+  const workflowShortcutLabel = workflowUiSuppressedInHeader
+    ? 'Workflow desk'
+    : t('sidebar.workflows')
   const workflowShortcutTitle = React.useMemo(() => {
+    const baseLabel = workflowShortcutLabel
     if (workflowError) {
-      return `${t('sidebar.workflows')} (attention needed)`
+      return `${baseLabel} (attention needed)`
     }
     if (workflowBoundRunId) {
-      return `${t('sidebar.workflows')} (run active)`
+      return `${baseLabel} (run active)`
     }
     if (workflowEnabled) {
-      return `${t('sidebar.workflows')} (enabled)`
+      return `${baseLabel} (enabled)`
     }
-    return t('sidebar.workflows')
-  }, [t, workflowBoundRunId, workflowEnabled, workflowError])
+    if (workflowUiSuppressedInHeader) {
+      return `${baseLabel} (advanced overrides)`
+    }
+    return baseLabel
+  }, [workflowBoundRunId, workflowEnabled, workflowError, workflowShortcutLabel, workflowUiSuppressedInHeader])
   const uploadTargetDir =
     projects.find((project) => project.id === effectiveProjectId)?.workspaceDir ??
     getString(settings?.paths?.workspace_dir) ??
@@ -2342,150 +2785,12 @@ export default function ChatPage() {
       }
 
       const mappedEvents = nextEvents
-        .map((event, eventIndex) => {
-          const type = getString(event.type)
-          const timestamp = getString(event.timestamp) ?? new Date().toISOString()
-          const turnId = `${runDetail.run_id}:${syncedCount + eventIndex}`
-          const nestedPayload = isRecord(event.payload) ? event.payload : null
-          if (type === 'turn_event') {
-            return {
-              type: 'turn_event',
-              phase: getString(event.phase) ?? 'status',
-              timestamp,
-              turn_id: turnId,
-              payload: nestedPayload
-                ? {
-                    ...nestedPayload,
-                    metadata: {
-                      ...(isRecord(nestedPayload.metadata) ? nestedPayload.metadata : {}),
-                      channel: 'workflow',
-                      workflow_run_id: runDetail.run_id,
-                    },
-                  }
-                : {
-                    content: formatWorkflowLifecycleMessage(event),
-                    metadata: {
-                      channel: 'workflow',
-                      workflow_run_id: runDetail.run_id,
-                    },
-                  },
-            }
-          }
-          if (
-            type === 'thinking' ||
-            type === 'status' ||
-            type === 'tool_call_request' ||
-            type === 'tool_call_result' ||
-            type === 'error' ||
-            type === 'final_answer'
-          ) {
-            return {
-              ...event,
-              type,
-              timestamp,
-              turn_id: turnId,
-              metadata: {
-                ...(isRecord(event.metadata) ? event.metadata : {}),
-                channel: 'workflow',
-                workflow_run_id: runDetail.run_id,
-              },
-            }
-          }
-          if (type === 'text_chunk' && getString(event.content)) {
-            return {
-              type: 'text_chunk',
-              content: getString(event.content) ?? '',
-              timestamp,
-              turn_id: turnId,
-            }
-          }
-          if (type === 'operator_message') {
-            return {
-              type: 'message',
-              role: 'user',
-              content: getString(event.content) ?? '',
-              attachments: Array.isArray(event.attachments) ? event.attachments : [],
-              timestamp,
-              turn_id: turnId,
-              metadata: {
-                channel: 'workflow',
-                workflow_run_id: runDetail.run_id,
-              },
-            }
-          }
-          if (type === 'assistant_message') {
-            const metadata = isRecord(event.metadata) ? event.metadata : {}
-            if (metadata.acknowledgement === true) {
-              return null
-            }
-            return {
-              type: 'message',
-              role: 'assistant',
-              content: getString(event.content) ?? '',
-              timestamp,
-              turn_id: turnId,
-              metadata: {
-                channel: 'workflow',
-                workflow_run_id: runDetail.run_id,
-              },
-            }
-          }
-          if (type === 'artifact') {
-            return {
-              type: 'turn_event',
-              phase: 'status',
-              timestamp,
-              turn_id: turnId,
-              payload: {
-                content:
-                  getString(event.title) ??
-                  getString(event.artifact_type) ??
-                  'Workflow artifact recorded.',
-                artifact_type: getString(event.artifact_type),
-                metadata: {
-                  channel: 'workflow',
-                  workflow_run_id: runDetail.run_id,
-                  raw_phase: 'workflow_artifact',
-                },
-              },
-            }
-          }
-          if (type === 'exec_update' || type === 'detached_exec_reattached' || type === 'detached_exec_stop') {
-            return {
-              type: 'turn_event',
-              phase: 'status',
-              timestamp,
-              turn_id: turnId,
-              payload: {
-                content:
-                  getString(event.content) ??
-                  getString(event.status) ??
-                  'Workflow execution updated.',
-                metadata: {
-                  channel: 'workflow',
-                  workflow_run_id: runDetail.run_id,
-                  raw_phase: 'workflow_exec_update',
-                },
-              },
-            }
-          }
-          return {
-            type: 'turn_event',
-            phase: 'status',
-            timestamp,
-            turn_id: turnId,
-            payload: {
-              content: formatWorkflowLifecycleMessage(event),
-              status: getString(event.status),
-              event_type: type,
-              metadata: {
-                channel: 'workflow',
-                workflow_run_id: runDetail.run_id,
-                raw_phase: 'workflow_status',
-              },
-            },
-          }
-        })
+        .map((event, eventIndex) =>
+          projectWorkflowRunEventToSessionEvent(event, {
+            runId: runDetail.run_id,
+            turnId: `${runDetail.run_id}:${syncedCount + eventIndex}`,
+          })
+        )
         .filter((event) => {
           if (event === null) {
             return false
@@ -2572,6 +2877,233 @@ export default function ChatPage() {
       }
     }
   }, [currentSessionId, sessionBoundRunId, syncWorkflowRunEventsToSession, workflowState])
+
+  React.useEffect(() => {
+    if (!currentSessionId) {
+      setSessionSubagents([])
+      return
+    }
+
+    setSessionSubagents([])
+    let cancelled = false
+    const loadSessionSubagents = async () => {
+      try {
+        const subagents = await api.fetchSessionSubagents(currentSessionId)
+        if (cancelled) {
+          return
+        }
+        setSessionSubagents(subagents)
+      } catch {
+        if (!cancelled) {
+          setSessionSubagents([])
+        }
+      }
+    }
+
+    void loadSessionSubagents()
+    return () => {
+      cancelled = true
+    }
+  }, [currentSessionId])
+
+  React.useEffect(() => {
+    if (!sessionBoundRunId) {
+      setExecutionTimelineEvents((current) =>
+        current.filter((event) => event.parentType !== 'agent_run' && event.parentType !== 'goal')
+      )
+      setExecutionTimelineError(null)
+      setAgentRunSubagents([])
+      setActiveSubagentId((current) => {
+        if (!current) {
+          return null
+        }
+        const stillExists = sessionSubagents.some((item) => item.subagentId === current)
+        return stillExists ? current : null
+      })
+      setActiveSubagentDetail((current) => (current?.agentRunId ? null : current))
+      setSubagentDrawerError(null)
+      setSubagentDrawerLoading(false)
+      lastTranscriptSeqRef.current = null
+      return
+    }
+
+    let cancelled = false
+    let timeoutId: number | null = null
+    let streamAbortController: AbortController | null = null
+    let shouldUsePollingFallback = false
+
+    const clearScheduledPoll = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+        timeoutId = null
+      }
+    }
+
+    const scheduleNext = (
+      runStatus?: string | null,
+      delayMs: number = EXECUTION_TIMELINE_POLL_MS
+    ) => {
+      clearScheduledPoll()
+      if (cancelled || isAgentRunTerminalStatus(runStatus ?? workflowCardRun?.status ?? null)) {
+        return
+      }
+      timeoutId = window.setTimeout(() => {
+        timeoutId = null
+        void pollTranscript(true)
+      }, delayMs)
+    }
+
+    const applyFallbackEvents = (runDetail: api.AgentRunDetail) => {
+      const fallbackEvents = runDetail.events
+        .map((event) => mapAgentRunEventToTranscriptEvent(event))
+        .filter((event): event is api.ExecutionTranscriptEvent => event !== null)
+      setExecutionTimelineEvents((current) => {
+        const preservedSessionEvents = current.filter((event) => event.parentType === 'chat_turn')
+        return mergeTranscriptEvents(preservedSessionEvents, fallbackEvents)
+      })
+      lastTranscriptSeqRef.current = fallbackEvents.reduce(
+        (max, event) => Math.max(max, event.seq ?? max),
+        0
+      )
+    }
+
+    const pollTranscript = async (
+      scheduleFollowUp = shouldUsePollingFallback
+    ): Promise<string | null> => {
+      try {
+        const [runDetail, subagents] = await Promise.all([
+          api.fetchAgentRun(sessionBoundRunId),
+          api.fetchAgentRunSubagents(sessionBoundRunId).catch(() => []),
+        ])
+        if (cancelled) {
+          return null
+        }
+
+        setWorkflowCardRun(runDetail)
+        setAgentRunSubagents((current) => mergeSubagentSummaries(current, subagents))
+
+        try {
+          const events = await api.fetchAgentRunEvents(sessionBoundRunId, {
+            afterSeq: lastTranscriptSeqRef.current,
+          })
+          if (cancelled) {
+            return null
+          }
+
+          if (events.length > 0) {
+            setExecutionTimelineEvents((current) => mergeTranscriptEvents(current, events))
+            lastTranscriptSeqRef.current = events.reduce(
+              (max, event) => Math.max(max, event.seq ?? max),
+              lastTranscriptSeqRef.current ?? 0
+            )
+          } else if (lastTranscriptSeqRef.current === null) {
+            applyFallbackEvents(runDetail)
+          }
+          setExecutionTimelineError(null)
+        } catch (error) {
+          if (cancelled) {
+            return null
+          }
+          applyFallbackEvents(runDetail)
+          setExecutionTimelineError(
+            error instanceof Error ? error.message : 'Transcript endpoint unavailable.'
+          )
+        }
+
+        if (scheduleFollowUp) {
+          scheduleNext(runDetail.status)
+        }
+        return runDetail.status
+      } catch (error) {
+        if (cancelled) {
+          return null
+        }
+        setExecutionTimelineError(
+          error instanceof Error ? error.message : 'Failed to load execution timeline.'
+        )
+        if (scheduleFollowUp) {
+          scheduleNext(null)
+        }
+        return null
+      }
+    }
+
+    const streamTranscript = async () => {
+      streamAbortController = new AbortController()
+      try {
+        for await (const event of api.streamAgentRunEvents(sessionBoundRunId, {
+          afterSeq: lastTranscriptSeqRef.current,
+          signal: streamAbortController.signal,
+        })) {
+          if (cancelled) {
+            return
+          }
+          setExecutionTimelineEvents((current) => mergeTranscriptEvents(current, [event]))
+          lastTranscriptSeqRef.current = Math.max(lastTranscriptSeqRef.current ?? 0, event.seq ?? 0)
+          setExecutionTimelineError(null)
+        }
+      } catch (error) {
+        if (cancelled) {
+          return
+        }
+        shouldUsePollingFallback = true
+        setExecutionTimelineError(
+          error instanceof Error ? error.message : 'Transcript stream unavailable.'
+        )
+        scheduleNext(null, EXECUTION_TIMELINE_STREAM_RECOVER_MS)
+        return
+      } finally {
+        streamAbortController = null
+      }
+
+      if (cancelled || shouldUsePollingFallback) {
+        return
+      }
+
+      shouldUsePollingFallback = true
+      scheduleNext(null, EXECUTION_TIMELINE_STREAM_RECOVER_MS)
+    }
+
+    void pollTranscript(false).then((runStatus) => {
+      if (cancelled || shouldUsePollingFallback || isAgentRunTerminalStatus(runStatus)) {
+        return
+      }
+      void streamTranscript()
+    })
+
+    return () => {
+      cancelled = true
+      streamAbortController?.abort()
+      clearScheduledPoll()
+    }
+  }, [sessionBoundRunId, sessionSubagents, workflowCardRun?.status])
+
+  React.useEffect(() => {
+    if (!currentSessionId) {
+      return
+    }
+    if (currentSessionDetail?.id !== currentSessionId) {
+      return
+    }
+
+    const restoredEvents = currentSessionDetail.events
+      .map((event) => normalizeStreamSubagentEvent(event))
+      .filter((event): event is StreamSubagentEvent => event !== null)
+      .filter((event) => (event.sessionId ?? currentSessionId) === currentSessionId)
+
+    setExecutionTimelineEvents((current) => {
+      const preservedNonChatTurn = current.filter((event) => event.parentType !== 'chat_turn')
+      return restoredEvents.length > 0
+        ? mergeTranscriptEvents(preservedNonChatTurn, restoredEvents)
+        : preservedNonChatTurn
+    })
+    const restoredSummaries = restoredEvents
+      .map((event) => buildSubagentSummaryFromEvent(event))
+      .filter((event): event is api.SubagentTranscriptSummary => event !== null)
+    if (restoredSummaries.length > 0) {
+      setSessionSubagents((current) => mergeSubagentSummaries(current, restoredSummaries))
+    }
+  }, [currentSessionDetail, currentSessionId])
 
   const hydrateSessionFromDetail = React.useCallback(
     (detail: api.SessionDetail) => {
@@ -3017,8 +3549,8 @@ export default function ChatPage() {
         availableModelOptions,
         selectedCurrentModel
       )
-      const protocolHint = detectGoalProtocolHint(heuristicSource)
-      const protocolId: api.AgentRunProtocolId =
+      const protocolHint = executionMode === 'workflow' ? detectGoalProtocolHint(heuristicSource) : null
+      const protocolId: api.AgentRunProtocolId | null =
         executionMode === 'workflow'
           ? protocolHint ??
             (workflowTemplate === 'research_debate'
@@ -3026,8 +3558,9 @@ export default function ChatPage() {
               : workflowProtocolId === DEFAULT_WORKFLOW_PROTOCOL
                 ? suggestedWorkflowStrategy.protocolId
                 : workflowProtocolId)
-          : protocolHint ?? suggestedWorkflowStrategy.protocolId
-      const executionTopology = goalProtocolExecutionTopology(protocolId)
+          : null
+      const executionTopology: api.GoalExecutionTopology =
+        protocolId ? goalProtocolExecutionTopology(protocolId) : 'single_agent'
       const primaryModels =
         executionTopology === 'multi_agent'
           ? uniqueStrings([
@@ -3081,7 +3614,10 @@ export default function ChatPage() {
         protocol_id: protocolId,
         bound_run_id: null,
         protocol_selection: protocolId,
-        selection_rationale: describeGoalProtocolSelection(protocolId, interactionMode),
+        selection_rationale:
+          protocolId && interactionMode === 'workflow'
+            ? describeGoalProtocolSelection(protocolId, interactionMode)
+            : null,
         models: primaryModels,
         role_summary: roleSummary,
         runtime_mode: runtimeMode,
@@ -3162,6 +3698,8 @@ export default function ChatPage() {
       userContent,
       assistantContent,
       goalCard,
+      userMetadata,
+      assistantMetadata,
     }: GoalConversationAppendInput) => {
       const detail = await api.appendSessionEvents(sessionId, [
         {
@@ -3170,12 +3708,14 @@ export default function ChatPage() {
           content: userContent,
           attachments,
           timestamp: new Date().toISOString(),
+          metadata: userMetadata ?? {},
         },
         {
           type: 'message',
           role: 'assistant',
           content: assistantContent,
           timestamp: new Date().toISOString(),
+          metadata: assistantMetadata ?? {},
           ...(goalCard ? { goal_card: goalCard } : {}),
         },
       ])
@@ -3239,10 +3779,8 @@ export default function ChatPage() {
       const activeGoalId = baseGoalState.active_goal_id
       const proposalRequested =
         route.kind === 'goal_proposal' ||
-        route.kind === 'workflow_proposal' ||
-        route.kind === 'natural_language_goal_proposal'
+        route.kind === 'workflow_proposal'
       const proposalRevisionRequested = route.kind === 'goal_revision'
-      const activeGoalFollowUpRequested = route.kind === 'goal_follow_up'
       const confirmationRequested = route.kind === 'goal_confirmation'
 
       if (route.kind === 'goal_help') {
@@ -3277,8 +3815,8 @@ export default function ChatPage() {
             attachments,
             userContent: route.raw,
             assistantContent: activeGoalId
-              ? 'Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage the active goal.'
-              : 'No active goal is currently bound to this chat. Start a new one with `/goal <request>` or `/workflow <request>`.',
+              ? buildGoalLifecycleMessage(route.raw, 'goal_manage_hint')
+              : buildGoalLifecycleMessage(route.raw, 'no_active_goal'),
             goalCard: summaryCard,
           })
           return true
@@ -3326,8 +3864,6 @@ export default function ChatPage() {
             ? 'workflow'
             : route.kind === 'goal_proposal'
               ? 'single_agent'
-              : route.kind === 'natural_language_goal_proposal'
-                ? detectGoalExecutionModeHint(requestText) ?? 'single_agent'
               : pendingProposal?.execution_mode ?? 'single_agent'
         const proposalObjective = proposalRevisionRequested
           ? pendingProposal?.objective ?? requestText
@@ -3370,53 +3906,40 @@ export default function ChatPage() {
             ? revisionSourceText
             : route.kind === 'workflow_proposal'
               ? requestText
-              : route.kind === 'natural_language_goal_proposal'
-                ? requestText
-                : route.kind === 'goal_proposal'
-                  ? route.content
-                  : requestText
-        const proposalExplanationSourceText =
-          proposalConversationUserContent || proposalObjective
-        const proposalAssistantCopy = await generateGoalProposalAssistantExplanation(
-          proposalExplanationSourceText,
+              : route.kind === 'goal_proposal'
+                ? route.content
+                : requestText
+        const assistantExplanation = await generateGoalProposalAssistantExplanation(
+          proposalConversationUserContent || nextProposal.objective,
           nextProposal
         )
-        const nextProposalWithExplanation: GoalSessionProposal = {
+        const pendingProposalSummary: GoalSessionProposal = {
           ...nextProposal,
-          assistant_explanation: proposalAssistantCopy.explanation,
-          assistant_explanation_source: proposalAssistantCopy.source,
+          assistant_explanation: assistantExplanation.explanation,
+          assistant_explanation_source: assistantExplanation.source,
         }
-        const nextGoalState: GoalSessionState = {
+        await persistSessionGoalState(sessionId, {
           active_goal_id: null,
           active_goal_status: null,
-          execution_mode: nextProposalWithExplanation.execution_mode,
-          interaction_mode: nextProposalWithExplanation.interaction_mode,
-          execution_topology: nextProposalWithExplanation.execution_topology,
-          bound_run_id: nextProposalWithExplanation.bound_run_id,
-          protocol_selection: nextProposalWithExplanation.protocol_selection,
-          selection_rationale: nextProposalWithExplanation.selection_rationale,
-          default_route: nextProposalWithExplanation.execution_mode === 'workflow' ? 'workflow' : 'goal',
+          execution_mode: pendingProposalSummary.execution_mode,
+          interaction_mode: pendingProposalSummary.interaction_mode,
+          execution_topology: pendingProposalSummary.execution_topology,
+          bound_run_id: pendingProposalSummary.bound_run_id,
+          protocol_selection: pendingProposalSummary.protocol_selection,
+          selection_rationale: pendingProposalSummary.selection_rationale,
+          default_route:
+            pendingProposalSummary.execution_mode === 'workflow' ? 'workflow' : 'goal',
           last_goal_summary: latestGoalSummary,
-          pending_proposal: nextProposalWithExplanation,
-        }
-
-        await syncWorkflowStateForGoal({
-          sessionId,
-          baseWorkflow,
-          executionMode: nextProposalWithExplanation.execution_mode,
-          interactionMode: nextProposalWithExplanation.interaction_mode,
-          executionTopology: nextProposalWithExplanation.execution_topology,
+          pending_proposal: pendingProposalSummary,
         })
-
-        await persistSessionGoalState(sessionId, nextGoalState)
         await persistGoalConversation({
           sessionId,
           attachments,
           userContent: proposalConversationUserContent,
-          assistantContent: nextProposalWithExplanation.assistant_explanation ?? '',
+          assistantContent: pendingProposalSummary.assistant_explanation ?? '',
           goalCard: goalCardFromSummary(
-            nextProposalWithExplanation,
-            pendingProposal || proposalRevisionRequested ? 'revised_proposal' : 'proposal',
+            pendingProposalSummary,
+            pendingProposalSummary.revision_index > 0 ? 'revised_proposal' : 'proposal',
             {
               copySource: proposalConversationUserContent,
             }
@@ -3426,6 +3949,10 @@ export default function ChatPage() {
       }
 
       if (confirmationRequested && pendingProposal) {
+        const goalAgentModelId = pendingProposal.models[0] ?? currentModel ?? modelOptions[0]?.id ?? null
+        const selectedGoalModelRoles: Record<string, string> = goalAgentModelId
+          ? { agent: goalAgentModelId }
+          : {}
         const createdGoal = await api.createGoal({
           objective: pendingProposal.objective,
           execution_mode: pendingProposal.execution_mode,
@@ -3438,6 +3965,10 @@ export default function ChatPage() {
           topic: pendingProposal.objective,
           projectId: workflowSessionProjectId,
           workspaceDir: effectiveWorkspaceDir,
+          selected_models_roles:
+            Object.keys(selectedGoalModelRoles).length > 0
+              ? buildSelectedModelsRolesPayload(selectedGoalModelRoles)
+              : {},
           summary: {
             operator_message: pendingProposal.objective,
             selected_skill_ids: selectedSkillIds,
@@ -3552,195 +4083,6 @@ export default function ChatPage() {
         return true
       }
 
-      if (activeGoalFollowUpRequested) {
-        const health = await api.fetchGoalHealth(activeGoalId)
-        const continuation = resolveGoalContinuationDecision(health)
-
-        if (continuation.action === 'manual_resolution_required') {
-          const activeGoal = await api.fetchGoal(activeGoalId)
-          const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
-          const approvalToolNames = getStringArray(health.approval_state?.tool_names)
-          const cardCopy = buildGoalCardChromeCopy(requestText)
-          await persistSessionGoalState(sessionId, {
-            active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
-            active_goal_status: activeGoal.status,
-            execution_mode: activeGoal.execution_mode,
-            interaction_mode: activeGoal.interaction_mode,
-            execution_topology: activeGoal.execution_topology,
-            bound_run_id: activeGoalSummary.bound_run_id,
-            protocol_selection: activeGoalSummary.protocol_selection,
-            selection_rationale: activeGoalSummary.selection_rationale,
-            default_route: isGoalTerminalStatus(activeGoal.status)
-              ? 'chat'
-              : activeGoal.execution_mode === 'workflow'
-                ? 'workflow'
-                : 'goal',
-            last_goal_summary: activeGoalSummary,
-            pending_proposal: null,
-          })
-          await persistGoalConversation({
-            sessionId,
-            attachments,
-            userContent: requestText,
-            assistantContent: buildGoalFollowUpMessage(requestText, 'manual_resolution_required', {
-              summary: continuation.summary,
-              approvalCount: continuation.approvalIds.length,
-              toolNames: approvalToolNames,
-            }),
-            goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-              label: cardCopy.goalBlockedLabel,
-              goalId: activeGoal.goal_id,
-              status: activeGoal.status,
-              copySource: requestText,
-            }),
-          })
-          return true
-        }
-
-        if (continuation.action === 'blocked') {
-          const activeGoal = await api.fetchGoal(activeGoalId)
-          const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
-          const operatorControlHint = formatGoalOperatorControlHint(health.operator_controls)
-          const cardCopy = buildGoalCardChromeCopy(requestText)
-          await persistSessionGoalState(sessionId, {
-            active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
-            active_goal_status: activeGoal.status,
-            execution_mode: activeGoal.execution_mode,
-            interaction_mode: activeGoal.interaction_mode,
-            execution_topology: activeGoal.execution_topology,
-            bound_run_id: activeGoalSummary.bound_run_id,
-            protocol_selection: activeGoalSummary.protocol_selection,
-            selection_rationale: activeGoalSummary.selection_rationale,
-            default_route: isGoalTerminalStatus(activeGoal.status)
-              ? 'chat'
-              : activeGoal.execution_mode === 'workflow'
-                ? 'workflow'
-                : 'goal',
-            last_goal_summary: activeGoalSummary,
-            pending_proposal: null,
-          })
-          await persistGoalConversation({
-            sessionId,
-            attachments,
-            userContent: requestText,
-            assistantContent: buildGoalFollowUpMessage(requestText, 'blocked', {
-              summary: continuation.summary,
-              operatorControlHint,
-            }),
-            goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-              label: cardCopy.goalBlockedLabel,
-              goalId: activeGoal.goal_id,
-              status: activeGoal.status,
-              copySource: requestText,
-            }),
-          })
-          return true
-        }
-
-        let activeGoal =
-          continuation.action === 'refresh_then_forward'
-            ? await api.refreshGoal(activeGoalId)
-            : continuation.action === 'resume_then_forward'
-              ? await api.resumeGoal(activeGoalId)
-              : await api.fetchGoal(activeGoalId)
-        const activeGoalSummary = buildGoalSummaryFromGoal(activeGoal, latestGoalSummary)
-        const activeRunId = getGoalAttemptRunId(activeGoal)
-
-        if (!activeRunId) {
-          await persistSessionGoalState(sessionId, {
-            active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
-            active_goal_status: activeGoal.status,
-            execution_mode: activeGoal.execution_mode,
-            interaction_mode: activeGoal.interaction_mode,
-            execution_topology: activeGoal.execution_topology,
-            bound_run_id: activeGoalSummary.bound_run_id,
-            protocol_selection: activeGoalSummary.protocol_selection,
-            selection_rationale: activeGoalSummary.selection_rationale,
-            default_route: isGoalTerminalStatus(activeGoal.status)
-              ? 'chat'
-              : activeGoal.execution_mode === 'workflow'
-                ? 'workflow'
-                : 'goal',
-            last_goal_summary: activeGoalSummary,
-            pending_proposal: null,
-          })
-          await persistGoalConversation({
-            sessionId,
-            attachments,
-            userContent: requestText,
-            assistantContent: buildGoalFollowUpMessage(requestText, 'no_live_attempt'),
-            goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-              label: buildGoalCardChromeCopy(requestText).goalStatusLabel,
-              goalId: activeGoal.goal_id,
-              status: activeGoal.status,
-              copySource: requestText,
-            }),
-          })
-          return true
-        }
-
-        await api.appendAgentRunMessage(activeRunId, {
-          role: 'operator',
-          content: requestText,
-          projectId: workflowSessionProjectId,
-          workspaceDir: effectiveWorkspaceDir,
-          attachments,
-          metadata: {
-            channel: 'goal-chat',
-            goal_id: activeGoal.goal_id,
-            source_session_id: sessionId,
-            selected_skill_ids: selectedSkillIds,
-          },
-        })
-
-        await syncWorkflowStateForGoal({
-          sessionId,
-          baseWorkflow,
-          executionMode: activeGoal.execution_mode,
-          interactionMode: activeGoal.interaction_mode,
-          executionTopology: activeGoal.execution_topology,
-          goalStatus: activeGoal.status,
-          runId: activeRunId,
-        })
-        await persistSessionGoalState(sessionId, {
-          active_goal_id: isGoalTerminalStatus(activeGoal.status) ? null : activeGoal.goal_id,
-          active_goal_status: activeGoal.status,
-          execution_mode: activeGoal.execution_mode,
-          interaction_mode: activeGoal.interaction_mode,
-          execution_topology: activeGoal.execution_topology,
-          bound_run_id: activeGoalSummary.bound_run_id,
-          protocol_selection: activeGoalSummary.protocol_selection,
-          selection_rationale: activeGoalSummary.selection_rationale,
-          default_route: isGoalTerminalStatus(activeGoal.status)
-            ? 'chat'
-            : activeGoal.execution_mode === 'workflow'
-              ? 'workflow'
-              : 'goal',
-          last_goal_summary: activeGoalSummary,
-          pending_proposal: null,
-        })
-        await persistGoalConversation({
-          sessionId,
-          attachments,
-          userContent: requestText,
-          assistantContent: buildGoalFollowUpMessage(
-            requestText,
-            continuation.action === 'refresh_then_forward'
-              ? 'refreshed_forwarded'
-              : continuation.action === 'resume_then_forward'
-                ? 'resumed_forwarded'
-                : 'forwarded'
-          ),
-          goalCard: goalCardFromSummary(activeGoalSummary, 'started', {
-            label: buildGoalCardChromeCopy(requestText).goalUpdatedLabel,
-            goalId: activeGoal.goal_id,
-            status: activeGoal.status,
-            copySource: requestText,
-          }),
-        })
-        return true
-      }
-
       if (route.kind !== 'goal_lifecycle') {
         return false
       }
@@ -3835,8 +4177,10 @@ export default function ChatPage() {
       requestText,
       attachments,
       selectedSkillIds,
+      toolMode,
       normalizedWorkflow,
       sessionScope,
+      systemPromptOverride,
     }: DirectChatTurnInput) => {
       let sessionId = sessionScope.getSessionId()
       let sessionContext = sessionScope.getContext()
@@ -4104,6 +4448,12 @@ export default function ChatPage() {
 
         let streamed = false
         let latestAssistantContent = ''
+        activeChatRunRef.current = {
+          sessionId,
+          turnId: null,
+          chatRunId: null,
+        }
+        pendingChatCancelRef.current = null
         try {
           for await (const chunk of api.streamChatMessages(requestText, {
             sessionId,
@@ -4112,9 +4462,10 @@ export default function ChatPage() {
               activeProjectId ??
               null,
             model: currentModel ?? undefined,
+            toolMode,
             selectedSkillIds,
             attachments,
-            systemPrompt: effectiveInference.systemPrompt,
+            systemPrompt: systemPromptOverride ?? effectiveInference.systemPrompt,
             temperature: effectiveInference.temperature,
             maxTokens: effectiveInference.maxTokens,
             reserveOutputTokens: effectiveInference.reserveOutputTokens,
@@ -4131,8 +4482,40 @@ export default function ChatPage() {
                 void selectSession(nextSessionId)
               }
             },
+            onResponseMeta: (meta) => {
+              activeChatRunRef.current = {
+                sessionId: meta.sessionId ?? activeChatRunRef.current.sessionId,
+                turnId: meta.turnId ?? activeChatRunRef.current.turnId,
+                chatRunId: meta.chatRunId ?? activeChatRunRef.current.chatRunId,
+              }
+            },
           })) {
             streamed = true
+
+            const subagentEvent = normalizeStreamSubagentEvent(chunk.rawEvent)
+            if (subagentEvent) {
+              setExecutionTimelineEvents((current) => mergeTranscriptEvents(current, [subagentEvent]))
+              const subagentSummary = buildSubagentSummaryFromEvent({
+                ...subagentEvent,
+                sessionId: subagentEvent.sessionId ?? sessionId,
+              })
+              if (subagentSummary) {
+                if (subagentSummary.agentRunId) {
+                  setAgentRunSubagents((current) => mergeSubagentSummaries(current, [subagentSummary]))
+                } else {
+                  setSessionSubagents((current) => mergeSubagentSummaries(current, [subagentSummary]))
+                }
+              }
+              if (activeSubagentId && subagentEvent.subagentId === activeSubagentId) {
+                setActiveSubagentDetail((current) => current
+                  ? {
+                      ...current,
+                      events: mergeTranscriptEvents(current.events, [subagentEvent]),
+                      updatedAt: subagentEvent.createdAt ?? current.updatedAt ?? null,
+                    }
+                  : current)
+              }
+            }
 
             if (chunk.event?.type === 'assistant' && chunk.event.content) {
               latestAssistantContent = chunk.event.content
@@ -4159,7 +4542,11 @@ export default function ChatPage() {
             currentModel,
             selectedSkillIds,
             attachments,
-            effectiveInference
+            toolMode,
+            {
+              ...effectiveInference,
+              systemPrompt: systemPromptOverride ?? effectiveInference.systemPrompt,
+            }
           )
           const eventMessages = response.events?.length
             ? api.buildMessagesFromChatEvents(response.events)
@@ -4200,9 +4587,20 @@ export default function ChatPage() {
         await syncSessionFromServer(sessionId)
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
+          const cancelResponse = pendingChatCancelRef.current
           updateSessionMessages(sessionId, (prev) => prev.map((message) =>
             message.turnKey === turnKey ? { ...message, isStreaming: false } : message
           ))
+          if (
+            cancelResponse?.status === 'already_completed' ||
+            cancelResponse?.status === 'cancel_requested'
+          ) {
+            try {
+              await syncSessionFromServer(sessionId)
+            } catch {
+              // Transport stop already succeeded; leave the optimistic state as-is.
+            }
+          }
           return
         }
         const detail = error instanceof Error ? error.message : null
@@ -4222,11 +4620,14 @@ export default function ChatPage() {
         ])
       } finally {
         setWorkflowBusy(false)
+        activeChatRunRef.current = { sessionId: null, turnId: null, chatRunId: null }
+        pendingChatCancelRef.current = null
         finishStreaming(sessionId)
       }
     },
     [
       activeProjectId,
+      activeSubagentId,
       appendOptimisticConversationTurn,
       currentModel,
       currentModelLoaded,
@@ -4282,7 +4683,7 @@ export default function ChatPage() {
         hasPendingProposal: pendingProposal !== null,
         hasActiveGoal:
           sessionContext.baseGoalState.active_goal_id !== null &&
-          !isGoalTerminalStatus(sessionContext.baseGoalState.active_goal_status),
+            !isGoalTerminalStatus(sessionContext.baseGoalState.active_goal_status),
       })
       const workflowProposalRequested = route.kind === 'workflow_proposal'
 
@@ -4426,11 +4827,36 @@ export default function ChatPage() {
         }
       }
 
+      const activeGoalId = sessionContext.baseGoalState.active_goal_id
+      const hasActiveNonTerminalGoal =
+        activeGoalId !== null && !isGoalTerminalStatus(sessionContext.baseGoalState.active_goal_status)
+      if (
+        route.kind === 'direct_chat' &&
+        hasActiveNonTerminalGoal &&
+        sessionContext.baseGoalState.pending_proposal === null &&
+        requestText.trim().length > 0
+      ) {
+        const handledActiveGoalDecision = await handleActiveGoalDirectTurnDecision({
+          sessionId,
+          requestText,
+          attachments,
+          activeGoalId,
+          baseWorkflow: sessionContext.baseWorkflow,
+          latestGoalSummary: sessionContext.baseGoalState.last_goal_summary,
+          selectedSkillIds,
+          sessionScope,
+        })
+        if (handledActiveGoalDecision) {
+          return
+        }
+      }
+
       await submitDirectChatTurn({
         targetSessionId,
         requestText,
         attachments,
         selectedSkillIds,
+        toolMode: undefined,
         normalizedWorkflow,
         sessionScope,
       })
@@ -4587,7 +5013,19 @@ export default function ChatPage() {
   }, [handleVoiceShortcut])
 
   const handleStopGeneration = React.useCallback(() => {
-    abortStreaming()
+    void (async () => {
+      const activeRun = activeChatRunRef.current
+      if (activeRun.sessionId) {
+        try {
+          pendingChatCancelRef.current = await api.cancelChatRun(activeRun.sessionId, {
+            turnId: activeRun.turnId,
+          })
+        } catch {
+          pendingChatCancelRef.current = null
+        }
+      }
+      abortStreaming()
+    })()
   }, [abortStreaming])
 
   const handleBuiltinCommand = React.useCallback(async (
@@ -5027,10 +5465,13 @@ export default function ChatPage() {
     }
   }, [activeAgentSettings, effectiveInference, selectedPresetName])
 
-  const closeRightPanels = React.useCallback((except?: 'goal' | 'inference' | 'tasks' | 'workflow') => {
+  const closeRightPanels = React.useCallback((except?: 'goal' | 'inference' | 'tasks' | 'workflow' | 'subagent') => {
     setWorkspaceMobileOpen(false)
     if (except !== 'goal') {
       setGoalDrawerOpen(false)
+    }
+    if (except !== 'subagent') {
+      setSubagentDrawerOpen(false)
     }
     if (except !== 'inference') {
       setPanelOpen(false)
@@ -5040,6 +5481,7 @@ export default function ChatPage() {
       setTaskPanelOpen(false)
       setTaskPanelMode('default')
       setTaskPanelFocusedTaskId(null)
+      setTaskPanelFocusedApprovalIds(null)
     }
     if (except !== 'workflow') {
       setWorkflowPanelOpen(false)
@@ -5051,6 +5493,197 @@ export default function ChatPage() {
     closeRightPanels('goal')
     setGoalDrawerOpen(nextOpen)
   }, [closeRightPanels, goalDrawerOpen])
+
+  const loadSubagentDetail = React.useCallback(async (
+    target: api.SubagentTranscriptSummary,
+    subagentId: string
+  ) => {
+    setSubagentDrawerLoading(true)
+    setSubagentDrawerError(null)
+    try {
+      const detail = target.agentRunId
+        ? await api.fetchAgentRunSubagent(target.agentRunId, subagentId)
+        : target.sessionId
+          ? await api.fetchSessionSubagent(target.sessionId, subagentId)
+          : null
+      if (!detail) {
+        throw new Error('Subagent transcript not found.')
+      }
+      setActiveSubagentDetail(detail)
+      if (detail.agentRunId) {
+        setAgentRunSubagents((current) => mergeSubagentSummaries(current, [detail]))
+      } else {
+        setSessionSubagents((current) => mergeSubagentSummaries(current, [detail]))
+      }
+    } catch (error) {
+      setSubagentDrawerError(error instanceof Error ? error.message : 'Failed to load subagent.')
+    } finally {
+      setSubagentDrawerLoading(false)
+    }
+  }, [])
+
+  const handleOpenSubagent = React.useCallback((subagentId: string) => {
+    const summary =
+      allVisibleSubagents.find((item) => item.subagentId === subagentId) ??
+      null
+    if (!summary) {
+      return
+    }
+
+    closeRightPanels('subagent')
+    setActiveSubagentId(subagentId)
+    setSubagentGuidance('')
+    setSubagentDrawerOpen(true)
+    setActiveSubagentDetail(
+      summary
+        ? {
+            ...summary,
+            systemPrompt: null,
+            userPrompt: null,
+            events: [],
+          }
+        : null
+    )
+    void loadSubagentDetail(summary, subagentId)
+  }, [allVisibleSubagents, closeRightPanels, loadSubagentDetail])
+
+  const handleSendSubagentGuidance = React.useCallback(async () => {
+    if (!activeSubagentId || subagentGuidance.trim().length === 0) {
+      return
+    }
+    const target =
+      allVisibleSubagents.find((item) => item.subagentId === activeSubagentId) ??
+      activeSubagentDetail
+    if (!target) {
+      return
+    }
+
+    setSubagentGuidanceSending(true)
+    setSubagentDrawerError(null)
+    try {
+      if (target.agentRunId) {
+        try {
+          await api.sendAgentRunSubagentMessage(target.agentRunId, activeSubagentId, {
+            content: subagentGuidance.trim(),
+            projectId: effectiveProjectId,
+            workspaceDir: effectiveWorkflowWorkspace || null,
+            metadata: {
+              target_subagent_id: activeSubagentId,
+            },
+          })
+        } catch {
+          await api.appendAgentRunSubagentMessage(target.agentRunId, target.roleId ?? activeSubagentId, {
+            content: subagentGuidance.trim(),
+            projectId: effectiveProjectId,
+            workspaceDir: effectiveWorkflowWorkspace || null,
+            metadata: {
+              target_subagent_id: activeSubagentId,
+            },
+          })
+        }
+      } else if (target.sessionId) {
+        const baseInput: api.AgentRunSubagentMessageInput = {
+          content: subagentGuidance.trim(),
+          projectId: effectiveProjectId,
+          workspaceDir: effectiveWorkflowWorkspace || null,
+          metadata: {
+            target_subagent_id: activeSubagentId,
+          },
+        }
+        const deliveryDefaults = getSubagentMessageDeliveryDefaults(target.status)
+        const inputWithDelivery: api.AgentRunSubagentMessageInput = {
+          ...baseInput,
+          ...deliveryDefaults,
+        }
+        let detail: api.SubagentTranscriptDetail | null = null
+        try {
+          detail = await api.sendSessionSubagentMessage(target.sessionId, activeSubagentId, inputWithDelivery)
+        } catch (error) {
+          if (deliveryDefaults.deliveryMode && isLegacySubagentMessageDeliveryError(error)) {
+            detail = await api.sendSessionSubagentMessage(target.sessionId, activeSubagentId, baseInput)
+          } else {
+            throw error
+          }
+        }
+        if (detail) {
+          setActiveSubagentDetail(detail)
+          setSessionSubagents((current) => mergeSubagentSummaries(current, [detail]))
+        }
+      } else {
+        throw new Error('Subagent guidance target is unavailable.')
+      }
+      setSubagentGuidance('')
+      await loadSubagentDetail(target, activeSubagentId)
+    } catch (error) {
+      setSubagentDrawerError(error instanceof Error ? error.message : 'Failed to send guidance.')
+    } finally {
+      setSubagentGuidanceSending(false)
+    }
+  }, [
+    activeSubagentDetail,
+    activeSubagentId,
+    allVisibleSubagents,
+    effectiveProjectId,
+    effectiveWorkflowWorkspace,
+    loadSubagentDetail,
+    subagentGuidance,
+  ])
+
+  const runSessionSubagentAction = React.useCallback(async (action: 'cancel' | 'resume') => {
+    if (!activeSubagentId || subagentBusyAction) {
+      return
+    }
+    const target =
+      allVisibleSubagents.find((item) => item.subagentId === activeSubagentId) ??
+      activeSubagentDetail
+    if (!target?.sessionId) {
+      setSubagentDrawerError('Session subagent target is unavailable.')
+      return
+    }
+
+    const guidance = action === 'resume' ? subagentGuidance.trim() : ''
+    setSubagentBusyAction(action)
+    setSubagentDrawerError(null)
+    try {
+      const actionDetail = action === 'cancel'
+        ? await api.cancelSessionSubagent(target.sessionId, activeSubagentId)
+        : await api.resumeSessionSubagent(target.sessionId, activeSubagentId, {
+            guidance: guidance.length > 0 ? guidance : null,
+          })
+      if (actionDetail) {
+        setActiveSubagentDetail(actionDetail)
+        setSessionSubagents((current) => mergeSubagentSummaries(current, [actionDetail]))
+      }
+
+      const [subagents, detail] = await Promise.all([
+        api.fetchSessionSubagents(target.sessionId),
+        api.fetchSessionSubagent(target.sessionId, activeSubagentId),
+      ])
+      setSessionSubagents(subagents)
+      if (detail) {
+        setActiveSubagentDetail(detail)
+      }
+      if (action === 'resume' && guidance.length > 0) {
+        setSubagentGuidance('')
+      }
+    } catch (error) {
+      setSubagentDrawerError(
+        error instanceof Error
+          ? error.message
+          : action === 'cancel'
+            ? 'Failed to cancel subagent.'
+            : 'Failed to resume subagent.'
+      )
+    } finally {
+      setSubagentBusyAction(null)
+    }
+  }, [
+    activeSubagentDetail,
+    activeSubagentId,
+    allVisibleSubagents,
+    subagentBusyAction,
+    subagentGuidance,
+  ])
 
   const refreshCurrentGoalBinding = React.useCallback(async (goalId: string) => {
     if (!currentSessionId) {
@@ -5261,9 +5894,11 @@ export default function ChatPage() {
     if (nextOpen) {
       setTaskPanelMode('default')
       setTaskPanelFocusedTaskId(null)
+      setTaskPanelFocusedApprovalIds(null)
     } else {
       setTaskPanelMode('default')
       setTaskPanelFocusedTaskId(null)
+      setTaskPanelFocusedApprovalIds(null)
     }
     setTaskPanelOpen(nextOpen)
   }, [closeRightPanels, taskPanelOpen])
@@ -5279,6 +5914,7 @@ export default function ChatPage() {
     closeRightPanels('tasks')
     setTaskPanelMode('default')
     setTaskPanelFocusedTaskId(null)
+    setTaskPanelFocusedApprovalIds(null)
     setTaskPanelOpen(true)
   }, [closeRightPanels])
 
@@ -5286,8 +5922,22 @@ export default function ChatPage() {
     closeRightPanels('tasks')
     setTaskPanelMode('subagent')
     setTaskPanelFocusedTaskId(taskId)
+    setTaskPanelFocusedApprovalIds(null)
     setTaskPanelOpen(true)
     void useTaskStore.getState().selectTask(taskId)
+  }, [closeRightPanels])
+
+  const handleOpenSubagentApprovals = React.useCallback((approvalIds: string[]) => {
+    const uniqueApprovalIds = Array.from(new Set(approvalIds.map((item) => item.trim()).filter(Boolean)))
+    if (uniqueApprovalIds.length === 0) {
+      return
+    }
+    closeRightPanels('tasks')
+    setTaskPanelMode('default')
+    setTaskPanelFocusedTaskId(null)
+    setTaskPanelFocusedApprovalIds(uniqueApprovalIds)
+    setTaskPanelOpen(true)
+    void useTaskStore.getState().load()
   }, [closeRightPanels])
 
   const handleTaskPanelOpenChange = React.useCallback((open: boolean) => {
@@ -5295,6 +5945,7 @@ export default function ChatPage() {
     if (!open) {
       setTaskPanelMode('default')
       setTaskPanelFocusedTaskId(null)
+      setTaskPanelFocusedApprovalIds(null)
     }
   }, [])
 
@@ -5331,19 +5982,15 @@ export default function ChatPage() {
 
     const isCompleted = isGoalCompletedStatus(status)
     const isBlocked = isGoalBlockedStatus(status)
-    const isFailedOrCancelled =
+    const hasTerminalIssue =
       isGoalTerminalStatus(status) &&
       !isCompleted
-
-    if (isFailedOrCancelled) {
-      return null
-    }
 
     const isActiveGoalBound =
       currentSessionGoalState.active_goal_id !== null &&
       !isGoalTerminalStatus(status)
 
-    if (!isCompleted && !isBlocked && !isActiveGoalBound) {
+    if (!isCompleted && !isBlocked && !hasTerminalIssue && !isActiveGoalBound) {
       return null
     }
 
@@ -5359,10 +6006,11 @@ export default function ChatPage() {
       protocolId: summary.protocol_id,
       modelCount: summary.models.length,
       runtimeMode: summary.runtime_mode,
-      pendingApprovalCount: isBlocked ? pendingApprovalCount : 0,
-      displayState: isCompleted ? 'completed' : isBlocked ? 'blocked' : 'active',
+      pendingApprovalCount: isCompleted ? pendingApprovalCount : goalSurfacePendingApprovalCount,
+      displayState:
+        isCompleted ? 'completed' : isBlocked ? 'blocked' : hasTerminalIssue ? 'failed' : 'active',
     }
-  }, [currentSessionGoalState, pendingApprovalCount, resolveGoalSurfaceCopySource])
+  }, [currentSessionGoalState, goalSurfacePendingApprovalCount, pendingApprovalCount, resolveGoalSurfaceCopySource])
 
   const goalSurfaceCopySource =
     headerGoal?.copySource ??
@@ -5383,6 +6031,11 @@ export default function ChatPage() {
         null,
       recommendedAction: getString(goalDrawerHealth.recommended_next_action?.action),
       latestError: goalDrawerHealth.latest_error,
+      approvalCount:
+        typeof goalDrawerHealth.approval_state?.pending_count === 'number' &&
+        Number.isFinite(goalDrawerHealth.approval_state.pending_count)
+          ? goalDrawerHealth.approval_state.pending_count
+          : getStringArray(goalDrawerHealth.approval_state?.approval_ids).length,
       approvalIds: getStringArray(goalDrawerHealth.approval_state?.approval_ids),
       approvalToolNames: getStringArray(goalDrawerHealth.approval_state?.tool_names),
       blockedTools: goalDrawerHealth.operator_controls.blocked_tools,
@@ -5390,6 +6043,25 @@ export default function ChatPage() {
       blockNetworkUsage: goalDrawerHealth.operator_controls.block_network_usage,
     }
   }, [goalDrawerHealth])
+
+  const goalPendingApprovalIds = React.useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...pendingGoalApprovalIds,
+          ...(goalDrawerBlocker?.approvalIds ?? []),
+        ])
+      ),
+    [goalDrawerBlocker, pendingGoalApprovalIds]
+  )
+
+  const handleOpenGoalApprovals = React.useCallback(() => {
+    if (goalPendingApprovalIds.length > 0) {
+      handleOpenSubagentApprovals(goalPendingApprovalIds)
+      return
+    }
+    handleOpenTaskPanel()
+  }, [goalPendingApprovalIds, handleOpenSubagentApprovals, handleOpenTaskPanel])
 
   React.useEffect(() => {
     if (!headerGoal) {
@@ -5405,26 +6077,385 @@ export default function ChatPage() {
   }, [headerGoal])
 
   React.useEffect(() => {
+    if (!subagentDrawerOpen) {
+      setSubagentGuidance('')
+    }
+  }, [subagentDrawerOpen])
+
+  React.useEffect(() => {
     const goalId = headerGoal?.goalId
     if (!goalId) {
       return
     }
-    if (!goalDrawerOpen && headerGoal.displayState !== 'blocked') {
+    const needsGoalSurfaceContext =
+      goalDrawerOpen ||
+      headerGoal.displayState === 'blocked' ||
+      headerGoal.displayState === 'failed' ||
+      headerGoal.pendingApprovalCount > 0
+    if (!needsGoalSurfaceContext) {
       return
     }
 
     void loadGoalDrawerContext(goalId)
   }, [goalDrawerOpen, headerGoal, loadGoalDrawerContext])
 
-  const blockingRuntimeNotice =
-    pendingApprovalCount > 0
+  const goalSurfaceCallout = React.useMemo(
+    () =>
+      headerGoal
+        ? buildGoalFocusCallout({
+            userMessage: goalSurfaceCopySource,
+            pendingApprovalCount: goalSurfacePendingApprovalCount,
+            blocker: goalDrawerBlocker,
+            errorMessage:
+              goalDrawerHealthError ??
+              goalDrawerApprovalError ??
+              (headerGoal.executionMode === 'workflow' ? workflowError : null),
+            goalDisplayState: headerGoal.displayState,
+          })
+        : null,
+    [
+      goalDrawerApprovalError,
+      goalDrawerBlocker,
+      goalDrawerHealthError,
+      goalSurfacePendingApprovalCount,
+      goalSurfaceCopySource,
+      headerGoal,
+      workflowError,
+    ]
+  )
+
+  const handleActiveGoalDirectTurnDecision = React.useCallback(
+    async ({
+      sessionId,
+      requestText,
+      attachments,
+      activeGoalId,
+      baseWorkflow,
+      latestGoalSummary,
+      selectedSkillIds,
+      sessionScope,
+      systemPromptOverride,
+    }: ActiveGoalDirectTurnDecisionInput): Promise<boolean> => {
+      let decision: api.ActiveGoalTurnDecision
+      try {
+        decision = await api.fetchGoalTurnDecision(activeGoalId, { message: requestText })
+      } catch {
+        await submitDirectChatTurn({
+          targetSessionId: sessionId,
+          requestText,
+          attachments,
+          selectedSkillIds,
+          toolMode: undefined,
+          normalizedWorkflow: baseWorkflow,
+          sessionScope,
+          systemPromptOverride,
+        })
+        return true
+      }
+      const decisionMetadata = {
+        active_goal_turn_decision: {
+          lane: decision.lane,
+          kind: decision.kind,
+          confidence: decision.confidence,
+          selection_source: decision.selection_source,
+          selection_reason: decision.selection_reason,
+          requires_confirmation: decision.requires_confirmation,
+          goal_status: decision.goal_status ?? null,
+          linked_run_status: decision.linked_run_status ?? null,
+          recommended_action: decision.recommended_action ?? null,
+        },
+      }
+
+      if (
+        decision.kind === 'answer_question' ||
+        decision.kind === 'explain_goal_state' ||
+        decision.kind === 'exit_to_chat' ||
+        (decision.kind === 'clarify' && decision.requires_confirmation)
+      ) {
+        await submitDirectChatTurn({
+          targetSessionId: sessionId,
+          requestText,
+          attachments,
+          selectedSkillIds,
+          toolMode: undefined,
+          normalizedWorkflow: baseWorkflow,
+          sessionScope,
+          systemPromptOverride:
+            systemPromptOverride ??
+            `${effectiveInference.systemPrompt ?? ''}\n\nActive goal decision metadata: ${JSON.stringify(decisionMetadata)}`
+              .trim(),
+        })
+        return true
+      }
+
+      if (decision.kind === 'steer') {
+        try {
+          const goalHealth = await api.fetchGoalHealth(activeGoalId)
+          const continuation = resolveGoalContinuationDecision(goalHealth)
+          const goalObjective = latestGoalSummary?.objective ?? goalHealth.goal_id ?? requestText
+          const continuationRunId = continuation.runId
+          const continuationResumeStrategy = continuation.resumeStrategy ?? 'continue_from_checkpoint'
+          let refreshedGoal: api.GoalSummary | null = null
+          if (continuation.action === 'refresh_then_forward') {
+            refreshedGoal = await api.refreshGoal(activeGoalId, { strategy: continuationResumeStrategy })
+            const refreshedRunId =
+              getGoalAttemptRunId(refreshedGoal) ??
+              getGoalAttemptRunId(await api.fetchGoal(activeGoalId))
+            if (refreshedRunId) {
+              await api.appendAgentRunGuidance(refreshedRunId, {
+                guidance: requestText,
+                author: 'operator',
+                metadata: decisionMetadata,
+              })
+            } else {
+              await api.resumeGoal(activeGoalId, {
+                strategy: continuationResumeStrategy,
+                guidanceMessage: requestText,
+              })
+            }
+          } else if (
+            continuation.action === 'resume_then_forward' ||
+            continuation.action === 'restart_attempt_with_context' ||
+            continuation.action === 'no_live_attempt_recoverable'
+          ) {
+            await api.resumeGoal(activeGoalId, {
+              strategy: continuationResumeStrategy,
+              guidanceMessage: requestText,
+            })
+          } else if (continuationRunId) {
+            await api.appendAgentRunGuidance(continuationRunId, {
+              guidance: requestText,
+              author: 'operator',
+              metadata: decisionMetadata,
+            })
+          } else {
+            await api.resumeGoal(activeGoalId, {
+              strategy: continuationResumeStrategy,
+              guidanceMessage: requestText,
+            })
+          }
+
+          refreshedGoal = await api.fetchGoal(activeGoalId)
+          const refreshedGoalSummary = buildGoalSummaryFromGoal(refreshedGoal, latestGoalSummary)
+          const refreshedRunId = getGoalAttemptRunId(refreshedGoal)
+          await syncWorkflowStateForGoal({
+            sessionId,
+            baseWorkflow,
+            executionMode: refreshedGoal.execution_mode,
+            interactionMode: refreshedGoal.interaction_mode,
+            executionTopology: refreshedGoal.execution_topology,
+            goalStatus: refreshedGoal.status,
+            runId: refreshedRunId,
+          })
+          await persistSessionGoalState(sessionId, {
+            active_goal_id: isGoalTerminalStatus(refreshedGoal.status) ? null : refreshedGoal.goal_id,
+            active_goal_status: refreshedGoal.status,
+            execution_mode: refreshedGoal.execution_mode,
+            interaction_mode: refreshedGoal.interaction_mode,
+            execution_topology: refreshedGoal.execution_topology,
+            bound_run_id: refreshedGoalSummary.bound_run_id,
+            protocol_selection: refreshedGoalSummary.protocol_selection,
+            selection_rationale: refreshedGoalSummary.selection_rationale,
+            default_route:
+              isGoalTerminalStatus(refreshedGoal.status)
+                ? 'chat'
+                : refreshedGoal.execution_mode === 'workflow'
+                  ? 'workflow'
+                  : 'goal',
+            last_goal_summary: refreshedGoalSummary,
+            pending_proposal: null,
+          })
+
+          const followUpKind =
+            continuation.action === 'refresh_then_forward'
+              ? 'refreshed_forwarded'
+              : continuation.action === 'resume_then_forward'
+                ? 'resumed_forwarded'
+                : continuation.action === 'restart_attempt_with_context' ||
+                    continuation.action === 'no_live_attempt_recoverable'
+                  ? 'restarted_forwarded'
+                  : 'forwarded'
+          const assistantCopy = await api.generateGoalFollowUpAssistantCopy({
+            message: requestText,
+            kind: followUpKind,
+            goalObjective,
+            goalStatus: refreshedGoal.status,
+            linkedRunStatus: decision.linked_run_status ?? null,
+            continuationAction: continuation.action,
+            continuationSummary: continuation.summary,
+            approvalCount: continuation.approvalIds.length,
+            toolNames: continuation.toolNames,
+            recommendedAction: continuation.recommendedAction,
+            latestError: refreshedGoal.latest_error ?? null,
+          })
+
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: requestText,
+            assistantContent:
+              assistantCopy.explanation.trim().length > 0
+                ? assistantCopy.explanation
+                : buildGoalFollowUpMessage(requestText, followUpKind),
+            userMetadata: decisionMetadata,
+            assistantMetadata: decisionMetadata,
+            goalCard: goalCardFromSummary(refreshedGoalSummary, 'started', {
+              goalId: refreshedGoal.goal_id,
+              status: refreshedGoal.status,
+              copySource: requestText,
+            }),
+          })
+          return true
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : null
+          updateSessionMessages(sessionId, (prev) => [
+            ...prev,
+            {
+              id: `error-${Date.now()}`,
+              type: 'error',
+              eventType: 'error',
+              content: t('chat.requestFailed'),
+              errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+              timestamp: new Date(),
+            },
+          ])
+          return true
+        }
+      }
+
+      if (decision.kind === 'replan') {
+        try {
+          const goalHealth = await api.fetchGoalHealth(activeGoalId)
+          const continuation = resolveGoalContinuationDecision(goalHealth)
+          const goalObjective = latestGoalSummary?.objective ?? goalHealth.goal_id ?? requestText
+          const continuationResumeStrategy = continuation.resumeStrategy ?? 'continue_from_checkpoint'
+          let refreshedGoal: api.GoalSummary | null = null
+          if (continuation.action === 'refresh_then_forward') {
+            refreshedGoal = await api.refreshGoal(activeGoalId, { strategy: continuationResumeStrategy })
+            const refreshedRunId =
+              getGoalAttemptRunId(refreshedGoal) ??
+              getGoalAttemptRunId(await api.fetchGoal(activeGoalId))
+            if (refreshedRunId) {
+              await api.appendAgentRunGuidance(refreshedRunId, {
+                guidance: requestText,
+                author: 'operator',
+                metadata: decisionMetadata,
+              })
+            } else {
+              await api.resumeGoal(activeGoalId, {
+                strategy: continuationResumeStrategy,
+                guidanceMessage: requestText,
+              })
+            }
+          } else {
+            await api.resumeGoal(activeGoalId, {
+              strategy: 'restart_attempt',
+              guidanceMessage: requestText,
+            })
+          }
+
+          refreshedGoal = await api.fetchGoal(activeGoalId)
+          const refreshedGoalSummary = buildGoalSummaryFromGoal(refreshedGoal, latestGoalSummary)
+          const refreshedRunId = getGoalAttemptRunId(refreshedGoal)
+          await syncWorkflowStateForGoal({
+            sessionId,
+            baseWorkflow,
+            executionMode: refreshedGoal.execution_mode,
+            interactionMode: refreshedGoal.interaction_mode,
+            executionTopology: refreshedGoal.execution_topology,
+            goalStatus: refreshedGoal.status,
+            runId: refreshedRunId,
+          })
+          await persistSessionGoalState(sessionId, {
+            active_goal_id: isGoalTerminalStatus(refreshedGoal.status) ? null : refreshedGoal.goal_id,
+            active_goal_status: refreshedGoal.status,
+            execution_mode: refreshedGoal.execution_mode,
+            interaction_mode: refreshedGoal.interaction_mode,
+            execution_topology: refreshedGoal.execution_topology,
+            bound_run_id: refreshedGoalSummary.bound_run_id,
+            protocol_selection: refreshedGoalSummary.protocol_selection,
+            selection_rationale: refreshedGoalSummary.selection_rationale,
+            default_route:
+              isGoalTerminalStatus(refreshedGoal.status)
+                ? 'chat'
+                : refreshedGoal.execution_mode === 'workflow'
+                  ? 'workflow'
+                  : 'goal',
+            last_goal_summary: refreshedGoalSummary,
+            pending_proposal: null,
+          })
+          const followUpKind =
+            continuation.action === 'refresh_then_forward'
+              ? 'refreshed_forwarded'
+              : 'restarted_forwarded'
+          const assistantCopy = await api.generateGoalFollowUpAssistantCopy({
+            message: requestText,
+            kind: followUpKind,
+            goalObjective,
+            goalStatus: refreshedGoal.status,
+            linkedRunStatus: decision.linked_run_status ?? null,
+            continuationAction: continuation.action,
+            continuationSummary: continuation.summary,
+            approvalCount: continuation.approvalIds.length,
+            toolNames: continuation.toolNames,
+            recommendedAction: continuation.recommendedAction,
+            latestError: refreshedGoal.latest_error ?? null,
+          })
+          await persistGoalConversation({
+            sessionId,
+            attachments,
+            userContent: requestText,
+            assistantContent:
+              assistantCopy.explanation.trim().length > 0
+                ? assistantCopy.explanation
+                : buildGoalFollowUpMessage(requestText, followUpKind),
+            userMetadata: decisionMetadata,
+            assistantMetadata: decisionMetadata,
+            goalCard: goalCardFromSummary(refreshedGoalSummary, 'started', {
+              goalId: refreshedGoal.goal_id,
+              status: refreshedGoal.status,
+              copySource: requestText,
+            }),
+          })
+          return true
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : null
+          updateSessionMessages(sessionId, (prev) => [
+            ...prev,
+            {
+              id: `error-${Date.now()}`,
+              type: 'error',
+              eventType: 'error',
+              content: t('chat.requestFailed'),
+              errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+              timestamp: new Date(),
+            },
+          ])
+          return true
+        }
+      }
+
+      return false
+    },
+    [
+      buildGoalSummaryFromGoal,
+      effectiveInference.systemPrompt,
+      persistGoalConversation,
+      persistSessionGoalState,
+      submitDirectChatTurn,
+      syncWorkflowStateForGoal,
+    ]
+  )
+
+  const footerRuntimeNotice =
+    !headerGoal && pendingApprovalCount > 0
       ? {
           tone: 'warning' as const,
           message: buildGoalPendingApprovalNotice(goalSurfaceCopySource, pendingApprovalCount),
           actionLabel: buildGoalReviewApprovalsLabel(goalSurfaceCopySource),
           onAction: handleOpenTaskPanel,
         }
-      : workflowError
+      : !headerGoal && workflowError
         ? {
             tone: 'error' as const,
             message: workflowError,
@@ -5434,6 +6465,14 @@ export default function ChatPage() {
         : null
 
   const showEmptyState = isConversationEffectivelyEmpty(displayMessages)
+  const showExecutionTranscript =
+    goalSurfaceTimelineEvents.length > 0 ||
+    goalSurfaceSubagents.length > 0 ||
+    Boolean(executionTimelineError)
+  const goalConversationBodyLayout = resolveGoalConversationBodyLayout({
+    showEmptyState,
+    showExecutionTranscript,
+  })
 
   return (
     <div className="flex h-full flex-col">
@@ -5470,7 +6509,7 @@ export default function ChatPage() {
                 className="max-sm:w-8 max-sm:px-0"
               >
                 <Workflow className="h-4 w-4" />
-                <span className="hidden sm:inline">{t('sidebar.workflows')}</span>
+                <span className="hidden sm:inline">{workflowShortcutLabel}</span>
               </Button>
               {workflowError ? (
                 <HeaderRuntimeIndicator tone="error" pulse />
@@ -5600,6 +6639,34 @@ export default function ChatPage() {
             />
           </FloatingPanelShell>
         ) : null}
+        <SubagentDrawer
+          open={subagentDrawerOpen}
+          onOpenChange={setSubagentDrawerOpen}
+          subagent={activeSubagentDetail}
+          loading={subagentDrawerLoading}
+          error={subagentDrawerError}
+          guidanceValue={subagentGuidance}
+          onGuidanceChange={setSubagentGuidance}
+          onSendGuidance={handleSendSubagentGuidance}
+          onCancel={
+            activeSubagentDetail?.sessionId
+              ? () => {
+                  void runSessionSubagentAction('cancel')
+                }
+              : undefined
+          }
+          onResume={
+            activeSubagentDetail?.sessionId
+              ? () => {
+                  void runSessionSubagentAction('resume')
+                }
+              : undefined
+          }
+          onOpenApprovals={handleOpenSubagentApprovals}
+          sendingGuidance={subagentGuidanceSending}
+          canceling={subagentBusyAction === 'cancel'}
+          resuming={subagentBusyAction === 'resume'}
+        />
         <div
           className={cn(
             'min-w-0 flex-1 transition-[padding] duration-300 ease-out-smooth',
@@ -5609,15 +6676,83 @@ export default function ChatPage() {
           <ScrollToBottom visible={showScrollToBottom} onClick={scrollToBottom} />
           <div ref={scrollRef} className="h-full overflow-y-auto">
             <div className="mx-auto flex w-full max-w-4xl flex-col px-4 py-8 sm:px-6">
-              {showEmptyState ? (
-                <EmptyState
-                  onPrompt={handleStarterPrompt}
-                  onVoice={() => void handleVoiceEntry()}
-                  onSettings={() => router.push('/settings')}
-                />
-              ) : (
-                <div className="space-y-6">
-                  {displayMessages.map((message) => (
+              <div className="space-y-6">
+                {headerGoal ? (
+                  <GoalFocusPanel
+                    goal={headerGoal}
+                    blocker={goalDrawerBlocker}
+                    callout={goalSurfaceCallout}
+                    timelineEvents={goalSurfaceTimelineEvents}
+                    subagents={goalSurfaceSubagents}
+                    timelineError={executionTimelineError}
+                    activeSubagentId={activeSubagentId}
+                    expandedSubagentIds={expandedSubagentIds}
+                    onExpandedChange={(subagentId, expanded) => {
+                      setExpandedSubagentIds((current) => {
+                        const next = new Set(current)
+                        if (expanded) {
+                          next.add(subagentId)
+                        } else {
+                          next.delete(subagentId)
+                        }
+                        return next
+                      })
+                    }}
+                    onOpenSubagent={handleOpenSubagent}
+                    onReviewApprovals={handleOpenGoalApprovals}
+                    onOpenDetails={handleGoalDrawerToggle}
+                    onOpenConsole={() => router.push('/goals')}
+                  />
+                ) : null}
+                {!headerGoal && layoutShowsExecutionHighlights(goalConversationBodyLayout) ? (
+                  <section className="space-y-4">
+                    {executionTimelineError ? (
+                      <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+                        {executionTimelineError}
+                      </div>
+                    ) : null}
+                    {goalSurfaceSubagents.length > 0 ? (
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {goalSurfaceSubagents.map((subagent) => (
+                          <SubagentTimelineCard
+                            key={subagent.subagentId}
+                            subagent={subagent}
+                            active={subagent.subagentId === activeSubagentId}
+                            expanded={expandedSubagentIds.has(subagent.subagentId)}
+                            onExpandedChange={(subagentId, expanded) => {
+                              setExpandedSubagentIds((current) => {
+                                const next = new Set(current)
+                                if (expanded) {
+                                  next.add(subagentId)
+                                } else {
+                                  next.delete(subagentId)
+                                }
+                                return next
+                              })
+                            }}
+                            onOpen={handleOpenSubagent}
+                            onOpenThread={handleOpenSubagent}
+                            recentEvents={subagentTimelineEventsById.get(subagent.subagentId) ?? []}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                    <ExecutionTimeline
+                      events={goalSurfaceTimelineEvents}
+                      subagents={allVisibleSubagents}
+                      activeSubagentId={activeSubagentId}
+                      onOpenSubagent={handleOpenSubagent}
+                    />
+                  </section>
+                ) : null}
+                {layoutShowsEmptyState(goalConversationBodyLayout) ? (
+                  <EmptyState
+                    onPrompt={handleStarterPrompt}
+                    onVoice={() => void handleVoiceEntry()}
+                    onSettings={() => router.push('/settings')}
+                  />
+                ) : (
+                  displayMessages.map((message) => (
                     <ChatMessage
                       key={message.id}
                       message={
@@ -5639,9 +6774,9 @@ export default function ChatPage() {
                       onUndoFileChange={handleUndoFileChange}
                       onOpenTask={handleOpenRuntimeTask}
                     />
-                  ))}
-                </div>
-              )}
+                  ))
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -5650,6 +6785,7 @@ export default function ChatPage() {
           onOpenChange={handleTaskPanelOpenChange}
           mode={taskPanelMode}
           focusedTaskId={taskPanelFocusedTaskId}
+          focusedApprovalIds={taskPanelFocusedApprovalIds}
           workflowRunId={workflowBoundRunId}
           onOpenWorkflowRun={(runId) => router.push(`/agent-runs/${runId}`)}
         />
@@ -5690,34 +6826,34 @@ export default function ChatPage() {
         </div>
       ) : null}
 
-      {blockingRuntimeNotice ? (
+      {footerRuntimeNotice ? (
         <div className="border-t border-border bg-canvas/95 py-2 backdrop-blur">
           <div className="mx-auto max-w-4xl px-4 sm:px-6">
             <div
               className={cn(
                 'flex items-center justify-between gap-3 rounded-md px-3 py-2 text-xs',
-                blockingRuntimeNotice.tone === 'error'
+                footerRuntimeNotice.tone === 'error'
                   ? 'border border-destructive/30 bg-destructive/10 text-destructive'
                   : 'border border-warning/30 bg-warning/10 text-warning-foreground'
               )}
             >
               <div className="flex min-w-0 items-start gap-2">
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span className="min-w-0 break-words">{blockingRuntimeNotice.message}</span>
+                <span className="min-w-0 break-words">{footerRuntimeNotice.message}</span>
               </div>
               <Button
                 type="button"
                 size="sm"
                 variant="ghost"
-                onClick={blockingRuntimeNotice.onAction}
+                onClick={footerRuntimeNotice.onAction}
                 className={cn(
                   'h-6 shrink-0 rounded-full px-2.5 text-[11px]',
-                  blockingRuntimeNotice.tone === 'error'
+                  footerRuntimeNotice.tone === 'error'
                     ? 'text-destructive hover:bg-destructive/10'
                     : 'text-warning-foreground hover:bg-warning/10'
                 )}
               >
-                {blockingRuntimeNotice.actionLabel}
+                {footerRuntimeNotice.actionLabel}
               </Button>
             </div>
           </div>

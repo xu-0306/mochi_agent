@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from mochi.agents.events import FinalAnswerEvent, TextChunkEvent, ToolCallResultEvent
 from mochi.config.schema import SecurityConfig
 from mochi.main import DEFAULT_TUI_MAX_TURNS, DEFAULT_TUI_SESSION_ID, app
+from mochi.terminal_goal_helpers import resolve_goal_workflow_routing
 
 runner = CliRunner()
 
@@ -864,8 +865,8 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
             if str(getattr(request, "session_id", "")).startswith("goal-proposal-copy:"):
                 return SimpleNamespace(
                     content=(
-                        "I framed your request as a goal proposal that we can launch directly. "
-                        "This scope fits a single-agent long-running run best."
+                        "I framed your request as a goal draft that acts as the contract for this task. "
+                        "This scope fits a single-agent strategy, and execution begins only after you confirm the start."
                     )
                 )
             assert '"user_follow_up": "start it"' in request.message
@@ -990,15 +991,17 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
         max_turns=2,
     )
     captured = capsys.readouterr().out
+    normalized_captured = " ".join(captured.split())
 
-    assert "I framed your request as a goal proposal that we can launch directly." in captured
+    assert "goal draft that acts as the contract for this task" in normalized_captured
     assert "Next step:" in captured
-    assert "Launch: Send a short confirmation when you want execution to begin." in captured
+    assert "Launch: Send a short confirmation when you want execution to begin." in normalized_captured
     assert "Goal started." in captured
     assert "Fetched the latest goal status." in captured
     assert "Paused the active goal." in captured
     assert "Resumed the active goal." in captured
     assert "Stopped the active goal." in captured
+    assert "launch directly" not in normalized_captured
     assert fake_engine.calls == []
     assert len(fake_engine.invocations) == 1
 
@@ -1019,13 +1022,13 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     assert goal_updates[-1]["goal"]["active_goal_status"] == "cancelled"
     initial_pending_proposal = goal_updates[0]["goal"]["pending_proposal"]
     assert initial_pending_proposal["assistant_explanation"] == (
-        "I framed your request as a goal proposal that we can launch directly. "
-        "This scope fits a single-agent long-running run best."
+        "I framed your request as a goal draft that acts as the contract for this task. "
+        "This scope fits a single-agent strategy, and execution begins only after you confirm the start."
     )
 
 
 @pytest.mark.asyncio
-async def test_chat_tui_async_routes_active_goal_followups_and_chat_escape(
+async def test_chat_tui_async_active_goal_natural_language_uses_chat_path(
     monkeypatch,
     capsys,
 ) -> None:
@@ -1091,53 +1094,12 @@ async def test_chat_tui_async_routes_active_goal_followups_and_chat_escape(
             self.by_session.pop(session_id, None)
             return True
 
-    class _FakeRuntimeService:
-        def __init__(self) -> None:
-            self.appended_messages: list[str] = []
-
-        async def get_goal_health(self, goal_id: str) -> dict[str, object]:
-            assert goal_id == "goal-1"
-            return {
-                "goal_id": "goal-1",
-                "status": "running",
-                "current_attempt": {"agent_run_id": "run-1"},
-                "linked_agent_run": {"run_id": "run-1", "status": "running"},
-                "recommended_next_action": {
-                    "action": "monitor",
-                    "summary": "The goal can continue with more guidance.",
-                },
-            }
-
-        async def get_goal(self, goal_id: str) -> dict[str, object]:
-            assert goal_id == "goal-1"
-            return {
-                "goal_id": "goal-1",
-                "objective": "Ship the task",
-                "execution_mode": "single_agent",
-                "protocol_id": None,
-                "status": "running",
-                "current_attempt_id": "attempt-1",
-                "attempts": [{"attempt_id": "attempt-1", "agent_run_id": "run-1"}],
-                "project_id": None,
-                "workspace_dir": None,
-                "latest_error": None,
-            }
-
-        async def append_agent_run_message(self, run_id: str, payload) -> dict[str, object]:  # noqa: ANN001
-            assert run_id == "run-1"
-            self.appended_messages.append(payload.content)
-            return {"run_id": run_id}
-
-        async def close(self) -> None:
-            return None
-
     fake_store = _FakeSessionStore(None)
-    fake_runtime = _FakeRuntimeService()
     fake_engine = _FakeEngine(None)
     inputs = iter(
         [
             "please focus on tests",
-            "/chat what time is it",
+            "Can you share progress?",
             "/exit",
         ]
     )
@@ -1152,10 +1114,6 @@ async def test_chat_tui_async_routes_active_goal_followups_and_chat_escape(
     )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005
     monkeypatch.setattr("mochi.sessions.store.SessionStore", lambda sessions_dir: fake_store)  # noqa: ARG005
-    async def fake_runtime_service_factory(**kwargs):  # noqa: ANN003, ARG001
-        return fake_runtime
-
-    monkeypatch.setattr("mochi.main._create_tui_runtime_service", fake_runtime_service_factory)
     monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
 
     await _chat_tui_async(
@@ -1166,10 +1124,33 @@ async def test_chat_tui_async_routes_active_goal_followups_and_chat_escape(
     )
     captured = capsys.readouterr().out
 
-    assert "Forwarded your guidance to the active goal." in captured
-    assert fake_runtime.appended_messages == ["please focus on tests"]
-    assert fake_engine.calls == [("what time is it", "goal-session")]
-    assert "plain chat reply" in captured
+    assert "Forwarded your guidance to the active goal." not in captured
+    assert fake_engine.calls == [
+        ("please focus on tests", "goal-session"),
+        ("Can you share progress?", "goal-session"),
+    ]
+    assert captured.count("plain chat reply") == 2
+
+
+def test_tui_goal_routing_ignores_non_slash_natural_language_goal_phrasing() -> None:
+    messages = [
+        "Can you share progress?",
+        "please focus on tests",
+        "Research this for 30 minutes and come back with progress",
+        "keep working on this in the background",
+    ]
+
+    for has_active_goal in (False, True):
+        for message in messages:
+            decision = resolve_goal_workflow_routing(
+                text=message,
+                has_pending_proposal=False,
+                has_active_goal=has_active_goal,
+            )
+            assert decision.natural_language_goal_requested is False
+            assert decision.active_goal_follow_up_requested is False
+            assert decision.pending_proposal_follow_up_requested is False
+            assert decision.should_handle_goal_workflow_routing is False
 
 
 @pytest.mark.asyncio

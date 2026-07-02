@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import inspect
@@ -93,7 +94,12 @@ from mochi.projects.store import ProjectStore
 from mochi.security.policy import build_runtime_permission_policy_dict
 from mochi.sessions.store import SessionStore
 from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
-from mochi.tools.base import ToolExecutionContext
+from mochi.tools.base import (
+    ActiveToolController,
+    RunCancellationContext,
+    ToolExecutionContext,
+    cancel_asyncio_task,
+)
 from mochi.tools.mcp_client import McpRuntimeManager
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.registry_factory import ToolRegistryFactory
@@ -330,8 +336,147 @@ class AgentEngine:
         self._tool_exposure_planner = ToolExposurePlanner(
             tool_groups=self._tool_registry_factory.tool_groups,
         )
+        self._active_chat_runs: dict[tuple[str, str], RunCancellationContext] = {}
+        self._active_chat_session_index: dict[str, list[str]] = {}
+        self._recent_chat_run_states: dict[tuple[str, str], str] = {}
+        self._recent_chat_run_turn_by_session: dict[str, str] = {}
+        self._chat_run_registry_lock = asyncio.Lock()
         self._preinitialized_model_info_cache: ModelInfo | None = None
         self._initialized = False
+
+    def _ensure_chat_run_registry(self) -> None:
+        if not hasattr(self, "_active_chat_runs"):
+            self._active_chat_runs = {}
+        if not hasattr(self, "_active_chat_session_index"):
+            self._active_chat_session_index = {}
+        if not hasattr(self, "_recent_chat_run_states"):
+            self._recent_chat_run_states = {}
+        if not hasattr(self, "_recent_chat_run_turn_by_session"):
+            self._recent_chat_run_turn_by_session = {}
+        if not hasattr(self, "_chat_run_registry_lock"):
+            self._chat_run_registry_lock = asyncio.Lock()
+
+    async def _register_chat_run(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        cancellation_context: RunCancellationContext,
+    ) -> None:
+        self._ensure_chat_run_registry()
+        key = (session_id, turn_id)
+        async with self._chat_run_registry_lock:
+            self._active_chat_runs[key] = cancellation_context
+            turns = self._active_chat_session_index.setdefault(session_id, [])
+            if turn_id in turns:
+                turns.remove(turn_id)
+            turns.append(turn_id)
+            self._recent_chat_run_states.pop(key, None)
+            if self._recent_chat_run_turn_by_session.get(session_id) == turn_id:
+                self._recent_chat_run_turn_by_session.pop(session_id, None)
+
+    async def _finalize_chat_run(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        final_state: str,
+    ) -> None:
+        self._ensure_chat_run_registry()
+        key = (session_id, turn_id)
+        async with self._chat_run_registry_lock:
+            self._active_chat_runs.pop(key, None)
+            turns = self._active_chat_session_index.get(session_id)
+            if isinstance(turns, list) and turn_id in turns:
+                turns.remove(turn_id)
+                if not turns:
+                    self._active_chat_session_index.pop(session_id, None)
+            normalized_state = final_state if final_state in {"completed", "cancelled"} else "completed"
+            self._recent_chat_run_states[key] = normalized_state
+            self._recent_chat_run_turn_by_session[session_id] = turn_id
+            if len(self._recent_chat_run_states) > 64:
+                oldest_key = next(iter(self._recent_chat_run_states))
+                self._recent_chat_run_states.pop(oldest_key, None)
+            if len(self._recent_chat_run_turn_by_session) > 64:
+                oldest_session = next(iter(self._recent_chat_run_turn_by_session))
+                self._recent_chat_run_turn_by_session.pop(oldest_session, None)
+
+    async def cancel_chat_run(
+        self,
+        session_id: str,
+        *,
+        turn_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_chat_run_registry()
+        normalized_session_id = str(session_id or "").strip()
+        normalized_turn_id = str(turn_id or "").strip() or None
+        async with self._chat_run_registry_lock:
+            key: tuple[str, str] | None = None
+            recent_state: str | None = None
+            if normalized_turn_id is not None:
+                candidate = (normalized_session_id, normalized_turn_id)
+                if candidate in self._active_chat_runs:
+                    key = candidate
+                elif candidate in self._recent_chat_run_states:
+                    key = candidate
+                    recent_state = self._recent_chat_run_states[candidate]
+            else:
+                turns = self._active_chat_session_index.get(normalized_session_id) or []
+                if turns:
+                    key = (normalized_session_id, turns[-1])
+                else:
+                    recent_turn_id = self._recent_chat_run_turn_by_session.get(normalized_session_id)
+                    if recent_turn_id is not None:
+                        candidate = (normalized_session_id, recent_turn_id)
+                        if candidate in self._recent_chat_run_states:
+                            key = candidate
+                            recent_state = self._recent_chat_run_states[candidate]
+            cancellation_context = self._active_chat_runs.get(key) if key is not None else None
+
+        if key is None:
+            return {
+                "status": "not_found",
+                "session_id": normalized_session_id,
+                "turn_id": normalized_turn_id,
+                "run_state": None,
+                "cancel_outcome": None,
+                "cancel_reason": None,
+            }
+
+        if cancellation_context is None:
+            run_state = recent_state or "completed"
+            return {
+                "status": "already_completed" if run_state == "completed" else "cancel_requested",
+                "session_id": normalized_session_id,
+                "turn_id": key[1],
+                "run_state": run_state,
+                "cancel_outcome": ("completed" if run_state == "completed" else "cancelled"),
+                "cancel_reason": None,
+            }
+
+        snapshot = await cancellation_context.snapshot()
+        state = str(snapshot.get("state") or "running")
+        if state == "completed":
+            return {
+                "status": "already_completed",
+                "session_id": normalized_session_id,
+                "turn_id": key[1],
+                "run_state": "completed",
+                "cancel_outcome": "completed",
+                "cancel_reason": None,
+            }
+
+        result = await cancellation_context.request_run_cancel()
+        post_snapshot = await cancellation_context.snapshot()
+        run_state = str(post_snapshot.get("state") or "running")
+        return {
+            "status": "already_completed" if result.state == "completed" else "cancel_requested",
+            "session_id": normalized_session_id,
+            "turn_id": key[1],
+            "run_state": run_state,
+            "cancel_outcome": result.state,
+            "cancel_reason": result.reason,
+        }
 
     def _preinitialized_active_backend_kwargs(self) -> dict[str, Any]:
         """Only remote model specs should inherit remote provider/model settings before init."""
@@ -395,8 +540,10 @@ class AgentEngine:
         workspace_dir: str | None = None,
         task_workspace_dir: str | None = None,
         permission_policy: dict[str, Any] | None = None,
+        tool_mode: Literal["disabled", "auto", "required"] = "auto",
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
+        turn_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         async for event in self._run_chat(
             AgentInvocationRequest(
@@ -410,9 +557,10 @@ class AgentEngine:
                 selected_skill_ids=selected_skill_ids,
                 attachments=attachments,
                 backend_override=None,
-                tool_mode="auto",
+                tool_mode=tool_mode,
                 execution_profile="chat",
                 persist_session=True,
+                turn_id=turn_id,
             )
         ):
             yield event
@@ -645,23 +793,55 @@ class AgentEngine:
         self,
         request: AgentInvocationRequest,
     ) -> AsyncIterator[AgentEvent]:
+        session_key = request.session_id or "default"
+        turn_id = str(request.turn_id or "").strip() or str(uuid4())
+        active_tool_controller = request.active_tool_controller or ActiveToolController()
+        cancellation_context = request.cancellation_context or RunCancellationContext(run_id=turn_id)
+        await cancellation_context.bind_active_tool_controller(active_tool_controller)
+        request.turn_id = turn_id
+        request.active_tool_controller = active_tool_controller
+        request.cancellation_context = cancellation_context
         queue: asyncio.Queue[AgentEvent | object] = asyncio.Queue()
         sentinel = object()
         invocation_error: Exception | None = None
 
         async def _emit_event(event: AgentEvent) -> None:
+            if isinstance(event, FinalAnswerEvent):
+                await cancellation_context.mark_completed()
             await queue.put(event)
 
         async def _run_invocation() -> None:
             nonlocal invocation_error
             try:
                 await self._invoke_shared_runtime(request, event_callback=_emit_event)
+                snapshot = await cancellation_context.snapshot()
+                if str(snapshot.get("state") or "") != "completed":
+                    await cancellation_context.mark_completed()
+            except asyncio.CancelledError:
+                snapshot = await cancellation_context.snapshot()
+                if str(snapshot.get("state") or "") != "completed":
+                    await cancellation_context.mark_cancelled()
+                raise
             except Exception as exc:  # pragma: no cover - defensive propagation
                 invocation_error = exc
             finally:
+                final_snapshot = await cancellation_context.snapshot()
+                await self._finalize_chat_run(
+                    session_id=session_key,
+                    turn_id=turn_id,
+                    final_state=str(final_snapshot.get("state") or "completed"),
+                )
                 await queue.put(sentinel)
 
+        await self._register_chat_run(
+            session_id=session_key,
+            turn_id=turn_id,
+            cancellation_context=cancellation_context,
+        )
         worker = asyncio.create_task(_run_invocation())
+        await cancellation_context.bind_generation_cancel_callback(
+            lambda: cancel_asyncio_task(worker)
+        )
         try:
             while True:
                 item = await queue.get()
@@ -669,7 +849,15 @@ class AgentEngine:
                     break
                 yield cast(AgentEvent, item)
         finally:
-            await worker
+            snapshot = await cancellation_context.snapshot()
+            if not worker.done() and str(snapshot.get("state") or "") != "completed":
+                cancel_result = await cancellation_context.request_generation_cancel()
+                if cancel_result.state == "cancelled":
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await worker
+            elif worker.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker
 
         if invocation_error is not None:
             raise invocation_error
@@ -858,7 +1046,7 @@ class AgentEngine:
         persist_turn_events = request.persist_session if request.persist_turn_events is None else request.persist_turn_events
         persist_learning = request.persist_session if request.persist_learning is None else request.persist_learning
         trajectory_id = self._start_trajectory(request.message) if persist_learning else None
-        turn_id = str(uuid4())
+        turn_id = str(request.turn_id or "").strip() or str(uuid4())
         turn_event_seq = 0
         user_msg = Message(
             role="user",
@@ -877,7 +1065,12 @@ class AgentEngine:
             workspace_dir=effective_workspace_dir,
             task_workspace_dir=request.task_workspace_dir,
             permission_policy_override=request.permission_policy,
+            active_tool_controller=request.active_tool_controller,
         )
+        if request.cancellation_context is not None:
+            await request.cancellation_context.bind_active_tool_controller(
+                request.active_tool_controller
+            )
         before_continuation_count = len(exposure_plan.tool_names)
         exposure_plan = self._preserve_tool_result_read_for_continuation(
             exposure_plan,
@@ -1451,6 +1644,55 @@ class AgentEngine:
             if model_spec.lower().endswith(".gguf"):
                 return ModelInfo(name=model_spec, backend_type="gguf", provider="local")
             return ModelInfo(name=model_spec, backend_type="safetensors", provider="local")
+
+    def supports_mid_generation_cancellation(
+        self,
+        *,
+        model_id: str | None = None,
+    ) -> bool:
+        """Return whether the current invoke path can usually unwind mid-generation cancellation."""
+        configured_model = (
+            self._find_configured_model(model_id)
+            if isinstance(model_id, str) and model_id.strip()
+            else self._find_active_configured_model()
+        )
+        if configured_model is not None:
+            provider = str(configured_model.provider or "").strip().lower()
+            backend_type = str(configured_model.backend_type or "").strip().lower()
+            launch_mode = str(configured_model.launch_mode or "").strip().lower()
+            model_spec = str(configured_model.model_spec or "").strip()
+            if provider == "ollama":
+                return True
+            if provider in {
+                "openai_compat",
+                "openai_codex",
+                "gemini",
+                "anthropic",
+                "vllm",
+                "sglang",
+                "tensorrt_llm",
+            }:
+                return True
+            if provider == "local":
+                if launch_mode == "external":
+                    return True
+                if backend_type == "llama_cpp_server":
+                    return True
+                if model_spec.startswith(("http://", "https://")):
+                    return True
+                return False
+
+        model_info = self.get_model_info()
+        backend_type = str(model_info.backend_type or "").strip().lower()
+        provider = str(model_info.provider or "").strip().lower()
+        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
+        if backend_type in {"openai_compat", "openai_codex", "ollama"}:
+            return True
+        if provider in {"openai_compat", "openai_codex", "ollama"}:
+            return True
+        if backend_type == "gguf" and str(metadata.get("base_url") or "").strip():
+            return True
+        return False
 
     async def probe_active_tool_calling(self) -> dict[str, Any] | None:
         """Probe native tool-calling support for the active backend when available."""
@@ -2291,10 +2533,15 @@ class AgentEngine:
         workspace_dir: str,
         task_workspace_dir: str | None = None,
         permission_policy_override: dict[str, Any] | None = None,
+        active_tool_controller: ActiveToolController | None = None,
     ) -> ToolExecutionContext:
         key = (session_id, str(workspace_dir), str(task_workspace_dir or ""))
         existing = self._tool_execution_contexts.get(key)
-        if existing is not None and permission_policy_override is None:
+        if (
+            existing is not None
+            and permission_policy_override is None
+            and active_tool_controller is None
+        ):
             return existing
 
         base_permission_policy = build_runtime_permission_policy_dict(self._config.security)
@@ -2312,11 +2559,12 @@ class AgentEngine:
             self._tool_execution_contexts[key] = context
             existing = context
 
-        if permission_policy_override is None:
+        if permission_policy_override is None and active_tool_controller is None:
             return existing
 
         merged_policy = dict(existing.permission_policy or base_permission_policy)
-        merged_policy.update(permission_policy_override)
+        if permission_policy_override is not None:
+            merged_policy.update(permission_policy_override)
         return ToolExecutionContext(
             workspace_dir=existing.workspace_dir,
             session_id=existing.session_id,
@@ -2330,6 +2578,7 @@ class AgentEngine:
             state=existing.state,
             progress_callback=existing.progress_callback,
             cancellation_requested=existing.cancellation_requested,
+            active_tool_controller=active_tool_controller,
         )
 
     async def _get_context(self, session_id: str) -> ContextManager:

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mochi.tools.base import ToolResult
+from mochi.tools.base import ActiveToolController, ToolExecutionContext, ToolResult
 from mochi.tools.literature_search import (
     ArxivSearchTool,
     CrossrefSearchTool,
@@ -15,22 +16,84 @@ from mochi.tools.literature_search import (
 )
 
 
-def _text_response(text: str, *, status_code: int = 200) -> MagicMock:
+def _text_response(text: str, *, status_code: int = 200, url: str | None = None) -> MagicMock:
     response = MagicMock()
     response.text = text
     response.status_code = status_code
     response.headers = {}
+    response.url = url or ""
     response.raise_for_status = MagicMock()
     return response
 
 
-def _json_response(payload: dict, *, status_code: int = 200) -> MagicMock:
+def _json_response(payload: dict, *, status_code: int = 200, url: str | None = None) -> MagicMock:
     response = MagicMock()
     response.json = MagicMock(return_value=payload)
     response.status_code = status_code
     response.headers = {}
+    response.url = url or ""
     response.raise_for_status = MagicMock()
     return response
+
+
+async def _assert_foreground_cancellation(
+    tool: object,
+    *,
+    tool_name: str,
+    execute_kwargs: dict[str, object],
+    expected_metadata: dict[str, object],
+) -> None:
+    controller = ActiveToolController()
+    context = ToolExecutionContext(active_tool_controller=controller)
+    await controller.activate_tool(
+        tool_call_id=f"tool-call-{tool_name}-cancel",
+        tool_name=tool_name,
+        cancellable=False,
+    )
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _slow_request(method: str, url: str, **kwargs: object) -> MagicMock:  # noqa: ARG001
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _text_response("", url=url)
+
+    with patch.object(
+        tool._client,  # type: ignore[attr-defined]
+        "request",
+        new_callable=AsyncMock,
+        side_effect=_slow_request,
+    ):
+        task = asyncio.create_task(tool.execute(context=context, **execute_kwargs))  # type: ignore[attr-defined]
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            for _ in range(100):
+                snapshot = await controller.snapshot()
+                if snapshot["active"] and snapshot["cancellable"]:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError(f"controller never observed a cancellable {tool_name} run")
+
+            cancel_result = await controller.request_cancel()
+            assert cancel_result.cancelled is True
+            assert cancelled.is_set() is True
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert result.error is None
+    assert result.output == []
+    assert result.metadata["status"] == "cancelled"
+    assert result.metadata["cancelled"] is True
+    for key, value in expected_metadata.items():
+        assert result.metadata[key] == value
 
 
 @pytest.mark.asyncio
@@ -241,6 +304,67 @@ async def test_pubmed_search_uses_esearch_then_esummary() -> None:
     assert result.metadata["include_abstract"] is True
 
     await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_arxiv_search_foreground_cancellation_reports_cancelled_status() -> None:
+    tool = ArxivSearchTool()
+    try:
+        await _assert_foreground_cancellation(
+            tool,
+            tool_name="arxiv_search",
+            execute_kwargs={"query": "transformers", "top_k": 3},
+            expected_metadata={"query": "transformers", "source": "arxiv", "top_k": 3},
+        )
+    finally:
+        await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_foreground_cancellation_reports_cancelled_status() -> None:
+    tool = SemanticScholarSearchTool()
+    try:
+        await _assert_foreground_cancellation(
+            tool,
+            tool_name="semantic_scholar_search",
+            execute_kwargs={"query": "transformers", "top_k": 2},
+            expected_metadata={"query": "transformers", "source": "semantic_scholar", "top_k": 2},
+        )
+    finally:
+        await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_crossref_search_foreground_cancellation_reports_cancelled_status() -> None:
+    tool = CrossrefSearchTool()
+    try:
+        await _assert_foreground_cancellation(
+            tool,
+            tool_name="crossref_search",
+            execute_kwargs={"query": "transformers", "top_k": 4},
+            expected_metadata={"query": "transformers", "source": "crossref", "top_k": 4},
+        )
+    finally:
+        await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_foreground_cancellation_reports_cancelled_status() -> None:
+    tool = PubMedSearchTool()
+    try:
+        await _assert_foreground_cancellation(
+            tool,
+            tool_name="pubmed_search",
+            execute_kwargs={"query": "transformers", "top_k": 5, "include_abstract": True},
+            expected_metadata={
+                "query": "transformers",
+                "source": "pubmed",
+                "top_k": 5,
+                "include_abstract": True,
+            },
+        )
+    finally:
+        await tool.close()
 
 
 @pytest.mark.asyncio

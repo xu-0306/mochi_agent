@@ -11,9 +11,15 @@ from uuid import uuid4
 from mochi.config import defaults
 from mochi.runtime.approvals import ApprovalStore, InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.runtime.exec_sessions import ExecSessionStatus
 from mochi.runtime.exec_sessions import SessionPollResult
 from mochi.security import deny_security_decision
-from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from mochi.tools.base import (
+    BaseTool,
+    ToolCancellationResult,
+    ToolExecutionContext,
+    ToolResult,
+)
 from mochi.utils.command_security import CommandSecurityPolicy, CommandSecurityResult
 from mochi.utils.security import build_policy_metadata, normalize_workspace_dir, resolve_path_in_workspace
 
@@ -182,6 +188,10 @@ class ExecCommandTool(BaseTool):
     def requires_approval(self) -> bool:
         return self._require_approval
 
+    @property
+    def is_cancellable(self) -> bool:
+        return True
+
     async def execute(
         self,
         *,
@@ -234,6 +244,21 @@ class ExecCommandTool(BaseTool):
             allow_dangerous_interpreters=True,
         )
         classification = security.classify(command, shell=shell, env=normalized_env)
+        permission_policy = (
+            context.permission_policy
+            if context is not None and isinstance(context.permission_policy, Mapping)
+            else {}
+        )
+        effective_require_approval = self._require_approval
+        if isinstance(permission_policy.get("require_approval_for_exec"), bool):
+            effective_require_approval = bool(permission_policy.get("require_approval_for_exec"))
+        autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
+        auto_review_policy_allow = (
+            classification.action == "ask"
+            and not effective_require_approval
+            and autonomy_mode in {"auto_review", "high_autonomy"}
+            and sandbox_permissions != "require_escalated"
+        )
         if classification.action == "deny":
             decision = deny_security_decision(
                 reason=classification.reason,
@@ -256,8 +281,8 @@ class ExecCommandTool(BaseTool):
             )
 
         needs_approval = (
-            self._require_approval
-            or classification.action == "ask"
+            effective_require_approval
+            or (classification.action == "ask" and not auto_review_policy_allow)
             or sandbox_permissions == "require_escalated"
         )
         if needs_approval:
@@ -340,6 +365,40 @@ class ExecCommandTool(BaseTool):
                 return ToolResult(error="`timeout` must be greater than 0.")
 
         try:
+            async def _bind_active_session(poll: SessionPollResult) -> None:
+                if context is None or context.active_tool_controller is None:
+                    return
+                session_id = str(poll.session_id or "").strip()
+                if not session_id:
+                    return
+
+                async def _cancel_active_session() -> ToolCancellationResult:
+                    cancelled_poll = await self._runtime.kill_session(session_id)
+                    if cancelled_poll is None:
+                        return ToolCancellationResult(
+                            cancelled=False,
+                            reason="tool_already_completed",
+                            session_id=session_id,
+                        )
+                    if cancelled_poll.status == ExecSessionStatus.KILLED:
+                        return ToolCancellationResult(
+                            cancelled=True,
+                            reason="tool_cancelled",
+                            session_id=session_id,
+                            metadata={"status": cancelled_poll.status.value},
+                        )
+                    return ToolCancellationResult(
+                        cancelled=False,
+                        reason="tool_already_completed",
+                        session_id=session_id,
+                        metadata={"status": cancelled_poll.status.value},
+                    )
+
+                await context.active_tool_controller.bind_cancel_callback(
+                    session_id=session_id,
+                    callback=_cancel_active_session,
+                )
+
             result = await self._runtime.start_command(
                 command=command,
                 shell=shell,
@@ -351,6 +410,7 @@ class ExecCommandTool(BaseTool):
                 approval_state="not_required",
                 log_path=resolved_layout.get("log_path"),
                 checkpoint_dir=resolved_layout.get("checkpoint_dir"),
+                session_started_callback=_bind_active_session,
             )
         except Exception as exc:
             return ToolResult(error=f"Exec command failed: {exc}")
@@ -371,15 +431,29 @@ class ExecCommandTool(BaseTool):
             tty=tty,
             approval_state=result.approval_state,
         )
+        policy_reason = classification.reason
+        if auto_review_policy_allow:
+            policy_reason = (
+                "Auto-review allowed a command that would normally require approval. "
+                f"{classification.reason}"
+            )
         metadata.update(
             _build_classification_metadata(
                 classification,
                 shell=shell,
                 policy_state="allow",
-                policy_reason=classification.reason,
+                policy_reason=policy_reason,
             )
         )
+        metadata["auto_reviewed_policy_ask"] = auto_review_policy_allow
         metadata["approval_id"] = None
+        if result.status == ExecSessionStatus.KILLED:
+            payload["runtime_status"] = result.status.value
+            payload["status"] = "cancelled"
+            metadata["runtime_status"] = result.status.value
+            metadata["status"] = "cancelled"
+            metadata["cancelled"] = True
+            return ToolResult(output=payload, metadata=metadata)
         if result.status.value in {"failed", "timed_out"}:
             return ToolResult(
                 error=result.stderr.strip() or f"Command exited with status: {result.status.value}",

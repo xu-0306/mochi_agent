@@ -347,6 +347,19 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
     sessions_dir = tmp_path / "sessions"
     config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
     app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+    expected_goal = {
+        "active_goal_id": "goal-1",
+        "active_goal_status": "running",
+        "execution_mode": "single_agent",
+        "interaction_mode": "goal",
+        "execution_topology": "single_agent",
+        "bound_run_id": None,
+        "protocol_selection": None,
+        "selection_rationale": None,
+        "default_route": "goal",
+        "last_goal_summary": None,
+        "pending_proposal": None,
+    }
 
     with TestClient(app) as client:
         assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
@@ -367,24 +380,15 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
         assert update_response.status_code == 200
         updated = update_response.json()
         assert updated["workflow"] == {"enabled": True, "bound_run_id": "run-1"}
-        assert updated["goal"] == {
-            "goal_id": "goal-1",
-            "status": "running",
-            "execution_mode": "single_agent",
-            "default_route": "continue",
-        }
+        assert updated["goal"] == expected_goal
         assert updated["events"][-2]["event"] == "workflow_state_updated"
         assert updated["events"][-1]["event"] == "goal_state_updated"
+        assert updated["events"][-1]["goal"] == expected_goal
 
         detail_response = client.get("/v1/sessions/alpha")
         assert detail_response.status_code == 200
         assert detail_response.json()["workflow"] == {"enabled": True, "bound_run_id": "run-1"}
-        assert detail_response.json()["goal"] == {
-            "goal_id": "goal-1",
-            "status": "running",
-            "execution_mode": "single_agent",
-            "default_route": "continue",
-        }
+        assert detail_response.json()["goal"] == expected_goal
 
         list_response = client.get("/v1/sessions")
         assert list_response.status_code == 200
@@ -392,12 +396,7 @@ def test_sessions_can_update_goal_metadata_separately_from_workflow(tmp_path: Pa
             "enabled": True,
             "bound_run_id": "run-1",
         }
-        assert list_response.json()["items"][0]["goal"] == {
-            "goal_id": "goal-1",
-            "status": "running",
-            "execution_mode": "single_agent",
-            "default_route": "continue",
-        }
+        assert list_response.json()["items"][0]["goal"] == expected_goal
 
 
 def test_sessions_goal_only_patch_preserves_prior_workflow_metadata(tmp_path: Path) -> None:
@@ -416,6 +415,19 @@ def test_sessions_goal_only_patch_preserves_prior_workflow_metadata(tmp_path: Pa
             "execution_mode": "single_agent",
             "default_route": "continue",
         }
+        expected_goal = {
+            "active_goal_id": "goal-1",
+            "active_goal_status": "running",
+            "execution_mode": "single_agent",
+            "interaction_mode": "goal",
+            "execution_topology": "single_agent",
+            "bound_run_id": None,
+            "protocol_selection": None,
+            "selection_rationale": None,
+            "default_route": "goal",
+            "last_goal_summary": None,
+            "pending_proposal": None,
+        }
 
         workflow_response = client.patch("/v1/sessions/alpha", json={"workflow": workflow})
         assert workflow_response.status_code == 200
@@ -426,18 +438,19 @@ def test_sessions_goal_only_patch_preserves_prior_workflow_metadata(tmp_path: Pa
         assert goal_response.status_code == 200
         goal_payload = goal_response.json()
         assert goal_payload["workflow"] == workflow
-        assert goal_payload["goal"] == goal
+        assert goal_payload["goal"] == expected_goal
         assert goal_payload["events"][-1]["event"] == "goal_state_updated"
+        assert goal_payload["events"][-1]["goal"] == expected_goal
 
         detail_response = client.get("/v1/sessions/alpha")
         assert detail_response.status_code == 200
         assert detail_response.json()["workflow"] == workflow
-        assert detail_response.json()["goal"] == goal
+        assert detail_response.json()["goal"] == expected_goal
 
         list_response = client.get("/v1/sessions")
         assert list_response.status_code == 200
         assert list_response.json()["items"][0]["workflow"] == workflow
-        assert list_response.json()["items"][0]["goal"] == goal
+        assert list_response.json()["items"][0]["goal"] == expected_goal
 
 
 def test_sessions_workflow_only_patch_preserves_prior_goal_metadata(tmp_path: Path) -> None:
@@ -455,29 +468,42 @@ def test_sessions_workflow_only_patch_preserves_prior_goal_metadata(tmp_path: Pa
             "execution_mode": "single_agent",
             "default_route": "continue",
         }
+        expected_goal = {
+            "active_goal_id": "goal-1",
+            "active_goal_status": "running",
+            "execution_mode": "single_agent",
+            "interaction_mode": "goal",
+            "execution_topology": "single_agent",
+            "bound_run_id": None,
+            "protocol_selection": None,
+            "selection_rationale": None,
+            "default_route": "goal",
+            "last_goal_summary": None,
+            "pending_proposal": None,
+        }
         workflow = {"enabled": True, "bound_run_id": "run-1"}
 
         goal_response = client.patch("/v1/sessions/alpha", json={"goal": goal})
         assert goal_response.status_code == 200
-        assert goal_response.json()["goal"] == goal
+        assert goal_response.json()["goal"] == expected_goal
         assert goal_response.json()["workflow"] is None
 
         workflow_response = client.patch("/v1/sessions/alpha", json={"workflow": workflow})
         assert workflow_response.status_code == 200
         workflow_payload = workflow_response.json()
         assert workflow_payload["workflow"] == workflow
-        assert workflow_payload["goal"] == goal
+        assert workflow_payload["goal"] == expected_goal
         assert workflow_payload["events"][-1]["event"] == "workflow_state_updated"
 
         detail_response = client.get("/v1/sessions/alpha")
         assert detail_response.status_code == 200
         assert detail_response.json()["workflow"] == workflow
-        assert detail_response.json()["goal"] == goal
+        assert detail_response.json()["goal"] == expected_goal
 
         list_response = client.get("/v1/sessions")
         assert list_response.status_code == 200
         assert list_response.json()["items"][0]["workflow"] == workflow
-        assert list_response.json()["items"][0]["goal"] == goal
+        assert list_response.json()["items"][0]["goal"] == expected_goal
 
 
 def test_sessions_goal_and_workflow_round_trip_across_fresh_app_instance(
@@ -493,6 +519,19 @@ def test_sessions_goal_and_workflow_round_trip_across_fresh_app_instance(
         "execution_mode": "single_agent",
         "default_route": "continue",
     }
+    expected_goal = {
+        "active_goal_id": "goal-1",
+        "active_goal_status": "running",
+        "execution_mode": "single_agent",
+        "interaction_mode": "goal",
+        "execution_topology": "single_agent",
+        "bound_run_id": None,
+        "protocol_selection": None,
+        "selection_rationale": None,
+        "default_route": "goal",
+        "last_goal_summary": None,
+        "pending_proposal": None,
+    }
 
     first_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
     with TestClient(first_app) as client:
@@ -503,19 +542,19 @@ def test_sessions_goal_and_workflow_round_trip_across_fresh_app_instance(
         )
         assert update_response.status_code == 200
         assert update_response.json()["workflow"] == workflow
-        assert update_response.json()["goal"] == goal
+        assert update_response.json()["goal"] == expected_goal
 
     reloaded_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
     with TestClient(reloaded_app) as reloaded_client:
         detail_response = reloaded_client.get("/v1/sessions/alpha")
         assert detail_response.status_code == 200
         assert detail_response.json()["workflow"] == workflow
-        assert detail_response.json()["goal"] == goal
+        assert detail_response.json()["goal"] == expected_goal
 
         list_response = reloaded_client.get("/v1/sessions")
         assert list_response.status_code == 200
         assert list_response.json()["items"][0]["workflow"] == workflow
-        assert list_response.json()["items"][0]["goal"] == goal
+        assert list_response.json()["items"][0]["goal"] == expected_goal
 
 
 def test_sessions_goal_state_round_trips_completed_summary_and_pending_proposal(
@@ -564,17 +603,101 @@ def test_sessions_goal_state_round_trips_completed_summary_and_pending_proposal(
             json={"goal": goal},
         )
         assert update_response.status_code == 200
-        assert update_response.json()["goal"] == goal
+        normalized_goal = update_response.json()["goal"]
+        assert normalized_goal["execution_mode"] == "workflow"
+        assert normalized_goal["interaction_mode"] == "workflow"
+        assert normalized_goal["execution_topology"] == "multi_agent"
+        assert normalized_goal["protocol_selection"] == "controlled_subagent_execution"
+        assert normalized_goal["selection_rationale"] == (
+            "Routed to controlled_subagent_execution for operator-gated execution steps."
+        )
+        assert normalized_goal["default_route"] == "goal"
+        assert normalized_goal["last_goal_summary"]["interaction_mode"] == "goal"
+        assert normalized_goal["last_goal_summary"]["execution_topology"] == "single_agent"
+        assert normalized_goal["pending_proposal"]["interaction_mode"] == "workflow"
+        assert normalized_goal["pending_proposal"]["execution_topology"] == "multi_agent"
+        assert normalized_goal["pending_proposal"]["protocol_selection"] == "controlled_subagent_execution"
+        assert normalized_goal["pending_proposal"]["selection_rationale"] == (
+            "Routed to controlled_subagent_execution for operator-gated execution steps."
+        )
 
     reloaded_app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
     with TestClient(reloaded_app) as reloaded_client:
         detail_response = reloaded_client.get("/v1/sessions/alpha")
         assert detail_response.status_code == 200
-        assert detail_response.json()["goal"] == goal
+        detail_goal = detail_response.json()["goal"]
+        assert detail_goal["execution_mode"] == "workflow"
+        assert detail_goal["interaction_mode"] == "workflow"
+        assert detail_goal["execution_topology"] == "multi_agent"
+        assert detail_goal["protocol_selection"] == "controlled_subagent_execution"
+        assert detail_goal["selection_rationale"] == (
+            "Routed to controlled_subagent_execution for operator-gated execution steps."
+        )
+        assert detail_goal["default_route"] == "goal"
+        assert detail_goal["last_goal_summary"]["interaction_mode"] == "goal"
+        assert detail_goal["last_goal_summary"]["execution_topology"] == "single_agent"
+        assert detail_goal["pending_proposal"]["interaction_mode"] == "workflow"
+        assert detail_goal["pending_proposal"]["execution_topology"] == "multi_agent"
+        assert detail_goal["pending_proposal"]["protocol_selection"] == "controlled_subagent_execution"
+        assert detail_goal["pending_proposal"]["selection_rationale"] == (
+            "Routed to controlled_subagent_execution for operator-gated execution steps."
+        )
 
         list_response = reloaded_client.get("/v1/sessions")
         assert list_response.status_code == 200
-        assert list_response.json()["items"][0]["goal"] == goal
+        listed_goal = list_response.json()["items"][0]["goal"]
+        assert listed_goal["execution_mode"] == "workflow"
+        assert listed_goal["interaction_mode"] == "workflow"
+        assert listed_goal["execution_topology"] == "multi_agent"
+        assert listed_goal["protocol_selection"] == "controlled_subagent_execution"
+        assert listed_goal["selection_rationale"] == (
+            "Routed to controlled_subagent_execution for operator-gated execution steps."
+        )
+        assert listed_goal["default_route"] == "goal"
+        assert listed_goal["last_goal_summary"]["interaction_mode"] == "goal"
+        assert listed_goal["last_goal_summary"]["execution_topology"] == "single_agent"
+        assert listed_goal["pending_proposal"]["interaction_mode"] == "workflow"
+        assert listed_goal["pending_proposal"]["execution_topology"] == "multi_agent"
+        assert listed_goal["pending_proposal"]["protocol_selection"] == "controlled_subagent_execution"
+        assert listed_goal["pending_proposal"]["selection_rationale"] == (
+            "Routed to controlled_subagent_execution for operator-gated execution steps."
+        )
+
+
+def test_sessions_goal_patch_normalizes_legacy_protocol_only_state(
+    tmp_path: Path,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "alpha"}).status_code == 200
+
+        response = client.patch(
+            "/v1/sessions/alpha",
+            json={
+                "goal": {
+                    "goal_id": "goal-legacy-1",
+                    "status": "running",
+                    "protocol_id": "autonomous_single_agent",
+                    "default_route": "continue",
+                }
+            },
+        )
+
+    assert response.status_code == 200
+    goal = response.json()["goal"]
+    assert goal["active_goal_id"] == "goal-legacy-1"
+    assert goal["active_goal_status"] == "running"
+    assert goal["execution_mode"] == "single_agent"
+    assert goal["interaction_mode"] == "goal"
+    assert goal["execution_topology"] == "single_agent"
+    assert goal["protocol_selection"] == "autonomous_single_agent"
+    assert goal["selection_rationale"] == (
+        "Routed to autonomous_single_agent for direct long-running execution."
+    )
+    assert goal["default_route"] == "goal"
 
 
 def test_sessions_can_rename_and_delete(tmp_path: Path) -> None:

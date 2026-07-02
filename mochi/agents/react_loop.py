@@ -515,6 +515,20 @@ class AsyncReActLoop:
                             )
                         if self._tool_registry is not None:
                             if unavailable_tool_result is None and guarded_tool_result is None:
+                                active_tool_controller = (
+                                    self._tool_execution_context.active_tool_controller
+                                    if self._tool_execution_context is not None
+                                    else None
+                                )
+                                tool_definition = self._tool_registry.get(tool_call.name)
+                                if active_tool_controller is not None:
+                                    await active_tool_controller.activate_tool(
+                                        tool_call_id=tool_call.id,
+                                        tool_name=tool_call.name,
+                                        cancellable=bool(
+                                            getattr(tool_definition, "is_cancellable", False)
+                                        ),
+                                    )
                                 try:
                                     tool_result = await self._tool_registry.execute(
                                         tool_call.name,
@@ -541,6 +555,9 @@ class AsyncReActLoop:
                                         output=tool_output,
                                         error=tool_error,
                                     )
+                                finally:
+                                    if active_tool_controller is not None:
+                                        await active_tool_controller.finish_tool()
                         elif unavailable_tool_result is None and guarded_tool_result is None:
                             tool_error = "No tool registry configured."
                             tool_result_payload = ToolResult(output=tool_output, error=tool_error)
@@ -617,6 +634,9 @@ class AsyncReActLoop:
                         )
                         messages.append(tool_message)
                         self._remember_turn_message(tool_message)
+                        injected_guidance = await self._consume_live_subagent_guidance()
+                        if injected_guidance is not None:
+                            messages.append(injected_guidance)
                     if literature_state["summary_ready"] and not literature_state["prompt_injected"]:
                         messages.append(
                             Message(
@@ -715,6 +735,24 @@ class AsyncReActLoop:
             generation_time_ms=total_generation_time_ms,
             finish_reason=finish_reason,
         )
+
+    async def _consume_live_subagent_guidance(self) -> Message | None:
+        if self._tool_execution_context is None:
+            return None
+        controller = self._tool_execution_context.active_tool_controller
+        if controller is None:
+            return None
+        guidance_messages = await controller.consume_post_tool_messages()
+        contents = [
+            str(item.get("content") or "").strip()
+            for item in guidance_messages
+            if str(item.get("content") or "").strip()
+        ]
+        if not contents:
+            return None
+        lines = ["Live subagent guidance:"]
+        lines.extend(f"- {content}" for content in contents)
+        return Message(role="user", content="\n".join(lines))
 
     def _split_thinking_blocks(self, content: str, thinking: str = "") -> tuple[str, str]:
         closing_only_match = _find_closing_reasoning_tag(content)

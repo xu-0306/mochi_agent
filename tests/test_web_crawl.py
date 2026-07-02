@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mochi.tools.base import ToolExecutionContext
+from mochi.tools.base import ActiveToolController, ToolExecutionContext
 from mochi.tools.web_crawl import WebCrawlTool
 
 
@@ -93,5 +94,65 @@ async def test_web_crawl_skips_blocked_discovered_links() -> None:
         "https://start.test/index",
         "https://allowed.test/page-2",
     ]
+
+    await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_web_crawl_foreground_cancellation_reports_cancelled_status() -> None:
+    tool = WebCrawlTool()
+    controller = ActiveToolController()
+    context = ToolExecutionContext(active_tool_controller=controller)
+    await controller.activate_tool(
+        tool_call_id="tool-call-web-crawl-cancel",
+        tool_name="web_crawl",
+        cancellable=False,
+    )
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _slow_request(method: str, url: str, **kwargs: object) -> MagicMock:  # noqa: ARG001
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _response(b"<html><body><p>never</p></body></html>", url=url)
+
+    with patch.object(
+        tool._client,
+        "request",
+        new_callable=AsyncMock,
+        side_effect=_slow_request,
+    ):
+        task = asyncio.create_task(
+            tool.execute(url="https://example.com/start", context=context)
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            for _ in range(100):
+                snapshot = await controller.snapshot()
+                if snapshot["active"] and snapshot["cancellable"]:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("controller never observed a cancellable web_crawl run")
+
+            cancel_result = await controller.request_cancel()
+            assert cancel_result.cancelled is True
+            assert cancelled.is_set() is True
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+    assert result.error is None
+    assert result.output == {"pages": []}
+    assert result.metadata["status"] == "cancelled"
+    assert result.metadata["cancelled"] is True
+    assert result.metadata["start_url"] == "https://example.com/start"
+    assert result.metadata["pages_crawled"] == 0
 
     await tool.close()

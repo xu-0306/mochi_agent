@@ -11,10 +11,23 @@ from pydantic import BaseModel
 from mochi.api.routes.approvals import _get_runtime_service
 from mochi.goal_intent import classify_goal_proposal_follow_up_intent
 from mochi.goal_proposal_copy import (
+    build_goal_follow_up_assistant_copy_fallback,
     build_goal_proposal_assistant_copy_fallback,
+    generate_goal_follow_up_assistant_copy,
     generate_goal_proposal_assistant_copy,
 )
-from mochi.runtime.models import GoalCreateRequest, GoalResponse
+from mochi.runtime.goal_strategy_registry import (
+    default_goal_strategy_entry,
+    list_goal_strategy_entries,
+)
+from mochi.runtime.models import (
+    ActiveGoalTurnDecision,
+    ActiveGoalTurnDecisionRequest,
+    GoalCreateRequest,
+    GoalResponse,
+    GoalStrategyRegistryEntry,
+    GoalStrategyRegistryResponse,
+)
 
 router = APIRouter(prefix="/v1/goals")
 
@@ -25,6 +38,7 @@ class GoalResumeRequest(BaseModel):
     strategy: Literal["continue_from_checkpoint", "restart_attempt"] = (
         "continue_from_checkpoint"
     )
+    guidance_message: str | None = None
     approval_id: str | None = None
     decision: Literal["approve_once", "approve_and_save_rule", "reject"] = "approve_once"
     reason: str | None = None
@@ -91,6 +105,40 @@ class GoalProposalAssistantCopyResponse(BaseModel):
     source: Literal["model", "fallback"]
 
 
+class GoalFollowUpAssistantCopyRequest(BaseModel):
+    """Bounded assistant-copy request for an active goal follow-up reply."""
+
+    message: str
+    kind: Literal[
+        "queued_after_resolution",
+        "manual_resolution_required",
+        "blocked",
+        "no_live_attempt",
+        "restarted_forwarded",
+        "refreshed_forwarded",
+        "resumed_forwarded",
+        "forwarded",
+    ]
+    goal_objective: str
+    goal_status: str
+    linked_run_status: str | None = None
+    continuation_action: str | None = None
+    continuation_summary: str | None = None
+    approval_count: int = 0
+    tool_names: list[str] | None = None
+    operator_control_hint: str | None = None
+    recommended_action: str | None = None
+    latest_error: str | None = None
+
+
+class GoalFollowUpAssistantCopyResponse(BaseModel):
+    """Assistant explanation text for an active goal follow-up reply."""
+
+    type: Literal["goal_follow_up_assistant_copy"] = "goal_follow_up_assistant_copy"
+    explanation: str
+    source: Literal["model", "fallback"]
+
+
 async def _get_or_create_goal_intent_engine(request: Request) -> Any:
     # Import lazily to avoid module-import cycles while still reusing the canonical app helper.
     from mochi.api.server import _get_or_create_engine
@@ -138,6 +186,18 @@ async def create_goal(
 ) -> GoalResponse:
     service = await _get_runtime_service(request.app)
     return GoalResponse.model_validate(await service.create_goal(payload))
+
+
+@router.get("/strategies", response_model=GoalStrategyRegistryResponse)
+async def list_goal_strategies() -> GoalStrategyRegistryResponse:
+    entries = [
+        GoalStrategyRegistryEntry.model_validate(entry.to_dict())
+        for entry in list_goal_strategy_entries()
+    ]
+    return GoalStrategyRegistryResponse(
+        default_strategy_id=default_goal_strategy_entry().id,
+        entries=entries,
+    )
 
 
 @router.post("/pending-proposal-intent", response_model=PendingGoalProposalIntentResponse)
@@ -197,6 +257,59 @@ async def build_goal_proposal_assistant_copy(
         explanation=result.explanation,
         source=result.source,
     )
+
+
+@router.post("/follow-up-assistant-copy", response_model=GoalFollowUpAssistantCopyResponse)
+async def build_goal_follow_up_assistant_copy(
+    request: Request,
+    payload: GoalFollowUpAssistantCopyRequest,
+) -> GoalFollowUpAssistantCopyResponse:
+    engine = await _get_or_create_goal_intent_engine(request)
+    invoke = getattr(engine, "invoke", None)
+    if not callable(invoke):
+        return GoalFollowUpAssistantCopyResponse(
+            explanation=build_goal_follow_up_assistant_copy_fallback(
+                user_message=payload.message,
+                kind=payload.kind,
+                summary=payload.continuation_summary,
+                approval_count=payload.approval_count,
+                tool_names=payload.tool_names,
+                operator_control_hint=payload.operator_control_hint,
+            ),
+            source="fallback",
+        )
+    result = await generate_goal_follow_up_assistant_copy(
+        engine,
+        user_message=payload.message,
+        kind=payload.kind,
+        goal_objective=payload.goal_objective,
+        goal_status=payload.goal_status,
+        linked_run_status=payload.linked_run_status,
+        continuation_action=payload.continuation_action,
+        continuation_summary=payload.continuation_summary,
+        approval_count=payload.approval_count,
+        tool_names=payload.tool_names,
+        operator_control_hint=payload.operator_control_hint,
+        recommended_action=payload.recommended_action,
+        latest_error=payload.latest_error,
+    )
+    return GoalFollowUpAssistantCopyResponse(
+        explanation=result.explanation,
+        source=result.source,
+    )
+
+
+@router.post("/{goal_id}/turn-decision", response_model=ActiveGoalTurnDecision)
+async def decide_active_goal_turn(
+    request: Request,
+    goal_id: str,
+    payload: ActiveGoalTurnDecisionRequest,
+) -> ActiveGoalTurnDecision:
+    service = await _get_runtime_service(request.app)
+    decision = await service.decide_active_goal_turn(goal_id, payload)
+    if decision is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return decision
 
 
 @router.get("", response_model=list[GoalResponse])
@@ -400,6 +513,11 @@ async def resume_goal(
             return GoalResponse.model_validate(refreshed_goal or current_goal)
 
         if linked_run_id:
+            queued_guidance_message = str(payload.guidance_message or "").strip()
+            if queued_guidance_message:
+                queue_guidance = getattr(service, "_queue_agent_run_guidance_message", None)
+                if callable(queue_guidance):
+                    await queue_guidance(linked_run_id, queued_guidance_message)
             resumed_run = await _resume_linked_agent_run(
                 service,
                 linked_run_id,
@@ -413,6 +531,7 @@ async def resume_goal(
     goal = await service.resume_goal(
         goal_id,
         strategy=payload.strategy if payload is not None else None,
+        guidance_message=payload.guidance_message if payload is not None else None,
     )
     if goal is None:
         raise HTTPException(status_code=404, detail="Goal not found")

@@ -5,15 +5,23 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, Mapping, cast
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, HTTPException, Request
+from pydantic import BaseModel, Field
 
+from mochi.api.routes.approvals import _get_runtime_service
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
+from mochi.runtime.models import (
+    AgentRunMessageRequest,
+    SessionSubagentMessageRequest,
+    SubagentTranscriptDetail,
+    SubagentTranscriptSummary,
+)
 from mochi.sessions.store import SessionStore
+from mochi.terminal_goal_helpers import normalize_goal_session_state
 
 router = APIRouter(prefix="/v1", tags=["sessions"])
 
@@ -52,6 +60,91 @@ class AppendSessionEventsRequest(BaseModel):
     """Append one or more replayable session events."""
 
     events: list[dict[str, object]]
+
+
+class SessionSubagentActionResponse(BaseModel):
+    """Result of an action against a session-scoped subagent transcript."""
+
+    type: str = "session_subagent_action"
+    action: str
+    session_id: str
+    subagent_id: str
+    task_id: str
+    task: dict[str, Any] | None = None
+    transcript: SubagentTranscriptDetail
+
+
+class SessionSubagentResumeRequest(BaseModel):
+    """Optional guidance payload for resuming a session-scoped subagent task."""
+
+    role: str | None = "operator"
+    content: str = ""
+    guidance: str | None = None
+    project_id: str | None = None
+    workspace_dir: str | None = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def to_message_request(self) -> AgentRunMessageRequest | None:
+        content = (self.content or "").strip() or (self.guidance or "").strip()
+        if not content and not self.attachments:
+            return None
+        role = "operator" if self.role not in {"user", "operator"} else self.role
+        return AgentRunMessageRequest.model_validate(
+            {
+                "role": role,
+                "content": content,
+                "project_id": self.project_id,
+                "workspace_dir": self.workspace_dir,
+                "attachments": self.attachments,
+                "metadata": self.metadata,
+            }
+        )
+
+
+def _initial_subagent_message_delivery(
+    payload: SessionSubagentMessageRequest,
+) -> tuple[str, str | None]:
+    if payload.delivery_mode == "resume_only":
+        return "accepted", None
+    if payload.cancel_current_tool:
+        return "queued", "tool_cancel_pending"
+    if payload.interrupt:
+        return "queued", "interrupt_pending"
+    return "queued", "runtime_safe_point_pending"
+
+
+def _message_request_with_delivery_metadata(
+    payload: SessionSubagentMessageRequest,
+) -> tuple[SessionSubagentMessageRequest, dict[str, Any]]:
+    delivery_status, delivery_reason = _initial_subagent_message_delivery(payload)
+    delivery: dict[str, Any] = {
+        "message_id": uuid4().hex,
+        "delivery_mode": payload.delivery_mode,
+        "delivery_status": delivery_status,
+        "interrupt": payload.interrupt,
+        "cancel_current_tool": payload.cancel_current_tool,
+    }
+    if delivery_reason:
+        delivery["delivery_reason"] = delivery_reason
+
+    metadata = dict(payload.metadata or {})
+    metadata.update(delivery)
+    return payload.model_copy(update={"metadata": metadata}), delivery
+
+
+def _subagent_message_response_with_delivery(
+    transcript: SubagentTranscriptDetail,
+    delivery: Mapping[str, Any],
+) -> SubagentTranscriptDetail:
+    message_id = str(delivery.get("message_id") or "")
+    events = []
+    for event in transcript.events:
+        event_message_id = str(event.metadata.get("message_id") or event.message_id or "")
+        if message_id and event_message_id == message_id:
+            event = event.model_copy(update=dict(delivery))
+        events.append(event)
+    return transcript.model_copy(update={**dict(delivery), "events": events})
 
 
 def _get_session_store(app: object, *, config: object | None = None) -> SessionStore:
@@ -167,7 +260,7 @@ def _session_goal_state(events: list[dict]) -> dict[str, object] | None:
             continue
         goal = event.get("goal")
         if isinstance(goal, dict):
-            return dict(goal)
+            return normalize_goal_session_state(dict(goal))
     return None
 
 
@@ -385,6 +478,213 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
     }
 
 
+@router.get("/sessions/{session_id}/subagents", response_model=list[SubagentTranscriptSummary])
+async def list_session_subagents(
+    session_id: str,
+    http_request: Request,
+) -> list[SubagentTranscriptSummary]:
+    service = await _get_runtime_service(http_request.app)
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    items = await service.list_session_subagents(session_id)
+    return [SubagentTranscriptSummary.model_validate(item) for item in items]
+
+
+@router.get(
+    "/sessions/{session_id}/subagents/{subagent_id}",
+    response_model=SubagentTranscriptDetail,
+)
+async def get_session_subagent(
+    session_id: str,
+    subagent_id: str,
+    http_request: Request,
+) -> SubagentTranscriptDetail:
+    service = await _get_runtime_service(http_request.app)
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    item = await service.get_session_subagent(session_id, subagent_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Session subagent not found")
+    return SubagentTranscriptDetail.model_validate(item)
+
+
+@router.post(
+    "/sessions/{session_id}/subagents/{subagent_id}/messages",
+    response_model=SubagentTranscriptDetail,
+)
+async def append_session_subagent_message(
+    session_id: str,
+    subagent_id: str,
+    payload: SessionSubagentMessageRequest,
+    http_request: Request,
+) -> SubagentTranscriptDetail:
+    service = await _get_runtime_service(http_request.app)
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    payload_with_delivery, delivery = _message_request_with_delivery_metadata(payload)
+    item = await service.append_session_subagent_message(
+        session_id,
+        subagent_id,
+        payload_with_delivery,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Session subagent not found")
+    transcript = SubagentTranscriptDetail.model_validate(item)
+    return _subagent_message_response_with_delivery(transcript, delivery)
+
+
+async def _get_session_subagent_or_404(
+    http_request: Request,
+    session_id: str,
+    subagent_id: str,
+) -> tuple[Any, SubagentTranscriptDetail]:
+    service = await _get_runtime_service(http_request.app)
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    item = await service.get_session_subagent(session_id, subagent_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Session subagent not found")
+    return service, SubagentTranscriptDetail.model_validate(item)
+
+
+def _metadata_task_id(metadata: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    task_id = metadata.get("task_id")
+    if isinstance(task_id, str) and task_id.strip():
+        return task_id.strip()
+    return None
+
+
+def _resolve_session_subagent_task_id(transcript: SubagentTranscriptDetail) -> str | None:
+    task_id = _metadata_task_id(transcript.metadata)
+    if task_id is not None:
+        return task_id
+
+    for event in transcript.events:
+        task_id = _metadata_task_id(event.metadata)
+        if task_id is not None:
+            return task_id
+
+    if transcript.parent_type == "delegated_task" and transcript.parent_id.strip():
+        return transcript.parent_id.strip()
+
+    for event in transcript.events:
+        if event.parent_type == "delegated_task" and event.parent_id and event.parent_id.strip():
+            return event.parent_id.strip()
+
+    return None
+
+
+async def _refresh_session_subagent_transcript(
+    service: Any,
+    session_id: str,
+    subagent_id: str,
+    fallback: SubagentTranscriptDetail,
+) -> SubagentTranscriptDetail:
+    item = await service.get_session_subagent(session_id, subagent_id)
+    if item is None:
+        return fallback
+    return SubagentTranscriptDetail.model_validate(item)
+
+
+@router.post(
+    "/sessions/{session_id}/subagents/{subagent_id}/cancel",
+    response_model=SessionSubagentActionResponse,
+)
+async def cancel_session_subagent(
+    session_id: str,
+    subagent_id: str,
+    http_request: Request,
+) -> SessionSubagentActionResponse:
+    service, transcript = await _get_session_subagent_or_404(
+        http_request,
+        session_id,
+        subagent_id,
+    )
+    task_id = _resolve_session_subagent_task_id(transcript)
+    if task_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Session subagent is not linked to a delegated task",
+        )
+
+    task = await service.cancel_task(task_id)
+    refreshed = await _refresh_session_subagent_transcript(
+        service,
+        session_id,
+        subagent_id,
+        transcript,
+    )
+    return SessionSubagentActionResponse(
+        action="cancel",
+        session_id=session_id,
+        subagent_id=subagent_id,
+        task_id=task_id,
+        task=task,
+        transcript=refreshed,
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/subagents/{subagent_id}/resume",
+    response_model=SessionSubagentActionResponse,
+)
+async def resume_session_subagent(
+    session_id: str,
+    subagent_id: str,
+    http_request: Request,
+    payload: SessionSubagentResumeRequest | None = Body(default=None),
+) -> SessionSubagentActionResponse:
+    service, transcript = await _get_session_subagent_or_404(
+        http_request,
+        session_id,
+        subagent_id,
+    )
+    task_id = _resolve_session_subagent_task_id(transcript)
+    if task_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Session subagent is not linked to a delegated task",
+        )
+
+    message_payload = payload.to_message_request() if payload is not None else None
+    if message_payload is not None:
+        updated = await service.append_session_subagent_message(session_id, subagent_id, message_payload)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Session subagent not found")
+        transcript = SubagentTranscriptDetail.model_validate(updated)
+
+    task = await service.resume_task(
+        task_id,
+        decision="approve_once",
+        reason="Session subagent resume requested",
+        rule=None,
+    )
+    refreshed = await _refresh_session_subagent_transcript(
+        service,
+        session_id,
+        subagent_id,
+        transcript,
+    )
+    return SessionSubagentActionResponse(
+        action="resume",
+        session_id=session_id,
+        subagent_id=subagent_id,
+        task_id=task_id,
+        task=task,
+        transcript=refreshed,
+    )
+
+
 @router.post("/sessions/{session_id}/rewrite-from-turn")
 async def rewrite_session_from_turn(
     session_id: str,
@@ -456,7 +756,7 @@ async def update_session(
     """更新 session 顯示 metadata。"""
     title = payload.title.strip() if isinstance(payload.title, str) else None
     workflow = dict(payload.workflow) if isinstance(payload.workflow, dict) else None
-    goal = dict(payload.goal) if isinstance(payload.goal, dict) else None
+    goal = normalize_goal_session_state(dict(payload.goal)) if isinstance(payload.goal, dict) else None
     security_override = _normalize_session_security_override(
         dict(payload.security_override) if isinstance(payload.security_override, dict) else None
     )

@@ -84,9 +84,23 @@ export function mergeReasoningStep(steps: ReasoningStep[], nextStep: ReasoningSt
         ? {
             ...step,
             ...nextStep,
-          }
+        }
         : step
     ))
+  }
+
+  const previous = steps.at(-1)
+  if (
+    previous &&
+    !previous.toolCallId &&
+    !nextStep.toolCallId &&
+    previous.type === nextStep.type &&
+    previous.content.trim() === nextStep.content.trim() &&
+    (previous.source ?? null) === (nextStep.source ?? null) &&
+    (previous.errorCode ?? null) === (nextStep.errorCode ?? null) &&
+    (previous.toolMeta?.raw_phase ?? null) === (nextStep.toolMeta?.raw_phase ?? null)
+  ) {
+    return [...steps.slice(0, -1), { ...previous, ...nextStep }]
   }
 
   return [...steps, nextStep]

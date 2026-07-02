@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
@@ -11,6 +12,7 @@ import httpx
 
 from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 from mochi.tools._http import (
+    BoundHttpToolCancellation,
     DEFAULT_USER_AGENT,
     ToolHttpError,
     error_to_tool_result,
@@ -258,6 +260,10 @@ class WebSearchTool(BaseTool):
         return True
 
     @property
+    def is_cancellable(self) -> bool:
+        return True
+
+    @property
     def tool_capabilities(self) -> dict[str, Any]:
         return {
             "domains": ["web"],
@@ -364,100 +370,123 @@ class WebSearchTool(BaseTool):
         provider_attempts: list[dict[str, Any]] = []
         warnings: list[dict[str, str]] = []
         fallback_diagnostics: list[dict[str, Any]] = []
+        cancellation = await BoundHttpToolCancellation.bind(context=context)
+        try:
+            for index, engine in enumerate(engines_to_try):
+                cancellation.raise_if_requested()
+                if engine not in _SUPPORTED_ENGINES:
+                    continue
+                provider_state = self._provider_state(engine)
+                next_engine = _next_provider_in_chain(engines_to_try, start=index + 1)
+                if not provider_state["configured"]:
+                    warning = {
+                        "provider": engine,
+                        "status": str(provider_state["status"]),
+                        "reason": str(provider_state["reason"]),
+                    }
+                    provider_attempts.append(dict(warning))
+                    warnings.append(warning)
+                    append_fallback_diagnostic(
+                        fallback_diagnostics,
+                        category="provider_chain",
+                        name="search_provider_skipped",
+                        reason=str(provider_state["status"]),
+                        kind="skip",
+                        severity="info",
+                        from_state=engine,
+                        to_state=next_engine,
+                        metadata={"detail": str(provider_state["reason"])},
+                    )
+                    continue
+                attempted_providers.append(engine)
 
-        for index, engine in enumerate(engines_to_try):
-            if engine not in _SUPPORTED_ENGINES:
-                continue
-            provider_state = self._provider_state(engine)
-            next_engine = _next_provider_in_chain(engines_to_try, start=index + 1)
-            if not provider_state["configured"]:
-                warning = {
+                result = await self._search_with_engine(
+                    engine=engine,
+                    query=query,
+                    top_k=top_k,
+                    search_depth=search_depth,
+                    include_content=include_content,
+                    allowed_domains=allowed_domains,
+                    blocked_domains=blocked_domains,
+                    language=language,
+                    region=region,
+                )
+                cancellation.raise_if_requested()
+                if result.error is None:
+                    provider_attempts.append({
+                        "provider": engine,
+                        "status": "succeeded",
+                    })
+                    return _normalize_search_tool_result(
+                        result=result,
+                        query=query,
+                        provider=engine,
+                        attempted_providers=attempted_providers,
+                        warnings=warnings,
+                        provider_attempts=provider_attempts,
+                        fallback_diagnostics=fallback_diagnostics,
+                    )
+                provider_attempts.append({
                     "provider": engine,
-                    "status": str(provider_state["status"]),
-                    "reason": str(provider_state["reason"]),
-                }
-                provider_attempts.append(dict(warning))
-                warnings.append(warning)
+                    "status": "request_failed",
+                    "reason": result.error or "request failed",
+                })
                 append_fallback_diagnostic(
                     fallback_diagnostics,
                     category="provider_chain",
-                    name="search_provider_skipped",
-                    reason=str(provider_state["status"]),
-                    kind="skip",
-                    severity="info",
+                    name="search_provider_fallback",
+                    reason="request_failed",
+                    kind="fallback",
+                    severity="warning",
                     from_state=engine,
                     to_state=next_engine,
-                    metadata={"detail": str(provider_state["reason"])},
+                    metadata={
+                        "error": result.error or "request failed",
+                        "retryable": result.retryable,
+                    },
                 )
-                continue
-            attempted_providers.append(engine)
+                last_error = result
 
-            result = await self._search_with_engine(
-                engine=engine,
-                query=query,
-                top_k=top_k,
-                search_depth=search_depth,
-                include_content=include_content,
-                allowed_domains=allowed_domains,
-                blocked_domains=blocked_domains,
-                language=language,
-                region=region,
-            )
-            if result.error is None:
-                provider_attempts.append({
-                    "provider": engine,
-                    "status": "succeeded",
-                })
-                return _normalize_search_tool_result(
-                    result=result,
-                    query=query,
-                    provider=engine,
-                    attempted_providers=attempted_providers,
-                    warnings=warnings,
-                    provider_attempts=provider_attempts,
-                    fallback_diagnostics=fallback_diagnostics,
-                )
-            provider_attempts.append({
-                "provider": engine,
-                "status": "request_failed",
-                "reason": result.error or "request failed",
-            })
-            append_fallback_diagnostic(
-                fallback_diagnostics,
-                category="provider_chain",
-                name="search_provider_fallback",
-                reason="request_failed",
-                kind="fallback",
-                severity="warning",
-                from_state=engine,
-                to_state=next_engine,
+            cancellation.raise_if_requested()
+            if last_error is not None:
+                last_error.metadata.setdefault("provider_attempts", provider_attempts)
+                last_error.metadata.setdefault("warnings", warnings)
+                last_error.metadata.setdefault("attempted_providers", attempted_providers)
+                last_error.metadata.setdefault("fallback_diagnostics", fallback_diagnostics)
+                return last_error
+
+            return ToolResult(
+                error="No configured search engine is available.",
                 metadata={
-                    "error": result.error or "request failed",
-                    "retryable": result.retryable,
+                    "attempted_providers": attempted_providers,
+                    "provider_attempts": provider_attempts,
+                    "warnings": warnings,
+                    "fallback_diagnostics": fallback_diagnostics,
                 },
+                suggestion=(
+                    "Configure at least one search engine API key in settings. "
+                    "Recommended: set MOCHI_TAVILY_API_KEY for reliable web search."
+                ),
             )
-            last_error = result
-
-        if last_error is not None:
-            last_error.metadata.setdefault("provider_attempts", provider_attempts)
-            last_error.metadata.setdefault("warnings", warnings)
-            last_error.metadata.setdefault("attempted_providers", attempted_providers)
-            last_error.metadata.setdefault("fallback_diagnostics", fallback_diagnostics)
-            return last_error
-
-        return ToolResult(
-            error="No configured search engine is available.",
-            metadata={
-                "attempted_providers": attempted_providers,
-                "provider_attempts": provider_attempts,
-                "warnings": warnings,
-                "fallback_diagnostics": fallback_diagnostics,
-            },
-            suggestion=(
-                "Configure at least one search engine API key in settings. "
-                "Recommended: set MOCHI_TAVILY_API_KEY for reliable web search."
-            ),
-        )
+        except asyncio.CancelledError:
+            if cancellation.requested:
+                return cancellation.cancelled_result(
+                    output={
+                        "query": query,
+                        "provider": attempted_providers[-1] if attempted_providers else None,
+                        "results": [],
+                        "warnings": warnings,
+                        "attempted_providers": attempted_providers,
+                    },
+                    metadata={
+                        "query": query,
+                        "attempted_providers": attempted_providers,
+                        "provider_attempts": provider_attempts,
+                        "warnings": warnings,
+                        "fallback_diagnostics": fallback_diagnostics,
+                    },
+                )
+            raise
 
     def _provider_chain(self) -> list[str]:
         primary_chain: list[str] = []

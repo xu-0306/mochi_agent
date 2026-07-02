@@ -1,6 +1,7 @@
 'use client'
 
 import {
+  AlertCircle,
   CheckCircle2,
   ExternalLink,
   Loader2,
@@ -31,7 +32,7 @@ import {
 } from '@/lib/goal-proposal-copy'
 import { cn } from '@/lib/utils'
 
-export type GoalHeaderDisplayState = 'active' | 'blocked' | 'completed'
+export type GoalHeaderDisplayState = 'active' | 'blocked' | 'completed' | 'failed'
 
 export interface GoalHeaderChipView {
   title: string
@@ -50,6 +51,7 @@ export interface GoalDrawerBlockerView {
   summary: string | null
   recommendedAction: string | null
   latestError: string | null
+  approvalCount?: number
   approvalIds: string[]
   approvalToolNames: string[]
   blockedTools: string[]
@@ -96,6 +98,11 @@ function displayStateTone(state: GoalHeaderDisplayState, open: boolean): string 
       ? 'border-emerald-400/40 bg-emerald-500/15 text-emerald-100'
       : 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200'
   }
+  if (state === 'failed') {
+    return open
+      ? 'border-destructive/40 bg-destructive/15 text-destructive'
+      : 'border-destructive/30 bg-destructive/10 text-destructive'
+  }
   if (state === 'blocked') {
     return open
       ? 'border-warning/40 bg-warning/15 text-warning-foreground'
@@ -106,14 +113,32 @@ function displayStateTone(state: GoalHeaderDisplayState, open: boolean): string 
     : 'border-primary-400/30 bg-primary-500/10 text-primary-200'
 }
 
-function statusBadgeVariant(state: GoalHeaderDisplayState): 'primary' | 'warning' | 'success' {
+function statusBadgeVariant(
+  state: GoalHeaderDisplayState
+): 'primary' | 'warning' | 'success' | 'error' {
   if (state === 'completed') {
     return 'success'
+  }
+  if (state === 'failed') {
+    return 'error'
   }
   if (state === 'blocked') {
     return 'warning'
   }
   return 'primary'
+}
+
+function isTerminalGoalStatus(status: string): boolean {
+  const normalized = status.toLowerCase()
+  return (
+    normalized === 'completed' ||
+    normalized === 'done' ||
+    normalized === 'succeeded' ||
+    normalized === 'cancelled' ||
+    normalized === 'canceled' ||
+    normalized === 'failed' ||
+    normalized === 'error'
+  )
 }
 
 function canPauseGoal(status: string): boolean {
@@ -176,6 +201,14 @@ export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
   const copySource = goalCopySource(goal)
   const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
   const executionLabel = buildGoalCardExecutionModeLabel(copySource, goal.executionMode)
+  const statusLabel =
+    buildGoalCardStatusLabel(copySource, goal.status) ?? goal.status.replaceAll('_', ' ')
+  const subtitleParts = [
+    statusLabel,
+    goal.pendingApprovalCount > 0
+      ? buildGoalApprovalCountLabel(copySource, goal.pendingApprovalCount)
+      : executionLabel,
+  ].filter((value) => value.trim().length > 0)
 
   return (
     <button
@@ -190,6 +223,8 @@ export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
     >
       {goal.displayState === 'completed' ? (
         <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+      ) : goal.displayState === 'failed' ? (
+        <AlertCircle className="h-3.5 w-3.5 shrink-0" />
       ) : goal.displayState === 'blocked' ? (
         <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
       ) : (
@@ -198,8 +233,7 @@ export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
       <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-semibold">{goal.title}</span>
         <span className="hidden truncate text-[11px] opacity-80 sm:block">
-          {executionLabel}
-          {goal.protocolId ? ` | ${goal.protocolId}` : ''}
+          {subtitleParts.join(' | ')}
         </span>
       </span>
       {goal.pendingApprovalCount > 0 ? (
@@ -240,11 +274,15 @@ export function GoalDrawerContent({
       canResumeGoal(goal.status) &&
       goal.pendingApprovalCount === 0
   )
-  const stopAvailable = Boolean(goal.goalId && onStop && goal.displayState !== 'completed')
-  const showBlockedDetails = goal.displayState === 'blocked' || blocker !== null
+  const stopAvailable = Boolean(goal.goalId && onStop && !isTerminalGoalStatus(goal.status))
+  const showBlockedDetails =
+    goal.displayState !== 'completed' &&
+    (goal.displayState === 'blocked' ||
+      goal.displayState === 'failed' ||
+      blocker !== null)
   const hasApprovalMetadata = Boolean(
     blocker &&
-      (blocker.approvalIds.length > 0 ||
+      ((blocker.approvalCount ?? blocker.approvalIds.length) > 0 ||
         blocker.approvalToolNames.length > 0 ||
         approvals.length > 0)
   )
@@ -330,10 +368,13 @@ export function GoalDrawerContent({
         {showBlockedDetails ? (
           <div className="rounded-2xl border border-warning/30 bg-warning/10 p-3">
             <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-warning-foreground/80">
-              {chromeCopy.blockedStatusLabel}
+              {goal.displayState === 'failed' ? displayLabel : chromeCopy.blockedStatusLabel}
             </p>
             <p className="mt-1 text-sm leading-6 text-foreground">
-              {buildGoalBlockerSummary(copySource, blocker?.summary, blocker?.latestError)}
+              {buildGoalBlockerSummary(copySource, blocker?.summary, blocker?.latestError, {
+                approvalCount: blocker?.approvalCount ?? blocker?.approvalIds.length ?? 0,
+                recommendedAction: blocker?.recommendedAction,
+              })}
             </p>
             {blocker?.recommendedAction ? (
               <p className="mt-2 text-xs text-muted-foreground">
@@ -377,7 +418,10 @@ export function GoalDrawerContent({
                 <div className="rounded-xl border border-border bg-surface-layer/60 p-3">
                   <p className="font-medium text-muted-foreground">{chromeCopy.approvalWaitLabel}</p>
                   <div className="mt-2 space-y-1.5 text-foreground">
-                    <p>{chromeCopy.pendingApprovalsCountLabel}: {blocker?.approvalIds.length ?? 0}</p>
+                    <p>
+                      {chromeCopy.pendingApprovalsCountLabel}:{' '}
+                      {blocker?.approvalCount ?? blocker?.approvalIds.length ?? 0}
+                    </p>
                     <p>
                       {chromeCopy.toolsSectionLabel}:{' '}
                       {(blocker?.approvalToolNames.length ?? 0) > 0

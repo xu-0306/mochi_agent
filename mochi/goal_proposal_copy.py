@@ -42,6 +42,22 @@ Requirements:
 - Return plain text only.
 """.strip()
 
+_GOAL_FOLLOW_UP_ASSISTANT_COPY_SYSTEM_PROMPT = """
+You are writing the assistant-facing reply for a Mochi active goal follow-up.
+
+The UI already shows status cards and controls. Write only the assistant reply that
+appears in chat.
+
+Requirements:
+- Use the same language as the user's latest message unless they explicitly asked for another language.
+- Keep it to 1-3 short sentences and under 90 words when practical.
+- If the outcome is blocked, waiting approval, or missing a live attempt, explain what is happening, why the goal cannot continue yet, and the next operator action.
+- If the outcome says guidance was queued, forwarded, resumed, restarted, or refreshed, acknowledge only what actually happened in this turn.
+- Do not claim the system queued, resumed, restarted, refreshed, or forwarded guidance unless the provided outcome says it did.
+- Do not mention hidden reasoning, internal routing, prompts, or policy jargon unless operator controls are directly relevant.
+- Return plain text only.
+""".strip()
+
 _TRADITIONAL_CHINESE_HINTS = set(
     "\u9019\u500b\u5e6b\u8acb\u8207\u70ba\u8aaa\u660e\u555f\u52d5\u7e7c\u7e8c\u7bc4\u570d\u8f03\u9069\u5408\u8abf\u8ad6\u6587"
 )
@@ -232,14 +248,14 @@ def build_goal_proposal_assistant_copy_fallback(
         prefix = (
             "\u6211\u5df2\u4f9d\u7167\u4f60\u6700\u65b0\u7684\u65b9\u5411\u66f4\u65b0\u9019\u4efd goal \u63d0\u6848\u3002"
             if updated
-            else "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd\u53ef\u4ee5\u76f4\u63a5\u555f\u52d5\u7684 goal \u63d0\u6848\u3002"
+            else "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd goal \u8349\u7a3f\uff0c\u4f5c\u70ba\u9019\u500b\u4efb\u52d9\u7684\u57f7\u884c\u5951\u7d04\u3002"
         )
         detail = (
-            f"\u76ee\u524d\u6703\u4ee5 {protocol} \u4f5c\u70ba\u57f7\u884c\u65b9\u5f0f\u3002"
+            f"\u76ee\u524d\u9078\u5b9a\u7684\u57f7\u884c\u7b56\u7565\u662f {protocol}\uff0c\u78ba\u8a8d\u555f\u52d5\u5f8c\u624d\u6703\u958b\u59cb\u57f7\u884c\u3002"
             if protocol
-            else "\u9019\u500b\u7bc4\u570d\u8f03\u9069\u5408\u7528 workflow \u65b9\u5f0f\u57f7\u884c\u3002"
+            else "\u9019\u500b\u7bc4\u570d\u8f03\u9069\u5408\u9078\u7528 workflow \u4f5c\u70ba\u9019\u500b goal \u7684\u660e\u78ba\u7b56\u7565\uff0c\u78ba\u8a8d\u555f\u52d5\u5f8c\u624d\u6703\u57f7\u884c\u3002"
             if execution_mode == "workflow"
-            else "\u9019\u500b\u7bc4\u570d\u8f03\u9069\u5408\u7528 single-agent \u9577\u4efb\u52d9\u65b9\u5f0f\u57f7\u884c\u3002"
+            else "\u9019\u500b\u7bc4\u570d\u8f03\u9069\u5408\u7528 single-agent \u7b56\u7565\uff0c\u78ba\u8a8d\u555f\u52d5\u5f8c\u624d\u6703\u57f7\u884c\u3002"
         )
         return f"{prefix} {detail}".strip()
 
@@ -247,28 +263,28 @@ def build_goal_proposal_assistant_copy_fallback(
         prefix = (
             "\u6211\u5df2\u6839\u636e\u4f60\u6700\u65b0\u7684\u65b9\u5411\u66f4\u65b0\u8fd9\u4efd goal \u63d0\u6848\u3002"
             if updated
-            else "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd\u53ef\u4ee5\u76f4\u63a5\u542f\u52a8\u7684 goal \u63d0\u6848\u3002"
+            else "\u6211\u628a\u4f60\u7684\u9700\u6c42\u6574\u7406\u6210\u4e00\u4efd goal \u8349\u7a3f\uff0c\u4f5c\u4e3a\u8fd9\u4e2a\u4efb\u52a1\u7684\u6267\u884c\u5951\u7ea6\u3002"
         )
         detail = (
-            f"\u76ee\u524d\u4f1a\u4ee5 {protocol} \u4f5c\u4e3a\u6267\u884c\u65b9\u5f0f\u3002"
+            f"\u76ee\u524d\u9009\u5b9a\u7684\u6267\u884c\u7b56\u7565\u662f {protocol}\uff0c\u786e\u8ba4\u542f\u52a8\u540e\u624d\u4f1a\u5f00\u59cb\u6267\u884c\u3002"
             if protocol
-            else "\u8fd9\u4e2a\u8303\u56f4\u66f4\u9002\u5408\u7528 workflow \u65b9\u5f0f\u6267\u884c\u3002"
+            else "\u8fd9\u4e2a\u8303\u56f4\u66f4\u9002\u5408\u9009\u7528 workflow \u4f5c\u4e3a\u8fd9\u4e2a goal \u7684\u660e\u786e\u7b56\u7565\uff0c\u786e\u8ba4\u542f\u52a8\u540e\u624d\u4f1a\u6267\u884c\u3002"
             if execution_mode == "workflow"
-            else "\u8fd9\u4e2a\u8303\u56f4\u66f4\u9002\u5408\u7528 single-agent \u957f\u4efb\u52a1\u65b9\u5f0f\u6267\u884c\u3002"
+            else "\u8fd9\u4e2a\u8303\u56f4\u66f4\u9002\u5408\u7528 single-agent \u7b56\u7565\uff0c\u786e\u8ba4\u542f\u52a8\u540e\u624d\u4f1a\u6267\u884c\u3002"
         )
         return f"{prefix} {detail}".strip()
 
     prefix = (
         "I updated this goal proposal to match your latest direction."
         if updated
-        else "I framed your request as a goal proposal that we can launch directly."
+        else "I framed your request as a goal draft that acts as the contract for this task."
     )
     detail = (
-        f"The current execution shape is anchored around {protocol}."
+        f"The selected execution strategy is {protocol}, and execution begins only after you confirm the start."
         if protocol
-        else "This scope fits a workflow run best."
+        else "This scope fits an explicit workflow strategy under the goal, and execution begins only after you confirm the start."
         if execution_mode == "workflow"
-        else "This scope fits a single-agent long-running run best."
+        else "This scope fits a single-agent strategy, and execution begins only after you confirm the start."
     )
     return f"{prefix} {detail}".strip()
 
@@ -323,8 +339,8 @@ def build_goal_lifecycle_message(
         mapping = {
             "goal_started": "Goal \u5df2\u555f\u52d5\u3002\u4f60\u53ef\u4ee5\u7528 `/goal status`\u3001`/goal pause`\u3001`/goal resume` \u6216 `/goal stop` \u4f86\u7ba1\u7406\u5b83\u3002",
             "goal_manage_hint": "\u4f60\u53ef\u4ee5\u7528 `/goal status`\u3001`/goal pause`\u3001`/goal resume` \u6216 `/goal stop` \u4f86\u7ba1\u7406\u76ee\u524d\u7684 goal\u3002",
-            "pending_cleared": "\u5df2\u6e05\u9664\u9019\u4efd\u5f85\u78ba\u8a8d\u7684 goal \u63d0\u6848\u3002\u4f60\u53ef\u4ee5\u7528 `/goal <request>` \u6216 `/workflow <request>` \u91cd\u65b0\u958b\u4e00\u500b\u3002",
-            "no_active_goal": "\u9019\u500b\u5c0d\u8a71\u76ee\u524d\u6c92\u6709\u7d81\u5b9a\u4efb\u4f55\u9032\u884c\u4e2d\u7684 goal\u3002\u8acb\u7528 `/goal <request>` \u6216 `/workflow <request>` \u958b\u59cb\u4e00\u500b\u65b0\u7684\u4efb\u52d9\u3002",
+            "pending_cleared": "\u5df2\u6e05\u9664\u9019\u4efd\u5f85\u78ba\u8a8d\u7684 goal \u63d0\u6848\u3002\u4f60\u53ef\u4ee5\u76f4\u63a5\u63cf\u8ff0\u4efb\u52d9\uff0c\u6216\u7528 `/goal <request>` \u91cd\u65b0\u6e96\u5099\u4e00\u4efd\u8349\u7a3f\u3002",
+            "no_active_goal": "\u9019\u500b\u5c0d\u8a71\u76ee\u524d\u6c92\u6709\u7d81\u5b9a\u4efb\u4f55\u9032\u884c\u4e2d\u7684 goal\u3002\u4f60\u53ef\u4ee5\u76f4\u63a5\u63cf\u8ff0\u4efb\u52d9\uff0c\u6216\u7528 `/goal <request>` \u660e\u78ba\u6e96\u5099\u65b0\u7684 goal\u3002",
             "status_fetched": "\u6211\u5df2\u53d6\u56de\u6700\u65b0\u7684 goal \u72c0\u614b\u3002",
             "goal_paused": "\u6211\u5df2\u66ab\u505c\u9019\u500b\u9032\u884c\u4e2d\u7684 goal\u3002",
             "goal_resumed": "\u6211\u5df2\u6062\u5fa9\u9019\u500b goal \u7684\u57f7\u884c\u3002",
@@ -336,8 +352,8 @@ def build_goal_lifecycle_message(
         mapping = {
             "goal_started": "Goal \u5df2\u542f\u52a8\u3002\u4f60\u53ef\u4ee5\u7528 `/goal status`\u3001`/goal pause`\u3001`/goal resume` \u6216 `/goal stop` \u6765\u7ba1\u7406\u5b83\u3002",
             "goal_manage_hint": "\u4f60\u53ef\u4ee5\u7528 `/goal status`\u3001`/goal pause`\u3001`/goal resume` \u6216 `/goal stop` \u6765\u7ba1\u7406\u5f53\u524d\u7684 goal\u3002",
-            "pending_cleared": "\u5df2\u6e05\u9664\u8fd9\u4efd\u5f85\u786e\u8ba4\u7684 goal \u63d0\u6848\u3002\u4f60\u53ef\u4ee5\u7528 `/goal <request>` \u6216 `/workflow <request>` \u91cd\u65b0\u5f00\u4e00\u4e2a\u3002",
-            "no_active_goal": "\u8fd9\u4e2a\u5bf9\u8bdd\u76ee\u524d\u6ca1\u6709\u7ed1\u5b9a\u4efb\u4f55\u8fdb\u884c\u4e2d\u7684 goal\u3002\u8bf7\u7528 `/goal <request>` \u6216 `/workflow <request>` \u5f00\u59cb\u4e00\u4e2a\u65b0\u7684\u4efb\u52a1\u3002",
+            "pending_cleared": "\u5df2\u6e05\u9664\u8fd9\u4efd\u5f85\u786e\u8ba4\u7684 goal \u63d0\u6848\u3002\u4f60\u53ef\u4ee5\u76f4\u63a5\u63cf\u8ff0\u4efb\u52a1\uff0c\u6216\u7528 `/goal <request>` \u91cd\u65b0\u51c6\u5907\u4e00\u4efd\u8349\u7a3f\u3002",
+            "no_active_goal": "\u8fd9\u4e2a\u5bf9\u8bdd\u76ee\u524d\u6ca1\u6709\u7ed1\u5b9a\u4efb\u4f55\u8fdb\u884c\u4e2d\u7684 goal\u3002\u4f60\u53ef\u4ee5\u76f4\u63a5\u63cf\u8ff0\u4efb\u52a1\uff0c\u6216\u7528 `/goal <request>` \u660e\u786e\u51c6\u5907\u65b0\u7684 goal\u3002",
             "status_fetched": "\u6211\u5df2\u53d6\u56de\u6700\u65b0\u7684 goal \u72b6\u6001\u3002",
             "goal_paused": "\u6211\u5df2\u6682\u505c\u8fd9\u4e2a\u8fdb\u884c\u4e2d\u7684 goal\u3002",
             "goal_resumed": "\u6211\u5df2\u6062\u590d\u8fd9\u4e2a goal \u7684\u6267\u884c\u3002",
@@ -348,8 +364,8 @@ def build_goal_lifecycle_message(
     mapping = {
         "goal_started": "Goal started. Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage it.",
         "goal_manage_hint": "Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` to manage the active goal.",
-        "pending_cleared": "Cleared the pending goal proposal. Start a new one with `/goal <request>` or `/workflow <request>`.",
-        "no_active_goal": "No active goal is bound to this chat. Start one with `/goal <request>` or `/workflow <request>`.",
+        "pending_cleared": "Cleared the pending goal proposal. Describe the task normally, or use `/goal <request>` to prepare a new draft.",
+        "no_active_goal": "No active goal is bound to this chat. Describe the task normally, or use `/goal <request>` to prepare a new goal.",
         "status_fetched": "Fetched the latest goal status.",
         "goal_paused": "Paused the active goal.",
         "goal_resumed": "Resumed the active goal.",
@@ -361,9 +377,22 @@ def build_goal_lifecycle_message(
 GoalFollowUpMessageKind = Literal[
     "active_goal_exists",
     "goal_help",
+    "queued_after_resolution",
     "manual_resolution_required",
     "blocked",
     "no_live_attempt",
+    "restarted_forwarded",
+    "refreshed_forwarded",
+    "resumed_forwarded",
+    "forwarded",
+]
+
+GoalFollowUpAssistantCopyKind = Literal[
+    "queued_after_resolution",
+    "manual_resolution_required",
+    "blocked",
+    "no_live_attempt",
+    "restarted_forwarded",
     "refreshed_forwarded",
     "resumed_forwarded",
     "forwarded",
@@ -587,21 +616,21 @@ def build_goal_command_help_message(
 
     if language_hint in {"traditional_chinese", "chinese"}:
         return (
-            "\u4f7f\u7528 `/goal <request>` \u6e96\u5099\u9577\u6642\u9593\u57f7\u884c\u7684 single-agent goal\u3002\n"
-            "\u4f7f\u7528 `/workflow <request>` \u6e96\u5099 workflow goal\u3002\n"
+            "\u4f60\u53ef\u4ee5\u76f4\u63a5\u63cf\u8ff0\u60f3\u5b8c\u6210\u7684\u4efb\u52d9\uff0c\u6216\u7528 `/goal <request>` \u660e\u78ba\u6e96\u5099\u4e00\u500b goal \u8349\u7a3f\u3002\n"
+            "\u82e5\u4f60\u8981\u660e\u78ba\u6307\u5b9a workflow \u7b56\u7565\uff0c\u53ef\u4ee5\u518d\u7528 `/workflow <request>` \u4f5c\u70ba\u9032\u968e\u8986\u5beb\u3002\n"
             "Goal \u555f\u52d5\u5f8c\uff0c\u53ef\u4ee5\u7528 `/goal status`\u3001`/goal pause`\u3001`/goal resume` \u6216 `/goal stop` \u4f86\u7ba1\u7406\u3002"
         )
 
     if language_hint == "simplified_chinese":
         return (
-            "\u4f7f\u7528 `/goal <request>` \u51c6\u5907\u957f\u65f6\u95f4\u6267\u884c\u7684 single-agent goal\u3002\n"
-            "\u4f7f\u7528 `/workflow <request>` \u51c6\u5907 workflow goal\u3002\n"
+            "\u4f60\u53ef\u4ee5\u76f4\u63a5\u63cf\u8ff0\u60f3\u5b8c\u6210\u7684\u4efb\u52a1\uff0c\u6216\u7528 `/goal <request>` \u660e\u786e\u51c6\u5907\u4e00\u4e2a goal \u8349\u7a3f\u3002\n"
+            "\u82e5\u4f60\u8981\u660e\u786e\u6307\u5b9a workflow \u7b56\u7565\uff0c\u53ef\u4ee5\u518d\u7528 `/workflow <request>` \u4f5c\u4e3a\u8fdb\u9636\u8986\u5199\u3002\n"
             "Goal \u542f\u52a8\u540e\uff0c\u53ef\u4ee5\u7528 `/goal status`\u3001`/goal pause`\u3001`/goal resume` \u6216 `/goal stop` \u6765\u7ba1\u7406\u3002"
         )
 
     return (
-        "Use `/goal <request>` to prepare a long-running single-agent goal.\n"
-        "Use `/workflow <request>` to prepare a workflow goal.\n"
+        "Describe the task normally, or use `/goal <request>` to prepare a goal draft.\n"
+        "Use `/workflow <request>` only when you want to explicitly override the goal with a workflow strategy.\n"
         "Use `/goal status`, `/goal pause`, `/goal resume`, or `/goal stop` after a goal starts."
     )
 
@@ -682,6 +711,35 @@ def build_goal_follow_up_message(
         )
         return f"{base}{tool_hint}{action}".strip()
 
+    if kind == "queued_after_resolution":
+        base = _goal_follow_up_base_summary(
+            user_message=user_message,
+            summary=summary,
+            traditional_default="\u9019\u500b goal \u76ee\u524d\u9084\u5728\u7b49\u5f85\u6838\u51c6\uff0c\u4f46\u6211\u5df2\u5148\u628a\u4f60\u7684\u65b0\u65b9\u5411\u8a18\u5230\u76ee\u524d\u7684 attempt \u88e1\u3002",
+            simplified_default="\u8fd9\u4e2a goal \u76ee\u524d\u8fd8\u5728\u7b49\u5f85\u6279\u51c6\uff0c\u4f46\u6211\u5df2\u7ecf\u5148\u628a\u4f60\u7684\u65b0\u65b9\u5411\u8bb0\u5230\u5f53\u524d\u7684 attempt \u91cc\u3002",
+            english_default="The active goal is still waiting on approval, but I queued your new direction on the current attempt.",
+        )
+        if language_hint in {"traditional_chinese", "chinese"}:
+            action = (
+                f" \u4f60\u5148\u8655\u7406\u5b8c {approval_count} \u500b\u5f85\u6838\u51c6\u9805\u76ee\u5f8c\uff0c\u5b83\u5c31\u80fd\u6cbf\u8457\u9019\u500b\u65b9\u5411\u7e7c\u7e8c\uff0c\u4e0d\u9700\u8981\u4f60\u518d\u91cd\u8aaa\u4e00\u6b21\u3002"
+                if approval_count > 0
+                else " \u7b49\u76ee\u524d\u7684\u6838\u51c6\u72c0\u614b\u89e3\u9664\u5f8c\uff0c\u5b83\u5c31\u80fd\u6cbf\u8457\u9019\u500b\u65b9\u5411\u7e7c\u7e8c\uff0c\u4e0d\u9700\u8981\u4f60\u518d\u91cd\u8aaa\u4e00\u6b21\u3002"
+            )
+            return f"{base}{action}".strip()
+        if language_hint == "simplified_chinese":
+            action = (
+                f" \u4f60\u5148\u5904\u7406\u5b8c {approval_count} \u4e2a\u5f85\u6279\u51c6\u9879\u76ee\u540e\uff0c\u5b83\u5c31\u80fd\u6cbf\u7740\u8fd9\u4e2a\u65b9\u5411\u7ee7\u7eed\uff0c\u4e0d\u9700\u8981\u4f60\u518d\u91cd\u8bf4\u4e00\u6b21\u3002"
+                if approval_count > 0
+                else " \u7b49\u5f53\u524d\u7684\u6279\u51c6\u72b6\u6001\u89e3\u9664\u540e\uff0c\u5b83\u5c31\u80fd\u6cbf\u7740\u8fd9\u4e2a\u65b9\u5411\u7ee7\u7eed\uff0c\u4e0d\u9700\u8981\u4f60\u518d\u91cd\u8bf4\u4e00\u6b21\u3002"
+            )
+            return f"{base}{action}".strip()
+        action = (
+            f" Resolve the pending approval{'s' if approval_count > 1 else ''} from the goal drawer or Goal Console, and it can continue without you restating it."
+            if approval_count > 0
+            else " Once the approval state clears, it can continue without you restating it."
+        )
+        return f"{base}{action}".strip()
+
     if kind == "blocked":
         base = _goal_follow_up_base_summary(
             user_message=user_message,
@@ -715,6 +773,13 @@ def build_goal_follow_up_message(
             "Use the Goal Console to inspect the current recovery state."
         )
 
+    if kind == "restarted_forwarded":
+        if language_hint in {"traditional_chinese", "chinese"}:
+            return "\u6211\u5df2\u7528\u76ee\u524d\u53ef\u6062\u5fa9\u7684\u4e0a\u4e0b\u6587\u91cd\u65b0\u958b\u4e00\u500b goal attempt\uff0c\u4e26\u628a\u4f60\u7684\u6307\u793a\u4e00\u8d77\u5e36\u9032\u53bb\u7e7c\u7e8c\u57f7\u884c\u3002"
+        if language_hint == "simplified_chinese":
+            return "\u6211\u5df2\u7ecf\u7528\u5f53\u524d\u53ef\u6062\u590d\u7684\u4e0a\u4e0b\u6587\u91cd\u65b0\u5f00\u542f\u4e00\u4e2a goal attempt\uff0c\u5e76\u628a\u4f60\u7684\u6307\u4ee4\u4e00\u8d77\u5e26\u8fdb\u53bb\u7ee7\u7eed\u6267\u884c\u3002"
+        return "Restarted the goal from the latest available recovery context and forwarded your guidance into the new attempt."
+
     if kind == "refreshed_forwarded":
         if language_hint in {"traditional_chinese", "chinese"}:
             return "\u6211\u5df2\u91cd\u65b0\u6574\u7406 active worker generation\uff0c\u4e26\u628a\u4f60\u7684\u6307\u793a\u8f49\u9001\u5230\u66f4\u65b0\u5f8c\u7684 goal attempt\u3002"
@@ -737,6 +802,113 @@ def build_goal_follow_up_message(
         return "Forwarded your guidance to the active goal. It will continue working with this updated direction."
 
     raise ValueError(f"Unsupported goal follow-up message kind: {kind}")
+
+
+def build_goal_follow_up_assistant_copy_fallback(
+    *,
+    user_message: str,
+    kind: GoalFollowUpAssistantCopyKind,
+    summary: str | None = None,
+    approval_count: int = 0,
+    tool_names: list[str] | None = None,
+    operator_control_hint: str | None = None,
+) -> str:
+    return build_goal_follow_up_message(
+        user_message=user_message,
+        kind=kind,
+        summary=summary,
+        approval_count=approval_count,
+        tool_names=tool_names,
+        operator_control_hint=operator_control_hint,
+    )
+
+
+async def generate_goal_follow_up_assistant_copy(
+    invoker: GoalProposalAssistantCopyInvoker,
+    *,
+    user_message: str,
+    kind: GoalFollowUpAssistantCopyKind,
+    goal_objective: str,
+    goal_status: str,
+    linked_run_status: str | None = None,
+    continuation_action: str | None = None,
+    continuation_summary: str | None = None,
+    approval_count: int = 0,
+    tool_names: list[str] | None = None,
+    operator_control_hint: str | None = None,
+    recommended_action: str | None = None,
+    latest_error: str | None = None,
+) -> GoalProposalAssistantCopyResult:
+    summary_lines = [
+        "Latest user message (use this language for the reply):",
+        user_message.strip() or goal_objective.strip() or "(empty)",
+        "",
+        "Goal follow-up outcome:",
+        f"- Outcome kind: {kind}",
+        f"- Goal objective: {goal_objective.strip() or '(empty)'}",
+        f"- Goal status: {goal_status.strip() or 'unknown'}",
+    ]
+    if linked_run_status and linked_run_status.strip():
+        summary_lines.append(f"- Linked run status: {linked_run_status.strip()}")
+    if continuation_action and continuation_action.strip():
+        summary_lines.append(f"- Continuation action: {continuation_action.strip()}")
+    if continuation_summary and continuation_summary.strip():
+        summary_lines.append(f"- Continuation summary: {continuation_summary.strip()}")
+    if latest_error and latest_error.strip():
+        summary_lines.append(f"- Latest error: {latest_error.strip()}")
+    if recommended_action and recommended_action.strip():
+        summary_lines.append(f"- Recommended next action: {recommended_action.strip()}")
+    if approval_count > 0:
+        summary_lines.append(f"- Pending approvals: {approval_count}")
+    if tool_names:
+        joined_tools = ", ".join(item.strip() for item in tool_names if item.strip())
+        if joined_tools:
+            summary_lines.append(f"- Related tools: {joined_tools}")
+    if operator_control_hint and operator_control_hint.strip():
+        summary_lines.append(f"- Operator controls: {operator_control_hint.strip()}")
+    summary_lines.append("")
+    summary_lines.append("Write the assistant reply now.")
+    message = "\n".join(summary_lines)
+
+    invocation = AgentInvocationRequest(
+        message=message,
+        session_id=f"goal-follow-up-copy:{uuid4()}",
+        inference_overrides={
+            "temperature": 0.2,
+            "max_tokens": 180,
+        },
+        tool_mode="disabled",
+        execution_profile="judge",
+        system_prompt_addendum=_GOAL_FOLLOW_UP_ASSISTANT_COPY_SYSTEM_PROMPT,
+        max_iterations_override=1,
+        persist_session=False,
+        persist_turn_events=False,
+        persist_learning=False,
+    )
+
+    try:
+        result = await invoker.invoke(invocation)
+        content = _normalize_explanation(str(getattr(result, "content", "") or ""))
+    except Exception:
+        content = ""
+
+    if content and _is_language_aligned(user_message, content):
+        return GoalProposalAssistantCopyResult(
+            explanation=content,
+            source="model",
+        )
+
+    return GoalProposalAssistantCopyResult(
+        explanation=build_goal_follow_up_assistant_copy_fallback(
+            user_message=user_message,
+            kind=kind,
+            summary=continuation_summary,
+            approval_count=approval_count,
+            tool_names=tool_names,
+            operator_control_hint=operator_control_hint,
+        ),
+        source="fallback",
+    )
 
 
 async def generate_goal_proposal_assistant_copy(
