@@ -50,7 +50,6 @@ import {
 } from '@/lib/chat-goal-routing'
 import {
   resolveGoalContinuationDecision,
-  type GoalContinuationDecision,
 } from '@/lib/chat-goal-continuation'
 import {
   layoutShowsEmptyState,
@@ -61,8 +60,6 @@ import { buildGoalFocusCallout } from '@/lib/goal-focus-surface'
 import {
   applyGoalProposalModelReadiness,
   buildGoalProposalProbeCandidates,
-  selectGoalProposalModels,
-  summarizeGoalProposalModelReadinessRisk,
   type GoalProposalModelReadinessById,
 } from '@/lib/goal-proposal-models'
 import {
@@ -84,6 +81,19 @@ import {
   projectGoalSurfaceExecutionEvents,
   projectWorkflowRunEventToSessionEvent,
 } from '@/lib/execution-transcript'
+import {
+  buildGoalProposalState as buildGoalProposalDraft,
+  buildGoalSummaryFromGoal as buildGoalSummarySnapshot,
+  buildSelectedModelsRolesPayload,
+  detectGoalModelHints,
+  mergeSelectedModelRoles,
+  normalizeGoalExecutionMode,
+  normalizeGoalExecutionTopology,
+  normalizeGoalInteractionMode,
+  normalizeSelectedModelRoles,
+  type GoalSessionProposalLike,
+  type GoalSessionSummaryLike,
+} from '@/lib/goal-strategy-selection'
 import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
@@ -205,36 +215,6 @@ function runPolicyPresetValues(preset: WorkflowRunPolicyPreset): Required<api.Ag
     max_subagent_failures_per_role: 2,
     on_budget_exhausted: 'pause',
     on_subagent_disconnect: 'retry_then_degrade',
-  }
-}
-
-function normalizeSelectedModelRoles(value: Record<string, string> | undefined): Record<string, string> {
-  const next: Record<string, string> = {}
-  for (const [role, modelId] of Object.entries(value ?? {})) {
-    const normalizedRole = role.trim()
-    const normalizedModelId = modelId.trim()
-    if (normalizedRole && normalizedModelId) {
-      next[normalizedRole] = normalizedModelId
-    }
-  }
-  return next
-}
-
-function mergeSelectedModelRoles(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
-  const next: Record<string, string> = {}
-  for (const source of sources) {
-    Object.assign(next, normalizeSelectedModelRoles(source))
-  }
-  return next
-}
-
-function buildSelectedModelsRolesPayload(byRole: Record<string, string>): Record<string, unknown> {
-  const normalized = normalizeSelectedModelRoles(byRole)
-  const entries = Object.entries(normalized).map(([role, model_id]) => ({ role, model_id }))
-  return {
-    by_role: normalized,
-    entries,
-    subagents: entries,
   }
 }
 
@@ -685,12 +665,15 @@ function workflowScheduleEnabled(workflow: api.SessionWorkflowState): boolean {
   )
 }
 
-interface GoalSessionSummary {
+interface GoalSessionSummary extends GoalSessionSummaryLike {
   goal_id: string | null
   objective: string
   execution_mode: api.GoalExecutionMode
   interaction_mode: api.GoalInteractionMode
   execution_topology: api.GoalExecutionTopology
+  strategy_id?: string | null
+  selection_source?: string | null
+  selection_reason?: string | null
   protocol_id: string | null
   bound_run_id: string | null
   protocol_selection: string | null
@@ -702,7 +685,7 @@ interface GoalSessionSummary {
   status: string | null
 }
 
-interface GoalSessionProposal extends GoalSessionSummary {
+interface GoalSessionProposal extends GoalSessionProposalLike {
   proposal_id: string
   revision_index: number
   updated_at: string
@@ -716,6 +699,9 @@ interface GoalSessionState {
   execution_mode: api.GoalExecutionMode | null
   interaction_mode: api.GoalInteractionMode | null
   execution_topology: api.GoalExecutionTopology | null
+  strategy_id?: string | null
+  selection_source?: string | null
+  selection_reason?: string | null
   bound_run_id: string | null
   protocol_selection: string | null
   selection_rationale: string | null
@@ -797,18 +783,6 @@ interface ActiveGoalDirectTurnDecisionInput {
   systemPromptOverride?: string | null
 }
 
-function normalizeGoalExecutionMode(value: unknown): api.GoalExecutionMode | null {
-  return value === 'single_agent' || value === 'workflow' ? value : null
-}
-
-function normalizeGoalInteractionMode(value: unknown): api.GoalInteractionMode | null {
-  return value === 'goal' || value === 'workflow' ? value : null
-}
-
-function normalizeGoalExecutionTopology(value: unknown): api.GoalExecutionTopology | null {
-  return value === 'single_agent' || value === 'multi_agent' ? value : null
-}
-
 function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null {
   if (!isRecord(value)) {
     return null
@@ -826,10 +800,23 @@ function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null 
     execution_mode: executionMode,
     interaction_mode: normalizeGoalInteractionMode(value.interaction_mode) ?? 'goal',
     execution_topology: normalizeGoalExecutionTopology(value.execution_topology) ?? 'single_agent',
+    strategy_id: getString(value.strategy_id) ?? null,
+    selection_source: getString(value.selection_source) ?? null,
+    selection_reason:
+      getString(value.selection_reason) ??
+      getString(value.selection_rationale) ??
+      null,
     protocol_id: getString(value.protocol_id) ?? null,
     bound_run_id: getString(value.bound_run_id) ?? null,
-    protocol_selection: getString(value.protocol_selection) ?? getString(value.protocol_id) ?? null,
-    selection_rationale: getString(value.selection_rationale) ?? null,
+    protocol_selection:
+      getString(value.protocol_selection) ??
+      getString(value.strategy_id) ??
+      getString(value.protocol_id) ??
+      null,
+    selection_rationale:
+      getString(value.selection_rationale) ??
+      getString(value.selection_reason) ??
+      null,
     models: getStringArray(value.models),
     role_summary: getString(value.role_summary) ?? null,
     runtime_mode: getString(value.runtime_mode) ?? null,
@@ -869,6 +856,9 @@ function normalizeGoalSessionState(value: api.SessionGoalState | null | undefine
       execution_mode: null,
       interaction_mode: null,
       execution_topology: null,
+      strategy_id: null,
+      selection_source: null,
+      selection_reason: null,
       bound_run_id: null,
       protocol_selection: null,
       selection_rationale: null,
@@ -896,6 +886,21 @@ function normalizeGoalSessionState(value: api.SessionGoalState | null | undefine
       normalizeGoalSessionProposal(value.pending_proposal)?.execution_topology ??
       normalizeGoalSessionSummary(value.last_goal_summary)?.execution_topology ??
       null,
+    strategy_id:
+      getString(value.strategy_id) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.strategy_id ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.strategy_id ??
+      null,
+    selection_source:
+      getString(value.selection_source) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.selection_source ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.selection_source ??
+      null,
+    selection_reason:
+      getString(value.selection_reason) ??
+      normalizeGoalSessionProposal(value.pending_proposal)?.selection_reason ??
+      normalizeGoalSessionSummary(value.last_goal_summary)?.selection_reason ??
+      null,
     bound_run_id:
       getString(value.bound_run_id) ??
       normalizeGoalSessionProposal(value.pending_proposal)?.bound_run_id ??
@@ -903,11 +908,13 @@ function normalizeGoalSessionState(value: api.SessionGoalState | null | undefine
       null,
     protocol_selection:
       getString(value.protocol_selection) ??
+      getString(value.strategy_id) ??
       normalizeGoalSessionProposal(value.pending_proposal)?.protocol_selection ??
       normalizeGoalSessionSummary(value.last_goal_summary)?.protocol_selection ??
       null,
     selection_rationale:
       getString(value.selection_rationale) ??
+      getString(value.selection_reason) ??
       normalizeGoalSessionProposal(value.pending_proposal)?.selection_rationale ??
       normalizeGoalSessionSummary(value.last_goal_summary)?.selection_rationale ??
       null,
@@ -1021,150 +1028,6 @@ function isLegacySubagentMessageDeliveryError(error: unknown): boolean {
 
 function uniqueStrings(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.map((value) => (typeof value === 'string' ? value.trim() : '')).filter((value) => value.length > 0))]
-}
-
-function formatGoalRoleSummary(roles: string[]): string | null {
-  if (roles.length === 0) {
-    return null
-  }
-  return roles.map((role) => role.replaceAll('_', ' ')).join(', ')
-}
-
-function detectGoalExecutionModeHint(value: string): api.GoalExecutionMode | null {
-  const normalized = value.toLowerCase()
-  if (
-    normalized.includes('single agent') ||
-    normalized.includes('single-agent') ||
-    normalized.includes('solo agent') ||
-    normalized.includes('one agent')
-  ) {
-    return 'single_agent'
-  }
-  if (
-    normalized.includes('workflow') ||
-    normalized.includes('multi agent') ||
-    normalized.includes('multi-agent') ||
-    normalized.includes('orchestrate') ||
-    normalized.includes('orchestrated')
-  ) {
-    return 'workflow'
-  }
-  return null
-}
-
-function detectGoalProtocolHint(value: string): api.AgentRunProtocolId | null {
-  const normalized = value.toLowerCase()
-  if (normalized.includes('debate')) {
-    return 'multi_agent_debate'
-  }
-  if (normalized.includes('self evolve') || normalized.includes('self-evolve') || normalized.includes('dr zero')) {
-    return 'dr_zero_self_evolve'
-  }
-  if (normalized.includes('controlled')) {
-    return 'controlled_subagent_execution'
-  }
-  if (normalized.includes('distill') || normalized.includes('teacher') || normalized.includes('student')) {
-    return 'teacher_student_distill'
-  }
-  return null
-}
-
-function suggestGoalWorkflowStrategy(value: string): {
-  protocolId: api.AgentRunProtocolId
-  roles: string[]
-} {
-  const normalized = value.toLowerCase()
-  if (/\b(compare|comparison|evaluate|evaluation|debate|judge)\b/.test(normalized)) {
-    return {
-      protocolId: 'multi_agent_debate',
-      roles: ['debater_a', 'debater_b', 'judge'],
-    }
-  }
-  if (/\b(distill|distillation|compress|compression|teacher|student|summarize)\b/.test(normalized)) {
-    return {
-      protocolId: 'teacher_student_distill',
-      roles: ['teacher', 'student', 'evaluator'],
-    }
-  }
-  if (/\b(controlled|controller|approval|approve commands|executor)\b/.test(normalized)) {
-    return {
-      protocolId: 'controlled_subagent_execution',
-      roles: ['planner', 'executor', 'controller', 'evaluator'],
-    }
-  }
-  return {
-    protocolId: 'autonomous_single_agent',
-    roles: ['agent'],
-  }
-}
-
-function detectGoalRuntimeHint(value: string): string | null {
-  const normalized = value.trim()
-  const durationMatch = normalized.match(/\b\d+\s*(?:min(?:ute)?s?|hour(?:s)?|hr|hrs)\b/i)
-  if (durationMatch) {
-    return `Requested duration: ${durationMatch[0]}`
-  }
-  if (/schedule|cron|interval/i.test(normalized)) {
-    return 'Scheduled goal execution requested'
-  }
-  return null
-}
-
-function goalProtocolExecutionTopology(
-  protocolId: api.AgentRunProtocolId | null
-): api.GoalExecutionTopology {
-  return protocolId === 'autonomous_single_agent' ? 'single_agent' : 'multi_agent'
-}
-
-function describeGoalProtocolSelection(
-  protocolId: api.AgentRunProtocolId,
-  interactionMode: api.GoalInteractionMode
-): string {
-  if (protocolId === 'autonomous_single_agent') {
-    return 'Routed to autonomous_single_agent for direct long-running execution.'
-  }
-  if (protocolId === 'teacher_student_distill') {
-    return 'Routed to teacher_student_distill for summarization and distillation work.'
-  }
-  if (protocolId === 'multi_agent_debate') {
-    return 'Routed to multi_agent_debate for comparison or evaluation work.'
-  }
-  if (protocolId === 'controlled_subagent_execution') {
-    return 'Routed to controlled_subagent_execution for operator-gated execution steps.'
-  }
-  if (protocolId === 'dr_zero_self_evolve') {
-    return 'Routed to dr_zero_self_evolve for iterative self-evolving problem solving.'
-  }
-  return interactionMode === 'goal'
-    ? 'Routed into the goal lane with workflow-capable execution.'
-    : 'Routed into the workflow lane for orchestrated execution.'
-}
-
-function detectGoalModelHints(
-  value: string,
-  candidates: ChatInputModelOption[],
-  currentModel: string | null
-): string[] {
-  const normalized = value.toLowerCase()
-  const matches: string[] = []
-
-  const currentModelTrimmed = currentModel?.trim() ?? ''
-  if (currentModelTrimmed && normalized.includes(currentModelTrimmed.toLowerCase())) {
-    matches.push(currentModelTrimmed)
-  }
-
-  for (const candidate of candidates) {
-    const id = candidate.id.trim()
-    const label = candidate.label.trim().toLowerCase()
-    if (!id) {
-      continue
-    }
-    if (normalized.includes(id.toLowerCase()) || (label && normalized.includes(label))) {
-      matches.push(id)
-    }
-  }
-
-  return uniqueStrings(matches)
 }
 
 function goalCardFromSummary(
@@ -1868,6 +1731,8 @@ export default function ChatPage() {
     Record<string, api.SessionWorkflowState>
   >({})
   const [workflowCardRun, setWorkflowCardRun] = React.useState<api.AgentRunDetail | null>(null)
+  const [goalStrategyRegistry, setGoalStrategyRegistry] =
+    React.useState<api.GoalStrategyRegistryResponse | null>(null)
   const [editState, setEditState] = React.useState<ComposerEditState | null>(null)
   const [voiceOpen, setVoiceOpen] = React.useState(false)
   const [voicePhase, setVoicePhase] = React.useState<VoiceRuntimePhase>('idle')
@@ -2117,6 +1982,25 @@ export default function ChatPage() {
       second: '2-digit',
     })
   }, [workflowLastSavedAt])
+  React.useEffect(() => {
+    let cancelled = false
+
+    api.fetchGoalStrategies()
+      .then((registry) => {
+        if (!cancelled) {
+          setGoalStrategyRegistry(registry)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setGoalStrategyRegistry(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
   const sessionSecurityOverride = React.useMemo(
     () => currentSessionDetail?.security_override ?? currentSession?.securityOverride ?? null,
     [currentSession?.securityOverride, currentSessionDetail?.security_override]
@@ -2682,6 +2566,9 @@ export default function ChatPage() {
         execution_mode: nextGoalState.execution_mode,
         interaction_mode: nextGoalState.interaction_mode,
         execution_topology: nextGoalState.execution_topology,
+        strategy_id: nextGoalState.strategy_id ?? null,
+        selection_source: nextGoalState.selection_source ?? null,
+        selection_reason: nextGoalState.selection_reason ?? null,
         bound_run_id: nextGoalState.bound_run_id,
         protocol_selection: nextGoalState.protocol_selection,
         selection_rationale: nextGoalState.selection_rationale,
@@ -3519,119 +3406,27 @@ export default function ChatPage() {
         modelCandidates?: ChatInputModelOption[]
         currentModelId?: string | null
       }
-    ): GoalSessionProposal => {
-      const revisionText = options?.revisionText?.trim() ?? ''
-      const heuristicSource = revisionText || objective
-      const availableModelOptions = options?.modelCandidates ?? modelOptions
-      const selectedCurrentModel = options?.currentModelId ?? currentModel
-      const interactionMode: api.GoalInteractionMode =
-        executionMode === 'workflow' ? 'workflow' : 'goal'
-      const suggestedWorkflowStrategy = suggestGoalWorkflowStrategy(heuristicSource)
-      const selectedRoles = normalizeSelectedModelRoles(workflowConfig.selected_models_roles)
-      const selectedRoleNames = Object.keys(selectedRoles)
-      const fallbackWorkflowRoles =
-        workflowTemplate === 'research_debate'
-          ? ['planner', 'debater_a', 'debater_b', 'judge']
-          : workflowProtocolId === 'controlled_subagent_execution'
-            ? ['planner', 'executor', 'controller', 'evaluator']
-            : workflowProtocolId === 'multi_agent_debate'
-              ? ['debater_a', 'debater_b', 'judge']
-              : workflowProtocolId === 'dr_zero_self_evolve'
-                ? ['proposer', 'solver', 'verifier']
-                : suggestedWorkflowStrategy.roles
-      const workflowModels = uniqueStrings([
-        ...Object.values(selectedRoles),
-        selectedCurrentModel,
-        availableModelOptions[0]?.id ?? null,
-      ])
-      const explicitModelHints = detectGoalModelHints(
-        heuristicSource,
-        availableModelOptions,
-        selectedCurrentModel
-      )
-      const protocolHint = executionMode === 'workflow' ? detectGoalProtocolHint(heuristicSource) : null
-      const protocolId: api.AgentRunProtocolId | null =
-        executionMode === 'workflow'
-          ? protocolHint ??
-            (workflowTemplate === 'research_debate'
-              ? 'multi_agent_debate'
-              : workflowProtocolId === DEFAULT_WORKFLOW_PROTOCOL
-                ? suggestedWorkflowStrategy.protocolId
-                : workflowProtocolId)
-          : null
-      const executionTopology: api.GoalExecutionTopology =
-        protocolId ? goalProtocolExecutionTopology(protocolId) : 'single_agent'
-      const primaryModels =
-        executionTopology === 'multi_agent'
-          ? uniqueStrings([
-              ...selectGoalProposalModels(
-                availableModelOptions,
-                selectedCurrentModel,
-                executionMode,
-                explicitModelHints
-              ),
-              ...workflowModels,
-            ]).slice(0, 3)
-          : selectGoalProposalModels(
-              availableModelOptions,
-              selectedCurrentModel,
-              executionMode,
-              explicitModelHints
-            )
-      const runtimeHint = detectGoalRuntimeHint(heuristicSource)
-      const roleSummary =
-        executionTopology === 'multi_agent'
-          ? formatGoalRoleSummary(selectedRoleNames.length > 0 ? selectedRoleNames : fallbackWorkflowRoles)
-          : 'Primary agent continues the task directly with the current chat tools.'
-      const runtimeMode =
-        runtimeHint ??
-        (executionTopology === 'single_agent'
-          ? 'Single-agent long-running execution'
-          : interactionMode === 'workflow'
-          ? workflowScheduleEnabled(workflowState)
-            ? `Scheduled ${workflowScheduleType} workflow`
-            : 'Workflow run starts immediately'
-          : 'Goal-backed orchestrated execution')
-      const modelReadinessRisk = summarizeGoalProposalModelReadinessRisk(
-        availableModelOptions,
-        primaryModels
-      )
-      const autonomyRisk =
-        effectiveAutonomyMode === 'strict'
-          ? 'Runtime actions may pause for approval before execution.'
-          : effectiveAutonomyMode === 'trusted_workspace'
-            ? 'Riskier runtime actions may still require approval.'
-            : null
-      const riskNote = [modelReadinessRisk, autonomyRisk].filter(Boolean).join(' ') || null
-
-      return {
-        goal_id: null,
-        proposal_id: options?.previous?.proposal_id ?? `goal-proposal-${Date.now()}`,
-        objective: objective.trim(),
-        execution_mode: executionMode,
-        interaction_mode: interactionMode,
-        execution_topology: executionTopology,
-        protocol_id: protocolId,
-        bound_run_id: null,
-        protocol_selection: protocolId,
-        selection_rationale:
-          protocolId && interactionMode === 'workflow'
-            ? describeGoalProtocolSelection(protocolId, interactionMode)
-            : null,
-        models: primaryModels,
-        role_summary: roleSummary,
-        runtime_mode: runtimeMode,
-        risk_note: riskNote,
-        status: null,
-        revision_index: (options?.previous?.revision_index ?? -1) + 1,
-        updated_at: new Date().toISOString(),
-        assistant_explanation: options?.previous?.assistant_explanation ?? null,
-        assistant_explanation_source: options?.previous?.assistant_explanation_source ?? null,
-      }
-    },
+    ): GoalSessionProposal =>
+      buildGoalProposalDraft({
+        objective,
+        executionMode,
+        previous: options?.previous ?? null,
+        revisionText: options?.revisionText ?? null,
+        modelCandidates: options?.modelCandidates ?? modelOptions,
+        currentModelId: options?.currentModelId ?? currentModel,
+        workflowSelectedModelRoles: workflowConfig.selected_models_roles,
+        workflowTemplate,
+        workflowProtocolId,
+        workflowScheduleEnabled: workflowScheduleEnabled(workflowState),
+        workflowScheduleType,
+        effectiveAutonomyMode,
+        goalStrategyRegistry,
+        defaultWorkflowProtocol: DEFAULT_WORKFLOW_PROTOCOL,
+      }),
     [
       currentModel,
       effectiveAutonomyMode,
+      goalStrategyRegistry,
       modelOptions,
       workflowConfig.selected_models_roles,
       workflowProtocolId,
@@ -3642,22 +3437,8 @@ export default function ChatPage() {
   )
 
   const buildGoalSummaryFromGoal = React.useCallback(
-    (goal: api.GoalSummary, fallback?: GoalSessionSummary | GoalSessionProposal | null): GoalSessionSummary => ({
-      goal_id: goal.goal_id ? goal.goal_id : (fallback?.goal_id ?? null),
-      objective: goal.objective ? goal.objective : (fallback?.objective ?? ''),
-      execution_mode: goal.execution_mode,
-      interaction_mode: goal.interaction_mode,
-      execution_topology: goal.execution_topology,
-      protocol_id: goal.protocol_id ?? fallback?.protocol_id ?? null,
-      bound_run_id: goal.bound_run_id ?? fallback?.bound_run_id ?? null,
-      protocol_selection: goal.protocol_selection ?? fallback?.protocol_selection ?? goal.protocol_id ?? null,
-      selection_rationale: goal.selection_rationale ?? fallback?.selection_rationale ?? null,
-      models: fallback?.models ?? [],
-      role_summary: fallback?.role_summary ?? null,
-      runtime_mode: fallback?.runtime_mode ?? null,
-      risk_note: fallback?.risk_note ?? null,
-      status: goal.status,
-    }),
+    (goal: api.GoalSummary, fallback?: GoalSessionSummary | GoalSessionProposal | null): GoalSessionSummary =>
+      buildGoalSummarySnapshot(goal, fallback),
     []
   )
 
