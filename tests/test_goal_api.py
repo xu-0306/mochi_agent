@@ -43,11 +43,16 @@ def _create_goal_test_client(tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
-def _create_goal_test_app(tmp_path: Path) -> tuple[Any, RuntimeService]:
+def _create_goal_test_app(
+    tmp_path: Path,
+    *,
+    active_goal_turn_selector: Any | None = None,
+) -> tuple[Any, RuntimeService]:
     app = create_app()
     runtime_service = RuntimeService(
         engine=object(),
         store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+        active_goal_turn_selector=active_goal_turn_selector,
     )
     runtime_service.set_scheduler_poll_interval(0.05)
     app.state.runtime_service = runtime_service
@@ -972,6 +977,254 @@ def test_goal_turn_decision_route_classifies_lifecycle_command(
     assert payload["kind"] == "lifecycle"
     assert payload["selection_source"] == "bounded_fallback"
     assert payload["requires_confirmation"] is False
+
+
+def test_goal_turn_decision_route_semantic_selector_can_override_non_keyword_steering(
+    tmp_path: Path,
+) -> None:
+    def semantic_selector(context: Any) -> dict[str, Any]:
+        assert context.fallback_decision.kind == "clarify"
+        return {
+            "kind": "steer",
+            "confidence": 0.97,
+            "selection_source": "semantic_registry_selector",
+            "selection_reason": "Semantic selector recognized a non-English directive to steer the goal.",
+            "requires_confirmation": False,
+            "goal_status": context.fallback_decision.goal_status,
+            "linked_run_status": context.fallback_decision.linked_run_status,
+            "recommended_action": context.fallback_decision.recommended_action,
+        }
+
+    app, _runtime_service = _create_goal_test_app(
+        tmp_path,
+        active_goal_turn_selector=semantic_selector,
+    )
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Accept semantic steering when the bounded fallback is ambiguous."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "다음에는 벤치마크 비교에 집중해 줘"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "steer"
+    assert payload["selection_source"] == "semantic_registry_selector"
+    assert payload["requires_confirmation"] is False
+
+
+def test_goal_turn_decision_route_falls_back_when_semantic_selector_returns_malformed_result(
+    tmp_path: Path,
+) -> None:
+    def semantic_selector(_context: Any) -> dict[str, Any]:
+        return {
+            "kind": "steer",
+            "selection_source": "semantic_registry_selector",
+        }
+
+    app, _runtime_service = _create_goal_test_app(
+        tmp_path,
+        active_goal_turn_selector=semantic_selector,
+    )
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Stay conservative when semantic selector output is malformed."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "다음에는 벤치마크 비교에 집중해 줘"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "clarify"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is True
+
+
+def test_goal_turn_decision_route_low_confidence_semantic_mutation_does_not_override_explanatory_fallback(
+    tmp_path: Path,
+) -> None:
+    def semantic_selector(context: Any) -> dict[str, Any]:
+        assert context.fallback_decision.kind == "explain_goal_state"
+        return {
+            "kind": "steer",
+            "confidence": 0.89,
+            "selection_source": "semantic_registry_selector",
+            "selection_reason": "Selector weakly inferred a steering intent.",
+            "requires_confirmation": False,
+            "goal_status": context.fallback_decision.goal_status,
+            "linked_run_status": context.fallback_decision.linked_run_status,
+            "recommended_action": context.fallback_decision.recommended_action,
+        }
+
+    app, runtime_service = _create_goal_test_app(
+        tmp_path,
+        active_goal_turn_selector=semantic_selector,
+    )
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id="goal-turn-decision-semantic-blocked-1",
+            objective="Explain why the goal is blocked.",
+            summary={"phase": "operator_review"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id="goal-turn-decision-semantic-blocked-attempt-1",
+            goal_id="goal-turn-decision-semantic-blocked-1",
+            attempt_index=1,
+            status="waiting_approval",
+            trigger="manual_start",
+            summary={
+                "linked_approval_state": {
+                    "status": "waiting_approval",
+                    "pending_count": 1,
+                    "approval_ids": ["exec-approval-turn-decision-semantic-1"],
+                    "tool_names": ["exec_command"],
+                }
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            "goal-turn-decision-semantic-blocked-1",
+            "waiting_approval",
+            current_attempt_id="goal-turn-decision-semantic-blocked-attempt-1",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/goal-turn-decision-semantic-blocked-1/turn-decision",
+            json={"message": "why is this blocked?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "explain_goal_state"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
+
+
+def test_goal_turn_decision_route_low_confidence_semantic_mutation_does_not_override_clarify_fallback(
+    tmp_path: Path,
+) -> None:
+    def semantic_selector(context: Any) -> dict[str, Any]:
+        assert context.fallback_decision.kind == "clarify"
+        return {
+            "kind": "steer",
+            "confidence": 0.94,
+            "selection_source": "semantic_registry_selector",
+            "selection_reason": "Selector inferred steering intent, but not confidently enough.",
+            "requires_confirmation": False,
+            "goal_status": context.fallback_decision.goal_status,
+            "linked_run_status": context.fallback_decision.linked_run_status,
+            "recommended_action": context.fallback_decision.recommended_action,
+        }
+
+    app, _runtime_service = _create_goal_test_app(
+        tmp_path,
+        active_goal_turn_selector=semantic_selector,
+    )
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Stay conservative about ambiguous continue instructions."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "keep going"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "clarify"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is True
+
+
+def test_goal_turn_decision_route_confirming_semantic_mutation_does_not_override_clarify_fallback(
+    tmp_path: Path,
+) -> None:
+    def semantic_selector(context: Any) -> dict[str, Any]:
+        assert context.fallback_decision.kind == "clarify"
+        return {
+            "kind": "steer",
+            "confidence": 0.99,
+            "selection_source": "semantic_registry_selector",
+            "selection_reason": "Selector inferred steering intent but still needs confirmation.",
+            "requires_confirmation": True,
+            "goal_status": context.fallback_decision.goal_status,
+            "linked_run_status": context.fallback_decision.linked_run_status,
+            "recommended_action": context.fallback_decision.recommended_action,
+        }
+
+    app, _runtime_service = _create_goal_test_app(
+        tmp_path,
+        active_goal_turn_selector=semantic_selector,
+    )
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Stay conservative about confirming semantic steering."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "keep going"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "clarify"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is True
+
+
+def test_goal_turn_decision_route_selector_exception_falls_back_without_server_error(
+    tmp_path: Path,
+) -> None:
+    def semantic_selector(_context: Any) -> dict[str, Any]:
+        raise RuntimeError("selector failure")
+
+    app, _runtime_service = _create_goal_test_app(
+        tmp_path,
+        active_goal_turn_selector=semantic_selector,
+    )
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Fall back when the semantic selector fails."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "다음에는 벤치마크 비교에 집중해 줘"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "clarify"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is True
 
 
 def _build_goal_linked_exec_approval_orchestrator(

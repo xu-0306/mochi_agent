@@ -133,7 +133,7 @@ ActiveGoalTurnKind = Literal[
     "exit_to_chat",
     "clarify",
 ]
-ActiveGoalTurnSelectionSource = Literal["bounded_fallback"]
+ActiveGoalTurnSelectionSource = Literal["bounded_fallback", "semantic_registry_selector"]
 
 
 class ActiveGoalTurnDecisionRequest(BaseModel):

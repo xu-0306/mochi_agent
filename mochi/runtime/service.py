@@ -8,12 +8,15 @@ import json
 import re
 import sqlite3
 import unicodedata
+from dataclasses import dataclass
 from hashlib import sha1
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 from urllib.parse import urlparse
 from uuid import uuid4
+
+from pydantic import ValidationError
 
 from mochi.agents.multi_agent.execution_policy import (
     execution_policy_to_dict,
@@ -172,6 +175,33 @@ _GOAL_CHECKPOINT_PROMOTABLE_ARTIFACT_TYPES = {
     "verification_chunk_summary",
     "verification_summary",
 }
+_ACTIVE_GOAL_TURN_MUTATING_KINDS = {"steer", "replan", "lifecycle"}
+_ACTIVE_GOAL_TURN_EXPLANATORY_KINDS = {"answer_question", "explain_goal_state"}
+_ACTIVE_GOAL_TURN_LIFECYCLE_CORRECTION_KINDS = {
+    "answer_question",
+    "explain_goal_state",
+    "exit_to_chat",
+}
+_ACTIVE_GOAL_TURN_SEMANTIC_MIN_CONFIDENCE = 0.7
+_ACTIVE_GOAL_TURN_SEMANTIC_MUTATING_MIN_CONFIDENCE = 0.9
+_ACTIVE_GOAL_TURN_SEMANTIC_CLARIFY_TO_MUTATING_MIN_CONFIDENCE = 0.95
+_ACTIVE_GOAL_TURN_SEMANTIC_LIFECYCLE_CORRECTION_MIN_CONFIDENCE = 0.95
+
+
+@dataclass(frozen=True)
+class ActiveGoalTurnSelectorContext:
+    message: str
+    goal: Mapping[str, Any]
+    health: Mapping[str, Any]
+    fallback_payload: Mapping[str, Any]
+    fallback_decision: ActiveGoalTurnDecision
+
+
+ActiveGoalTurnSelectorResult = ActiveGoalTurnDecision | Mapping[str, Any] | None
+ActiveGoalTurnSelector = Callable[
+    [ActiveGoalTurnSelectorContext],
+    ActiveGoalTurnSelectorResult | Awaitable[ActiveGoalTurnSelectorResult],
+]
 
 
 def _goal_selection_from_create_payload(payload: GoalCreateRequest) -> GoalStrategySelectionResult:
@@ -453,11 +483,13 @@ class RuntimeService:
         store: RuntimeStore,
         exec_approval_store: ApprovalStore | None = None,
         exec_runtime: ExecRuntime | None = None,
+        active_goal_turn_selector: ActiveGoalTurnSelector | None = None,
     ) -> None:
         self._engine = engine
         self._store = store
         self._exec_approval_store = exec_approval_store or get_shared_exec_approval_store()
         self._exec_runtime = exec_runtime or get_shared_exec_runtime()
+        self._active_goal_turn_selector = active_goal_turn_selector
         self._runtime_tasks_root = Path("sessions") / "runtime-tasks"
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._active_agent_run_jobs: dict[str, asyncio.Task[None]] = {}
@@ -996,12 +1028,40 @@ class RuntimeService:
         if goal is None:
             return None
         health = await self.get_goal_health(goal_id)
-        decision_payload = _classify_active_goal_turn_decision(
+        fallback_payload = _classify_active_goal_turn_decision(
             payload.message,
             goal=goal,
             health=health or {},
         )
-        return ActiveGoalTurnDecision.model_validate(decision_payload)
+        fallback_decision = ActiveGoalTurnDecision.model_validate(fallback_payload)
+        selector = self._active_goal_turn_selector
+        if selector is None:
+            return fallback_decision
+
+        try:
+            selector_result = selector(
+                ActiveGoalTurnSelectorContext(
+                    message=payload.message,
+                    goal=goal,
+                    health=health or {},
+                    fallback_payload=fallback_payload,
+                    fallback_decision=fallback_decision,
+                )
+            )
+            if inspect.isawaitable(selector_result):
+                selector_result = await selector_result
+        except Exception:
+            return fallback_decision
+
+        semantic_decision = _coerce_active_goal_turn_selector_result(selector_result)
+        if semantic_decision is None:
+            return fallback_decision
+        if not _accept_semantic_active_goal_turn_decision(
+            fallback_decision=fallback_decision,
+            semantic_decision=semantic_decision,
+        ):
+            return fallback_decision
+        return semantic_decision
 
     async def list_goal_audit_findings(
         self,
@@ -10075,6 +10135,76 @@ def _active_goal_turn_decision_payload(
         "linked_run_status": linked_run_status,
         "recommended_action": recommended_action,
     }
+
+
+def _coerce_active_goal_turn_selector_result(
+    selector_result: ActiveGoalTurnSelectorResult,
+) -> ActiveGoalTurnDecision | None:
+    if selector_result is None:
+        return None
+    try:
+        if isinstance(selector_result, ActiveGoalTurnDecision):
+            decision = selector_result
+        elif isinstance(selector_result, Mapping):
+            payload = dict(selector_result)
+            payload.setdefault("lane", "active_goal_turn")
+            payload.setdefault("selection_source", "semantic_registry_selector")
+            decision = ActiveGoalTurnDecision.model_validate(payload)
+        else:
+            return None
+    except ValidationError:
+        return None
+    return decision if decision.selection_source == "semantic_registry_selector" else None
+
+
+def _accept_semantic_active_goal_turn_decision(
+    *,
+    fallback_decision: ActiveGoalTurnDecision,
+    semantic_decision: ActiveGoalTurnDecision,
+) -> bool:
+    if semantic_decision.lane != "active_goal_turn":
+        return False
+    if semantic_decision.selection_source != "semantic_registry_selector":
+        return False
+    if semantic_decision.confidence < _ACTIVE_GOAL_TURN_SEMANTIC_MIN_CONFIDENCE:
+        return False
+
+    fallback_kind = fallback_decision.kind
+    semantic_kind = semantic_decision.kind
+    semantic_mutating = semantic_kind in _ACTIVE_GOAL_TURN_MUTATING_KINDS
+    fallback_mutating = fallback_kind in _ACTIVE_GOAL_TURN_MUTATING_KINDS
+
+    if semantic_mutating and (
+        semantic_decision.confidence < _ACTIVE_GOAL_TURN_SEMANTIC_MUTATING_MIN_CONFIDENCE
+        or semantic_decision.requires_confirmation
+    ):
+        return False
+
+    if fallback_kind == "lifecycle":
+        if semantic_kind == "lifecycle":
+            return True
+        return (
+            semantic_kind in _ACTIVE_GOAL_TURN_LIFECYCLE_CORRECTION_KINDS
+            and semantic_decision.confidence >= _ACTIVE_GOAL_TURN_SEMANTIC_LIFECYCLE_CORRECTION_MIN_CONFIDENCE
+            and not semantic_decision.requires_confirmation
+        )
+
+    if fallback_kind in _ACTIVE_GOAL_TURN_EXPLANATORY_KINDS and semantic_mutating:
+        return False
+
+    if fallback_kind == "clarify" and semantic_mutating:
+        return (
+            semantic_decision.confidence >= _ACTIVE_GOAL_TURN_SEMANTIC_CLARIFY_TO_MUTATING_MIN_CONFIDENCE
+            and not semantic_decision.requires_confirmation
+        )
+
+    if fallback_mutating:
+        return semantic_kind == fallback_kind
+
+    if fallback_kind == "exit_to_chat":
+        return semantic_kind == "exit_to_chat"
+
+    return True
 
 
 def _normalize_active_goal_turn_message(message: str) -> str:
