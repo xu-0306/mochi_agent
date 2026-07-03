@@ -24,6 +24,7 @@
     "test:chat-active-goal-turn-decision": "node --experimental-strip-types ./scripts/test-chat-active-goal-turn-decision.mjs",
     "test:execution-transcript-chat-projection": "node --experimental-strip-types ./scripts/test-execution-transcript-chat-projection.mjs",
     "test:goal-execution-timeline-projection": "node --experimental-strip-types ./scripts/test-goal-execution-timeline-projection.mjs",
+    "test:goal-live-browser-evidence": "node ./scripts/test-goal-live-browser-evidence.mjs",
     "test:chat-send-contract": "node --experimental-strip-types ./scripts/test-chat-send-contract.mjs",
     "test:current-model-selection": "node --experimental-strip-types ./scripts/test-current-model-selection.mjs",
     "test:goal-proposal-models": "node --experimental-strip-types ./scripts/test-goal-proposal-models.mjs",
