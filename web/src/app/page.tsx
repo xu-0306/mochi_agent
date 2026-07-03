@@ -78,9 +78,9 @@ import { resolvePreferredCurrentModelId } from '@/lib/current-model-selection'
 import {
   mapAgentRunEventToTranscriptEvent,
   mergeSubagentSummaries,
-  projectGoalSurfaceExecutionEvents,
   projectWorkflowRunEventToSessionEvent,
 } from '@/lib/execution-transcript'
+import { buildGoalExecutionProjectionView } from '@/lib/goal-execution-projection-store'
 import {
   buildGoalProposalState as buildGoalProposalDraft,
   buildGoalSummaryFromGoal as buildGoalSummarySnapshot,
@@ -550,54 +550,6 @@ function mergeTranscriptEvents(
     const rightTime = Date.parse(right.createdAt ?? '') || 0
     return leftTime - rightTime
   })
-}
-
-function transcriptEventsForSubagent(
-  events: api.ExecutionTranscriptEvent[],
-  subagent: api.SubagentTranscriptSummary
-): api.ExecutionTranscriptEvent[] {
-  return events.filter((event) => {
-    if (event.subagentId && event.subagentId === subagent.subagentId) {
-      return true
-    }
-    if (event.roleId && subagent.roleId && event.roleId === subagent.roleId) {
-      return true
-    }
-    return false
-  })
-}
-
-function isGoalSurfaceSubagentVisible(
-  subagent: api.SubagentTranscriptSummary,
-  recentEvents: api.ExecutionTranscriptEvent[]
-): boolean {
-  const status = subagent.status.trim().toLowerCase()
-  const hasIdentity = Boolean((subagent.title ?? '').trim() || (subagent.roleId ?? '').trim())
-  const hasSummary = Boolean(
-    (subagent.summary ?? '').trim() ||
-    (subagent.promptPreview ?? '').trim() ||
-    (subagent.outputPreview ?? '').trim()
-  )
-
-  if (recentEvents.length > 0) {
-    return true
-  }
-  if (!hasIdentity) {
-    return false
-  }
-  if (
-    status === 'blocked' ||
-    status === 'awaiting_approval' ||
-    status === 'failed' ||
-    status === 'cancelled' ||
-    status === 'interrupted'
-  ) {
-    return true
-  }
-  if (status === 'completed' || status === 'running') {
-    return hasSummary
-  }
-  return hasSummary
 }
 
 function buildDefaultWorkflowState(
@@ -1896,41 +1848,22 @@ export default function ChatPage() {
     () => (workflowConfig.run_policy ?? {}) as api.AgentRunRunPolicy,
     [workflowConfig.run_policy]
   )
-  const allVisibleSubagents = React.useMemo(
-    () => mergeSubagentSummaries(sessionSubagents, agentRunSubagents),
-    [agentRunSubagents, sessionSubagents]
-  )
-  const goalSurfaceTimelineEvents = React.useMemo(
-    () => projectGoalSurfaceExecutionEvents(executionTimelineEvents),
-    [executionTimelineEvents]
-  )
-  const goalSurfaceTimelineEventsById = React.useMemo(() => {
-    const grouped = new Map<string, api.ExecutionTranscriptEvent[]>()
-    for (const subagent of allVisibleSubagents) {
-      grouped.set(subagent.subagentId, transcriptEventsForSubagent(goalSurfaceTimelineEvents, subagent))
-    }
-    return grouped
-  }, [allVisibleSubagents, goalSurfaceTimelineEvents])
-  const goalSurfaceSubagents = React.useMemo(
+  const goalExecutionProjection = React.useMemo(
     () =>
-      allVisibleSubagents.filter((subagent) =>
-        isGoalSurfaceSubagentVisible(
-          subagent,
-          goalSurfaceTimelineEventsById.get(subagent.subagentId) ?? []
-        )
-      ),
-    [allVisibleSubagents, goalSurfaceTimelineEventsById]
+      buildGoalExecutionProjectionView({
+        executionTimelineEvents,
+        sessionSubagents,
+        agentRunSubagents,
+      }),
+    [agentRunSubagents, executionTimelineEvents, sessionSubagents]
   )
-  const subagentTimelineEventsById = React.useMemo(() => {
-    const grouped = new Map<string, api.ExecutionTranscriptEvent[]>()
-    for (const subagent of goalSurfaceSubagents) {
-      grouped.set(
-        subagent.subagentId,
-        goalSurfaceTimelineEventsById.get(subagent.subagentId) ?? []
-      )
-    }
-    return grouped
-  }, [goalSurfaceSubagents, goalSurfaceTimelineEventsById])
+  const {
+    allVisibleSubagents,
+    goalSurfaceTimelineEvents,
+    goalSurfaceTimelineEventsById,
+    goalSurfaceSubagents,
+    subagentTimelineEventsById,
+  } = goalExecutionProjection
   const workflowExecutionPolicy = React.useMemo(
     () => (workflowConfig.execution_policy ?? {}) as Record<string, unknown>,
     [workflowConfig.execution_policy]

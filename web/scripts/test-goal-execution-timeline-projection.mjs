@@ -56,8 +56,25 @@ try {
       .replaceAll("from '@/lib/subagent-protocol-events'", "from './subagent-protocol-events.ts'")
   )
 
+  const projectionViewSource = await fs.readFile(
+    path.join(sourceLibDir, 'goal-execution-projection-store.ts'),
+    'utf8'
+  )
+  await fs.writeFile(
+    path.join(tempLibDir, 'goal-execution-projection-store.ts'),
+    projectionViewSource
+      .replaceAll("from '@/lib/api'", "from './api.stub.ts'")
+      .replaceAll("from '@/lib/execution-transcript'", "from './execution-transcript.ts'")
+  )
+
   const moduleUrl = pathToFileURL(path.join(tempLibDir, 'execution-transcript.ts')).href
   const { projectGoalSurfaceExecutionEvents } = await import(moduleUrl)
+  const projectionViewUrl = pathToFileURL(
+    path.join(tempLibDir, 'goal-execution-projection-store.ts')
+  ).href
+  const { buildGoalExecutionProjectionView, isGoalSurfaceSubagentVisible } = await import(
+    projectionViewUrl
+  )
 
   function executionEvent(type, overrides = {}) {
     return {
@@ -79,6 +96,24 @@ try {
       metadata: {
         ...(overrides.metadata ?? {}),
       },
+    }
+  }
+
+  function subagentSummary(subagentId, overrides = {}) {
+    return {
+      subagentId,
+      parentType: 'agent_run',
+      parentId: 'goal-1',
+      roleId: `${subagentId}-role`,
+      title: subagentId,
+      status: 'running',
+      promptPreview: null,
+      summary: null,
+      outputPreview: null,
+      eventCount: 0,
+      createdAt: '2026-07-01T00:00:00.000Z',
+      updatedAt: '2026-07-01T00:00:00.000Z',
+      ...overrides,
     }
   }
 
@@ -208,6 +243,143 @@ try {
     separatedLegacyProjected,
     [separatedLegacyFirst, legacySeparator, separatedLegacySecond],
     'non-contract legacy duplicates should remain distinct when separated by another projected row'
+  )
+
+  const projectionView = buildGoalExecutionProjectionView({
+    executionTimelineEvents: [
+      executionEvent('runtime_blocked', {
+        dedupeKey: 'approval:goal-1',
+        summary: 'Approval required',
+      }),
+      executionEvent('runtime_blocked', {
+        dedupeKey: 'approval:goal-1',
+        summary: 'Hidden blocker copy',
+        visibility: 'hidden',
+      }),
+      executionEvent('subagent_completed', {
+        eventId: 'worker-1-complete',
+        subagentId: 'worker-1',
+        roleId: 'worker-1-role',
+        summary: 'Worker 1 completed',
+      }),
+      executionEvent('subagent_completed', {
+        eventId: 'worker-4-complete',
+        subagentId: 'worker-4',
+        roleId: null,
+        summary: 'Anonymous worker completed',
+      }),
+    ],
+    sessionSubagents: [
+      subagentSummary('worker-1', {
+        title: 'Worker 1',
+        roleId: 'worker-1-role',
+        status: 'running',
+      }),
+      subagentSummary('worker-2', {
+        title: 'Reviewer',
+        roleId: 'worker-2-role',
+        status: 'blocked',
+      }),
+      subagentSummary('worker-3', {
+        title: 'Analyst',
+        roleId: 'worker-3-role',
+        status: 'completed',
+        summary: 'Compiled notes',
+      }),
+      subagentSummary('worker-4', {
+        title: null,
+        roleId: null,
+        status: 'running',
+      }),
+      subagentSummary('worker-5', {
+        title: 'Silent worker',
+        roleId: 'worker-5-role',
+        status: 'running',
+      }),
+    ],
+    agentRunSubagents: [
+      subagentSummary('worker-1', {
+        title: 'Worker 1',
+        roleId: 'worker-1-role',
+        status: 'completed',
+        summary: 'Finished execution',
+        eventCount: 2,
+        updatedAt: '2026-07-01T00:05:00.000Z',
+      }),
+    ],
+  })
+
+  assert.equal(projectionView.allVisibleSubagents.length, 5)
+  assert.equal(
+    projectionView.allVisibleSubagents.find((item) => item.subagentId === 'worker-1')?.summary,
+    'Finished execution'
+  )
+  assert.deepEqual(
+    projectionView.goalSurfaceTimelineEvents.map((event) => event.summary),
+    ['Approval required', 'Worker 1 completed', 'Anonymous worker completed']
+  )
+  assert.deepEqual(
+    (projectionView.goalSurfaceTimelineEventsById.get('worker-1') ?? []).map(
+      (event) => event.summary
+    ),
+    ['Worker 1 completed']
+  )
+  assert.deepEqual(
+    (projectionView.goalSurfaceTimelineEventsById.get('worker-4') ?? []).map(
+      (event) => event.summary
+    ),
+    ['Anonymous worker completed']
+  )
+  assert.deepEqual(
+    projectionView.goalSurfaceSubagents.map((item) => item.subagentId).sort(),
+    ['worker-1', 'worker-2', 'worker-3', 'worker-4']
+  )
+  assert.equal(projectionView.goalSurfaceSubagents.some((item) => item.subagentId === 'worker-5'), false)
+  assert.deepEqual(
+    [...projectionView.subagentTimelineEventsById.keys()].sort(),
+    ['worker-1', 'worker-2', 'worker-3', 'worker-4']
+  )
+  assert.equal((projectionView.subagentTimelineEventsById.get('worker-2') ?? []).length, 0)
+  assert.equal((projectionView.subagentTimelineEventsById.get('worker-3') ?? []).length, 0)
+
+  assert.equal(
+    isGoalSurfaceSubagentVisible(
+      subagentSummary('worker-6', {
+        title: 'Needs approval',
+        roleId: 'worker-6-role',
+        status: 'awaiting_approval',
+      }),
+      []
+    ),
+    true
+  )
+  assert.equal(
+    isGoalSurfaceSubagentVisible(
+      subagentSummary('worker-7', {
+        title: 'No summary yet',
+        roleId: 'worker-7-role',
+        status: 'running',
+      }),
+      []
+    ),
+    false
+  )
+
+  const pageSource = await fs.readFile(path.join(workspaceRoot, 'src/app/page.tsx'), 'utf8')
+  assert.match(
+    pageSource,
+    /buildGoalExecutionProjectionView\(\{\s*executionTimelineEvents,\s*sessionSubagents,\s*agentRunSubagents,\s*\}\)/,
+    'page.tsx should derive the goal execution view via the extracted helper'
+  )
+  assert.doesNotMatch(
+    pageSource,
+    /function transcriptEventsForSubagent\(/,
+    'page.tsx should not retain the subagent transcript grouping helper'
+  )
+  assert.doesNotMatch(
+    pageSource,
+    /function isGoalSurfaceSubagentVisible\(/,
+    'page.tsx should not retain the goal-surface subagent visibility helper'
   )
 
   console.log('goal execution timeline projection assertions passed')
