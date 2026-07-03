@@ -94,6 +94,10 @@ import {
   type GoalSessionProposalLike,
   type GoalSessionSummaryLike,
 } from '@/lib/goal-strategy-selection'
+import {
+  buildActiveGoalTurnDecisionMetadata,
+  classifyActiveGoalTurnDecision,
+} from '@/lib/goal-turn-controller'
 import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
@@ -5933,26 +5937,10 @@ export default function ChatPage() {
         })
         return true
       }
-      const decisionMetadata = {
-        active_goal_turn_decision: {
-          lane: decision.lane,
-          kind: decision.kind,
-          confidence: decision.confidence,
-          selection_source: decision.selection_source,
-          selection_reason: decision.selection_reason,
-          requires_confirmation: decision.requires_confirmation,
-          goal_status: decision.goal_status ?? null,
-          linked_run_status: decision.linked_run_status ?? null,
-          recommended_action: decision.recommended_action ?? null,
-        },
-      }
+      const decisionMetadata = buildActiveGoalTurnDecisionMetadata(decision)
+      const decisionAction = classifyActiveGoalTurnDecision(decision)
 
-      if (
-        decision.kind === 'answer_question' ||
-        decision.kind === 'explain_goal_state' ||
-        decision.kind === 'exit_to_chat' ||
-        (decision.kind === 'clarify' && decision.requires_confirmation)
-      ) {
+      if (decisionAction.kind === 'direct_chat') {
         await submitDirectChatTurn({
           targetSessionId: sessionId,
           requestText,
@@ -5969,7 +5957,7 @@ export default function ChatPage() {
         return true
       }
 
-      if (decision.kind === 'steer') {
+      if (decisionAction.kind === 'steer_goal') {
         try {
           const goalHealth = await api.fetchGoalHealth(activeGoalId)
           const continuation = resolveGoalContinuationDecision(goalHealth)
@@ -6104,7 +6092,7 @@ export default function ChatPage() {
         }
       }
 
-      if (decision.kind === 'replan') {
+      if (decisionAction.kind === 'replan_goal') {
         try {
           const goalHealth = await api.fetchGoalHealth(activeGoalId)
           const continuation = resolveGoalContinuationDecision(goalHealth)

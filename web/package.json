@@ -21,7 +21,7 @@
     "test:chat-inference-context-settings": "node ./scripts/test-chat-inference-context-settings.mjs",
     "test:chat-goal-routing": "node --experimental-strip-types ./scripts/test-chat-goal-routing.mjs",
     "test:chat-goal-workflow-routing": "node --experimental-strip-types ./scripts/test-chat-goal-workflow-routing.mjs",
-    "test:chat-active-goal-turn-decision": "node ./scripts/test-chat-active-goal-turn-decision.mjs",
+    "test:chat-active-goal-turn-decision": "node --experimental-strip-types ./scripts/test-chat-active-goal-turn-decision.mjs",
     "test:execution-transcript-chat-projection": "node --experimental-strip-types ./scripts/test-execution-transcript-chat-projection.mjs",
     "test:goal-execution-timeline-projection": "node --experimental-strip-types ./scripts/test-goal-execution-timeline-projection.mjs",
     "test:chat-send-contract": "node --experimental-strip-types ./scripts/test-chat-send-contract.mjs",
