@@ -582,6 +582,188 @@ def test_goal_turn_decision_route_classifies_progress_question_as_explanatory(
     assert payload["recommended_action"] == "monitor"
 
 
+def test_goal_turn_decision_route_classifies_chinese_blocked_approval_question_as_explanatory(
+    tmp_path: Path,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id="goal-turn-decision-blocked-zh-1",
+            objective="Explain approval blockage in Chinese.",
+            summary={"phase": "operator_review"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id="goal-turn-decision-blocked-zh-attempt-1",
+            goal_id="goal-turn-decision-blocked-zh-1",
+            attempt_index=1,
+            status="waiting_approval",
+            trigger="manual_start",
+            agent_run_id="goal-turn-decision-blocked-zh-run-1",
+            summary={
+                "linked_approval_state": {
+                    "status": "waiting_approval",
+                    "pending_count": 1,
+                    "approval_ids": ["exec-approval-turn-decision-zh-1"],
+                    "tool_names": ["exec_command"],
+                }
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id="goal-turn-decision-blocked-zh-run-1",
+            protocol_id="autonomous_single_agent",
+            title="Blocked approval monitor",
+            topic="Explain approval blockage in Chinese.",
+            summary={},
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status("goal-turn-decision-blocked-zh-run-1", "awaiting_approval"))
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            "goal-turn-decision-blocked-zh-1",
+            "waiting_approval",
+            current_attempt_id="goal-turn-decision-blocked-zh-attempt-1",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/goal-turn-decision-blocked-zh-1/turn-decision",
+            json={"message": "为什么这个目标还在等批准？"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "explain_goal_state"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
+    assert payload["goal_status"] == "waiting_approval"
+    assert payload["linked_run_status"] == "awaiting_approval"
+    assert payload["recommended_action"] == "resolve_approval"
+
+
+def test_goal_turn_decision_route_classifies_chinese_progress_question_as_explanatory(
+    tmp_path: Path,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id="goal-turn-decision-progress-zh-1",
+            objective="Summarize current progress in Chinese.",
+            summary={"phase": "running"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id="goal-turn-decision-progress-zh-attempt-1",
+            goal_id="goal-turn-decision-progress-zh-1",
+            attempt_index=1,
+            status="running",
+            trigger="manual_start",
+            agent_run_id="goal-turn-decision-progress-zh-run-1",
+            summary={},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id="goal-turn-decision-progress-zh-run-1",
+            protocol_id="autonomous_single_agent",
+            title="Chinese progress monitor run",
+            topic="Summarize current progress in Chinese.",
+            summary={},
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status("goal-turn-decision-progress-zh-run-1", "running"))
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            "goal-turn-decision-progress-zh-1",
+            "running",
+            current_attempt_id="goal-turn-decision-progress-zh-attempt-1",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/goal-turn-decision-progress-zh-1/turn-decision",
+            json={"message": "現在進度怎麼樣？"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] in {"answer_question", "explain_goal_state"}
+    assert payload["kind"] != "steer"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["goal_status"] == "running"
+    assert payload["linked_run_status"] == "running"
+    assert payload["recommended_action"] == "monitor"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "¿Cuál es el progreso hasta ahora?",
+        "अब तक क्या प्रगति हुई है?",
+    ],
+)
+def test_goal_turn_decision_route_classifies_non_english_progress_questions_as_non_mutating(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    app, runtime_service = _create_goal_test_app(tmp_path)
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id="goal-turn-decision-progress-intl-1",
+            objective="Summarize multilingual progress questions.",
+            summary={"phase": "running"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id="goal-turn-decision-progress-intl-attempt-1",
+            goal_id="goal-turn-decision-progress-intl-1",
+            attempt_index=1,
+            status="running",
+            trigger="manual_start",
+            agent_run_id="goal-turn-decision-progress-intl-run-1",
+            summary={},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id="goal-turn-decision-progress-intl-run-1",
+            protocol_id="autonomous_single_agent",
+            title="International progress monitor run",
+            topic="Summarize multilingual progress questions.",
+            summary={},
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status("goal-turn-decision-progress-intl-run-1", "running"))
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            "goal-turn-decision-progress-intl-1",
+            "running",
+            current_attempt_id="goal-turn-decision-progress-intl-attempt-1",
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/goals/goal-turn-decision-progress-intl-1/turn-decision",
+            json={"message": message},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] in {"answer_question", "explain_goal_state"}
+    assert payload["kind"] != "steer"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["linked_run_status"] == "running"
+    assert payload["recommended_action"] == "monitor"
+
+
 def test_goal_turn_decision_route_does_not_treat_explanation_question_as_steering(
     tmp_path: Path,
 ) -> None:
@@ -603,6 +785,67 @@ def test_goal_turn_decision_route_does_not_treat_explanation_question_as_steerin
     assert payload["kind"] in {"answer_question", "explain_goal_state"}
     assert payload["kind"] != "steer"
     assert payload["selection_source"] == "bounded_fallback"
+
+
+def test_goal_turn_decision_route_does_not_treat_continue_question_as_steering(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Continue only when explicitly instructed."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "can you continue with benchmark comparisons?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] in {"answer_question", "explain_goal_state"}
+    assert payload["kind"] != "steer"
+    assert payload["selection_source"] == "bounded_fallback"
+
+
+@pytest.mark.parametrize(
+    ("message", "allowed_kinds", "requires_confirmation"),
+    [
+        ("maybe focus on benchmarks", {"clarify"}, True),
+        ("I think focus on benchmarks might help", {"clarify"}, True),
+        ("can you continue the goal?", {"answer_question", "explain_goal_state", "clarify"}, None),
+        ("should we take a different approach?", {"answer_question", "explain_goal_state", "clarify"}, None),
+        ("maybe take a different approach", {"clarify"}, True),
+    ],
+)
+def test_goal_turn_decision_route_does_not_overclassify_ambiguous_or_question_mutations(
+    tmp_path: Path,
+    message: str,
+    allowed_kinds: set[str],
+    requires_confirmation: bool | None,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Stay conservative about mutating follow-up intent."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": message},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] in allowed_kinds
+    assert payload["kind"] not in {"steer", "replan", "lifecycle"}
+    assert payload["selection_source"] == "bounded_fallback"
+    if requires_confirmation is not None:
+        assert payload["requires_confirmation"] is requires_confirmation
 
 
 def test_goal_turn_decision_route_classifies_steering_instruction(
@@ -628,6 +871,29 @@ def test_goal_turn_decision_route_classifies_steering_instruction(
     assert payload["requires_confirmation"] is False
 
 
+def test_goal_turn_decision_route_classifies_ambiguous_continue_instruction_as_clarify(
+    tmp_path: Path,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Only continue after specific guidance."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "keep going"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "clarify"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is True
+
+
 def test_goal_turn_decision_route_classifies_replan_instruction(
     tmp_path: Path,
 ) -> None:
@@ -647,6 +913,40 @@ def test_goal_turn_decision_route_classifies_replan_instruction(
     assert response.status_code == 200
     payload = response.json()
     assert payload["kind"] == "replan"
+    assert payload["selection_source"] == "bounded_fallback"
+    assert payload["requires_confirmation"] is False
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_kind"),
+    [
+        ("pause goal", "lifecycle"),
+        ("resume", "lifecycle"),
+        ("stop goal", "lifecycle"),
+        ("continue with benchmark comparisons", "steer"),
+    ],
+)
+def test_goal_turn_decision_route_preserves_explicit_mutating_commands(
+    tmp_path: Path,
+    message: str,
+    expected_kind: str,
+) -> None:
+    with _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Keep explicit mutating command routing stable."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": message},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == expected_kind
     assert payload["selection_source"] == "bounded_fallback"
     assert payload["requires_confirmation"] is False
 

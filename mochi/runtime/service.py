@@ -7,6 +7,7 @@ import inspect
 import json
 import re
 import sqlite3
+import unicodedata
 from hashlib import sha1
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -9768,11 +9769,16 @@ def _active_goal_turn_decision_payload(
 
 
 def _normalize_active_goal_turn_message(message: str) -> str:
-    return re.sub(r"\s+", " ", str(message or "").strip().lower())
+    normalized = unicodedata.normalize("NFKC", str(message or "").strip()).casefold()
+    return re.sub(r"\s+", " ", normalized)
 
 
 def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in text for phrase in phrases)
+
+
+def _starts_with_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(text.startswith(phrase) for phrase in phrases)
 
 
 def _is_active_goal_turn_exit_to_chat(text: str) -> bool:
@@ -9790,6 +9796,9 @@ def _is_active_goal_turn_exit_to_chat(text: str) -> bool:
 
 
 def _is_active_goal_turn_lifecycle(text: str) -> bool:
+    if _is_active_goal_turn_question(text):
+        return False
+    stripped = _strip_active_goal_turn_polite_prefix(text)
     lifecycle_prefixes = (
         "resume goal",
         "pause goal",
@@ -9797,64 +9806,83 @@ def _is_active_goal_turn_lifecycle(text: str) -> bool:
         "stop goal",
         "start goal",
         "restart goal",
+        "resume this goal",
+        "pause this goal",
+        "cancel this goal",
+        "stop this goal",
+        "restart this goal",
     )
-    if text in {"resume", "pause", "cancel", "stop", "start", "restart"}:
+    if stripped in {"resume", "pause", "cancel", "stop", "start", "restart"}:
         return True
-    if text.startswith(lifecycle_prefixes):
+    if _starts_with_any_phrase(stripped, lifecycle_prefixes):
         return True
-    return _contains_any_phrase(
-        text,
-        (
-            "resume this goal",
-            "pause this goal",
-            "cancel this goal",
-            "stop this goal",
-            "restart this goal",
-            "continue the goal",
-        ),
-    )
+    return stripped in {"pause goal", "stop goal", "cancel goal", "start goal", "restart goal"}
 
 
 def _is_active_goal_turn_replan(text: str) -> bool:
+    if _is_active_goal_turn_question(text):
+        return False
+    stripped = _strip_active_goal_turn_polite_prefix(text)
+    replan_prefixes = (
+        "replan",
+        "revise the plan",
+        "change the plan",
+        "adjust the plan",
+        "change strategy",
+        "switch strategy",
+        "start over with",
+        "take a different approach",
+    )
+    if _starts_with_any_phrase(stripped, replan_prefixes):
+        return True
     return _contains_any_phrase(
-        text,
+        stripped,
         (
-            "replan",
-            "revise the plan",
-            "change the plan",
-            "new plan",
-            "different plan",
-            "adjust the plan",
-            "change strategy",
-            "switch strategy",
-            "different approach",
-            "take a different approach",
-            "start over with",
+            "replan this",
+            "replan the goal",
+            "replan and",
+            "replan this and",
+            "revise the plan and",
+            "change the plan and",
+            "adjust the plan and",
+            "change strategy and",
+            "switch strategy and",
         ),
     )
+
+
+def _strip_active_goal_turn_polite_prefix(text: str) -> str:
+    for prefix in ("please ", "pls "):
+        if text.startswith(prefix):
+            return text[len(prefix) :].strip()
+    return text
 
 
 def _is_active_goal_turn_steer(text: str) -> bool:
     if _is_active_goal_turn_question(text):
         return False
-    if _contains_any_phrase(
-        text,
+    stripped = _strip_active_goal_turn_polite_prefix(text)
+    if _starts_with_any_phrase(
+        stripped,
         (
             "focus on",
-            "prioritize",
-            "continue with",
-            "go deeper on",
-            "keep going on",
-            "proceed with",
+            "prioritize ",
+            "continue with ",
+            "go deeper on ",
+            "keep going on ",
+            "keep working on ",
+            "proceed with ",
             "use ",
             "avoid ",
             "include ",
             "exclude ",
             "next, ",
-        ),
+            "next focus on ",
+            "next prioritize ",
+        )
     ):
         return True
-    return text.startswith(("please ", "continue ", "keep ", "go ", "use ", "avoid "))
+    return False
 
 
 def _is_active_goal_turn_explain_state(text: str, *, health: Mapping[str, Any]) -> bool:
@@ -9872,6 +9900,49 @@ def _is_active_goal_turn_explain_state(text: str, *, health: Mapping[str, Any]) 
             "why is it waiting",
             "what state is this",
             "why did this stop",
+            "what is the status",
+            "what's the status",
+            "what is the progress",
+            "what's the progress",
+            "what is the current progress",
+            "what is the current status",
+            "why is this waiting for approval",
+            "why is this awaiting approval",
+            "現在進度",
+            "现在进度",
+            "目前進度",
+            "目前进度",
+            "進度怎麼樣",
+            "进度怎么样",
+            "為什麼卡住",
+            "为什么卡住",
+            "為什麼被阻塞",
+            "为什么被阻塞",
+            "為什麼在等批准",
+            "为什么在等批准",
+            "這是什麼狀態",
+            "这是什么状态",
+            "發生了什麼",
+            "发生了什么",
+            "怎麼回事",
+            "怎么回事",
+            "por que esta bloqueado",
+            "por qué está bloqueado",
+            "cual es el estado",
+            "cuál es el estado",
+            "cual es el progreso",
+            "cuál es el progreso",
+            "que paso",
+            "qué pasó",
+            "como va",
+            "cómo va",
+            "que esta pasando",
+            "qué está pasando",
+            "क्या हुआ",
+            "क्या प्रगति",
+            "क्या स्थिति",
+            "क्यों रुका",
+            "क्यों अटका",
         ),
     ):
         return True
@@ -9901,6 +9972,26 @@ def _is_active_goal_turn_explain_state(text: str, *, health: Mapping[str, Any]) 
         "progress",
         "happened",
         "mean",
+        "進度",
+        "进度",
+        "狀態",
+        "状态",
+        "卡住",
+        "阻塞",
+        "批准",
+        "审批",
+        "發生",
+        "发生",
+        "estado",
+        "progreso",
+        "bloqueado",
+        "aprobación",
+        "aprobacion",
+        "स्थिति",
+        "प्रगति",
+        "अनुमोदन",
+        "अटका",
+        "रुका",
     )
     if any(term in text for term in explanatory_terms):
         return True
@@ -9916,8 +10007,7 @@ def _is_active_goal_turn_explain_state(text: str, *, health: Mapping[str, Any]) 
 def _is_active_goal_turn_question(text: str) -> bool:
     if "?" in text:
         return True
-    return _contains_any_phrase(
-        text,
+    if text.startswith(
         (
             "what ",
             "what's",
@@ -9927,10 +10017,81 @@ def _is_active_goal_turn_question(text: str) -> bool:
             "when ",
             "where ",
             "which ",
+            "who ",
+            "can ",
+            "could ",
+            "would ",
+            "should ",
+            "will ",
+            "is ",
+            "are ",
+            "do ",
+            "does ",
+            "did ",
             "explain",
             "help me understand",
-            "status",
-            "progress",
+            "tell me ",
+            "que ",
+            "qué ",
+            "por que ",
+            "por qué ",
+            "como ",
+            "cómo ",
+            "cuando ",
+            "cuándo ",
+            "donde ",
+            "dónde ",
+            "cual ",
+            "cuál ",
+            "puedes ",
+            "podrias ",
+            "podrías ",
+            "me explicas ",
+            "por qué",
+            "por que",
+            "为什么",
+            "為什麼",
+            "怎么",
+            "怎麼",
+            "如何",
+            "什么",
+            "什麼",
+            "क्या",
+            "क्यों",
+            "कैसे",
+            "कब",
+            "कहाँ",
+        )
+    ):
+        return True
+    if text.endswith(("吗", "嗎", "呢", "么", "麼")):
+        return True
+    return _contains_any_phrase(
+        text,
+        (
+            "what happened",
+            "how far",
+            "how's it going",
+            "how is it going",
+            "status update",
+            "progress update",
+            "current status",
+            "current progress",
+            "latest status",
+            "latest progress",
+            "現在進度",
+            "现在进度",
+            "目前進度",
+            "目前进度",
+            "進度怎麼樣",
+            "进度怎么样",
+            "que paso",
+            "qué pasó",
+            "como va",
+            "cómo va",
+            "hasta ahora",
+            "अब तक",
+            "क्या हुआ",
         ),
     )
 
