@@ -1558,6 +1558,266 @@ async def _handle_terminal_goal_input(
     return {"handled": True, "chat_text": None}
 
 
+async def _maybe_handle_active_goal_direct_chat_follow_up(
+    *,
+    text: str,
+    session_id: str,
+    session_store: object,
+    ensure_runtime_service: object,
+) -> bool:
+    from mochi.goal_proposal_copy import (
+        build_goal_card_chrome_copy,
+        build_goal_follow_up_message,
+    )
+    from mochi.runtime.models import (
+        ActiveGoalTurnDecisionRequest,
+        AgentRunGuidanceRequest,
+    )
+    from mochi.terminal_goal_helpers import (
+        build_goal_summary_from_goal,
+        goal_card_from_summary,
+        is_goal_terminal_status,
+        normalize_goal_session_state,
+        resolve_goal_continuation_decision,
+    )
+
+    user_text = text.strip()
+    if not user_text:
+        return False
+
+    events = await session_store.load_session(session_id)
+    base_goal_state = normalize_goal_session_state(_session_goal_state(events))
+    active_goal_id = _string_or_none(base_goal_state.get("active_goal_id"))
+    active_goal_status = _string_or_none(base_goal_state.get("active_goal_status"))
+    pending_proposal = base_goal_state.get("pending_proposal")
+    latest_goal_summary = (
+        base_goal_state.get("last_goal_summary")
+        if isinstance(base_goal_state.get("last_goal_summary"), dict)
+        else None
+    )
+    if (
+        active_goal_id is None
+        or is_goal_terminal_status(active_goal_status)
+        or pending_proposal is not None
+    ):
+        return False
+
+    try:
+        runtime_service = await ensure_runtime_service()
+        decision = await runtime_service.decide_active_goal_turn(
+            active_goal_id,
+            ActiveGoalTurnDecisionRequest(message=user_text),
+        )
+    except Exception:
+        return False
+    if decision is None:
+        return False
+
+    decision_kind = _string_or_none(getattr(decision, "kind", None))
+    if decision_kind not in {"steer", "replan"}:
+        return False
+
+    try:
+        health = await runtime_service.get_goal_health(active_goal_id)
+    except Exception:
+        return False
+    if health is None:
+        return False
+    continuation = resolve_goal_continuation_decision(health)
+
+    if continuation.action == "manual_resolution_required":
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=user_text,
+            assistant_content=build_goal_follow_up_message(
+                user_message=user_text,
+                kind="manual_resolution_required",
+                summary=continuation.summary,
+                approval_count=len(continuation.approval_ids),
+            ),
+        )
+        return True
+
+    if continuation.action == "blocked":
+        await _append_terminal_goal_conversation(
+            session_store=session_store,
+            session_id=session_id,
+            user_content=user_text,
+            assistant_content=build_goal_follow_up_message(
+                user_message=user_text,
+                kind="blocked",
+                summary=continuation.summary,
+            ),
+        )
+        return True
+
+    try:
+        next_goal: dict[str, object] | None = None
+        follow_up_kind: str | None = None
+
+        if decision_kind == "replan":
+            if continuation.action == "refresh_then_forward":
+                next_goal = await runtime_service.refresh_goal(active_goal_id)
+                refreshed_run_id = _get_goal_attempt_run_id(next_goal or {})
+                if refreshed_run_id:
+                    guidance_result = await runtime_service.append_agent_run_guidance(
+                        refreshed_run_id,
+                        AgentRunGuidanceRequest(guidance=user_text),
+                    )
+                    if guidance_result is None:
+                        console.print("[yellow]Could not forward guidance to the refreshed goal attempt.[/yellow]")
+                        return True
+                    follow_up_kind = "refreshed_forwarded"
+                else:
+                    next_goal = await runtime_service.resume_goal(
+                        active_goal_id,
+                        strategy="restart_attempt",
+                        guidance_message=user_text,
+                    )
+                    if next_goal is None:
+                        console.print("[yellow]Could not restart the active goal for replanning.[/yellow]")
+                        return True
+                    follow_up_kind = "restarted_forwarded"
+            else:
+                next_goal = await runtime_service.resume_goal(
+                    active_goal_id,
+                    strategy="restart_attempt",
+                    guidance_message=user_text,
+                )
+                if next_goal is None:
+                    console.print("[yellow]Could not restart the active goal for replanning.[/yellow]")
+                    return True
+                follow_up_kind = "restarted_forwarded"
+        else:
+            if continuation.action == "forward_guidance":
+                if not continuation.run_id:
+                    await _append_terminal_goal_conversation(
+                        session_store=session_store,
+                        session_id=session_id,
+                        user_content=user_text,
+                        assistant_content=build_goal_follow_up_message(
+                            user_message=user_text,
+                            kind="no_live_attempt",
+                        ),
+                    )
+                    return True
+                guidance_result = await runtime_service.append_agent_run_guidance(
+                    continuation.run_id,
+                    AgentRunGuidanceRequest(guidance=user_text),
+                )
+                if guidance_result is None:
+                    console.print("[yellow]Could not forward guidance to the active goal.[/yellow]")
+                    return True
+                follow_up_kind = "forwarded"
+            elif continuation.action == "refresh_then_forward":
+                next_goal = await runtime_service.refresh_goal(active_goal_id)
+                refreshed_run_id = _get_goal_attempt_run_id(next_goal or {})
+                if refreshed_run_id:
+                    guidance_result = await runtime_service.append_agent_run_guidance(
+                        refreshed_run_id,
+                        AgentRunGuidanceRequest(guidance=user_text),
+                    )
+                    if guidance_result is None:
+                        console.print("[yellow]Could not forward guidance to the refreshed goal attempt.[/yellow]")
+                        return True
+                    follow_up_kind = "refreshed_forwarded"
+                else:
+                    next_goal = await runtime_service.resume_goal(
+                        active_goal_id,
+                        guidance_message=user_text,
+                    )
+                    if next_goal is None:
+                        console.print("[yellow]Could not resume the active goal.[/yellow]")
+                        return True
+                    follow_up_kind = "resumed_forwarded"
+            elif continuation.action == "resume_then_forward":
+                next_goal = await runtime_service.resume_goal(
+                    active_goal_id,
+                    guidance_message=user_text,
+                )
+                if next_goal is None:
+                    console.print("[yellow]Could not resume the active goal.[/yellow]")
+                    return True
+                follow_up_kind = "resumed_forwarded"
+    except Exception as exc:
+        console.print(f"[red]Active goal follow-up failed: {exc}[/red]")
+        return True
+
+    if follow_up_kind is None:
+        return False
+
+    try:
+        refreshed_goal = await runtime_service.get_goal(active_goal_id)
+    except Exception:
+        refreshed_goal = None
+    goal_record = refreshed_goal or next_goal
+    if not isinstance(goal_record, dict):
+        console.print("[yellow]Updated the active goal, but could not refresh its latest state.[/yellow]")
+        return True
+
+    next_goal_summary = build_goal_summary_from_goal(goal_record, latest_goal_summary)
+    next_goal_status = _string_or_none(goal_record.get("status"))
+    next_goal_terminal = is_goal_terminal_status(next_goal_status)
+    next_run_id = _get_goal_attempt_run_id(goal_record)
+    next_execution_mode = (
+        _string_or_none(goal_record.get("execution_mode"))
+        or _string_or_none(base_goal_state.get("execution_mode"))
+        or "workflow"
+    )
+    await _sync_terminal_workflow_state_for_goal(
+        session_store=session_store,
+        session_id=session_id,
+        execution_mode=next_execution_mode,
+        interaction_mode=next_goal_summary.get("interaction_mode"),
+        execution_topology=next_goal_summary.get("execution_topology"),
+        goal_status=next_goal_status,
+        run_id=next_run_id,
+    )
+    await _persist_terminal_goal_state(
+        session_store=session_store,
+        session_id=session_id,
+        goal_state={
+            "active_goal_id": None if next_goal_terminal else goal_record.get("goal_id") or active_goal_id,
+            "active_goal_status": next_goal_status,
+            "execution_mode": next_execution_mode,
+            "interaction_mode": next_goal_summary.get("interaction_mode"),
+            "execution_topology": next_goal_summary.get("execution_topology"),
+            "bound_run_id": next_goal_summary.get("bound_run_id"),
+            "protocol_selection": next_goal_summary.get("protocol_selection"),
+            "selection_rationale": next_goal_summary.get("selection_rationale"),
+            "default_route": (
+                "chat"
+                if next_goal_terminal
+                else "workflow"
+                if next_execution_mode == "workflow"
+                else "goal"
+            ),
+            "last_goal_summary": next_goal_summary,
+            "pending_proposal": None,
+        },
+    )
+    await _append_terminal_goal_conversation(
+        session_store=session_store,
+        session_id=session_id,
+        user_content=user_text,
+        assistant_content=build_goal_follow_up_message(
+            user_message=user_text,
+            kind=follow_up_kind,  # type: ignore[arg-type]
+            summary=continuation.summary,
+        ),
+        goal_card=goal_card_from_summary(
+            next_goal_summary,
+            kind="started",
+            label=build_goal_card_chrome_copy(user_message=user_text).goal_updated_label,
+            copy_source=user_text,
+            goal_id=goal_record.get("goal_id"),
+            status=next_goal_status,
+        ),
+    )
+    return True
+
+
 async def _create_tui_runtime_service(
     *,
     engine: object,
@@ -1844,6 +2104,7 @@ async def _chat_tui_async(
                 break
 
             text = raw.strip()
+            explicit_chat_override = False
             if not text:
                 continue
 
@@ -2097,6 +2358,7 @@ async def _chat_tui_async(
                     continue
                 if routing_result["chat_text"]:
                     text = str(routing_result["chat_text"])
+                    explicit_chat_override = command == "chat"
                 else:
                     console.print(f"[yellow]Unknown command: /{command}[/yellow]")
                     continue
@@ -2117,6 +2379,15 @@ async def _chat_tui_async(
                     text = str(routing_result["chat_text"])
 
             turns += 1
+            if not explicit_chat_override:
+                handled_active_goal_follow_up = await _maybe_handle_active_goal_direct_chat_follow_up(
+                    text=text,
+                    session_id=current_session,
+                    session_store=session_store,
+                    ensure_runtime_service=_ensure_runtime_service,
+                )
+                if handled_active_goal_follow_up:
+                    continue
             try:
                 await _run_chat_turn(text)
             except Exception as exc:
