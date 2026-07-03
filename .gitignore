@@ -103,6 +103,7 @@ web/scripts/
 !web/scripts/
 web/scripts/*
 !web/scripts/test-execution-transcript-chat-projection.mjs
+!web/scripts/test-goal-execution-timeline-projection.mjs
 web/README.md
 web/next-env.d.ts
 web/tsconfig.tsbuildinfo

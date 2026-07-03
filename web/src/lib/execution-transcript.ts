@@ -237,13 +237,9 @@ function isRedundantApprovalToolResult(
 }
 
 function buildGoalSurfaceFingerprint(event: ExecutionTranscriptEvent): string {
-  const dedupeKey = getEventContractField(event, 'dedupeKey', 'dedupe_key', 'dedupeKey')
-  if (dedupeKey) {
-    return `contract:${dedupeKey}`
-  }
-  const eventId = getEventContractField(event, 'eventId', 'event_id', 'eventId')
-  if (eventId) {
-    return `event:${eventId}`
+  const sourceIdentity = getGoalSurfaceSourceIdentity(event)
+  if (sourceIdentity) {
+    return sourceIdentity
   }
 
   const status = normalizeStatus(deriveSubagentEventStatus(event.type, event.status))
@@ -260,6 +256,20 @@ function buildGoalSurfaceFingerprint(event: ExecutionTranscriptEvent): string {
     event.summary ?? '',
     event.content ?? '',
   ].join('::')
+}
+
+function getGoalSurfaceSourceIdentity(event: ExecutionTranscriptEvent): string | null {
+  const dedupeKey = getEventContractField(event, 'dedupeKey', 'dedupe_key', 'dedupeKey')
+  if (dedupeKey) {
+    return `contract:${dedupeKey}`
+  }
+
+  const eventId = getEventContractField(event, 'eventId', 'event_id', 'eventId')
+  if (eventId) {
+    return `event:${eventId}`
+  }
+
+  return null
 }
 
 function mergeTranscriptMetadata(
@@ -548,6 +558,18 @@ export function projectGoalSurfaceExecutionEvents(
 ): ExecutionTranscriptEvent[] {
   const meaningfulEvents = events.filter((event) => shouldKeepGoalSurfaceEvent(event))
   const projected: ExecutionTranscriptEvent[] = []
+  const projectedSourceIdentityIndices = new Map<string, number>()
+
+  const rebuildProjectedSourceIdentityIndices = () => {
+    projectedSourceIdentityIndices.clear()
+    for (let projectedIndex = 0; projectedIndex < projected.length; projectedIndex += 1) {
+      const projectedEvent = projected[projectedIndex]
+      const sourceIdentity = getGoalSurfaceSourceIdentity(projectedEvent)
+      if (sourceIdentity) {
+        projectedSourceIdentityIndices.set(sourceIdentity, projectedIndex)
+      }
+    }
+  }
 
   for (let index = 0; index < meaningfulEvents.length; index += 1) {
     const event = meaningfulEvents[index]
@@ -560,6 +582,19 @@ export function projectGoalSurfaceExecutionEvents(
       ) {
         continue
       }
+    }
+
+    const sourceIdentity = getGoalSurfaceSourceIdentity(event)
+    if (sourceIdentity) {
+      const existingIndex = projectedSourceIdentityIndices.get(sourceIdentity)
+      if (existingIndex !== undefined) {
+        projected.splice(existingIndex, 1)
+        rebuildProjectedSourceIdentityIndices()
+      }
+
+      projected.push(event)
+      projectedSourceIdentityIndices.set(sourceIdentity, projected.length - 1)
+      continue
     }
 
     const fingerprint = buildGoalSurfaceFingerprint(event)
