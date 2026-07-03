@@ -3260,6 +3260,8 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
         selection_reason=payload.get("selection_reason"),
         selection_source=normalized_selection_source,
         strategy_id=normalized_strategy_id,
+        summary=summary,
+        metadata=metadata,
     )
     payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
     payload["capability_policy"] = json.loads(payload.pop("capability_policy_json") or "{}")
@@ -3491,6 +3493,35 @@ def _normalize_goal_execution_mode(value: Any) -> str:
     return _DEFAULT_GOAL_EXECUTION_MODE
 
 
+def _goal_text_from_sources(
+    summary: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+    *keys: str,
+) -> str:
+    for source in (summary or {}, metadata or {}):
+        for key in keys:
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _goal_has_legacy_route_state(
+    summary: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    return bool(
+        _goal_text_from_sources(
+            summary,
+            metadata,
+            "interaction_mode",
+            "execution_topology",
+            "execution_mode",
+            "default_route",
+        )
+    )
+
+
 def _validate_goal_strategy_protocol_inputs(
     *,
     strategy_id: str | None,
@@ -3544,18 +3575,15 @@ def _normalize_goal_strategy_id(
     normalized = str(strategy_id or "").strip()
     if normalized:
         return normalized
-    normalized_selection_source = str(selection_source or "").strip()
-    if normalized_selection_source in {"explicit_override", "semantic_registry_selector"}:
-        for source in (summary or {}, metadata or {}):
-            summary_strategy = str(source.get("strategy_id") or "").strip()
-            if summary_strategy:
-                return summary_strategy
-            protocol_selection = str(source.get("protocol_selection") or "").strip()
-            if protocol_selection:
-                return protocol_selection
     protocol = str(protocol_id or "").strip()
-    if protocol and normalized_selection_source == "explicit_override":
+    if protocol:
         return protocol
+    legacy_strategy = _goal_text_from_sources(summary, metadata, "strategy_id", "protocol_selection")
+    if legacy_strategy:
+        return legacy_strategy
+    normalized_selection_source = str(selection_source or "").strip()
+    if normalized_selection_source == "explicit_override":
+        return _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL
     return DEFAULT_GOAL_STRATEGY_ID
 
 
@@ -3577,17 +3605,26 @@ def _normalize_goal_selection_source(
         return "explicit_override"
     for source in (summary or {}, metadata or {}):
         summary_selection_source = str(source.get("selection_source") or "").strip()
-        if summary_selection_source in {"explicit_override", "semantic_registry_selector"}:
+        if summary_selection_source in {
+            "explicit_override",
+            "semantic_registry_selector",
+            "safe_default",
+            "legacy_migration",
+        }:
             return summary_selection_source
     if str(protocol_id or "").strip():
         return "legacy_migration"
-    for source in (summary or {}, metadata or {}):
-        if str(source.get("strategy_id") or "").strip():
-            return "legacy_migration"
-        if str(source.get("protocol_selection") or "").strip():
-            return "legacy_migration"
-        if str(source.get("selection_rationale") or "").strip():
-            return "legacy_migration"
+    if _goal_text_from_sources(
+        summary,
+        metadata,
+        "strategy_id",
+        "protocol_selection",
+        "selection_reason",
+        "selection_rationale",
+    ):
+        return "legacy_migration"
+    if _goal_has_legacy_route_state(summary, metadata):
+        return "legacy_migration"
     if normalized:
         return "legacy_migration"
     return "safe_default"
@@ -3598,10 +3635,15 @@ def _normalize_goal_selection_reason(
     selection_reason: Any,
     selection_source: Any,
     strategy_id: Any,
+    summary: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> str:
     normalized = str(selection_reason or "").strip()
     if normalized:
         return normalized
+    legacy_reason = _goal_text_from_sources(summary, metadata, "selection_reason", "selection_rationale")
+    if legacy_reason:
+        return legacy_reason
     resolved_strategy_id = _normalize_goal_strategy_id(
         strategy_id=strategy_id,
         protocol_id=None,

@@ -1909,14 +1909,14 @@ def test_goal_api_legacy_workflow_without_strategy_does_not_default_to_distill(
         fetched = get_response.json()
         assert fetched["execution_mode"] == "workflow"
         assert fetched["strategy_id"] == "autonomous_single_agent"
-        assert fetched["selection_source"] == "safe_default"
+        assert fetched["selection_source"] == "legacy_migration"
         assert fetched["selection_reason"] == (
-            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+            "Legacy goal metadata mapped to autonomous_single_agent during strategy migration."
         )
         assert fetched["protocol_id"] == "autonomous_single_agent"
         assert fetched["protocol_selection"] == "autonomous_single_agent"
         assert fetched["selection_rationale"] == (
-            "Defaulted to autonomous_single_agent because no explicit strategy was provided."
+            "Legacy goal metadata mapped to autonomous_single_agent during strategy migration."
         )
         assert fetched["protocol_id"] != "teacher_student_distill"
 

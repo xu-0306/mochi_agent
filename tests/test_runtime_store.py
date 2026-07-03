@@ -1143,7 +1143,7 @@ def test_runtime_store_reads_legacy_goal_rows_without_execution_mode_column(
     assert goals[0]["selection_source"] == "safe_default"
 
 
-def test_runtime_store_maps_legacy_protocol_only_goal_to_autonomous_single_agent_migration(
+def test_runtime_store_preserves_legacy_protocol_only_goal_history_during_strategy_migration(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "sessions" / "runtime.db"
@@ -1192,8 +1192,125 @@ def test_runtime_store_maps_legacy_protocol_only_goal_to_autonomous_single_agent
     goal = asyncio.run(store.get_goal("goal-legacy-migration-1"))
     assert goal is not None
     assert goal["execution_mode"] == "workflow"
-    assert goal["strategy_id"] == "autonomous_single_agent"
+    assert goal["strategy_id"] == "teacher_student_distill"
     assert goal["protocol_id"] == "teacher_student_distill"
+    assert goal["selection_source"] == "legacy_migration"
+    assert goal["selection_reason"] == (
+        "Legacy goal metadata mapped to teacher_student_distill during strategy migration."
+    )
+
+    listed = asyncio.run(store.list_goals())
+    assert listed[0]["strategy_id"] == "teacher_student_distill"
+    assert listed[0]["protocol_id"] == "teacher_student_distill"
+    assert listed[0]["selection_source"] == "legacy_migration"
+
+
+def test_runtime_store_uses_legacy_protocol_selection_and_rationale_from_summary_or_metadata(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO goals (
+                id, objective, title, goal_type, execution_mode, strategy_id, selection_source,
+                selection_reason, protocol_id, topic, project_id, workspace_dir, status,
+                current_attempt_id, run_policy_json, capability_policy_json, source_manifest_json,
+                summary_json, metadata_json, latest_error, started_at, finished_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "goal-legacy-summary-selection-1",
+                "Read legacy protocol selection fields from summary metadata.",
+                None,
+                None,
+                "workflow",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "created",
+                None,
+                "{}",
+                "{}",
+                "{}",
+                '{"interaction_mode":"workflow","protocol_selection":"teacher_student_distill"}',
+                '{"selection_rationale":"Legacy goal explicitly selected distill mode from workflow UI."}',
+                None,
+                None,
+                None,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    goal = asyncio.run(store.get_goal("goal-legacy-summary-selection-1"))
+    assert goal is not None
+    assert goal["strategy_id"] == "teacher_student_distill"
+    assert goal["protocol_id"] == "teacher_student_distill"
+    assert goal["selection_source"] == "legacy_migration"
+    assert goal["selection_reason"] == (
+        "Legacy goal explicitly selected distill mode from workflow UI."
+    )
+
+
+def test_runtime_store_marks_route_derived_legacy_defaults_as_legacy_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO goals (
+                id, objective, title, goal_type, execution_mode, strategy_id, selection_source,
+                selection_reason, protocol_id, topic, project_id, workspace_dir, status,
+                current_attempt_id, run_policy_json, capability_policy_json, source_manifest_json,
+                summary_json, metadata_json, latest_error, started_at, finished_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "goal-legacy-route-default-1",
+                "Read a legacy goal whose selection was implied by route-derived state.",
+                None,
+                None,
+                "single_agent",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "created",
+                None,
+                "{}",
+                "{}",
+                "{}",
+                '{"interaction_mode":"goal","execution_mode":"single_agent"}',
+                '{"default_route":"workflow"}',
+                None,
+                None,
+                None,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    goal = asyncio.run(store.get_goal("goal-legacy-route-default-1"))
+    assert goal is not None
+    assert goal["strategy_id"] == "autonomous_single_agent"
+    assert goal["protocol_id"] == "autonomous_single_agent"
     assert goal["selection_source"] == "legacy_migration"
     assert goal["selection_reason"] == (
         "Legacy goal metadata mapped to autonomous_single_agent during strategy migration."
