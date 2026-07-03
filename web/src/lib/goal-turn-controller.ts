@@ -1,6 +1,6 @@
 import type { ActiveGoalTurnDecision } from './api'
 
-export interface ActiveGoalTurnDecisionMetadata {
+export interface ActiveGoalTurnDecisionMetadata extends Record<string, unknown> {
   active_goal_turn_decision: {
     lane: ActiveGoalTurnDecision['lane']
     kind: ActiveGoalTurnDecision['kind']
