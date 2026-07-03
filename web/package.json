@@ -22,6 +22,7 @@
     "test:chat-goal-routing": "node --experimental-strip-types ./scripts/test-chat-goal-routing.mjs",
     "test:chat-goal-workflow-routing": "node --experimental-strip-types ./scripts/test-chat-goal-workflow-routing.mjs",
     "test:chat-active-goal-turn-decision": "node ./scripts/test-chat-active-goal-turn-decision.mjs",
+    "test:execution-transcript-chat-projection": "node --experimental-strip-types ./scripts/test-execution-transcript-chat-projection.mjs",
     "test:chat-send-contract": "node --experimental-strip-types ./scripts/test-chat-send-contract.mjs",
     "test:current-model-selection": "node --experimental-strip-types ./scripts/test-current-model-selection.mjs",
     "test:goal-proposal-models": "node --experimental-strip-types ./scripts/test-goal-proposal-models.mjs",

@@ -36,6 +36,18 @@ const DURABLE_WORKFLOW_LIFECYCLE_EVENT_TYPES = new Set([
   'run_started',
 ])
 
+const DURABLE_CHAT_PROJECTION_LANES = new Set(['conversation', 'chat'])
+
+const TRANSIENT_CHAT_PROJECTION_LANES = new Set([
+  'execution',
+  'execution_only',
+  'goal_surface',
+  'goal_surface_only',
+  'subagent',
+  'subagent_detail',
+  'subagent_only',
+])
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
@@ -83,6 +95,16 @@ function normalizeStatus(value: string | null | undefined): string {
 function normalizeContractToken(value: string | null | undefined): string | null {
   const normalized = value?.trim().toLowerCase() ?? ''
   return normalized.length > 0 ? normalized : null
+}
+
+function getRecordString(record: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = getString(record[key])
+    if (value) {
+      return value
+    }
+  }
+  return null
 }
 
 function getEventToolName(event: ExecutionTranscriptEvent): string | null {
@@ -592,6 +614,45 @@ export function formatWorkflowLifecycleMessage(event: Record<string, unknown>): 
   return type.replaceAll('_', ' ')
 }
 
+function shouldProjectAssistantMessageToDurableChat(event: Record<string, unknown>): boolean {
+  const metadata = isRecord(event.metadata) ? event.metadata : {}
+  const visibility = normalizeContractToken(
+    getRecordString(event, 'visibility') ?? getMetadataString(metadata, 'visibility')
+  )
+  if (visibility === 'hidden' || visibility === 'none') {
+    return false
+  }
+
+  const durability = normalizeContractToken(
+    getRecordString(event, 'durability') ?? getMetadataString(metadata, 'durability')
+  )
+  if (durability === 'transient') {
+    return false
+  }
+
+  const projectionLane = normalizeContractToken(
+    getRecordString(event, 'projection_lane', 'projectionLane') ??
+      getMetadataString(metadata, 'projection_lane', 'projectionLane')
+  )
+  if (projectionLane && TRANSIENT_CHAT_PROJECTION_LANES.has(projectionLane)) {
+    return false
+  }
+  if (projectionLane && DURABLE_CHAT_PROJECTION_LANES.has(projectionLane)) {
+    return true
+  }
+  if (durability === 'durable') {
+    return true
+  }
+
+  const hasSourceContractField =
+    visibility !== null || durability !== null || projectionLane !== null
+  if (!hasSourceContractField) {
+    return metadata.acknowledgement !== true
+  }
+
+  return true
+}
+
 export function projectWorkflowRunEventToSessionEvent(
   event: Record<string, unknown>,
   options: {
@@ -673,8 +734,7 @@ export function projectWorkflowRunEventToSessionEvent(
   }
 
   if (type === 'assistant_message') {
-    const eventMetadata = isRecord(event.metadata) ? event.metadata : {}
-    if (eventMetadata.acknowledgement === true) {
+    if (!shouldProjectAssistantMessageToDurableChat(event)) {
       return null
     }
     return {

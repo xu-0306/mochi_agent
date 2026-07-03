@@ -100,6 +100,9 @@ documents/
 implementation_plan.md
 scripts/
 web/scripts/
+!web/scripts/
+web/scripts/*
+!web/scripts/test-execution-transcript-chat-projection.mjs
 web/README.md
 web/next-env.d.ts
 web/tsconfig.tsbuildinfo
