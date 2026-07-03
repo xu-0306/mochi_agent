@@ -119,27 +119,69 @@ assert.deepEqual(
   }
 )
 
-for (const text of [
-  'research this for 20 minutes',
-  'Keep working on this in the background for the next 30 minutes.',
-  'Resume the migration and come back with progress.',
-  'Investiga este tema durante 20 minutos y resume los hallazgos.',
-  'Is vishay par 20 minute research karke summary do.',
-  'what is the goal doing right now?',
-  'Prioritize the failing login test first and keep the patch minimal',
-  '\u8acb\u7814\u7a76\u9019\u500b\u4e3b\u984c 20\u5206\u9418\uff0c\u6574\u7406\u91cd\u9ede\u7d66\u6211\u3002',
-  '\u76ee\u524d\u9032\u5ea6\u5982\u4f55',
-  '\u5148\u67e5\u6587\u737b\u518d\u5be6\u4f5c',
+for (const { label, text, hasActiveGoal } of [
+  {
+    label: 'chinese timed research request',
+    text: '\u8acb\u7814\u7a76\u9019\u500b\u4e3b\u984c 20\u5206\u9418\uff0c\u6574\u7406\u91cd\u9ede\u7d66\u6211\u3002',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'english timed research request',
+    text: 'Research this for 30 minutes and come back with progress',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'english background-work request',
+    text: 'Keep working on this in the background for the next 30 minutes.',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'spanish timed research request',
+    text: 'Investiga este tema durante 20 minutos y resume los hallazgos.',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'hindi timed research request',
+    text: 'Is vishay par 20 minute research karke summary do.',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'active goal progress question',
+    text: 'What is the goal doing right now?',
+    hasActiveGoal: true,
+  },
+  {
+    label: 'active goal blocked-state explanation',
+    text: 'What does this blocked state mean?',
+    hasActiveGoal: true,
+  },
+  {
+    label: 'active goal steering instruction',
+    text: 'Prioritize the failing login test first and keep the patch minimal',
+    hasActiveGoal: true,
+  },
+  {
+    label: 'active goal ambiguous follow-up',
+    text: 'Can you share progress?',
+    hasActiveGoal: true,
+  },
 ]) {
   assert.deepEqual(
     resolveChatGoalWorkflowRouting({
       text,
       attachmentCount: 0,
       hasPendingProposal: false,
-      hasActiveGoal: false,
-    }).route,
-    { kind: 'direct_chat' },
-    `expected ordinary natural language without an active goal to stay direct_chat: ${text}`
+      hasActiveGoal,
+    }),
+    {
+      modeCommand: null,
+      requestText: text,
+      route: { kind: 'direct_chat' },
+      workflowModeRequested: false,
+      requiresSessionMaterialization: false,
+      shouldHandleGoalWorkflowRouting: false,
+    },
+    `expected ${label} to stay direct_chat`
   )
 
   assert.deepEqual(
@@ -147,10 +189,10 @@ for (const text of [
       text,
       attachmentCount: 0,
       hasPendingProposal: false,
-      hasActiveGoal: true,
+      hasActiveGoal: !hasActiveGoal,
     }).route,
     { kind: 'direct_chat' },
-    `expected ordinary natural language with an active goal to stay direct_chat: ${text}`
+    `expected ${label} to stay direct_chat regardless of active goal state`
   )
 }
 

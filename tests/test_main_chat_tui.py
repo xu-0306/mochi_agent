@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 from mochi.agents.events import FinalAnswerEvent, TextChunkEvent, ToolCallResultEvent
 from mochi.config.schema import SecurityConfig
 from mochi.main import DEFAULT_TUI_MAX_TURNS, DEFAULT_TUI_SESSION_ID, app
-from mochi.terminal_goal_helpers import resolve_goal_workflow_routing
+from mochi.terminal_goal_helpers import is_natural_language_goal_request, resolve_goal_workflow_routing
 
 runner = CliRunner()
 
@@ -1942,25 +1942,119 @@ async def test_chat_tui_async_active_goal_runtime_service_creation_failure_falls
     assert "fallback chat" in captured
 
 
-def test_tui_goal_routing_ignores_non_slash_natural_language_goal_phrasing() -> None:
+def test_is_natural_language_goal_request_remains_disabled_placeholder() -> None:
     messages = [
-        "Can you share progress?",
-        "please focus on tests",
+        "請研究這個主題 20分鐘，整理重點給我。",
         "Research this for 30 minutes and come back with progress",
-        "keep working on this in the background",
+        "Keep working on this in the background for the next 30 minutes.",
+        "Investiga este tema durante 20 minutos y resume los hallazgos.",
+        "Is vishay par 20 minute research karke summary do.",
+        "What is the goal doing right now?",
+        "What does this blocked state mean?",
+        "Prioritize the failing login test first and keep the patch minimal",
+        "Can you share progress?",
     ]
 
-    for has_active_goal in (False, True):
-        for message in messages:
-            decision = resolve_goal_workflow_routing(
-                text=message,
-                has_pending_proposal=False,
-                has_active_goal=has_active_goal,
-            )
-            assert decision.natural_language_goal_requested is False
-            assert decision.active_goal_follow_up_requested is False
-            assert decision.pending_proposal_follow_up_requested is False
-            assert decision.should_handle_goal_workflow_routing is False
+    for message in messages:
+        assert is_natural_language_goal_request(message) is False
+
+
+def test_tui_goal_routing_ignores_non_slash_natural_language_goal_phrasing() -> None:
+    cases = [
+        ("chinese timed research", "請研究這個主題 20分鐘，整理重點給我。", False),
+        ("english timed research", "Research this for 30 minutes and come back with progress", False),
+        (
+            "english background work",
+            "Keep working on this in the background for the next 30 minutes.",
+            False,
+        ),
+        ("spanish timed research", "Investiga este tema durante 20 minutos y resume los hallazgos.", False),
+        ("hindi timed research", "Is vishay par 20 minute research karke summary do.", False),
+        ("active goal progress question", "What is the goal doing right now?", True),
+        ("active goal blocked-state explanation", "What does this blocked state mean?", True),
+        (
+            "active goal steering instruction",
+            "Prioritize the failing login test first and keep the patch minimal",
+            True,
+        ),
+        ("active goal ambiguous follow-up", "Can you share progress?", True),
+    ]
+
+    for label, message, has_active_goal in cases:
+        decision = resolve_goal_workflow_routing(
+            text=message,
+            has_pending_proposal=False,
+            has_active_goal=has_active_goal,
+        )
+        assert decision.mode_command is None, label
+        assert decision.goal_command is None, label
+        assert decision.request_text == message, label
+        assert decision.workflow_mode_requested is False, label
+        assert decision.workflow_proposal_requested is False, label
+        assert decision.natural_language_goal_requested is False, label
+        assert decision.active_goal_follow_up_requested is False, label
+        assert decision.pending_proposal_follow_up_requested is False, label
+        assert decision.confirmation_requested is False, label
+        assert decision.proposal_revision_requested is False, label
+        assert decision.should_handle_goal_workflow_routing is False, label
+
+
+def test_tui_goal_routing_only_handles_explicit_goal_workflow_commands_and_pending_follow_up() -> None:
+    explicit_goal_proposal = resolve_goal_workflow_routing(
+        text="/goal research this for 20 minutes",
+        has_pending_proposal=False,
+        has_active_goal=False,
+    )
+    assert explicit_goal_proposal.goal_command is not None
+    assert explicit_goal_proposal.goal_command.action == "proposal"
+    assert explicit_goal_proposal.goal_command.content == "research this for 20 minutes"
+    assert explicit_goal_proposal.request_text == "research this for 20 minutes"
+    assert explicit_goal_proposal.should_handle_goal_workflow_routing is True
+
+    explicit_goal_lifecycle = resolve_goal_workflow_routing(
+        text="/goal status",
+        has_pending_proposal=False,
+        has_active_goal=True,
+    )
+    assert explicit_goal_lifecycle.goal_command is not None
+    assert explicit_goal_lifecycle.goal_command.action == "status"
+    assert explicit_goal_lifecycle.request_text == "/goal status"
+    assert explicit_goal_lifecycle.should_handle_goal_workflow_routing is True
+
+    explicit_workflow = resolve_goal_workflow_routing(
+        text="/workflow draft a multi-agent plan",
+        has_pending_proposal=False,
+        has_active_goal=False,
+    )
+    assert explicit_workflow.mode_command is not None
+    assert explicit_workflow.mode_command.mode == "workflow"
+    assert explicit_workflow.request_text == "draft a multi-agent plan"
+    assert explicit_workflow.workflow_mode_requested is True
+    assert explicit_workflow.workflow_proposal_requested is True
+    assert explicit_workflow.should_handle_goal_workflow_routing is True
+
+    explicit_chat = resolve_goal_workflow_routing(
+        text="/chat what models are available?",
+        has_pending_proposal=False,
+        has_active_goal=True,
+    )
+    assert explicit_chat.mode_command is not None
+    assert explicit_chat.mode_command.mode == "chat"
+    assert explicit_chat.request_text == "what models are available?"
+    assert explicit_chat.workflow_mode_requested is False
+    assert explicit_chat.workflow_proposal_requested is False
+    assert explicit_chat.should_handle_goal_workflow_routing is False
+
+    pending_follow_up = resolve_goal_workflow_routing(
+        text="go ahead",
+        has_pending_proposal=True,
+        has_active_goal=False,
+    )
+    assert pending_follow_up.mode_command is None
+    assert pending_follow_up.goal_command is None
+    assert pending_follow_up.request_text == "go ahead"
+    assert pending_follow_up.pending_proposal_follow_up_requested is True
+    assert pending_follow_up.should_handle_goal_workflow_routing is True
 
 
 @pytest.mark.asyncio

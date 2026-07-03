@@ -45,31 +45,74 @@ assert.equal(workflowProposal.workflowModeRequested, true)
 assert.equal(workflowProposal.route.kind, 'workflow_proposal')
 assert.equal(workflowProposal.shouldHandleGoalWorkflowRouting, true)
 
-for (const text of [
-  '\u8acb\u7814\u7a76\u9019\u500b\u4e3b\u984c 20\u5206\u9418\uff0c\u6574\u7406\u91cd\u9ede\u7d66\u6211\u3002',
-  'research this for 20 minutes',
-  'Keep working on this in the background for 30 minutes and come back with progress',
-  'What does this blocked state mean?',
-  'Prioritize the failing login test first and keep the patch minimal',
-  '\u6211\u554f\u7684\u662f\u4f60\u7684\u9032\u5ea6\u5982\u4f55',
-]) {
-  const idleNaturalLanguage = resolveChatGoalWorkflowRouting({
-    text,
-    attachmentCount: 0,
-    hasPendingProposal: false,
+for (const { label, text, hasActiveGoal } of [
+  {
+    label: 'chinese timed research request',
+    text: '\u8acb\u7814\u7a76\u9019\u500b\u4e3b\u984c 20\u5206\u9418\uff0c\u6574\u7406\u91cd\u9ede\u7d66\u6211\u3002',
     hasActiveGoal: false,
-  })
-  assert.equal(idleNaturalLanguage.route.kind, 'direct_chat')
-  assert.equal(idleNaturalLanguage.shouldHandleGoalWorkflowRouting, false)
-
-  const activeGoalNaturalLanguage = resolveChatGoalWorkflowRouting({
+  },
+  {
+    label: 'english timed research request',
+    text: 'Research this for 20 minutes',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'english background-work request',
+    text: 'Keep working on this in the background for 30 minutes and come back with progress',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'spanish timed research request',
+    text: 'Investiga este tema durante 20 minutos y resume los hallazgos.',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'hindi timed research request',
+    text: 'Is vishay par 20 minute research karke summary do.',
+    hasActiveGoal: false,
+  },
+  {
+    label: 'active goal progress question',
+    text: 'What is the goal doing right now?',
+    hasActiveGoal: true,
+  },
+  {
+    label: 'active goal blocked-state explanation',
+    text: 'What does this blocked state mean?',
+    hasActiveGoal: true,
+  },
+  {
+    label: 'active goal steering instruction',
+    text: 'Prioritize the failing login test first and keep the patch minimal',
+    hasActiveGoal: true,
+  },
+  {
+    label: 'active goal ambiguous follow-up',
+    text: 'Can you share progress?',
+    hasActiveGoal: true,
+  },
+]) {
+  const decision = resolveChatGoalWorkflowRouting({
     text,
     attachmentCount: 0,
     hasPendingProposal: false,
-    hasActiveGoal: true,
+    hasActiveGoal,
   })
-  assert.equal(activeGoalNaturalLanguage.route.kind, 'direct_chat')
-  assert.equal(activeGoalNaturalLanguage.shouldHandleGoalWorkflowRouting, false)
+  assert.equal(decision.route.kind, 'direct_chat', label)
+  assert.equal(decision.shouldHandleGoalWorkflowRouting, false, label)
+
+  const alternateStateDecision = resolveChatGoalWorkflowRouting({
+    text,
+    attachmentCount: 0,
+    hasPendingProposal: false,
+    hasActiveGoal: !hasActiveGoal,
+  })
+  assert.equal(alternateStateDecision.route.kind, 'direct_chat', `${label} alternate state`)
+  assert.equal(
+    alternateStateDecision.shouldHandleGoalWorkflowRouting,
+    false,
+    `${label} alternate state`
+  )
 }
 
 const explicitGoalProposal = resolveChatGoalWorkflowRouting({
