@@ -2133,13 +2133,36 @@ export default function ChatPage() {
     [projectedWorkflowRun]
   )
   const displayMessages = React.useMemo<Message[]>(() => {
-    return buildProjectedDisplayMessages({
+    const projected = buildProjectedDisplayMessages({
       messages,
       runtimeTasks: contextualRuntimeTasks,
       workflowProgressCard,
       workflowRun: projectedWorkflowRun,
     })
-  }, [contextualRuntimeTasks, messages, projectedWorkflowRun, workflowProgressCard])
+    if (currentSessionGoalState.pending_proposal !== null) {
+      return projected
+    }
+    const visibleMessages: Message[] = []
+    for (const message of projected) {
+      const goalCard = message.goalCard
+      if (!goalCard || goalCard.kind === 'started' || goalCard.superseded) {
+        visibleMessages.push(message)
+        continue
+      }
+
+      const { goalCard: _staleGoalCard, ...messageWithoutGoalCard } = message
+      if (messageWithoutGoalCard.content.trim().length > 0 || messageWithoutGoalCard.attachments?.length) {
+        visibleMessages.push(messageWithoutGoalCard)
+      }
+    }
+    return visibleMessages
+  }, [
+    contextualRuntimeTasks,
+    currentSessionGoalState.pending_proposal,
+    messages,
+    projectedWorkflowRun,
+    workflowProgressCard,
+  ])
 
   React.useEffect(() => {
     if (delegatedSubagentToolResultCount > 0) {
@@ -4496,6 +4519,22 @@ export default function ChatPage() {
           return
         }
       }
+
+      if (
+        route.kind === 'direct_chat' &&
+        sessionContext.baseGoalState.pending_proposal !== null &&
+        requestText.trim().length > 0
+      ) {
+        await persistSessionGoalState(sessionId, {
+          ...sessionContext.baseGoalState,
+          active_goal_id: null,
+          active_goal_status: null,
+          default_route: 'chat',
+          pending_proposal: null,
+        })
+        sessionContext = sessionScope.getContext()
+      }
+
       if (workflowProposalRequested) {
         setTaskPanelOpen(false)
         setTaskPanelMode('default')
@@ -4589,6 +4628,7 @@ export default function ChatPage() {
       handleGoalWorkflowRouting,
       hasActiveStream,
       persistGoalConversation,
+      persistSessionGoalState,
       persistWorkflowState,
       setPanelOpen,
       setTaskPanelFocusedTaskId,

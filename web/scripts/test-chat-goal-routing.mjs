@@ -224,6 +224,26 @@ assert.deepEqual(
   }
 )
 
+for (const text of ['hi', 'hello', '\u4f60\u597d', '\u55e8']) {
+  assert.deepEqual(
+    resolveChatGoalWorkflowRouting({
+      text,
+      attachmentCount: 0,
+      hasPendingProposal: true,
+      hasActiveGoal: false,
+    }),
+    {
+      modeCommand: null,
+      requestText: text,
+      route: { kind: 'direct_chat' },
+      workflowModeRequested: false,
+      requiresSessionMaterialization: false,
+      shouldHandleGoalWorkflowRouting: false,
+    },
+    `expected ordinary follow-up ${text} to leave pending goal proposal lane`
+  )
+}
+
 assert.deepEqual(
   resolveChatGoalWorkflowRouting({
     text: '\u8abf\u6574\u7bc4\u570d',

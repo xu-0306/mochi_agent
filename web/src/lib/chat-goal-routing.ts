@@ -37,6 +37,18 @@ export interface ResolveChatGoalWorkflowRoutingInput {
   hasActiveGoal: boolean
 }
 
+const ORDINARY_CHAT_FOLLOW_UPS = new Set([
+  'hi',
+  'hello',
+  'hey',
+  'yo',
+  '你好',
+  '您好',
+  '嗨',
+  '哈囉',
+  '哈啰',
+])
+
 export function parseChatModeCommand(value: string): ChatModeCommand | null {
   const match = value.match(/^\/(workflow|chat)(?:\s+([\s\S]*))?$/i)
   if (!match) {
@@ -79,6 +91,17 @@ export function parseGoalCommand(value: string): GoalCommand | null {
   }
 }
 
+function normalizeOrdinaryFollowUp(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.!?,;:'"`~()[\]{}<>/\\|，。！？；：「」『』（）【】《》、]+/g, '')
+}
+
+function isOrdinaryChatFollowUp(value: string): boolean {
+  return ORDINARY_CHAT_FOLLOW_UPS.has(normalizeOrdinaryFollowUp(value))
+}
+
 export function resolveChatGoalWorkflowRouting(
   input: ResolveChatGoalWorkflowRoutingInput
 ): ChatGoalWorkflowRoutingDecision {
@@ -97,7 +120,8 @@ export function resolveChatGoalWorkflowRouting(
     !modeCommand &&
     input.hasPendingProposal &&
     input.attachmentCount === 0 &&
-    requestText.trim().length > 0
+    requestText.trim().length > 0 &&
+    !isOrdinaryChatFollowUp(requestText)
   const proposalRevisionRequested =
     !goalCommand &&
     !modeCommand &&
