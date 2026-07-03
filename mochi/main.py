@@ -1826,13 +1826,18 @@ async def _create_tui_runtime_service(
 ) -> object:
     from mochi.config import defaults
     from mochi.config.schema import SecurityConfig
+    from mochi.runtime.active_goal_turn_selector import build_active_goal_turn_selector
     from mochi.runtime.service import RuntimeService
     from mochi.runtime.store import RuntimeStore
 
     sessions_dir = str(getattr(config, "sessions_dir", defaults.default_sessions_dir()))
     store = RuntimeStore(Path(sessions_dir) / "runtime.db")
     await store.initialize()
-    service = RuntimeService(engine=engine, store=store)
+    service = RuntimeService(
+        engine=engine,
+        store=store,
+        active_goal_turn_selector=build_active_goal_turn_selector(engine),
+    )
     security = getattr(config, "security", None)
     if not isinstance(security, SecurityConfig):
         payload = dict(security.__dict__) if security is not None and hasattr(security, "__dict__") else {}

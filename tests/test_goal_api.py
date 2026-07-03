@@ -979,6 +979,57 @@ def test_goal_turn_decision_route_classifies_lifecycle_command(
     assert payload["requires_confirmation"] is False
 
 
+def test_goal_turn_decision_route_uses_production_semantic_selector_from_app_runtime_service(
+    tmp_path: Path,
+) -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def invoke(self, request: Any) -> Any:
+            self.requests.append(request)
+            return SimpleNamespace(
+                content=(
+                    '{"kind":"steer","confidence":0.97,'
+                    '"selection_reason":"Semantic selector recognized a non-English steering instruction.",'
+                    '"requires_confirmation":false}'
+                )
+            )
+
+    app = create_app()
+    fake_engine = _FakeEngine()
+    app.state.engine_factory = lambda: fake_engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={"objective": "Accept semantic steering from the production runtime-service builder."},
+        )
+        assert create_response.status_code == 200
+        goal_id = create_response.json()["goal_id"]
+
+        response = client.post(
+            f"/v1/goals/{goal_id}/turn-decision",
+            json={"message": "다음에는 벤치마크 비교에 집중해 줘"},
+        )
+        assert callable(getattr(app.state.runtime_service, "_active_goal_turn_selector", None))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "steer"
+    assert payload["selection_source"] == "semantic_registry_selector"
+    assert payload["requires_confirmation"] is False
+    assert len(fake_engine.requests) == 1
+    request = fake_engine.requests[0]
+    assert request.tool_mode == "disabled"
+    assert request.execution_profile == "judge"
+    assert request.persist_session is False
+    assert '"fallback_decision"' in request.message
+
+
 def test_goal_turn_decision_route_semantic_selector_can_override_non_keyword_steering(
     tmp_path: Path,
 ) -> None:

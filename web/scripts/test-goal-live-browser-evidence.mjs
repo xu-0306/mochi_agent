@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -9,6 +10,7 @@ const PORT = Number(process.env.MOCHI_GOAL_LIVE_FIXTURE_PORT ?? 3220)
 const BASE_URL = `http://127.0.0.1:${PORT}`
 const APP_URL = `${BASE_URL}/`
 const require = createRequire(import.meta.url)
+const SSE_CHUNK_DELAY_MS = 80
 let stoppingDevServer = false
 
 const sessionId = 'session-goal-live-evidence'
@@ -43,13 +45,14 @@ function findChromiumExecutable() {
   return candidates.find((candidate) => fs.existsSync(candidate))
 }
 
-function startDevServer() {
+function startDevServer(directApiBaseUrl) {
   const command = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   const child = spawn(command, ['run', 'dev', '--', '--hostname', '127.0.0.1', '--port', String(PORT)], {
     cwd: WEB_DIR,
     env: {
       ...process.env,
       NEXT_TELEMETRY_DISABLED: '1',
+      NEXT_PUBLIC_MOCHI_API_BASE_URL: directApiBaseUrl,
     },
     shell: process.platform === 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -100,9 +103,24 @@ async function waitForServer(url, timeoutMs = 45_000) {
     } catch {
       // Server is not ready yet.
     }
-    await new Promise((resolve) => setTimeout(resolve, 500))
+    await sleep(500)
   }
   throw new Error(`Timed out waiting for ${url}`)
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForCondition(predicate, label, timeoutMs = 30_000) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return
+    }
+    await sleep(100)
+  }
+  throw new Error(`Timed out waiting for ${label}`)
 }
 
 function json(body) {
@@ -110,6 +128,36 @@ function json(body) {
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify(body),
+  }
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function buildRowKey(event) {
+  return (
+    event.event_id ??
+    event.eventId ??
+    event.dedupe_key ??
+    event.dedupeKey ??
+    `${event.seq ?? 'seq'}:${event.type}:${event.subagent_id ?? event.subagentId ?? 'runtime'}:${event.created_at ?? event.createdAt ?? 'unknown'}`
+  )
+}
+
+function serializeSseFrame(event) {
+  return `id: ${event.event_id ?? event.seq ?? 'event'}\nevent: goal_surface\ndata: ${JSON.stringify(event)}\n\n`
+}
+
+async function writeChunkedSseFrame(response, event) {
+  const frame = serializeSseFrame(event)
+  const chunkSize = Math.max(1, Math.ceil(frame.length / 3))
+  for (let index = 0; index < frame.length; index += chunkSize) {
+    if (response.destroyed || response.writableEnded) {
+      return
+    }
+    response.write(frame.slice(index, index + chunkSize))
+    await sleep(SSE_CHUNK_DELAY_MS)
   }
 }
 
@@ -134,11 +182,11 @@ const goalSummary = {
       status: 'running',
       agent_run_id: runId,
       created_at: '2026-07-03T03:01:00.000Z',
-      updated_at: '2026-07-03T03:02:00.000Z',
+      updated_at: '2026-07-03T03:02:15.000Z',
     },
   ],
   created_at: '2026-07-03T03:00:00.000Z',
-  updated_at: '2026-07-03T03:02:00.000Z',
+  updated_at: '2026-07-03T03:02:15.000Z',
 }
 
 const sessionGoalState = {
@@ -170,7 +218,7 @@ const sessionEvents = [
   },
 ]
 
-const transcriptEvents = [
+const transcriptSeedEvents = [
   {
     type: 'run_started',
     seq: 1,
@@ -224,45 +272,217 @@ const transcriptEvents = [
   },
 ]
 
-const duplicatedTranscriptPayload = {
-  events: [
-    ...transcriptEvents,
-    { ...transcriptEvents[1], seq: 22 },
-    { ...transcriptEvents[2], seq: 23 },
-  ],
-}
-
-const subagentSummary = {
-  subagent_id: subagentId,
-  agent_run_id: runId,
+const streamedGoalSurfaceEvent = {
+  type: 'subagent_progress',
+  seq: 4,
+  event_id: 'evt-worker-progress-live',
+  dedupe_key: `${runId}:${subagentId}:progress:live`,
+  visibility: 'visible',
+  durability: 'transient',
+  projection_lane: 'goal_surface',
   parent_type: 'agent_run',
   parent_id: runId,
-  session_id: sessionId,
+  subagent_id: subagentId,
   role_id: 'executor',
   title: 'Goal live fixture worker',
   model_id: 'fixture-model',
   status: 'running',
-  prompt_preview: 'Collect live browser evidence.',
-  summary: 'Worker started live browser evidence collection.',
-  output_preview: null,
-  event_count: 3,
-  created_at: '2026-07-03T03:01:15.000Z',
-  updated_at: '2026-07-03T03:01:30.000Z',
+  summary: 'Streamed execution progress reached the browser live.',
+  timestamp: '2026-07-03T03:01:45.000Z',
 }
 
-const agentRunDetail = {
-  run_id: runId,
+const reconnectPollEvent = {
+  type: 'subagent_thinking',
+  seq: 5,
+  event_id: 'evt-worker-thinking-reconnect',
+  dedupe_key: `${runId}:${subagentId}:thinking:reconnect`,
+  visibility: 'visible',
+  durability: 'transient',
+  projection_lane: 'goal_surface',
+  parent_type: 'agent_run',
+  parent_id: runId,
+  subagent_id: subagentId,
+  role_id: 'executor',
+  title: 'Goal live fixture worker',
+  model_id: 'fixture-model',
   status: 'running',
-  protocol_id: 'autonomous_single_agent',
-  objective,
-  created_at: '2026-07-03T03:01:00.000Z',
-  updated_at: '2026-07-03T03:01:30.000Z',
-  events: transcriptEvents,
+  summary: 'Polling fallback replayed the live transcript without duplicates.',
+  timestamp: '2026-07-03T03:02:00.000Z',
 }
 
-async function installRoutes(page, requestLog) {
+const expectedTimelineRowKeys = [
+  transcriptSeedEvents[0],
+  transcriptSeedEvents[1],
+  transcriptSeedEvents[2],
+  streamedGoalSurfaceEvent,
+  reconnectPollEvent,
+].map((event) => buildRowKey(event))
+
+function buildTranscriptHistory(state) {
+  const events = [...transcriptSeedEvents]
+  if (state.streamDelivered) {
+    events.push(streamedGoalSurfaceEvent)
+  }
+  if (state.reconnectDelivered) {
+    events.push(reconnectPollEvent)
+  }
+  return events
+}
+
+function buildTranscriptPayload(state, afterSeq) {
+  if (afterSeq === null) {
+    if (state.reconnectDelivered) {
+      return [
+        ...transcriptSeedEvents,
+        streamedGoalSurfaceEvent,
+        reconnectPollEvent,
+        { ...streamedGoalSurfaceEvent },
+        { ...reconnectPollEvent },
+      ]
+    }
+    return [
+      ...transcriptSeedEvents,
+      { ...transcriptSeedEvents[1] },
+      { ...transcriptSeedEvents[2] },
+    ]
+  }
+
+  if (afterSeq >= 5) {
+    return [{ ...reconnectPollEvent }]
+  }
+
+  if (afterSeq >= 4) {
+    state.reconnectDelivered = true
+    return [
+      { ...streamedGoalSurfaceEvent },
+      reconnectPollEvent,
+      { ...reconnectPollEvent },
+    ]
+  }
+
+  if (afterSeq >= 3) {
+    return [{ ...streamedGoalSurfaceEvent }]
+  }
+
+  return buildTranscriptHistory(state)
+}
+
+function buildAgentRunDetail(state) {
+  const events = buildTranscriptHistory(state)
+  return {
+    run_id: runId,
+    status: 'running',
+    protocol_id: 'autonomous_single_agent',
+    objective,
+    created_at: '2026-07-03T03:01:00.000Z',
+    updated_at: events.at(-1)?.timestamp ?? '2026-07-03T03:01:30.000Z',
+    events,
+  }
+}
+
+function buildSubagentSummary(state) {
+  const events = buildTranscriptHistory(state)
+  return {
+    subagent_id: subagentId,
+    agent_run_id: runId,
+    parent_type: 'agent_run',
+    parent_id: runId,
+    session_id: sessionId,
+    role_id: 'executor',
+    title: 'Goal live fixture worker',
+    model_id: 'fixture-model',
+    status: 'running',
+    prompt_preview: 'Collect live browser evidence.',
+    summary: 'Worker started live browser evidence collection.',
+    output_preview: null,
+    event_count: events.length,
+    created_at: '2026-07-03T03:01:15.000Z',
+    updated_at: events.at(-1)?.timestamp ?? '2026-07-03T03:01:30.000Z',
+  }
+}
+
+async function startMockApiServer(requestLog) {
+  const state = {
+    reconnectDelivered: false,
+    streamConnectionCount: 0,
+    streamDelivered: false,
+  }
+
+  const server = createServer((request, response) => {
+    void (async () => {
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+      requestLog.push(`${request.method ?? 'GET'} ${url.pathname}${url.search}`)
+      response.setHeader('Access-Control-Allow-Origin', '*')
+      response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS')
+      response.setHeader('Access-Control-Allow-Headers', '*')
+
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204)
+        response.end()
+        return
+      }
+
+      if (url.pathname !== `/v1/agent-runs/${runId}/events/stream`) {
+        response.writeHead(404, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ detail: 'Not found' }))
+        return
+      }
+
+      state.streamConnectionCount += 1
+      const connectionNumber = state.streamConnectionCount
+      response.writeHead(200, {
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'X-Accel-Buffering': 'no',
+      })
+
+      await sleep(150)
+      if (connectionNumber === 1) {
+        state.streamDelivered = true
+        await writeChunkedSseFrame(response, streamedGoalSurfaceEvent)
+      } else if (connectionNumber === 2) {
+        await writeChunkedSseFrame(response, reconnectPollEvent)
+      }
+
+      await sleep(100)
+      if (!response.destroyed && !response.writableEnded) {
+        response.write('data: [DONE]\n\n')
+        response.end()
+      }
+    })().catch((error) => {
+      if (!response.destroyed) {
+        response.destroy(error)
+      }
+    })
+  })
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to bind mock SSE server.')
+  }
+  return {
+    directApiBaseUrl: `http://127.0.0.1:${address.port}`,
+    server,
+    state,
+  }
+}
+
+async function stopMockApiServer(server) {
+  if (!server || !server.listening) {
+    return
+  }
+  await new Promise((resolve) => server.close(resolve))
+}
+
+async function installRoutes(page, requestLog, fixtureState) {
+  const apiPattern = new RegExp(`^${escapeRegex(BASE_URL)}/v1/`)
   await page.route('**/favicon.ico', (route) => route.fulfill({ status: 204, body: '' }))
-  await page.route('**/v1/**', (route) => {
+  await page.route(apiPattern, (route) => {
     const request = route.request()
     const url = new URL(request.url())
     const pathname = url.pathname
@@ -274,7 +494,7 @@ async function installRoutes(page, requestLog) {
           {
             session_id: sessionId,
             title: 'Goal Live Evidence Session',
-            updated_at: '2026-07-03T03:02:00.000Z',
+            updated_at: '2026-07-03T03:02:15.000Z',
             event_count: sessionEvents.length,
             goal: sessionGoalState,
           },
@@ -313,20 +533,22 @@ async function installRoutes(page, requestLog) {
       return route.fulfill(json({ subagents: [] }))
     }
     if (pathname === `/v1/agent-runs/${runId}`) {
-      return route.fulfill(json(agentRunDetail))
+      return route.fulfill(json(buildAgentRunDetail(fixtureState)))
     }
     if (pathname === `/v1/agent-runs/${runId}/events`) {
-      return route.fulfill(json(duplicatedTranscriptPayload))
-    }
-    if (pathname === `/v1/agent-runs/${runId}/events/stream`) {
-      return route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        body: '',
-      })
+      const afterSeqText = url.searchParams.get('after_seq')
+      const afterSeq =
+        afterSeqText === null || afterSeqText === ''
+          ? null
+          : Number.isFinite(Number(afterSeqText))
+            ? Number(afterSeqText)
+            : null
+      return route.fulfill(json({
+        events: buildTranscriptPayload(fixtureState, afterSeq),
+      }))
     }
     if (pathname === `/v1/agent-runs/${runId}/subagents`) {
-      return route.fulfill(json({ subagents: [subagentSummary] }))
+      return route.fulfill(json({ subagents: [buildSubagentSummary(fixtureState)] }))
     }
     if (pathname === '/v1/goals') {
       return route.fulfill(json([goalSummary]))
@@ -369,42 +591,6 @@ async function installRoutes(page, requestLog) {
   })
 }
 
-async function visibleTextCount(page, text) {
-  return page.evaluate((expected) => {
-    return Array.from(document.querySelectorAll('body *')).filter((element) => {
-      const rect = element.getBoundingClientRect()
-      const style = window.getComputedStyle(element)
-      const visible = (
-        element.textContent?.includes(expected) &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.visibility !== 'hidden' &&
-        style.display !== 'none'
-      )
-      if (!visible) {
-        return false
-      }
-      return !Array.from(element.children).some((child) => child.textContent?.includes(expected))
-    }).length
-  }, text)
-}
-
-async function visibleTextContainerCount(page, text) {
-  return page.evaluate((expected) => {
-    return Array.from(document.querySelectorAll('body *')).filter((element) => {
-      const rect = element.getBoundingClientRect()
-      const style = window.getComputedStyle(element)
-      return (
-        element.textContent?.includes(expected) &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.visibility !== 'hidden' &&
-        style.display !== 'none'
-      )
-    }).length
-  }, text)
-}
-
 async function waitForVisibleText(page, text, label, requestLog = []) {
   await page.waitForFunction(
     (expected) =>
@@ -427,6 +613,26 @@ async function waitForVisibleText(page, text, label, requestLog = []) {
       `${label}: visible text not found: ${text}. requests=${JSON.stringify(requestLog)} body=${JSON.stringify(body.slice(0, 1500))}. ${error.message}`
     )
   })
+}
+
+async function readTimelineRowKeys(page) {
+  return page.locator('[data-testid="execution-timeline-row"]').evaluateAll((rows) =>
+    rows.map((row) => row.getAttribute('data-row-key') ?? '')
+  )
+}
+
+async function assertTimelineRows(page, expectedKeys, label) {
+  const actualKeys = await readTimelineRowKeys(page)
+  assert.deepEqual(
+    actualKeys,
+    expectedKeys,
+    `${label}: expected rendered timeline row keys ${JSON.stringify(expectedKeys)}, saw ${JSON.stringify(actualKeys)}`
+  )
+  assert.equal(
+    new Set(actualKeys).size,
+    actualKeys.length,
+    `${label}: duplicate timeline rows should not render`
+  )
 }
 
 async function assertNoEmptyAssistantCards(page) {
@@ -461,7 +667,9 @@ async function assertNoConsoleNoise(page, badMessages) {
 }
 
 async function main() {
-  const server = startDevServer()
+  const requestLog = []
+  const mockApi = await startMockApiServer(requestLog)
+  const server = startDevServer(mockApi.directApiBaseUrl)
   try {
     await waitForServer(APP_URL)
     const { chromium } = requireLocalPlaywright()
@@ -471,7 +679,6 @@ async function main() {
     })
     try {
       const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
-      const requestLog = []
       const badMessages = []
       page.on('console', (message) => {
         if (message.type() === 'warning' || message.type() === 'error') {
@@ -479,7 +686,7 @@ async function main() {
         }
       })
       page.on('pageerror', (error) => badMessages.push(`pageerror: ${error.message}`))
-      await installRoutes(page, requestLog)
+      await installRoutes(page, requestLog, mockApi.state)
 
       await page.goto(APP_URL, { waitUntil: 'domcontentloaded' })
       await waitForVisibleText(page, objective, 'initial goal title', requestLog)
@@ -487,40 +694,36 @@ async function main() {
       await waitForVisibleText(page, 'Goal runtime accepted the autonomous task.', 'initial run progress', requestLog)
       await waitForVisibleText(page, 'Thinking through the live execution evidence path.', 'initial thinking progress', requestLog)
       await waitForVisibleText(page, 'Goal live fixture worker', 'initial subagent progress', requestLog)
+      await waitForVisibleText(page, 'Streamed execution progress reached the browser live.', 'live streamed progress row', requestLog)
+      await waitForVisibleText(page, 'Polling fallback replayed the live transcript without duplicates.', 'poll fallback progress row', requestLog)
       await assertNoEmptyAssistantCards(page)
-
-      const initialThinkingRows = await visibleTextCount(page, 'Thinking through the live execution evidence path.')
-      const initialWorkerCards = await visibleTextCount(page, 'Goal live fixture worker')
-      const initialThinkingContainers = await visibleTextContainerCount(page, 'Thinking through the live execution evidence path.')
+      await assertTimelineRows(page, expectedTimelineRowKeys, 'after initial stream and poll recovery')
 
       await page.reload({ waitUntil: 'domcontentloaded' })
       await waitForVisibleText(page, objective, 'reload goal title', requestLog)
       await waitForVisibleText(page, 'Execution highlights', 'reload execution lane', requestLog)
       await waitForVisibleText(page, 'Goal runtime accepted the autonomous task.', 'reload run progress', requestLog)
-      await waitForVisibleText(page, 'Thinking through the live execution evidence path.', 'reload thinking progress', requestLog)
+      await waitForVisibleText(page, 'Streamed execution progress reached the browser live.', 'reload streamed progress row', requestLog)
+      await waitForVisibleText(page, 'Polling fallback replayed the live transcript without duplicates.', 'reload poll replay row', requestLog)
+      await waitForCondition(
+        () => requestLog.includes(`GET /v1/agent-runs/${runId}/events/stream?after_seq=5`),
+        'reload SSE replay request'
+      )
+      await sleep(400)
       await assertNoEmptyAssistantCards(page)
+      await assertTimelineRows(page, expectedTimelineRowKeys, 'after reload reconstruction and stream replay')
 
-      const reloadedThinkingRows = await visibleTextCount(page, 'Thinking through the live execution evidence path.')
-      const reloadedWorkerCards = await visibleTextCount(page, 'Goal live fixture worker')
-      const reloadedThinkingContainers = await visibleTextContainerCount(page, 'Thinking through the live execution evidence path.')
-
-      assert.equal(
-        reloadedThinkingRows,
-        initialThinkingRows,
-        'reload should reconstruct thinking rows without duplicates'
-      )
-      assert.equal(
-        reloadedWorkerCards,
-        initialWorkerCards,
-        'reload should reconstruct subagent cards without duplicates'
+      assert.ok(
+        requestLog.includes(`GET /v1/agent-runs/${runId}/events/stream?after_seq=3`),
+        'browser should open the live SSE stream after initial transcript hydration'
       )
       assert.ok(
-        initialThinkingContainers > initialThinkingRows,
-        'fixture should verify row text inside rendered containers, not only a detached string'
+        requestLog.includes(`GET /v1/agent-runs/${runId}/events?after_seq=4`),
+        'browser should poll transcript recovery after the first stream closes'
       )
       assert.ok(
-        requestLog.some((item) => item.startsWith(`GET /v1/agent-runs/${runId}/events`)),
-        'browser should request run transcript events'
+        requestLog.filter((item) => item === `GET /v1/agent-runs/${runId}/events`).length >= 2,
+        'reload should reconstruct from transcript history again'
       )
       assert.ok(
         requestLog.filter((item) => item === `GET /v1/sessions/${sessionId}`).length >= 2,
@@ -533,24 +736,24 @@ async function main() {
         ok: true,
         checks: {
           visibleExecutionHighlights: true,
-          visibleThinkingProgress: true,
+          visibleStreamedProgress: true,
+          visiblePollReplayProgress: true,
           noEmptyAssistantCards: true,
-          reloadDedupeStable: true,
+          reloadAndReconnectDedupeStable: true,
         },
         counts: {
-          initialThinkingRows,
-          reloadedThinkingRows,
-          initialWorkerCards,
-          reloadedWorkerCards,
-          initialThinkingContainers,
-          reloadedThinkingContainers,
+          expectedTimelineRows: expectedTimelineRowKeys.length,
+          streamConnections: mockApi.state.streamConnectionCount,
+          requestLogEntries: requestLog.length,
         },
+        requests: requestLog,
       }, null, 2))
     } finally {
       await browser.close()
     }
   } finally {
     await stopDevServer(server)
+    await stopMockApiServer(mockApi.server)
   }
 }
 

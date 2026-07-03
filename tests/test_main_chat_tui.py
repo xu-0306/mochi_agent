@@ -259,6 +259,118 @@ async def test_chat_tui_async_supports_final_answer_event_fallback(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_create_tui_runtime_service_wires_active_goal_turn_selector(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from mochi.main import _create_tui_runtime_service
+    from mochi.runtime.models import ActiveGoalTurnDecision
+
+    class _FakeRuntimeStore:
+        def __init__(self, db_path) -> None:  # noqa: ANN001
+            self.db_path = db_path
+            self.initialized = False
+
+        async def initialize(self) -> None:
+            self.initialized = True
+
+    class _FakeRuntimeService:
+        def __init__(self, *, engine, store, active_goal_turn_selector=None) -> None:  # noqa: ANN001
+            self.engine = engine
+            self.store = store
+            self.active_goal_turn_selector = active_goal_turn_selector
+            self.bound_config = None
+            self.runtime_tasks_root = None
+            self.started = False
+
+        def update_security_config(self, security) -> None:  # noqa: ANN001
+            self.security = security
+
+        def bind_app_config(self, *, config, config_path) -> None:  # noqa: ANN001
+            self.bound_config = (config, config_path)
+
+        def set_runtime_tasks_root(self, root_dir) -> None:  # noqa: ANN001
+            self.runtime_tasks_root = root_dir
+
+        async def start(self) -> None:
+            self.started = True
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def invoke(self, request) -> SimpleNamespace:  # noqa: ANN001
+            self.requests.append(request)
+            return SimpleNamespace(
+                content=(
+                    '{"kind":"steer","confidence":0.97,'
+                    '"selection_reason":"Semantic selector recognized a steering follow-up.",'
+                    '"requires_confirmation":false}'
+                )
+            )
+
+    monkeypatch.setattr("mochi.runtime.store.RuntimeStore", _FakeRuntimeStore)
+    monkeypatch.setattr("mochi.runtime.service.RuntimeService", _FakeRuntimeService)
+
+    config = SimpleNamespace(
+        sessions_dir=str(tmp_path / "sessions"),
+        security=SecurityConfig(),
+    )
+    engine = _FakeEngine()
+    service = await _create_tui_runtime_service(
+        engine=engine,
+        config=config,
+        config_path="config.yaml",
+    )
+
+    assert isinstance(service, _FakeRuntimeService)
+    assert isinstance(service.store, _FakeRuntimeStore)
+    assert service.store.initialized is True
+    assert callable(service.active_goal_turn_selector)
+    assert service.started is True
+
+    fallback_decision = ActiveGoalTurnDecision.model_validate(
+        {
+            "kind": "clarify",
+            "confidence": 0.55,
+            "selection_source": "bounded_fallback",
+            "selection_reason": "Bounded fallback could not classify the message safely.",
+            "requires_confirmation": True,
+            "goal_status": "running",
+            "linked_run_status": "running",
+            "recommended_action": "wait",
+        }
+    )
+    decision = await service.active_goal_turn_selector(
+        SimpleNamespace(
+            message="다음에는 벤치마크 비교에 집중해 줘",
+            goal={
+                "goal_id": "goal-1",
+                "objective": "Keep the active goal moving with minimal churn.",
+                "status": "running",
+            },
+            health={
+                "status": "running",
+                "linked_agent_run": {"run_id": "run-1", "status": "running"},
+                "recommended_next_action": {"action": "wait"},
+            },
+            fallback_payload=fallback_decision.model_dump(mode="python"),
+            fallback_decision=fallback_decision,
+        )
+    )
+
+    assert decision is not None
+    assert decision.kind == "steer"
+    assert decision.selection_source == "semantic_registry_selector"
+    assert len(engine.requests) == 1
+    request = engine.requests[0]
+    assert request.tool_mode == "disabled"
+    assert request.execution_profile == "judge"
+    assert request.persist_session is False
+    assert '"fallback_decision"' in request.message
+
+
+@pytest.mark.asyncio
 async def test_chat_tui_async_tools_commands_show_and_update_web_search_settings(
     monkeypatch,
     capsys,

@@ -104,7 +104,7 @@ export function ExecutionTimeline({
   const subagentById = new Map(subagents.map((item) => [item.subagentId, item]))
 
   return (
-    <div className="rounded-lg border border-border bg-surface-layer/50">
+    <div data-testid="execution-timeline" className="rounded-lg border border-border bg-surface-layer/50">
       <div className="border-b border-border px-3 py-2">
         <p className="text-xs font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           Execution highlights
@@ -130,10 +130,17 @@ export function ExecutionTimeline({
               ? describeSubagentEventMetadata(event)
               : []
 
+          const rowKey =
+            event.eventId ??
+            event.dedupeKey ??
+            `${event.seq ?? 'seq'}:${event.type}:${subagentId ?? 'runtime'}:${event.createdAt ?? 'unknown'}`
+
           return (
             <button
               key={`${event.seq ?? 'seq'}:${event.type}:${subagentId ?? index}`}
               type="button"
+              data-testid="execution-timeline-row"
+              data-row-key={rowKey}
               disabled={!interactive}
               onClick={() => {
                 if (interactive && subagentId) {

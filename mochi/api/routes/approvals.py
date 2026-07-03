@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi import FastAPI
 
 from mochi.api.server import _get_config, _get_or_create_engine
+from mochi.runtime.active_goal_turn_selector import build_active_goal_turn_selector
 from mochi.runtime.approvals import PersistentApprovalStore
 from mochi.runtime.models import ApprovalResolution
 from mochi.runtime.service import RuntimeService
@@ -93,6 +94,7 @@ async def _get_runtime_service(app: FastAPI) -> RuntimeService:
         engine=engine,
         store=store,
         exec_approval_store=PersistentApprovalStore(Path(config.sessions_dir) / "exec-approvals.db"),
+        active_goal_turn_selector=build_active_goal_turn_selector(engine),
     )
     service.update_security_config(config.security)
     service.bind_app_config(config=config, config_path=getattr(app.state, "config_path", None))
