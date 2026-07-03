@@ -136,52 +136,6 @@ function formatGoalRoleSummary(roles: string[]): string | null {
   return roles.map((role) => role.replaceAll('_', ' ')).join(', ')
 }
 
-function detectGoalProtocolHint(value: string): AgentRunProtocolId | null {
-  const normalized = value.toLowerCase()
-  if (normalized.includes('debate')) {
-    return 'multi_agent_debate'
-  }
-  if (normalized.includes('self evolve') || normalized.includes('self-evolve') || normalized.includes('dr zero')) {
-    return 'dr_zero_self_evolve'
-  }
-  if (normalized.includes('controlled')) {
-    return 'controlled_subagent_execution'
-  }
-  if (normalized.includes('distill') || normalized.includes('teacher') || normalized.includes('student')) {
-    return 'teacher_student_distill'
-  }
-  return null
-}
-
-function suggestGoalWorkflowStrategy(value: string): {
-  protocolId: AgentRunProtocolId
-  roles: string[]
-} {
-  const normalized = value.toLowerCase()
-  if (/\b(compare|comparison|evaluate|evaluation|debate|judge)\b/.test(normalized)) {
-    return {
-      protocolId: 'multi_agent_debate',
-      roles: ['debater_a', 'debater_b', 'judge'],
-    }
-  }
-  if (/\b(distill|distillation|compress|compression|teacher|student|summarize)\b/.test(normalized)) {
-    return {
-      protocolId: 'teacher_student_distill',
-      roles: ['teacher', 'student', 'evaluator'],
-    }
-  }
-  if (/\b(controlled|controller|approval|approve commands|executor)\b/.test(normalized)) {
-    return {
-      protocolId: 'controlled_subagent_execution',
-      roles: ['planner', 'executor', 'controller', 'evaluator'],
-    }
-  }
-  return {
-    protocolId: 'autonomous_single_agent',
-    roles: ['agent'],
-  }
-}
-
 function detectGoalRuntimeHint(value: string): string | null {
   const normalized = value.trim()
   const durationMatch = normalized.match(/\b\d+\s*(?:min(?:ute)?s?|hour(?:s)?|hr|hrs)\b/i)
@@ -198,6 +152,25 @@ export function goalProtocolExecutionTopology(
   protocolId: AgentRunProtocolId | null
 ): GoalExecutionTopology {
   return protocolId === 'autonomous_single_agent' ? 'single_agent' : 'multi_agent'
+}
+
+export function defaultRolesForGoalProtocol(
+  protocolId: AgentRunProtocolId | null,
+  workflowTemplate: WorkflowTemplate
+): string[] {
+  if (workflowTemplate === 'research_debate') {
+    return ['planner', 'debater_a', 'debater_b', 'judge']
+  }
+  if (protocolId === 'controlled_subagent_execution') {
+    return ['planner', 'executor', 'controller', 'evaluator']
+  }
+  if (protocolId === 'multi_agent_debate') {
+    return ['debater_a', 'debater_b', 'judge']
+  }
+  if (protocolId === 'dr_zero_self_evolve') {
+    return ['proposer', 'solver', 'verifier']
+  }
+  return ['agent']
 }
 
 export function describeGoalProtocolSelection(
@@ -356,19 +329,20 @@ export function buildGoalProposalState(
   const heuristicSource = revisionText || options.objective
   const interactionMode: GoalInteractionMode =
     options.executionMode === 'workflow' ? 'workflow' : 'goal'
-  const suggestedWorkflowStrategy = suggestGoalWorkflowStrategy(heuristicSource)
+  const defaultWorkflowProtocol =
+    options.defaultWorkflowProtocol ?? 'teacher_student_distill'
+  const explicitWorkflowProtocolId: AgentRunProtocolId | null =
+    options.executionMode !== 'workflow'
+      ? null
+      : options.workflowTemplate === 'research_debate'
+        ? 'multi_agent_debate'
+        : options.workflowProtocolId ?? defaultWorkflowProtocol
   const selectedRoles = normalizeSelectedModelRoles(options.workflowSelectedModelRoles)
   const selectedRoleNames = Object.keys(selectedRoles)
-  const fallbackWorkflowRoles =
-    options.workflowTemplate === 'research_debate'
-      ? ['planner', 'debater_a', 'debater_b', 'judge']
-      : options.workflowProtocolId === 'controlled_subagent_execution'
-        ? ['planner', 'executor', 'controller', 'evaluator']
-        : options.workflowProtocolId === 'multi_agent_debate'
-          ? ['debater_a', 'debater_b', 'judge']
-          : options.workflowProtocolId === 'dr_zero_self_evolve'
-            ? ['proposer', 'solver', 'verifier']
-            : suggestedWorkflowStrategy.roles
+  const fallbackWorkflowRoles = defaultRolesForGoalProtocol(
+    explicitWorkflowProtocolId,
+    options.workflowTemplate
+  )
   const workflowModels = uniqueStrings([
     ...Object.values(selectedRoles),
     options.currentModelId,
@@ -379,27 +353,12 @@ export function buildGoalProposalState(
     options.modelCandidates,
     options.currentModelId ?? null
   )
-  const protocolHint =
-    options.executionMode === 'workflow'
-      ? detectGoalProtocolHint(heuristicSource)
-      : null
-  const defaultWorkflowProtocol =
-    options.defaultWorkflowProtocol ?? 'teacher_student_distill'
-  const tentativeProtocolId: AgentRunProtocolId | null =
-    options.executionMode === 'workflow'
-      ? protocolHint ??
-        (options.workflowTemplate === 'research_debate'
-          ? 'multi_agent_debate'
-          : options.workflowProtocolId === defaultWorkflowProtocol
-            ? suggestedWorkflowStrategy.protocolId
-            : options.workflowProtocolId)
-      : null
   const strategySelection = resolveGoalStrategyDisplaySelection({
     registry: options.goalStrategyRegistry,
-    protocolId: tentativeProtocolId,
+    protocolId: explicitWorkflowProtocolId,
     interactionMode,
   })
-  const protocolId = strategySelection.protocolId ?? tentativeProtocolId
+  const protocolId = strategySelection.protocolId ?? explicitWorkflowProtocolId
   const executionTopology = protocolId
     ? strategySelection.executionTopology
     : 'single_agent'
