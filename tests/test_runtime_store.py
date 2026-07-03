@@ -1317,6 +1317,68 @@ def test_runtime_store_marks_route_derived_legacy_defaults_as_legacy_migration(
     )
 
 
+def test_runtime_store_marks_execution_mode_only_workflow_rows_as_legacy_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO goals (
+                id, objective, title, goal_type, execution_mode, strategy_id, selection_source,
+                selection_reason, protocol_id, topic, project_id, workspace_dir, status,
+                current_attempt_id, run_policy_json, capability_policy_json, source_manifest_json,
+                summary_json, metadata_json, latest_error, started_at, finished_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "goal-legacy-execution-mode-only-1",
+                "Read a legacy goal with only workflow execution_mode in the row.",
+                None,
+                None,
+                "workflow",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "created",
+                None,
+                "{}",
+                "{}",
+                "{}",
+                "{}",
+                "{}",
+                None,
+                None,
+                None,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    goal = asyncio.run(store.get_goal("goal-legacy-execution-mode-only-1"))
+    assert goal is not None
+    assert goal["execution_mode"] == "workflow"
+    assert goal["strategy_id"] == "autonomous_single_agent"
+    assert goal["protocol_id"] == "autonomous_single_agent"
+    assert goal["selection_source"] == "legacy_migration"
+    assert goal["selection_reason"] == (
+        "Legacy goal metadata mapped to autonomous_single_agent during strategy migration."
+    )
+
+    listed = asyncio.run(store.list_goals())
+    assert listed[0]["execution_mode"] == "workflow"
+    assert listed[0]["strategy_id"] == "autonomous_single_agent"
+    assert listed[0]["selection_source"] == "legacy_migration"
+
+
 def test_runtime_store_clamps_invalid_selection_source_to_legacy_migration_on_read(
     tmp_path: Path,
 ) -> None:

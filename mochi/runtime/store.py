@@ -3231,7 +3231,8 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     payload = dict(row)
-    payload["execution_mode"] = _normalize_goal_execution_mode(payload.get("execution_mode"))
+    raw_execution_mode = payload.get("execution_mode")
+    payload["execution_mode"] = _normalize_goal_execution_mode(raw_execution_mode)
     summary = json.loads(payload.pop("summary_json") or "{}")
     metadata = json.loads(payload.pop("metadata_json") or "{}")
     raw_strategy_id = payload.get("strategy_id")
@@ -3250,6 +3251,7 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
     )
     normalized_selection_source = _normalize_goal_selection_source(
         selection_source=payload.get("selection_source"),
+        execution_mode=raw_execution_mode,
         strategy_id=raw_strategy_id,
         protocol_id=raw_protocol_id,
         summary=summary,
@@ -3590,6 +3592,7 @@ def _normalize_goal_strategy_id(
 def _normalize_goal_selection_source(
     *,
     selection_source: Any,
+    execution_mode: Any = None,
     strategy_id: Any,
     protocol_id: Any,
     summary: Mapping[str, Any] | None = None,
@@ -3624,6 +3627,8 @@ def _normalize_goal_selection_source(
     ):
         return "legacy_migration"
     if _goal_has_legacy_route_state(summary, metadata):
+        return "legacy_migration"
+    if _normalize_goal_execution_mode(execution_mode) == "workflow":
         return "legacy_migration"
     if normalized:
         return "legacy_migration"
