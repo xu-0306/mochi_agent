@@ -770,19 +770,55 @@ function WorkflowPanelBody({
         {workflowUiSuppressed ? (
           <div className="space-y-4">
             <PanelSectionCard
-              title="Workflow override"
-              description="This chat is currently bound to a single-agent goal, so workflow-native controls stay outside the main path."
+              title="Goal path"
+              description="Single-agent goals stay chat-first. This panel stays in inspection mode until the selected strategy actually needs workflow controls."
             >
               <div className="space-y-3 rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-3 text-sm text-muted-foreground">
                 <p>
-                  Single-agent goals should stay chat-first. Workflow routing, bound-run controls, and role configuration stay hidden unless you explicitly switch into a workflow strategy.
+                  Use the conversation to steer this goal. Stored workflow settings remain available for operator inspection, but override controls stay out of the main path while this session is running as a single-agent goal.
                 </p>
-                <p>
-                  Use <code>/workflow &lt;request&gt;</code> when you intentionally want to promote the next long-running task into a workflow proposal.
-                </p>
-                <p>
-                  Stored workflow settings remain available for inspection here, but they are not active while the current goal stays in single-agent mode.
-                </p>
+                <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                  <div className="rounded-lg border border-white/8 bg-canvas/30 px-3 py-2">
+                    <p className="font-medium text-foreground">Active runtime</p>
+                    <p className="mt-1 text-muted-foreground">
+                      {sessionGoalRuntimeContext.interactionMode === 'goal' &&
+                      sessionGoalRuntimeContext.executionTopology === 'single_agent'
+                        ? sessionGoalExecutionMode === 'single_agent'
+                          ? 'Chat-first single-agent goal'
+                          : 'Chat-first goal'
+                        : 'Goal runtime'}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-white/8 bg-canvas/30 px-3 py-2">
+                    <p className="font-medium text-foreground">On-file workflow settings</p>
+                    <p className="mt-1 text-muted-foreground">
+                      {selectedWorkflowProtocolOption?.label ?? 'No workflow settings on file'}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-white/8 bg-canvas/30 px-3 py-2">
+                    <p className="font-medium text-foreground">Bound run</p>
+                    <p className="mt-1 text-muted-foreground">
+                      {workflowBoundRunId ?? 'Not bound while chat-first execution stays active'}
+                    </p>
+                  </div>
+                </div>
+                {selectedWorkflowProtocolOption?.description ? (
+                  <p className="text-xs text-muted-foreground">
+                    On-file workflow setting: {selectedWorkflowProtocolOption.description}
+                  </p>
+                ) : null}
+                {workflowBoundRunId ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="rounded-full px-0"
+                    onClick={() => onOpenRunDetail(workflowBoundRunId)}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    Open run detail
+                  </Button>
+                ) : null}
               </div>
             </PanelSectionCard>
             {onClose ? (
@@ -796,15 +832,15 @@ function WorkflowPanelBody({
         ) : (
         <div className="space-y-4">
           <PanelSectionCard
-            title="Workflow override"
-            description="Explicitly route this chat into the workflow runtime when you want an operator-style override."
+            title="Explicit override"
+            description="Operator control for routing this chat into the workflow runtime when the selected strategy actually needs it."
           >
             <div className="space-y-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-medium text-foreground">Enable workflow override</p>
+                  <p className="text-sm font-medium text-foreground">Enable explicit override</p>
                   <p className="text-xs text-muted-foreground">
-                    Switch between ordinary chat replies and the bound workflow lane.
+                    Switch between the ordinary goal path and the bound workflow lane.
                   </p>
                 </div>
                 <Switch checked={workflowEnabled} onCheckedChange={onWorkflowToggle} />
@@ -812,7 +848,7 @@ function WorkflowPanelBody({
               <div className="rounded-xl border border-white/8 bg-surface-layer/60 px-3 py-2 text-xs text-muted-foreground">
                 {workflowEnabled
                   ? 'Workflow override is active for this chat session.'
-                  : 'Workflow override is off. Use /workflow or this switch only when you intentionally want a workflow run.'}
+                  : 'Workflow override is off. Goal chat stays on the standard path until you explicitly enable workflow execution.'}
               </div>
             </div>
           </PanelSectionCard>

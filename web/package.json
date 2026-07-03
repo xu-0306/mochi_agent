@@ -27,6 +27,7 @@
     "test:chat-send-contract": "node --experimental-strip-types ./scripts/test-chat-send-contract.mjs",
     "test:current-model-selection": "node --experimental-strip-types ./scripts/test-current-model-selection.mjs",
     "test:goal-proposal-models": "node --experimental-strip-types ./scripts/test-goal-proposal-models.mjs",
+    "test:workflow-panel-positioning": "node ./scripts/test-workflow-panel-positioning.mjs",
     "test:chat-markdown-code-renderers": "node ./scripts/test-chat-markdown-code-renderers.mjs",
     "test:code-theme-preferences": "node ./scripts/test-code-theme-preferences.mjs",
     "test:task-panel-desktop-conditional-render": "node ./scripts/test-task-panel-desktop-conditional-render.mjs",
