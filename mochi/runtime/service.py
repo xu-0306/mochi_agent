@@ -918,6 +918,17 @@ class RuntimeService:
             _goal_audit_finding_response(finding)
             for finding in findings
         ]
+        approval_state = _goal_attempt_approval_state_payload(effective_attempt)
+        recommended_next_action = _goal_recommended_next_action(
+            goal_status=current_status,
+            runtime_budget=runtime_budget,
+            approval_state=approval_state,
+            current_generation=current_generation_payload,
+            checkpoint_policy=checkpoint_policy,
+            collector_state=collector_state,
+            linked_agent_run=linked_agent_run_payload,
+            open_findings=open_finding_payloads,
+        )
         return {
             "goal_id": goal_id,
             "execution_mode": _normalize_goal_execution_mode(goal.get("execution_mode")),
@@ -946,7 +957,7 @@ class RuntimeService:
             "persisted_checkpoint": _goal_checkpoint_record_response(latest_checkpoint),
             "memory_snapshot": _goal_memory_snapshot_response(latest_memory_snapshot),
             "current_generation": current_generation_payload,
-            "approval_state": _goal_attempt_approval_state_payload(effective_attempt),
+            "approval_state": approval_state,
             "checkpoint_policy": checkpoint_policy,
             "collector_state": collector_state,
             "linked_agent_run": linked_agent_run_payload,
@@ -956,15 +967,23 @@ class RuntimeService:
                 runtime_owner_id=self._runtime_owner_id,
             ),
             "open_findings": open_finding_payloads,
-            "recommended_next_action": _goal_recommended_next_action(
+            "recommended_next_action": recommended_next_action,
+            "approval_diagnostic": _goal_approval_diagnostic_payload(
+                goal_status=current_status,
+                approval_state=approval_state,
+                linked_agent_run=linked_agent_run_payload,
+                run_policy=normalized_run_policy,
+                open_findings=open_finding_payloads,
+            ),
+            "blocker_diagnostic": _goal_blocker_diagnostic_payload(
                 goal_status=current_status,
                 runtime_budget=runtime_budget,
-                approval_state=_goal_attempt_approval_state_payload(effective_attempt),
-                current_generation=current_generation_payload,
-                checkpoint_policy=checkpoint_policy,
-                collector_state=collector_state,
+                approval_state=approval_state,
+                run_policy=normalized_run_policy,
+                operator_controls=operator_controls,
                 linked_agent_run=linked_agent_run_payload,
                 open_findings=open_finding_payloads,
+                recommended_next_action=recommended_next_action,
             ),
         }
 
@@ -9193,6 +9212,296 @@ def _goal_runtime_budget_started_at(goal: dict[str, Any]) -> str | None:
     started_at = goal.get("started_at")
     if isinstance(started_at, str) and started_at.strip():
         return started_at.strip()
+    return None
+
+
+def _goal_blocker_diagnostic_base(
+    *,
+    cause_code: str,
+    what_is_blocked: str,
+    why_blocked: str,
+    actor_required: str,
+    next_action: str,
+    auto_resume_policy: str,
+    source_event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "cause_code": cause_code,
+        "what_is_blocked": what_is_blocked,
+        "why_blocked": why_blocked,
+        "actor_required": actor_required,
+        "next_action": next_action,
+        "auto_resume_policy": auto_resume_policy,
+        "source_event_ids": source_event_ids or [],
+    }
+    return payload
+
+
+def _goal_open_finding_event_ids(
+    open_findings: list[dict[str, Any]] | None,
+    *,
+    finding_codes: set[str] | None = None,
+) -> list[str]:
+    event_ids: list[str] = []
+    allowed_codes = finding_codes or set()
+    for item in open_findings or []:
+        if not isinstance(item, dict):
+            continue
+        finding_code = str(item.get("finding_code") or "").strip()
+        if allowed_codes and finding_code not in allowed_codes:
+            continue
+        finding_id = item.get("finding_id")
+        if finding_id is None:
+            continue
+        event_id = f"goal_finding:{finding_id}"
+        if event_id not in event_ids:
+            event_ids.append(event_id)
+    return event_ids
+
+
+def _goal_operator_control_event_ids(
+    operator_controls: Mapping[str, Any] | None,
+) -> list[str]:
+    normalized = _normalize_goal_operator_controls(operator_controls)
+    updated_at = _normalized_nonempty_text(normalized.get("updated_at"))
+    if updated_at is not None:
+        return [f"goal_operator_controls:{updated_at}"]
+    created_at = _normalized_nonempty_text(normalized.get("created_at"))
+    if created_at is not None:
+        return [f"goal_operator_controls:{created_at}"]
+    if (
+        normalized.get("stop_all_goals")
+        or normalized.get("block_network_usage")
+        or normalized.get("blocked_domains")
+        or normalized.get("blocked_tools")
+    ):
+        return ["goal_operator_controls:active"]
+    return []
+
+
+def _goal_approval_diagnostic_payload(
+    *,
+    goal_status: str,
+    approval_state: dict[str, Any] | None,
+    linked_agent_run: dict[str, Any] | None,
+    run_policy: Mapping[str, Any] | None,
+    open_findings: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(approval_state, dict):
+        return None
+    approval_status = str(approval_state.get("status") or "").strip().lower()
+    if goal_status != "waiting_approval" and approval_status not in {"waiting_approval", "awaiting_approval"}:
+        return None
+    pending_entries = (
+        approval_state.get("pending_approvals")
+        if isinstance(approval_state.get("pending_approvals"), list)
+        else []
+    )
+    approval_ids = _normalized_string_list(approval_state.get("approval_ids"))
+    tool_names = sorted(
+        {
+            text
+            for text in _normalized_string_list(approval_state.get("tool_names"))
+            if text
+        }
+        | {
+            str(item.get("tool_name") or "").strip()
+            for item in pending_entries
+            if isinstance(item, Mapping) and str(item.get("tool_name") or "").strip()
+        }
+    )
+    run_id = (
+        _normalized_nonempty_text(linked_agent_run.get("run_id"))
+        if isinstance(linked_agent_run, Mapping)
+        else None
+    )
+    finding_codes = {
+        str(item.get("finding_code") or "").strip()
+        for item in (open_findings or [])
+        if isinstance(item, dict)
+    }
+    timed_out = "approval_wait_timeout" in finding_codes
+    source_event_ids = []
+    if run_id is not None:
+        source_event_ids.append(f"agent_run:{run_id}")
+    source_event_ids.extend(
+        _goal_open_finding_event_ids(
+            open_findings,
+            finding_codes={"approval_wait_timeout"},
+        )
+    )
+    source_event_ids.extend(
+        [
+            event_id
+            for event_id in (f"approval:{approval_id}" for approval_id in approval_ids)
+            if event_id not in source_event_ids
+        ]
+    )
+    reason_fragments: list[str] = []
+    auto_review_blocked = False
+    for item in pending_entries:
+        if not isinstance(item, Mapping):
+            continue
+        security_decision = str(item.get("security_decision") or "").strip().lower()
+        if security_decision == "require_approval":
+            auto_reviewed_policy_ask = item.get("auto_reviewed_policy_ask")
+            if auto_reviewed_policy_ask is False:
+                auto_review_blocked = True
+        policy_reason = _normalized_nonempty_text(item.get("policy_reason"))
+        approval_reason = _normalized_nonempty_text(item.get("reason"))
+        if policy_reason is not None and policy_reason not in reason_fragments:
+            reason_fragments.append(policy_reason)
+        elif approval_reason is not None and approval_reason not in reason_fragments:
+            reason_fragments.append(approval_reason)
+    approval_mode = _normalized_goal_approval_mode(
+        run_policy.get("approval_mode") if isinstance(run_policy, Mapping) else None
+    )
+    if timed_out:
+        why_blocked = (
+            "A pending exec_command approval has exceeded the configured approval wait timeout "
+            "for the linked run."
+        )
+    elif auto_review_blocked:
+        why_blocked = (
+            "Stored approval metadata still marks the pending tool request as requiring operator "
+            "approval, so the linked run cannot continue automatically."
+        )
+    elif approval_mode == "auto_review":
+        why_blocked = (
+            "The linked run still has a pending approval-required tool request in runtime state, "
+            "so execution remains blocked until that request is resolved."
+        )
+    else:
+        why_blocked = "A pending exec_command approval must be resolved before the linked run can continue."
+    if reason_fragments:
+        why_blocked = f"{why_blocked} {' '.join(reason_fragments[:2])}"
+    payload = _goal_blocker_diagnostic_base(
+        cause_code="approval_wait_timeout" if timed_out else "approval_required",
+        what_is_blocked="Active goal execution is waiting on operator approval.",
+        why_blocked=why_blocked,
+        actor_required="operator",
+        next_action="resolve_approval",
+        auto_resume_policy="resume_after_approval_if_run_can_continue",
+        source_event_ids=source_event_ids,
+    )
+    if approval_ids:
+        payload["approval_ids"] = approval_ids
+    if tool_names:
+        payload["tool_names"] = tool_names
+    if run_id is not None:
+        payload["run_id"] = run_id
+    if approval_state.get("approval_wait_elapsed_sec") is not None:
+        payload["wait_elapsed_seconds"] = approval_state.get("approval_wait_elapsed_sec")
+    if approval_state.get("approval_wait_timeout_sec") is not None:
+        payload["wait_timeout_seconds"] = approval_state.get("approval_wait_timeout_sec")
+    return payload
+
+
+def _goal_blocker_diagnostic_payload(
+    *,
+    goal_status: str,
+    runtime_budget: dict[str, Any] | None,
+    approval_state: dict[str, Any] | None,
+    run_policy: Mapping[str, Any] | None,
+    operator_controls: Mapping[str, Any] | None,
+    linked_agent_run: dict[str, Any] | None,
+    open_findings: list[dict[str, Any]] | None,
+    recommended_next_action: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    approval_diagnostic = _goal_approval_diagnostic_payload(
+        goal_status=goal_status,
+        approval_state=approval_state,
+        linked_agent_run=linked_agent_run,
+        run_policy=run_policy,
+        open_findings=open_findings,
+    )
+    if approval_diagnostic is not None:
+        return {
+            key: value
+            for key, value in approval_diagnostic.items()
+            if key
+            in {
+                "cause_code",
+                "what_is_blocked",
+                "why_blocked",
+                "actor_required",
+                "next_action",
+                "auto_resume_policy",
+                "source_event_ids",
+            }
+        }
+    normalized_controls = _normalize_goal_operator_controls(operator_controls)
+    if (
+        normalized_controls.get("stop_all_goals")
+        or (
+            goal_status in {"paused", "awaiting_operator"}
+            and _goal_operator_controls_stop_message(normalized_controls)
+            in str((recommended_next_action or {}).get("summary") or "")
+        )
+    ):
+        return _goal_blocker_diagnostic_base(
+            cause_code="operator_emergency_stop",
+            what_is_blocked="Active goal execution cannot continue under current operator controls.",
+            why_blocked=_goal_operator_controls_stop_message(normalized_controls),
+            actor_required="operator",
+            next_action="clear_operator_controls",
+            auto_resume_policy="manual_resume_required",
+            source_event_ids=_goal_operator_control_event_ids(normalized_controls),
+        )
+    if (
+        normalized_controls.get("block_network_usage")
+        or normalized_controls.get("blocked_domains")
+        or normalized_controls.get("blocked_tools")
+    ) and goal_status in {"paused", "awaiting_operator"}:
+        return _goal_blocker_diagnostic_base(
+            cause_code="operator_controls_active",
+            what_is_blocked="Active goal execution cannot continue under current operator controls.",
+            why_blocked=_goal_operator_controls_stop_message(normalized_controls),
+            actor_required="operator",
+            next_action="clear_operator_controls",
+            auto_resume_policy="manual_resume_required",
+            source_event_ids=_goal_operator_control_event_ids(normalized_controls),
+        )
+    if isinstance(runtime_budget, dict):
+        budget_status = str(runtime_budget.get("status") or "").strip()
+        if budget_status in {"retry_limit_reached", "hard_stop_reached", "duration_exhausted"}:
+            cause_code = {
+                "retry_limit_reached": "runtime_retry_limit_reached",
+                "hard_stop_reached": "runtime_hard_stop_reached",
+                "duration_exhausted": "runtime_budget_exhausted",
+            }.get(budget_status, "runtime_budget_exhausted")
+            why_blocked = {
+                "retry_limit_reached": "The configured retry budget is exhausted, so a new goal attempt cannot be started.",
+                "hard_stop_reached": "The configured hard stop time has passed, so goal execution cannot continue safely.",
+                "duration_exhausted": "The configured runtime duration is exhausted, so goal execution cannot continue safely.",
+            }.get(budget_status, "The runtime budget or retry policy is exhausted.")
+            return _goal_blocker_diagnostic_base(
+                cause_code=cause_code,
+                what_is_blocked="Active goal execution cannot safely continue.",
+                why_blocked=why_blocked,
+                actor_required="operator",
+                next_action="inspect_runtime_budget",
+                auto_resume_policy="manual_resume_required",
+                source_event_ids=_goal_open_finding_event_ids(
+                    open_findings,
+                    finding_codes={"runtime_budget_exhausted"},
+                ),
+            )
+    action = (
+        str(recommended_next_action.get("action") or "").strip()
+        if isinstance(recommended_next_action, dict)
+        else ""
+    )
+    if action == "resume_goal" and goal_status in {"paused", "stalled", "awaiting_resources", "awaiting_operator"}:
+        return _goal_blocker_diagnostic_base(
+            cause_code=f"goal_{goal_status}",
+            what_is_blocked="Goal execution is not actively progressing.",
+            why_blocked=str(recommended_next_action.get("summary") or "Goal is resumable but blocked."),
+            actor_required="operator",
+            next_action="resume_goal",
+            auto_resume_policy="manual_resume_required",
+            source_event_ids=[],
+        )
     return None
 
 

@@ -2065,7 +2065,7 @@ def test_goal_surfaces_waiting_approval_and_checkpoint_policy_in_health(
                     "checkpoint_interval_sec": 60,
                     "generation_refresh_interval_sec": 1_800,
                     "context_handoff_threshold": 0.8,
-                    "approval_mode": "default",
+                    "approval_mode": "auto_review",
                 },
             },
         )
@@ -2104,6 +2104,39 @@ def test_goal_surfaces_waiting_approval_and_checkpoint_policy_in_health(
         assert health_payload["linked_agent_run"]["status"] == "stalled"
         assert health_payload["linked_agent_run"]["approval_state"]["pending_count"] == 1
         assert health_payload["linked_agent_run"]["checkpoint_policy"]["status"] == "recorded"
+        assert health_payload["approval_diagnostic"] == {
+            "cause_code": "approval_required",
+            "what_is_blocked": "Active goal execution is waiting on operator approval.",
+            "why_blocked": (
+                "The linked run still has a pending approval-required tool request in runtime state, "
+                "so execution remains blocked until that request is resolved."
+            ),
+            "actor_required": "operator",
+            "next_action": "resolve_approval",
+            "auto_resume_policy": "resume_after_approval_if_run_can_continue",
+            "source_event_ids": [
+                f"agent_run:{health_payload['linked_agent_run']['run_id']}",
+                "approval:exec-approval-1",
+            ],
+            "approval_ids": ["exec-approval-1"],
+            "tool_names": ["exec_command"],
+            "run_id": health_payload["linked_agent_run"]["run_id"],
+        }
+        assert health_payload["blocker_diagnostic"] == {
+            "cause_code": "approval_required",
+            "what_is_blocked": "Active goal execution is waiting on operator approval.",
+            "why_blocked": (
+                "The linked run still has a pending approval-required tool request in runtime state, "
+                "so execution remains blocked until that request is resolved."
+            ),
+            "actor_required": "operator",
+            "next_action": "resolve_approval",
+            "auto_resume_policy": "resume_after_approval_if_run_can_continue",
+            "source_event_ids": [
+                f"agent_run:{health_payload['linked_agent_run']['run_id']}",
+                "approval:exec-approval-1",
+            ],
+        }
         assert "approval_wait_timeout" not in [
             item["finding_code"] for item in health_payload["open_findings"]
         ]
@@ -9758,6 +9791,18 @@ def test_goal_start_blocks_when_runtime_budget_hard_stop_already_passed(tmp_path
         assert health_payload["runtime_budget"]["status"] == "hard_stop_reached"
         finding_codes = [item["finding_code"] for item in health_payload["open_findings"]]
         assert "runtime_budget_exhausted" in finding_codes
+        assert health_payload["approval_diagnostic"] is None
+        assert health_payload["blocker_diagnostic"] == {
+            "cause_code": "runtime_hard_stop_reached",
+            "what_is_blocked": "Active goal execution cannot safely continue.",
+            "why_blocked": "The configured hard stop time has passed, so goal execution cannot continue safely.",
+            "actor_required": "operator",
+            "next_action": "inspect_runtime_budget",
+            "auto_resume_policy": "manual_resume_required",
+            "source_event_ids": [
+                f"goal_finding:{health_payload['open_findings'][0]['finding_id']}",
+            ],
+        }
 
 
 def test_goal_resume_blocks_when_retry_budget_exhausted(tmp_path: Path) -> None:
@@ -11604,6 +11649,37 @@ def test_goal_supervisor_opens_and_resolves_approval_wait_timeout_report_only(
         "approval_wait_elapsed_sec": health_payload["approval_state"]["approval_wait_elapsed_sec"],
         "approval_wait_timeout_sec": 60,
     }
+    assert health_payload["approval_diagnostic"] == {
+        "cause_code": "approval_wait_timeout",
+        "what_is_blocked": "Active goal execution is waiting on operator approval.",
+        "why_blocked": "A pending exec_command approval has exceeded the configured approval wait timeout for the linked run.",
+        "actor_required": "operator",
+        "next_action": "resolve_approval",
+        "auto_resume_policy": "resume_after_approval_if_run_can_continue",
+        "source_event_ids": [
+            "agent_run:linked-approval-timeout-run-1",
+            f"goal_finding:{health_payload['open_findings'][0]['finding_id']}",
+            "approval:exec-approval-timeout-1",
+        ],
+        "approval_ids": ["exec-approval-timeout-1"],
+        "tool_names": ["exec_command"],
+        "run_id": "linked-approval-timeout-run-1",
+        "wait_elapsed_seconds": health_payload["approval_state"]["approval_wait_elapsed_sec"],
+        "wait_timeout_seconds": 60,
+    }
+    assert health_payload["blocker_diagnostic"] == {
+        "cause_code": "approval_wait_timeout",
+        "what_is_blocked": "Active goal execution is waiting on operator approval.",
+        "why_blocked": "A pending exec_command approval has exceeded the configured approval wait timeout for the linked run.",
+        "actor_required": "operator",
+        "next_action": "resolve_approval",
+        "auto_resume_policy": "resume_after_approval_if_run_can_continue",
+        "source_event_ids": [
+            "agent_run:linked-approval-timeout-run-1",
+            f"goal_finding:{health_payload['open_findings'][0]['finding_id']}",
+            "approval:exec-approval-timeout-1",
+        ],
+    }
     assert [item["finding_code"] for item in findings_after_open] == ["approval_wait_timeout"]
     assert findings_after_open[0]["details"]["approval_wait_timeout_sec"] == 60
     assert findings_after_open[0]["details"]["approval_wait_elapsed_sec"] >= 300
@@ -12088,6 +12164,18 @@ def test_goal_estop_persists_across_restart_and_blocks_manual_start(tmp_path: Pa
         health_payload = health_response.json()
         assert health_payload["operator_controls"]["stop_all_goals"] is True
         assert "operator emergency stop" in str(health_payload["latest_error"])
+        assert health_payload["approval_diagnostic"] is None
+        assert health_payload["blocker_diagnostic"] == {
+            "cause_code": "operator_emergency_stop",
+            "what_is_blocked": "Active goal execution cannot continue under current operator controls.",
+            "why_blocked": "Goal execution is blocked by operator emergency stop. Reason: maintenance window",
+            "actor_required": "operator",
+            "next_action": "clear_operator_controls",
+            "auto_resume_policy": "manual_resume_required",
+            "source_event_ids": [
+                f"goal_operator_controls:{health_payload['operator_controls']['updated_at']}",
+            ],
+        }
 
 
 def test_goal_estop_update_pauses_running_goal(tmp_path: Path) -> None:
