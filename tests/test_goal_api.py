@@ -1,8 +1,9 @@
-﻿"""Goal runtime API tests."""
+"""Goal runtime API tests."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sqlite3
@@ -5223,20 +5224,28 @@ def test_goal_resume_uses_summary_guidance_and_role_guidance_messages(
     assert len(completed_goal["attempts"]) == 1
     assert len(captured_requests) == 1
     assert captured_requests[0].metadata["resume_strategy"] == "restart_attempt"
-    assert captured_requests[0].metadata["resume_payload"] == {
-        "guidance_messages": [
-            "Resume from the stored summary guidance.",
-            "Preserve the existing teacher output.",
-        ],
-        "role_guidance_messages": {
-            "teacher": ["Teacher: keep the original evidence structure."],
-            "student": ["Student: condense the answer for final delivery."],
-        },
+    resume_payload = captured_requests[0].metadata["resume_payload"]
+    assert resume_payload["role_guidance_messages"] == {
+        "teacher": ["Teacher: keep the original evidence structure."],
+        "student": ["Student: condense the answer for final delivery."],
     }
-    assert captured_requests[0].guidance_messages == [
+    assert "Resume from the stored summary guidance." in resume_payload["guidance_messages"]
+    assert "Preserve the existing teacher output." in resume_payload["guidance_messages"]
+    carryover_messages = [
+        item
+        for item in resume_payload["guidance_messages"]
+        if item.startswith("Goal carryover state: ")
+    ]
+    assert len(carryover_messages) == 1
+    carryover = json.loads(carryover_messages[0].removeprefix("Goal carryover state: "))
+    assert carryover["goal_id"] == goal_id
+    assert carryover["attempt_id"] == attempt_id
+    assert carryover["agent_run_id"] == run_id
+    assert carryover["operator_guidance"] == [
         "Resume from the stored summary guidance.",
         "Preserve the existing teacher output.",
     ]
+    assert captured_requests[0].guidance_messages == resume_payload["guidance_messages"]
     assert captured_requests[0].role_guidance_messages == {
         "teacher": ["Teacher: keep the original evidence structure."],
         "student": ["Student: condense the answer for final delivery."],
@@ -5384,8 +5393,21 @@ def test_goal_resume_carries_follow_up_guidance_inside_resume_payload(
 
     assert completed_goal["status"] == "completed"
     assert len(captured_requests) == 1
-    assert captured_requests[0].guidance_messages == [follow_up]
+    assert follow_up in captured_requests[0].guidance_messages
+    carryover_messages = [
+        item
+        for item in captured_requests[0].guidance_messages
+        if item.startswith("Goal carryover state: ")
+    ]
+    assert len(carryover_messages) == 1
+    carryover = json.loads(carryover_messages[0].removeprefix("Goal carryover state: "))
+    assert carryover["goal_id"] == goal_id
+    assert carryover["attempt_id"] == attempt_id
+    assert carryover["agent_run_id"] == run_id
+    assert carryover["previous_status"] == "stalled"
+    assert follow_up in carryover["operator_guidance"]
     assert follow_up in captured_requests[0].metadata["resume_payload"]["guidance_messages"]
+    assert carryover_messages[0] in captured_requests[0].metadata["resume_payload"]["guidance_messages"]
 
 
 def test_goal_resume_new_attempt_seeds_follow_up_guidance_into_linked_run(
@@ -5485,8 +5507,217 @@ def test_goal_resume_new_attempt_seeds_follow_up_guidance_into_linked_run(
     assert len(completed_goal["attempts"]) == 2
     assert completed_goal["current_attempt_id"] != old_attempt_id
     assert len(captured_requests) == 1
-    assert captured_requests[0].guidance_messages == [follow_up]
-    assert captured_requests[0].metadata["summary"]["guidance_messages"] == [follow_up]
+    assert follow_up in captured_requests[0].guidance_messages
+    carryover_messages = [
+        item
+        for item in captured_requests[0].guidance_messages
+        if item.startswith("Goal carryover state: ")
+    ]
+    assert len(carryover_messages) == 1
+    carryover = json.loads(carryover_messages[0].removeprefix("Goal carryover state: "))
+    assert carryover["goal_id"] == goal_id
+    assert carryover["previous_status"] == "stalled"
+    assert carryover["current_status"] == "queued"
+    assert carryover["agent_run_id"] == old_run_id
+    assert follow_up in carryover["operator_guidance"]
+    assert captured_requests[0].metadata["summary"]["guidance_messages"] == [
+        follow_up,
+        carryover_messages[0],
+    ]
+
+
+def test_goal_resume_carryover_marks_truncated_final_answer(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    captured_requests: list[Any] = []
+
+    async def _fake_run(self: Any, request: Any) -> MultiAgentRunResult:
+        del self
+        captured_requests.append(request)
+        return MultiAgentRunResult(
+            run_id=request.run_id,
+            protocol="teacher_student_distill",
+            state="succeeded",
+            task_input=request.task_input,
+            candidates=[],
+            selected_candidate_id=None,
+            evaluation={},
+            artifacts={"final_answer": "Recovered from a truncated prior answer."},
+            events=[],
+            metadata={},
+        )
+
+    monkeypatch.setattr("mochi.runtime.service.MultiAgentOrchestrator.run", _fake_run)
+
+    app = create_app()
+    runtime_service = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+    )
+    runtime_service.set_scheduler_poll_interval(0.05)
+    app.state.runtime_service = runtime_service
+    app.state.engine_factory = lambda: object()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+
+    goal_id = "goal-truncated-carryover-1"
+    attempt_id = "goal-truncated-carryover-attempt-1"
+    run_id = "goal-truncated-carryover-run-1"
+    partial_answer = (
+        "This final answer was cut off mid implementation patch.\n\n"
+        "```python\n"
+        "def save_recent_code() -> str:\n"
+        "    return 'persist this unfinished implementation'\n"
+        "```\n"
+    )
+
+    asyncio.run(
+        runtime_service._store.create_goal(
+            goal_id=goal_id,
+            objective="Resume a goal whose previous final answer was truncated.",
+            protocol_id="teacher_student_distill",
+            summary={"phase": "manual_resume"},
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_goal_attempt(
+            attempt_id=attempt_id,
+            goal_id=goal_id,
+            attempt_index=1,
+            status="stalled",
+            trigger="manual_start",
+            agent_run_id=run_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.update_goal_status(
+            goal_id,
+            "stalled",
+            current_attempt_id=attempt_id,
+        )
+    )
+    asyncio.run(
+        runtime_service._store.create_agent_run(
+            run_id=run_id,
+            protocol_id="teacher_student_distill",
+            title="Truncated carryover run",
+            topic="truncated carryover",
+            summary={
+                "goal_id": goal_id,
+                "goal_attempt_id": attempt_id,
+                "objective": "Resume a goal whose previous final answer was truncated.",
+                "task_input": "Resume a goal whose previous final answer was truncated.",
+                "recovery_state": {
+                    "status": "stalled",
+                    "action": "resume",
+                    "reason": "Previous final answer was truncated.",
+                    "stage": "research_context_prepared",
+                    "checkpoint": {
+                        "checkpoint_index": 1,
+                        "stage": "research_context_prepared",
+                    },
+                    "resume_payload": {
+                        "version": 1,
+                        "executor": "continue_from_checkpoint",
+                        "strategy_default": "continue_from_checkpoint",
+                        "stage": "research_context_prepared",
+                        "checkpoint": {
+                            "checkpoint_index": 1,
+                            "stage": "research_context_prepared",
+                        },
+                        "guidance_messages": [],
+                        "role_guidance_messages": {},
+                        "metadata_state": {},
+                        "precomputed_artifacts": {},
+                        "protocol_artifacts": {},
+                        "candidates": [],
+                        "evidence_packets": [],
+                        "verifications": [],
+                        "role_task_snapshot": {},
+                    },
+                },
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.append_agent_run_event(
+            run_id,
+            {
+                "type": "final_answer",
+                "payload": {
+                    "type": "final_answer",
+                    "content": partial_answer,
+                    "finish_reason": "length",
+                    "metadata": {"truncated": True, "recovery_attempts": 1},
+                },
+            },
+        )
+    )
+    asyncio.run(
+        runtime_service._store.append_agent_run_artifact(
+            run_id,
+            artifact_id=f"{run_id}:attempt:{attempt_id}:produced_artifacts",
+            artifact_type="produced_artifacts",
+            title="Produced Code Artifacts",
+            uri=f"agent-run://{run_id}/artifacts/{attempt_id}/produced_artifacts",
+            mime_type="application/json",
+            metadata={
+                "attempt_id": attempt_id,
+                "content": {
+                    "items": [
+                        {
+                            "path": "mochi/runtime/service.py",
+                            "status": "partial",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    asyncio.run(runtime_service._store.update_agent_run_status(run_id, "stalled"))
+
+    with TestClient(app) as client:
+        resume_response = client.post(
+            f"/v1/goals/{goal_id}/resume",
+            json={"strategy": "continue_from_checkpoint"},
+        )
+        assert resume_response.status_code == 200
+        completed_goal = _wait_goal_until(client, goal_id, {"completed"}, timeout_seconds=4.0)
+
+    assert completed_goal["status"] == "completed"
+    assert len(captured_requests) == 1
+    carryover_messages = [
+        item
+        for item in captured_requests[0].guidance_messages
+        if item.startswith("Goal carryover state: ")
+    ]
+    assert len(carryover_messages) == 1
+    carryover = json.loads(carryover_messages[0].removeprefix("Goal carryover state: "))
+    assert carryover["finish_reason"] == "length"
+    assert carryover["truncated"] is True
+    assert carryover["recovery_attempts"] == 1
+    assert carryover["pending_next_action"] == "continue_from_prior_truncated_final_answer"
+    assert carryover["final_answer_preview"] == partial_answer.rstrip()
+    assert carryover["recent_code_blocks"] == [
+        {
+            "language": "python",
+            "preview": (
+                "def save_recent_code() -> str:\n"
+                "    return 'persist this unfinished implementation'"
+            ),
+        }
+    ]
+    assert carryover["recent_artifact_refs"] == [
+        {
+            "artifact_type": "produced_artifacts",
+            "title": "Produced Code Artifacts",
+            "uri": f"agent-run://{run_id}/artifacts/{attempt_id}/produced_artifacts",
+            "mime_type": "application/json",
+        }
+    ]
+    assert carryover_messages[0] in captured_requests[0].metadata["resume_payload"]["guidance_messages"]
 
 
 def test_goal_operator_audit_log_can_filter_to_selected_goal(tmp_path: Path) -> None:
@@ -12544,10 +12775,32 @@ def test_goal_estop_update_pauses_running_goal(tmp_path: Path) -> None:
         assert linked_run_response.status_code == 200
         linked_run = linked_run_response.json()
 
+        audit_response = client.get(
+            "/v1/goals/operator-audit-log?event_type=goal_state_changed&goal_id=goal-estop-running-1"
+        )
+        assert audit_response.status_code == 200
+        state_events = audit_response.json()
+
     assert goal_payload["status"] == "paused"
     assert goal_payload["attempts"][0]["status"] == "paused"
     assert "operator emergency stop" in str(goal_payload["latest_error"])
     assert linked_run["status"] == "paused"
+    assert state_events
+    pause_event = state_events[0]
+    assert pause_event["event_type"] == "goal_state_changed"
+    assert pause_event["subject_type"] == "goal"
+    assert pause_event["subject_id"] == "goal-estop-running-1"
+    assert pause_event["action"] == "operator_pause"
+    assert pause_event["details"] == {
+        "type": "goal_state_changed",
+        "goal_id": "goal-estop-running-1",
+        "previous_status": "running",
+        "status": "paused",
+        "attempt_id": "goal-estop-running-attempt-1",
+        "agent_run_id": "goal-estop-linked-run-1",
+        "reason": "Goal execution is blocked by operator emergency stop. Reason: operator pause",
+        "metadata": {"source": "operator_controls"},
+    }
 
 
 def test_goal_operator_controls_propagate_into_linked_run_request_metadata(

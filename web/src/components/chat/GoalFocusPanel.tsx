@@ -12,9 +12,9 @@ import { Button } from '@/components/ui/button'
 import type { ExecutionTranscriptEvent, SubagentTranscriptSummary } from '@/lib/api'
 import type { GoalFocusCalloutView } from '@/lib/goal-focus-surface'
 import {
-  buildGoalCardChromeCopy,
-  buildGoalCardExecutionModeLabel,
-  buildGoalCardStatusLabel,
+  buildGoalChromeCopy,
+  buildGoalExecutionModeLabel,
+  buildGoalStatusLabel,
   buildGoalDisplayStateLabel,
   buildGoalModelCountLabel,
 } from '@/lib/goal-proposal-copy'
@@ -115,11 +115,11 @@ export function GoalFocusPanel({
     blocker?.summary ||
     blocker?.latestError ||
     goal.title
-  const chromeCopy = buildGoalCardChromeCopy(copySource)
+  const chromeCopy = buildGoalChromeCopy(copySource)
   const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
-  const executionLabel = buildGoalCardExecutionModeLabel(copySource, goal.executionMode)
+  const executionLabel = buildGoalExecutionModeLabel(copySource, goal.executionMode)
   const statusLabel =
-    buildGoalCardStatusLabel(copySource, goal.status) ??
+    buildGoalStatusLabel(copySource, goal.status) ??
     goal.status.replaceAll('_', ' ')
   const hasTimeline = subagents.length > 0 || timelineEvents.length > 0 || Boolean(timelineError)
   const summaryIntro =

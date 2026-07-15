@@ -51,7 +51,13 @@ class OllamaConfig(BaseModel):
     """HTTP 請求逾時秒數。"""
 
     num_ctx: int | None = Field(default=None, ge=1, le=1_048_576)
-    """Optional Ollama runtime `num_ctx` override. `None` keeps the server default."""
+    """Optional Ollama runtime `num_ctx` override. When set, this wins over auto sizing."""
+
+    auto_num_ctx: bool = True
+    """Automatically send Ollama `num_ctx` when no explicit override is configured."""
+
+    auto_num_ctx_cap: int = Field(default=32768, ge=1, le=1_048_576)
+    """Upper bound for automatic Ollama `num_ctx` sizing."""
 
 
 class GGUFConfig(BaseModel):

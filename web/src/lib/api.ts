@@ -6,9 +6,6 @@
 
 import type {
   ChatAttachment,
-  GoalCardExecutionMode,
-  GoalCardKind,
-  GoalCardView,
   Message,
   MessageEventType,
   ReasoningStep,
@@ -73,92 +70,6 @@ function getStringArray(value: unknown): string[] {
 
 function hasOwnField(record: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key)
-}
-
-function isGoalCardKind(value: unknown): value is GoalCardKind {
-  return value === 'proposal' || value === 'revised_proposal' || value === 'started'
-}
-
-function isGoalCardExecutionMode(value: unknown): value is GoalCardExecutionMode {
-  return value === 'single_agent' || value === 'workflow'
-}
-
-function normalizeGoalCardRecord(value: unknown): GoalCardView | null {
-  const record = isRecord(value) ? value : null
-  if (!record) {
-    return null
-  }
-
-  const kind = getString(record.kind)
-  const label = getNonEmptyString(record.label)
-  const objective = getNonEmptyString(record.objective)
-  const executionMode =
-    getString(record.execution_mode) ??
-    getString(record.executionMode)
-
-  if (
-    !isGoalCardKind(kind) ||
-    !label ||
-    !objective ||
-    !isGoalCardExecutionMode(executionMode)
-  ) {
-    return null
-  }
-
-  return {
-    kind,
-    label,
-    objective,
-    executionMode,
-    copySource:
-      getNonEmptyString(record.copy_source) ??
-      getNonEmptyString(record.copySource) ??
-      null,
-    protocolId:
-      getNonEmptyString(record.protocol_id) ??
-      getNonEmptyString(record.protocolId) ??
-      null,
-    models: getStringArray(record.models)
-      .map((model) => model.trim())
-      .filter((model, index, models) => model.length > 0 && models.indexOf(model) === index),
-    roleSummary:
-      getNonEmptyString(record.role_summary) ??
-      getNonEmptyString(record.roleSummary) ??
-      null,
-    runtimeMode:
-      getNonEmptyString(record.runtime_mode) ??
-      getNonEmptyString(record.runtimeMode) ??
-      null,
-    riskNote:
-      getNonEmptyString(record.risk_note) ??
-      getNonEmptyString(record.riskNote) ??
-      null,
-    goalId:
-      getNonEmptyString(record.goal_id) ??
-      getNonEmptyString(record.goalId) ??
-      null,
-    status: getNonEmptyString(record.status) ?? null,
-    superseded: getBoolean(record.superseded),
-  }
-}
-
-function extractGoalCard(record: Record<string, unknown>): GoalCardView | null {
-  const direct =
-    normalizeGoalCardRecord(record.goal_card) ??
-    normalizeGoalCardRecord(record.goalCard)
-  if (direct) {
-    return direct
-  }
-
-  const metadata = isRecord(record.metadata) ? record.metadata : null
-  if (!metadata) {
-    return null
-  }
-
-  return (
-    normalizeGoalCardRecord(metadata.goal_card) ??
-    normalizeGoalCardRecord(metadata.goalCard)
-  )
 }
 
 function getOptionalBoolean(value: unknown): boolean | undefined {
@@ -409,8 +320,12 @@ export interface SendMessageOptions {
 export type TurnEventPhase =
   | 'thinking'
   | 'status'
+  | 'assistant_truncated'
+  | 'tool_call_created'
+  | 'tool_call_completed'
   | 'tool_call_request'
   | 'tool_call_result'
+  | 'goal_state_changed'
   | 'error'
   | 'final_answer'
   | 'workflow_status'
@@ -421,8 +336,12 @@ export interface LegacyChatEvent {
   type:
     | 'thinking'
     | 'status'
+    | 'assistant_truncated'
+    | 'tool_call_created'
+    | 'tool_call_completed'
     | 'tool_call_request'
     | 'tool_call_result'
+    | 'goal_state_changed'
     | 'error'
     | 'final_answer'
 }
@@ -448,8 +367,6 @@ export interface TurnEventPayload extends Record<string, unknown> {
   trajectory_id?: unknown
   trajectoryId?: unknown
   metadata?: unknown
-  goal_card?: unknown
-  goalCard?: unknown
   input_tokens?: unknown
   output_tokens?: unknown
   generation_time_ms?: unknown
@@ -462,8 +379,6 @@ export interface SessionMessageEvent {
   content?: string
   attachments?: unknown
   metadata?: unknown
-  goal_card?: unknown
-  goalCard?: unknown
   timestamp?: string
   turn_id?: string | number
   turnId?: string | number
@@ -610,7 +525,6 @@ interface NormalizedMessageEvent {
   attachments: ChatAttachment[]
   hasContentField: boolean
   hasAttachmentsField: boolean
-  goalCard?: GoalCardView
   timestamp?: string
   turnKey: string | null
 }
@@ -633,7 +547,6 @@ interface NormalizedTurnEvent {
   outputTokens?: number
   generationTimeMs?: number
   finishReason?: string
-  goalCard?: GoalCardView
 }
 
 interface NormalizedTextChunkEvent {
@@ -801,7 +714,6 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
     const attachments = normalizeAttachments(event.attachments)
     const hasContentField = hasOwnField(event, 'content')
     const hasAttachmentsField = hasOwnField(event, 'attachments')
-    const goalCard = extractGoalCard(event)
 
     if (!role) {
       return null
@@ -811,7 +723,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       return null
     }
 
-    if (content.trim().length === 0 && attachments.length === 0 && !goalCard) {
+    if (content.trim().length === 0 && attachments.length === 0) {
       return null
     }
 
@@ -822,7 +734,6 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       attachments,
       hasContentField,
       hasAttachmentsField,
-      goalCard: role === 'assistant' ? goalCard ?? undefined : undefined,
       timestamp,
       turnKey,
     }
@@ -831,18 +742,12 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
   if (type === 'turn_event') {
     const rawPhase = getString(event.phase)
     const payload = isRecord(event.payload) ? event.payload : {}
-    const metadata = getPayloadRecord(payload, 'metadata', 'metadata')
     const phase =
       rawPhase === 'workflow_status' ||
       rawPhase === 'workflow_artifact' ||
       rawPhase === 'workflow_exec_update'
         ? 'status'
         : rawPhase
-    const goalCard =
-      normalizeGoalCardRecord(payload.goal_card) ??
-      normalizeGoalCardRecord(payload.goalCard) ??
-      normalizeGoalCardRecord(metadata?.goal_card) ??
-      normalizeGoalCardRecord(metadata?.goalCard)
     const finishReason =
       getNonEmptyString(payload.finish_reason) ??
       getNonEmptyString(payload.finishReason) ??
@@ -851,8 +756,12 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
     if (
       phase !== 'thinking' &&
       phase !== 'status' &&
+      phase !== 'assistant_truncated' &&
+      phase !== 'tool_call_created' &&
+      phase !== 'tool_call_completed' &&
       phase !== 'tool_call_request' &&
       phase !== 'tool_call_result' &&
+      phase !== 'goal_state_changed' &&
       phase !== 'error' &&
       phase !== 'final_answer'
     ) {
@@ -883,7 +792,6 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getPayloadNumber(payload, 'output_tokens', 'outputTokens'),
       generationTimeMs: getPayloadNumber(payload, 'generation_time_ms', 'generationTimeMs'),
       finishReason,
-      goalCard: goalCard ?? undefined,
     }
   }
 
@@ -903,8 +811,12 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
   if (
     type === 'thinking' ||
     type === 'status' ||
+    type === 'assistant_truncated' ||
+    type === 'tool_call_created' ||
+    type === 'tool_call_completed' ||
     type === 'tool_call_request' ||
     type === 'tool_call_result' ||
+    type === 'goal_state_changed' ||
     type === 'error' ||
     type === 'final_answer'
   ) {
@@ -930,7 +842,6 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getNumber(event.output_tokens) ?? undefined,
       generationTimeMs: getNumber(event.generation_time_ms) ?? undefined,
       finishReason: getNonEmptyString(event.finish_reason) ?? undefined,
-      goalCard: extractGoalCard(event) ?? undefined,
     }
   }
 
@@ -984,6 +895,8 @@ function buildReasoningStep(
         transport,
       }
     case 'status':
+    case 'assistant_truncated':
+    case 'goal_state_changed':
       return {
         id,
         type: 'status',
@@ -994,6 +907,7 @@ function buildReasoningStep(
         toolExposure,
         transport,
       }
+    case 'tool_call_created':
     case 'tool_call_request':
       return {
         id,
@@ -1005,6 +919,7 @@ function buildReasoningStep(
         toolArgs: event.toolArgs,
         status: 'running',
       }
+    case 'tool_call_completed':
     case 'tool_call_result':
       return {
         id,
@@ -1247,7 +1162,6 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
             ...messages[existingIndex],
             content: nextContent,
             attachments: nextAttachments,
-            goalCard: event.goalCard ?? messages[existingIndex].goalCard,
             timestamp: toMessageTimestamp(event.timestamp),
           }, {
             content: nextContent,
@@ -1264,7 +1178,6 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
         type: event.role,
         content: event.content,
         attachments: event.attachments,
-        goalCard: event.role === 'assistant' ? event.goalCard : undefined,
         timestamp: toMessageTimestamp(event.timestamp),
         turnKey: event.turnKey,
         turnId: event.turnKey,
@@ -1333,7 +1246,6 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
           timestamp: toMessageTimestamp(event.timestamp),
           eventType: 'final_answer',
           isStreaming: false,
-          goalCard: event.goalCard ?? messages[existingIndex].goalCard,
           tokenStats: tokenStats ?? messages[existingIndex].tokenStats,
         }, {
           content: event.content,
@@ -1350,7 +1262,6 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
           eventType: 'final_answer',
           turnKey,
           turnId: turnKey,
-          goalCard: event.goalCard,
           isStreaming: false,
           reasoningSteps: [],
           tokenStats: tokenStats,
@@ -1573,6 +1484,7 @@ function toStreamMessages(event: StreamChatEvent): Message[] {
   if (
     event.type === 'thinking' ||
     event.type === 'status' ||
+    event.type === 'assistant_truncated' ||
     event.type === 'tool_call_request' ||
     event.type === 'tool_call_result' ||
     event.type === 'error' ||

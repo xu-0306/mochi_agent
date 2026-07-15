@@ -59,9 +59,19 @@ class SafetensorsBackend(BaseLLMBackend):
         self.device = device
         self.torch_dtype = torch_dtype
         self._pipeline_factory = pipeline_factory
-        self._tool_call_simulator = tool_call_simulator or ToolCallSimulator()
+        self._tool_prompt_profile = self._resolve_tool_prompt_profile(model_dir)
+        self._tool_call_simulator = tool_call_simulator or ToolCallSimulator(
+            tool_prompt_profile=self._tool_prompt_profile,
+        )
         self._pipeline: Any | None = None
         self._dependency_error: str | None = self._probe_dependency_error()
+
+    @staticmethod
+    def _resolve_tool_prompt_profile(model_dir: str) -> str:
+        normalized = str(model_dir or "").strip().lower()
+        if "qwen" in normalized:
+            return "qwen_xml_tool_call"
+        return "json_tool_call"
 
     async def generate(
         self,
@@ -380,6 +390,7 @@ class SafetensorsBackend(BaseLLMBackend):
                     message.content = self._tool_call_simulator.inject_tools_into_prompt(
                         message.content,
                         tools,
+                        tool_prompt_profile=self._tool_prompt_profile,
                     )
                     injected = True
                     break
@@ -388,7 +399,11 @@ class SafetensorsBackend(BaseLLMBackend):
                     0,
                     Message(
                         role="system",
-                        content=self._tool_call_simulator.inject_tools_into_prompt("", tools).strip(),
+                        content=self._tool_call_simulator.inject_tools_into_prompt(
+                        "",
+                        tools,
+                        tool_prompt_profile=self._tool_prompt_profile,
+                    ).strip(),
                     ),
                 )
 

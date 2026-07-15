@@ -16,7 +16,7 @@ export type ChatGoalWorkflowRoute =
   | { kind: 'goal_help'; raw: string }
   | { kind: 'goal_proposal'; content: string; raw: string }
   | { kind: 'workflow_proposal'; requestText: string }
-  | { kind: 'goal_pending_follow_up'; requestText: string; raw: string }
+  | { kind: 'workflow_pending_follow_up'; requestText: string; raw: string }
   | { kind: 'goal_confirmation'; requestText: string; raw: string }
   | { kind: 'goal_revision'; requestText: string }
   | { kind: 'goal_lifecycle'; action: 'status' | 'pause' | 'resume' | 'stop'; raw: string }
@@ -36,18 +36,6 @@ export interface ResolveChatGoalWorkflowRoutingInput {
   hasPendingProposal: boolean
   hasActiveGoal: boolean
 }
-
-const ORDINARY_CHAT_FOLLOW_UPS = new Set([
-  'hi',
-  'hello',
-  'hey',
-  'yo',
-  '你好',
-  '您好',
-  '嗨',
-  '哈囉',
-  '哈啰',
-])
 
 export function parseChatModeCommand(value: string): ChatModeCommand | null {
   const match = value.match(/^\/(workflow|chat)(?:\s+([\s\S]*))?$/i)
@@ -91,17 +79,10 @@ export function parseGoalCommand(value: string): GoalCommand | null {
   }
 }
 
-function normalizeOrdinaryFollowUp(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[\s.!?,;:'"`~()[\]{}<>/\\|，。！？；：「」『』（）【】《》、]+/g, '')
+export function isPlainGreeting(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/[\s!\uFF01.\u3002?\uFF1F,\uFF0C~\uFF5E]+/g, '')
+  return ['hi', 'hello', 'hey', '\u4f60\u597d', '\u60a8\u597d', '\u55e8'].includes(normalized)
 }
-
-function isOrdinaryChatFollowUp(value: string): boolean {
-  return ORDINARY_CHAT_FOLLOW_UPS.has(normalizeOrdinaryFollowUp(value))
-}
-
 export function resolveChatGoalWorkflowRouting(
   input: ResolveChatGoalWorkflowRoutingInput
 ): ChatGoalWorkflowRoutingDecision {
@@ -120,8 +101,8 @@ export function resolveChatGoalWorkflowRouting(
     !modeCommand &&
     input.hasPendingProposal &&
     input.attachmentCount === 0 &&
-    requestText.trim().length > 0 &&
-    !isOrdinaryChatFollowUp(requestText)
+    !isPlainGreeting(requestText) &&
+    requestText.trim().length > 0
   const proposalRevisionRequested =
     !goalCommand &&
     !modeCommand &&
@@ -158,7 +139,7 @@ export function resolveChatGoalWorkflowRouting(
     }
   } else if (pendingProposalFollowUpRequested) {
     route = {
-      kind: 'goal_pending_follow_up',
+      kind: 'workflow_pending_follow_up',
       requestText,
       raw: input.text.trim(),
     }

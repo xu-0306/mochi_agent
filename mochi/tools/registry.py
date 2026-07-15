@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
     logger = logging.getLogger(__name__)
 
-from mochi.security import deny_security_decision
+from mochi.security import deny_security_decision, require_approval_decision
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.tools.tool_search import ToolSearchTool
 
@@ -33,6 +33,9 @@ class ToolRegistry:
     ) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._factories: dict[str, ToolFactory] = {}
+        self._activation_source: ToolRegistry | None = None
+        self._activation_discoverable_names: set[str] = set()
+        self._activation_callable_names: set[str] | None = None
         if discover_builtin:
             package_dir = Path(__file__).resolve().parent
             self._discover(package_dir)
@@ -100,7 +103,11 @@ class ToolRegistry:
     ) -> ToolRegistry:
         """Create a shallow registry view containing only the selected tools."""
         registry = ToolRegistry(discover_builtin=False)
+        callable_names = set(tool_names)
         scoped_catalog_names = list(tool_search_catalog_names or tool_names)
+        registry._activation_source = self
+        registry._activation_discoverable_names = set(scoped_catalog_names)
+        registry._activation_callable_names = callable_names
         for name in tool_names:
             tool = self.get(name)
             if tool is not None:
@@ -111,12 +118,325 @@ class ToolRegistry:
                                 candidate
                                 for candidate_name in scoped_catalog_names
                                 if (candidate := self.get(candidate_name)) is not None
-                            ]
+                            ],
+                            callable_name_provider=lambda: set(callable_names),
                         )
                     )
                     continue
                 registry._register_tool(tool)
         return registry
+
+    def request_tool_activation(
+        self,
+        tool_name: str,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
+        """Request promotion of one discoverable tool into this view only."""
+        requested_tool = str(tool_name or "").strip()
+        policy: dict[str, Any] = {}
+        if context is not None:
+            candidate_policy = context.state.get("tool_activation_policy")
+            if isinstance(candidate_policy, dict):
+                policy = candidate_policy
+
+        callable_names = self._activation_callable_names
+        if callable_names is None:
+            callable_names = {tool.name for tool in self.list_tools()}
+        if requested_tool in callable_names:
+            return ToolResult(
+                metadata={
+                    "status": "tool_already_callable",
+                    "requested_tool": requested_tool,
+                    "callable_this_turn": True,
+                }
+            )
+
+        activation_signature = (
+            self._activation_request_signature(
+                requested_tool,
+                context=context,
+                discoverable_tool_names=self._activation_discoverable_names,
+                view_identity=id(self),
+                source_identity=id(self._activation_source or self),
+            )
+            if context is not None
+            else None
+        )
+        denied_signatures = (
+            context.state.get("denied_tool_activation_signatures")
+            if context is not None
+            else None
+        )
+        if (
+            activation_signature is not None
+            and isinstance(denied_signatures, set)
+            and activation_signature in denied_signatures
+        ):
+            return self._activation_replay_denied(requested_tool)
+
+        source = self._activation_source or self
+        context_discoverable_names = policy.get("discoverable_tool_names")
+        if (
+            isinstance(context_discoverable_names, list)
+            and bool(context_discoverable_names)
+            and requested_tool not in context_discoverable_names
+        ):
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="not_discoverable",
+                context=context,
+            )
+        if requested_tool not in self._activation_discoverable_names:
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="not_discoverable",
+                context=context,
+            )
+        tool = source.get(requested_tool)
+        if tool is None:
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="tool_not_found",
+                context=context,
+            )
+        if context is None:
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="missing_execution_context",
+                context=context,
+            )
+
+        routed_intent = str(policy.get("routed_intent") or "").strip().lower()
+        mutation_tools = {"file_write", "file_edit", "apply_patch"}
+        if requested_tool in mutation_tools and routed_intent != "workspace_write":
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="routed_intent_disallows_activation",
+                context=context,
+            )
+
+        execution_profile = str(policy.get("execution_profile") or "chat").strip().lower()
+        readonly_profiles = {
+            "subagent_readonly",
+            "subagent_execution_request",
+            "subagent_research",
+            "judge",
+            "verifier",
+            "controller_exec",
+        }
+        if requested_tool in mutation_tools and execution_profile in readonly_profiles:
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="execution_profile_disallows_activation",
+                context=context,
+            )
+
+        tool_mode = str(policy.get("tool_mode") or "auto").strip().lower()
+        if tool_mode == "disabled":
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="tool_mode_disabled",
+                context=context,
+            )
+
+        allowlist = policy.get("tool_allowlist")
+        if isinstance(allowlist, list) and requested_tool not in allowlist:
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="allowlist_excluded",
+                context=context,
+            )
+        denylist = policy.get("tool_denylist")
+        if isinstance(denylist, list) and requested_tool in denylist:
+            return self._activation_denied(
+                requested_tool=requested_tool,
+                reason="denylist_blocked",
+                context=context,
+            )
+
+        if requested_tool in mutation_tools:
+            permission_policy = context.permission_policy
+            approval_required = bool(
+                permission_policy.get("require_approval_for_file_write")
+                or getattr(tool, "requires_approval", False)
+            )
+            approved_tools = permission_policy.get("approved_activation_tools")
+            approved = isinstance(approved_tools, list) and requested_tool in approved_tools
+            approved_tool_calls = permission_policy.get("approved_tool_calls")
+            if isinstance(approved_tool_calls, list):
+                approved = approved or any(
+                    isinstance(candidate, dict)
+                    and candidate.get("tool_name") == requested_tool
+                    for candidate in approved_tool_calls
+                )
+            if approval_required and not approved:
+                approval_kind = {
+                    "file_write": "file_write",
+                    "file_edit": "file_edit",
+                    "apply_patch": "apply_patch",
+                }.get(requested_tool, "other")
+                decision = require_approval_decision(
+                    reason="Activation requires approval before a workspace mutation tool can be promoted.",
+                    approval_kind=approval_kind,
+                    approval_scope="workspace",
+                    policy_source="tool_activation_policy",
+                )
+                metadata = decision.to_metadata()
+                metadata.update(
+                    {
+                        "runtime_category": "tool_activation",
+                        "error_type": "tool_activation_denied",
+                        "requested_tool": requested_tool,
+                        "reason": "approval_required",
+                        "recoverability": "requires_approval",
+                    }
+                )
+                self._remember_denied_activation(context, requested_tool)
+                return ToolResult(
+                    error="tool_activation_denied: approval is required before activation.",
+                    metadata=metadata,
+                    retryable=False,
+                    suggestion="Request or obtain approval, then retry with the same task context.",
+                )
+
+            workspace_dir = str(context.workspace_dir or "").strip()
+            tool_workspace = getattr(tool, "_workspace_dir", None)
+            workspace_mismatch = False
+            if workspace_dir and tool_workspace is not None and not context.task_sandbox_dir:
+                try:
+                    workspace_mismatch = (
+                        Path(workspace_dir).expanduser().resolve()
+                        != Path(str(tool_workspace)).expanduser().resolve()
+                    )
+                except OSError:
+                    workspace_mismatch = True
+            if not workspace_dir or workspace_mismatch:
+                return self._activation_denied(
+                    requested_tool=requested_tool,
+                    reason="workspace_security_rejected",
+                    context=context,
+                )
+
+        callable_names.add(requested_tool)
+        self._activation_callable_names = callable_names
+        self._register_tool(tool)
+        return ToolResult(
+            metadata={
+                "status": "tool_activated",
+                "requested_tool": requested_tool,
+                "callable_this_turn": True,
+                "activation_scope": "current_registry_view",
+            }
+        )
+
+    def _activation_denied(
+        self,
+        *,
+        requested_tool: str,
+        reason: str,
+        context: ToolExecutionContext | None,
+    ) -> ToolResult:
+        if context is not None:
+            self._remember_denied_activation(context, requested_tool)
+        return ToolResult(
+            error=f"tool_activation_denied: {reason}",
+            metadata={
+                "runtime_category": "tool_activation",
+                "error_type": "tool_activation_denied",
+                "requested_tool": requested_tool,
+                "reason": reason,
+                "recoverability": "requires_policy_change_or_replanning",
+                "retryable": False,
+            },
+            retryable=False,
+            suggestion="Change the activation context or choose a callable tool; do not replay unchanged.",
+        )
+
+    def _remember_denied_activation(self, context: ToolExecutionContext, tool_name: str) -> None:
+        denied = context.state.setdefault("denied_tool_activation_names", set())
+        if not isinstance(denied, set):
+            denied = set()
+            context.state["denied_tool_activation_names"] = denied
+        denied.add(tool_name)
+        signatures = context.state.setdefault("denied_tool_activation_signatures", set())
+        if not isinstance(signatures, set):
+            signatures = set()
+            context.state["denied_tool_activation_signatures"] = signatures
+        signatures.add(
+            self._activation_request_signature(
+                tool_name,
+                context=context,
+                discoverable_tool_names=self._activation_discoverable_names,
+                view_identity=id(self),
+                source_identity=id(self._activation_source or self),
+            )
+        )
+
+    @staticmethod
+    def _activation_request_signature(
+        tool_name: str,
+        *,
+        context: ToolExecutionContext,
+        discoverable_tool_names: set[str] | None = None,
+        view_identity: int | None = None,
+        source_identity: int | None = None,
+    ) -> str:
+        policy = context.state.get("tool_activation_policy")
+        policy = policy if isinstance(policy, dict) else {}
+        permission_policy = context.permission_policy
+        path_signatures: dict[str, str | None] = {}
+        for key in ("workspace_dir", "task_sandbox_dir"):
+            value = getattr(context, key, None)
+            if not value:
+                path_signatures[key] = None
+                continue
+            try:
+                path_signatures[key] = str(Path(str(value)).expanduser().resolve())
+            except OSError:
+                path_signatures[key] = str(value)
+        return ToolRegistry._tool_call_signature(
+            name=f"activation:{tool_name}",
+            args={
+                "routed_intent": policy.get("routed_intent"),
+                "execution_profile": policy.get("execution_profile"),
+                "tool_mode": policy.get("tool_mode"),
+                "discoverable_tool_names": policy.get("discoverable_tool_names"),
+                "view_discoverable_tool_names": sorted(discoverable_tool_names or set()),
+                "view_identity": view_identity,
+                "source_identity": source_identity,
+                "tool_allowlist": policy.get("tool_allowlist"),
+                "tool_denylist": policy.get("tool_denylist"),
+                "require_approval_for_file_write": permission_policy.get(
+                    "require_approval_for_file_write"
+                ),
+                "approved_activation_tools": permission_policy.get(
+                    "approved_activation_tools"
+                ),
+                "approved_tool_calls": permission_policy.get("approved_tool_calls"),
+                "workspace_dir": path_signatures["workspace_dir"],
+                "task_sandbox_dir": path_signatures["task_sandbox_dir"],
+            },
+        )
+
+    @staticmethod
+    def _activation_replay_denied(tool_name: str) -> ToolResult:
+        return ToolResult(
+            error=(
+                f"tool_activation_denied: the exact activation request for '{tool_name}' "
+                "was already denied and cannot be replayed unchanged."
+            ),
+            metadata={
+                "runtime_category": "tool_activation",
+                "error_type": "tool_activation_denied",
+                "requested_tool": tool_name,
+                "reason": "activation_denied_replay",
+                "recoverability": "requires_policy_change_or_replanning",
+                "replay_safe": False,
+            },
+            retryable=False,
+            suggestion="Change the policy context or obtain approval before retrying.",
+        )
 
     async def execute(
         self,
@@ -204,9 +524,22 @@ class ToolRegistry:
             replay_safe=False,
             policy_source="approval_memory",
         )
+        metadata = decision.to_metadata()
+        metadata.update(
+            {
+                "runtime_category": "permission",
+                "error_type": "tool_denied",
+                "recoverability": "requires_changed_tool_call",
+                "status": "tool_denied",
+                "code": "tool_denied",
+                "tool_name": name,
+                "arguments": args,
+                "requires_approval": False,
+            }
+        )
         return ToolResult(
-            error="This exact tool call was already denied and cannot be retried unchanged.",
-            metadata=decision.to_metadata(),
+            error="tool_denied: This exact tool call was already denied and cannot be retried unchanged.",
+            metadata=metadata,
             retryable=False,
             suggestion="Change the arguments or choose a different approach before retrying.",
         )

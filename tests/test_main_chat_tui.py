@@ -1,4 +1,4 @@
-﻿"""Chat TUI CLI tests."""
+"""Chat TUI CLI tests."""
 
 from __future__ import annotations
 
@@ -1069,7 +1069,7 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     fake_engine = _FakeEngine(None)
     inputs = iter(
         [
-            "/goal keep working on this for 30 minutes",
+            "/workflow keep working on this for 30 minutes",
             "start it",
             "/goal status",
             "/goal pause",
@@ -1106,8 +1106,8 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
     normalized_captured = " ".join(captured.split())
 
     assert "goal draft that acts as the contract for this task" in normalized_captured
-    assert "Next step:" in captured
-    assert "Launch: Send a short confirmation when you want execution to begin." in normalized_captured
+    assert "Next step:" not in captured
+    assert "Launch: Send a short confirmation when you want execution to begin." not in normalized_captured
     assert "Goal started." in captured
     assert "Fetched the latest goal status." in captured
     assert "Paused the active goal." in captured
@@ -1137,6 +1137,98 @@ async def test_chat_tui_async_goal_lifecycle_commands_use_terminal_goal_flow(
         "I framed your request as a goal draft that acts as the contract for this task. "
         "This scope fits a single-agent strategy, and execution begins only after you confirm the start."
     )
+    assistant_goal_cards = [
+        event.get("goal_card")
+        for event in session_events
+        if event.get("type") == "message" and event.get("role") == "assistant" and event.get("goal_card")
+    ]
+    assert assistant_goal_cards == []
+
+
+@pytest.mark.asyncio
+async def test_chat_tui_async_goal_command_runs_as_autonomous_chat_without_pending_proposal(
+    monkeypatch,
+    capsys,
+) -> None:
+    from mochi.main import _chat_tui_async
+
+    class _FakeEngine:
+        def __init__(self, config) -> None:  # noqa: ANN001, ARG002
+            self.calls: list[tuple[str, str | None, dict[str, object] | None]] = []
+            self.invocations: list[object] = []
+            self.closed = False
+
+        async def initialize(self) -> None:
+            return None
+
+        async def chat(
+            self,
+            message: str,
+            session_id: str | None = None,
+            inference_overrides: dict[str, object] | None = None,
+        ) -> AsyncIterator[object]:
+            self.calls.append((message, session_id, inference_overrides))
+            yield FinalAnswerEvent(content="autonomous goal turn")
+
+        async def invoke(self, request):  # noqa: ANN001
+            self.invocations.append(request)
+            return SimpleNamespace(content="unexpected")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FakeSessionStore:
+        def __init__(self, sessions_dir) -> None:  # noqa: ANN001, ARG002
+            self.by_session: dict[str, list[dict[str, object]]] = {}
+
+        async def save_event(self, session_id: str, event: dict[str, object]) -> None:
+            self.by_session.setdefault(session_id, []).append(dict(event))
+
+        async def load_session(self, session_id: str) -> list[dict[str, object]]:
+            return list(self.by_session.get(session_id, []))
+
+        async def delete_session(self, session_id: str) -> bool:
+            self.by_session.pop(session_id, None)
+            return True
+
+    fake_store = _FakeSessionStore(None)
+    fake_engine = _FakeEngine(None)
+    inputs = iter(["/goal ship this fix without a proposal UI", "/exit"])
+
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config",
+        lambda config_path=None: SimpleNamespace(  # noqa: ARG005
+            model="ollama:base",
+            sessions_dir="/tmp/mochi-sessions",
+            security=SecurityConfig(),
+            agent=SimpleNamespace(system_prompt="Base prompt."),
+        ),
+    )
+    monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005
+    monkeypatch.setattr("mochi.sessions.store.SessionStore", lambda sessions_dir: fake_store)  # noqa: ARG005
+    monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
+
+    await _chat_tui_async(
+        model=None,
+        config_path=None,
+        session_id="goal-session",
+        max_turns=2,
+    )
+    captured = capsys.readouterr().out
+
+    assert "autonomous goal turn" in captured
+    assert fake_engine.invocations == []
+    assert len(fake_engine.calls) == 1
+    message, session_id, inference_overrides = fake_engine.calls[0]
+    assert message == "ship this fix without a proposal UI"
+    assert session_id == "goal-session"
+    assert isinstance(inference_overrides, dict)
+    system_prompt = str(inference_overrides.get("system_prompt") or "")
+    assert system_prompt.startswith("Base prompt.")
+    assert "Autonomous goal mode is active for this turn." in system_prompt
+    assert "Goal objective: ship this fix without a proposal UI" in system_prompt
+    assert "Do not create or describe a separate goal proposal UI" in system_prompt
+    assert fake_store.by_session.get("goal-session", []) == []
 
 
 def _active_goal_session_event() -> dict[str, object]:
@@ -2167,6 +2259,103 @@ def test_tui_goal_routing_only_handles_explicit_goal_workflow_commands_and_pendi
     assert pending_follow_up.request_text == "go ahead"
     assert pending_follow_up.pending_proposal_follow_up_requested is True
     assert pending_follow_up.should_handle_goal_workflow_routing is True
+
+    for greeting in ("hi", "hello", "\u4f60\u597d", "\u55e8"):
+        greeting_decision = resolve_goal_workflow_routing(
+            text=greeting,
+            has_pending_proposal=True,
+            has_active_goal=False,
+        )
+        assert greeting_decision.goal_command is None, greeting
+        assert greeting_decision.mode_command is None, greeting
+        assert greeting_decision.pending_proposal_follow_up_requested is False, greeting
+        assert greeting_decision.should_handle_goal_workflow_routing is False, greeting
+
+
+@pytest.mark.asyncio
+async def test_terminal_pending_goal_ambiguous_follow_up_clears_pending_and_returns_to_chat() -> None:
+    from mochi.main import _handle_terminal_goal_input
+
+    class _FakeSessionStore:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = [
+                {
+                    "type": "session_meta",
+                    "event": "goal_state_updated",
+                    "session_id": "goal-session",
+                    "goal": {
+                        "active_goal_id": None,
+                        "active_goal_status": None,
+                        "execution_mode": "single_agent",
+                        "interaction_mode": "goal",
+                        "execution_topology": "single_agent",
+                        "bound_run_id": None,
+                        "protocol_selection": None,
+                        "selection_rationale": None,
+                        "default_route": "goal",
+                        "last_goal_summary": None,
+                        "pending_proposal": {
+                            "proposal_id": "proposal-1",
+                            "objective": "Ship the task",
+                            "execution_mode": "single_agent",
+                            "interaction_mode": "goal",
+                            "execution_topology": "single_agent",
+                            "bound_run_id": None,
+                            "protocol_selection": None,
+                            "selection_rationale": None,
+                            "protocol_id": None,
+                            "models": ["ollama:base"],
+                            "role_summary": "Primary agent continues the task directly.",
+                            "runtime_mode": "Single-agent long-running execution",
+                            "risk_note": None,
+                            "revision_index": 0,
+                            "assistant_explanation": "Old proposal copy.",
+                        },
+                    },
+                    "timestamp": "2026-07-04T00:00:00+00:00",
+                }
+            ]
+
+        async def save_event(self, session_id: str, event: dict[str, object]) -> None:
+            assert session_id == "goal-session"
+            self.events.append(dict(event))
+
+        async def load_session(self, session_id: str) -> list[dict[str, object]]:
+            assert session_id == "goal-session"
+            return list(self.events)
+
+    class _AmbiguousIntentInvoker:
+        async def invoke(self, request) -> SimpleNamespace:  # noqa: ANN001
+            assert '"user_follow_up": "random side question"' in request.message
+            return SimpleNamespace(
+                content='{"intent":"ambiguous","confidence":0.0,"rationale":"Side question is normal chat."}'
+            )
+
+    fake_store = _FakeSessionStore()
+    result = await _handle_terminal_goal_input(
+        text="random side question",
+        session_id="goal-session",
+        current_model="ollama:base",
+        autonomy_mode=None,
+        session_store=fake_store,
+        ensure_runtime_service=lambda: None,
+        intent_invoker=_AmbiguousIntentInvoker(),
+    )
+
+    assert result == {"handled": False, "chat_text": "random side question"}
+    goal_updates = [
+        event
+        for event in fake_store.events
+        if event.get("type") == "session_meta" and event.get("event") == "goal_state_updated"
+    ]
+    assert goal_updates[-1]["goal"]["default_route"] == "chat"
+    assert goal_updates[-1]["goal"]["pending_proposal"] is None
+    assistant_goal_cards = [
+        event.get("goal_card")
+        for event in fake_store.events
+        if event.get("type") == "message" and event.get("role") == "assistant"
+    ]
+    assert assistant_goal_cards == []
 
 
 @pytest.mark.asyncio

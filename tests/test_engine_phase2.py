@@ -10,7 +10,16 @@ import pytest
 from mochi.agents import engine as engine_module
 from mochi.agents.context import ContextManager
 from mochi.agents.engine import AgentEngine
-from mochi.agents.events import AgentEvent, ErrorEvent, FinalAnswerEvent
+from mochi.agents.events import (
+    AgentEvent,
+    AssistantTruncatedEvent,
+    ErrorEvent,
+    FinalAnswerEvent,
+    GoalStateChangedEvent,
+    StatusEvent,
+    ToolCallCompletedEvent,
+    ToolCallCreatedEvent,
+)
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest
 from mochi.agents.tool_exposure import ToolExposurePlan
 from mochi.agents.tool_intent_router import ToolIntentRoute
@@ -19,6 +28,8 @@ from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.types import AttachmentRef, GenerationResult, Message, ModelInfo, ResponsesReplayState, StreamChunk
 from mochi.config.schema import MochiConfig
 from mochi.sessions.store import SessionStore
+from mochi.tools.base import BaseTool, ToolResult
+from mochi.tools.registry import ToolRegistry
 
 
 class FakeBackend(BaseLLMBackend):
@@ -92,6 +103,69 @@ class FakeBackend(BaseLLMBackend):
 
     async def close(self) -> None:
         self.closed = True
+
+
+class EchoTool(BaseTool):
+    @property
+    def name(self) -> str:
+        return "echo_tool"
+
+    @property
+    def description(self) -> str:
+        return "Echo a short value."
+
+    @property
+    def parameters_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        }
+
+    async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+        return ToolResult(output={"echo": kwargs.get("value")})
+
+
+class FileWriteProbeTool(BaseTool):
+    def __init__(self, *, error: str | None = None) -> None:
+        self._error = error
+
+    @property
+    def name(self) -> str:
+        return "file_write"
+
+    @property
+    def description(self) -> str:
+        return "Write a file in the workspace."
+
+    @property
+    def parameters_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        }
+
+    async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+        if self._error:
+            return ToolResult(
+                error=self._error,
+                metadata={
+                    "file_changes": [{"path": kwargs.get("path", "report.md")}],
+                    "change_count": 1,
+                },
+            )
+        return ToolResult(
+            output=str(kwargs.get("path", "report.md")),
+            metadata={
+                "file_changes": [{"path": kwargs.get("path", "report.md")}],
+                "change_count": 1,
+                "bytes_written": len(str(kwargs.get("content", "")).encode("utf-8")),
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -525,6 +599,414 @@ def test_engine_resolve_inference_params_derives_auto_tokens_from_context_hint(t
     assert resolved["reserve_output_tokens"] == 2816
 
 
+@pytest.mark.asyncio
+async def test_react_loop_rescues_final_text_tool_call_markup() -> None:
+    from mochi.agents.events import FinalAnswerEvent, StatusEvent, ToolCallRequestEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+
+    class _RawToolMarkupBackend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(
+                    content=(
+                        'I need to use a tool. '
+                        '<tool_call>{"name":"echo_tool","arguments":{"value":"rescued"}}</tool_call>'
+                    ),
+                    finish_reason="stop",
+                )
+            assert messages[-1].role == "tool"
+            assert messages[-1].name == "echo_tool"
+            return GenerationResult(content="tool output consumed", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(EchoTool())
+    loop = AsyncReActLoop(backend=_RawToolMarkupBackend(), tool_registry=registry, max_iterations=3)
+
+    events = [event async for event in loop.run("system", [], "use a tool")]
+
+    statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "final_text_tool_call_rescue"
+    ]
+    requests = [event for event in events if isinstance(event, ToolCallRequestEvent)]
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+    assert len(statuses) == 1
+    assert statuses[0].metadata["tool_names"] == ["echo_tool"]
+    assert len(requests) == 1
+    assert requests[0].tool_name == "echo_tool"
+    assert requests[0].arguments == {"value": "rescued"}
+    assert len(results) == 1
+    assert results[0].result == {"echo": "rescued"}
+    assert len(finals) == 1
+    assert finals[0].content == "tool output consumed"
+
+
+@pytest.mark.asyncio
+async def test_react_loop_rescues_thinking_tool_call_markup_without_leaking_it() -> None:
+    from mochi.agents.events import FinalAnswerEvent, StatusEvent, ThinkingEvent, ToolCallRequestEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+
+    class _ThinkingToolMarkupBackend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(
+                    content="I should search before answering.",
+                    thinking=(
+                        "Need evidence.\n"
+                        "<tool_call>\n"
+                        "<function=echo_tool>\n"
+                        "<parameter=value>rescued from thinking</parameter>\n"
+                        "</function>\n"
+                        "</tool_call>"
+                    ),
+                    finish_reason="stop",
+                )
+            assert messages[-1].role == "tool"
+            assert messages[-1].name == "echo_tool"
+            return GenerationResult(content="tool output consumed", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(EchoTool())
+    loop = AsyncReActLoop(backend=_ThinkingToolMarkupBackend(), tool_registry=registry, max_iterations=3)
+
+    events = [event async for event in loop.run("system", [], "use a tool")]
+
+    statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "thinking_tool_call_rescue"
+    ]
+    thinking_events = [event for event in events if isinstance(event, ThinkingEvent)]
+    requests = [event for event in events if isinstance(event, ToolCallRequestEvent)]
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+
+    assert len(statuses) == 1
+    assert statuses[0].metadata["tool_names"] == ["echo_tool"]
+    assert all("<tool_call>" not in event.content for event in thinking_events)
+    assert len(requests) == 1
+    assert requests[0].tool_name == "echo_tool"
+    assert requests[0].arguments == {"value": "rescued from thinking"}
+    assert len(results) == 1
+    assert results[0].result == {"echo": "rescued from thinking"}
+    assert len(finals) == 1
+    assert finals[0].content == "tool output consumed"
+
+@pytest.mark.asyncio
+async def test_react_loop_recovers_once_from_length_limited_final_answer() -> None:
+    from mochi.agents.events import AssistantTruncatedEvent, FinalAnswerEvent, StatusEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+
+    class _LengthBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__(backend_type="ollama")
+            self.count = 0
+
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            self.count += 1
+            if self.count == 1:
+                return GenerationResult(content="partial answer", finish_reason="length")
+            assert "Continue exactly where it stopped" in messages[-1].content
+            assert messages[-2].role == "assistant"
+            assert messages[-2].content == "partial answer"
+            return GenerationResult(content=" completed", finish_reason="stop")
+
+    backend = _LengthBackend()
+    loop = AsyncReActLoop(backend=backend, tool_registry=None, max_iterations=3)
+
+    events = [event async for event in loop.run("system", [], "user request")]
+
+    truncation_events = [event for event in events if isinstance(event, AssistantTruncatedEvent)]
+    statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "finish_reason_length"
+    ]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+    assert len(truncation_events) == 1
+    assert truncation_events[0].finish_reason == "length"
+    assert truncation_events[0].recovery_attempt == 1
+    assert truncation_events[0].partial_output_chars == len("partial answer")
+    assert truncation_events[0].metadata["error_type"] == "output_truncated"
+    assert len(statuses) == 1
+    assert statuses[0].metadata["reason"] == "finish_reason_length"
+    assert statuses[0].metadata["runtime_category"] == "truncation"
+    assert statuses[0].metadata["error_type"] == "output_truncated"
+    assert statuses[0].metadata["recoverability"] == "retrying"
+    assert len(finals) == 1
+    assert finals[0].content == "completed"
+    assert finals[0].finish_reason == "stop"
+    assert finals[0].metadata == {
+        "runtime_category": "truncation",
+        "error_type": "output_truncated",
+        "recoverability": "recovered",
+        "truncated": True,
+        "recovery_attempts": 1,
+    }
+    assert backend.count == 2
+
+
+@pytest.mark.asyncio
+async def test_react_loop_recovers_truncated_final_text_tool_call_markup() -> None:
+    from mochi.agents.events import FinalAnswerEvent, StatusEvent, ToolCallRequestEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+
+    class _SplitToolMarkupBackend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(
+                    content='<tool_call>{"name":"echo_tool","arguments":{"value":"split',
+                    finish_reason="length",
+                )
+            if len(self.calls) == 2:
+                assert "Continue exactly where it stopped" in messages[-1].content
+                assert messages[-2].role == "assistant"
+                return GenerationResult(content=' rescued"}}</tool_call>', finish_reason="stop")
+            assert messages[-1].role == "tool"
+            assert messages[-1].name == "echo_tool"
+            return GenerationResult(content="tool output consumed", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(EchoTool())
+    backend = _SplitToolMarkupBackend()
+    loop = AsyncReActLoop(backend=backend, tool_registry=registry, max_iterations=4)
+
+    events = [event async for event in loop.run("system", [], "use a tool")]
+
+    truncation_statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "finish_reason_length"
+    ]
+    rescue_statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "truncated_final_text_tool_call_rescue"
+    ]
+    requests = [event for event in events if isinstance(event, ToolCallRequestEvent)]
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+
+    assert len(truncation_statuses) == 1
+    assert len(rescue_statuses) == 1
+    assert rescue_statuses[0].metadata["tool_names"] == ["echo_tool"]
+    assert len(requests) == 1
+    assert requests[0].arguments == {"value": "split rescued"}
+    assert len(results) == 1
+    assert results[0].result == {"echo": "split rescued"}
+    assert len(finals) == 1
+    assert finals[0].content == "tool output consumed"
+    assert any(message.role == "tool" and message.name == "echo_tool" for message in backend.calls[-1])
+
+
+@pytest.mark.asyncio
+async def test_react_loop_enforces_file_artifact_obligation_before_final_answer() -> None:
+    from mochi.agents.events import FinalAnswerEvent, StatusEvent, ToolCallRequestEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+    from mochi.backends.types import ToolCall
+
+    class _FileArtifactBackend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(content="Saved report.md", finish_reason="stop")
+            if len(self.calls) == 2:
+                assert "no successful file mutation" in messages[-1].content
+                return GenerationResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            name="file_write",
+                            arguments={"path": "report.md", "content": "# Report\n"},
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            assert messages[-1].role == "tool"
+            assert messages[-1].name == "file_write"
+            return GenerationResult(content="Saved report.md", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(FileWriteProbeTool())
+    backend = _FileArtifactBackend()
+    loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        max_iterations=4,
+        requires_file_mutation=True,
+    )
+
+    events = [event async for event in loop.run("system", [], "save a report file")]
+
+    guard_statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "file_artifact_missing"
+    ]
+    requests = [event for event in events if isinstance(event, ToolCallRequestEvent)]
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+
+    assert len(guard_statuses) == 1
+    assert guard_statuses[0].metadata["available_file_mutation_tools"] == ["file_write"]
+    assert len(requests) == 1
+    assert requests[0].tool_name == "file_write"
+    assert len(results) == 1
+    assert results[0].error is None
+    assert len(finals) == 1
+    assert finals[0].content == "Saved report.md"
+    assert any(
+        message.role == "user" and "no successful file mutation" in message.content
+        for message in backend.calls[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_loop_does_not_count_failed_file_preview_as_file_mutation() -> None:
+    from mochi.agents.events import FinalAnswerEvent, StatusEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+    from mochi.backends.types import ToolCall
+
+    class _FileArtifactApprovalBackend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            name="file_write",
+                            arguments={"path": "report.md", "content": "# Report\n"},
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            if len(self.calls) == 2:
+                return GenerationResult(content="Saved report.md", finish_reason="stop")
+            assert "previous file mutation attempt failed" in messages[-1].content
+            return GenerationResult(content="Blocked: file write requires approval.", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(FileWriteProbeTool(error="File write requires approval."))
+    backend = _FileArtifactApprovalBackend()
+    loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        max_iterations=4,
+        requires_file_mutation=True,
+    )
+
+    events = [event async for event in loop.run("system", [], "save a report file")]
+
+    guard_statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "file_artifact_missing"
+    ]
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+
+    assert len(results) == 1
+    assert results[0].error == "File write requires approval."
+    assert len(guard_statuses) == 2
+    assert guard_statuses[-1].metadata["last_file_mutation_error"] == "File write requires approval."
+    assert len(finals) == 1
+    assert finals[0].content == "Blocked: file write requires approval."
+
+
+@pytest.mark.asyncio
+async def test_react_loop_marks_final_answer_when_length_recovery_also_truncates() -> None:
+    from mochi.agents.events import FinalAnswerEvent, StatusEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+
+    class _StillLengthBackend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            return GenerationResult(content=f"part {len(self.calls)}", finish_reason="length")
+
+    backend = _StillLengthBackend(backend_type="ollama")
+    loop = AsyncReActLoop(backend=backend, tool_registry=None, max_iterations=3)
+
+    events = [event async for event in loop.run("system", [], "user request")]
+
+    truncation_statuses = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "finish_reason_length"
+    ]
+    assert len(truncation_statuses) == 1
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+    assert len(finals) == 1
+    assert finals[0].content == "part 2"
+    assert finals[0].finish_reason == "length"
+    assert finals[0].metadata == {
+        "runtime_category": "truncation",
+        "error_type": "output_truncated",
+        "recoverability": "partial",
+        "truncated": True,
+        "recovery_attempts": 1,
+    }
+    assert len(backend.calls) == 2
+
+
+def test_engine_context_hint_prefers_effective_context_metadata(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    engine._preinitialized_model_info_cache = ModelInfo(  # noqa: SLF001
+        name="ollama:test",
+        backend_type="ollama",
+        provider="ollama",
+        context_length=131072,
+        metadata={
+            "context_length_source": "api_show.model_info.llama.context_length",
+            "effective_context_length": 8192,
+            "effective_context_length_source": "config.num_ctx",
+        },
+    )
+
+    resolved = engine._resolve_inference_params(  # noqa: SLF001
+        {
+            "max_output_tokens": None,
+            "reserve_output_tokens": None,
+        }
+    )
+
+    assert resolved["max_output_tokens"] == 2048
+    assert resolved["max_tokens"] == 2048
+    assert resolved["reserve_output_tokens"] == 768
+    assert engine._snapshot_context_length(engine._preinitialized_model_info_cache) == 8192  # noqa: SLF001
+
+
 def test_engine_resolve_inference_params_uses_conservative_auto_fallback_without_context_hint(
     tmp_path: Path,
 ) -> None:
@@ -582,7 +1064,7 @@ async def test_engine_preview_runtime_and_backend_payload_keep_output_cap_and_re
         name="gpt-5.2",
         provider="openai_compat",
         backend_type="openai_compat",
-        context_length=8192,
+        context_length=32768,
         supports_tool_calling=True,
         metadata={"api_mode": "responses"},
     )
@@ -1573,6 +2055,116 @@ async def test_engine_invocation_tool_overrides_are_limited_by_profile(
 
 
 @pytest.mark.asyncio
+async def test_engine_passes_workspace_write_route_as_file_mutation_obligation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_backend = FakeBackend()
+    seen_requires_file_mutation: list[bool] = []
+    seen_tool_names: list[list[str]] = []
+
+    class SpyReActLoop:
+        def __init__(
+            self,
+            *args: object,
+            tool_registry: ToolRegistry | None = None,
+            requires_file_mutation: bool = False,
+            **kwargs: object,
+        ) -> None:
+            del args, kwargs
+            seen_requires_file_mutation.append(requires_file_mutation)
+            seen_tool_names.append(
+                [schema["function"]["name"] for schema in tool_registry.get_schemas()]
+                if tool_registry is not None
+                else []
+            )
+
+        async def run(self, *args: object, **kwargs: object) -> AsyncIterator[AgentEvent]:
+            del args, kwargs
+            yield FinalAnswerEvent(content="spy reply")
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    routed_intent = "workspace_write"
+
+    async def fake_route_tool_intent_for_exposure(**kwargs: object) -> ToolIntentRoute:
+        del kwargs
+        return ToolIntentRoute(
+            intent=routed_intent,
+            confidence=0.99,
+            source="classifier" if routed_intent == "workspace_write" else "fallback_keyword",
+            rationale="The user is asking to create or save a workspace file.",
+        )
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    engine._route_tool_intent_for_exposure = fake_route_tool_intent_for_exposure  # type: ignore[method-assign]
+    monkeypatch.setattr(engine_module, "AsyncReActLoop", SpyReActLoop)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message="create report.md",
+            session_id="workspace-write-obligation-worker",
+            tool_mode="auto",
+            execution_profile="chat",
+            tool_denylist=["file_write", "file_edit", "apply_patch"],
+            persist_session=False,
+        )
+    )
+
+    assert result.content == "spy reply"
+    assert seen_requires_file_mutation == [True]
+    assert not any(tool_name in {"file_write", "file_edit", "apply_patch"} for tool_name in seen_tool_names[0])
+
+    routed_intent = "ambiguous"
+    fallback_result = await engine.invoke(
+        AgentInvocationRequest(
+            message="save report.md",
+            session_id="ambiguous-workspace-write-obligation-worker",
+            tool_mode="auto",
+            execution_profile="chat",
+            tool_denylist=["file_write", "file_edit", "apply_patch"],
+            persist_session=False,
+        )
+    )
+
+    assert fallback_result.content == "spy reply"
+    assert seen_requires_file_mutation == [True, True]
+    assert all(
+        not ({"file_write", "file_edit", "apply_patch"} & set(tool_names))
+        for tool_names in seen_tool_names
+    )
+
+    routed_intent = "open_world_lookup"
+    non_write_result = await engine.invoke(
+        AgentInvocationRequest(
+            message="Update me on the latest weather in Taipei",
+            session_id="open-world-obligation-worker",
+            tool_mode="auto",
+            execution_profile="chat",
+            tool_denylist=["file_write", "file_edit", "apply_patch"],
+            persist_session=False,
+        )
+    )
+
+    assert non_write_result.content == "spy reply"
+    assert seen_requires_file_mutation == [True, True, False]
+
+    await engine.close()
+
+@pytest.mark.asyncio
 async def test_engine_invocation_max_iterations_override_reaches_react_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1673,6 +2265,269 @@ async def test_engine_uses_higher_default_max_iterations_for_local_backends(
 
     await engine.close()
 
+
+@pytest.mark.asyncio
+async def test_engine_blocks_invocation_when_prompt_exceeds_conservative_fallback_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_backend = FakeBackend(
+        metadata={
+            "effective_context_length": 128,
+            "effective_context_length_source": "auto_num_ctx.fallback_default",
+            "context_length_source": "unknown",
+            "context_length_fallback": 128,
+        }
+    )
+    react_loop_called = False
+
+    class SpyReActLoop:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            nonlocal react_loop_called
+            react_loop_called = True
+
+        async def run(self, *args: object, **kwargs: object) -> AsyncIterator[AgentEvent]:
+            del args, kwargs
+            yield FinalAnswerEvent(content="should not run")
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    monkeypatch.setattr(engine_module, "AsyncReActLoop", SpyReActLoop)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message=" ".join(["oversized"] * 1000),
+            session_id="fallback-context-overflow-worker",
+            inference_overrides={
+                "max_output_tokens": 64,
+                "reserve_output_tokens": 64,
+            },
+            tool_mode="disabled",
+            execution_profile="subagent_readonly",
+            persist_session=False,
+        )
+    )
+
+    assert react_loop_called is False
+    assert fake_backend.calls == []
+    assert result.diagnostics.fallback_reason == "context_overflow"
+    final_events = [event for event in result.events if isinstance(event, FinalAnswerEvent)]
+    assert final_events[-1].finish_reason == "context_overflow"
+    assert final_events[-1].metadata["context_length_source"] == "auto_num_ctx.fallback_default"
+    assert final_events[-1].metadata["hard_overflow"] is True
+    assert final_events[-1].metadata["runtime_category"] == "context_budget"
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_blocks_invocation_when_prompt_exceeds_effective_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_backend = FakeBackend(
+        metadata={
+            "effective_context_length": 128,
+            "effective_context_length_source": "test.effective_context",
+        }
+    )
+    react_loop_called = False
+
+    class SpyReActLoop:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            nonlocal react_loop_called
+            react_loop_called = True
+
+        async def run(self, *args: object, **kwargs: object) -> AsyncIterator[AgentEvent]:
+            del args, kwargs
+            yield FinalAnswerEvent(content="should not run")
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    monkeypatch.setattr(engine_module, "AsyncReActLoop", SpyReActLoop)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message=" ".join(["oversized"] * 1000),
+            session_id="context-overflow-worker",
+            inference_overrides={
+                "max_output_tokens": 64,
+                "reserve_output_tokens": 64,
+            },
+            tool_mode="disabled",
+            execution_profile="subagent_readonly",
+            persist_session=False,
+        )
+    )
+
+    assert react_loop_called is False
+    assert fake_backend.calls == []
+    assert result.diagnostics.fallback_reason == "context_overflow"
+    assert "context window" in result.content
+    assert any(
+        isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "context_overflow"
+        for event in result.events
+    )
+    final_events = [event for event in result.events if isinstance(event, FinalAnswerEvent)]
+    assert final_events[-1].finish_reason == "context_overflow"
+    assert final_events[-1].metadata["estimated_prompt_tokens"] > final_events[-1].metadata[
+        "context_length"
+    ]
+    assert final_events[-1].metadata["hard_overflow"] is True
+    assert final_events[-1].metadata["runtime_category"] == "context_budget"
+    assert final_events[-1].metadata["error_type"] == "context_overflow"
+    assert final_events[-1].metadata["recoverability"] == "requires_user_input"
+
+    await engine.close()
+
+
+def test_turn_event_payload_serializes_assistant_truncated_event(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    phase, payload = engine._turn_event_payload(  # noqa: SLF001
+        AssistantTruncatedEvent(
+            content="Model output hit the response length limit; requesting continuation.",
+            finish_reason="length",
+            recovery_attempt=1,
+            partial_output_chars=42,
+            metadata={
+                "runtime_category": "truncation",
+                "error_type": "output_truncated",
+                "recoverability": "retrying",
+            },
+        )
+    )
+
+    assert phase == "assistant_truncated"
+    assert payload["finish_reason"] == "length"
+    assert payload["recovery_attempt"] == 1
+    assert payload["partial_output_chars"] == 42
+    assert payload["metadata"]["error_type"] == "output_truncated"
+
+
+
+
+
+def test_turn_event_payload_serializes_explicit_tool_call_events(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    created_phase, created_payload = engine._turn_event_payload(  # noqa: SLF001
+        ToolCallCreatedEvent(
+            call_id="call-1",
+            tool_name="write_file",
+            arguments={"path": "demo.py"},
+            metadata={"compat_event_type": "tool_call_request"},
+        )
+    )
+    completed_phase, completed_payload = engine._turn_event_payload(  # noqa: SLF001
+        ToolCallCompletedEvent(
+            call_id="call-1",
+            tool_name="write_file",
+            arguments={"path": "demo.py"},
+            result={"status": "ok"},
+            error=None,
+            metadata={"compat_event_type": "tool_call_result"},
+        )
+    )
+
+    assert created_phase == "tool_call_created"
+    assert created_payload == {
+        "call_id": "call-1",
+        "tool_name": "write_file",
+        "arguments": {"path": "demo.py"},
+        "metadata": {"compat_event_type": "tool_call_request"},
+    }
+    assert completed_phase == "tool_call_completed"
+    assert completed_payload == {
+        "call_id": "call-1",
+        "tool_name": "write_file",
+        "arguments": {"path": "demo.py"},
+        "result": {"status": "ok"},
+        "error": None,
+        "metadata": {"compat_event_type": "tool_call_result"},
+    }
+
+
+def test_turn_event_payload_serializes_goal_state_changed_event(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+
+    phase, payload = engine._turn_event_payload(  # noqa: SLF001
+        GoalStateChangedEvent(
+            goal_id="goal-1",
+            previous_status="running",
+            status="paused",
+            attempt_id="attempt-1",
+            agent_run_id="run-1",
+            reason="operator emergency stop",
+            metadata={"source": "operator_controls"},
+        )
+    )
+
+    assert phase == "goal_state_changed"
+    assert payload == {
+        "goal_id": "goal-1",
+        "previous_status": "running",
+        "status": "paused",
+        "attempt_id": "attempt-1",
+        "agent_run_id": "run-1",
+        "reason": "operator emergency stop",
+        "metadata": {"source": "operator_controls"},
+    }
 
 def test_turn_event_payload_preserves_error_metadata(tmp_path: Path) -> None:
     config = MochiConfig.model_validate(

@@ -34,6 +34,8 @@ class BackendRouter:
         self,
         ollama_base_url: str = "http://localhost:11434",
         ollama_num_ctx: int | None = None,
+        ollama_auto_num_ctx: bool = True,
+        ollama_auto_num_ctx_cap: int = 32768,
         openai_default_model: str = "auto",
         openai_api_key: str = "",
         openai_codex_default_model: str | None = None,
@@ -47,6 +49,8 @@ class BackendRouter:
     ) -> None:
         self._ollama_base_url = ollama_base_url
         self._ollama_num_ctx = ollama_num_ctx
+        self._ollama_auto_num_ctx = bool(ollama_auto_num_ctx)
+        self._ollama_auto_num_ctx_cap = int(ollama_auto_num_ctx_cap)
         self._openai_compat_default_model = openai_default_model
         self._openai_compat_api_key = openai_api_key
         self._openai_codex_default_model = openai_codex_default_model or openai_default_model
@@ -65,6 +69,8 @@ class BackendRouter:
         *,
         ollama_base_url: str,
         ollama_num_ctx: int | None,
+        ollama_auto_num_ctx: bool,
+        ollama_auto_num_ctx_cap: int,
         openai_default_model: str,
         openai_api_key: str,
         openai_codex_default_model: str | None = None,
@@ -78,6 +84,8 @@ class BackendRouter:
     ) -> None:
         self._ollama_base_url = ollama_base_url
         self._ollama_num_ctx = ollama_num_ctx
+        self._ollama_auto_num_ctx = bool(ollama_auto_num_ctx)
+        self._ollama_auto_num_ctx_cap = int(ollama_auto_num_ctx_cap)
         self._openai_compat_default_model = openai_default_model
         self._openai_compat_api_key = openai_api_key
         self._openai_codex_default_model = openai_codex_default_model or openai_default_model
@@ -123,6 +131,8 @@ class BackendRouter:
         }
         if self._ollama_num_ctx is not None:
             backend_kwargs["num_ctx"] = self._ollama_num_ctx
+        backend_kwargs["auto_num_ctx"] = self._ollama_auto_num_ctx
+        backend_kwargs["auto_num_ctx_cap"] = self._ollama_auto_num_ctx_cap
         backend = OllamaBackend(**backend_kwargs)
         active_backend = await self._switch_to_backend(backend, f"ollama:{normalized_model}")
         self._ollama_base_url = normalized_base_url
@@ -315,6 +325,8 @@ class BackendRouter:
             }
             if self._ollama_num_ctx is not None:
                 backend_kwargs["num_ctx"] = self._ollama_num_ctx
+            backend_kwargs["auto_num_ctx"] = self._ollama_auto_num_ctx
+            backend_kwargs["auto_num_ctx_cap"] = self._ollama_auto_num_ctx_cap
             return OllamaBackend(**backend_kwargs)
 
         if model_spec.startswith(("http://", "https://")):

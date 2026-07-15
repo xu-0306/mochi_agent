@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+import pytest
+
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.tool_exposure import ToolExposurePlanner
 from mochi.agents.tool_intent_router import (
@@ -498,9 +500,154 @@ def test_tool_exposure_workspace_readonly_baseline_keeps_tool_result_read() -> N
     )
 
     assert {"file_read", "tool_result_read", "glob_search", "grep_search"} <= set(plan.tool_names)
-    assert "file_write" in plan.tool_names
+    assert "file_write" not in plan.tool_names
+    assert "file_write" in plan.discoverable_tool_names
 
 
+
+
+def test_tool_exposure_routed_workspace_write_exposes_write_tools_without_session_binding() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "repo_map",
+                "read_symbol",
+                "glob_search",
+                "grep_search",
+                "file_read",
+                "tool_search",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+            ],
+        }
+    )
+
+    plan = planner.plan(
+        message="create report.md",
+        user_intent_message="create report.md",
+        available_tool_names=[
+            "repo_map",
+            "read_symbol",
+            "glob_search",
+            "grep_search",
+            "file_read",
+            "tool_search",
+            "file_write",
+            "file_edit",
+            "apply_patch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=False,
+        autonomy_mode="trusted_workspace",
+        routed_intent="workspace_write",
+        intent_confidence=0.99,
+        intent_source="classifier",
+        intent_rationale="The user is asking to create a workspace file.",
+    )
+
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.tool_names)
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.discoverable_tool_names)
+
+
+def test_tool_exposure_routed_workspace_write_exposes_write_tools_from_intent_not_phrase() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "repo_map",
+                "read_symbol",
+                "glob_search",
+                "grep_search",
+                "file_read",
+                "tool_search",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+            ],
+        }
+    )
+
+    plan = planner.plan(
+        message="produce an artifact",
+        user_intent_message="produce an artifact",
+        available_tool_names=[
+            "repo_map",
+            "read_symbol",
+            "glob_search",
+            "grep_search",
+            "file_read",
+            "tool_search",
+            "file_write",
+            "file_edit",
+            "apply_patch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="trusted_workspace",
+        routed_intent="workspace_write",
+        intent_confidence=0.93,
+        intent_source="classifier",
+        intent_rationale="The user asked for a workspace artifact to be saved.",
+    )
+
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.tool_names)
+    assert plan.exposure_metadata()["intent_route"]["source"] == "classifier"
+
+def test_tool_exposure_workspace_code_creation_save_exposes_write_tools() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "file_read",
+                "glob_search",
+                "grep_search",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+            ],
+        }
+    )
+
+    plan = planner.plan(
+        message="create a training script and save it in the workspace",
+        user_intent_message="create a training script and save it in the workspace",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "file_write",
+            "file_edit",
+            "apply_patch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="strict",
+        routed_intent="workspace_write",
+        intent_confidence=0.92,
+        intent_source="classifier",
+        intent_rationale="Explicit code creation and save request.",
+    )
+
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.tool_names)
+    assert {"file_write", "apply_patch"} <= set(plan.discoverable_tool_names)
+
+
+def test_tool_exposure_workspace_greeting_keeps_write_tools_discoverable() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["file_read", "glob_search", "grep_search", "file_write", "apply_patch"],
+        }
+    )
+
+    plan = planner.plan(
+        message="hello",
+        user_intent_message="hello",
+        available_tool_names=["file_read", "glob_search", "grep_search", "file_write", "apply_patch"],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="strict",
+    )
+
+    assert {"file_write", "apply_patch"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_routed_workspace_read_stays_workspace_focused() -> None:
@@ -537,10 +684,101 @@ def test_tool_exposure_routed_workspace_read_stays_workspace_focused() -> None:
     )
 
     assert plan.matched_groups == ["workspace"]
-    assert {"glob_search", "grep_search", "file_read", "file_write"} <= set(plan.tool_names)
+    assert {"glob_search", "grep_search", "file_read"} <= set(plan.tool_names)
+    assert "file_write" not in plan.tool_names
+    assert "file_write" in plan.discoverable_tool_names
     assert "web_search" not in plan.tool_names
     assert "semantic_scholar_search" not in plan.tool_names
     assert plan.exposure_metadata()["intent_route"]["intent"] == "workspace_read"
+
+
+def test_tool_exposure_workspace_read_inspect_repository_hides_write_tools() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": [
+                "file_read",
+                "glob_search",
+                "grep_search",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+            ],
+        }
+    )
+    write_tools = {"file_write", "file_edit", "apply_patch"}
+    plan = planner.plan(
+        message="inspect the repository",
+        user_intent_message="inspect the repository",
+        available_tool_names=[
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "file_write",
+            "file_edit",
+            "apply_patch",
+        ],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="trusted_workspace",
+        tool_capabilities=_tool_capabilities(
+            "file_read",
+            "glob_search",
+            "grep_search",
+            "file_write",
+            "file_edit",
+            "apply_patch",
+        ),
+        routed_intent="workspace_read",
+        intent_confidence=0.95,
+        intent_source="classifier",
+        intent_rationale="The user asks for repository inspection only.",
+    )
+
+    assert not write_tools & set(plan.tool_names)
+    assert write_tools <= set(plan.discoverable_tool_names)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Update me on the latest weather in Taipei",
+        "請更新台北最新天氣",
+        "请更新台北最新天气",
+    ],
+)
+def test_tool_exposure_open_world_weather_hides_write_tools(message: str) -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "web": ["web_search", "web_fetch"],
+            "workspace": ["file_read", "file_write", "file_edit", "apply_patch"],
+        }
+    )
+    write_tools = {"file_write", "file_edit", "apply_patch"}
+    available_tools = [
+        "web_search",
+        "web_fetch",
+        "file_read",
+        "file_write",
+        "file_edit",
+        "apply_patch",
+    ]
+    plan = planner.plan(
+        message=message,
+        user_intent_message=message,
+        available_tool_names=available_tools,
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="trusted_workspace",
+        tool_capabilities=_tool_capabilities(*available_tools),
+        routed_intent="open_world_lookup",
+        intent_confidence=0.95,
+        intent_source="classifier",
+        intent_rationale="The user asks for current weather information.",
+    )
+
+    assert {"web_search", "web_fetch"} <= set(plan.tool_names)
+    assert not write_tools & set(plan.tool_names)
+    assert write_tools <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_normalizes_legacy_workspace_read_alias_in_metadata() -> None:
@@ -614,6 +852,31 @@ def test_tool_exposure_routed_tool_discovery_prefers_tool_search() -> None:
 
     assert "tool_search" in plan.tool_names
     assert plan.exposure_metadata()["intent_route"]["source"] == "fallback_keyword"
+
+
+def test_tool_exposure_tool_discovery_keeps_write_tools_discoverable_not_callable() -> None:
+    planner = ToolExposurePlanner(
+        tool_groups={
+            "workspace": ["tool_search", "file_read", "file_write"],
+        }
+    )
+
+    plan = planner.plan(
+        message="你有沒有保存檔案的工具？",
+        user_intent_message="你有沒有保存檔案的工具？",
+        available_tool_names=["tool_search", "file_read", "file_write"],
+        backend=_FakeBackend(),
+        session_bound_workspace=True,
+        autonomy_mode="trusted_workspace",
+        routed_intent="tool_discovery",
+        intent_confidence=0.9,
+        intent_source="classifier",
+        intent_rationale="The user is asking whether a save-file tool exists.",
+    )
+
+    assert "tool_search" in plan.tool_names
+    assert "file_write" not in plan.tool_names
+    assert "file_write" in plan.discoverable_tool_names
 
 
 def test_tool_exposure_strict_mode_filters_risky_tools() -> None:
@@ -1709,7 +1972,7 @@ def test_prompt_builder_guides_workspace_reads_and_tool_search() -> None:
     assert "use `tool_search` to discover the right tool instead of guessing" in prompt
 
 
-def test_tool_exposure_attached_workspace_reads_skip_risky_tools() -> None:
+def test_tool_exposure_attached_workspace_reads_skip_execution_but_keep_write_capability() -> None:
     planner = ToolExposurePlanner(
         tool_groups={
             "workspace": [
@@ -1745,6 +2008,7 @@ def test_tool_exposure_attached_workspace_reads_skip_risky_tools() -> None:
     )
     assert {"file_read", "pdf_read", "docx_read"} <= set(plan.tool_names)
     assert not {"exec_command", "file_write", "file_edit", "execute_code"} & set(plan.tool_names)
+    assert {"file_write", "file_edit"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_attachment_bias_works_with_engine_structured_attachment_header() -> None:
@@ -1806,6 +2070,7 @@ def test_tool_exposure_attachment_bias_works_with_engine_structured_attachment_h
     assert "Structured attachments:" in planner_message
     assert {"file_read", "pdf_read", "docx_read"} <= set(plan.tool_names)
     assert not {"exec_command", "file_write", "file_edit", "execute_code"} & set(plan.tool_names)
+    assert {"file_write", "file_edit"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_attached_docx_edit_intent_keeps_write_tools_available() -> None:
@@ -1861,6 +2126,7 @@ def test_tool_exposure_write_summary_of_attached_pdf_stays_read_only() -> None:
 
     assert {"file_read", "pdf_read"} <= set(plan.tool_names)
     assert not {"file_write", "file_edit", "apply_patch"} & set(plan.tool_names)
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_attached_json_processing_keeps_non_mutating_execution_tools() -> None:
@@ -1895,6 +2161,7 @@ def test_tool_exposure_attached_json_processing_keeps_non_mutating_execution_too
 
     assert {"file_read", "exec_command", "execute_code"} <= set(plan.tool_names)
     assert not {"file_write", "file_edit"} & set(plan.tool_names)
+    assert {"file_write", "file_edit"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_attachment_filename_with_update_keyword_stays_read_only() -> None:
@@ -1946,6 +2213,7 @@ def test_tool_exposure_attachment_filename_with_update_keyword_stays_read_only()
 
     assert {"file_read", "pdf_read"} <= set(plan.tool_names)
     assert not {"file_write", "file_edit", "apply_patch"} & set(plan.tool_names)
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_attachment_filename_with_update_keyword_stays_read_only_without_user_intent() -> None:
@@ -1996,6 +2264,7 @@ def test_tool_exposure_attachment_filename_with_update_keyword_stays_read_only_w
 
     assert {"file_read", "pdf_read"} <= set(plan.tool_names)
     assert not {"file_write", "file_edit", "apply_patch"} & set(plan.tool_names)
+    assert {"file_write", "file_edit", "apply_patch"} <= set(plan.discoverable_tool_names)
 
 
 def test_tool_exposure_file_browse_requests_skip_exec() -> None:

@@ -76,12 +76,22 @@ class GGUFBackend(BaseLLMBackend):
         self.use_mlock = use_mlock
         self.llama_cpp_lib_path = llama_cpp_lib_path
         self._model_loader = model_loader
-        self._tool_call_simulator = tool_call_simulator or ToolCallSimulator()
+        self._tool_prompt_profile = self._resolve_tool_prompt_profile(str(model_path))
+        self._tool_call_simulator = tool_call_simulator or ToolCallSimulator(
+            tool_prompt_profile=self._tool_prompt_profile,
+        )
         self._model: Any | None = None
         self._dependency_error: str | None = self._probe_dependency_error()
         self._tool_call_strategy = "flattened_text"
         self._tool_call_strategy_reason = "conservative default: tools not requested yet"
         self._detected_chat_format = "unknown"
+
+    @staticmethod
+    def _resolve_tool_prompt_profile(model_path: str) -> str:
+        normalized = str(model_path or "").strip().lower()
+        if "qwen" in normalized:
+            return "qwen_xml_tool_call"
+        return "json_tool_call"
 
     async def generate(
         self,
@@ -350,6 +360,7 @@ class GGUFBackend(BaseLLMBackend):
                 message.content = self._tool_call_simulator.inject_tools_into_prompt(
                     message.content,
                     tools,
+                    tool_prompt_profile=self._tool_prompt_profile,
                 )
                 injected = True
                 break
@@ -359,7 +370,11 @@ class GGUFBackend(BaseLLMBackend):
                 0,
                 Message(
                     role="system",
-                    content=self._tool_call_simulator.inject_tools_into_prompt("", tools).strip(),
+                    content=self._tool_call_simulator.inject_tools_into_prompt(
+                        "",
+                        tools,
+                        tool_prompt_profile=self._tool_prompt_profile,
+                    ).strip(),
                 ),
             )
         return prepared

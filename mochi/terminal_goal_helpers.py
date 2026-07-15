@@ -129,17 +129,26 @@ def normalize_goal_session_summary(value: Any) -> dict[str, Any] | None:
     execution_mode = normalize_goal_execution_mode(value.get("execution_mode"))
     if objective is None or execution_mode is None:
         return None
+    interaction_mode = normalize_goal_interaction_mode(value.get("interaction_mode")) or (
+        "workflow" if execution_mode == "workflow" else "goal"
+    )
+    execution_topology = normalize_goal_execution_topology(value.get("execution_topology")) or (
+        "multi_agent" if interaction_mode == "workflow" else "single_agent"
+    )
+    protocol_selection = _string_or_none(value.get("protocol_selection")) or _string_or_none(value.get("protocol_id"))
+    selection_rationale = _string_or_none(value.get("selection_rationale"))
+    if selection_rationale is None and protocol_selection is not None:
+        selection_rationale = _describe_goal_protocol_selection(protocol_selection, interaction_mode)
     return {
         "goal_id": _string_or_none(value.get("goal_id")),
         "objective": objective,
         "execution_mode": execution_mode,
-        "interaction_mode": normalize_goal_interaction_mode(value.get("interaction_mode")) or "workflow",
-        "execution_topology": normalize_goal_execution_topology(value.get("execution_topology")) or "multi_agent",
+        "interaction_mode": interaction_mode,
+        "execution_topology": execution_topology,
         "protocol_id": _string_or_none(value.get("protocol_id")),
         "bound_run_id": _string_or_none(value.get("bound_run_id")),
-        "protocol_selection": _string_or_none(value.get("protocol_selection"))
-        or _string_or_none(value.get("protocol_id")),
-        "selection_rationale": _string_or_none(value.get("selection_rationale")),
+        "protocol_selection": protocol_selection,
+        "selection_rationale": selection_rationale,
         "models": _string_list(value.get("models")),
         "role_summary": _string_or_none(value.get("role_summary")),
         "runtime_mode": _string_or_none(value.get("runtime_mode")),
@@ -261,6 +270,17 @@ def is_natural_language_goal_request(value: str) -> bool:
     return False
 
 
+def is_plain_greeting(value: str) -> bool:
+    normalized = re.sub(r"[\s!\uFF01.\u3002?\uFF1F,\uFF0C~\uFF5E]+", "", value.strip().lower())
+    return normalized in {
+        "hi",
+        "hello",
+        "hey",
+        "\u4f60\u597d",
+        "\u60a8\u597d",
+        "\u55e8",
+    }
+
 def resolve_goal_workflow_routing(
     *,
     text: str,
@@ -284,6 +304,7 @@ def resolve_goal_workflow_routing(
         goal_command is None
         and mode_command is None
         and has_pending_proposal
+        and not is_plain_greeting(request_text)
         and len(request_text.strip()) > 0
     )
     confirmation_requested = False
@@ -458,51 +479,17 @@ def build_goal_summary_from_goal(
         "goal_id": _string_or_none(goal.get("goal_id")) or _string_or_none(goal.get("id")) or (fallback or {}).get("goal_id"),
         "objective": _string_or_none(goal.get("objective")) or (fallback or {}).get("objective") or "",
         "execution_mode": normalize_goal_execution_mode(goal.get("execution_mode")) or (fallback or {}).get("execution_mode") or "workflow",
-        "interaction_mode": normalize_goal_interaction_mode(goal.get("interaction_mode")) or (fallback or {}).get("interaction_mode") or "workflow",
-        "execution_topology": normalize_goal_execution_topology(goal.get("execution_topology")) or (fallback or {}).get("execution_topology") or "multi_agent",
+        "interaction_mode": normalize_goal_interaction_mode(goal.get("interaction_mode")) or (fallback or {}).get("interaction_mode"),
+        "execution_topology": normalize_goal_execution_topology(goal.get("execution_topology")) or (fallback or {}).get("execution_topology"),
         "protocol_id": _string_or_none(goal.get("protocol_id")) or (fallback or {}).get("protocol_id"),
         "bound_run_id": _string_or_none(goal.get("bound_run_id")) or (fallback or {}).get("bound_run_id"),
-        "protocol_selection": _string_or_none(goal.get("protocol_selection")) or (fallback or {}).get("protocol_selection") or _string_or_none(goal.get("protocol_id")) or (fallback or {}).get("protocol_id"),
+        "protocol_selection": _string_or_none(goal.get("protocol_selection")) or (fallback or {}).get("protocol_selection"),
         "selection_rationale": _string_or_none(goal.get("selection_rationale")) or (fallback or {}).get("selection_rationale"),
         "models": list((fallback or {}).get("models") or []),
         "role_summary": (fallback or {}).get("role_summary"),
         "runtime_mode": (fallback or {}).get("runtime_mode"),
         "risk_note": (fallback or {}).get("risk_note"),
         "status": _string_or_none(goal.get("status")) or (fallback or {}).get("status"),
-    }
-
-
-def goal_card_from_summary(
-    summary: dict[str, Any],
-    *,
-    kind: Literal["proposal", "revised_proposal", "started"],
-    label: str | None = None,
-    copy_source: str | None = None,
-    goal_id: str | None = None,
-    status: str | None = None,
-    superseded: bool | None = None,
-) -> dict[str, Any]:
-    from mochi.goal_proposal_copy import build_goal_card_kind_label
-
-    resolved_copy_source = copy_source or _string_or_none(summary.get("objective")) or label or ""
-    default_label = build_goal_card_kind_label(
-        user_message=resolved_copy_source,
-        kind=kind,
-    )
-    return {
-        "kind": kind,
-        "label": label or default_label,
-        "objective": summary.get("objective") or "",
-        "executionMode": summary.get("execution_mode") or "workflow",
-        "copySource": resolved_copy_source,
-        "protocolId": summary.get("protocol_id"),
-        "models": list(summary.get("models") or []),
-        "roleSummary": summary.get("role_summary"),
-        "runtimeMode": summary.get("runtime_mode"),
-        "riskNote": summary.get("risk_note"),
-        "goalId": goal_id if goal_id is not None else summary.get("goal_id"),
-        "status": status if status is not None else summary.get("status"),
-        "superseded": superseded,
     }
 
 

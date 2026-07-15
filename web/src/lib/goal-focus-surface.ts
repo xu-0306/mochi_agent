@@ -1,7 +1,7 @@
 import {
   buildGoalApprovalCountLabel,
   buildGoalBlockerSummary,
-  buildGoalCardChromeCopy,
+  buildGoalChromeCopy,
   buildGoalPendingApprovalNotice,
   buildGoalRecommendedActionLabel,
   buildGoalReviewApprovalsLabel,
@@ -44,7 +44,7 @@ export function summarizeGoalRestrictionMeta(
     return []
   }
 
-  const copy = buildGoalCardChromeCopy(userMessage)
+  const copy = buildGoalChromeCopy(userMessage)
   const values: Array<string | null> = []
 
   if (blocker.blockNetworkUsage) {
@@ -77,7 +77,7 @@ export function buildGoalFocusCallout(options: {
     errorMessage = null,
     goalDisplayState = 'active',
   } = options
-  const copy = buildGoalCardChromeCopy(userMessage)
+  const copy = buildGoalChromeCopy(userMessage)
   const approvalCount = Math.max(
     pendingApprovalCount,
     blocker?.approvalCount ?? blocker?.approvalIds.length ?? 0

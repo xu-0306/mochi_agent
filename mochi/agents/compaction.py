@@ -156,8 +156,13 @@ class ConversationCompactor:
         if reason is None:
             return None
 
-        compacted = history[:-retain]
-        retained_history = list(history[-retain:])
+        retained_history = self._select_retained_history(
+            history,
+            retain=retain,
+            reason=reason,
+            budget=budget,
+        )
+        compacted = history[: len(history) - len(retained_history)]
         if self._policy.semantic_compaction_enabled:
             summary_state = self._build_state_summary(compacted, previous_state)
             if self._policy.summary_mode == "hybrid" and summarizer is not None:
@@ -220,6 +225,33 @@ class ConversationCompactor:
 
         if len(history) > self._policy.trigger_messages and len(history) > retain:
             return "history_window"
+        return None
+
+    def _select_retained_history(
+        self,
+        history: list[Message],
+        *,
+        retain: int,
+        reason: Literal["history_window", "token_budget"],
+        budget: ContextBudget | None,
+    ) -> list[Message]:
+        retained = list(history[-retain:])
+        if reason != "token_budget" or not retained:
+            return retained
+
+        max_input_tokens = self._retained_history_token_budget(budget)
+        if max_input_tokens is None:
+            return retained
+
+        while len(retained) > 1 and _estimate_messages_tokens(retained) > max_input_tokens:
+            retained.pop(0)
+        return retained
+
+    def _retained_history_token_budget(self, budget: ContextBudget | None) -> int | None:
+        if budget is not None and budget.max_input_tokens is not None:
+            return max(1, budget.max_input_tokens - max(0, budget.reserve_output_tokens))
+        if self._policy.max_input_tokens is not None:
+            return max(1, self._policy.max_input_tokens)
         return None
 
     def _build_state_summary(

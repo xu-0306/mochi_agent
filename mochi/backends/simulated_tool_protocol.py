@@ -13,8 +13,14 @@ from mochi.backends.types import Message, ToolCall, ToolSchema
 class SimulatedToolProtocol:
     """Wrap prompt injection, message flattening, and simulated output parsing."""
 
-    def __init__(self, simulator: ToolCallSimulator | None = None) -> None:
-        self._simulator = simulator or ToolCallSimulator()
+    def __init__(
+        self,
+        simulator: ToolCallSimulator | None = None,
+        *,
+        tool_prompt_profile: str = "json_tool_call",
+    ) -> None:
+        self._simulator = simulator or ToolCallSimulator(tool_prompt_profile=tool_prompt_profile)
+        self.tool_prompt_profile = tool_prompt_profile
 
     def prepare_messages(
         self,
@@ -78,7 +84,11 @@ class SimulatedToolProtocol:
     def inject_tools_into_prompt(self, prompt: str, tools: list[ToolSchema] | None) -> str:
         if not tools:
             return prompt
-        return self._simulator.inject_tools_into_prompt(prompt, tools)
+        return self._simulator.inject_tools_into_prompt(
+            prompt,
+            tools,
+            tool_prompt_profile=self.tool_prompt_profile,
+        )
 
     def parse_assistant_content(self, content: str) -> tuple[str, list[ToolCall]]:
         tool_calls = self._simulator.parse_tool_calls(content)
@@ -96,7 +106,11 @@ class SimulatedToolProtocol:
         for message in prepared:
             if message.role != "system":
                 continue
-            message.content = self._simulator.inject_tools_into_prompt(message.content, tools)
+            message.content = self._simulator.inject_tools_into_prompt(
+                message.content,
+                tools,
+                tool_prompt_profile=self.tool_prompt_profile,
+            )
             injected = True
             break
 
@@ -105,7 +119,11 @@ class SimulatedToolProtocol:
                 0,
                 Message(
                     role="system",
-                    content=self._simulator.inject_tools_into_prompt("", tools).strip(),
+                    content=self._simulator.inject_tools_into_prompt(
+                        "",
+                        tools,
+                        tool_prompt_profile=self.tool_prompt_profile,
+                    ).strip(),
                 ),
             )
         return prepared

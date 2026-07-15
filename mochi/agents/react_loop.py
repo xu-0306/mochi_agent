@@ -19,15 +19,19 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
 from mochi.agents.events import (
     AgentEvent,
+    AssistantTruncatedEvent,
     ErrorEvent,
     FinalAnswerEvent,
     StatusEvent,
     ThinkingEvent,
     TextChunkEvent,
+    ToolCallCompletedEvent,
+    ToolCallCreatedEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
 from mochi.backends.base import BackendRequestError
+from mochi.backends.tool_call_parsers import parse_tool_calls, strip_tool_call_blocks
 from mochi.backends.types import Message, StreamChunk, ToolCall
 from mochi.tools.base import ToolResult
 from mochi.tools.transport_guard import ToolResultTransportGuard
@@ -119,6 +123,7 @@ class AsyncReActLoop:
         tool_execution_context: ToolExecutionContext | None = None,
         max_iterations: int = 10,
         max_tool_message_chars: int = 2000,
+        requires_file_mutation: bool = False,
     ) -> None:
         self._backend = backend
         self._tool_registry = tool_registry
@@ -129,6 +134,7 @@ class AsyncReActLoop:
         self._transport_guard = ToolResultTransportGuard()
         self._last_transport_diagnostics: dict[str, Any] | None = None
         self._turn_messages: list[Message] = []
+        self._requires_file_mutation = bool(requires_file_mutation)
 
     async def run(
         self,
@@ -209,8 +215,12 @@ class AsyncReActLoop:
         finish_reason = "stop"
         last_tool_signature: tuple[str, ...] | None = None
         repeated_tool_rounds = 0
+        terminal_unavailable_mutation_signatures: set[str] = set()
         empty_final_recovery_attempts = 0
         invalid_tool_turn_recovery_attempts = 0
+        truncated_final_recovery_attempts = 0
+        final_was_truncated = False
+        truncated_final_prefix: str | None = None
         force_plain_answer_without_tools = False
         web_fetch_guard_state: dict[str, Any] = {
             "last_failed_url": None,
@@ -241,6 +251,14 @@ class AsyncReActLoop:
             "last_low_info_chars": None,
             "last_low_info_lines": None,
         }
+        file_artifact_guard_state: dict[str, Any] = {
+            "satisfied": not self._requires_file_mutation,
+            "nudge_count": 0,
+            "last_error": None,
+            "last_tool_name": None,
+            "mutation_paths": [],
+        }
+        final_file_artifact_blocker_metadata: dict[str, Any] | None = None
         allowed_tool_names = {tool.name for tool in tools}
 
         try:
@@ -391,19 +409,73 @@ class AsyncReActLoop:
                     logger.exception(f"ReAct loop backend error: {exc}")
                     yield ErrorEvent(
                         message=str(exc),
-                        metadata=self._build_backend_error_metadata(exc),
+                        metadata=self._with_runtime_error_taxonomy(
+                            self._build_backend_error_metadata(exc),
+                            error_type="backend_request_error",
+                            recoverability="retryable_after_repair",
+                        ),
                     )
                     return
                 total_generation_time_ms += (time.perf_counter() - started_at) * 1000.0
 
                 if not isinstance(result, GenerationResult):
-                    yield ErrorEvent(message="Expected GenerationResult in non-stream mode.")
+                    yield ErrorEvent(
+                        message="Expected GenerationResult in non-stream mode.",
+                        metadata=self._runtime_error_taxonomy(
+                            error_type="invalid_backend_result",
+                            recoverability="not_retryable",
+                        ),
+                    )
                     return
 
                 total_input_tokens += result.input_tokens
                 total_output_tokens += result.output_tokens
                 finish_reason = result.finish_reason or finish_reason
                 force_plain_answer_without_tools = False
+
+                if not result.tool_calls and not force_plain_answer_without_tools:
+                    rescued_source_content = result.content
+                    rescue_reason = "final_text_tool_call_rescue"
+                    if truncated_final_prefix:
+                        combined_source = f"{truncated_final_prefix}{result.content}"
+                        if self._parse_final_text_tool_calls(combined_source):
+                            rescued_source_content = combined_source
+                            rescue_reason = "truncated_final_text_tool_call_rescue"
+                    if not self._parse_final_text_tool_calls(rescued_source_content) and result.thinking:
+                        combined_source = "\n".join(
+                            part for part in (result.content, result.thinking) if part
+                        )
+                        if self._parse_final_text_tool_calls(combined_source):
+                            rescued_source_content = combined_source
+                            rescue_reason = "thinking_tool_call_rescue"
+                    rescued_tool_calls = self._parse_final_text_tool_calls(rescued_source_content)
+                    if rescued_tool_calls:
+                        rescued_visible_content = strip_tool_call_blocks(result.content).strip()
+                        rescued_thinking_content = strip_tool_call_blocks(result.thinking).strip()
+                        result = GenerationResult(
+                            content=rescued_visible_content,
+                            thinking=rescued_thinking_content,
+                            tool_calls=rescued_tool_calls,
+                            model=result.model,
+                            input_tokens=result.input_tokens,
+                            output_tokens=result.output_tokens,
+                            finish_reason="tool_calls",
+                            responses_replay=result.responses_replay,
+                        )
+                        finish_reason = "tool_calls"
+                        yield StatusEvent(
+                            content="Recovered tool call markup from assistant text.",
+                            metadata={
+                                **self._runtime_error_taxonomy(
+                                    error_type="final_text_tool_call_rescue",
+                                    recoverability="recovered",
+                                    runtime_category="tool_protocol",
+                                ),
+                                "reason": rescue_reason,
+                                "tool_names": [tool_call.name for tool_call in rescued_tool_calls],
+                                "rescued_tool_call_count": len(rescued_tool_calls),
+                            },
+                        )
 
                 if result.tool_calls:
                     current_tool_signature = self._build_tool_call_signature(result.tool_calls)
@@ -462,6 +534,12 @@ class AsyncReActLoop:
                     self._remember_turn_message(assistant_message)
 
                     for tool_call in result.tool_calls:
+                        yield ToolCallCreatedEvent(
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            metadata={"compat_event_type": "tool_call_request"},
+                        )
                         yield ToolCallRequestEvent(
                             call_id=tool_call.id,
                             tool_name=tool_call.name,
@@ -477,10 +555,82 @@ class AsyncReActLoop:
                             tool_call=tool_call,
                             evidence_guard_state=evidence_guard_state,
                         )
-                        unavailable_tool_result = self._build_unavailable_tool_result(
+                        activation_tool_result = self._request_tool_activation_if_needed(
                             tool_call=tool_call,
                             allowed_tool_names=allowed_tool_names,
+                            terminal_unavailable_mutation_signatures=(
+                                terminal_unavailable_mutation_signatures
+                            ),
                         )
+                        if (
+                            activation_tool_result is not None
+                            and activation_tool_result.metadata.get("status") == "tool_activated"
+                        ):
+                            tools = self._collect_tool_schemas()
+                            allowed_tool_names = {tool.name for tool in tools}
+                        unavailable_tool_result = (
+                            activation_tool_result
+                            or self._build_unavailable_tool_result(
+                                tool_call=tool_call,
+                                allowed_tool_names=allowed_tool_names,
+                            )
+                        )
+                        mutation_tool_signature = (
+                            self._build_tool_call_signature([tool_call])[0]
+                            if self._is_file_mutation_tool(tool_call.name)
+                            else None
+                        )
+                        repeated_unavailable_mutation = (
+                            unavailable_tool_result is not None
+                            and mutation_tool_signature is not None
+                            and mutation_tool_signature in terminal_unavailable_mutation_signatures
+                        )
+                        if (
+                            unavailable_tool_result is not None
+                            and mutation_tool_signature is not None
+                            and unavailable_tool_result.retryable is False
+                        ):
+                            terminal_unavailable_mutation_signatures.add(mutation_tool_signature)
+                        if repeated_unavailable_mutation and unavailable_tool_result is not None:
+                            repeated_metadata = (
+                                dict(unavailable_tool_result.metadata)
+                                if isinstance(unavailable_tool_result.metadata, dict)
+                                else {}
+                            )
+                            repeated_metadata.update(
+                                self._runtime_error_taxonomy(
+                                    error_type="repeated_unavailable_mutation_tool",
+                                    recoverability="requires_replanning_or_activation",
+                                    runtime_category="tool_activation",
+                                )
+                            )
+                            repeated_metadata.update(
+                                {
+                                    "retryable": False,
+                                    "repeated_tool_call_signature": mutation_tool_signature,
+                                }
+                            )
+                            unavailable_tool_result = ToolResult(
+                                output=unavailable_tool_result.output,
+                                error=(
+                                    (unavailable_tool_result.error or "Mutation tool is not available.")
+                                    + " Repeating the same unavailable mutation call is blocked; replan or request activation."
+                                ),
+                                metadata=repeated_metadata,
+                                retryable=False,
+                                suggestion=(
+                                    "Replan with a different callable path or request activation; "
+                                    "do not repeat this exact mutation call."
+                                ),
+                            )
+                            file_artifact_guard_state["nudge_count"] = max(
+                                2,
+                                int(file_artifact_guard_state.get("nudge_count") or 0),
+                            )
+                            # A terminal unavailable mutation is a blocker, not a
+                            # normal repeated-tool loop; allow the final blocker path.
+                            last_tool_signature = None
+                            repeated_tool_rounds = 0
                         if unavailable_tool_result is not None:
                             tool_output = unavailable_tool_result.output
                             tool_error = unavailable_tool_result.error
@@ -581,6 +731,11 @@ class AsyncReActLoop:
                             tool_result=tool_result_payload,
                             literature_state=literature_state,
                         )
+                        self._update_file_artifact_guard_state(
+                            tool_call=tool_call,
+                            tool_result=tool_result_payload,
+                            file_artifact_guard_state=file_artifact_guard_state,
+                        )
 
                         tool_content, transport_diagnostics = self._guard_tool_message(
                             tool_name=tool_call.name,
@@ -618,6 +773,29 @@ class AsyncReActLoop:
                         elif followup_retrieval_attempt and not tool_error:
                             self._clear_low_information_fetch_guard(evidence_guard_state)
 
+                        if tool_metadata.get("status") == "runtime_steering":
+                            yield StatusEvent(
+                                content="Runtime steering: synthesize from collected literature evidence.",
+                                metadata={
+                                    **self._runtime_error_taxonomy(
+                                        error_type="runtime_steering",
+                                        recoverability="recovered",
+                                        runtime_category="runtime_steering",
+                                    ),
+                                    "reason": "runtime_steering",
+                                    "tool_name": tool_call.name,
+                                    **tool_metadata,
+                                },
+                            )
+
+                        yield ToolCallCompletedEvent(
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            result=tool_output,
+                            error=tool_error,
+                            metadata={**tool_metadata, "compat_event_type": "tool_call_result"},
+                        )
                         yield ToolCallResultEvent(
                             call_id=tool_call.id,
                             tool_name=tool_call.name,
@@ -660,6 +838,47 @@ class AsyncReActLoop:
                     )
                     evidence_guard_state["nudge_count"] = int(evidence_guard_state.get("nudge_count") or 0) + 1
                     continue
+                if self._should_force_file_artifact_followup(file_artifact_guard_state):
+                    messages.append(
+                        Message(
+                            role="user",
+                            content=self._build_file_artifact_followup_prompt(
+                                file_artifact_guard_state=file_artifact_guard_state,
+                                allowed_tool_names=allowed_tool_names,
+                            ),
+                        )
+                    )
+                    file_artifact_guard_state["nudge_count"] = (
+                        int(file_artifact_guard_state.get("nudge_count") or 0) + 1
+                    )
+                    yield StatusEvent(
+                        content=(
+                            "The user requested a workspace file artifact, but no successful file mutation "
+                            "has occurred yet; requesting a file mutation tool call."
+                        ),
+                        metadata={
+                            **self._runtime_error_taxonomy(
+                                error_type="file_artifact_missing",
+                                recoverability="retrying",
+                                runtime_category="deliverable_guard",
+                            ),
+                            "reason": "file_artifact_missing",
+                            "nudge_count": file_artifact_guard_state["nudge_count"],
+                            "available_file_mutation_tools": self._available_file_mutation_tools(allowed_tool_names),
+                            "last_file_mutation_error": file_artifact_guard_state.get("last_error"),
+                            "last_file_mutation_tool": file_artifact_guard_state.get("last_tool_name"),
+                        },
+                    )
+                    continue
+                if self._should_block_unsatisfied_file_artifact_final(file_artifact_guard_state, final_text):
+                    final_text = self._build_file_artifact_blocker_final(
+                        file_artifact_guard_state=file_artifact_guard_state,
+                        allowed_tool_names=allowed_tool_names,
+                    )
+                    final_file_artifact_blocker_metadata = self._build_file_artifact_blocker_metadata(
+                        file_artifact_guard_state=file_artifact_guard_state,
+                        allowed_tool_names=allowed_tool_names,
+                    )
                 if final_thinking:
                     yield ThinkingEvent(
                         content=final_thinking,
@@ -684,15 +903,62 @@ class AsyncReActLoop:
                     logger.warning("ReAct loop received an empty final response from the backend.")
                     yield ErrorEvent(
                         message="Model returned an empty response.",
-                        metadata={
-                            "backend": {
-                                "backend_type": backend_info.backend_type,
-                                "model": backend_info.name,
-                                "finish_reason": finish_reason,
-                            }
-                        },
+                        metadata=self._with_runtime_error_taxonomy(
+                            {
+                                "backend": {
+                                    "backend_type": backend_info.backend_type,
+                                    "model": backend_info.name,
+                                    "finish_reason": finish_reason,
+                                }
+                            },
+                            error_type="empty_model_response",
+                            recoverability="not_retryable",
+                        ),
                     )
                     return
+                if self._is_length_finish_reason(finish_reason):
+                    if truncated_final_recovery_attempts < 1:
+                        truncated_final_recovery_attempts += 1
+                        final_was_truncated = True
+                        truncated_final_prefix = final_text
+                        messages.append(
+                            Message(
+                                role="assistant",
+                                content=final_text,
+                                thinking=final_thinking,
+                                responses_replay=result.responses_replay,
+                            )
+                        )
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=self._build_truncated_final_continuation_prompt(),
+                            )
+                        )
+                        truncation_metadata = {
+                            **self._runtime_error_taxonomy(
+                                error_type="output_truncated",
+                                recoverability="retrying",
+                                runtime_category="truncation",
+                            ),
+                            "reason": "finish_reason_length",
+                            "finish_reason": finish_reason,
+                            "recovery_attempt": truncated_final_recovery_attempts,
+                            "partial_output_chars": len(final_text),
+                        }
+                        yield AssistantTruncatedEvent(
+                            content="Model output hit the response length limit; requesting continuation.",
+                            finish_reason=finish_reason or "length",
+                            recovery_attempt=truncated_final_recovery_attempts,
+                            partial_output_chars=len(final_text),
+                            metadata=truncation_metadata,
+                        )
+                        yield StatusEvent(
+                            content="Model output hit the response length limit; requesting continuation.",
+                            metadata=truncation_metadata,
+                        )
+                        continue
+                    final_was_truncated = True
                 if streamed_generation and held_stream_text:
                     yield TextChunkEvent(content=held_stream_text)
                 final_assistant_message = Message(
@@ -717,24 +983,205 @@ class AsyncReActLoop:
                 yield ErrorEvent(
                     message=max_iterations_message,
                     code="MAX_ITERATIONS_REACHED",
-                    metadata=self._build_max_iterations_metadata(finish_reason=finish_reason),
+                    metadata=self._with_runtime_error_taxonomy(
+                        self._build_max_iterations_metadata(finish_reason=finish_reason),
+                        error_type="max_iterations_reached",
+                        recoverability="not_retryable",
+                    ),
                 )
                 return
         except Exception as exc:
             logger.exception(f"ReAct loop error: {exc}")
             yield ErrorEvent(
                 message=str(exc),
-                metadata=self._build_backend_error_metadata(exc),
+                metadata=self._with_runtime_error_taxonomy(
+                    self._build_backend_error_metadata(exc),
+                    error_type="runtime_exception",
+                    recoverability="not_retryable",
+                ),
             )
             return
 
+        final_metadata: dict[str, Any] = {}
+        if final_was_truncated:
+            final_metadata.update(
+                self._runtime_error_taxonomy(
+                    error_type="output_truncated",
+                    recoverability="recovered" if not self._is_length_finish_reason(finish_reason) else "partial",
+                    runtime_category="truncation",
+                )
+            )
+            final_metadata["truncated"] = True
+            final_metadata["recovery_attempts"] = truncated_final_recovery_attempts
+        if final_file_artifact_blocker_metadata:
+            final_metadata.update(final_file_artifact_blocker_metadata)
         yield FinalAnswerEvent(
             content=final_text,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             generation_time_ms=total_generation_time_ms,
             finish_reason=finish_reason,
+            metadata=final_metadata,
         )
+
+    @staticmethod
+    def _is_length_finish_reason(finish_reason: str | None) -> bool:
+        normalized = (finish_reason or "").strip().lower()
+        return normalized in {"length", "max_tokens", "token_limit", "context_length"}
+
+    @staticmethod
+    def _parse_final_text_tool_calls(content: str) -> list[ToolCall]:
+        if "<tool_call" not in content:
+            return []
+        return parse_tool_calls(content)
+
+    @staticmethod
+    def _build_truncated_final_continuation_prompt() -> str:
+        return (
+            "Your previous answer was cut off because the response length limit was reached. "
+            "Continue exactly where it stopped. Do not restart, do not repeat completed text, "
+            "and include only the missing continuation."
+        )
+
+    @staticmethod
+    def _available_file_mutation_tools(allowed_tool_names: set[str]) -> list[str]:
+        preferred_order = ("file_write", "file_edit", "apply_patch")
+        return [tool_name for tool_name in preferred_order if tool_name in allowed_tool_names]
+
+    @staticmethod
+    def _is_file_mutation_tool(tool_name: str) -> bool:
+        return tool_name in {"file_write", "file_edit", "apply_patch"}
+
+    def _update_file_artifact_guard_state(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        file_artifact_guard_state: dict[str, Any],
+    ) -> None:
+        if not self._is_file_mutation_tool(tool_call.name):
+            return
+        file_artifact_guard_state["last_tool_name"] = tool_call.name
+        metadata = tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        file_changes = metadata.get("file_changes")
+        has_file_changes = isinstance(file_changes, list) and bool(file_changes)
+        if tool_result.error:
+            file_artifact_guard_state["last_error"] = tool_result.error
+            return
+        if has_file_changes and ("bytes_written" in metadata or tool_result.output is not None):
+            file_artifact_guard_state["satisfied"] = True
+            paths = metadata.get("paths")
+            if isinstance(paths, list):
+                file_artifact_guard_state["mutation_paths"] = [str(path) for path in paths if path]
+            elif len(file_changes) == 1 and isinstance(file_changes[0], dict):
+                path = file_changes[0].get("path")
+                if path:
+                    file_artifact_guard_state["mutation_paths"] = [str(path)]
+            file_artifact_guard_state["last_error"] = None
+
+    @staticmethod
+    def _should_force_file_artifact_followup(file_artifact_guard_state: dict[str, Any]) -> bool:
+        if bool(file_artifact_guard_state.get("satisfied")):
+            return False
+        return int(file_artifact_guard_state.get("nudge_count") or 0) < 2
+
+    @classmethod
+    def _should_block_unsatisfied_file_artifact_final(
+        cls,
+        file_artifact_guard_state: dict[str, Any],
+        final_text: str,
+    ) -> bool:
+        if bool(file_artifact_guard_state.get("satisfied")):
+            return False
+        return not cls._looks_like_file_artifact_blocker_final(final_text)
+
+    @staticmethod
+    def _looks_like_file_artifact_blocker_final(final_text: str) -> bool:
+        normalized = final_text.strip().lower()
+        if not normalized:
+            return False
+        blocker_markers = (
+            "blocked",
+            "could not save",
+            "couldn't save",
+            "unable to save",
+            "not saved",
+            "did not save",
+            "failed to save",
+            "requires approval",
+            "not callable",
+            "no successful file mutation",
+            "write is blocked",
+            "file mutation did not succeed",
+        )
+        return any(marker in normalized for marker in blocker_markers)
+
+    def _build_file_artifact_followup_prompt(
+        self,
+        *,
+        file_artifact_guard_state: dict[str, Any],
+        allowed_tool_names: set[str],
+    ) -> str:
+        available_tools = self._available_file_mutation_tools(allowed_tool_names)
+        tool_hint = ", ".join(available_tools) if available_tools else "no file mutation tools are exposed"
+        last_error = str(file_artifact_guard_state.get("last_error") or "").strip()
+        if last_error:
+            return (
+                "The user requested a workspace file artifact, but the previous file mutation attempt failed. "
+                f"Last error: {last_error}. "
+                f"Available file mutation tools: {tool_hint}. "
+                "Retry with a valid file mutation tool call if possible. If the write is blocked by approval, "
+                "path policy, missing tool access, or another runtime error, give a final answer that clearly "
+                "states the blocker and do not claim the file was saved."
+            )
+        return (
+            "The user requested a workspace file artifact, but no successful file mutation has occurred. "
+            f"Available file mutation tools: {tool_hint}. "
+            "Use file_write, file_edit, or apply_patch to create or update the requested local file. "
+            "If no file mutation tool is available or the write is blocked, give a final answer that clearly "
+            "states the blocker and do not claim the file was saved."
+        )
+
+    def _build_file_artifact_blocker_final(
+        self,
+        *,
+        file_artifact_guard_state: dict[str, Any],
+        allowed_tool_names: set[str],
+    ) -> str:
+        available_tools = self._available_file_mutation_tools(allowed_tool_names)
+        last_error = str(file_artifact_guard_state.get("last_error") or "").strip()
+        last_tool_name = str(file_artifact_guard_state.get("last_tool_name") or "").strip()
+        hidden_mutation_tool = (
+            bool(last_tool_name)
+            and self._is_file_mutation_tool(last_tool_name)
+            and last_tool_name not in allowed_tool_names
+        )
+        if hidden_mutation_tool or not available_tools:
+            return "I could not save the file because the required write tool was not callable in this turn."
+        if last_error:
+            return f"I could not save the file because the file mutation did not succeed: {last_error}"
+        return "I could not save the file because no successful file mutation occurred in this turn."
+
+    def _build_file_artifact_blocker_metadata(
+        self,
+        *,
+        file_artifact_guard_state: dict[str, Any],
+        allowed_tool_names: set[str],
+    ) -> dict[str, Any]:
+        last_tool_name = file_artifact_guard_state.get("last_tool_name")
+        last_error = file_artifact_guard_state.get("last_error")
+        return {
+            **self._runtime_error_taxonomy(
+                error_type="file_artifact_not_mutated",
+                recoverability="requires_replanning_or_activation",
+                runtime_category="deliverable_guard",
+            ),
+            "reason": "file_artifact_not_mutated",
+            "available_file_mutation_tools": self._available_file_mutation_tools(allowed_tool_names),
+            "last_file_mutation_error": last_error,
+            "last_file_mutation_tool": last_tool_name,
+            "mutation_paths": list(file_artifact_guard_state.get("mutation_paths") or []),
+        }
 
     async def _consume_live_subagent_guidance(self) -> Message | None:
         if self._tool_execution_context is None:
@@ -864,6 +1311,51 @@ class AsyncReActLoop:
     def _remember_turn_message(self, message: Message) -> None:
         self._turn_messages.append(Message(**message.__dict__))
 
+    def _request_tool_activation_if_needed(
+        self,
+        *,
+        tool_call: ToolCall,
+        allowed_tool_names: set[str],
+        terminal_unavailable_mutation_signatures: set[str],
+    ) -> ToolResult | None:
+        if (
+            not self._is_file_mutation_tool(tool_call.name)
+            or tool_call.name in allowed_tool_names
+            or self._tool_registry is None
+            or self._tool_execution_context is None
+        ):
+            return None
+        mutation_signature = self._build_tool_call_signature([tool_call])[0]
+        if mutation_signature in terminal_unavailable_mutation_signatures:
+            return ToolResult(
+                error=(
+                    f"Tool '{tool_call.name}' was already denied as unavailable; "
+                    "repeating the exact mutation request is blocked."
+                ),
+                metadata={
+                    "guard": "tool_not_exposed",
+                    "requested_tool": tool_call.name,
+                    "callable_this_turn": False,
+                    "activation_required": True,
+                    "activation_reason": "The exact unavailable mutation request was already denied.",
+                    **self._runtime_error_taxonomy(
+                        error_type="repeated_unavailable_mutation_tool",
+                        recoverability="requires_replanning_or_activation",
+                        runtime_category="tool_activation",
+                    ),
+                    "repeated_tool_call_signature": mutation_signature,
+                },
+                retryable=False,
+                suggestion="Replan or obtain activation; do not replay the exact denied request.",
+            )
+        policy = self._tool_execution_context.state.get("tool_activation_policy")
+        if not isinstance(policy, dict):
+            return None
+        return self._tool_registry.request_tool_activation(
+            tool_call.name,
+            context=self._tool_execution_context,
+        )
+
     def _build_unavailable_tool_result(
         self,
         *,
@@ -881,16 +1373,35 @@ class AsyncReActLoop:
         available_hint = available_preview or "(none)"
         requested_tool = tool_call.name or "(empty tool name)"
 
+        metadata: dict[str, Any] = {
+            "guard": "tool_not_exposed",
+            "requested_tool": requested_tool,
+            "available_tools": available_tools,
+        }
+        if self._requires_file_mutation and self._is_file_mutation_tool(requested_tool):
+            metadata.update(
+                self._runtime_error_taxonomy(
+                    error_type="mutation_tool_not_callable",
+                    recoverability="requires_replanning_or_activation",
+                    runtime_category="tool_activation",
+                )
+            )
+            metadata.update(
+                {
+                    "callable_this_turn": False,
+                    "activation_required": True,
+                    "activation_reason": (
+                        "Mutation tool is discoverable or requested but not exposed as callable in this turn."
+                    ),
+                }
+            )
+
         return ToolResult(
             error=(
                 f"Tool '{requested_tool}' is not available in this turn. "
                 f"Use only the exposed tools: {available_hint}."
             ),
-            metadata={
-                "guard": "tool_not_exposed",
-                "requested_tool": requested_tool,
-                "available_tools": available_tools,
-            },
+            metadata=metadata,
             retryable=False,
             suggestion=(
                 "Choose one of the exposed tools for this turn, "
@@ -1287,6 +1798,38 @@ class AsyncReActLoop:
         rejected_thinking = exc.metadata.get("rejected_thinking")
         return rejected_thinking if isinstance(rejected_thinking, str) else ""
 
+    @staticmethod
+    def _runtime_error_taxonomy(
+        *,
+        error_type: str,
+        recoverability: str,
+        runtime_category: str = "runtime_error",
+    ) -> dict[str, Any]:
+        return {
+            "runtime_category": runtime_category,
+            "error_type": error_type,
+            "recoverability": recoverability,
+        }
+
+    @classmethod
+    def _with_runtime_error_taxonomy(
+        cls,
+        metadata: dict[str, Any],
+        *,
+        error_type: str,
+        recoverability: str,
+        runtime_category: str = "runtime_error",
+    ) -> dict[str, Any]:
+        merged = dict(metadata)
+        merged.update(
+            cls._runtime_error_taxonomy(
+                error_type=error_type,
+                recoverability=recoverability,
+                runtime_category=runtime_category,
+            )
+        )
+        return merged
+
     def _build_backend_error_metadata(self, exc: Exception) -> dict[str, Any]:
         backend_info = self._backend.get_model_info()
         backend_metadata: dict[str, Any] = {
@@ -1606,11 +2149,13 @@ class AsyncReActLoop:
 
         if literature_state["summary_ready"] and self._is_research_retrieval_tool_call(tool_call):
             return ToolResult(
-                error=(
+                output=(
                     "Sufficient literature evidence is already collected. "
                     "Do not call more search or fetch tools; synthesize the answer now."
                 ),
                 metadata={
+                    "status": "runtime_steering",
+                    "steering_reason": "evidence_sufficient",
                     "guard": "literature_summary_ready",
                     "paper_hits": literature_state["paper_hits"],
                     "abstract_hits": literature_state["abstract_hits"],

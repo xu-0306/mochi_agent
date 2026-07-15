@@ -86,7 +86,7 @@ class PendingGoalProposalIntentResponse(BaseModel):
 
 
 class GoalProposalAssistantCopyRequest(BaseModel):
-    """Bounded assistant-copy request for a goal proposal card."""
+    """Bounded assistant-copy request for a goal proposal explanation."""
 
     message: str
     proposal_objective: str
@@ -98,7 +98,7 @@ class GoalProposalAssistantCopyRequest(BaseModel):
 
 
 class GoalProposalAssistantCopyResponse(BaseModel):
-    """Assistant explanation text for a goal proposal card."""
+    """Assistant explanation text for a goal proposal."""
 
     type: Literal["goal_proposal_assistant_copy"] = "goal_proposal_assistant_copy"
     explanation: str

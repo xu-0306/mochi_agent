@@ -40,7 +40,7 @@ import { WorkspacePanel } from '@/components/chat/WorkspacePanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import { buildWorkflowProgressCardView } from '@/components/workflow/utils'
 import * as api from '@/lib/api'
-import type { ChatAttachment, GoalCardView, Message, ReasoningStep } from '@/lib/chat'
+import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
 import {
   buildOptimisticConversationTurnMessages,
 } from '@/lib/chat-send-contract'
@@ -63,8 +63,7 @@ import {
   type GoalProposalModelReadinessById,
 } from '@/lib/goal-proposal-models'
 import {
-  buildGoalCardChromeCopy,
-  buildGoalCardKindLabel,
+  buildGoalChromeCopy,
   buildGoalCommandHelpMessage,
   buildGoalFollowUpMessage,
   buildGoalLifecycleMessage,
@@ -671,7 +670,6 @@ interface GoalConversationAppendInput {
   attachments: ChatAttachment[]
   userContent: string
   assistantContent: string
-  goalCard?: GoalCardView
   userMetadata?: Record<string, unknown>
   assistantMetadata?: Record<string, unknown>
 }
@@ -986,32 +984,6 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.map((value) => (typeof value === 'string' ? value.trim() : '')).filter((value) => value.length > 0))]
 }
 
-function goalCardFromSummary(
-  summary: GoalSessionSummary,
-  kind: GoalCardView['kind'],
-  overrides?: Partial<GoalCardView>
-): GoalCardView {
-  const copySource = overrides?.copySource ?? summary.objective
-  const defaultLabel = buildGoalCardKindLabel(copySource, kind)
-
-  return {
-    kind,
-    label: defaultLabel,
-    objective: summary.objective,
-    executionMode: summary.execution_mode,
-    copySource,
-    protocolId: summary.protocol_id,
-    models: summary.models,
-    roleSummary: summary.role_summary,
-    runtimeMode: summary.runtime_mode,
-    riskNote: summary.risk_note,
-    goalId: summary.goal_id,
-    status: summary.status,
-    superseded: false,
-    ...overrides,
-  }
-}
-
 function resolveGoalWorkflowRouteUserContent(
   route: Exclude<ChatGoalWorkflowRoute, { kind: 'direct_chat' }>,
   requestText: string
@@ -1023,12 +995,24 @@ function resolveGoalWorkflowRouteUserContent(
       return route.content
     case 'workflow_proposal':
     case 'goal_revision':
-    case 'goal_pending_follow_up':
+    case 'workflow_pending_follow_up':
       return requestText
     case 'goal_confirmation':
     case 'goal_lifecycle':
       return route.raw
   }
+}
+
+function buildAutonomousGoalSystemPrompt(basePrompt: string, objective: string): string {
+  const trimmedBase = basePrompt.trim()
+  const goalInstruction = [
+    'Autonomous goal mode is active for this turn.',
+    `Goal objective: ${objective.trim()}`,
+    'Work like a long-running coding/research agent inside the normal chat transcript.',
+    'Use available tools when they are helpful, continue without asking for confirmation unless safety or missing critical information requires it, and stop only when the objective is complete or genuinely blocked.',
+    'Do not create or describe a separate goal proposal card; report progress and final results as normal assistant messages.',
+  ].join('\n')
+  return trimmedBase ? `${trimmedBase}\n\n${goalInstruction}` : goalInstruction
 }
 
 function getGoalAttemptRunId(goal: api.GoalSummary): string | null {
@@ -1291,12 +1275,12 @@ function formatModelSource(model: Record<string, unknown>): string | null {
   const toolMode = formatToolModeDetail(model)
 
   if (provider === 'openai_codex' || backendType === 'openai_codex') {
-    return toolMode ? `OpenAI Codex 繚 ${toolMode}` : 'OpenAI Codex'
+    return toolMode ? `OpenAI Codex 蝜?${toolMode}` : 'OpenAI Codex'
   }
 
   if (provider === 'openai_compat' || (backendType === 'openai_compat' && !provider)) {
     const source = baseUrl ?? 'OpenAI-Compatible'
-    return toolMode ? `${source} 繚 ${toolMode}` : source
+    return toolMode ? `${source} 蝜?${toolMode}` : source
   }
 
   if (provider === 'gemini') {
@@ -1325,16 +1309,16 @@ function formatModelSource(model: Record<string, unknown>): string | null {
   }
 
   if (provider === 'ollama' || backendType === 'ollama') {
-    return toolMode ? `Ollama 繚 ${toolMode}` : 'Ollama'
+    return toolMode ? `Ollama 蝜?${toolMode}` : 'Ollama'
   }
 
   if (provider === 'local') {
     const source = backendType ? `Local ${backendType}` : 'Local'
-    return toolMode ? `${source} 繚 ${toolMode}` : source
+    return toolMode ? `${source} 蝜?${toolMode}` : source
   }
 
   const source = provider ?? backendType ?? baseUrl
-  return toolMode && source ? `${source} 繚 ${toolMode}` : source
+  return toolMode && source ? `${source} 蝜?${toolMode}` : source
 }
 
 function displaySessionTitle(title: string | undefined, fallback: string): string {
@@ -2103,21 +2087,9 @@ export default function ChatPage() {
     goalId: string | null,
     objective: string | null | undefined
   ): string => {
-    const normalizedObjective = (objective ?? '').trim()
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const goalCard = messages[index]?.goalCard
-      if (!goalCard?.copySource) {
-        continue
-      }
-      if (goalId && goalCard.goalId === goalId) {
-        return goalCard.copySource
-      }
-      if (!goalId && normalizedObjective && goalCard.objective === normalizedObjective) {
-        return goalCard.copySource
-      }
-    }
-    return normalizedObjective
-  }, [messages])
+    void goalId
+    return (objective ?? '').trim()
+  }, [])
   const delegatedSubagentToolResultCount = React.useMemo(
     () =>
       messages.reduce((count, message) => (
@@ -2133,32 +2105,16 @@ export default function ChatPage() {
     [projectedWorkflowRun]
   )
   const displayMessages = React.useMemo<Message[]>(() => {
-    const projected = buildProjectedDisplayMessages({
+    return buildProjectedDisplayMessages({
       messages,
       runtimeTasks: contextualRuntimeTasks,
       workflowProgressCard,
       workflowRun: projectedWorkflowRun,
+      goalExecutionMode: currentSessionGoalState.execution_mode,
     })
-    if (currentSessionGoalState.pending_proposal !== null) {
-      return projected
-    }
-    const visibleMessages: Message[] = []
-    for (const message of projected) {
-      const goalCard = message.goalCard
-      if (!goalCard || goalCard.kind === 'started' || goalCard.superseded) {
-        visibleMessages.push(message)
-        continue
-      }
-
-      const { goalCard: _staleGoalCard, ...messageWithoutGoalCard } = message
-      if (messageWithoutGoalCard.content.trim().length > 0 || messageWithoutGoalCard.attachments?.length) {
-        visibleMessages.push(messageWithoutGoalCard)
-      }
-    }
-    return visibleMessages
   }, [
     contextualRuntimeTasks,
-    currentSessionGoalState.pending_proposal,
+    currentSessionGoalState.execution_mode,
     messages,
     projectedWorkflowRun,
     workflowProgressCard,
@@ -3438,7 +3394,6 @@ export default function ChatPage() {
       attachments,
       userContent,
       assistantContent,
-      goalCard,
       userMetadata,
       assistantMetadata,
     }: GoalConversationAppendInput) => {
@@ -3457,7 +3412,6 @@ export default function ChatPage() {
           content: assistantContent,
           timestamp: new Date().toISOString(),
           metadata: assistantMetadata ?? {},
-          ...(goalCard ? { goal_card: goalCard } : {}),
         },
       ])
       upsertSessionDetail(detail)
@@ -3526,31 +3480,16 @@ export default function ChatPage() {
 
       if (route.kind === 'goal_help') {
         if (pendingProposal) {
-          const pendingCard = goalCardFromSummary(
-            pendingProposal,
-            pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal',
-            {
-              copySource: route.raw,
-            }
-          )
           await persistGoalConversation({
             sessionId,
             attachments,
             userContent: route.raw,
             assistantContent: pendingProposal.assistant_explanation ?? '',
-            goalCard: pendingCard,
           })
           return true
         }
 
         if (latestGoalSummary) {
-          const cardCopy = buildGoalCardChromeCopy(route.raw)
-          const summaryCard = goalCardFromSummary(latestGoalSummary, 'started', {
-            label: activeGoalId ? cardCopy.goalSummaryLabel : cardCopy.mostRecentGoalLabel,
-            goalId: latestGoalSummary.goal_id,
-            status: baseGoalState.active_goal_status ?? latestGoalSummary.status,
-            copySource: route.raw,
-          })
           await persistGoalConversation({
             sessionId,
             attachments,
@@ -3558,7 +3497,6 @@ export default function ChatPage() {
             assistantContent: activeGoalId
               ? buildGoalLifecycleMessage(route.raw, 'goal_manage_hint')
               : buildGoalLifecycleMessage(route.raw, 'no_active_goal'),
-            goalCard: summaryCard,
           })
           return true
         }
@@ -3678,13 +3616,6 @@ export default function ChatPage() {
           attachments,
           userContent: proposalConversationUserContent,
           assistantContent: pendingProposalSummary.assistant_explanation ?? '',
-          goalCard: goalCardFromSummary(
-            pendingProposalSummary,
-            pendingProposalSummary.revision_index > 0 ? 'revised_proposal' : 'proposal',
-            {
-              copySource: proposalConversationUserContent,
-            }
-          ),
         })
         return true
       }
@@ -3755,11 +3686,6 @@ export default function ChatPage() {
             pendingProposal.objective || route.raw,
             'goal_started'
           ),
-          goalCard: goalCardFromSummary(startedSummary, 'started', {
-            goalId: startedGoal.goal_id,
-            status: startedGoal.status,
-            copySource: route.raw,
-          }),
         })
         return true
       }
@@ -3771,13 +3697,6 @@ export default function ChatPage() {
             attachments,
             userContent: route.raw,
             assistantContent: pendingProposal.assistant_explanation ?? '',
-            goalCard: goalCardFromSummary(
-              pendingProposal,
-              pendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal',
-              {
-                copySource: route.raw,
-              }
-            ),
           })
           return true
         }
@@ -3863,15 +3782,6 @@ export default function ChatPage() {
         pending_proposal: null,
       })
 
-      const lifecycleCopy = buildGoalCardChromeCopy(route.raw)
-      const lifecycleLabel =
-        route.action === 'status'
-          ? lifecycleCopy.goalStatusLabel
-          : route.action === 'pause'
-            ? lifecycleCopy.goalPausedLabel
-            : route.action === 'resume'
-              ? lifecycleCopy.goalResumedLabel
-              : lifecycleCopy.goalStoppedLabel
       const lifecycleContent =
         nextGoal.latest_error?.trim() ||
         buildGoalLifecycleMessage(
@@ -3890,12 +3800,6 @@ export default function ChatPage() {
         attachments,
         userContent: route.raw,
         assistantContent: lifecycleContent,
-        goalCard: goalCardFromSummary(nextGoalSummary, 'started', {
-          label: lifecycleLabel,
-          goalId: nextGoal.goal_id,
-          status: nextGoal.status,
-          copySource: route.raw,
-        }),
       })
       return true
     },
@@ -4434,7 +4338,7 @@ export default function ChatPage() {
         sessionContext = sessionScope.getContext()
       }
 
-      if (route.kind === 'goal_pending_follow_up') {
+      if (route.kind === 'workflow_pending_follow_up') {
         const currentPendingProposal = sessionContext.baseGoalState.pending_proposal
         if (currentPendingProposal) {
           let intentResult: api.PendingGoalProposalIntentResult
@@ -4467,25 +4371,8 @@ export default function ChatPage() {
             route = { kind: 'direct_chat' }
             shouldHandleGoalWorkflowRouting = false
           } else {
-            await persistGoalConversation({
-              sessionId,
-              attachments,
-              userContent: route.raw,
-              assistantContent:
-                currentPendingProposal.assistant_explanation ??
-                buildLocalGoalProposalAssistantExplanation(
-                  route.requestText || route.raw || currentPendingProposal.objective,
-                  currentPendingProposal
-                ),
-              goalCard: goalCardFromSummary(
-                currentPendingProposal,
-                currentPendingProposal.revision_index > 0 ? 'revised_proposal' : 'proposal',
-                {
-                  copySource: route.raw,
-                }
-              ),
-            })
-            return
+            route = { kind: 'direct_chat' }
+            shouldHandleGoalWorkflowRouting = false
           }
         } else {
           route = { kind: 'direct_chat' }
@@ -4542,6 +4429,23 @@ export default function ChatPage() {
         setPanelOpen(false)
         setMobileInferenceOpen(false)
         setWorkflowPanelOpen(true)
+      }
+
+      if (route.kind === 'goal_proposal') {
+        await submitDirectChatTurn({
+          targetSessionId,
+          requestText: route.content,
+          attachments,
+          selectedSkillIds,
+          toolMode: 'auto',
+          normalizedWorkflow,
+          sessionScope,
+          systemPromptOverride: buildAutonomousGoalSystemPrompt(
+            effectiveInference.systemPrompt,
+            route.content
+          ),
+        })
+        return
       }
 
       if (shouldHandleGoalWorkflowRouting && route.kind !== 'direct_chat') {
@@ -5497,7 +5401,7 @@ export default function ChatPage() {
       goalId,
       currentSessionGoalState.last_goal_summary?.objective ?? null
     )
-    const drawerCopy = buildGoalCardChromeCopy(copySource)
+    const drawerCopy = buildGoalChromeCopy(copySource)
     setGoalDrawerHealthLoading(true)
     setGoalDrawerHealthError(null)
     setGoalDrawerApprovalError(null)
@@ -5572,7 +5476,7 @@ export default function ChatPage() {
       const detail = buildGoalUiErrorMessage(
         copySource,
         error instanceof Error ? error.message : null,
-        buildGoalCardChromeCopy(copySource).goalStatusRefreshFailedLabel
+        buildGoalChromeCopy(copySource).goalStatusRefreshFailedLabel
       )
       setGoalDrawerHealthError(detail)
     } finally {
@@ -5606,7 +5510,7 @@ export default function ChatPage() {
       const detail = buildGoalUiErrorMessage(
         copySource,
         error instanceof Error ? error.message : null,
-        buildGoalCardChromeCopy(copySource).approvalResolveFailedLabel
+        buildGoalChromeCopy(copySource).approvalResolveFailedLabel
       )
       setGoalDrawerApprovalError(detail)
     } finally {
@@ -6041,11 +5945,6 @@ export default function ChatPage() {
                 : buildGoalFollowUpMessage(requestText, followUpKind),
             userMetadata: decisionMetadata,
             assistantMetadata: decisionMetadata,
-            goalCard: goalCardFromSummary(refreshedGoalSummary, 'started', {
-              goalId: refreshedGoal.goal_id,
-              status: refreshedGoal.status,
-              copySource: requestText,
-            }),
           })
           return true
         } catch (error) {
@@ -6153,11 +6052,6 @@ export default function ChatPage() {
                 : buildGoalFollowUpMessage(requestText, followUpKind),
             userMetadata: decisionMetadata,
             assistantMetadata: decisionMetadata,
-            goalCard: goalCardFromSummary(refreshedGoalSummary, 'started', {
-              goalId: refreshedGoal.goal_id,
-              status: refreshedGoal.status,
-              copySource: requestText,
-            }),
           })
           return true
         } catch (error) {
@@ -6638,7 +6532,8 @@ export default function ChatPage() {
       <ExportDialog
         open={exportOpen}
         onOpenChange={setExportOpen}
-        messages={messages}
+        messages={displayMessages}
+        traceEvents={executionTimelineEvents}
       />
 
       <FloatingPanelShell

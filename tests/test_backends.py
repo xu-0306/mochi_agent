@@ -1166,6 +1166,8 @@ def test_model_info(backend: OllamaBackend) -> None:
     assert info.metadata["supports_reasoning_effort"] is False
     assert info.metadata["context_length_source"] == "unknown"
     assert info.metadata["context_length_fallback"] == 4096
+    assert info.metadata["effective_context_length"] == 4096
+    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.fallback_default"
 
 
 @pytest.mark.asyncio
@@ -1192,9 +1194,37 @@ async def test_ollama_prime_model_info_reads_context_length_from_show_model_info
     assert info.context_length == 32768
     assert info.metadata["context_length_source"] == "api_show.model_info.llama.context_length"
     assert info.metadata["context_length_fallback"] is None
+    assert info.metadata["effective_context_length"] == 32768
+    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.model_max_cap"
     assert info.metadata["runtime_context_length"] is None
     assert info.metadata["model_max_context_length"] == 32768
     assert info.metadata["model_max_context_length_source"] == "api_show.model_info.llama.context_length"
+
+
+@pytest.mark.asyncio
+async def test_ollama_configured_num_ctx_overrides_model_max_effective_context() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434", num_ctx=8192)
+    response = _mock_response(
+        {
+            "model_info": {
+                "llama.context_length": 131072,
+            }
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response):
+            await backend.prime_model_info()
+    finally:
+        await backend.close()
+
+    info = backend.get_model_info()
+    assert info.context_length == 8192
+    assert info.metadata["effective_context_length"] == 8192
+    assert info.metadata["effective_context_length_source"] == "config.num_ctx"
+    assert info.metadata["runtime_context_length"] == 8192
+    assert info.metadata["runtime_context_length_source"] == "config.num_ctx"
+    assert info.metadata["model_max_context_length"] == 131072
 
 
 @pytest.mark.asyncio
@@ -1215,6 +1245,8 @@ async def test_ollama_prime_model_info_reads_context_length_from_parameters() ->
     info = backend.get_model_info()
     assert info.context_length == 8192
     assert info.metadata["context_length_source"] == "api_show.parameters:num_ctx"
+    assert info.metadata["effective_context_length"] == 8192
+    assert info.metadata["effective_context_length_source"] == "api_show.parameters:num_ctx"
     assert info.metadata["runtime_context_length"] == 8192
     assert info.metadata["runtime_context_length_source"] == "api_show.parameters:num_ctx"
 
@@ -1240,6 +1272,8 @@ async def test_ollama_prime_model_info_prefers_runtime_num_ctx_over_model_max() 
     info = backend.get_model_info()
     assert info.context_length == 16384
     assert info.metadata["context_length_source"] == "api_show.parameters:num_ctx"
+    assert info.metadata["effective_context_length"] == 16384
+    assert info.metadata["effective_context_length_source"] == "api_show.parameters:num_ctx"
     assert info.metadata["runtime_context_length"] == 16384
     assert info.metadata["model_max_context_length"] == 262144
     assert info.metadata["model_max_context_length_source"] == "api_show.model_info.llama.context_length"
@@ -1288,7 +1322,7 @@ async def test_ollama_generate_maps_reasoning_effort_to_think() -> None:
 
 @pytest.mark.asyncio
 async def test_ollama_generate_keeps_output_cap_on_num_predict_only() -> None:
-    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434", auto_num_ctx=False)
     mock_resp = _mock_response(
         {
             "model": "llama3.2",
@@ -1310,6 +1344,74 @@ async def test_ollama_generate_keeps_output_cap_on_num_predict_only() -> None:
     options = post.await_args.kwargs["json"]["options"]
     assert options["num_predict"] == 2048
     assert "num_ctx" not in options
+
+
+@pytest.mark.asyncio
+async def test_ollama_generate_auto_num_ctx_uses_conservative_default_before_prime() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    mock_resp = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp) as post:
+            await backend.generate(
+                messages=[Message(role="user", content="hi")],
+                max_tokens=2048,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    options = post.await_args.kwargs["json"]["options"]
+    assert options["num_predict"] == 2048
+    assert options["num_ctx"] == 4096
+    info = backend.get_model_info()
+    assert info.metadata["effective_context_length"] == 4096
+    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.fallback_default"
+
+
+@pytest.mark.asyncio
+async def test_ollama_generate_auto_num_ctx_caps_model_max_context() -> None:
+    backend = OllamaBackend(
+        model="llama3.2",
+        base_url="http://localhost:11434",
+        auto_num_ctx=True,
+        auto_num_ctx_cap=32768,
+    )
+    show_resp = _mock_response({"model_info": {"llama.context_length": 131072}})
+    chat_resp = _mock_response(
+        {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, side_effect=[show_resp, chat_resp]) as post:
+            await backend.prime_model_info()
+            await backend.generate(
+                messages=[Message(role="user", content="hi")],
+                max_tokens=2048,
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    options = post.await_args_list[-1].kwargs["json"]["options"]
+    assert options["num_predict"] == 2048
+    assert options["num_ctx"] == 32768
+    info = backend.get_model_info()
+    assert info.metadata["auto_num_ctx"] is True
+    assert info.metadata["auto_num_ctx_cap"] == 32768
+    assert info.metadata["auto_num_ctx_value"] == 32768
+    assert info.metadata["effective_context_length"] == 32768
+    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.model_max_cap"
 
 
 @pytest.mark.asyncio
@@ -1891,3 +1993,25 @@ async def test_openai_compat_probe_marks_tools_unavailable_when_all_openai_proto
     assert metadata["tool_call_mode"] == "unavailable"
     assert metadata["tool_calling_blocked"] is True
     assert metadata["tool_protocol_probe"]["selected_protocol"] is None
+
+@pytest.mark.asyncio
+async def test_ollama_qwen_model_uses_qwen_xml_tool_prompt_profile() -> None:
+    backend = OllamaBackend(model="qwen2.5")
+    try:
+        metadata = backend.get_model_info().metadata
+        assert metadata["tool_prompt_profile"] == "qwen_xml_tool_call"
+        prepared = backend._prepare_messages(  # noqa: SLF001
+            [Message(role="system", content="You are Mochi.")],
+            [
+                ToolSchema(
+                    name="web_search",
+                    description="Search web pages",
+                    parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+                )
+            ],
+            use_native_tools=False,
+        )
+        assert "<function=tool_name>" in prepared[0].content
+        assert "<parameter=arg1>value1</parameter>" in prepared[0].content
+    finally:
+        await backend.close()

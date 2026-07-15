@@ -1,4 +1,4 @@
-﻿export interface GoalProposalAssistantFallbackInput {
+export interface GoalProposalAssistantFallbackInput {
   objective: string
   execution_mode: 'single_agent' | 'workflow'
   protocol_selection?: string | null
@@ -15,9 +15,7 @@ export interface GoalProposalSystemCtaCopy {
   chatBody: string
 }
 
-export type GoalCardKind = 'proposal' | 'revised_proposal' | 'started'
-
-export interface GoalCardChromeCopy {
+export interface GoalChromeCopy {
   proposalLabel: string
   revisedProposalLabel: string
   startedLabel: string
@@ -241,9 +239,9 @@ function buildGoalApprovalWaitSummary(userMessage: string, approvalCount: number
 
   if (languageHint === 'simplified_chinese') {
     if (safeCount > 0) {
-      return `这个 goal 还在等待 ${safeCount} 个待批准项目处理完成。请到 goal drawer 或 Goal Console 处理后再继续。`
+      return `?? goal ?在等待 ${safeCount} ?待批准?目?理完成。?到 goal drawer 或 Goal Console ?理后再??。`
     }
-    return '这个 goal 还在等待操作员批准。请到 goal drawer 或 Goal Console 检查后再继续。'
+    return '?? goal ?在等待操作?批准。?到 goal drawer 或 Goal Console ?查后再??。'
   }
 
   if (safeCount > 0) {
@@ -418,7 +416,7 @@ export type GoalFollowUpMessageKind =
   | 'resumed_forwarded'
   | 'forwarded'
 
-export function buildGoalCardChromeCopy(userMessage: string): GoalCardChromeCopy {
+export function buildGoalChromeCopy(userMessage: string): GoalChromeCopy {
   const languageHint = detectGoalProposalLanguageHint(userMessage)
 
   if (languageHint === 'traditional_chinese' || languageHint === 'chinese') {
@@ -630,26 +628,15 @@ export function buildGoalCardChromeCopy(userMessage: string): GoalCardChromeCopy
   }
 }
 
-export function buildGoalCardKindLabel(userMessage: string, kind: GoalCardKind): string {
-  const copy = buildGoalCardChromeCopy(userMessage)
-  if (kind === 'revised_proposal') {
-    return copy.revisedProposalLabel
-  }
-  if (kind === 'started') {
-    return copy.startedLabel
-  }
-  return copy.proposalLabel
-}
-
-export function buildGoalCardExecutionModeLabel(
+export function buildGoalExecutionModeLabel(
   userMessage: string,
   executionMode: 'single_agent' | 'workflow'
 ): string {
-  const copy = buildGoalCardChromeCopy(userMessage)
+  const copy = buildGoalChromeCopy(userMessage)
   return executionMode === 'single_agent' ? copy.singleAgentLabel : copy.workflowLabel
 }
 
-export function buildGoalCardStatusLabel(
+export function buildGoalStatusLabel(
   userMessage: string,
   status: string | null | undefined
 ): string | null {
@@ -738,7 +725,7 @@ export function buildGoalDisplayStateLabel(
   userMessage: string,
   state: 'active' | 'blocked' | 'completed' | 'failed'
 ): string {
-  const copy = buildGoalCardChromeCopy(userMessage)
+  const copy = buildGoalChromeCopy(userMessage)
   if (state === 'completed') {
     return copy.completedGoalLabel
   }
@@ -940,7 +927,7 @@ export function buildGoalBlockerSummary(
   if (isChineseLanguageHint(userHint) && recommendedAction === 'resolve_approval') {
     return buildGoalApprovalWaitSummary(userMessage, approvalCount)
   }
-  return buildGoalCardChromeCopy(userMessage).goalNeedsAttentionBody
+  return buildGoalChromeCopy(userMessage).goalNeedsAttentionBody
 }
 
 export function buildGoalUiErrorMessage(

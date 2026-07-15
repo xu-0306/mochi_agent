@@ -13,7 +13,15 @@ import sys
 
 from fastapi.testclient import TestClient
 
-from mochi.agents.events import FinalAnswerEvent, ThinkingEvent, ToolCallRequestEvent, ToolCallResultEvent
+from mochi.agents.events import (
+    FinalAnswerEvent,
+    GoalStateChangedEvent,
+    ThinkingEvent,
+    ToolCallCompletedEvent,
+    ToolCallCreatedEvent,
+    ToolCallRequestEvent,
+    ToolCallResultEvent,
+)
 from mochi.agents.multi_agent.orchestrator import (
     MultiAgentOrchestrator,
     MultiAgentRunEvent,
@@ -21,6 +29,7 @@ from mochi.agents.multi_agent.orchestrator import (
 )
 from mochi.backends.base import BackendRequestError
 from mochi.backends.types import GenerationResult, Message
+from mochi.api.routes.chat import _serialize_event
 from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
 from mochi.runtime.approvals import InMemoryApprovalStore, PersistentApprovalStore
@@ -32,6 +41,28 @@ from mochi.runtime.service import (
 )
 from mochi.runtime.store import RuntimeStore
 from mochi.utils.shell_providers import BaseShellProvider, SubprocessSpec
+
+
+def test_chat_serializer_preserves_final_answer_metadata() -> None:
+    serialized = _serialize_event(
+        FinalAnswerEvent(
+            content="done",
+            finish_reason="length",
+            metadata={
+                "runtime_category": "truncation",
+                "error_type": "output_truncated",
+                "recoverability": "partial",
+                "truncated": True,
+                "recovery_attempts": 1,
+            },
+        )
+    )
+
+    assert serialized["type"] == "final_answer"
+    assert serialized["finish_reason"] == "length"
+    assert serialized["metadata"]["runtime_category"] == "truncation"
+    assert serialized["metadata"]["error_type"] == "output_truncated"
+    assert serialized["metadata"]["truncated"] is True
 
 
 class _RuntimeFakeEngine:
@@ -642,6 +673,70 @@ class _BackgroundControlledExecAgentRunEngine(_AgentRunModelBackedEngine):
             reasoning_effort=reasoning_effort,
         )
 
+
+
+def test_chat_serializer_supports_explicit_tool_and_goal_events() -> None:
+    created = _serialize_event(
+        ToolCallCreatedEvent(
+            call_id="call-1",
+            tool_name="write_file",
+            arguments={"path": "demo.py"},
+            metadata={"compat_event_type": "tool_call_request"},
+        ),
+        fallback_turn_id="turn-1",
+    )
+    completed = _serialize_event(
+        ToolCallCompletedEvent(
+            call_id="call-1",
+            tool_name="write_file",
+            arguments={"path": "demo.py"},
+            result={"status": "ok"},
+            metadata={"compat_event_type": "tool_call_result"},
+        ),
+        fallback_turn_id="turn-1",
+    )
+    goal_changed = _serialize_event(
+        GoalStateChangedEvent(
+            goal_id="goal-1",
+            previous_status="running",
+            status="paused",
+            attempt_id="attempt-1",
+            agent_run_id="run-1",
+            reason="operator emergency stop",
+            metadata={"source": "operator_controls"},
+        ),
+        fallback_turn_id="turn-1",
+    )
+
+    assert created == {
+        "type": "tool_call_created",
+        "call_id": "call-1",
+        "tool_name": "write_file",
+        "arguments": {"path": "demo.py"},
+        "metadata": {"compat_event_type": "tool_call_request"},
+        "turn_id": "turn-1",
+    }
+    assert completed == {
+        "type": "tool_call_completed",
+        "call_id": "call-1",
+        "tool_name": "write_file",
+        "arguments": {"path": "demo.py"},
+        "result": {"status": "ok"},
+        "error": None,
+        "metadata": {"compat_event_type": "tool_call_result"},
+        "turn_id": "turn-1",
+    }
+    assert goal_changed == {
+        "type": "goal_state_changed",
+        "goal_id": "goal-1",
+        "previous_status": "running",
+        "status": "paused",
+        "attempt_id": "attempt-1",
+        "agent_run_id": "run-1",
+        "reason": "operator emergency stop",
+        "metadata": {"source": "operator_controls"},
+        "turn_id": "turn-1",
+    }
 
 def _agent_run_response_payload(
     run_id: str,

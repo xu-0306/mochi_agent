@@ -131,7 +131,7 @@ const pendingConfirmation = resolveChatGoalWorkflowRouting({
   hasPendingProposal: true,
   hasActiveGoal: false,
 })
-assert.equal(pendingConfirmation.route.kind, 'goal_pending_follow_up')
+assert.equal(pendingConfirmation.route.kind, 'workflow_pending_follow_up')
 assert.equal(pendingConfirmation.shouldHandleGoalWorkflowRouting, true)
 
 const pendingRevision = resolveChatGoalWorkflowRouting({
@@ -140,7 +140,7 @@ const pendingRevision = resolveChatGoalWorkflowRouting({
   hasPendingProposal: true,
   hasActiveGoal: false,
 })
-assert.equal(pendingRevision.route.kind, 'goal_pending_follow_up')
+assert.equal(pendingRevision.route.kind, 'workflow_pending_follow_up')
 assert.equal(pendingRevision.shouldHandleGoalWorkflowRouting, true)
 
 const attachmentBackedRevision = resolveChatGoalWorkflowRouting({

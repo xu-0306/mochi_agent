@@ -25,10 +25,10 @@ GoalProposalLanguageHint = Literal[
 ]
 
 _GOAL_PROPOSAL_ASSISTANT_COPY_SYSTEM_PROMPT = """
-You are writing the assistant-facing explanation text for a Mochi goal proposal card.
+You are writing the assistant-facing explanation text for a Mochi goal proposal.
 
-The UI already shows the proposal details and a separate system CTA. Write only the
-assistant explanation that appears under the card.
+The UI already stores the proposal details and a separate system CTA. Write only the
+assistant explanation that accompanies the proposal.
 
 Requirements:
 - Use the same language as the user's latest request unless they explicitly asked for another language.
@@ -88,11 +88,8 @@ class GoalProposalSystemCtaCopy:
     chat_body: str
 
 
-GoalCardKind = Literal["proposal", "revised_proposal", "started"]
-
-
 @dataclass(frozen=True)
-class GoalCardChromeCopy:
+class GoalChromeCopy:
     proposal_label: str
     revised_proposal_label: str
     started_label: str
@@ -399,14 +396,14 @@ GoalFollowUpAssistantCopyKind = Literal[
 ]
 
 
-def build_goal_card_chrome_copy(
+def build_goal_chrome_copy(
     *,
     user_message: str,
-) -> GoalCardChromeCopy:
+) -> GoalChromeCopy:
     language_hint = detect_goal_proposal_language_hint(user_message)
 
     if language_hint in {"traditional_chinese", "chinese"}:
-        return GoalCardChromeCopy(
+        return GoalChromeCopy(
             proposal_label="Goal \u63d0\u6848",
             revised_proposal_label="\u5df2\u66f4\u65b0\u7684 goal \u63d0\u6848",
             started_label="Goal \u5df2\u555f\u52d5",
@@ -436,7 +433,7 @@ def build_goal_card_chrome_copy(
         )
 
     if language_hint == "simplified_chinese":
-        return GoalCardChromeCopy(
+        return GoalChromeCopy(
             proposal_label="Goal \u63d0\u6848",
             revised_proposal_label="\u5df2\u66f4\u65b0\u7684 goal \u63d0\u6848",
             started_label="Goal \u5df2\u542f\u52a8",
@@ -465,7 +462,7 @@ def build_goal_card_chrome_copy(
             recent_summary_intro="\u4ee5\u4e0b\u662f\u8fd9\u4e2a\u5bf9\u8bdd\u6700\u8fd1\u4e00\u6b21\u7684 goal \u6458\u8981\u3002",
         )
 
-    return GoalCardChromeCopy(
+    return GoalChromeCopy(
         proposal_label="Goal proposal",
         revised_proposal_label="Revised goal proposal",
         started_label="Goal started",
@@ -495,29 +492,16 @@ def build_goal_card_chrome_copy(
     )
 
 
-def build_goal_card_kind_label(
-    *,
-    user_message: str,
-    kind: GoalCardKind,
-) -> str:
-    copy = build_goal_card_chrome_copy(user_message=user_message)
-    if kind == "revised_proposal":
-        return copy.revised_proposal_label
-    if kind == "started":
-        return copy.started_label
-    return copy.proposal_label
-
-
-def build_goal_card_execution_mode_label(
+def build_goal_execution_mode_label(
     *,
     user_message: str,
     execution_mode: str,
 ) -> str:
-    copy = build_goal_card_chrome_copy(user_message=user_message)
+    copy = build_goal_chrome_copy(user_message=user_message)
     return copy.single_agent_label if execution_mode == "single_agent" else copy.workflow_label
 
 
-def build_goal_card_status_label(
+def build_goal_status_label(
     *,
     user_message: str,
     status: str | None,

@@ -32,9 +32,14 @@ from mochi.agents.context_snapshot import (
 from mochi.agents.multi_agent.evidence_collector import collect_evidence_packets
 from mochi.agents.events import (
     AgentEvent,
+    AssistantTruncatedEvent,
     ErrorEvent,
     FinalAnswerEvent,
+    StatusEvent,
     ThinkingEvent,
+    GoalStateChangedEvent,
+    ToolCallCompletedEvent,
+    ToolCallCreatedEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
@@ -277,6 +282,8 @@ class AgentEngine:
         self._router = BackendRouter(
             ollama_base_url=config.ollama.base_url,
             ollama_num_ctx=config.ollama.num_ctx,
+            ollama_auto_num_ctx=config.ollama.auto_num_ctx,
+            ollama_auto_num_ctx_cap=config.ollama.auto_num_ctx_cap,
             openai_default_model=config.openai_compat.model,
             openai_api_key=self._resolve_active_openai_compat_api_key(config),
             openai_codex_default_model=config.openai_codex.model,
@@ -1091,19 +1098,30 @@ class AgentEngine:
             exposure_plan.tool_names,
             tool_search_catalog_names=exposure_plan.discoverable_tool_names,
         )
-        react_loop = AsyncReActLoop(
-            backend=active_backend,
-            tool_registry=tool_registry,
-            tool_execution_context=tool_execution_context,
-            max_iterations=(
-                request.max_iterations_override
-                if isinstance(request.max_iterations_override, int) and request.max_iterations_override > 0
-                else self._default_max_iterations_for_backend(
-                    self._config.agent.max_react_iterations,
-                    active_backend,
-                )
-            ),
+        tool_activation_policy = tool_execution_context.state.setdefault(
+            "tool_activation_policy",
+            {},
         )
+        if isinstance(tool_activation_policy, dict):
+            tool_activation_policy.update(
+                {
+                    "routed_intent": tool_intent_route.intent,
+                    "execution_profile": request.execution_profile,
+                    "tool_mode": request.tool_mode,
+                    "discoverable_tool_names": list(exposure_plan.discoverable_tool_names),
+                    "tool_allowlist": (
+                        list(request.tool_allowlist)
+                        if request.tool_allowlist is not None
+                        else None
+                    ),
+                    "tool_denylist": (
+                        list(request.tool_denylist)
+                        if request.tool_denylist is not None
+                        else None
+                    ),
+                }
+            )
+        model_info = active_backend.get_model_info()
         diagnostics = AgentInvocationDiagnostics(
             execution_profile=request.execution_profile,
             tool_mode=request.tool_mode,
@@ -1127,10 +1145,163 @@ class AgentEngine:
         if request.tool_mode == "required" and not exposure_plan.tool_names:
             diagnostics.fallback_reason = "tool_mode_required_but_no_tools_exposed"
 
+        tool_schemas = workspace_registry.get_schemas_for_names(exposure_plan.tool_names)
+        prompt_budget = self._estimate_prompt_budget(
+            system_prompt=system_prompt,
+            history=prompt_context.history,
+            user_message=request.message,
+            tool_schemas=tool_schemas,
+            backend=active_backend,
+            model_info=model_info,
+            reserve_output_tokens=reserve_output_tokens,
+        )
+        if prompt_budget["hard_gate_enabled"] and prompt_budget["hard_overflow"]:
+            diagnostics.fallback_reason = "context_overflow"
+            overflow_metadata = {
+                "runtime_category": "context_budget",
+                "error_type": "context_overflow",
+                "recoverability": "requires_user_input",
+                "reason": "context_overflow",
+                "context_length": prompt_budget["context_length"],
+                "estimated_prompt_tokens": prompt_budget["estimated_prompt_tokens"],
+                "reserved_output_tokens": reserve_output_tokens,
+                "remaining_tokens": prompt_budget["remaining_tokens"],
+                "usage_ratio": prompt_budget["usage_ratio"],
+                "available_input_tokens": prompt_budget["available_input_tokens"],
+                "soft_overflow": prompt_budget["soft_overflow"],
+                "hard_overflow": prompt_budget["hard_overflow"],
+                "token_breakdown": prompt_budget["token_breakdown"],
+                "approximate": prompt_budget["approximate"],
+                "context_length_source": prompt_budget["context_length_source"],
+                "model": model_info.name,
+                "backend_type": model_info.backend_type,
+            }
+            final_text = (
+                "The request exceeds the current model context window after compaction. "
+                "Please reduce the prompt, attachments, or history before retrying."
+            )
+            events: list[AgentEvent] = [
+                StatusEvent(
+                    content="Context budget overflow before model generation.",
+                    metadata=copy.deepcopy(overflow_metadata),
+                ),
+                FinalAnswerEvent(
+                    content=final_text,
+                    finish_reason="context_overflow",
+                    input_tokens=int(prompt_budget["estimated_prompt_tokens"]),
+                    output_tokens=0,
+                    metadata=copy.deepcopy(overflow_metadata),
+                ),
+            ]
+            for seq, event in enumerate(events, start=1):
+                event_metadata = getattr(event, "metadata", None)
+                if isinstance(event_metadata, dict):
+                    event_metadata.setdefault("tool_exposure", copy.deepcopy(tool_exposure_metadata))
+                event.turn_id = turn_id  # type: ignore[attr-defined]
+                if persist_turn_events:
+                    await self._persist_turn_event(
+                        session_key,
+                        event,
+                        turn_id=turn_id,
+                        seq=seq,
+                    )
+                if event_callback is not None:
+                    callback_result = event_callback(event)
+                    if inspect.isawaitable(callback_result):
+                        await cast(Awaitable[None], callback_result)
+            if persist_learning:
+                await self._finish_learning_cycle(trajectory_id)
+            if request.persist_session:
+                context.add_message(user_msg)
+                assistant_msg = Message(role="assistant", content=final_text)
+                context.add_message(assistant_msg)
+                await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
+            return AgentInvocationResult(
+                content=final_text,
+                events=events,
+                diagnostics=diagnostics,
+            )
+
+        workspace_write_obligation_diagnostics = exposure_plan.diagnostics.get(
+            "workspace_write_obligation"
+        )
+        requires_file_mutation = (
+            tool_intent_route.intent == "workspace_write"
+            or (
+                isinstance(workspace_write_obligation_diagnostics, dict)
+                and bool(workspace_write_obligation_diagnostics.get("required"))
+            )
+        )
+        react_loop = AsyncReActLoop(
+            backend=active_backend,
+            tool_registry=tool_registry,
+            tool_execution_context=tool_execution_context,
+            max_iterations=(
+                request.max_iterations_override
+                if isinstance(request.max_iterations_override, int) and request.max_iterations_override > 0
+                else self._default_max_iterations_for_backend(
+                    self._config.agent.max_react_iterations,
+                    active_backend,
+                )
+            ),
+            requires_file_mutation=requires_file_mutation,
+        )
         events: list[AgentEvent] = []
+        pre_generation_events: list[AgentEvent] = []
+        if (
+            prompt_budget["hard_gate_enabled"]
+            and prompt_budget["soft_overflow"]
+            and not prompt_budget["hard_overflow"]
+        ):
+            soft_overflow_metadata = {
+                "runtime_category": "context_budget",
+                "error_type": "context_reserve_overflow",
+                "recoverability": "continuing_with_warning",
+                "reason": "context_reserve_overflow",
+                "context_length": prompt_budget["context_length"],
+                "estimated_prompt_tokens": prompt_budget["estimated_prompt_tokens"],
+                "reserved_output_tokens": reserve_output_tokens,
+                "remaining_tokens": prompt_budget["remaining_tokens"],
+                "usage_ratio": prompt_budget["usage_ratio"],
+                "available_input_tokens": prompt_budget["available_input_tokens"],
+                "soft_overflow": prompt_budget["soft_overflow"],
+                "hard_overflow": prompt_budget["hard_overflow"],
+                "token_breakdown": prompt_budget["token_breakdown"],
+                "approximate": prompt_budget["approximate"],
+                "context_length_source": prompt_budget["context_length_source"],
+                "model": model_info.name,
+                "backend_type": model_info.backend_type,
+            }
+            pre_generation_events.append(
+                StatusEvent(
+                    content="Context reserve is exhausted before model generation.",
+                    metadata=soft_overflow_metadata,
+                )
+            )
+
         final_text = ""
         await self._router.mark_backend_busy(active_backend)
         try:
+            for event in pre_generation_events:
+                self._log_agent_event(trajectory_id, event)
+                event_metadata = getattr(event, "metadata", None)
+                if isinstance(event_metadata, dict):
+                    event_metadata.setdefault("tool_exposure", copy.deepcopy(tool_exposure_metadata))
+                event.turn_id = turn_id  # type: ignore[attr-defined]
+                turn_event_seq += 1
+                if persist_turn_events:
+                    await self._persist_turn_event(
+                        session_key,
+                        event,
+                        turn_id=turn_id,
+                        seq=turn_event_seq,
+                    )
+                events.append(event)
+                if event_callback is not None:
+                    callback_result = event_callback(event)
+                    if inspect.isawaitable(callback_result):
+                        await cast(Awaitable[None], callback_result)
+
             async for event in react_loop.run(
                 system_prompt=system_prompt,
                 history=prompt_context.history,
@@ -1583,10 +1754,11 @@ class AgentEngine:
             tool_names = [name for name in tool_names if name not in denied]
             discoverable_tool_names = [name for name in discoverable_tool_names if name not in denied]
 
+        effective_limit = max(exposure_plan.limit, len(exposure_plan.tool_names))
         return ToolExposurePlan(
-            tool_names=tool_names[: exposure_plan.limit] if exposure_plan.limit > 0 else [],
+            tool_names=tool_names[:effective_limit] if effective_limit > 0 else [],
             matched_groups=exposure_plan.matched_groups,
-            limit=exposure_plan.limit,
+            limit=effective_limit,
             discoverable_tool_names=discoverable_tool_names,
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
@@ -1944,6 +2116,8 @@ class AgentEngine:
         self._router.apply_settings(
             ollama_base_url=config.ollama.base_url,
             ollama_num_ctx=config.ollama.num_ctx,
+            ollama_auto_num_ctx=config.ollama.auto_num_ctx,
+            ollama_auto_num_ctx_cap=config.ollama.auto_num_ctx_cap,
             openai_default_model=config.openai_compat.model,
             openai_api_key=self._resolve_active_openai_compat_api_key(config),
             openai_codex_default_model=config.openai_codex.model,
@@ -2242,9 +2416,17 @@ class AgentEngine:
     def _reliable_context_length_hint(model_info: ModelInfo | None) -> int | None:
         if model_info is None:
             return None
+        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
+        effective_context_length = metadata.get("effective_context_length")
+        effective_context_source = metadata.get("effective_context_length_source")
+        if (
+            isinstance(effective_context_length, int)
+            and effective_context_length > 0
+            and effective_context_source != "fallback_default"
+        ):
+            return effective_context_length
         if not isinstance(model_info.context_length, int) or model_info.context_length <= 0:
             return None
-        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
         source = metadata.get("context_length_source")
         fallback = metadata.get("context_length_fallback")
         if source == "unknown" and isinstance(fallback, int) and fallback > 0:
@@ -2303,13 +2485,90 @@ class AgentEngine:
 
     @staticmethod
     def _snapshot_context_length(model_info: ModelInfo) -> int:
+        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
+        effective_context_length = metadata.get("effective_context_length")
+        if isinstance(effective_context_length, int) and effective_context_length > 0:
+            return effective_context_length
         if isinstance(model_info.context_length, int) and model_info.context_length > 0:
             return model_info.context_length
-        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
         fallback = metadata.get("context_length_fallback")
         if isinstance(fallback, int) and fallback > 0:
             return fallback
         return _DEFAULT_CONTEXT_LENGTH_FALLBACK
+
+    def _estimate_prompt_budget(
+        self,
+        *,
+        system_prompt: str,
+        history: list[Message],
+        user_message: str,
+        tool_schemas: list[dict[str, Any]],
+        backend: BaseLLMBackend,
+        model_info: ModelInfo,
+        reserve_output_tokens: int,
+    ) -> dict[str, Any]:
+        system_estimate = estimate_backend_text_tokens(
+            system_prompt,
+            backend=backend,
+            model_info=model_info,
+        )
+        history_estimate = estimate_messages_tokens(history, model_name=model_info.name)
+        draft_estimate = estimate_backend_text_tokens(
+            user_message,
+            backend=backend,
+            model_info=model_info,
+        )
+        tool_estimate = estimate_backend_text_tokens(
+            json.dumps(tool_schemas, ensure_ascii=False, sort_keys=True),
+            backend=backend,
+            model_info=model_info,
+        )
+        estimated_prompt_tokens = (
+            system_estimate.tokens
+            + history_estimate.tokens
+            + draft_estimate.tokens
+            + tool_estimate.tokens
+        )
+        reliable_context_length = self._reliable_context_length_hint(model_info)
+        context_length = reliable_context_length or self._snapshot_context_length(model_info)
+        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
+        context_length_source = metadata.get("effective_context_length_source") or metadata.get(
+            "context_length_source"
+        )
+        safe_reserve_output_tokens = max(0, reserve_output_tokens)
+        available_input_tokens = max(context_length - safe_reserve_output_tokens, 0)
+        remaining_tokens = context_length - estimated_prompt_tokens - safe_reserve_output_tokens
+        usage_ratio = min(
+            1.0,
+            max(0.0, (estimated_prompt_tokens + safe_reserve_output_tokens) / context_length),
+        )
+        return {
+            "context_length": context_length,
+            "context_length_source": context_length_source,
+            "hard_gate_enabled": reliable_context_length is not None,
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "available_input_tokens": available_input_tokens,
+            "remaining_tokens": max(remaining_tokens, 0),
+            "usage_ratio": usage_ratio,
+            "soft_overflow": estimated_prompt_tokens > available_input_tokens,
+            "hard_overflow": estimated_prompt_tokens > context_length,
+            "overflow": estimated_prompt_tokens > context_length,
+            "token_breakdown": {
+                "system_tokens": system_estimate.tokens,
+                "history_tokens": history_estimate.tokens,
+                "draft_tokens": draft_estimate.tokens,
+                "tool_tokens": tool_estimate.tokens,
+            },
+            "approximate": any(
+                estimate.approximate
+                for estimate in (
+                    system_estimate,
+                    history_estimate,
+                    draft_estimate,
+                    tool_estimate,
+                )
+            ),
+        }
 
     async def _build_skills_context(self, message: str) -> str:
         """搜尋相關技能並格式化為 system prompt context。"""
@@ -2407,6 +2666,60 @@ class AgentEngine:
                 tokens_used=0,
                 duration_ms=0,
             )
+        if isinstance(event, AssistantTruncatedEvent):
+            return TrajectoryStep(
+                step_id=self._next_trajectory_step_id(),
+                timestamp=now,
+                step_type="assistant_truncated",
+                input_data={},
+                output_data={"content": event.content},
+                tokens_used=0,
+                duration_ms=0,
+                metadata={
+                    "finish_reason": event.finish_reason,
+                    "recovery_attempt": event.recovery_attempt,
+                    "partial_output_chars": event.partial_output_chars,
+                    **copy.deepcopy(event.metadata),
+                },
+            )
+        if isinstance(event, ToolCallCreatedEvent):
+            return TrajectoryStep(
+                step_id=self._next_trajectory_step_id(),
+                timestamp=now,
+                step_type="tool_call_created",
+                input_data={"tool_name": event.tool_name, "arguments": event.arguments},
+                output_data={},
+                tokens_used=0,
+                duration_ms=0,
+                metadata={"call_id": event.call_id, **copy.deepcopy(event.metadata)},
+            )
+        if isinstance(event, ToolCallCompletedEvent):
+            return TrajectoryStep(
+                step_id=self._next_trajectory_step_id(),
+                timestamp=now,
+                step_type="tool_call_completed",
+                input_data={"tool_name": event.tool_name, "arguments": event.arguments},
+                output_data={"result": event.result, "error": event.error},
+                tokens_used=0,
+                duration_ms=0,
+                metadata={"call_id": event.call_id, **copy.deepcopy(event.metadata)},
+            )
+        if isinstance(event, GoalStateChangedEvent):
+            return TrajectoryStep(
+                step_id=self._next_trajectory_step_id(),
+                timestamp=now,
+                step_type="goal_state_changed",
+                input_data={"goal_id": event.goal_id, "previous_status": event.previous_status},
+                output_data={"status": event.status},
+                tokens_used=0,
+                duration_ms=0,
+                metadata={
+                    "attempt_id": event.attempt_id,
+                    "agent_run_id": event.agent_run_id,
+                    "reason": event.reason,
+                    **copy.deepcopy(event.metadata),
+                },
+            )
         if isinstance(event, ToolCallRequestEvent):
             return TrajectoryStep(
                 step_id=self._next_trajectory_step_id(),
@@ -2438,6 +2751,10 @@ class AgentEngine:
                 output_data={"content": event.content},
                 tokens_used=0,
                 duration_ms=0,
+                metadata={
+                    "finish_reason": event.finish_reason,
+                    **copy.deepcopy(event.metadata),
+                },
             )
         if isinstance(event, ErrorEvent):
             return TrajectoryStep(
@@ -2763,6 +3080,40 @@ class AgentEngine:
                 "content": event.content,
                 "metadata": copy.deepcopy(event.metadata),
             }
+        if isinstance(event, AssistantTruncatedEvent):
+            return "assistant_truncated", {
+                "content": event.content,
+                "finish_reason": event.finish_reason,
+                "recovery_attempt": event.recovery_attempt,
+                "partial_output_chars": event.partial_output_chars,
+                "metadata": copy.deepcopy(event.metadata),
+            }
+        if isinstance(event, ToolCallCreatedEvent):
+            return "tool_call_created", {
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "arguments": copy.deepcopy(event.arguments),
+                "metadata": copy.deepcopy(event.metadata),
+            }
+        if isinstance(event, ToolCallCompletedEvent):
+            return "tool_call_completed", {
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "arguments": copy.deepcopy(event.arguments),
+                "result": copy.deepcopy(event.result),
+                "error": event.error,
+                "metadata": copy.deepcopy(event.metadata),
+            }
+        if isinstance(event, GoalStateChangedEvent):
+            return "goal_state_changed", {
+                "goal_id": event.goal_id,
+                "previous_status": event.previous_status,
+                "status": event.status,
+                "attempt_id": event.attempt_id,
+                "agent_run_id": event.agent_run_id,
+                "reason": event.reason,
+                "metadata": copy.deepcopy(event.metadata),
+            }
         if isinstance(event, ToolCallRequestEvent):
             return "tool_call_request", {
                 "call_id": event.call_id,
@@ -2781,6 +3132,8 @@ class AgentEngine:
             return "final_answer", {
                 "content": event.content,
                 "trajectory_id": event.trajectory_id,
+                "finish_reason": event.finish_reason,
+                "metadata": copy.deepcopy(event.metadata),
             }
         if isinstance(event, ErrorEvent):
             return "error", {

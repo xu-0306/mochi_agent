@@ -8,6 +8,7 @@ from typing import Any
 from mochi.tools.base import BaseTool, ToolResult
 
 ToolCatalogProvider = Callable[[], list[BaseTool]]
+CallableToolNameProvider = Callable[[], set[str]]
 
 
 class ToolSearchTool(BaseTool):
@@ -17,10 +18,12 @@ class ToolSearchTool(BaseTool):
         self,
         *,
         catalog_provider: ToolCatalogProvider,
+        callable_name_provider: CallableToolNameProvider | None = None,
         default_top_k: int = 5,
         max_top_k: int = 50,
     ) -> None:
         self._catalog_provider = catalog_provider
+        self._callable_name_provider = callable_name_provider
         self._default_top_k = max(1, int(default_top_k))
         self._max_top_k = max(self._default_top_k, int(max_top_k))
 
@@ -79,9 +82,11 @@ class ToolSearchTool(BaseTool):
     def _search_catalog(self, query: str, top_k: int) -> list[dict[str, Any]]:
         tokens = [token for token in query.lower().split() if token]
         ranked: list[tuple[int, str, dict[str, Any]]] = []
+        catalog = self._catalog_provider()
+        callable_names = self._callable_names_for_catalog(catalog)
 
-        for tool in self._catalog_provider():
-            payload = self._tool_payload(tool)
+        for tool in catalog:
+            payload = self._tool_payload(tool, callable_names=callable_names)
             capabilities_text = self._capabilities_text(tool.tool_capabilities).lower()
             haystacks = [
                 tool.name.lower(),
@@ -101,12 +106,22 @@ class ToolSearchTool(BaseTool):
         ranked.sort(key=lambda item: (-item[0], item[1]))
         return [payload for _, _, payload in ranked[:top_k]]
 
-    def scoped_to_catalog(self, catalog_provider: ToolCatalogProvider) -> ToolSearchTool:
+    def scoped_to_catalog(
+        self,
+        catalog_provider: ToolCatalogProvider,
+        callable_name_provider: CallableToolNameProvider | None = None,
+    ) -> ToolSearchTool:
         return ToolSearchTool(
             catalog_provider=catalog_provider,
+            callable_name_provider=callable_name_provider,
             default_top_k=self._default_top_k,
             max_top_k=self._max_top_k,
         )
+
+    def _callable_names_for_catalog(self, catalog: list[BaseTool]) -> set[str]:
+        if self._callable_name_provider is not None:
+            return set(self._callable_name_provider())
+        return {tool.name for tool in catalog}
 
     @staticmethod
     def _schema_text(schema: dict[str, Any]) -> str:
@@ -134,8 +149,9 @@ class ToolSearchTool(BaseTool):
         return " ".join(parts)
 
     @staticmethod
-    def _tool_payload(tool: BaseTool) -> dict[str, Any]:
-        return {
+    def _tool_payload(tool: BaseTool, *, callable_names: set[str]) -> dict[str, Any]:
+        callable_this_turn = tool.name in callable_names
+        payload = {
             "name": tool.name,
             "description": tool.description,
             "search_hint": tool.search_hint,
@@ -143,4 +159,35 @@ class ToolSearchTool(BaseTool):
             "destructive": tool.is_destructive,
             "open_world": tool.is_open_world,
             "capabilities": tool.tool_capabilities,
+            "callable_this_turn": callable_this_turn,
+            "activation_required": not callable_this_turn,
+            "activation_reason": (
+                None
+                if callable_this_turn
+                else "Tool is discoverable but not exposed as callable in this turn."
+            ),
         }
+        activation_request = ToolSearchTool._activation_request_for_tool(
+            tool,
+            callable_this_turn=callable_this_turn,
+        )
+        if activation_request is not None:
+            payload["activation_request"] = activation_request
+        return payload
+
+    @staticmethod
+    def _activation_request_for_tool(
+        tool: BaseTool,
+        *,
+        callable_this_turn: bool,
+    ) -> dict[str, str] | None:
+        if callable_this_turn or tool.is_read_only:
+            return None
+
+        if tool.name in {"file_write", "file_edit", "apply_patch"}:
+            return {
+                "tool_name": tool.name,
+                "required_intent": "workspace_write",
+                "policy_check": "required",
+            }
+        return None

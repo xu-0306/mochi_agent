@@ -8,6 +8,25 @@ from mochi.backends.tool_call_simulator import ToolCallSimulator
 from mochi.backends.types import ToolSchema
 
 
+def test_qwen_tool_prompt_profile_prefers_xml_function_markup() -> None:
+    simulator = ToolCallSimulator(tool_prompt_profile="qwen_xml_tool_call")
+    tools = [
+        ToolSchema(
+            name="web_search",
+            description="Search web pages",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+        )
+    ]
+
+    injected = simulator.inject_tools_into_prompt("You are Mochi.", tools)
+
+    assert "<function=tool_name>" in injected
+    assert "<parameter=arg1>value1</parameter>" in injected
+    assert "JSON <tool_call> blocks are also accepted" in injected
+    assert "web_search" in injected
+    assert re.search(r"[\u4e00-\u9fff]", injected) is None
+
+
 def test_inject_tools_into_prompt_adds_tool_definitions() -> None:
     """應把工具定義注入 system prompt。"""
     simulator = ToolCallSimulator()

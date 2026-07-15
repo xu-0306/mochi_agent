@@ -225,11 +225,39 @@ def _is_suspicious_raw_path(path: str) -> bool:
     return False
 
 
-def _is_protected_path(candidate: Path) -> bool:
-    for segment in candidate.parts:
+def _is_protected_path(
+    candidate: Path,
+    *,
+    workspace_dir: Path | None = None,
+) -> bool:
+    """Return whether a path targets a protected state/config location.
+
+    A configured workspace may intentionally live under the project-local
+    `.mochi/workspace` directory. In that case `.mochi` is an ancestor of the
+    trusted workspace, not the target being edited. The protected `.mochi`
+    root itself and all protected descendants remain denied.
+    """
+    candidate_parts = tuple(candidate.parts)
+    workspace_parts = tuple(workspace_dir.parts) if workspace_dir is not None else ()
+    workspace_is_nested_under_mochi = (
+        bool(workspace_parts)
+        and len(workspace_parts) > 1
+        and workspace_parts[-1].lower() not in PROTECTED_DIRECTORIES
+        and any(part.lower() == ".mochi" for part in workspace_parts[:-1])
+    )
+
+    for index, segment in enumerate(candidate_parts):
         lowered = segment.lower()
         if lowered in PROTECTED_DIRECTORIES:
-            return True
+            is_trusted_mochi_ancestor = (
+                workspace_is_nested_under_mochi
+                and lowered == ".mochi"
+                and index < len(workspace_parts)
+                and candidate_parts[: len(workspace_parts)] == workspace_parts
+                and index < len(workspace_parts) - 1
+            )
+            if not is_trusted_mochi_ancestor:
+                return True
         if lowered in PROTECTED_FILE_NAMES:
             return True
     return False
@@ -296,7 +324,7 @@ def check_file_tool_path(
         )
 
     if access != "read" and (
-        _is_protected_path(Path(raw_path).expanduser()) or _is_protected_path(resolved)
+        _is_protected_path(Path(raw_path).expanduser()) or _is_protected_path(resolved, workspace_dir=normalize_workspace_dir(workspace_dir))
     ):
         return (
             None,

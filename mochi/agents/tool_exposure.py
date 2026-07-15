@@ -49,6 +49,12 @@ class ToolExposurePlanner:
         "notebook_read",
     )
 
+    _CORE_WORKSPACE_WRITE_TOOLS: tuple[str, ...] = (
+        "file_write",
+        "file_edit",
+        "apply_patch",
+    )
+
     _RISKY_TOOLS: frozenset[str] = frozenset(
         {
             "exec_command",
@@ -236,6 +242,9 @@ class ToolExposurePlanner:
         "extract",
         "file-reading",
     )
+    # Fallback recall hints only. Structured routed intent is the source of
+    # truth for workspace write exposure; do not expand this into a primary
+    # natural-language classifier.
     _ATTACHMENT_MUTATION_INTENT_KEYWORDS: tuple[str, ...] = (
         "edit",
         "edited",
@@ -256,13 +265,27 @@ class ToolExposurePlanner:
         "save",
         "replace",
         "fix",
-        "修改",
-        "更新",
         "編輯",
         "编辑",
+        "更新",
+        "修改",
+        "變更",
+        "变更",
         "改寫",
         "改写",
-        "修正",
+        "修補",
+        "修复",
+        "修復",
+        "儲存",
+        "保存",
+        "寫入",
+        "写入",
+        "建立",
+        "创建",
+        "新增",
+        "刪除",
+        "删除",
+        "套用 patch",
     )
     _ATTACHMENT_PROCESSING_INTENT_KEYWORDS: tuple[str, ...] = (
         "translate",
@@ -556,9 +579,25 @@ class ToolExposurePlanner:
         attached_workspace_files = normalized_workspace_attachment_count > 0 or any(
             marker in lowered for marker in self._ATTACHED_WORKSPACE_FILE_MARKERS
         )
-        attachment_mutation_request = routed_workspace_write or self._matches_any_keyword(
-            lowered_user_intent,
-            self._ATTACHMENT_MUTATION_INTENT_KEYWORDS,
+        explicit_workspace_target = attached_workspace_files or bool(
+            re.search(
+                (
+                    r"(?:[a-z]:[\\/]|(?:\.\.?[\\/])|"
+                    r"\b(?:file|files|path|paths|artifact|workspace)\b|"
+                    r"\b[\w.-]+\.(?:py|txt|md|json|ya?ml|csv|ts|tsx|js|jsx|toml|ini|cfg|sql|html|css)\b)"
+                ),
+                lowered_user_intent,
+            )
+        )
+        route_allows_mutation_fallback = normalized_routed_intent in {None, "ambiguous"}
+        attachment_mutation_request = routed_workspace_write or (
+            route_allows_mutation_fallback
+            and explicit_workspace_target
+            and not routed_tool_discovery
+            and self._matches_any_keyword(
+                lowered_user_intent,
+                self._ATTACHMENT_MUTATION_INTENT_KEYWORDS,
+            )
         )
         attachment_processing_request = (
             attached_workspace_files
@@ -753,6 +792,19 @@ class ToolExposurePlanner:
         for tool_name in selected:
             capabilities = normalized_capabilities.get(tool_name, {})
             domains = set(capabilities.get("domains", ()))
+            core_workspace_write_tool = tool_name in self._CORE_WORKSPACE_WRITE_TOOLS
+            if (
+                normalized_routed_intent
+                in {
+                    "workspace_read",
+                    "open_world_lookup",
+                    "literature_research",
+                    "tool_discovery",
+                    "execution_or_process",
+                }
+                and core_workspace_write_tool
+            ):
+                continue
             if tool_name == "delegate_subagent_task" and not explicit_subagent_delegation:
                 continue
             if (
@@ -760,6 +812,8 @@ class ToolExposurePlanner:
                 and bool(capabilities.get("open_world", False))
                 and domains & {"web", "literature"}
             ):
+                continue
+            if routed_tool_discovery and tool_name in self._CORE_WORKSPACE_WRITE_TOOLS:
                 continue
             if non_workspace_attachment_request and tool_name in self._CORE_WORKSPACE_READ_ONLY_TOOLS:
                 continue
@@ -773,9 +827,12 @@ class ToolExposurePlanner:
             if (
                 read_only_file_request
                 and tool_name in self._RISKY_TOOLS
-                and not (
-                    attachment_processing_request
-                    and tool_name in self._NON_MUTATING_EXECUTION_TOOLS
+                and (
+                    tool_name in self._CORE_WORKSPACE_WRITE_TOOLS
+                    or not (
+                        attachment_processing_request
+                        and tool_name in self._NON_MUTATING_EXECUTION_TOOLS
+                    )
                 )
             ):
                 continue
@@ -805,6 +862,12 @@ class ToolExposurePlanner:
                 or attachment_processing_request
             )
         ]
+        workspace_write_baseline = [
+            tool_name
+            for tool_name in self._CORE_WORKSPACE_WRITE_TOOLS
+            if (session_bound_workspace or routed_workspace_write or attachment_mutation_request)
+            and tool_name in available
+        ]
         general_web_baseline = [
             tool_name
             for tool_name in ("web_search", "web_fetch", "get_current_time")
@@ -819,6 +882,10 @@ class ToolExposurePlanner:
         for tool_name in workspace_baseline:
             if tool_name not in final_tool_names:
                 final_tool_names.append(tool_name)
+        if routed_workspace_write or attachment_mutation_request:
+            for tool_name in workspace_write_baseline:
+                if tool_name not in final_tool_names:
+                    final_tool_names.append(tool_name)
         # A workspace-bound session should not silently lose general web lookup.
         # Keep a small open-world baseline visible unless the user explicitly
         # asked for workspace-local inspection/manipulation.
@@ -830,17 +897,43 @@ class ToolExposurePlanner:
             discoverable_tool_names=filtered,
             visible_tool_names=final_tool_names,
         ) and "tool_search" not in final_tool_names:
-            if not session_bound_workspace and limit > 0 and len(final_tool_names) >= limit:
+            if (
+                not session_bound_workspace
+                and not routed_workspace_write
+                and not attachment_mutation_request
+                and limit > 0
+                and len(final_tool_names) >= limit
+            ):
                 final_tool_names = [*final_tool_names[: limit - 1], "tool_search"]
             else:
                 final_tool_names.append("tool_search")
 
         final_limit = max(limit, len(final_tool_names))
+        discoverable_tool_names = list(filtered)
+        for tool_name in workspace_write_baseline:
+            if tool_name not in discoverable_tool_names:
+                discoverable_tool_names.append(tool_name)
+        if routed_workspace_write:
+            workspace_write_obligation_source = intent_source or "routed_intent"
+            workspace_write_obligation_confidence = intent_confidence
+            workspace_write_obligation_rationale = (
+                intent_rationale or "Routed workspace write intent."
+            )
+        elif attachment_mutation_request:
+            workspace_write_obligation_source = "fallback_keyword"
+            workspace_write_obligation_confidence = None
+            workspace_write_obligation_rationale = (
+                "Explicit workspace target and mutation keyword fallback."
+            )
+        else:
+            workspace_write_obligation_source = "none"
+            workspace_write_obligation_confidence = None
+            workspace_write_obligation_rationale = None
         return ToolExposurePlan(
             tool_names=final_tool_names,
             matched_groups=matched_groups,
             limit=final_limit,
-            discoverable_tool_names=list(filtered),
+            discoverable_tool_names=discoverable_tool_names,
             workspace_bound=session_bound_workspace,
             attachment_count=normalized_attachment_count,
             intent_route=intent_route_metadata,
@@ -849,6 +942,12 @@ class ToolExposurePlanner:
                 "available_tool_count": len(available_tool_names),
                 "filtered_tool_count": len(filtered),
                 "final_tool_count": len(final_tool_names),
+                "workspace_write_obligation": {
+                    "required": routed_workspace_write or attachment_mutation_request,
+                    "source": workspace_write_obligation_source,
+                    "confidence": workspace_write_obligation_confidence,
+                    "rationale": workspace_write_obligation_rationale,
+                },
                 "backend": self._backend_diagnostics(backend_info, metadata),
             },
         )

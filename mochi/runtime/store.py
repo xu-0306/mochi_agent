@@ -1220,6 +1220,7 @@ class RuntimeStore:
         agent_run_id: str | None | object = _UNSET,
         attempt_summary: dict[str, Any] | None = None,
         attempt_metadata: dict[str, Any] | None = None,
+        goal_summary: dict[str, Any] | None = None,
         reset_goal_started_at: bool = False,
         reset_goal_finished_at: bool = False,
         reset_attempt_started_at: bool = False,
@@ -1232,7 +1233,7 @@ class RuntimeStore:
             with sqlite3.connect(self._db_path) as conn:
                 goal_existing = conn.execute(
                     """
-                    SELECT started_at, finished_at, latest_error, current_attempt_id
+                    SELECT started_at, finished_at, latest_error, current_attempt_id, summary_json
                     FROM goals
                     WHERE id=?
                     """,
@@ -1253,6 +1254,7 @@ class RuntimeStore:
                 goal_finished_at = None if reset_goal_finished_at else goal_existing[1]
                 goal_latest_error = goal_existing[2]
                 goal_current_attempt_id = goal_existing[3]
+                goal_current_summary = json.loads(str(goal_existing[4] or "{}"))
                 next_goal_started_at = (
                     now
                     if goal_status in {"queued", "running"} and not goal_started_at
@@ -1316,6 +1318,7 @@ class RuntimeStore:
                     """
                     UPDATE goals
                     SET status=?,
+                        summary_json=?,
                         latest_error=?,
                         current_attempt_id=?,
                         started_at=?,
@@ -1325,6 +1328,10 @@ class RuntimeStore:
                     """,
                     (
                         goal_status,
+                        json.dumps(
+                            goal_current_summary if goal_summary is None else goal_summary,
+                            ensure_ascii=False,
+                        ),
                         goal_latest_error if latest_error is _UNSET else latest_error,
                         goal_current_attempt_id if current_attempt_id is _UNSET else current_attempt_id,
                         next_goal_started_at,

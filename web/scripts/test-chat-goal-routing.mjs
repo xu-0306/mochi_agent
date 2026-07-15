@@ -204,7 +204,7 @@ assert.deepEqual(
     hasActiveGoal: false,
   }).route,
   {
-    kind: 'goal_pending_follow_up',
+    kind: 'workflow_pending_follow_up',
     requestText: 'start',
     raw: 'start',
   }
@@ -218,7 +218,7 @@ assert.deepEqual(
     hasActiveGoal: false,
   }).route,
   {
-    kind: 'goal_pending_follow_up',
+    kind: 'workflow_pending_follow_up',
     requestText: '\u540c\u610f',
     raw: '\u540c\u610f',
   }
@@ -231,16 +231,9 @@ for (const text of ['hi', 'hello', '\u4f60\u597d', '\u55e8']) {
       attachmentCount: 0,
       hasPendingProposal: true,
       hasActiveGoal: false,
-    }),
-    {
-      modeCommand: null,
-      requestText: text,
-      route: { kind: 'direct_chat' },
-      workflowModeRequested: false,
-      requiresSessionMaterialization: false,
-      shouldHandleGoalWorkflowRouting: false,
-    },
-    `expected ordinary follow-up ${text} to leave pending goal proposal lane`
+    }).route,
+    { kind: 'direct_chat' },
+    `expected greeting ${text} to stay in direct_chat even with a workflow pending proposal`
   )
 }
 
@@ -252,7 +245,7 @@ assert.deepEqual(
     hasActiveGoal: false,
   }).route,
   {
-    kind: 'goal_pending_follow_up',
+    kind: 'workflow_pending_follow_up',
     requestText: '\u8abf\u6574\u7bc4\u570d',
     raw: '\u8abf\u6574\u7bc4\u570d',
   }
@@ -266,7 +259,7 @@ assert.deepEqual(
     hasActiveGoal: false,
   }).route,
   {
-    kind: 'goal_pending_follow_up',
+    kind: 'workflow_pending_follow_up',
     requestText: 'Revise the proposal to include rollback steps.',
     raw: 'Revise the proposal to include rollback steps.',
   }

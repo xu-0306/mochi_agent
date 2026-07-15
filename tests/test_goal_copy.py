@@ -2,25 +2,24 @@ from __future__ import annotations
 
 from mochi.goal_proposal_copy import (
     build_goal_command_help_message,
-    build_goal_card_chrome_copy,
-    build_goal_card_status_label,
+    build_goal_chrome_copy,
+    build_goal_status_label,
     build_goal_follow_up_message,
     build_goal_lifecycle_message,
     build_goal_proposal_assistant_copy_fallback,
 )
 from mochi.terminal_goal_helpers import (
     build_goal_summary_from_goal,
-    goal_card_from_summary,
     normalize_goal_session_state,
 )
 
 
-def test_goal_card_chrome_copy_localizes_traditional_chinese_labels() -> None:
-    copy = build_goal_card_chrome_copy(user_message="\u958b\u59cb\u9019\u500b goal")
+def test_goal_chrome_copy_localizes_traditional_chinese_labels() -> None:
+    copy = build_goal_chrome_copy(user_message="\u958b\u59cb\u9019\u500b goal")
 
     assert copy.goal_status_label == "Goal \u72c0\u614b"
     assert copy.execution_label == "\u57f7\u884c\u65b9\u5f0f"
-    assert build_goal_card_status_label(
+    assert build_goal_status_label(
         user_message="\u958b\u59cb\u9019\u500b goal",
         status="running",
     ) == "\u57f7\u884c\u4e2d"
@@ -198,20 +197,6 @@ def test_goal_lifecycle_copy_simplified_chinese_does_not_offer_workflow_as_prima
     assert "`/goal <request>`" in pending_cleared
     assert "/workflow <request>" not in no_active_goal
     assert "/workflow <request>" not in pending_cleared
-
-
-def test_terminal_goal_card_uses_copy_source_for_default_label() -> None:
-    card = goal_card_from_summary(
-        {
-            "objective": "Ship the release",
-            "execution_mode": "single_agent",
-        },
-        kind="started",
-        copy_source="\u958b\u59cb",
-    )
-
-    assert card["label"] == "Goal \u5df2\u555f\u52d5"
-    assert card["copySource"] == "\u958b\u59cb"
 
 
 def test_normalize_goal_session_state_preserves_backend_goal_metadata_without_synthetic_defaults() -> None:

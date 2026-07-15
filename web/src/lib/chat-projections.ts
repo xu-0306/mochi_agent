@@ -1,6 +1,7 @@
 import type { WorkflowProgressCardView } from '../components/workflow/types'
 import type { AgentRunDetail, TaskSummary } from './api'
 import type { Message } from './chat'
+import { stripLegacyGoalCardMessage } from './legacy-goal-card-projection.ts'
 import {
   buildDelegatedSubagentCardView,
   buildDelegatedSubagentFailureCardView,
@@ -24,16 +25,6 @@ function isWorkflowCompletionReportStatus(status: string | null | undefined): bo
 
 function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
-}
-
-function getLatestGoalCardExecutionMode(messages: Message[]): 'single_agent' | 'workflow' | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const goalCard = messages[index]?.goalCard
-    if (goalCard?.executionMode === 'single_agent' || goalCard?.executionMode === 'workflow') {
-      return goalCard.executionMode
-    }
-  }
-  return null
 }
 
 export function buildWorkflowCompletionContent(run: AgentRunDetail | null): string | null {
@@ -109,12 +100,18 @@ export function buildProjectedDisplayMessages(input: {
   runtimeTasks: TaskSummary[]
   workflowProgressCard?: WorkflowProgressCardView | null
   workflowRun?: AgentRunDetail | null
+  goalExecutionMode?: 'single_agent' | 'workflow' | null
 }): Message[] {
-  const { messages, runtimeTasks, workflowProgressCard = null, workflowRun = null } = input
-  const latestGoalExecutionMode = getLatestGoalCardExecutionMode(messages)
+  const {
+    messages,
+    runtimeTasks,
+    workflowProgressCard = null,
+    workflowRun = null,
+    goalExecutionMode = null,
+  } = input
   const allowWorkflowNativeContent =
-    latestGoalExecutionMode === 'workflow' ||
-    (latestGoalExecutionMode === null && Boolean(workflowProgressCard || workflowRun))
+    goalExecutionMode !== 'single_agent' &&
+    (goalExecutionMode === 'workflow' || Boolean(workflowProgressCard || workflowRun))
   const workflowCompletionContent = allowWorkflowNativeContent
     ? buildWorkflowCompletionContent(workflowRun)
     : null
@@ -200,6 +197,8 @@ export function buildProjectedDisplayMessages(input: {
   }
 
   let nextMessages = messages
+    .map((message) => stripLegacyGoalCardMessage(message))
+    .filter((message): message is Message => message !== null)
 
   for (const { card, timestamp } of [...subagentTaskCards.values()].sort(
     (left, right) => left.timestamp.getTime() - right.timestamp.getTime()
@@ -240,33 +239,5 @@ export function buildProjectedDisplayMessages(input: {
     })
   }
 
-  const latestGoalCardIndexByGoalId = new Map<string, number>()
-  nextMessages.forEach((message, index) => {
-    const goalCard = message.goalCard
-    if (goalCard?.goalId) {
-      latestGoalCardIndexByGoalId.set(goalCard.goalId, index)
-    }
-  })
-
-  return nextMessages.map((message, index) => {
-    const goalCard = message.goalCard
-    if (!goalCard?.goalId) {
-      return message
-    }
-
-    const shouldMarkSuperseded =
-      goalCard.kind !== 'started' &&
-      latestGoalCardIndexByGoalId.get(goalCard.goalId) !== index
-    if (!shouldMarkSuperseded && !goalCard.superseded) {
-      return message
-    }
-
-    return {
-      ...message,
-      goalCard: {
-        ...goalCard,
-        superseded: Boolean(goalCard.superseded) || shouldMarkSuperseded,
-      },
-    }
-  })
+  return nextMessages
 }

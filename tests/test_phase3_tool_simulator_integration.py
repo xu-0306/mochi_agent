@@ -6,7 +6,7 @@ import pytest
 
 from mochi.agents.engine import AgentEngine
 from mochi.agents.invocation import AgentInvocationRequest
-from mochi.agents.events import FinalAnswerEvent, ThinkingEvent, ToolCallResultEvent
+from mochi.agents.events import FinalAnswerEvent, StatusEvent, ThinkingEvent, ToolCallResultEvent
 from mochi.agents.react_loop import AsyncReActLoop
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo, ToolCall, ToolSchema
@@ -645,6 +645,75 @@ class _TwoStepLiteratureBackend(BaseLLMBackend):
         return None
 
 
+class _OvereagerLiteratureBackend(BaseLLMBackend):
+    async def generate(
+        self,
+        messages: list[Message],
+        tools: list[ToolSchema] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        repeat_penalty: float = 1.0,
+        stream: bool = False,
+    ) -> GenerationResult:
+        del tools, temperature, max_tokens, top_p, min_p, top_k
+        del frequency_penalty, presence_penalty, repeat_penalty, stream
+        tool_messages = [message for message in messages if message.role == "tool"]
+        if len(tool_messages) >= 3:
+            return GenerationResult(content="Synthesized after runtime steering.")
+        if len(tool_messages) == 2:
+            return GenerationResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-pubmed-after-ready",
+                        name="pubmed_search",
+                        arguments={"query": "weather model fine-tuning clinical literature"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if len(tool_messages) == 1:
+            return GenerationResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-semantic-scholar",
+                        name="semantic_scholar_search",
+                        arguments={"query": "meteorological forecast model fine tuning"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return GenerationResult(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call-arxiv",
+                    name="arxiv_search",
+                    arguments={"query": "weather forecast model fine-tuning"},
+                )
+            ],
+            finish_reason="tool_calls",
+        )
+
+    def supports_tool_calling(self) -> bool:
+        return True
+
+    def get_model_info(self) -> ModelInfo:
+        return ModelInfo(name="overeager-literature-backend", backend_type="test")
+
+    async def health_check(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
 class _FakeLiteratureSearchTool(BaseTool):
     def __init__(self, name: str, results: list[dict[str, str]]) -> None:
         self._name = name
@@ -1174,6 +1243,70 @@ async def test_literature_guard_allows_second_search_after_single_arxiv_batch() 
     assert [event.tool_name for event in tool_results] == ["arxiv_search", "semantic_scholar_search"]
     assert all(event.error is None for event in tool_results)
     assert final_event.content == "Synthesized from two searches."
+
+
+@pytest.mark.asyncio
+async def test_literature_guard_reports_runtime_steering_without_tool_error() -> None:
+    backend = _OvereagerLiteratureBackend()
+    arxiv_results = [
+        {
+            "title": f"Space weather validation paper {index}",
+            "summary": "A paper about space weather forecast validation.",
+        }
+        for index in range(10)
+    ]
+    semantic_results = [
+        {
+            "title": "Fine-tuning meteorological forecast models",
+            "abstract": "A relevant paper about model adaptation for weather prediction.",
+        }
+    ]
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(_FakeLiteratureSearchTool("arxiv_search", arxiv_results))
+    registry.register(_FakeLiteratureSearchTool("semantic_scholar_search", semantic_results))
+    registry.register(_FakeLiteratureSearchTool("pubmed_search", []))
+    react_loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        tool_execution_context=ToolExecutionContext(workspace_dir="."),
+        max_iterations=5,
+    )
+
+    events = [
+        event
+        async for event in react_loop.run(
+            system_prompt="system",
+            history=[],
+            user_message="Find papers about weather forecast model fine-tuning.",
+        )
+    ]
+
+    tool_results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    steering_events = [
+        event
+        for event in events
+        if isinstance(event, StatusEvent)
+        and event.metadata.get("reason") == "runtime_steering"
+        and event.metadata.get("guard") == "literature_summary_ready"
+    ]
+    final_event = next(event for event in events if isinstance(event, FinalAnswerEvent))
+
+    assert [event.tool_name for event in tool_results] == [
+        "arxiv_search",
+        "semantic_scholar_search",
+        "pubmed_search",
+    ]
+    guarded_result = tool_results[-1]
+    assert guarded_result.error is None
+    assert guarded_result.metadata["status"] == "runtime_steering"
+    assert guarded_result.metadata["steering_reason"] == "evidence_sufficient"
+    assert steering_events[0].metadata["runtime_category"] == "runtime_steering"
+    assert steering_events[0].metadata["error_type"] == "runtime_steering"
+    assert steering_events[0].metadata["recoverability"] == "recovered"
+    assert "Sufficient literature evidence" in str(guarded_result.result)
+    assert steering_events
+    assert steering_events[0].metadata["tool_name"] == "pubmed_search"
+    assert final_event.content == "Synthesized after runtime steering."
 
 
 @pytest.mark.asyncio

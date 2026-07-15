@@ -21,9 +21,9 @@ import {
   buildGoalApprovalCountLabel,
   buildGoalApprovalScopeLabel,
   buildGoalBlockerSummary,
-  buildGoalCardChromeCopy,
-  buildGoalCardExecutionModeLabel,
-  buildGoalCardStatusLabel,
+  buildGoalChromeCopy,
+  buildGoalExecutionModeLabel,
+  buildGoalStatusLabel,
   buildGoalDisplayStateLabel,
   buildGoalFileCountLabel,
   buildGoalModelCountLabel,
@@ -200,9 +200,9 @@ function goalCopySource(
 export function GoalHeaderChip({ goal, open, onClick }: GoalHeaderChipProps) {
   const copySource = goalCopySource(goal)
   const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
-  const executionLabel = buildGoalCardExecutionModeLabel(copySource, goal.executionMode)
+  const executionLabel = buildGoalExecutionModeLabel(copySource, goal.executionMode)
   const statusLabel =
-    buildGoalCardStatusLabel(copySource, goal.status) ?? goal.status.replaceAll('_', ' ')
+    buildGoalStatusLabel(copySource, goal.status) ?? goal.status.replaceAll('_', ' ')
   const subtitleParts = [
     statusLabel,
     goal.pendingApprovalCount > 0
@@ -262,11 +262,11 @@ export function GoalDrawerContent({
   onClose,
 }: GoalDrawerContentProps) {
   const copySource = goalCopySource(goal, blocker)
-  const chromeCopy = buildGoalCardChromeCopy(copySource)
+  const chromeCopy = buildGoalChromeCopy(copySource)
   const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
-  const executionLabel = buildGoalCardExecutionModeLabel(copySource, goal.executionMode)
+  const executionLabel = buildGoalExecutionModeLabel(copySource, goal.executionMode)
   const statusLabel =
-    buildGoalCardStatusLabel(copySource, goal.status) ?? goal.status.replaceAll('_', ' ')
+    buildGoalStatusLabel(copySource, goal.status) ?? goal.status.replaceAll('_', ' ')
   const pauseAvailable = Boolean(goal.goalId && onPause && canPauseGoal(goal.status))
   const resumeAvailable = Boolean(
     goal.goalId &&
@@ -469,7 +469,7 @@ export function GoalDrawerContent({
                         <div className="min-w-0 flex-1 space-y-2">
                           <div className="flex flex-wrap items-center gap-2">
                             <Badge variant="warning">
-                              {buildGoalCardStatusLabel(copySource, approval.status) ??
+                              {buildGoalStatusLabel(copySource, approval.status) ??
                                 approval.status.replaceAll('_', ' ')}
                             </Badge>
                             <span className="text-sm font-semibold text-foreground">{approval.tool_name}</span>

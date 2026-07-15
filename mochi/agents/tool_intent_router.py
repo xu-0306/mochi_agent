@@ -51,7 +51,7 @@ Rules:
 - Weather, news, current facts, or web lookup requests in any language are open_world_lookup even when the session is workspace-bound.
 - Paper, citation, DOI, literature, PubMed, arXiv, or scholarly research requests are literature_research.
 - Reading, inspecting, summarizing, or searching workspace files is workspace_read.
-- Editing, rewriting, patching, creating, or changing workspace files is workspace_write.
+- Editing, rewriting, patching, creating, saving, or changing workspace files is workspace_write.
 - Running tests, commands, scripts, builds, or process/session control is execution_or_process.
 - Asking which tools are available or which tool to use is tool_discovery.
 - Be conservative. Prefer ambiguous over a false positive workspace route.

@@ -87,13 +87,21 @@ class OllamaBackend(BaseLLMBackend):
         base_url: str = "http://localhost:11434",
         timeout: float = 120.0,
         num_ctx: int | None = None,
+        auto_num_ctx: bool = True,
+        auto_num_ctx_cap: int = 32768,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._configured_num_ctx = self._normalize_context_length(num_ctx)
+        self._auto_num_ctx = bool(auto_num_ctx)
+        self._auto_num_ctx_cap = self._normalize_context_length(auto_num_ctx_cap) or 32768
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
-        self._tool_call_simulator = ToolCallSimulator()
-        self._simulated_tool_protocol = SimulatedToolProtocol(self._tool_call_simulator)
+        self._tool_prompt_profile = self._resolve_tool_prompt_profile(self.model)
+        self._tool_call_simulator = ToolCallSimulator(tool_prompt_profile=self._tool_prompt_profile)
+        self._simulated_tool_protocol = SimulatedToolProtocol(
+            self._tool_call_simulator,
+            tool_prompt_profile=self._tool_prompt_profile,
+        )
         self._tool_state = ToolCallingState()
         self._tool_state.recover_native("native_default")
         self._native_tool_probe: dict[str, Any] | None = None
@@ -119,10 +127,33 @@ class OllamaBackend(BaseLLMBackend):
             return "unavailable"
         return "prompt_guided"
 
+    @staticmethod
+    def _resolve_tool_prompt_profile(model: str) -> str:
+        normalized = str(model or "").strip().lower()
+        if "qwen" in normalized:
+            return "qwen_xml_tool_call"
+        return "json_tool_call"
+
     def get_model_info(self) -> ModelInfo:
         supports_reasoning_effort = self._supports_reasoning_effort_model(self.model)
         probe = self._native_tool_probe if isinstance(self._native_tool_probe, dict) else {}
         context_length = self._context_length
+        request_num_ctx = self._request_num_ctx()
+        if request_num_ctx is not None:
+            effective_context_length = request_num_ctx
+            if self._configured_num_ctx is not None:
+                effective_context_length_source = "config.num_ctx"
+            elif self._runtime_context_length is not None:
+                effective_context_length_source = self._runtime_context_length_source
+            elif self._model_max_context_length is not None:
+                effective_context_length_source = "auto_num_ctx.model_max_cap"
+            else:
+                effective_context_length_source = "auto_num_ctx.fallback_default"
+        else:
+            effective_context_length = context_length or self._CONTEXT_LENGTH_FALLBACK
+            effective_context_length_source = (
+                self._context_length_source if context_length is not None else "fallback_default"
+            )
         return ModelInfo(
             name=self.model,
             backend_type="ollama",
@@ -136,7 +167,12 @@ class OllamaBackend(BaseLLMBackend):
                 "context_length_fallback": (
                     None if context_length is not None else self._CONTEXT_LENGTH_FALLBACK
                 ),
+                "effective_context_length": effective_context_length,
+                "effective_context_length_source": effective_context_length_source,
                 "configured_num_ctx": self._configured_num_ctx,
+                "auto_num_ctx": self._auto_num_ctx,
+                "auto_num_ctx_cap": self._auto_num_ctx_cap,
+                "auto_num_ctx_value": self._auto_num_ctx_value(),
                 "runtime_context_length": self._runtime_context_length,
                 "runtime_context_length_source": self._runtime_context_length_source,
                 "model_max_context_length": self._model_max_context_length,
@@ -144,6 +180,7 @@ class OllamaBackend(BaseLLMBackend):
                 "tool_call_mode": self._tool_call_mode(),
                 "tool_calling_protocol": self._tool_calling_protocol(),
                 "tool_calling_style": self._tool_calling_protocol(),
+                "tool_prompt_profile": self._tool_prompt_profile,
                 "native_tool_calling_status": probe.get("status", self._tool_state.native_status),
                 "native_tool_calling_message": probe.get("message"),
                 "native_tool_calling_checked_at": probe.get("checked_at"),
@@ -208,8 +245,9 @@ class OllamaBackend(BaseLLMBackend):
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
         }
-        if self._configured_num_ctx is not None:
-            options["num_ctx"] = self._configured_num_ctx
+        request_num_ctx = self._request_num_ctx()
+        if request_num_ctx is not None:
+            options["num_ctx"] = request_num_ctx
         think_value = self._reasoning_effort_to_think_value(reasoning_effort)
         tools_requested = bool(tools)
         post_tool_continuation = self._is_post_tool_continuation(messages)
@@ -558,6 +596,8 @@ class OllamaBackend(BaseLLMBackend):
         return {
             "context_length": effective_context_length,
             "context_length_source": effective_context_length_source,
+            "effective_context_length": effective_context_length,
+            "effective_context_length_source": effective_context_length_source,
             "runtime_context_length": runtime_context_length,
             "runtime_context_length_source": runtime_context_length_source,
             "model_max_context_length": model_max_context_length,
@@ -571,6 +611,20 @@ class OllamaBackend(BaseLLMBackend):
         self._runtime_context_length_source = "config.num_ctx"
         self._context_length = self._configured_num_ctx
         self._context_length_source = "config.num_ctx"
+
+    def _auto_num_ctx_value(self) -> int | None:
+        if not self._auto_num_ctx or self._configured_num_ctx is not None:
+            return None
+        if isinstance(self._runtime_context_length, int) and self._runtime_context_length > 0:
+            return self._runtime_context_length
+        if isinstance(self._model_max_context_length, int) and self._model_max_context_length > 0:
+            return min(self._model_max_context_length, self._auto_num_ctx_cap)
+        return min(self._CONTEXT_LENGTH_FALLBACK, self._auto_num_ctx_cap)
+
+    def _request_num_ctx(self) -> int | None:
+        if self._configured_num_ctx is not None:
+            return self._configured_num_ctx
+        return self._auto_num_ctx_value()
 
     def _extract_runtime_context_length(
         self,

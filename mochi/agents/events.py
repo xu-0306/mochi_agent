@@ -35,6 +35,18 @@ class StatusEvent:
 
 
 @dataclass
+class AssistantTruncatedEvent:
+    """Explicit event emitted when assistant output hits a length limit."""
+
+    type: Literal["assistant_truncated"] = field(default="assistant_truncated", init=False)
+    content: str = ""
+    finish_reason: str = "length"
+    recovery_attempt: int = 0
+    partial_output_chars: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class SubagentStartedEvent:
     """UI-safe delegated subagent lifecycle start event."""
 
@@ -102,6 +114,44 @@ class SubagentCompletedEvent:
 
 
 @dataclass
+class ToolCallCreatedEvent:
+    """Explicit event emitted when a tool call is parsed and ready to execute."""
+
+    type: Literal["tool_call_created"] = field(default="tool_call_created", init=False)
+    call_id: str = ""
+    tool_name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ToolCallCompletedEvent:
+    """Explicit event emitted when a parsed tool call has completed execution."""
+
+    type: Literal["tool_call_completed"] = field(default="tool_call_completed", init=False)
+    call_id: str = ""
+    tool_name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    result: Any = None
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GoalStateChangedEvent:
+    """Explicit event emitted when a goal lifecycle status changes."""
+
+    type: Literal["goal_state_changed"] = field(default="goal_state_changed", init=False)
+    goal_id: str = ""
+    previous_status: str | None = None
+    status: str = ""
+    attempt_id: str | None = None
+    agent_run_id: str | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ToolCallRequestEvent:
     """Agent 請求呼叫工具。"""
 
@@ -160,6 +210,9 @@ class FinalAnswerEvent:
     finish_reason: str = "stop"
     """停止原因。"""
 
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Additional diagnostics."""
+
 
 @dataclass
 class ErrorEvent:
@@ -179,10 +232,14 @@ AgentEvent = (
     TextChunkEvent
     | ThinkingEvent
     | StatusEvent
+    | AssistantTruncatedEvent
     | SubagentStartedEvent
     | SubagentPromptEvent
     | SubagentProgressEvent
     | SubagentCompletedEvent
+    | ToolCallCreatedEvent
+    | ToolCallCompletedEvent
+    | GoalStateChangedEvent
     | ToolCallRequestEvent
     | ToolCallResultEvent
     | FinalAnswerEvent

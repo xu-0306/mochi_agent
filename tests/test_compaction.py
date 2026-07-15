@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mochi.agents.compaction import ConversationCompactor
+from mochi.agents.compaction import ContextBudget, ConversationCompactor
 from mochi.agents.context import ContextManager
 from mochi.agents.engine import AgentEngine
 from mochi.backends.base import BaseLLMBackend
@@ -83,6 +83,34 @@ def test_context_manager_compacts_history_into_summary() -> None:
     assert prompt_context.summary_state is not None
     assert prompt_context.summary_state.current_task.startswith("user-")
     assert len(prompt_context.history) <= 4
+
+
+def test_token_budget_compaction_trims_retained_tail_by_tokens() -> None:
+    compactor = ConversationCompactor.from_settings(
+        max_messages=20,
+        max_input_tokens=48,
+        keep_recent_messages=4,
+    )
+    history = [
+        Message(role="user", content="old setup"),
+        Message(role="assistant", content="old response"),
+        Message(role="user", content="large recent one " + ("x " * 120)),
+        Message(role="assistant", content="large recent two " + ("y " * 120)),
+        Message(role="user", content="newest request"),
+    ]
+
+    result = compactor.compact(
+        history,
+        budget=ContextBudget(max_input_tokens=48, reserve_output_tokens=0),
+    )
+
+    assert result is not None
+    assert result.diagnostics is not None
+    assert result.diagnostics.reason == "token_budget"
+    assert [message.content for message in result.retained_history] == ["newest request"]
+    assert result.compacted_count == 4
+    assert result.diagnostics.compacted_count == 4
+    assert result.diagnostics.retained_tokens <= 48
 
 
 @pytest.mark.asyncio

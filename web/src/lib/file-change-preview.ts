@@ -460,13 +460,16 @@ export function extractFileChangeGroupFromToolData(input: {
     )
   }
 
-  const resultFiles = isRecord(input.toolResult)
-    ? normalizeFileChanges(
-        input.toolResult.file_changes ??
-        input.toolResult.files ??
-        input.toolResult.changes
-      )
-    : []
+  const resultRecord = isRecord(input.toolResult) ? input.toolResult : null
+  const explicitResultFiles = normalizeFileChanges(resultRecord?.file_changes)
+  const acceptsGenericResultFiles =
+    toolName === 'file_write' || toolName === 'file_edit' || toolName === 'apply_patch'
+  const resultFiles =
+    explicitResultFiles.length > 0
+      ? explicitResultFiles
+      : acceptsGenericResultFiles
+        ? normalizeFileChanges(resultRecord?.files ?? resultRecord?.changes)
+        : []
   if (resultFiles.length > 0) {
     return buildFileChangeGroup(
       input.id,

@@ -13,6 +13,7 @@ from mochi.utils.security import (
     check_file_tool_path,
     content_size_bytes,
     normalize_workspace_dir,
+    resolve_path_with_scope,
     size_limit_bytes,
 )
 
@@ -22,9 +23,16 @@ ChangeType = Literal["add", "update", "delete"]
 class PatchValidationError(ValueError):
     """Structured patch validation error."""
 
-    def __init__(self, message: str, *, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 400,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(frozen=True)
@@ -405,7 +413,12 @@ async def prepare_apply_patch(
             scope=path_scope,
         )
         if security_decision is not None or target is None:
-            raise _patch_validation_from_security(security_decision)
+            raise _patch_validation_from_security(
+                security_decision,
+                path=operation.path,
+                workspace_root=workspace_root,
+                path_scope=path_scope,
+            )
 
         existed_before = await asyncio.to_thread(target.exists)
         original_content: str | None = None
@@ -460,11 +473,43 @@ async def prepare_apply_patch(
     )
 
 
-def _patch_validation_from_security(decision: SecurityDecision | None) -> PatchValidationError:
+def _patch_validation_from_security(
+    decision: SecurityDecision | None,
+    *,
+    path: str | Path | None = None,
+    workspace_root: Path | None = None,
+    path_scope: str | None = None,
+) -> PatchValidationError:
     if decision is None:
         return PatchValidationError("Path denied.")
     status_code = 403 if decision.approval_scope in {"workspace", "protected_path"} else 400
-    return PatchValidationError(decision.reason or "Path denied.", status_code=status_code)
+    metadata = decision.to_metadata()
+    if path is not None and workspace_root is not None:
+        metadata.update(
+            {
+                "workspace_dir": str(workspace_root),
+                "requested_path": str(path),
+            }
+        )
+        if path_scope is not None:
+            metadata["path_scope"] = path_scope
+        try:
+            metadata["resolved_path"] = str(resolve_path_with_scope(path, workspace_root, "any"))
+        except (OSError, RuntimeError, ValueError):
+            pass
+    metadata.update(
+        {
+            "runtime_category": "permission",
+            "error_type": "file_path_denied",
+            "recoverability": "requires_changed_path_or_policy",
+            "status_code": status_code,
+        }
+    )
+    return PatchValidationError(
+        decision.reason or "Path denied.",
+        status_code=status_code,
+        metadata=metadata,
+    )
 
 
 def _validate_patch_path(path: str, seen_paths: set[str]) -> None:

@@ -1224,6 +1224,44 @@ class RuntimeService:
                 logs = logs[:limit]
         return [_goal_operator_audit_log_response(item) for item in logs]
 
+    async def _append_goal_state_changed_event(
+        self,
+        *,
+        goal_id: str,
+        previous_status: str | None,
+        status: str,
+        action: str,
+        attempt_id: str | None = None,
+        agent_run_id: str | None = None,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_goal_id = str(goal_id or "").strip()
+        normalized_status = str(status or "").strip()
+        if not normalized_goal_id or not normalized_status:
+            return
+        normalized_previous = str(previous_status or "").strip() or None
+        if normalized_previous == normalized_status:
+            return
+        details = {
+            "type": "goal_state_changed",
+            "goal_id": normalized_goal_id,
+            "previous_status": normalized_previous,
+            "status": normalized_status,
+            "attempt_id": str(attempt_id or "").strip() or None,
+            "agent_run_id": str(agent_run_id or "").strip() or None,
+            "reason": str(reason or "").strip() or None,
+            "metadata": dict(metadata or {}),
+        }
+        await self._store.append_goal_operator_audit_log(
+            event_type="goal_state_changed",
+            subject_type="goal",
+            subject_id=normalized_goal_id,
+            action=action,
+            summary=f"Goal state changed from {normalized_previous or 'unknown'} to {normalized_status}.",
+            details=details,
+        )
+
     async def start_goal(self, goal_id: str) -> dict[str, Any] | None:
         goal = await self._store.get_goal(goal_id)
         if goal is None:
@@ -1255,6 +1293,15 @@ class RuntimeService:
             current_attempt_id=attempt_id,
             latest_error=None,
             reset_finished_at=True,
+        )
+        await self._append_goal_state_changed_event(
+            goal_id=goal_id,
+            previous_status="created",
+            status="queued",
+            action="manual_start",
+            attempt_id=attempt_id,
+            reason="manual_start",
+            metadata={"source": "goal_start"},
         )
         await self._acquire_goal_lease(
             goal_id,
@@ -1300,6 +1347,24 @@ class RuntimeService:
                 latest_error=None,
             )
         await self._store.update_goal_status(goal_id, "paused")
+        await self._append_goal_state_changed_event(
+            goal_id=goal_id,
+            previous_status=refreshed_status,
+            status="paused",
+            action="manual_pause",
+            attempt_id=(
+                str(refreshed_attempt.get("id") or "").strip()
+                if isinstance(refreshed_attempt, dict)
+                else None
+            ),
+            agent_run_id=(
+                str(refreshed_attempt.get("agent_run_id") or "").strip()
+                if isinstance(refreshed_attempt, dict)
+                else None
+            ),
+            reason="manual_pause",
+            metadata={"source": "goal_pause"},
+        )
         await self._store.delete_goal_lease(goal_id)
         paused_goal = await self._store.get_goal(goal_id)
         return _goal_response(paused_goal or refreshed_goal)
@@ -1339,9 +1404,26 @@ class RuntimeService:
             return resumed_goal
 
         attempt_id = str(uuid4())
+        carryover_guidance = await self._build_goal_carryover_guidance_message(
+            goal=goal,
+            attempt=_current_goal_attempt(goal),
+            run=None,
+            previous_status=current_status,
+            current_status="queued",
+            operator_guidance=queued_guidance_message,
+            next_attempt_id=attempt_id,
+        )
         attempt_summary: dict[str, Any] = {"queued_from_status": current_status}
-        if queued_guidance_message:
-            attempt_summary["guidance_messages"] = [queued_guidance_message]
+        queued_guidance_messages = _merge_unique_text_items(
+            [],
+            [
+                item
+                for item in [queued_guidance_message, carryover_guidance]
+                if isinstance(item, str) and item.strip()
+            ],
+        )
+        if queued_guidance_messages:
+            attempt_summary["guidance_messages"] = queued_guidance_messages
         await self._store.create_goal_attempt(
             attempt_id=attempt_id,
             goal_id=goal_id,
@@ -1356,6 +1438,15 @@ class RuntimeService:
             current_attempt_id=attempt_id,
             latest_error=None,
             reset_finished_at=True,
+        )
+        await self._append_goal_state_changed_event(
+            goal_id=goal_id,
+            previous_status=current_status,
+            status="queued",
+            action="manual_resume",
+            attempt_id=attempt_id,
+            reason="manual_resume",
+            metadata={"source": "goal_resume"},
         )
         await self._acquire_goal_lease(
             goal_id,
@@ -1581,6 +1672,21 @@ class RuntimeService:
                 ),
             }
         )
+        carryover_guidance = await self._build_goal_carryover_guidance_message(
+            goal=goal,
+            attempt=current_attempt,
+            run=run,
+            previous_status=current_status,
+            current_status=current_status,
+            operator_guidance=queued_guidance_message,
+        )
+        if carryover_guidance:
+            updated_run = await self._queue_agent_run_guidance_message(
+                agent_run_id,
+                carryover_guidance,
+            )
+            if isinstance(updated_run, dict):
+                run = updated_run
         await self._acquire_goal_lease(goal_id, reason="manual_resume")
         resumed = await self.resume_agent_run(
             agent_run_id,
@@ -1632,6 +1738,24 @@ class RuntimeService:
                 latest_error=None,
             )
         await self._store.update_goal_status(goal_id, "cancelled", latest_error=None)
+        await self._append_goal_state_changed_event(
+            goal_id=goal_id,
+            previous_status=refreshed_status,
+            status="cancelled",
+            action="manual_cancel",
+            attempt_id=(
+                str(refreshed_attempt.get("id") or "").strip()
+                if isinstance(refreshed_attempt, dict)
+                else None
+            ),
+            agent_run_id=(
+                str(refreshed_attempt.get("agent_run_id") or "").strip()
+                if isinstance(refreshed_attempt, dict)
+                else None
+            ),
+            reason="manual_cancel",
+            metadata={"source": "goal_cancel"},
+        )
         await self._store.delete_goal_lease(goal_id)
         cancelled_goal = await self._store.get_goal(goal_id)
         return _goal_response(cancelled_goal or refreshed_goal)
@@ -2055,6 +2179,130 @@ class RuntimeService:
         summary = _inject_summary_guidance_into_recovery_state(summary)
         await self._store.update_agent_run_metadata(run_id, summary=summary)
         return await self._store.get_agent_run(run_id)
+
+    async def _build_goal_carryover_guidance_message(
+        self,
+        *,
+        goal: Mapping[str, Any],
+        attempt: Mapping[str, Any] | None,
+        run: Mapping[str, Any] | None,
+        previous_status: str,
+        current_status: str,
+        operator_guidance: str | None = None,
+        next_attempt_id: str | None = None,
+    ) -> str | None:
+        goal_id = str(goal.get("id") or "").strip()
+        objective = str(goal.get("objective") or "").strip()
+        attempt_id = (
+            str(next_attempt_id or "").strip()
+            or (str(attempt.get("id") or "").strip() if isinstance(attempt, Mapping) else "")
+            or None
+        )
+        agent_run_id = (
+            str(run.get("id") or "").strip()
+            if isinstance(run, Mapping)
+            else str(attempt.get("agent_run_id") or "").strip()
+            if isinstance(attempt, Mapping)
+            else ""
+        ) or None
+        operator_guidance_clean = str(operator_guidance or "").strip() or None
+        summary = run.get("summary") if isinstance(run, Mapping) and isinstance(run.get("summary"), Mapping) else {}
+        final_answer = summary.get("final_answer") if isinstance(summary.get("final_answer"), str) else None
+        finish_reason = summary.get("finish_reason") if isinstance(summary.get("finish_reason"), str) else None
+        metadata = summary.get("metadata") if isinstance(summary.get("metadata"), Mapping) else {}
+
+        events: list[Any] = []
+        if isinstance(run, Mapping):
+            run_events = run.get("events")
+            if isinstance(run_events, list):
+                events = list(run_events)
+            elif agent_run_id:
+                events = await self._store.get_agent_run_events(agent_run_id)
+        for event in reversed(events):
+            if not isinstance(event, Mapping):
+                continue
+            event_type = str(event.get("type") or event.get("event") or "").strip()
+            payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else event
+            if event_type not in {"final_answer", "agent_final_text", "agent_event"}:
+                if not (
+                    isinstance(payload, Mapping)
+                    and str(payload.get("type") or "").strip() == "final_answer"
+                ):
+                    continue
+            if not isinstance(payload, Mapping):
+                continue
+            if not final_answer and isinstance(payload.get("content"), str):
+                final_answer = payload.get("content")
+            if not finish_reason and isinstance(payload.get("finish_reason"), str):
+                finish_reason = payload.get("finish_reason")
+            event_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+            if event_metadata:
+                metadata = {**dict(metadata), **dict(event_metadata)}
+            break
+
+        recovery_attempts = metadata.get("recovery_attempts")
+        truncated = bool(metadata.get("truncated"))
+        length_finish_reasons = {"length", "max_tokens", "token_limit", "context_length"}
+        normalized_finish_reason = str(finish_reason or "").strip() or None
+        pending_next_action = None
+        if truncated or (normalized_finish_reason in length_finish_reasons):
+            pending_next_action = "continue_from_prior_truncated_final_answer"
+        recent_code_blocks = _goal_carryover_recent_code_blocks(final_answer)
+        recent_artifact_refs = (
+            _goal_carryover_recent_artifact_refs(run) if isinstance(run, Mapping) else []
+        )
+
+        existing_guidance = _summary_guidance_messages(summary if isinstance(summary, Mapping) else None)
+        filtered_operator_guidance = [
+            item
+            for item in existing_guidance
+            if not item.startswith(_GOAL_CARRYOVER_GUIDANCE_PREFIX)
+        ]
+        if operator_guidance_clean:
+            filtered_operator_guidance = _merge_unique_text_items(
+                filtered_operator_guidance,
+                [operator_guidance_clean],
+            )
+
+        final_answer_preview = _truncate_preview(final_answer, max_chars=240)
+        substantive_carryover = any(
+            [
+                bool(filtered_operator_guidance),
+                bool(final_answer_preview),
+                bool(normalized_finish_reason),
+                bool(truncated),
+                recovery_attempts not in (None, ""),
+                bool(pending_next_action),
+                bool(recent_code_blocks),
+            ]
+        )
+        if not substantive_carryover:
+            return None
+
+        payload: dict[str, Any] = {
+            "goal_id": goal_id or None,
+            "objective": _truncate_preview(objective, max_chars=240),
+            "attempt_id": attempt_id,
+            "agent_run_id": agent_run_id,
+            "previous_status": str(previous_status or "").strip() or None,
+            "current_status": str(current_status or "").strip() or None,
+            "operator_guidance": filtered_operator_guidance[:3],
+            "final_answer_preview": final_answer_preview,
+            "finish_reason": normalized_finish_reason,
+            "truncated": truncated or None,
+            "recovery_attempts": recovery_attempts,
+            "pending_next_action": pending_next_action,
+            "recent_code_blocks": recent_code_blocks,
+            "recent_artifact_refs": recent_artifact_refs,
+        }
+        compact = {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+        if not compact:
+            return None
+        return _GOAL_CARRYOVER_GUIDANCE_PREFIX + json.dumps(
+            compact,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     async def append_agent_run_message(
         self,
@@ -3685,17 +3933,7 @@ class RuntimeService:
         )
         if current_attempt_id and current_attempt_id != attempt_id:
             return
-        await self._store.update_goal_projection(
-            goal_id=goal_id,
-            goal_status=goal_status,
-            attempt_id=attempt_id,
-            attempt_status=attempt_status,
-            current_attempt_id=attempt_id,
-            agent_run_id=str(run["id"]),
-            latest_error=latest_error,
-            attempt_summary=attempt_summary,
-            reset_goal_finished_at=goal_status not in GOAL_TERMINAL_STATUS,
-        )
+        goal_summary = None
         if isinstance(current_goal, dict):
             goal_summary = (
                 dict(current_goal.get("summary"))
@@ -3720,7 +3958,21 @@ class RuntimeService:
                 goal_summary["latest_goal_memory_snapshot_id"] = int(latest_memory_snapshot["id"])
             else:
                 goal_summary.pop("latest_goal_memory_snapshot_id", None)
-            await self._store.update_goal_metadata(goal_id, summary=goal_summary)
+
+        await self._store.update_goal_projection(
+            goal_id=goal_id,
+            goal_status=goal_status,
+            attempt_id=attempt_id,
+            attempt_status=attempt_status,
+            current_attempt_id=attempt_id,
+            agent_run_id=str(run["id"]),
+            latest_error=latest_error,
+            attempt_summary=attempt_summary,
+            goal_summary=goal_summary,
+            reset_goal_finished_at=goal_status not in GOAL_TERMINAL_STATUS,
+        )
+        if goal_status not in GOAL_ACTIVE_STATUS:
+            await self._store.delete_goal_lease(goal_id)
 
         await self._sync_goal_worker_generation_from_run_status(
             run=run,
@@ -4958,11 +5210,31 @@ class RuntimeService:
                 hold_status,
                 latest_error=block_reason,
             )
+            await self._append_goal_state_changed_event(
+                goal_id=goal_id,
+                previous_status=current_status,
+                status=hold_status,
+                action="runtime_budget_hold",
+                attempt_id=attempt_id or None,
+                agent_run_id=agent_run_id or None,
+                reason=block_reason,
+                metadata={"source": "runtime_budget"},
+            )
         elif current_status in GOAL_ACTIVE_STATUS:
             await self._store.update_goal_status(
                 goal_id,
                 hold_status,
                 latest_error=block_reason,
+            )
+            await self._append_goal_state_changed_event(
+                goal_id=goal_id,
+                previous_status=current_status,
+                status=hold_status,
+                action="runtime_budget_hold",
+                attempt_id=attempt_id or None,
+                agent_run_id=agent_run_id or None,
+                reason=block_reason,
+                metadata={"source": "runtime_budget"},
             )
             await self._store.delete_goal_lease(goal_id)
 
@@ -4992,10 +5264,46 @@ class RuntimeService:
             paused = await self.pause_goal(goal_id)
             if paused is None:
                 continue
+            paused_status = str(paused.get("status") or "paused") if isinstance(paused, dict) else "paused"
             await self._store.update_goal_metadata(
                 goal_id,
                 latest_error=reason,
             )
+            current_attempt = _current_goal_attempt(paused)
+            await self._append_goal_state_changed_event(
+                goal_id=goal_id,
+                previous_status=str(goal.get("status") or ""),
+                status=paused_status,
+                action="operator_pause",
+                attempt_id=(
+                    str(current_attempt.get("attempt_id") or current_attempt.get("id") or "").strip()
+                    if isinstance(current_attempt, dict)
+                    else None
+                ),
+                agent_run_id=(
+                    str(current_attempt.get("agent_run_id") or "").strip()
+                    if isinstance(current_attempt, dict)
+                    else None
+                ),
+                reason=reason,
+                metadata={"source": "operator_controls"},
+            )
+            if current_attempt is not None:
+                attempt_id = str(current_attempt.get("attempt_id") or current_attempt.get("id") or "").strip()
+                if attempt_id:
+                    await self._store.update_goal_attempt_status(
+                        attempt_id,
+                        str(current_attempt.get("status") or "paused"),
+                        latest_error=reason,
+                    )
+                agent_run_id = str(current_attempt.get("agent_run_id") or "").strip()
+                if agent_run_id:
+                    linked_run = await self._store.get_agent_run(agent_run_id)
+                    await self._store.update_agent_run_status(
+                        agent_run_id,
+                        str((linked_run or {}).get("status") or "paused"),
+                        latest_error=reason,
+                    )
 
     async def _scheduler_loop(self) -> None:
         while True:
@@ -13922,6 +14230,77 @@ def _clean_text(value: Any) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+_GOAL_CARRYOVER_GUIDANCE_PREFIX = "Goal carryover state: "
+
+
+def _goal_carryover_recent_code_blocks(
+    text: str | None,
+    *,
+    limit: int = 2,
+    max_chars: int = 800,
+) -> list[dict[str, Any]]:
+    if not isinstance(text, str) or "```" not in text:
+        return []
+    blocks: list[dict[str, Any]] = []
+    parts = text.split("```")
+    for index in range(1, len(parts), 2):
+        raw_block = parts[index]
+        if not isinstance(raw_block, str):
+            continue
+        block = raw_block.strip("\r\n")
+        if not block.strip():
+            continue
+        first_line, separator, remainder = block.partition("\n")
+        language = first_line.strip()
+        code = remainder if separator else block
+        if separator and not language.replace("-", "").replace("_", "").isalnum():
+            code = block
+            language = ""
+        code = code.strip()
+        if not code:
+            continue
+        blocks.append(
+            {
+                key: value
+                for key, value in {
+                    "language": language or None,
+                    "preview": _truncate_preview(code, max_chars=max_chars),
+                }.items()
+                if value not in (None, "")
+            }
+        )
+    return blocks[-limit:]
+
+
+def _goal_carryover_recent_artifact_refs(
+    run: Mapping[str, Any],
+    *,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    artifacts = run.get("artifacts") if isinstance(run.get("artifacts"), list) else []
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for artifact in reversed(artifacts):
+        if not isinstance(artifact, Mapping):
+            continue
+        ref = _goal_artifact_ref_payload(artifact)
+        if not ref:
+            continue
+        key = (
+            str(ref.get("artifact_type") or ""),
+            str(ref.get("uri") or ""),
+            str(ref.get("title") or ""),
+        )
+        if key in seen:
+            continue
+        refs.append(ref)
+        seen.add(key)
+        if len(refs) >= limit:
+            break
+    refs.reverse()
+    return refs
 
 
 def _agent_run_task_input(run: dict[str, Any]) -> str:

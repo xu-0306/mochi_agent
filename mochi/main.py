@@ -628,6 +628,7 @@ async def _chat_async_terminal(
             session_id=current_session,
             current_model=cfg.model,
             autonomy_mode=_ensure_security_config().autonomy_mode,
+            base_system_prompt=str(getattr(getattr(cfg, "agent", None), "system_prompt", "") or ""),
             session_store=session_store,
             ensure_runtime_service=_ensure_runtime_service,
             intent_invoker=engine,
@@ -636,7 +637,11 @@ async def _chat_async_terminal(
             return
 
         chat_text = routing_result["chat_text"] or text
-        async for event in engine.chat(chat_text, session_id=current_session):
+        chat_kwargs: dict[str, object] = {"session_id": current_session}
+        inference_overrides = routing_result.get("inference_overrides")
+        if isinstance(inference_overrides, dict):
+            chat_kwargs["inference_overrides"] = inference_overrides
+        async for event in engine.chat(chat_text, **chat_kwargs):
             if isinstance(event, TextChunkEvent):
                 console.print(event.content, end="", highlight=False)
                 full_reply += event.content
@@ -775,90 +780,12 @@ def _get_goal_attempt_run_id(goal: dict[str, object]) -> str | None:
     return None
 
 
-def _print_goal_card(goal_card: dict[str, object]) -> None:
-    from mochi.goal_proposal_copy import (
-        build_goal_card_chrome_copy,
-        build_goal_card_execution_mode_label,
-        build_goal_card_kind_label,
-        build_goal_card_status_label,
-        build_goal_proposal_system_cta_copy,
-    )
-
-    label = _string_or_none(goal_card.get("label")) or "Goal"
-    objective = _string_or_none(goal_card.get("objective")) or ""
-    execution_mode = _string_or_none(goal_card.get("executionMode")) or "workflow"
-    copy_source = (
-        _string_or_none(goal_card.get("copySource"))
-        or objective
-        or _string_or_none(goal_card.get("roleSummary"))
-        or _string_or_none(goal_card.get("runtimeMode"))
-        or label
-    )
-    kind = _string_or_none(goal_card.get("kind")) or "proposal"
-    status = _string_or_none(goal_card.get("status"))
-    protocol_id = _string_or_none(goal_card.get("protocolId"))
-    models = goal_card.get("models") if isinstance(goal_card.get("models"), list) else []
-    role_summary = _string_or_none(goal_card.get("roleSummary"))
-    runtime_mode = _string_or_none(goal_card.get("runtimeMode"))
-    risk_note = _string_or_none(goal_card.get("riskNote"))
-    superseded = bool(goal_card.get("superseded"))
-    chrome_copy = build_goal_card_chrome_copy(user_message=copy_source)
-    localized_kind_label = build_goal_card_kind_label(
-        user_message=copy_source,
-        kind=kind,  # type: ignore[arg-type]
-    )
-    localized_execution_mode = build_goal_card_execution_mode_label(
-        user_message=copy_source,
-        execution_mode=execution_mode,
-    )
-    localized_status = build_goal_card_status_label(
-        user_message=copy_source,
-        status=status,
-    )
-
-    console.print(f"[bold]{label}[/bold]")
-    if objective:
-        console.print(f"  {chrome_copy.objective_label}: {objective}", highlight=False)
-    console.print(f"  {chrome_copy.execution_label}: {localized_execution_mode}", highlight=False)
-    console.print(f"  {localized_kind_label}", highlight=False)
-    if localized_status:
-        console.print(f"  {chrome_copy.goal_status_label}: {localized_status}", highlight=False)
-    if protocol_id:
-        console.print(f"  {chrome_copy.protocol_label}: {protocol_id}", highlight=False)
-    if models:
-        console.print(f"  {chrome_copy.models_label}: {', '.join(str(item) for item in models)}", highlight=False)
-    if role_summary:
-        console.print(f"  {chrome_copy.role_summary_label}: {role_summary}", highlight=False)
-    if runtime_mode:
-        console.print(f"  {chrome_copy.runtime_label}: {runtime_mode}", highlight=False)
-    if risk_note:
-        console.print(f"  {chrome_copy.risk_note_label}: {risk_note}", highlight=False)
-    if not superseded and kind in {"proposal", "revised_proposal"}:
-        cta_copy = build_goal_proposal_system_cta_copy(
-            user_message=copy_source
-        )
-        console.print(f"  {cta_copy.title}:", highlight=False)
-        console.print(
-            f"    {cta_copy.launch_label}: {cta_copy.launch_body}",
-            highlight=False,
-        )
-        console.print(
-            f"    {cta_copy.revise_label}: {cta_copy.revise_body}",
-            highlight=False,
-        )
-        console.print(
-            f"    {cta_copy.chat_label}: {cta_copy.chat_body}",
-            highlight=False,
-        )
-
-
 async def _append_terminal_goal_conversation(
     *,
     session_store: object,
     session_id: str,
     user_content: str,
     assistant_content: str,
-    goal_card: dict[str, object] | None = None,
 ) -> None:
     now = datetime.now(tz=UTC).isoformat()
     await session_store.save_event(
@@ -876,12 +803,8 @@ async def _append_terminal_goal_conversation(
         "content": assistant_content,
         "timestamp": now,
     }
-    if goal_card is not None:
-        assistant_event["goal_card"] = goal_card
     await session_store.save_event(session_id, assistant_event)
     console.print(f"[green]Mochi[/green] {assistant_content}", highlight=False)
-    if goal_card is not None:
-        _print_goal_card(goal_card)
 
 
 async def _persist_terminal_goal_state(
@@ -966,11 +889,7 @@ async def _show_terminal_goal_summary(
     session_id: str,
     prefix: str | None = None,
 ) -> None:
-    from mochi.goal_proposal_copy import build_goal_card_chrome_copy
-    from mochi.terminal_goal_helpers import (
-        goal_card_from_summary,
-        normalize_goal_session_state,
-    )
+    from mochi.terminal_goal_helpers import normalize_goal_session_state
 
     events = await session_store.load_session(session_id)
     goal_state = normalize_goal_session_state(_session_goal_state(events))
@@ -983,38 +902,57 @@ async def _show_terminal_goal_summary(
         console.print(prefix, highlight=False)
 
     if isinstance(pending_proposal, dict):
-        copy = build_goal_card_chrome_copy(
-            user_message=str(pending_proposal.get("objective") or ""),
-        )
-        console.print(f"[dim]{copy.pending_summary_intro}[/dim]")
-        _print_goal_card(
-            goal_card_from_summary(
-                pending_proposal,
-                kind="revised_proposal" if int(pending_proposal.get("revision_index", 0) or 0) > 0 else "proposal",
-                copy_source=str(pending_proposal.get("objective") or ""),
-            )
-        )
+        console.print("[dim]Pending goal proposal in this session.[/dim]")
+        objective = _string_or_none(pending_proposal.get("objective"))
+        execution_mode = _string_or_none(pending_proposal.get("execution_mode"))
+        protocol_selection = _string_or_none(pending_proposal.get("protocol_selection"))
+        if objective:
+            console.print(f"  Objective: {objective}", highlight=False)
+        if execution_mode:
+            console.print(f"  Execution: {execution_mode}", highlight=False)
+        if protocol_selection:
+            console.print(f"  Protocol: {protocol_selection}", highlight=False)
         return
 
     if isinstance(last_goal_summary, dict):
-        copy = build_goal_card_chrome_copy(
-            user_message=str(last_goal_summary.get("objective") or ""),
-        )
         console.print(
-            f"[dim]{copy.active_summary_intro}[/dim]"
+            "[dim]Active goal summary for this session.[/dim]"
             if active_goal_id
-            else f"[dim]{copy.recent_summary_intro}[/dim]"
+            else "[dim]Most recent goal summary for this session.[/dim]"
         )
-        _print_goal_card(
-            goal_card_from_summary(
-                last_goal_summary,
-                kind="started",
-                label=copy.active_goal_label if active_goal_id else copy.most_recent_goal_label,
-                copy_source=str(last_goal_summary.get("objective") or ""),
-                goal_id=last_goal_summary.get("goal_id"),
-                status=active_goal_status or last_goal_summary.get("status"),
-            )
-        )
+        objective = _string_or_none(last_goal_summary.get("objective"))
+        execution_mode = _string_or_none(last_goal_summary.get("execution_mode"))
+        status = _string_or_none(active_goal_status) or _string_or_none(last_goal_summary.get("status"))
+        protocol_selection = _string_or_none(last_goal_summary.get("protocol_selection"))
+        if objective:
+            console.print(f"  Objective: {objective}", highlight=False)
+        if execution_mode:
+            console.print(f"  Execution: {execution_mode}", highlight=False)
+        if status:
+            console.print(f"  Status: {status}", highlight=False)
+        if protocol_selection:
+            console.print(f"  Protocol: {protocol_selection}", highlight=False)
+
+
+def _build_autonomous_goal_system_prompt(base_prompt: str, objective: str) -> str:
+    trimmed_base = base_prompt.strip()
+    goal_instruction = "\n".join(
+        [
+            "Autonomous goal mode is active for this turn.",
+            f"Goal objective: {objective.strip()}",
+            "Work like a long-running coding/research agent inside the normal chat transcript.",
+            (
+                "Use available tools when they are helpful, continue without asking for confirmation "
+                "unless safety or missing critical information requires it, and stop only when the "
+                "objective is complete or genuinely blocked."
+            ),
+            (
+                "Do not create or describe a separate goal proposal UI; report progress and final "
+                "results as normal assistant messages."
+            ),
+        ]
+    )
+    return f"{trimmed_base}\n\n{goal_instruction}" if trimmed_base else goal_instruction
 
 
 async def _handle_terminal_goal_input(
@@ -1023,6 +961,7 @@ async def _handle_terminal_goal_input(
     session_id: str,
     current_model: str,
     autonomy_mode: str | None,
+    base_system_prompt: str = "",
     session_store: object,
     ensure_runtime_service: object,
     intent_invoker: object,
@@ -1030,7 +969,6 @@ async def _handle_terminal_goal_input(
     from mochi.runtime.models import GoalCreateRequest
     from mochi.goal_intent import classify_goal_proposal_follow_up_intent
     from mochi.goal_proposal_copy import (
-        build_goal_card_chrome_copy,
         build_goal_command_help_message,
         build_goal_follow_up_message,
         build_goal_lifecycle_message,
@@ -1040,7 +978,6 @@ async def _handle_terminal_goal_input(
     from mochi.terminal_goal_helpers import (
         build_goal_proposal_state,
         build_goal_summary_from_goal,
-        goal_card_from_summary,
         is_goal_terminal_status,
         normalize_goal_session_state,
         resolve_goal_workflow_routing,
@@ -1129,6 +1066,30 @@ async def _handle_terminal_goal_input(
     confirmation_requested = routing_decision.confirmation_requested
     proposal_revision_requested = routing_decision.proposal_revision_requested
 
+    if goal_command is not None and goal_command.action == "proposal":
+        if pending_proposal is not None:
+            await _persist_terminal_goal_state(
+                session_store=session_store,
+                session_id=session_id,
+                goal_state={
+                    **base_goal_state,
+                    "active_goal_id": None,
+                    "active_goal_status": None,
+                    "default_route": "chat",
+                    "pending_proposal": None,
+                },
+            )
+        return {
+            "handled": False,
+            "chat_text": goal_command.content,
+            "inference_overrides": {
+                "system_prompt": _build_autonomous_goal_system_prompt(
+                    base_system_prompt,
+                    goal_command.content,
+                ),
+            },
+        }
+
     if routing_decision.pending_proposal_follow_up_requested and isinstance(pending_proposal, dict):
         try:
             intent_result = await classify_goal_proposal_follow_up_intent(
@@ -1148,46 +1109,30 @@ async def _handle_terminal_goal_input(
             confirmation_requested = True
         elif intent_result.intent == "revise_proposal":
             proposal_revision_requested = True
-        elif intent_result.intent == "exit_goal_lane":
-            return {"handled": False, "chat_text": text}
         else:
-            await _append_terminal_goal_conversation(
+            await _persist_terminal_goal_state(
                 session_store=session_store,
                 session_id=session_id,
-                user_content=text.strip(),
-                assistant_content=_pending_goal_proposal_assistant_content(pending_proposal),
-                goal_card=goal_card_from_summary(
-                    pending_proposal,
-                    kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
-                ),
+                goal_state={
+                    **base_goal_state,
+                    "active_goal_id": None,
+                    "active_goal_status": None,
+                    "default_route": "chat",
+                    "pending_proposal": None,
+                },
             )
-            return {"handled": True, "chat_text": None}
+            return {"handled": False, "chat_text": text}
 
     if goal_command is not None and goal_command.action == "help":
         if pending_proposal is not None:
-            pending_card = goal_card_from_summary(
-                pending_proposal,
-                kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
-                copy_source=goal_command.raw,
-            )
             await _append_terminal_goal_conversation(
                 session_store=session_store,
                 session_id=session_id,
                 user_content=goal_command.raw,
                 assistant_content=_pending_goal_proposal_assistant_content(pending_proposal),
-                goal_card=pending_card,
             )
             return {"handled": True, "chat_text": None}
         if latest_goal_summary is not None:
-            card_copy = build_goal_card_chrome_copy(user_message=goal_command.raw)
-            summary_card = goal_card_from_summary(
-                latest_goal_summary,
-                kind="started",
-                label=card_copy.goal_summary_label if active_goal_id else card_copy.most_recent_goal_label,
-                copy_source=goal_command.raw,
-                goal_id=latest_goal_summary.get("goal_id"),
-                status=base_goal_state["active_goal_status"] or latest_goal_summary.get("status"),
-            )
             await _append_terminal_goal_conversation(
                 session_store=session_store,
                 session_id=session_id,
@@ -1207,7 +1152,6 @@ async def _handle_terminal_goal_input(
                         kind="no_active_goal",
                     )
                 ),
-                goal_card=summary_card,
             )
             return {"handled": True, "chat_text": None}
         await _append_terminal_goal_conversation(
@@ -1317,11 +1261,6 @@ async def _handle_terminal_goal_input(
             session_id=session_id,
             user_content=proposal_user_content,
             assistant_content=proposal_assistant_content,
-            goal_card=goal_card_from_summary(
-                next_proposal,
-                kind="revised_proposal" if pending_proposal is not None or proposal_revision_requested else "proposal",
-                copy_source=proposal_user_content,
-            ),
         )
         return {"handled": True, "chat_text": None}
 
@@ -1387,13 +1326,6 @@ async def _handle_terminal_goal_input(
                 user_message=str(pending_proposal.get("objective") or "") or text.strip(),
                 kind="goal_started",
             ),
-            goal_card=goal_card_from_summary(
-                started_summary,
-                kind="started",
-                copy_source=text.strip(),
-                goal_id=started_goal["goal_id"],
-                status=started_goal.get("status"),
-            ),
         )
         return {"handled": True, "chat_text": None}
 
@@ -1404,11 +1336,6 @@ async def _handle_terminal_goal_input(
                 session_id=session_id,
                 user_content=goal_command.raw,
                 assistant_content=_pending_goal_proposal_assistant_content(pending_proposal),
-                goal_card=goal_card_from_summary(
-                    pending_proposal,
-                    kind="revised_proposal" if pending_proposal["revision_index"] > 0 else "proposal",
-                    copy_source=goal_command.raw,
-                ),
             )
             return {"handled": True, "chat_text": None}
         if goal_command is not None and goal_command.action == "stop" and pending_proposal is not None:
@@ -1506,18 +1433,6 @@ async def _handle_terminal_goal_input(
             "pending_proposal": None,
         },
     )
-    lifecycle_copy = build_goal_card_chrome_copy(
-        user_message=goal_command.raw if goal_command is not None else text.strip(),
-    )
-    lifecycle_label = (
-        lifecycle_copy.goal_status_label
-        if goal_command is not None and goal_command.action == "status"
-        else lifecycle_copy.goal_paused_label
-        if goal_command is not None and goal_command.action == "pause"
-        else lifecycle_copy.goal_resumed_label
-        if goal_command is not None and goal_command.action == "resume"
-        else lifecycle_copy.goal_stopped_label
-    )
     lifecycle_content = _string_or_none((next_goal or {}).get("latest_error"))
     if lifecycle_content is None:
         if goal_command is not None and goal_command.action == "status":
@@ -1546,14 +1461,6 @@ async def _handle_terminal_goal_input(
         session_id=session_id,
         user_content=goal_command.raw if goal_command is not None else text.strip(),
         assistant_content=lifecycle_content,
-        goal_card=goal_card_from_summary(
-            next_goal_summary,
-            kind="started",
-            label=lifecycle_label,
-            copy_source=goal_command.raw if goal_command is not None else text.strip(),
-            goal_id=(next_goal or {}).get("goal_id"),
-            status=next_goal_status,
-        ),
     )
     return {"handled": True, "chat_text": None}
 
@@ -1565,17 +1472,13 @@ async def _maybe_handle_active_goal_direct_chat_follow_up(
     session_store: object,
     ensure_runtime_service: object,
 ) -> bool:
-    from mochi.goal_proposal_copy import (
-        build_goal_card_chrome_copy,
-        build_goal_follow_up_message,
-    )
+    from mochi.goal_proposal_copy import build_goal_follow_up_message
     from mochi.runtime.models import (
         ActiveGoalTurnDecisionRequest,
         AgentRunGuidanceRequest,
     )
     from mochi.terminal_goal_helpers import (
         build_goal_summary_from_goal,
-        goal_card_from_summary,
         is_goal_terminal_status,
         normalize_goal_session_state,
         resolve_goal_continuation_decision,
@@ -1805,14 +1708,6 @@ async def _maybe_handle_active_goal_direct_chat_follow_up(
             user_message=user_text,
             kind=follow_up_kind,  # type: ignore[arg-type]
             summary=continuation.summary,
-        ),
-        goal_card=goal_card_from_summary(
-            next_goal_summary,
-            kind="started",
-            label=build_goal_card_chrome_copy(user_message=user_text).goal_updated_label,
-            copy_source=user_text,
-            goal_id=goal_record.get("goal_id"),
-            status=next_goal_status,
         ),
     )
     return True
@@ -2079,11 +1974,18 @@ async def _chat_tui_async(
     )
     console.print()
 
-    async def _run_chat_turn(user_text: str) -> bool:
+    async def _run_chat_turn(
+        user_text: str,
+        *,
+        inference_overrides: dict[str, object] | None = None,
+    ) -> bool:
         console.print("[green]Mochi[/green] ", end="")
         full_reply = ""
         saw_error = False
-        async for event in engine.chat(user_text, session_id=current_session):
+        chat_kwargs: dict[str, object] = {"session_id": current_session}
+        if inference_overrides is not None:
+            chat_kwargs["inference_overrides"] = inference_overrides
+        async for event in engine.chat(user_text, **chat_kwargs):
             if isinstance(event, TextChunkEvent) or (
                 isinstance(event, FinalAnswerEvent) and not full_reply
             ):
@@ -2110,6 +2012,7 @@ async def _chat_tui_async(
 
             text = raw.strip()
             explicit_chat_override = False
+            turn_inference_overrides: dict[str, object] | None = None
             if not text:
                 continue
 
@@ -2355,6 +2258,7 @@ async def _chat_tui_async(
                     session_id=current_session,
                     current_model=cfg.model,
                     autonomy_mode=_ensure_security_config().autonomy_mode,
+                    base_system_prompt=str(getattr(getattr(cfg, "agent", None), "system_prompt", "") or ""),
                     session_store=session_store,
                     ensure_runtime_service=_ensure_runtime_service,
                     intent_invoker=engine,
@@ -2364,6 +2268,9 @@ async def _chat_tui_async(
                 if routing_result["chat_text"]:
                     text = str(routing_result["chat_text"])
                     explicit_chat_override = command == "chat"
+                    candidate_overrides = routing_result.get("inference_overrides")
+                    if isinstance(candidate_overrides, dict):
+                        turn_inference_overrides = candidate_overrides
                 else:
                     console.print(f"[yellow]Unknown command: /{command}[/yellow]")
                     continue
@@ -2374,6 +2281,7 @@ async def _chat_tui_async(
                     session_id=current_session,
                     current_model=cfg.model,
                     autonomy_mode=_ensure_security_config().autonomy_mode,
+                    base_system_prompt=str(getattr(getattr(cfg, "agent", None), "system_prompt", "") or ""),
                     session_store=session_store,
                     ensure_runtime_service=_ensure_runtime_service,
                     intent_invoker=engine,
@@ -2382,9 +2290,12 @@ async def _chat_tui_async(
                     continue
                 if routing_result["chat_text"]:
                     text = str(routing_result["chat_text"])
+                    candidate_overrides = routing_result.get("inference_overrides")
+                    if isinstance(candidate_overrides, dict):
+                        turn_inference_overrides = candidate_overrides
 
             turns += 1
-            if not explicit_chat_override:
+            if not explicit_chat_override and turn_inference_overrides is None:
                 handled_active_goal_follow_up = await _maybe_handle_active_goal_direct_chat_follow_up(
                     text=text,
                     session_id=current_session,
@@ -2394,7 +2305,7 @@ async def _chat_tui_async(
                 if handled_active_goal_follow_up:
                     continue
             try:
-                await _run_chat_turn(text)
+                await _run_chat_turn(text, inference_overrides=turn_inference_overrides)
             except Exception as exc:
                 console.print(f"[red]Chat failed: {exc}[/red]")
 

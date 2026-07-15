@@ -7,6 +7,7 @@ import type { FileChangeSummary } from '@/lib/chat-p2'
 import { extractFileChangeGroupFromReasoningStep } from '@/lib/chat-p2'
 import { cn } from '@/lib/utils'
 import type { ReasoningStep, TokenStats } from '@/lib/chat'
+import { compactReasoningStepsForDisplay } from '@/lib/reasoning-display'
 import { FileChangeCard } from './FileChangeCard'
 import { getReasoningStepBadge } from './reasoning-badges'
 import { ToolCallCard } from './ToolCallCard'
@@ -259,6 +260,10 @@ export function ReasoningPanel({
   const [open, setOpen] = React.useState(isStreaming)
   const [userInteracted, setUserInteracted] = React.useState(false)
   const previousStreamingRef = React.useRef(isStreaming)
+  const displaySteps = React.useMemo(
+    () => compactReasoningStepsForDisplay(steps, { isStreaming }),
+    [steps, isStreaming]
+  )
 
   React.useEffect(() => {
     setOpen((previousOpen) => getNextReasoningPanelOpen({
@@ -270,12 +275,12 @@ export function ReasoningPanel({
     previousStreamingRef.current = isStreaming
   }, [isStreaming, userInteracted])
 
-  if (steps.length === 0) {
+  if (displaySteps.length === 0) {
     return null
   }
 
   const summary = deriveReasoningPanelSummary({
-    steps,
+    steps: displaySteps,
     isStreaming,
     generationTimeMs: resolveReasoningGenerationTime(tokenStats),
   })
@@ -340,7 +345,7 @@ export function ReasoningPanel({
 
       {open ? (
         <div className="space-y-3 border-t border-border/60 bg-black/[0.08] px-3 py-3">
-          {steps.map((step, index) => {
+          {displaySteps.map((step, index) => {
             const badge = getReasoningStepBadge(step)
             const signature = diagnosticsSignature(step)
             const suppressDuplicateDiagnostics =
@@ -354,7 +359,7 @@ export function ReasoningPanel({
                   <div className="flex h-6 w-6 items-center justify-center rounded-full border border-border/80 bg-canvas/90">
                     <StepIcon type={step.type} status={step.status} />
                   </div>
-                  {index < steps.length - 1 ? <div className="mt-1 h-6 w-px bg-border" /> : null}
+                  {index < displaySteps.length - 1 ? <div className="mt-1 h-6 w-px bg-border" /> : null}
                 </div>
                 <div className="min-w-0 flex-1 pb-1">
                   <div className="flex flex-wrap items-center gap-2">

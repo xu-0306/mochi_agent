@@ -304,7 +304,8 @@ async def test_router_switch_ollama_updates_base_url_even_when_backend_is_unheal
     candidates: list[_FakeBackend] = []
 
     class _UnhealthyOllamaBackend(_FakeBackend):
-        def __init__(self, model: str, base_url: str) -> None:
+        def __init__(self, model: str, base_url: str, **kwargs) -> None:
+            del kwargs
             super().__init__(name=model, healthy=False)
             self.model = model
             self.base_url = base_url

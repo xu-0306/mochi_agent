@@ -21,14 +21,18 @@ from mochi.agents.invocation import ToolMode
 from mochi.backends.types import AttachmentRef
 from mochi.api.attachment_schema import AttachmentPayload
 from mochi.agents.events import (
+    AssistantTruncatedEvent,
     ErrorEvent,
     FinalAnswerEvent,
+    GoalStateChangedEvent,
     StatusEvent,
     SubagentCompletedEvent,
     SubagentProgressEvent,
     SubagentPromptEvent,
     SubagentStartedEvent,
     ThinkingEvent,
+    ToolCallCompletedEvent,
+    ToolCallCreatedEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
@@ -599,6 +603,60 @@ def _serialize_event(
             },
             fallback_turn_id=fallback_turn_id,
         )
+    if isinstance(event, AssistantTruncatedEvent):
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "content": event.content,
+                "finish_reason": event.finish_reason,
+                "recovery_attempt": event.recovery_attempt,
+                "partial_output_chars": event.partial_output_chars,
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
+    if isinstance(event, ToolCallCreatedEvent):
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "arguments": jsonable_encoder(event.arguments),
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
+    if isinstance(event, ToolCallCompletedEvent):
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "arguments": jsonable_encoder(event.arguments),
+                "result": _json_safe(event.result),
+                "error": event.error,
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
+    if isinstance(event, GoalStateChangedEvent):
+        return _attach_turn_id(
+            event,
+            {
+                "type": event.type,
+                "goal_id": event.goal_id,
+                "previous_status": event.previous_status,
+                "status": event.status,
+                "attempt_id": event.attempt_id,
+                "agent_run_id": event.agent_run_id,
+                "reason": event.reason,
+                "metadata": jsonable_encoder(event.metadata),
+            },
+            fallback_turn_id=fallback_turn_id,
+        )
     if isinstance(event, ToolCallRequestEvent):
         return _attach_turn_id(
             event,
@@ -624,17 +682,20 @@ def _serialize_event(
             fallback_turn_id=fallback_turn_id,
         )
     if isinstance(event, FinalAnswerEvent):
+        payload = {
+            "type": event.type,
+            "content": event.content,
+            "trajectory_id": event.trajectory_id,
+            "input_tokens": event.input_tokens,
+            "output_tokens": event.output_tokens,
+            "generation_time_ms": event.generation_time_ms,
+            "finish_reason": event.finish_reason,
+        }
+        if event.metadata:
+            payload["metadata"] = jsonable_encoder(event.metadata)
         return _attach_turn_id(
             event,
-            {
-                "type": event.type,
-                "content": event.content,
-                "trajectory_id": event.trajectory_id,
-                "input_tokens": event.input_tokens,
-                "output_tokens": event.output_tokens,
-                "generation_time_ms": event.generation_time_ms,
-                "finish_reason": event.finish_reason,
-            },
+            payload,
             fallback_turn_id=fallback_turn_id,
         )
     if isinstance(event, ErrorEvent):
@@ -896,6 +957,14 @@ def _event_phase(event: dict[str, Any]) -> str | None:
         return "status"
     if event_type in {"subagent_started", "subagent_prompt", "subagent_progress", "subagent_completed"}:
         return str(event_type)
+    if event_type == "assistant_truncated":
+        return "assistant_truncated"
+    if event_type == "tool_call_created":
+        return "tool_call_created"
+    if event_type == "tool_call_completed":
+        return "tool_call_completed"
+    if event_type == "goal_state_changed":
+        return "goal_state_changed"
     if event_type == "tool_call_request":
         return "tool_call_request"
     if event_type == "tool_call_result":

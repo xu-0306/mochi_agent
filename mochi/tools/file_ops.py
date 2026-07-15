@@ -21,12 +21,36 @@ from mochi.utils.security import (
     content_size_bytes,
     is_within_write_size_limit,
     normalize_workspace_dir,
+    resolve_path_with_scope,
     size_limit_bytes,
 )
 
 FileReader = Callable[[Path, str], Awaitable[str]]
 FileWriter = Callable[[Path, str, bool, str], Awaitable[int]]
 _TOOL_RESULT_PATH_PREFIX = "tool-result://"
+
+
+def _build_path_denial_metadata(
+    *,
+    path: str | Path,
+    workspace_root: Path,
+    path_scope: str,
+    security_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose the effective path boundary in structured write-denial diagnostics."""
+    metadata = dict(security_metadata)
+    metadata.update(
+        {
+            "workspace_dir": str(workspace_root),
+            "requested_path": str(path),
+            "path_scope": path_scope,
+        }
+    )
+    try:
+        metadata["resolved_path"] = str(resolve_path_with_scope(path, workspace_root, "any"))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return metadata
 
 
 class FileReadTool(BaseTool):
@@ -497,9 +521,25 @@ class FileWriteTool(BaseTool):
             scope=self._path_scope,
         )
         if security_decision is not None or target is None:
+            metadata = _build_path_denial_metadata(
+                path=path,
+                workspace_root=workspace_root,
+                path_scope=self._path_scope,
+                security_metadata=(
+                    security_decision.to_metadata() if security_decision is not None else {}
+                ),
+            )
+            if security_decision is not None:
+                metadata.update(
+                    {
+                        "runtime_category": "permission",
+                        "error_type": "file_path_denied",
+                        "recoverability": "requires_changed_path_or_policy",
+                    }
+                )
             return ToolResult(
                 error=security_decision.reason if security_decision is not None else "Path denied.",
-                metadata=security_decision.to_metadata() if security_decision is not None else {},
+                metadata=metadata,
             )
 
         existing_result = await _load_existing_content(target, active_encoding)
@@ -529,7 +569,18 @@ class FileWriteTool(BaseTool):
             extra={"append": append},
         )
         metadata = build_file_change_payload([file_change])
-        if self._require_approval and not approved:
+        metadata.update(
+            {
+                'workspace_dir': str(workspace_root),
+                'resolved_path': str(target),
+                'path_scope': self._path_scope,
+            }
+        )
+        policy_requires_approval = (
+            context is not None
+            and bool(context.permission_policy.get("require_approval_for_file_write"))
+        )
+        if (self._require_approval or policy_requires_approval) and not approved:
             decision = require_approval_decision(
                 reason="File writes require explicit approval in the current autonomy mode.",
                 approval_kind="file_write",
@@ -631,9 +682,25 @@ class FileEditTool(FileWriteTool):
             scope=self._path_scope,
         )
         if security_decision is not None or target is None:
+            metadata = _build_path_denial_metadata(
+                path=path,
+                workspace_root=workspace_root,
+                path_scope=self._path_scope,
+                security_metadata=(
+                    security_decision.to_metadata() if security_decision is not None else {}
+                ),
+            )
+            if security_decision is not None:
+                metadata.update(
+                    {
+                        "runtime_category": "permission",
+                        "error_type": "file_path_denied",
+                        "recoverability": "requires_changed_path_or_policy",
+                    }
+                )
             return ToolResult(
                 error=security_decision.reason if security_decision is not None else "Path denied.",
-                metadata=security_decision.to_metadata() if security_decision is not None else {},
+                metadata=metadata,
             )
 
         existing_result = await _load_existing_content(target, active_encoding)
@@ -673,7 +740,18 @@ class FileEditTool(FileWriteTool):
             extra={"append": False, "edit_type": "replace_all" if replace_all else "replace_first"},
         )
         metadata = build_file_change_payload([file_change])
-        if self._require_approval and not approved:
+        metadata.update(
+            {
+                'workspace_dir': str(workspace_root),
+                'resolved_path': str(target),
+                'path_scope': self._path_scope,
+            }
+        )
+        policy_requires_approval = (
+            context is not None
+            and bool(context.permission_policy.get("require_approval_for_file_write"))
+        )
+        if (self._require_approval or policy_requires_approval) and not approved:
             decision = require_approval_decision(
                 reason="File edits require explicit approval in the current autonomy mode.",
                 approval_kind="file_edit",
@@ -753,7 +831,10 @@ class ApplyPatchTool(FileWriteTool):
                 tool_name=self.name,
             )
         except PatchValidationError as exc:
-            return ToolResult(error=str(exc))
+            return ToolResult(
+                error=str(exc),
+                metadata=dict(getattr(exc, "metadata", {}) or {}),
+            )
 
         for item in prepared:
             if item.new_content is not None and not is_within_write_size_limit(
@@ -780,7 +861,11 @@ class ApplyPatchTool(FileWriteTool):
                 if guard_error is not None:
                     return guard_error
 
-        if self._require_approval and not approved:
+        policy_requires_approval = (
+            context is not None
+            and bool(context.permission_policy.get("require_approval_for_file_write"))
+        )
+        if (self._require_approval or policy_requires_approval) and not approved:
             decision = require_approval_decision(
                 reason="Patch application requires explicit approval in the current autonomy mode.",
                 approval_kind="apply_patch",
