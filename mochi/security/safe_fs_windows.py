@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import os
 import secrets
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, cast
@@ -12,8 +14,10 @@ from typing import Any, cast
 from .file_contract import AuthorizationEnvelope, FileIdentity
 from .safe_filesystem import (
     AuthorizedFileBinding,
+    CommittedFilesystemMutationError,
     SafeFilesystemUnavailable,
     SafeTarget,
+    StagedTemp,
     UnsafeFilesystemTarget,
     resolve_authorized_file_binding,
 )
@@ -44,6 +48,8 @@ class _WindowsNativeAdapter:
     SYNCHRONIZE = 0x00100000
     FILE_LIST_DIRECTORY = 0x1
     FILE_READ_ATTRIBUTES = 0x80
+    FILE_WRITE_DATA = 0x2
+    STATUS_OBJECT_NAME_COLLISION = 0xC0000035
 
     def __init__(self) -> None:
         self.available = False
@@ -163,9 +169,13 @@ class _WindowsNativeAdapter:
         handle = wintypes.HANDLE()
         options = self.FILE_SYNCHRONOUS_IO_NONALERT | self.FILE_OPEN_REPARSE_POINT
         options |= self.FILE_DIRECTORY_FILE if directory else self.FILE_NON_DIRECTORY_FILE
-        access = self.FILE_READ_ATTRIBUTES | self.SYNCHRONIZE | self.DELETE
+        access = (
+            self.FILE_READ_ATTRIBUTES | self.SYNCHRONIZE | self.DELETE
+        )
         if directory:
             access |= self.FILE_LIST_DIRECTORY
+        elif disposition == self.FILE_CREATE:
+            access |= self.FILE_WRITE_DATA
         status = int(
             self._NtCreateFile(
                 ctypes.byref(handle), access, ctypes.byref(attrs), ctypes.byref(io), None, 0,
@@ -173,6 +183,13 @@ class _WindowsNativeAdapter:
             )
         )
         if status < 0:
+            if (
+                status & 0xFFFFFFFF
+                == self.STATUS_OBJECT_NAME_COLLISION
+            ):
+                raise FileExistsError(
+                    f"relative name already exists: {basename}"
+                )
             raise self._nt_error(status, "NtCreateFile")
         return handle
 
@@ -310,6 +327,16 @@ class _IssuedWindowsTarget:
     pin: _WindowsPin
 
 
+@dataclass(frozen=True, slots=True)
+class _IssuedWindowsTemp:
+    temp: StagedTemp
+    basename: str
+    identity: FileIdentity
+    binding: AuthorizedFileBinding
+    parent_handle: object
+    file_handle: object
+
+
 class WindowsSafeFilesystem:
     """Pin Windows handles and mutate through NT relative APIs only."""
 
@@ -330,17 +357,27 @@ class WindowsSafeFilesystem:
             )
         self._closed = False
         self._issued: dict[int, _IssuedWindowsTarget] = {}
-        self._boundary = self._normalize_path(str(workspace))
-        self._root_handle = self._adapter.createfile_workspace(str(workspace))
+        self._temps: dict[int, _IssuedWindowsTemp] = {}
+        self._root_handle = self._adapter.createfile_workspace(
+            str(workspace)
+        )
         try:
-            self._adapter.final_path(self._root_handle)
-            self._root_identity = self._adapter.identity(self._root_handle)
+            root_final = self._adapter.final_path(
+                self._root_handle
+            )
+            self._boundary = self._normalize_path(root_final)
+            self._root_identity = self._adapter.identity(
+                self._root_handle
+            )
             if self._root_identity.is_reparse_point:
                 raise UnsafeFilesystemTarget(
                     "workspace root is a reparse point"
                 )
-        except BaseException:
-            self._adapter.close(self._root_handle)
+        except BaseException as primary:
+            self._remember_error(
+                primary,
+                lambda: self._adapter.close(self._root_handle),
+            )
             raise
 
     @staticmethod
@@ -350,8 +387,22 @@ class WindowsSafeFilesystem:
             normalized = normalized[4:]
         return normalized.rstrip("\\").casefold()
 
-    def _assert_final_inside(self, handle: object) -> None:
-        final = self._normalize_path(self._adapter.final_path(handle))
+    @staticmethod
+    def _remember_error(
+        first: BaseException | None,
+        action: Callable[[], None],
+    ) -> BaseException | None:
+        try:
+            action()
+        except BaseException as exc:
+            if first is None:
+                return exc
+            first.add_note(
+                f"additional cleanup failure: {exc!r}"
+            )
+        return first
+
+    def _assert_normalized_inside(self, final: str) -> None:
         if (
             final != self._boundary
             and not final.startswith(self._boundary + "\\")
@@ -359,6 +410,12 @@ class WindowsSafeFilesystem:
             raise UnsafeFilesystemTarget(
                 "final handle path escapes workspace"
             )
+
+    def _assert_final_inside(self, handle: object) -> None:
+        final = self._normalize_path(
+            self._adapter.final_path(handle)
+        )
+        self._assert_normalized_inside(final)
 
     @staticmethod
     def _segments(relative_path: str | Path) -> tuple[str, ...]:
@@ -419,9 +476,31 @@ class WindowsSafeFilesystem:
                 next_handle = self._adapter.ntcreate_relative(
                     parent, segment, directory=True
                 )
-                self._verify_handle(next_handle, hardlink=False)
+                try:
+                    self._verify_handle(
+                        next_handle, hardlink=False
+                    )
+                except BaseException as primary:
+                    self._remember_error(
+                        primary,
+                        lambda handle=next_handle: self._adapter.close(
+                            handle
+                        ),
+                    )
+                    raise
                 if owns_parent:
-                    self._adapter.close(parent)
+                    owned_parent = parent
+                    owns_parent = False
+                    try:
+                        self._adapter.close(owned_parent)
+                    except BaseException as primary:
+                        self._remember_error(
+                            primary,
+                            lambda handle=next_handle: self._adapter.close(
+                                handle
+                            ),
+                        )
+                        raise
                 parent = next_handle
                 owns_parent = True
             file_handle = self._adapter.ntcreate_relative(
@@ -457,12 +536,19 @@ class WindowsSafeFilesystem:
                     pin=pin,
                 )
                 return target
-            except BaseException:
-                self._adapter.close(file_handle)
+            except BaseException as primary:
+                self._remember_error(
+                    primary,
+                    lambda: self._adapter.close(file_handle),
+                )
                 raise
-        except BaseException:
+        except BaseException as primary:
             if owns_parent:
-                self._adapter.close(parent)
+                owns_parent = False
+                self._remember_error(
+                    primary,
+                    lambda: self._adapter.close(parent),
+                )
             raise
 
     def _record(self, target: SafeTarget) -> _IssuedWindowsTarget:
@@ -489,6 +575,34 @@ class WindowsSafeFilesystem:
             )
         return record
 
+    def _temp_record(
+        self, temp: StagedTemp
+    ) -> _IssuedWindowsTemp:
+        if not isinstance(temp, StagedTemp):
+            raise TypeError(
+                "replace source must be a StagedTemp capability"
+            )
+        record = self._temps.get(id(temp))
+        if (
+            record is None
+            or record.temp is not temp
+            or not temp._is_authentic()
+            or temp._owner is not self
+            or temp.closed
+            or temp.basename != record.basename
+            or temp.identity != record.identity
+            or temp.binding != record.binding
+            or (
+                temp.authorization_digest
+                != record.binding.authorization_digest
+            )
+            or temp._parent is not record.parent_handle
+        ):
+            raise UnsafeFilesystemTarget(
+                "StagedTemp is not an issued capability"
+            )
+        return record
+
     def _validated(
         self, target: SafeTarget
     ) -> _IssuedWindowsTarget:
@@ -502,6 +616,21 @@ class WindowsSafeFilesystem:
             )
         return record
 
+    def _validated_temp(
+        self, temp: StagedTemp
+    ) -> _IssuedWindowsTemp:
+        record = self._temp_record(temp)
+        if (
+            self._verify_handle(
+                record.file_handle, hardlink=True
+            )
+            != record.identity
+        ):
+            raise UnsafeFilesystemTarget(
+                "staged temp identity changed after issuance"
+            )
+        return record
+
     def unlink(self, target: SafeTarget) -> None:
         record = self._validated(target)
         if record.binding.operation != "delete":
@@ -511,74 +640,193 @@ class WindowsSafeFilesystem:
         self._adapter.ntset_unlink(record.pin.file_handle)
         self.release_target(target)
 
-    def replace(
-        self, source: SafeTarget, destination: SafeTarget
-    ) -> None:
-        source_record = self._validated(source)
-        destination_record = self._validated(destination)
-        if destination_record.binding.operation not in {
-            "update",
-            "rename",
-        }:
-            raise UnsafeFilesystemTarget(
-                "replace destination requires update or rename authorization"
-            )
-        if source_record.binding != destination_record.binding:
-            raise UnsafeFilesystemTarget(
-                "replace operands require the same authorization binding"
-            )
-        self._adapter.ntset_replace(
-            source_record.pin.file_handle,
-            destination_record.pin.parent_handle,
-            destination_record.basename,
-        )
-        self.release_target(source)
-        self.release_target(destination)
-
-    def create_temp(
-        self, target: SafeTarget
-    ) -> tuple[str, object]:
+    def create_temp(self, target: SafeTarget) -> StagedTemp:
         record = self._validated(target)
+        if record.binding.operation not in {"update", "rename"}:
+            raise UnsafeFilesystemTarget(
+                "temp creation requires update or rename authorization"
+            )
         for _ in range(128):
             basename = (
-                f".mochi-{record.basename}.{secrets.token_hex(6)}"
+                f".mochi-{record.basename}."
+                f"{secrets.token_hex(6)}"
             )
             try:
                 handle = self._adapter.ntcreate_new_relative(
                     record.pin.parent_handle, basename
                 )
-                self._verify_handle(handle, hardlink=True)
-                return basename, handle
             except FileExistsError:
                 continue
+            try:
+                identity = self._verify_handle(
+                    handle, hardlink=True
+                )
+            except BaseException:
+                with suppress(BaseException):
+                    self._adapter.close(handle)
+                raise
+            temp = StagedTemp._create(
+                basename=basename,
+                identity=identity,
+                binding=record.binding,
+                owner=self,
+                parent=record.pin.parent_handle,
+            )
+            self._temps[id(temp)] = _IssuedWindowsTemp(
+                temp=temp,
+                basename=basename,
+                identity=identity,
+                binding=record.binding,
+                parent_handle=record.pin.parent_handle,
+                file_handle=handle,
+            )
+            return temp
         raise RuntimeError(
             "unable to allocate handle-relative temp file"
         )
 
+    def replace(
+        self, source: StagedTemp, destination: SafeTarget
+    ) -> None:
+        source_record = self._validated_temp(source)
+        destination_record = self._validated(destination)
+        if source_record.binding != destination_record.binding:
+            raise UnsafeFilesystemTarget(
+                "replace operands require the same authorization binding"
+            )
+        expected_destination_path = self._normalize_path(
+            self._adapter.final_path(
+                destination_record.pin.file_handle
+            )
+        )
+        self._assert_normalized_inside(
+            expected_destination_path
+        )
+        self._adapter.ntset_replace(
+            source_record.file_handle,
+            destination_record.pin.parent_handle,
+            destination_record.basename,
+        )
+
+        error: BaseException | None = None
+        phase = "successor_verification"
+        successor: object | None = None
+        try:
+            source_identity = self._verify_handle(
+                source_record.file_handle, hardlink=True
+            )
+            if source_identity != source_record.identity:
+                raise UnsafeFilesystemTarget(
+                    "source identity changed after replace"
+                )
+            source_path = self._normalize_path(
+                self._adapter.final_path(
+                    source_record.file_handle
+                )
+            )
+            if source_path != expected_destination_path:
+                raise UnsafeFilesystemTarget(
+                    "source final path does not match destination"
+                )
+
+            successor = self._adapter.ntcreate_relative(
+                destination_record.pin.parent_handle,
+                destination_record.basename,
+                directory=False,
+            )
+            successor_identity = self._verify_handle(
+                successor, hardlink=True
+            )
+            if successor_identity != source_record.identity:
+                raise UnsafeFilesystemTarget(
+                    "successor identity does not match staged source"
+                )
+            successor_path = self._normalize_path(
+                self._adapter.final_path(successor)
+            )
+            if successor_path != expected_destination_path:
+                raise UnsafeFilesystemTarget(
+                    "successor final path does not match destination"
+                )
+        except BaseException as exc:
+            error = exc
+        finally:
+            had_error = error is not None
+            if successor is not None:
+                error = self._remember_error(
+                    error,
+                    lambda: self._adapter.close(successor),
+                )
+            error = self._remember_error(
+                error, lambda: self.release_temp(source)
+            )
+            error = self._remember_error(
+                error,
+                lambda: self.release_target(destination),
+            )
+            if not had_error and error is not None:
+                phase = "operand_cleanup"
+        if error is not None:
+            outcome = CommittedFilesystemMutationError(
+                phase=phase, cause=error
+            )
+            raise outcome from error
+
     def release_target(self, target: SafeTarget) -> None:
         record = self._record(target)
         del self._issued[id(target)]
-        try:
-            self._adapter.close(record.pin.file_handle)
-        finally:
-            try:
-                if record.pin.owns_parent:
-                    self._adapter.close(record.pin.parent_handle)
-            finally:
-                target._mark_closed()
+        error: BaseException | None = None
+        error = self._remember_error(
+            error,
+            lambda: self._adapter.close(
+                record.pin.file_handle
+            ),
+        )
+        if record.pin.owns_parent:
+            error = self._remember_error(
+                error,
+                lambda: self._adapter.close(
+                    record.pin.parent_handle
+                ),
+            )
+        target._mark_closed()
+        if error is not None:
+            raise error
+
+    def release_temp(self, temp: StagedTemp) -> None:
+        record = self._temp_record(temp)
+        del self._temps[id(temp)]
+        error = self._remember_error(
+            None,
+            lambda: self._adapter.close(record.file_handle),
+        )
+        temp._mark_closed()
+        if error is not None:
+            raise error
 
     def close(self) -> None:
         if self._closed:
             return
+        error: BaseException | None = None
+        for record in tuple(self._temps.values()):
+            error = self._remember_error(
+                error,
+                lambda item=record: self.release_temp(item.temp),
+            )
         for record in tuple(self._issued.values()):
-            try:
-                self._adapter.close(record.pin.file_handle)
-            finally:
-                if record.pin.owns_parent:
-                    self._adapter.close(record.pin.parent_handle)
-                record.target._mark_closed()
-        self._issued.clear()
-        self._adapter.close(self._root_handle)
+            error = self._remember_error(
+                error,
+                lambda item=record: self.release_target(
+                    item.target
+                ),
+            )
+        error = self._remember_error(
+            error,
+            lambda: self._adapter.close(self._root_handle),
+        )
         self._closed = True
+        if error is not None:
+            raise error
+
 
 __all__ = ["WindowsSafeFilesystem"]

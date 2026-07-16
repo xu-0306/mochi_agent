@@ -389,6 +389,10 @@ class _FakePosixAdapter:
         self.unlinked: list[tuple[str, str]] = []
         self.open_calls: list[tuple[str, int | None]] = []
         self.replace_calls: list[tuple[str, str, str, str]] = []
+        self.close_calls: list[int] = []
+        self.dup_calls: list[tuple[int, int]] = []
+        self.fstat_calls: list[int] = []
+        self.stat_calls: list[tuple[str, int, bool]] = []
 
     def open(
         self,
@@ -417,17 +421,25 @@ class _FakePosixAdapter:
         duplicate = self.next_fd
         self.next_fd += 1
         self.fd_nodes[duplicate] = self.fd_nodes[fd]
+        self.dup_calls.append((fd, duplicate))
         return duplicate
 
     def close(self, fd: int) -> None:
+        self.close_calls.append(fd)
         self.fd_nodes.pop(fd, None)
 
     def fstat(self, fd: int) -> SimpleNamespace:
+        self.fstat_calls.append(fd)
         node = self.fd_nodes[fd]
+        is_file = node.startswith("temp:")
         return SimpleNamespace(
-            st_mode=0o040700,
-            st_dev=10,
-            st_ino=20 if node == "workspace" else 21,
+            st_mode=0o100600 if is_file else 0o040700,
+            st_dev=1 if is_file else 10,
+            st_ino=(
+                77
+                if is_file
+                else (20 if node == "workspace" else 21)
+            ),
             st_nlink=1,
         )
 
@@ -439,13 +451,16 @@ class _FakePosixAdapter:
         follow_symlinks: bool,
     ) -> SimpleNamespace:
         assert follow_symlinks is False
+        self.stat_calls.append((path, dir_fd, follow_symlinks))
         node = self.children[(self.fd_nodes[dir_fd], path)]
         return SimpleNamespace(
             st_mode=0o100600,
             st_dev=1,
-            st_ino={"note-original": 41, "outside-note": 99}.get(
-                node, 77
-            ),
+            st_ino={
+                "note-original": 41,
+                "other-original": 42,
+                "outside-note": 99,
+            }.get(node, 77),
             st_nlink=self.link_count,
         )
 
@@ -523,28 +538,72 @@ class _FakeWindowsAdapter:
         link_count: int = 1,
         parent_reparse: bool = False,
         root_file_id: str = "20",
+        workspace_final_path: str = "C:/workspace",
+        temp_reparse: bool = False,
+        collisions: int = 0,
     ) -> None:
         from mochi.security.file_contract import FileIdentity
 
         self.available = available
         self.calls: list[tuple[object, ...]] = []
         self.nodes: dict[object, str] = {}
+        self.relative_results: list[tuple[object, str, object]] = []
+        self.temp_handles: list[object] = []
+        self.successor_handles: set[object] = set()
+        self.workspace_final_path = workspace_final_path
+        self.renamed = False
+        self.source_path_after_rename: str | None = None
+        self.successor_path_after_rename: str | None = None
+        self.source_identity_after_rename = None
+        self.successor_identity_after_rename = None
+        self.temp_reparse = temp_reparse
+        self.collisions = collisions
         self.children = {
             ("workspace", "safe"): "safe-original",
             ("safe-original", "note.txt"): "note-original",
+            ("safe-original", "other.txt"): "other-original",
             ("outside", "note.txt"): "outside-note",
         }
         self.identities = {
-            "workspace": FileIdentity("windows", "10", root_file_id, 1, False),
-            "safe-original": FileIdentity("windows", "10", "21", 1, parent_reparse),
-            "outside": FileIdentity("windows", "99", "21", 1, False),
-            "note-original": FileIdentity("windows", "10", "41", link_count, False),
-            "outside-note": FileIdentity("windows", "99", "41", 1, False),
+            "workspace": FileIdentity(
+                "windows", "10", root_file_id, 1, False
+            ),
+            "safe-original": FileIdentity(
+                "windows", "10", "21", 1, parent_reparse
+            ),
+            "outside": FileIdentity(
+                "windows", "99", "21", 1, False
+            ),
+            "note-original": FileIdentity(
+                "windows", "10", "41", link_count, False
+            ),
+            "other-original": FileIdentity(
+                "windows", "10", "42", 1, False
+            ),
+            "outside-note": FileIdentity(
+                "windows", "99", "41", 1, False
+            ),
+        }
+        self.paths = {
+            "workspace": workspace_final_path,
+            "safe-original": f"{workspace_final_path}/safe",
+            "outside": "C:/outside",
+            "note-original": (
+                f"{workspace_final_path}/safe/note.txt"
+            ),
+            "other-original": (
+                f"{workspace_final_path}/safe/other.txt"
+            ),
+            "outside-note": "C:/outside/note.txt",
         }
 
     def createfile_workspace(self, path: str) -> object:
         self.calls.append(
-            ("CreateFileW", path, "OPEN_REPARSE_POINT|BACKUP_SEMANTICS")
+            (
+                "CreateFileW",
+                path,
+                "OPEN_REPARSE_POINT|BACKUP_SEMANTICS",
+            )
         )
         handle = object()
         self.nodes[handle] = "workspace"
@@ -554,10 +613,21 @@ class _FakeWindowsAdapter:
         self, root: object, basename: str, *, directory: bool
     ) -> object:
         self.calls.append(
-            ("NtCreateFile", root, basename, directory, "OPEN_REPARSE_POINT")
+            (
+                "NtCreateFile",
+                root,
+                basename,
+                directory,
+                "OPEN_REPARSE_POINT",
+            )
         )
         handle = object()
-        self.nodes[handle] = self.children[(self.nodes[root], basename)]
+        self.nodes[handle] = self.children[
+            (self.nodes[root], basename)
+        ]
+        self.relative_results.append((root, basename, handle))
+        if self.renamed and not directory:
+            self.successor_handles.add(handle)
         return handle
 
     def ntcreate_new_relative(
@@ -571,37 +641,80 @@ class _FakeWindowsAdapter:
                 root,
                 basename,
                 False,
-                "CREATE|OPEN_REPARSE_POINT",
+                "CREATE|OPEN_REPARSE_POINT|FILE_WRITE_DATA",
             )
         )
+        if self.collisions:
+            self.collisions -= 1
+            raise FileExistsError(basename)
         node = f"temp:{basename}"
         self.children[(self.nodes[root], basename)] = node
         self.identities[node] = FileIdentity(
-            "windows", "10", "temp", 1, False
+            "windows", "10", "temp", 1, self.temp_reparse
+        )
+        self.paths[node] = (
+            f"{self.paths[self.nodes[root]]}/{basename}"
         )
         handle = object()
         self.nodes[handle] = node
+        self.temp_handles.append(handle)
         return handle
 
     def final_path(self, handle: object) -> str:
-        self.calls.append(("GetFinalPathNameByHandleW", handle))
-        return "C:/workspace/" + self.nodes[handle]
+        if self.renamed and handle in self.successor_handles:
+            path = self.successor_path_after_rename
+        elif self.renamed and handle in self.temp_handles:
+            path = self.source_path_after_rename
+        else:
+            path = None
+        path = path or self.paths[self.nodes[handle]]
+        self.calls.append(
+            ("GetFinalPathNameByHandleW", handle, path)
+        )
+        return path
 
     def identity(self, handle: object):
-        self.calls.append(("GetFileInformationByHandle", handle))
+        self.calls.append(
+            ("GetFileInformationByHandle", handle)
+        )
+        if self.renamed and handle in self.successor_handles:
+            return (
+                self.successor_identity_after_rename
+                or self.identities[self.nodes[handle]]
+            )
+        if self.renamed and handle in self.temp_handles:
+            return (
+                self.source_identity_after_rename
+                or self.identities[self.nodes[handle]]
+            )
         return self.identities[self.nodes[handle]]
 
     def ntset_unlink(self, handle: object) -> None:
         self.calls.append(
-            ("NtSetInformationFile", handle, "FileDispositionInformation")
+            (
+                "NtSetInformationFile",
+                handle,
+                "FileDispositionInformation",
+            )
         )
 
     def ntset_replace(
         self, handle: object, root: object, basename: str
     ) -> None:
         self.calls.append(
-            ("NtSetInformationFile", handle, "FileRenameInformation", root, basename)
+            (
+                "NtSetInformationFile",
+                handle,
+                "FileRenameInformation",
+                root,
+                basename,
+            )
         )
+        node = self.nodes[handle]
+        parent = self.nodes[root]
+        self.children[(parent, basename)] = node
+        self.paths[node] = f"{self.paths[parent]}/{basename}"
+        self.renamed = True
 
     def close(self, handle: object) -> None:
         self.calls.append(("CloseHandle", handle))
@@ -1035,74 +1148,870 @@ def test_windows_native_rejects_real_directory_symlink_when_available(
     finally:
         filesystem.close()
 
-def test_posix_temp_and_replace_use_only_pinned_parent_and_basenames() -> None:
+def _two_file_authorization(platform: Literal["posix", "windows"]):
+    from mochi.security.file_contract import (
+        FileChangeRequest,
+        FileIdentity,
+    )
+
+    first_identity = FileIdentity(platform, "1" if platform == "posix" else "10", "41", 1, False)
+    second_identity = FileIdentity(platform, "1" if platform == "posix" else "10", "42", 1, False)
+    authorization = _file_authorization(
+        "safe/note.txt", first_identity
+    )
+    return replace(
+        authorization,
+        file_request=FileChangeRequest(
+            entries=(
+                authorization.file_request.entries[0],
+                _entry(
+                    entry_id="0002",
+                    relative_path="safe/other.txt",
+                    base_identity=second_identity,
+                ),
+            ),
+            patch_sha256=_sha("patch"),
+        ),
+    )
+
+
+def test_facade_create_temp_returns_backend_issued_staged_capability() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import (
+        AuthorizedFileBinding,
+        SafeFilesystem,
+        SafeTarget,
+        StagedTemp,
+    )
     from mochi.security.safe_fs_posix import PosixSafeFilesystem
 
     adapter = _FakePosixAdapter()
-    filesystem = PosixSafeFilesystem(
-        "/workspace", adapter=adapter
+    backend = PosixSafeFilesystem("/workspace", adapter=adapter)
+    facade = SafeFilesystem.__new__(SafeFilesystem)
+    facade._backend = backend
+    authorization = _authorization()
+    destination = facade.prepare_target(
+        "safe/note.txt", authorization
     )
-    target = filesystem.prepare_target(
-        "safe/note.txt", _authorization()
-    )
-    temp_name, temp_fd = filesystem.create_temp(target)
-    adapter.close(temp_fd)
-    target.close()
 
-    assert not temp_name.startswith("/")
-    assert adapter.open_calls[-1][1] is not None
+    staged = facade.create_temp(destination)
 
-    source = filesystem.prepare_target(
-        "safe/note.txt", _authorization()
+    assert isinstance(staged, StagedTemp)
+    assert not isinstance(staged, (tuple, SafeTarget))
+    assert staged.binding == AuthorizedFileBinding(
+        entry_id="0001",
+        canonical_relative_path="safe/note.txt",
+        operation="update",
+        base_identity=FileIdentity(
+            "posix", "1", "41", 1, False
+        ),
+        authorization_digest=staged.authorization_digest,
     )
+    with pytest.raises(AttributeError, match="immutable"):
+        staged.basename = "forged"
+    staged.close()
+    destination.close()
+    facade.close()
+
+
+@pytest.mark.parametrize("operation", ["add", "delete"])
+def test_posix_create_temp_requires_update_or_rename_authorization(
+    operation: Literal["add", "delete"],
+) -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    adapter = _FakePosixAdapter()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+    destination = filesystem.prepare_target(
+        "safe/note.txt",
+        _file_authorization(
+            "safe/note.txt",
+            FileIdentity("posix", "1", "41", 1, False),
+            operation,
+        ),
+    )
+    opens_before = len(adapter.open_calls)
+
+    with pytest.raises(
+        UnsafeFilesystemTarget, match="update or rename"
+    ):
+        filesystem.create_temp(destination)
+
+    assert len(adapter.open_calls) == opens_before
+    destination.close()
+    filesystem.close()
+
+
+def test_posix_staged_temp_is_identity_checked_and_replaced_relative() -> None:
+    from mochi.security.safe_filesystem import StagedTemp
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    adapter = _FakePosixAdapter()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
     destination = filesystem.prepare_target(
         "safe/note.txt", _authorization()
     )
-    filesystem.replace(source, destination)
+
+    staged = filesystem.create_temp(destination)
+
+    assert isinstance(staged, StagedTemp)
+    assert staged.identity.file_id == "77"
+    assert adapter.fstat_calls[-1] in adapter.fd_nodes
+    assert adapter.stat_calls[-1][0] == staged.basename
+    assert adapter.stat_calls[-1][2] is False
+    filesystem.replace(staged, destination)
 
     assert adapter.replace_calls == [
         (
             "safe-original",
-            "note.txt",
+            staged.basename,
             "safe-original",
             "note.txt",
         )
     ]
+    assert staged.closed is True
+    assert destination.closed is True
+    filesystem.close()
+    assert adapter.fd_nodes == {}
+
+
+def test_replace_rejects_non_staged_source_before_posix_syscall() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    adapter = _FakePosixAdapter()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _authorization()
+    )
+
+    with pytest.raises(
+        (TypeError, UnsafeFilesystemTarget), match="StagedTemp"
+    ):
+        filesystem.replace(destination, destination)
+
+    assert adapter.replace_calls == []
+    destination.close()
     filesystem.close()
 
 
-def test_windows_temp_and_replace_use_only_pinned_handles_and_basenames() -> None:
+@pytest.mark.parametrize("mismatch", ["digest", "entry"])
+def test_posix_replace_rejects_staged_binding_mismatch_before_syscall(
+    mismatch: Literal["digest", "entry"],
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    adapter = _FakePosixAdapter()
+    adapter.children[("safe-original", "other.txt")] = (
+        "other-original"
+    )
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+    if mismatch == "digest":
+        source_authorization = _authorization()
+        destination_authorization = replace(
+            _authorization(), policy_version="policy-v2"
+        )
+        destination_path = "safe/note.txt"
+    else:
+        source_authorization = _two_file_authorization("posix")
+        destination_authorization = source_authorization
+        destination_path = "safe/other.txt"
+
+    source_destination = filesystem.prepare_target(
+        "safe/note.txt", source_authorization
+    )
+    staged = filesystem.create_temp(source_destination)
+    destination = filesystem.prepare_target(
+        destination_path, destination_authorization
+    )
+
+    with pytest.raises(
+        UnsafeFilesystemTarget,
+        match="authorization binding",
+    ):
+        filesystem.replace(staged, destination)
+
+    assert adapter.replace_calls == []
+    staged.close()
+    source_destination.close()
+    destination.close()
+    filesystem.close()
+
+
+def test_windows_replace_reopens_and_verifies_successor_relative() -> None:
+    from mochi.security.safe_filesystem import StagedTemp
     from mochi.security.safe_fs_windows import WindowsSafeFilesystem
 
     adapter = _FakeWindowsAdapter()
     filesystem = WindowsSafeFilesystem(
         "C:/workspace", adapter=adapter, enforce=True
     )
-    target = filesystem.prepare_target(
+    destination = filesystem.prepare_target(
         "safe/note.txt", _windows_authorization()
     )
-    temp_name, temp_handle = filesystem.create_temp(target)
-    adapter.close(temp_handle)
-    target.close()
+    staged = filesystem.create_temp(destination)
+    assert isinstance(staged, StagedTemp)
+    staged_handle = adapter.temp_handles[-1]
+    old_destination_path = "C:/workspace/safe/note.txt"
+    adapter.calls.clear()
 
-    assert not temp_name.startswith(("C:", "\\"))
+    filesystem.replace(staged, destination)
 
-    source = filesystem.prepare_target(
-        "safe/note.txt", _windows_authorization()
+    rename_index = next(
+        index
+        for index, call in enumerate(adapter.calls)
+        if call[:3]
+        == (
+            "NtSetInformationFile",
+            staged_handle,
+            "FileRenameInformation",
+        )
+    )
+    reopen_index, reopen = next(
+        (index, call)
+        for index, call in enumerate(adapter.calls)
+        if index > rename_index
+        and call[0] == "NtCreateFile"
+        and call[2] == "note.txt"
+    )
+    assert reopen[1] is adapter.relative_results[-1][0]
+    assert not str(reopen[2]).startswith(("C:", "\\"))
+    successor_handle = adapter.relative_results[-1][2]
+    post_rename_paths = {
+        call[1]: call[2]
+        for call in adapter.calls[rename_index + 1 :]
+        if call[0] == "GetFinalPathNameByHandleW"
+    }
+    assert post_rename_paths[staged_handle] == old_destination_path
+    assert post_rename_paths[successor_handle] == old_destination_path
+    assert reopen_index > rename_index
+    assert ("CloseHandle", successor_handle) in adapter.calls
+    assert staged.closed is True
+    assert destination.closed is True
+    filesystem.close()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected"),
+    [
+        ("source_path", "source.*path"),
+        ("source_identity", "source.*identity"),
+        ("successor_path", "successor.*path"),
+        ("successor_identity", "successor.*identity"),
+    ],
+)
+def test_windows_replace_rejects_unverified_successor(
+    mismatch: str, expected: str
+) -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import (
+        CommittedFilesystemMutationError,
+        UnsafeFilesystemTarget,
+    )
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    adapter = _FakeWindowsAdapter()
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
     )
     destination = filesystem.prepare_target(
         "safe/note.txt", _windows_authorization()
     )
-    filesystem.replace(source, destination)
-    rename = next(
-        call
+    staged = filesystem.create_temp(destination)
+    if mismatch == "source_path":
+        adapter.source_path_after_rename = (
+            "C:/workspace/safe/wrong.txt"
+        )
+    elif mismatch == "source_identity":
+        adapter.source_identity_after_rename = FileIdentity(
+            "windows", "10", "wrong", 1, False
+        )
+    elif mismatch == "successor_path":
+        adapter.successor_path_after_rename = (
+            "C:/workspace/safe/wrong.txt"
+        )
+    else:
+        adapter.successor_identity_after_rename = FileIdentity(
+            "windows", "10", "wrong", 1, False
+        )
+
+    with pytest.raises(
+        CommittedFilesystemMutationError
+    ) as raised:
+        filesystem.replace(staged, destination)
+
+    outcome = raised.value
+    assert outcome.committed is True
+    assert outcome.phase == "successor_verification"
+    assert isinstance(outcome.cause, UnsafeFilesystemTarget)
+    assert all(
+        part in str(outcome.cause)
+        for part in expected.split(".*")
+    )
+    assert outcome.__cause__ is outcome.cause
+    assert staged.closed is True
+    assert destination.closed is True
+    if mismatch.startswith("successor"):
+        successor_handle = adapter.relative_results[-1][2]
+        assert successor_handle in adapter.successor_handles
+        assert ("CloseHandle", successor_handle) in adapter.calls
+    assert all(
+        not str(call[2]).startswith(("C:", "\\"))
         for call in adapter.calls
-        if call[0] == "NtSetInformationFile"
-        and call[2] == "FileRenameInformation"
+        if call[0] == "NtCreateFile"
+    )
+    filesystem.close()
+
+
+def test_windows_native_temp_requests_file_write_data() -> None:
+    import ctypes
+
+    from mochi.security.safe_fs_windows import _WindowsNativeAdapter
+
+    captured: dict[str, int] = {}
+    adapter = object.__new__(_WindowsNativeAdapter)
+
+    def ntcreate_file(*args):
+        captured["access"] = int(args[1])
+        return 0
+
+    adapter._NtCreateFile = ntcreate_file
+    adapter.ntcreate_new_relative(
+        ctypes.c_void_p(1), "stage.tmp"
     )
 
-    assert rename[4] == "note.txt"
-    assert not str(rename[4]).startswith(("C:", "\\"))
+    assert (
+        captured["access"] & adapter.FILE_WRITE_DATA
+        == adapter.FILE_WRITE_DATA
+    )
+
+
+def test_windows_native_name_collision_maps_file_exists() -> None:
+    import ctypes
+
+    from mochi.security.safe_fs_windows import _WindowsNativeAdapter
+
+    adapter = object.__new__(_WindowsNativeAdapter)
+    collision = ctypes.c_long(0xC0000035).value
+    adapter._NtCreateFile = lambda *args: collision
+
+    with pytest.raises(FileExistsError):
+        adapter.ntcreate_new_relative(
+            ctypes.c_void_p(1), "stage.tmp"
+        )
+
+
+def test_windows_create_temp_retries_native_name_collision() -> None:
+    from mochi.security.safe_filesystem import StagedTemp
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    adapter = _FakeWindowsAdapter(collisions=1)
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+
+    staged = filesystem.create_temp(destination)
+
+    assert isinstance(staged, StagedTemp)
+    temp_creates = [
+        call
+        for call in adapter.calls
+        if call[0] == "NtCreateFile"
+        and "CREATE" in str(call[4])
+    ]
+    assert len(temp_creates) == 2
+    staged.close()
+    destination.close()
+    filesystem.close()
+
+
+def test_windows_boundary_comes_from_opened_root_handle() -> None:
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    adapter = _FakeWindowsAdapter(
+        workspace_final_path="C:/real/workspace"
+    )
+    filesystem = WindowsSafeFilesystem(
+        "C:/alias", adapter=adapter, enforce=True
+    )
+
+    target = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+
+    target.close()
+    filesystem.close()
+
+
+def test_windows_traversal_verify_failure_closes_new_handle() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    adapter = _FakeWindowsAdapter(parent_reparse=True)
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+
+    with pytest.raises(UnsafeFilesystemTarget, match="reparse"):
+        filesystem.prepare_target(
+            "safe/note.txt", _windows_authorization()
+        )
+
+    assert set(adapter.nodes.values()) == {"workspace"}
+    filesystem.close()
+    assert adapter.nodes == {}
+
+
+def test_windows_temp_verify_failure_closes_temp_handle() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    adapter = _FakeWindowsAdapter(temp_reparse=True)
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+
+    with pytest.raises(UnsafeFilesystemTarget, match="reparse"):
+        filesystem.create_temp(destination)
+
+    temp_handle = adapter.temp_handles[-1]
+    assert temp_handle not in adapter.nodes
+    assert ("CloseHandle", temp_handle) in adapter.calls
+    destination.close()
+    filesystem.close()
+
+
+def test_posix_root_fstat_failure_closes_root_fd() -> None:
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class RootFstatFailure(_FakePosixAdapter):
+        def fstat(self, fd: int) -> SimpleNamespace:
+            super().fstat(fd)
+            raise OSError("root fstat failed")
+
+    adapter = RootFstatFailure()
+
+    with pytest.raises(OSError, match="root fstat failed"):
+        PosixSafeFilesystem("/workspace", adapter=adapter)
+
+    assert adapter.fd_nodes == {}
+    assert adapter.close_calls == [100]
+
+
+def test_posix_temp_identity_failure_closes_temp_and_duplicated_parent() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class TempIdentityMismatch(_FakePosixAdapter):
+        def stat(
+            self,
+            path: str,
+            *,
+            dir_fd: int,
+            follow_symlinks: bool,
+        ) -> SimpleNamespace:
+            info = super().stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            if path.startswith(".mochi-"):
+                values = vars(info).copy()
+                values["st_ino"] = 78
+                return SimpleNamespace(**values)
+            return info
+
+    adapter = TempIdentityMismatch()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _authorization()
+    )
+    baseline = dict(adapter.fd_nodes)
+
+    with pytest.raises(
+        UnsafeFilesystemTarget, match="temp.*identity"
+    ):
+        filesystem.create_temp(destination)
+
+    assert adapter.fd_nodes == baseline
+    destination.close()
+    filesystem.close()
+
+
+def test_posix_open_parent_close_failure_releases_both_owned_fds() -> None:
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class CloseTransitionFailure(_FakePosixAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_transition_once = True
+
+        def close(self, fd: int) -> None:
+            if (
+                self.fail_transition_once
+                and self.fd_nodes.get(fd) == "workspace"
+                and fd != 100
+            ):
+                self.fail_transition_once = False
+                self.failed_fd = fd
+                super().close(fd)
+                raise OSError("transition close failed")
+            super().close(fd)
+
+    adapter = CloseTransitionFailure()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+
+    with pytest.raises(OSError, match="transition close failed"):
+        filesystem.prepare_target(
+            "safe/note.txt", _authorization()
+        )
+
+    assert adapter.fd_nodes == {100: "workspace"}
+    assert adapter.close_calls.count(adapter.failed_fd) == 1
+    filesystem.close()
+
+
+def test_windows_parent_close_failure_is_not_retried() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    class CloseOwnedParentFailure(_FakeWindowsAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = True
+
+        def close(self, handle: object) -> None:
+            node = self.nodes.get(handle)
+            if self.fail_once and node == "safe-original":
+                self.fail_once = False
+                self.failed_handle = handle
+                super().close(handle)
+                raise OSError("parent close failed")
+            super().close(handle)
+
+    adapter = CloseOwnedParentFailure()
+    adapter.children[("safe-original", "nested")] = "nested"
+    adapter.children[("nested", "note.txt")] = "note-original"
+    adapter.identities["nested"] = FileIdentity(
+        "windows", "10", "22", 1, False
+    )
+    adapter.paths["nested"] = "C:/workspace/safe/nested"
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    authorization = _file_authorization(
+        "safe/nested/note.txt",
+        FileIdentity("windows", "10", "41", 1, False),
+    )
+
+    with pytest.raises(OSError, match="parent close failed"):
+        filesystem.prepare_target(
+            "safe/nested/note.txt", authorization
+        )
+
+    assert adapter.calls.count(
+        ("CloseHandle", adapter.failed_handle)
+    ) == 1
+    assert set(adapter.nodes.values()) == {"workspace"}
+    filesystem.close()
+
+
+def test_posix_post_replace_cleanup_reports_committed_outcome() -> None:
+    from mochi.security.safe_filesystem import (
+        CommittedFilesystemMutationError,
+    )
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class TempCloseFailure(_FakePosixAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.armed = False
+
+        def close(self, fd: int) -> None:
+            node = self.fd_nodes.get(fd)
+            super().close(fd)
+            if self.armed and node and node.startswith("temp:"):
+                self.armed = False
+                raise OSError("post-replace temp close failed")
+
+    adapter = TempCloseFailure()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _authorization()
+    )
+    staged = filesystem.create_temp(destination)
+    adapter.armed = True
+
+    with pytest.raises(
+        CommittedFilesystemMutationError
+    ) as raised:
+        filesystem.replace(staged, destination)
+
+    outcome = raised.value
+    assert outcome.committed is True
+    assert outcome.phase == "operand_cleanup"
+    assert isinstance(outcome.cause, OSError)
+    assert outcome.__cause__ is outcome.cause
+    assert staged.closed is True
+    assert destination.closed is True
+    filesystem.close()
+
+
+def test_posix_precommit_replace_failure_keeps_capabilities_live() -> None:
+    from mochi.security.safe_filesystem import (
+        CommittedFilesystemMutationError,
+    )
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class ReplaceFailure(_FakePosixAdapter):
+        def replace(self, *args, **kwargs) -> None:
+            raise OSError("replace did not commit")
+
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=ReplaceFailure()
+    )
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _authorization()
+    )
+    staged = filesystem.create_temp(destination)
+
+    with pytest.raises(OSError, match="did not commit") as raised:
+        filesystem.replace(staged, destination)
+
+    assert not isinstance(
+        raised.value, CommittedFilesystemMutationError
+    )
+    assert staged.closed is False
+    assert destination.closed is False
+    filesystem.close()
+
+
+def test_windows_post_replace_cleanup_reports_committed_outcome() -> None:
+    from mochi.security.safe_filesystem import (
+        CommittedFilesystemMutationError,
+    )
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    class SuccessorCloseFailure(_FakeWindowsAdapter):
+        def close(self, handle: object) -> None:
+            is_successor = handle in self.successor_handles
+            super().close(handle)
+            if is_successor:
+                raise OSError("successor close failed")
+
+    adapter = SuccessorCloseFailure()
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    destination = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+    staged = filesystem.create_temp(destination)
+
+    with pytest.raises(
+        CommittedFilesystemMutationError
+    ) as raised:
+        filesystem.replace(staged, destination)
+
+    outcome = raised.value
+    assert outcome.committed is True
+    assert outcome.phase == "operand_cleanup"
+    assert isinstance(outcome.cause, OSError)
+    assert outcome.__cause__ is outcome.cause
+    assert staged.closed is True
+    assert destination.closed is True
+    filesystem.close()
+
+
+def test_windows_constructor_preserves_primary_when_close_fails() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    class RootCloseFailure(_FakeWindowsAdapter):
+        def close(self, handle: object) -> None:
+            node = self.nodes.get(handle)
+            super().close(handle)
+            if node == "workspace":
+                raise OSError("root cleanup failed")
+
+    adapter = RootCloseFailure()
+    adapter.identities["workspace"] = FileIdentity(
+        "windows", "10", "20", 1, True
+    )
+
+    with pytest.raises(
+        UnsafeFilesystemTarget, match="workspace root.*reparse"
+    ) as raised:
+        WindowsSafeFilesystem(
+            "C:/workspace", adapter=adapter, enforce=True
+        )
+
+    assert any(
+        "root cleanup failed" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
+    assert adapter.nodes == {}
+
+
+@pytest.mark.parametrize("failure", ["verification", "authorization"])
+def test_windows_prepare_preserves_primary_when_close_fails(
+    failure: str,
+) -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    class FileCloseFailure(_FakeWindowsAdapter):
+        def close(self, handle: object) -> None:
+            node = self.nodes.get(handle)
+            super().close(handle)
+            if node == "note-original":
+                raise OSError("file cleanup failed")
+
+    adapter = FileCloseFailure(
+        link_count=2 if failure == "verification" else 1
+    )
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    identity = FileIdentity(
+        "windows",
+        "10",
+        "99" if failure == "authorization" else "41",
+        1,
+        False,
+    )
+    expected = (
+        "hardlink" if failure == "verification" else "base identity"
+    )
+
+    with pytest.raises(
+        UnsafeFilesystemTarget, match=expected
+    ) as raised:
+        filesystem.prepare_target(
+            "safe/note.txt",
+            _file_authorization("safe/note.txt", identity),
+        )
+
+    assert any(
+        "file cleanup failed" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
+    assert set(adapter.nodes.values()) == {"workspace"}
+    filesystem.close()
+
+
+def test_posix_close_drains_all_targets_after_close_error() -> None:
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class OneCloseFailure(_FakePosixAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = False
+
+        def close(self, fd: int) -> None:
+            node = self.fd_nodes.get(fd)
+            super().close(fd)
+            if self.fail_once and node == "safe-original":
+                self.fail_once = False
+                raise OSError("close failed")
+
+    adapter = OneCloseFailure()
+    filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
+    first = filesystem.prepare_target(
+        "safe/note.txt", _authorization()
+    )
+    second = filesystem.prepare_target(
+        "safe/note.txt", _authorization()
+    )
+    staged = filesystem.create_temp(first)
+    adapter.fail_once = True
+
+    with pytest.raises(OSError, match="close failed"):
+        filesystem.close()
+
+    assert adapter.fd_nodes == {}
+    assert first.closed is True
+    assert second.closed is True
+    assert staged.closed is True
+
+
+def test_windows_close_drains_all_targets_after_close_error() -> None:
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    class OneCloseFailure(_FakeWindowsAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = False
+
+        def close(self, handle: object) -> None:
+            node = self.nodes.get(handle)
+            super().close(handle)
+            if self.fail_once and node == "note-original":
+                self.fail_once = False
+                raise OSError("close failed")
+
+    adapter = OneCloseFailure()
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    first = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+    second = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+    staged = filesystem.create_temp(first)
+    adapter.fail_once = True
+
+    with pytest.raises(OSError, match="close failed"):
+        filesystem.close()
+
+    assert adapter.nodes == {}
+    assert first.closed is True
+    assert second.closed is True
+    assert staged.closed is True
+
+
+def test_windows_release_drains_pin_after_file_close_error() -> None:
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    class FileCloseFailure(_FakeWindowsAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = False
+
+        def close(self, handle: object) -> None:
+            node = self.nodes.get(handle)
+            super().close(handle)
+            if self.fail_once and node == "note-original":
+                self.fail_once = False
+                raise OSError("file close failed")
+
+    adapter = FileCloseFailure()
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    target = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization()
+    )
+    adapter.fail_once = True
+
+    with pytest.raises(OSError, match="file close failed"):
+        target.close()
+
+    assert set(adapter.nodes.values()) == {"workspace"}
+    assert target.closed is True
     filesystem.close()
 
 
@@ -1246,9 +2155,10 @@ def test_replace_rejects_cross_authorization_operands() -> None:
         "/workspace", adapter=_FakePosixAdapter()
     )
     try:
-        source = filesystem.prepare_target(
+        source_destination = filesystem.prepare_target(
             "safe/note.txt", _authorization()
         )
+        source = filesystem.create_temp(source_destination)
         destination = filesystem.prepare_target(
             "safe/note.txt",
             replace(_authorization(), policy_version="policy-v2"),
@@ -1259,7 +2169,7 @@ def test_replace_rejects_cross_authorization_operands() -> None:
         filesystem.close()
 
 
-def test_replace_destination_requires_update_or_rename() -> None:
+def test_create_temp_requires_update_or_rename() -> None:
     from mochi.security.file_contract import FileIdentity
     from mochi.security.safe_filesystem import UnsafeFilesystemTarget
     from mochi.security.safe_fs_posix import PosixSafeFilesystem
@@ -1273,15 +2183,12 @@ def test_replace_destination_requires_update_or_rename() -> None:
         "/workspace", adapter=_FakePosixAdapter()
     )
     try:
-        source = filesystem.prepare_target(
-            "safe/note.txt", authorization
-        )
         destination = filesystem.prepare_target(
             "safe/note.txt", authorization
         )
         with pytest.raises(
             UnsafeFilesystemTarget, match="update or rename"
         ):
-            filesystem.replace(source, destination)
+            filesystem.create_temp(destination)
     finally:
         filesystem.close()
