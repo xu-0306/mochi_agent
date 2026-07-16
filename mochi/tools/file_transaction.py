@@ -15,12 +15,15 @@ from ..security.safe_filesystem import (
 from ..security.safe_filesystem import (
     CommittedFilesystemMutationError as _CommittedFilesystemMutationError,
 )
-from ..security.safe_filesystem import SafeTarget as _SafeTarget
-from ..security.safe_filesystem import StagedTemp as _StagedTemp
+from ..security.safe_filesystem import (
+    SafeTarget as _SafeTarget,
+)
+from ..security.safe_filesystem import (
+    StagedTemp as _StagedTemp,
+)
 from ..security.safe_filesystem import (
     UnsafeFilesystemTarget as _UnsafeFilesystemTarget,
 )
-
 
 _SHA256_PATTERN = _re.compile(r"[0-9a-f]{64}\Z")
 
@@ -53,6 +56,14 @@ class AtomicWriteResult:
 
     successor_identity: _FileIdentity
     bytes_written: int
+
+    def __post_init__(self) -> None:
+        if type(self.successor_identity) is not _FileIdentity:
+            raise TypeError("successor_identity must be exactly FileIdentity")
+        if type(self.bytes_written) is not int:
+            raise TypeError("bytes_written must be exactly int")
+        if self.bytes_written < 0:
+            raise ValueError("bytes_written must be non-negative")
 
 
 class _TransactionOwner(_Protocol):
@@ -138,9 +149,33 @@ def _validate_snapshot(
         _reject("metadata snapshot data does not match authorized after_sha256")
 
     owner: _TransactionOwner = target._owner
-    if owner.transaction_binding(target) != binding:
-        _reject("metadata snapshot does not match the owner binding")
+    owner_binding = owner.transaction_binding(target)
+    if (
+        type(owner_binding) is not _AuthorizedFileBinding
+        or owner_binding != binding
+    ):
+        _reject("metadata snapshot does not match the exact owner binding")
     return owner
+
+
+def _validate_temp_candidate(
+    candidate: object,
+    owner: _TransactionOwner,
+    target: _SafeTarget,
+    binding: _AuthorizedFileBinding,
+) -> _StagedTemp:
+    if (
+        type(candidate) is not _StagedTemp
+        or candidate.closed
+        or not candidate._is_authentic()
+        or candidate._owner is not owner
+        or type(candidate.binding) is not _AuthorizedFileBinding
+        or candidate.binding != binding
+        or candidate.authorization_digest != binding.authorization_digest
+        or candidate._parent is not target._parent
+    ):
+        _reject("owner returned an invalid staged temp capability")
+    return candidate
 
 
 def _write_all(
@@ -164,9 +199,36 @@ def _write_all(
 def _attach_cleanup_failure(
     primary: BaseException, cleanup: BaseException
 ) -> None:
-    add_note = getattr(primary, "add_note", None)
-    if callable(add_note):
-        add_note(f"discard_temp cleanup failed: {cleanup}")
+    try:
+        try:
+            cleanup_message = str(cleanup)
+        except BaseException:
+            cleanup_message = f"<{type(cleanup).__name__} could not be formatted>"
+        note = f"discard_temp cleanup failed: {cleanup_message}"
+        BaseException.add_note(primary, note)
+    except BaseException:
+        pass
+
+
+def _validate_successor(
+    successor_identity: object,
+    source: _StagedTemp,
+    destination: _SafeTarget,
+) -> _FileIdentity:
+    cause: BaseException | None = None
+    if type(successor_identity) is not _FileIdentity:
+        cause = TypeError("replace must return exactly FileIdentity")
+    elif not source.closed or not destination.closed:
+        cause = RuntimeError(
+            "replace must consume both source and destination capabilities"
+        )
+    if cause is not None:
+        error = _CommittedFilesystemMutationError(
+            phase="validate_successor",
+            cause=cause,
+        )
+        raise error from cause
+    return successor_identity
 
 
 def atomic_write_bytes(
@@ -179,13 +241,22 @@ def atomic_write_bytes(
     owner = _validate_snapshot(target, data, metadata_snapshot)
     temp: _StagedTemp | None = None
     try:
-        temp = owner.create_temp(target)
+        candidate = owner.create_temp(target)
+        temp = _validate_temp_candidate(
+            candidate,
+            owner,
+            target,
+            metadata_snapshot.binding,
+        )
         bytes_written = _write_all(owner, temp, data)
         owner.apply_metadata_snapshot(temp, metadata_snapshot)
         owner.verify_staged(temp, metadata_snapshot)
         owner.flush_temp(temp)
         owner.revalidate_base(target, metadata_snapshot)
         successor_identity = owner.replace(temp, target)
+        successor_identity = _validate_successor(
+            successor_identity, temp, target
+        )
     except _CommittedFilesystemMutationError:
         raise
     except BaseException as primary:

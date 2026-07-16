@@ -29,6 +29,24 @@ _BASE_BYTES = b"original bytes"
 _AFTER_BYTES = b"replacement bytes"
 
 
+class _EqualBindingImpostor:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
+class _UnsafeCleanupError(RuntimeError):
+    def __str__(self) -> str:
+        raise RuntimeError("cleanup formatting failed")
+
+
+class _UnsafeAddNoteError(OSError):
+    def add_note(self, note: str) -> None:
+        raise RuntimeError("overridden add_note failed")
+
+
 def _binding() -> AuthorizedFileBinding:
     from mochi.security.file_contract import FileIdentity
     from mochi.security.safe_filesystem import AuthorizedFileBinding
@@ -75,6 +93,9 @@ class _BehavioralTransactionOwner:
         self.binding_calls = 0
         self.write_plan = list(write_plan or [])
         self.failures = dict(failures or {})
+        self.transaction_binding_result: object = self.binding
+        self.temp_tamper: str | None = None
+        self.replace_consumption = "both"
         self.committed_replace_failure: BaseException | None = None
         self.discard_attempts = 0
         self.original_bytes = _BASE_BYTES
@@ -90,6 +111,7 @@ class _BehavioralTransactionOwner:
         self.issued_temp: StagedTemp | None = None
         self.discarded_temp: StagedTemp | None = None
         self.successor_identity = FileIdentity("posix", "1", "99", 1, False)
+        self.replace_result: object = self.successor_identity
         self.target = SafeTarget._create(
             basename="note.txt",
             identity=self.binding.base_identity,
@@ -108,7 +130,7 @@ class _BehavioralTransactionOwner:
     ) -> AuthorizedFileBinding:
         self.binding_calls += 1
         assert target is self.target and not target.closed
-        return self.binding
+        return self.transaction_binding_result
 
     def create_temp(self, target: SafeTarget) -> StagedTemp:
         from mochi.security.safe_filesystem import StagedTemp
@@ -124,6 +146,26 @@ class _BehavioralTransactionOwner:
         )
         self.issued_temp = temp
         self.temp_live = self.temp_resource_open = True
+        if self.temp_tamper == "wrong_type":
+            return object()
+        if self.temp_tamper == "closed":
+            temp._mark_closed()
+        elif self.temp_tamper == "authenticity":
+            object.__setattr__(temp, "_seal", object())
+        elif self.temp_tamper == "foreign_owner":
+            object.__setattr__(temp, "_owner", object())
+        elif self.temp_tamper == "binding":
+            object.__setattr__(
+                temp,
+                "_binding",
+                replace(self.binding, entry_id="different-entry"),
+            )
+        elif self.temp_tamper == "authorization_digest":
+            object.__setattr__(
+                temp, "_authorization_digest", _sha_label("different-auth")
+            )
+        elif self.temp_tamper == "parent":
+            object.__setattr__(temp, "_parent", object())
         return temp
 
     def write_temp(self, temp: StagedTemp, data: memoryview) -> int:
@@ -192,11 +234,13 @@ class _BehavioralTransactionOwner:
         self.original_identity = self.successor_identity
         self.temp_live = self.temp_resource_open = False
         self.target_resource_open = False
-        source._mark_closed()
-        destination._mark_closed()
+        if self.replace_consumption != "source_open":
+            source._mark_closed()
+        if self.replace_consumption != "destination_open":
+            destination._mark_closed()
         if self.committed_replace_failure is not None:
             raise self.committed_replace_failure
-        return self.successor_identity
+        return self.replace_result
 
     def discard_temp(self, temp: StagedTemp) -> None:
         self.discard_attempts += 1
@@ -345,6 +389,62 @@ def test_snapshot_mismatch_rejects_before_creating_temp(tamper: str) -> None:
     assert not target.closed
 
 
+@pytest.mark.parametrize("payload", ["matching", "altered"])
+def test_owner_binding_requires_exact_authorized_binding(
+    payload: str,
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    owner, target, snapshot = _transaction()
+    impersonated = (
+        owner.binding
+        if payload == "matching"
+        else replace(owner.binding, entry_id="different-entry")
+    )
+    owner.transaction_binding_result = _EqualBindingImpostor(impersonated)
+
+    with pytest.raises(UnsafeFilesystemTarget, match="owner binding"):
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert owner.events == []
+    assert owner.issued_temp is None
+    assert owner.original_bytes == _BASE_BYTES
+    assert not target.closed
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "wrong_type",
+        "closed",
+        "authenticity",
+        "foreign_owner",
+        "binding",
+        "authorization_digest",
+        "parent",
+    ],
+)
+def test_untrusted_temp_candidate_is_rejected_before_staging(
+    tamper: str,
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    owner, target, snapshot = _transaction()
+    owner.temp_tamper = tamper
+
+    with pytest.raises(UnsafeFilesystemTarget, match="staged temp"):
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert owner.events == ["create_temp"]
+    assert owner.discard_attempts == 0
+    assert owner.temp_bytes == b""
+    assert owner.original_bytes == _BASE_BYTES
+    assert owner.original_identity == owner.binding.base_identity
+    assert owner.target_resource_open and not target.closed
+
+
 def test_short_writes_and_interruptions_are_retried_until_complete() -> None:
     from mochi.tools.file_transaction import atomic_write_bytes
 
@@ -475,6 +575,43 @@ def test_committed_replace_failure_is_not_discarded_or_wrapped() -> None:
     assert not owner.target_resource_open
 
 
+@pytest.mark.parametrize(
+    "violation",
+    ["return_type", "source_open", "destination_open"],
+)
+def test_replace_success_contract_violation_is_committed(
+    violation: str,
+) -> None:
+    from mochi.security.safe_filesystem import (
+        CommittedFilesystemMutationError,
+    )
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    owner, target, snapshot = _transaction()
+    if violation == "return_type":
+        owner.replace_result = object()
+    else:
+        owner.replace_consumption = violation
+
+    with pytest.raises(CommittedFilesystemMutationError) as raised:
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert raised.value.phase == "validate_successor"
+    assert owner.discard_attempts == 0
+    assert owner.events[-1] == "replace"
+    assert owner.original_bytes == _AFTER_BYTES
+    assert owner.original_identity == owner.successor_identity
+    assert owner.issued_temp is not None
+    if violation == "source_open":
+        assert not owner.issued_temp.closed
+    else:
+        assert owner.issued_temp.closed
+    if violation == "destination_open":
+        assert not target.closed
+    else:
+        assert target.closed
+
+
 def test_success_runs_exact_foundation_sequence_and_consumes_operands() -> None:
     from mochi.tools.file_transaction import (
         AtomicWriteResult,
@@ -507,6 +644,45 @@ def test_success_runs_exact_foundation_sequence_and_consumes_operands() -> None:
         result.bytes_written = 0
 
 
+def test_cleanup_str_failure_does_not_mask_primary_error() -> None:
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    primary = OSError("replace failed first")
+    cleanup = _UnsafeCleanupError()
+    owner, target, snapshot = _transaction(
+        failures={"replace": primary, "discard_temp": cleanup}
+    )
+
+    with pytest.raises(BaseException) as raised:
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert raised.value is primary
+    assert owner.discard_attempts == 1
+    assert owner.original_bytes == _BASE_BYTES
+    assert not target.closed
+
+
+def test_overridden_add_note_does_not_mask_primary_error() -> None:
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    primary = _UnsafeAddNoteError("replace failed first")
+    cleanup = OSError("discard failed second")
+    owner, target, snapshot = _transaction(
+        failures={"replace": primary, "discard_temp": cleanup}
+    )
+
+    with pytest.raises(BaseException) as raised:
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert raised.value is primary
+    assert any(
+        "discard failed second" in note
+        for note in getattr(primary, "__notes__", ())
+    )
+    assert owner.original_bytes == _BASE_BYTES
+    assert not target.closed
+
+
 def test_cleanup_failure_is_attached_without_masking_precommit_error() -> None:
     from mochi.tools.file_transaction import atomic_write_bytes
 
@@ -527,6 +703,35 @@ def test_cleanup_failure_is_attached_without_masking_precommit_error() -> None:
     assert not owner.temp_live
     assert owner.original_bytes == _BASE_BYTES
     assert not target.closed
+
+
+@pytest.mark.parametrize(
+    ("successor_identity", "bytes_written", "error"),
+    [
+        (object(), 0, TypeError),
+        ("valid", True, TypeError),
+        ("valid", 1.5, TypeError),
+        ("valid", -1, ValueError),
+    ],
+)
+def test_atomic_write_result_validates_exact_fields(
+    successor_identity: object,
+    bytes_written: object,
+    error: type[Exception],
+) -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.tools.file_transaction import AtomicWriteResult
+
+    identity = (
+        FileIdentity("posix", "1", "99", 1, False)
+        if successor_identity == "valid"
+        else successor_identity
+    )
+    with pytest.raises(error):
+        AtomicWriteResult(
+            successor_identity=identity,
+            bytes_written=bytes_written,
+        )
 
 
 def test_public_contract_exposes_no_path_or_raw_resource_api() -> None:
