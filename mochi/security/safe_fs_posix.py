@@ -9,8 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .file_contract import AuthorizationEnvelope, FileIdentity, authorization_request_digest
-from .safe_filesystem import SafeTarget, UnsafeFilesystemTarget
+from .file_contract import AuthorizationEnvelope, FileIdentity
+from .safe_filesystem import (
+    AuthorizedFileBinding,
+    SafeTarget,
+    UnsafeFilesystemTarget,
+    resolve_authorized_file_binding,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +23,7 @@ class _IssuedPosixTarget:
     target: SafeTarget
     basename: str
     identity: FileIdentity
-    authorization_digest: str
+    binding: AuthorizedFileBinding
     parent_fd: int
 
 
@@ -117,6 +122,10 @@ class PosixSafeFilesystem:
             raise ValueError("filesystem is closed")
         if not isinstance(authorization, AuthorizationEnvelope):
             raise TypeError("authorization must be AuthorizationEnvelope")
+        if authorization.kind != "file_change":
+            raise UnsafeFilesystemTarget(
+                "file targets require a file_change authorization"
+            )
         if self._root_identity != authorization.context.workspace_identity:
             raise UnsafeFilesystemTarget(
                 "workspace identity does not match authorization"
@@ -125,11 +134,18 @@ class PosixSafeFilesystem:
         parent_fd = self._open_parent(segments)
         try:
             identity = self._identity_at(parent_fd, segments[-1])
-            digest = authorization_request_digest(authorization)
+            binding = resolve_authorized_file_binding(
+                canonical_relative_path="/".join(segments),
+                authorization=authorization,
+                captured_identity=identity,
+                canonicalize_authorized_path=lambda path: "/".join(
+                    self._segments(path)
+                ),
+            )
             target = SafeTarget._create(
                 basename=segments[-1],
                 identity=identity,
-                authorization_digest=digest,
+                authorization_digest=binding.authorization_digest,
                 owner=self,
                 parent=parent_fd,
             )
@@ -137,7 +153,7 @@ class PosixSafeFilesystem:
                 target=target,
                 basename=segments[-1],
                 identity=identity,
-                authorization_digest=digest,
+                binding=binding,
                 parent_fd=parent_fd,
             )
             return target
@@ -157,7 +173,11 @@ class PosixSafeFilesystem:
             or target.closed
             or target.basename != record.basename
             or target.identity != record.identity
-            or target.authorization_digest != record.authorization_digest
+            or target.identity != record.binding.base_identity
+            or (
+                target.authorization_digest
+                != record.binding.authorization_digest
+            )
             or target._parent != record.parent_fd
         ):
             raise UnsafeFilesystemTarget(
@@ -175,12 +195,27 @@ class PosixSafeFilesystem:
 
     def unlink(self, target: SafeTarget) -> None:
         record = self._validated(target)
+        if record.binding.operation != "delete":
+            raise UnsafeFilesystemTarget(
+                "unlink requires delete authorization"
+            )
         self._adapter.unlink(record.basename, dir_fd=record.parent_fd)
         self.release_target(target)
 
     def replace(self, source: SafeTarget, destination: SafeTarget) -> None:
         source_record = self._validated(source)
         destination_record = self._validated(destination)
+        if destination_record.binding.operation not in {
+            "update",
+            "rename",
+        }:
+            raise UnsafeFilesystemTarget(
+                "replace destination requires update or rename authorization"
+            )
+        if source_record.binding != destination_record.binding:
+            raise UnsafeFilesystemTarget(
+                "replace operands require the same authorization binding"
+            )
         self._adapter.replace(
             source_record.basename,
             destination_record.basename,

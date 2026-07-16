@@ -1,35 +1,62 @@
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
+if TYPE_CHECKING:
+    from mochi.security.file_contract import (
+        AuthorizationEnvelope,
+        ChangeEntry,
+        ChangeManifest,
+        FileIdentity,
+    )
 
-def _entry(*, entry_id: str = "0002", relative_path: str = "b.txt"):
+
+def _sha(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _entry(
+    *,
+    entry_id: str = "0002",
+    relative_path: str = "safe/note.txt",
+    operation: Literal["add", "update", "delete", "rename"] = "update",
+    base_identity: FileIdentity | None = None,
+) -> ChangeEntry:
     from mochi.security.file_contract import ChangeEntry, FileIdentity
 
+    if base_identity is None:
+        base_identity = FileIdentity("posix", "1", "41", 1, False)
     return ChangeEntry(
         entry_id=entry_id,
         relative_path=relative_path,
-        operation="update",
-        base_sha256="base-sha256",
-        after_sha256="after-sha256",
-        base_identity=FileIdentity("posix", "1", "2", 1, False),
+        operation=operation,
+        base_sha256=_sha("base-content"),
+        after_sha256=_sha("after-content"),
+        base_identity=base_identity,
         before_blob_id="before-blob",
         after_blob_id="after-blob",
         mode_before=0o644,
         mode_after=0o600,
-        base_metadata_sha256="base-meta",
-        after_metadata_sha256="after-meta",
+        base_metadata_sha256=_sha("base-metadata"),
+        after_metadata_sha256=_sha("after-metadata"),
         rename_source=None,
         dependency_group="group-a",
     )
 
 
-def _authorization():
+def _file_authorization(
+    path: str,
+    identity: FileIdentity,
+    operation: Literal["add", "update", "delete", "rename"] = "update",
+) -> AuthorizationEnvelope:
     from mochi.security.file_contract import (
         AuthorizationContext,
         AuthorizationEnvelope,
@@ -44,17 +71,59 @@ def _authorization():
             requester_id="requester-1",
             session_id="session-1",
             task_id="task-1",
-            workspace_root="workspace",
-            workspace_identity=FileIdentity("posix", "10", "20", 1, False),
+            workspace_root=(
+                "C:/workspace"
+                if identity.platform == "windows"
+                else "workspace"
+            ),
+            workspace_identity=FileIdentity(
+                identity.platform, "10", "20", 1, False
+            ),
         ),
         policy_version="policy-v1",
         file_request=FileChangeRequest(
-            entries=(_entry(), _entry(entry_id="0001", relative_path="a.txt")),
-            patch_sha256="patch-sha256",
+            entries=(
+                _entry(
+                    entry_id="0001",
+                    relative_path=path,
+                    operation=operation,
+                    base_identity=identity,
+                ),
+            ),
+            patch_sha256=_sha("patch"),
         ),
         exec_request=None,
     )
 
+
+def _authorization() -> AuthorizationEnvelope:
+    from mochi.security.file_contract import FileIdentity
+
+    return _file_authorization(
+        "safe/note.txt",
+        FileIdentity("posix", "1", "41", 1, False),
+    )
+
+def _manifest(
+    *, entries: tuple[ChangeEntry, ...] | None = None
+) -> ChangeManifest:
+    from mochi.security.file_contract import ChangeManifest, FileIdentity
+
+    return ChangeManifest(
+        version=1,
+        change_set_id="change-set",
+        workspace_root="workspace",
+        workspace_identity=FileIdentity("posix", "10", "20", 1, False),
+        tool_name="write_file",
+        intent="mutate",
+        entries=(_entry(),) if entries is None else entries,
+        patch_sha256=_sha("manifest-patch"),
+        policy_version="policy-v1",
+        created_at="created",
+        expires_at="expires",
+        request_digest=_sha("manifest-request"),
+        ui_metadata={"label": "preview"},
+    )
 
 def test_contract_roundtrips_complete_file_request_and_identity() -> None:
     from mochi.security.file_contract import AuthorizationEnvelope, FileIdentity
@@ -91,7 +160,7 @@ def test_file_request_digest_is_deterministic_and_binds_authorization() -> None:
         replace(envelope, policy_version="policy-v2"),
         replace(
             envelope,
-            file_request=replace(envelope.file_request, patch_sha256="other-patch"),
+            file_request=replace(envelope.file_request, patch_sha256=_sha("other-patch")),
         ),
     ]
     original = authorization_request_digest(envelope)
@@ -107,17 +176,17 @@ def test_envelope_requires_exactly_one_matching_request() -> None:
 
     envelope = _authorization()
     exec_request = ExecRequest(
-        command_utf8_sha256="command-sha256",
+        command_utf8_sha256=_sha("command"),
         shell="powershell",
         executable="pwsh.exe",
         argv=("-NoProfile", "-Command", "Get-Date"),
         resolved_cwd="workspace",
-        env=(EnvVarHash("PATH", "path-value-sha256"),),
+        env=(EnvVarHash("PATH", _sha("path-value")),),
         network_policy="deny",
         resource_limits=ResourceLimits(30, 1024, 4096),
         requested_escalation="none",
         sandbox_backend="windows-native",
-        sandbox_capability_plan_digest="sandbox-plan-sha256",
+        sandbox_capability_plan_digest=_sha("sandbox-plan"),
     )
     with pytest.raises(ValueError, match="exactly one"):
         replace(envelope, exec_request=exec_request)
@@ -139,11 +208,11 @@ def test_contract_rejects_unknown_fields_at_every_model_layer() -> None:
         _authorization().context,
         _entry(),
         _authorization().file_request,
-        EnvVarHash("PATH", "hash"),
+        EnvVarHash("PATH", _sha("hash")),
         ResourceLimits(30, 1024, 4096),
         ExecRequest(
-            "command", None, "tool", (), "workspace", (), "deny",
-            ResourceLimits(30, 1024, 4096), "none", "native", "plan"
+            _sha("command"), None, "tool", (), "workspace", (), "deny",
+            ResourceLimits(30, 1024, 4096), "none", "native", _sha("plan")
         ),
         _authorization(),
         ChangeManifest(
@@ -154,11 +223,11 @@ def test_contract_rejects_unknown_fields_at_every_model_layer() -> None:
             tool_name="write_file",
             intent="mutate",
             entries=(_entry(),),
-            patch_sha256="patch",
+            patch_sha256=_sha("patch"),
             policy_version="policy-v1",
             created_at="2026-01-01T00:00:00Z",
             expires_at="2026-01-01T01:00:00Z",
-            request_digest="request",
+            request_digest=_sha("request"),
             ui_metadata={"label": "preview"},
         ),
     ]
@@ -193,11 +262,11 @@ def test_manifest_projection_only_excludes_explicit_top_level_volatile_fields() 
         tool_name="write_file",
         intent="mutate",
         entries=(_entry(),),
-        patch_sha256="patch",
+        patch_sha256=_sha("patch"),
         policy_version="policy-v1",
         created_at="created",
         expires_at="expires",
-        request_digest="request",
+        request_digest=_sha("request"),
         ui_metadata={"created_at": "nested-security-relevant"},
     )
     projection = manifest_digest_projection(manifest)
@@ -221,9 +290,84 @@ def test_preview_idempotency_key_is_context_scoped_composite() -> None:
     )
     assert key != preview_idempotency_key(replace(envelope, policy_version="different"))
     assert key != preview_idempotency_key(
-        replace(envelope, file_request=replace(envelope.file_request, patch_sha256="different"))
+        replace(envelope, file_request=replace(envelope.file_request, patch_sha256=_sha("different")))
     )
 
+
+def test_authorization_envelope_supports_only_schema_version_one() -> None:
+    envelope = _authorization()
+
+    with pytest.raises(ValueError, match="schema_version.*1"):
+        replace(envelope, schema_version=2)
+
+
+def test_file_request_and_manifest_reject_duplicate_entry_path_keys() -> None:
+    from mochi.security.file_contract import FileChangeRequest
+
+    duplicate = replace(_entry(), operation="delete")
+    with pytest.raises(ValueError, match="duplicate"):
+        FileChangeRequest(
+            entries=(_entry(), duplicate),
+            patch_sha256=_sha("patch"),
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        _manifest(entries=(_entry(), duplicate))
+
+
+def test_all_explicit_digest_fields_require_lowercase_sha256_hex() -> None:
+    from mochi.security.file_contract import (
+        EnvVarHash,
+        ExecRequest,
+        FileChangeRequest,
+        ResourceLimits,
+    )
+
+    exec_request = ExecRequest(
+        command_utf8_sha256=_sha("command"),
+        shell=None,
+        executable="tool",
+        argv=(),
+        resolved_cwd="workspace",
+        env=(EnvVarHash("PATH", _sha("env")),),
+        network_policy="deny",
+        resource_limits=ResourceLimits(30, 1024, 4096),
+        requested_escalation="none",
+        sandbox_backend="native",
+        sandbox_capability_plan_digest=_sha("sandbox-plan"),
+    )
+    manifest = _manifest()
+    cases: tuple[Callable[[str], object], ...] = (
+        lambda value: replace(_entry(), base_sha256=value),
+        lambda value: replace(_entry(), after_sha256=value),
+        lambda value: replace(_entry(), base_metadata_sha256=value),
+        lambda value: replace(_entry(), after_metadata_sha256=value),
+        lambda value: FileChangeRequest(
+            entries=(_entry(),), patch_sha256=value
+        ),
+        lambda value: EnvVarHash("PATH", value),
+        lambda value: replace(exec_request, command_utf8_sha256=value),
+        lambda value: replace(
+            exec_request, sandbox_capability_plan_digest=value
+        ),
+        lambda value: replace(manifest, patch_sha256=value),
+        lambda value: replace(manifest, request_digest=value),
+    )
+    invalid_digests = ("A" * 64, "g" * 64, "a" * 63)
+
+    for invalid in invalid_digests:
+        for construct in cases:
+            with pytest.raises(ValueError, match="lowercase hexadecimal"):
+                construct(invalid)
+
+
+def test_manifest_projection_fully_validates_raw_mappings() -> None:
+    from mochi.security.file_contract import manifest_digest_projection
+
+    payload = _manifest().to_dict()
+    payload["patch_sha256"] = "not-a-digest"
+
+    with pytest.raises(ValueError, match="lowercase hexadecimal"):
+        manifest_digest_projection(payload)
 
 class _FakePosixAdapter:
     O_RDONLY = 0
@@ -326,11 +470,19 @@ class _FakePosixAdapter:
         )
 
 def test_posix_pinned_parent_survives_symlink_rebind() -> None:
+    from mochi.security.file_contract import FileIdentity
     from mochi.security.safe_fs_posix import PosixSafeFilesystem
 
     adapter = _FakePosixAdapter()
     filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
-    target = filesystem.prepare_target("safe/note.txt", _authorization())
+    target = filesystem.prepare_target(
+        "safe/note.txt",
+        _file_authorization(
+            "safe/note.txt",
+            FileIdentity("posix", "1", "41", 1, False),
+            "delete",
+        ),
+    )
     adapter.children[("workspace", "safe")] = "outside"
     filesystem.unlink(target)
 
@@ -352,16 +504,15 @@ def test_posix_rejects_hardlinked_target_and_parent_traversal() -> None:
             "safe/../note.txt", _authorization()
         )
 
-def _windows_authorization():
+def _windows_authorization(
+    operation: Literal["add", "update", "delete", "rename"] = "update",
+) -> AuthorizationEnvelope:
     from mochi.security.file_contract import FileIdentity
 
-    envelope = _authorization()
-    return replace(
-        envelope,
-        context=replace(
-            envelope.context,
-            workspace_identity=FileIdentity("windows", "10", "20", 1, False),
-        ),
+    return _file_authorization(
+        "safe/note.txt",
+        FileIdentity("windows", "10", "41", 1, False),
+        operation,
     )
 
 class _FakeWindowsAdapter:
@@ -464,7 +615,9 @@ def test_windows_pins_handles_and_survives_junction_rebind() -> None:
     filesystem = WindowsSafeFilesystem(
         "C:/workspace", adapter=adapter, enforce=True
     )
-    target = filesystem.prepare_target("safe/note.txt", _windows_authorization())
+    target = filesystem.prepare_target(
+        "safe/note.txt", _windows_authorization("delete")
+    )
     adapter.children[("workspace", "safe")] = "outside"
     filesystem.unlink(target)
 
@@ -588,11 +741,11 @@ def test_change_manifest_ui_metadata_is_immutable() -> None:
         tool_name="write_file",
         intent="mutate",
         entries=(_entry(),),
-        patch_sha256="patch",
+        patch_sha256=_sha("patch"),
         policy_version="p",
         created_at="created",
         expires_at="expires",
-        request_digest="request",
+        request_digest=_sha("request"),
         ui_metadata={"label": "preview"},
     )
 
@@ -620,11 +773,20 @@ def test_windows_native_handle_relative_unlink(tmp_path: Path) -> None:
     handle = adapter.createfile_workspace(str(tmp_path))
     try:
         workspace_identity = adapter.identity(handle)
+        target_handle = adapter.ntcreate_relative(
+            handle, "native.txt", directory=False
+        )
+        try:
+            target_identity = adapter.identity(target_handle)
+        finally:
+            adapter.close(target_handle)
     finally:
         adapter.close(handle)
 
     authorization = replace(
-        _windows_authorization(),
+        _file_authorization(
+            "native.txt", target_identity, "delete"
+        ),
         context=AuthorizationContext(
             requester_id="requester-1",
             session_id="session-1",
@@ -642,7 +804,7 @@ def test_windows_native_handle_relative_unlink(tmp_path: Path) -> None:
 
     assert not target_path.exists()
 
-def _exec_authorization():
+def _exec_authorization() -> AuthorizationEnvelope:
     from mochi.security.file_contract import (
         AuthorizationContext,
         AuthorizationEnvelope,
@@ -667,17 +829,17 @@ def _exec_authorization():
         policy_version="policy-v1",
         file_request=None,
         exec_request=ExecRequest(
-            command_utf8_sha256="command-sha256",
+            command_utf8_sha256=_sha("command"),
             shell="powershell",
             executable="pwsh.exe",
             argv=("-NoProfile", "-Command", "Get-Date"),
             resolved_cwd="C:/workspace",
-            env=(EnvVarHash("PATH", "path-value-sha256"),),
+            env=(EnvVarHash("PATH", _sha("path-value")),),
             network_policy="deny",
             resource_limits=ResourceLimits(30, 1024, 4096),
             requested_escalation="none",
             sandbox_backend="windows-native",
-            sandbox_capability_plan_digest="sandbox-plan-sha256",
+            sandbox_capability_plan_digest=_sha("sandbox-plan"),
         ),
     )
 
@@ -729,7 +891,7 @@ def test_exec_digest_binds_every_authorization_and_execution_field() -> None:
         replace(
             envelope,
             exec_request=replace(
-                request, command_utf8_sha256="other-command"
+                request, command_utf8_sha256=_sha("other-command")
             ),
         ),
         replace(
@@ -754,7 +916,7 @@ def test_exec_digest_binds_every_authorization_and_execution_field() -> None:
             envelope,
             exec_request=replace(
                 request,
-                env=(EnvVarHash("PATH", "other-value-sha256"),),
+                env=(EnvVarHash("PATH", _sha("other-value")),),
             ),
         ),
         replace(
@@ -784,7 +946,7 @@ def test_exec_digest_binds_every_authorization_and_execution_field() -> None:
             envelope,
             exec_request=replace(
                 request,
-                sandbox_capability_plan_digest="other-plan",
+                sandbox_capability_plan_digest=_sha("other-plan"),
             ),
         ),
     ]
@@ -942,3 +1104,184 @@ def test_windows_temp_and_replace_use_only_pinned_handles_and_basenames() -> Non
     assert rename[4] == "note.txt"
     assert not str(rename[4]).startswith(("C:", "\\"))
     filesystem.close()
+
+
+def test_exec_authorization_cannot_prepare_file_target() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="file_change"):
+            filesystem.prepare_target(
+                "safe/note.txt", _exec_authorization()
+            )
+    finally:
+        filesystem.close()
+
+
+def test_prepare_target_rejects_unlisted_path() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    authorization = _file_authorization(
+        "safe/other.txt",
+        FileIdentity("posix", "1", "41", 1, False),
+    )
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="not authorized"):
+            filesystem.prepare_target("safe/note.txt", authorization)
+    finally:
+        filesystem.close()
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["safe\\note.txt", "SAFE/NOTE.TXT"],
+)
+def test_windows_rejects_duplicate_canonical_authorization_aliases(
+    alias: str,
+) -> None:
+    from mochi.security.file_contract import FileChangeRequest, FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    identity = FileIdentity("windows", "10", "41", 1, False)
+    authorization = _file_authorization("safe/note.txt", identity)
+    file_request = authorization.file_request
+    assert file_request is not None
+    authorization = replace(
+        authorization,
+        file_request=FileChangeRequest(
+            entries=(
+                file_request.entries[0],
+                _entry(
+                    entry_id="0002",
+                    relative_path=alias,
+                    base_identity=identity,
+                ),
+            ),
+            patch_sha256=_sha("patch"),
+        ),
+    )
+    adapter = _FakeWindowsAdapter()
+    filesystem = WindowsSafeFilesystem(
+        "C:/workspace", adapter=adapter, enforce=True
+    )
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="canonical"):
+            filesystem.prepare_target("safe/note.txt", authorization)
+    finally:
+        filesystem.close()
+
+    assert adapter.nodes == {}
+
+
+def test_prepare_target_rejects_base_identity_mismatch() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    authorization = _file_authorization(
+        "safe/note.txt",
+        FileIdentity("posix", "1", "99", 1, False),
+    )
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="base identity"):
+            filesystem.prepare_target("safe/note.txt", authorization)
+    finally:
+        filesystem.close()
+
+
+def test_prepare_target_accepts_canonical_path_and_captured_identity() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    identity = FileIdentity("posix", "1", "41", 1, False)
+    authorization = _file_authorization("safe/./note.txt", identity)
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        target = filesystem.prepare_target(
+            "safe/note.txt", authorization
+        )
+        assert target.identity == identity
+        target.close()
+    finally:
+        filesystem.close()
+
+
+def test_unlink_requires_delete_authorization() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        target = filesystem.prepare_target(
+            "safe/note.txt", _authorization()
+        )
+        with pytest.raises(UnsafeFilesystemTarget, match="delete"):
+            filesystem.unlink(target)
+    finally:
+        filesystem.close()
+
+
+def test_replace_rejects_cross_authorization_operands() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        source = filesystem.prepare_target(
+            "safe/note.txt", _authorization()
+        )
+        destination = filesystem.prepare_target(
+            "safe/note.txt",
+            replace(_authorization(), policy_version="policy-v2"),
+        )
+        with pytest.raises(UnsafeFilesystemTarget, match="authorization"):
+            filesystem.replace(source, destination)
+    finally:
+        filesystem.close()
+
+
+def test_replace_destination_requires_update_or_rename() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    authorization = _file_authorization(
+        "safe/note.txt",
+        FileIdentity("posix", "1", "41", 1, False),
+        "delete",
+    )
+    filesystem = PosixSafeFilesystem(
+        "/workspace", adapter=_FakePosixAdapter()
+    )
+    try:
+        source = filesystem.prepare_target(
+            "safe/note.txt", authorization
+        )
+        destination = filesystem.prepare_target(
+            "safe/note.txt", authorization
+        )
+        with pytest.raises(
+            UnsafeFilesystemTarget, match="update or rename"
+        ):
+            filesystem.replace(source, destination)
+    finally:
+        filesystem.close()

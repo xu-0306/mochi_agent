@@ -9,8 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, cast
 
-from .file_contract import AuthorizationEnvelope, FileIdentity, authorization_request_digest
-from .safe_filesystem import SafeFilesystemUnavailable, SafeTarget, UnsafeFilesystemTarget
+from .file_contract import AuthorizationEnvelope, FileIdentity
+from .safe_filesystem import (
+    AuthorizedFileBinding,
+    SafeFilesystemUnavailable,
+    SafeTarget,
+    UnsafeFilesystemTarget,
+    resolve_authorized_file_binding,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,7 +306,7 @@ class _IssuedWindowsTarget:
     target: SafeTarget
     basename: str
     identity: FileIdentity
-    authorization_digest: str
+    binding: AuthorizedFileBinding
     pin: _WindowsPin
 
 
@@ -397,6 +403,10 @@ class WindowsSafeFilesystem:
             raise ValueError("filesystem is closed")
         if not isinstance(authorization, AuthorizationEnvelope):
             raise TypeError("authorization must be AuthorizationEnvelope")
+        if authorization.kind != "file_change":
+            raise UnsafeFilesystemTarget(
+                "file targets require a file_change authorization"
+            )
         if self._root_identity != authorization.context.workspace_identity:
             raise UnsafeFilesystemTarget(
                 "workspace identity does not match authorization"
@@ -421,26 +431,35 @@ class WindowsSafeFilesystem:
                 identity = self._verify_handle(
                     file_handle, hardlink=True
                 )
+                binding = resolve_authorized_file_binding(
+                    canonical_relative_path="\\".join(parts).casefold(),
+                    authorization=authorization,
+                    captured_identity=identity,
+                    canonicalize_authorized_path=lambda path: "\\".join(
+                        self._segments(path)
+                    ).casefold(),
+                )
+                pin = _WindowsPin(parent, file_handle, owns_parent)
+                target = SafeTarget._create(
+                    basename=parts[-1],
+                    identity=identity,
+                    authorization_digest=(
+                        binding.authorization_digest
+                    ),
+                    owner=self,
+                    parent=pin,
+                )
+                self._issued[id(target)] = _IssuedWindowsTarget(
+                    target=target,
+                    basename=parts[-1],
+                    identity=identity,
+                    binding=binding,
+                    pin=pin,
+                )
+                return target
             except BaseException:
                 self._adapter.close(file_handle)
                 raise
-            digest = authorization_request_digest(authorization)
-            pin = _WindowsPin(parent, file_handle, owns_parent)
-            target = SafeTarget._create(
-                basename=parts[-1],
-                identity=identity,
-                authorization_digest=digest,
-                owner=self,
-                parent=pin,
-            )
-            self._issued[id(target)] = _IssuedWindowsTarget(
-                target=target,
-                basename=parts[-1],
-                identity=identity,
-                authorization_digest=digest,
-                pin=pin,
-            )
-            return target
         except BaseException:
             if owns_parent:
                 self._adapter.close(parent)
@@ -458,7 +477,11 @@ class WindowsSafeFilesystem:
             or target.closed
             or target.basename != record.basename
             or target.identity != record.identity
-            or target.authorization_digest != record.authorization_digest
+            or target.identity != record.binding.base_identity
+            or (
+                target.authorization_digest
+                != record.binding.authorization_digest
+            )
             or target._parent is not record.pin
         ):
             raise UnsafeFilesystemTarget(
@@ -481,6 +504,10 @@ class WindowsSafeFilesystem:
 
     def unlink(self, target: SafeTarget) -> None:
         record = self._validated(target)
+        if record.binding.operation != "delete":
+            raise UnsafeFilesystemTarget(
+                "unlink requires delete authorization"
+            )
         self._adapter.ntset_unlink(record.pin.file_handle)
         self.release_target(target)
 
@@ -489,6 +516,17 @@ class WindowsSafeFilesystem:
     ) -> None:
         source_record = self._validated(source)
         destination_record = self._validated(destination)
+        if destination_record.binding.operation not in {
+            "update",
+            "rename",
+        }:
+            raise UnsafeFilesystemTarget(
+                "replace destination requires update or rename authorization"
+            )
+        if source_record.binding != destination_record.binding:
+            raise UnsafeFilesystemTarget(
+                "replace operands require the same authorization binding"
+            )
         self._adapter.ntset_replace(
             source_record.pin.file_handle,
             destination_record.pin.parent_handle,

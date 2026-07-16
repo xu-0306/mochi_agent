@@ -33,6 +33,24 @@ def _string(value: object, name: str, *, optional: bool = False) -> str | None:
     return value
 
 
+def _sha256_digest(
+    value: object,
+    name: str,
+    *,
+    optional: bool = False,
+) -> str | None:
+    digest = _string(value, name, optional=optional)
+    if digest is None:
+        return None
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(
+            f"{name} must be a 64-character lowercase hexadecimal SHA-256 digest"
+        )
+    return digest
+
+
 def _integer(value: object, name: str, *, optional: bool = False) -> int | None:
     if optional and value is None:
         return None
@@ -138,8 +156,16 @@ class ChangeEntry:
         if self.operation not in {"add", "update", "delete", "rename"}:
             raise ValueError("invalid change operation")
         for name in (
-            "base_sha256", "after_sha256", "before_blob_id", "after_blob_id",
-            "base_metadata_sha256", "after_metadata_sha256", "rename_source",
+            "base_sha256",
+            "after_sha256",
+            "base_metadata_sha256",
+            "after_metadata_sha256",
+        ):
+            _sha256_digest(getattr(self, name), name, optional=True)
+        for name in (
+            "before_blob_id",
+            "after_blob_id",
+            "rename_source",
             "dependency_group",
         ):
             _string(getattr(self, name), name, optional=True)
@@ -211,12 +237,19 @@ class FileChangeRequest:
             not isinstance(entry, ChangeEntry) for entry in self.entries
         ):
             raise ValueError("entries must be a tuple of ChangeEntry values")
+        keys = tuple(
+            (entry.entry_id, entry.relative_path) for entry in self.entries
+        )
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "entries contain a duplicate (entry_id, relative_path)"
+            )
         object.__setattr__(
             self,
             "entries",
             tuple(sorted(self.entries, key=lambda item: (item.entry_id, item.relative_path))),
         )
-        _string(self.patch_sha256, "patch_sha256", optional=True)
+        _sha256_digest(self.patch_sha256, "patch_sha256", optional=True)
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -245,7 +278,7 @@ class EnvVarHash:
 
     def __post_init__(self) -> None:
         _string(self.key, "key")
-        _string(self.value_sha256, "value_sha256")
+        _sha256_digest(self.value_sha256, "value_sha256")
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {"key": self.key, "value_sha256": self.value_sha256}
@@ -315,7 +348,7 @@ class ExecRequest:
     )
 
     def __post_init__(self) -> None:
-        _string(self.command_utf8_sha256, "command_utf8_sha256")
+        _sha256_digest(self.command_utf8_sha256, "command_utf8_sha256")
         _string(self.shell, "shell", optional=True)
         _string(self.executable, "executable")
         _string(self.resolved_cwd, "resolved_cwd")
@@ -332,7 +365,10 @@ class ExecRequest:
             raise ValueError("resource_limits must be ResourceLimits")
         _string(self.requested_escalation, "requested_escalation")
         _string(self.sandbox_backend, "sandbox_backend")
-        _string(self.sandbox_capability_plan_digest, "sandbox_capability_plan_digest")
+        _sha256_digest(
+            self.sandbox_capability_plan_digest,
+            "sandbox_capability_plan_digest",
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -441,8 +477,8 @@ class AuthorizationEnvelope:
 
     def __post_init__(self) -> None:
         version = _integer(self.schema_version, "schema_version")
-        if version is None or version < 1:
-            raise ValueError("schema_version must be positive")
+        if version != 1:
+            raise ValueError("schema_version must be 1")
         if self.kind not in {"file_change", "exec"}:
             raise ValueError("kind must be 'file_change' or 'exec'")
         if not isinstance(self.context, AuthorizationContext):
@@ -520,10 +556,15 @@ class ChangeManifest:
         if version is None or version < 1:
             raise ValueError("version must be positive")
         for name in (
-            "change_set_id", "workspace_root", "tool_name", "policy_version",
-            "created_at", "expires_at", "request_digest",
+            "change_set_id",
+            "workspace_root",
+            "tool_name",
+            "policy_version",
+            "created_at",
+            "expires_at",
         ):
             _string(getattr(self, name), name)
+        _sha256_digest(self.request_digest, "request_digest")
         if not isinstance(self.workspace_identity, FileIdentity):
             raise ValueError("workspace_identity must be a FileIdentity")
         if self.intent not in {"mutate", "undo"}:
@@ -532,12 +573,19 @@ class ChangeManifest:
             not isinstance(entry, ChangeEntry) for entry in self.entries
         ):
             raise ValueError("entries must be a tuple of ChangeEntry values")
+        keys = tuple(
+            (entry.entry_id, entry.relative_path) for entry in self.entries
+        )
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "entries contain a duplicate (entry_id, relative_path)"
+            )
         object.__setattr__(
             self,
             "entries",
             tuple(sorted(self.entries, key=lambda item: (item.entry_id, item.relative_path))),
         )
-        _string(self.patch_sha256, "patch_sha256", optional=True)
+        _sha256_digest(self.patch_sha256, "patch_sha256", optional=True)
         metadata = _mapping(self.ui_metadata, "ui_metadata")
         normalized_metadata = canonical_value(metadata)
         object.__setattr__(
@@ -634,7 +682,7 @@ def manifest_digest_projection(
     if isinstance(manifest, ChangeManifest):
         source: Mapping[str, object] = manifest.to_dict()
     elif isinstance(manifest, Mapping):
-        source = manifest
+        source = ChangeManifest.from_dict(manifest).to_dict()
     else:
         raise TypeError("manifest must be ChangeManifest or a mapping")
     projection = {

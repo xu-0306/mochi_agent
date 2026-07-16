@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
-from .file_contract import AuthorizationEnvelope, FileIdentity
+from .file_contract import (
+    AuthorizationEnvelope,
+    ChangeEntry,
+    FileIdentity,
+    authorization_request_digest,
+)
 
 
 class UnsafeFilesystemTarget(PermissionError):
@@ -19,6 +26,65 @@ class SafeFilesystemUnavailable(RuntimeError):
 
 class _TargetOwner(Protocol):
     def release_target(self, target: SafeTarget) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizedFileBinding:
+    """Canonical file authority captured when a SafeTarget is issued."""
+
+    entry_id: str
+    canonical_relative_path: str
+    operation: Literal["add", "update", "delete", "rename"]
+    base_identity: FileIdentity
+    authorization_digest: str
+
+
+def resolve_authorized_file_binding(
+    *,
+    canonical_relative_path: str,
+    authorization: AuthorizationEnvelope,
+    captured_identity: FileIdentity,
+    canonicalize_authorized_path: Callable[[str], str],
+) -> AuthorizedFileBinding:
+    """Resolve one unique canonical manifest entry to the pinned file."""
+
+    if (
+        authorization.kind != "file_change"
+        or authorization.file_request is None
+        or authorization.exec_request is not None
+    ):
+        raise UnsafeFilesystemTarget(
+            "file targets require a file_change authorization"
+        )
+
+    entries_by_path: dict[str, ChangeEntry] = {}
+    for entry in authorization.file_request.entries:
+        canonical_entry_path = canonicalize_authorized_path(
+            entry.relative_path
+        )
+        if canonical_entry_path in entries_by_path:
+            raise UnsafeFilesystemTarget(
+                "authorization contains duplicate canonical file paths"
+            )
+        entries_by_path[canonical_entry_path] = entry
+
+    entry = entries_by_path.get(canonical_relative_path)
+    if entry is None:
+        raise UnsafeFilesystemTarget(
+            "filesystem target is not authorized by the file request"
+        )
+    if entry.base_identity != captured_identity:
+        raise UnsafeFilesystemTarget(
+            "captured file identity does not match authorized base identity"
+        )
+
+    return AuthorizedFileBinding(
+        entry_id=entry.entry_id,
+        canonical_relative_path=canonical_relative_path,
+        operation=entry.operation,
+        base_identity=captured_identity,
+        authorization_digest=authorization_request_digest(authorization),
+    )
 
 
 class SafeTarget:
@@ -174,8 +240,10 @@ class SafeFilesystem:
 
 
 __all__ = [
+    "AuthorizedFileBinding",
     "SafeFilesystem",
     "SafeFilesystemUnavailable",
     "SafeTarget",
     "UnsafeFilesystemTarget",
+    "resolve_authorized_file_binding",
 ]
