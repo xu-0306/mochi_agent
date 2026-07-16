@@ -5526,14 +5526,22 @@ function LearningStorageForm({
 
 function SecuritySettingsForm({
   security,
+  sandbox,
   onUpdated,
 }: {
   security: api.SecuritySettings | undefined
+  sandbox: api.SandboxSettings | undefined
   onUpdated: (settings: api.Settings) => void
 }) {
   const { t } = useI18n()
   const [autonomyMode, setAutonomyMode] = React.useState<api.SecuritySettings['autonomy_mode']>(
     security?.autonomy_mode ?? 'trusted_workspace'
+  )
+  const [changeContractMode, setChangeContractMode] = React.useState<api.SecuritySettings['change_contract_mode']>(
+    security?.change_contract_mode ?? 'observe'
+  )
+  const [sandboxMode, setSandboxMode] = React.useState<api.SandboxSettings['mode']>(
+    sandbox?.mode ?? 'off'
   )
   const [requireFileWriteApproval, setRequireFileWriteApproval] = React.useState(security?.require_approval_for_file_write ?? false)
   const [requireExecApproval, setRequireExecApproval] = React.useState(security?.require_approval_for_exec ?? true)
@@ -5565,6 +5573,8 @@ function SecuritySettingsForm({
 
   React.useEffect(() => {
     setAutonomyMode(security?.autonomy_mode ?? 'trusted_workspace')
+    setChangeContractMode(security?.change_contract_mode ?? 'observe')
+    setSandboxMode(sandbox?.mode ?? 'off')
     setRequireFileWriteApproval(security?.require_approval_for_file_write ?? false)
     setRequireExecApproval(security?.require_approval_for_exec ?? true)
     setAgentRunDefaultMaxWallClockSec(
@@ -5582,7 +5592,7 @@ function SecuritySettingsForm({
     setFileOpsScope(security?.file_ops_scope ?? 'workspace')
     setMaxFileWriteSizeMb(String(security?.max_file_write_size_mb ?? 10.0))
     setFileUndoMaxSizeMb(String(security?.file_undo_max_size_mb ?? 2.0))
-  }, [security])
+  }, [security, sandbox])
 
   const handleAutonomyModeChange = (value: api.SecuritySettings['autonomy_mode']) => {
     setAutonomyMode(value)
@@ -5621,6 +5631,7 @@ function SecuritySettingsForm({
       const settings = await settingsApi.updateSettings({
         security: {
           autonomy_mode: autonomyMode,
+          change_contract_mode: changeContractMode,
           require_approval_for_file_write: requireFileWriteApproval,
           require_approval_for_exec: requireExecApproval,
           agent_run_default_max_wall_clock_sec:
@@ -5643,6 +5654,7 @@ function SecuritySettingsForm({
           max_file_write_size_mb: Number.parseFloat(maxFileWriteSizeMb) || 10.0,
           file_undo_max_size_mb: Number.parseFloat(fileUndoMaxSizeMb) || 2.0,
         },
+        sandbox: { mode: sandboxMode },
       })
       onUpdated(settings)
       setMessage({ type: 'success', text: t('settings.security.successSaved') })
@@ -5682,6 +5694,31 @@ function SecuritySettingsForm({
             </SelectContent>
           </Select>
         </label>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <label className="space-y-1.5">
+            <SettingLabel>File change contract</SettingLabel>
+            <Select value={changeContractMode} onValueChange={(value) => setChangeContractMode(value as api.SecuritySettings['change_contract_mode'])}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="observe">Observe — legacy file changes continue</SelectItem>
+                <SelectItem value="enforce">Enforce — fail closed without contract</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[11px] text-muted-foreground">{changeContractMode === 'observe' ? 'Shadow would-reject only; legacy mutation and Undo remain unchanged.' : 'File mutation and legacy Undo are blocked until the new contract is available.'}</p>
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>Execution sandbox</SettingLabel>
+            <Select value={sandboxMode} onValueChange={(value) => setSandboxMode(value as api.SandboxSettings['mode'])}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="off">Off — host execution permitted</SelectItem>
+                <SelectItem value="preferred">Preferred — degrade to host</SelectItem>
+                <SelectItem value="required">Required — fail closed</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[11px] text-muted-foreground">Backend: {sandbox?.backend_available ? sandbox.backend ?? 'available' : 'unavailable; no exec containment is active'}. Status: {sandbox?.status ?? 'off'}.</p>
+          </label>
+        </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-2">
             <span className="text-sm text-foreground">{t('settings.security.requireFileWriteApproval')}</span>
@@ -6464,6 +6501,7 @@ export default function SettingsPage() {
   const memorySection = React.useMemo(() => extractSection(settings, 'memory'), [settings])
   const learningSection = React.useMemo(() => extractSection(settings, 'learning'), [settings])
   const securitySection = React.useMemo(() => settings?.security, [settings])
+  const sandboxSection = React.useMemo(() => settings?.sandbox, [settings])
   const toolsSection = React.useMemo(() => settings?.tools ?? {}, [settings])
   const channelsSection = React.useMemo(() => extractSection(settings, 'channels'), [settings])
   const webSection = React.useMemo(() => extractSection(settings, 'web'), [settings])
@@ -6712,6 +6750,7 @@ export default function SettingsPage() {
             <TabsContent value="security" className="mt-0">
               <SecuritySettingsForm
                 security={securitySection}
+                sandbox={sandboxSection}
                 onUpdated={(updatedSettings) => setSettings(updatedSettings)}
               />
             </TabsContent>

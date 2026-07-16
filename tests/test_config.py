@@ -124,10 +124,12 @@ def test_default_config_is_valid() -> None:
     assert cfg.tools.web_search_searxng_base_url is None
     assert cfg.tools.web_search_brave_api_key is None
     assert cfg.security.autonomy_mode == "trusted_workspace"
+    assert cfg.security.change_contract_mode == "observe"
     assert cfg.security.require_approval_for_exec is True
     assert cfg.security.require_approval_for_file_write is False
     assert cfg.security.file_ops_scope == "workspace"
     assert cfg.security.file_undo_max_size_mb == 2.0
+    assert cfg.sandbox.mode == "off"
     assert cfg.workspace_dir == defaults.default_workspace_dir()
     assert cfg.sessions_dir == defaults.default_sessions_dir()
     assert cfg.skills_dir == defaults.default_skills_dir()
@@ -232,10 +234,42 @@ def test_default_yaml_parseable() -> None:
     assert cfg.tools.web_search_searxng_base_url is None
     assert cfg.tools.web_search_brave_api_key is None
     assert cfg.security.autonomy_mode == "trusted_workspace"
+    assert cfg.security.change_contract_mode == "observe"
     assert cfg.security.require_approval_for_exec is True
     assert cfg.security.require_approval_for_file_write is False
     assert cfg.security.file_ops_scope == "workspace"
     assert cfg.security.file_undo_max_size_mb == 2.0
+
+
+def test_legacy_config_without_protected_workspace_axes_uses_safe_rollout_defaults() -> None:
+    cfg = MochiConfig.model_validate(
+        {
+            "security": {
+                "autonomy_mode": "strict",
+                "require_approval_for_file_write": True,
+                "require_approval_for_exec": True,
+                "file_ops_scope": "workspace",
+            }
+        }
+    )
+
+    assert cfg.security.change_contract_mode == "observe"
+    assert cfg.sandbox.mode == "off"
+
+
+@pytest.mark.parametrize(
+    ("payload", "invalid_value"),
+    [
+        ({"security": {"change_contract_mode": "hybrid"}}, "hybrid"),
+        ({"sandbox": {"mode": "observe"}}, "observe"),
+    ],
+)
+def test_protected_workspace_axes_reject_invalid_modes(
+    payload: dict[str, object],
+    invalid_value: str,
+) -> None:
+    with pytest.raises(ValueError, match=invalid_value):
+        MochiConfig.model_validate(payload)
 
 
 def test_legacy_default_output_token_pair_migrates_to_auto() -> None:

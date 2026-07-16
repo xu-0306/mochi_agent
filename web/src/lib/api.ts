@@ -4178,6 +4178,7 @@ interface BackendSettings {
   channels: Record<string, ApiValue>
   web: Record<string, ApiValue>
   security?: Record<string, ApiValue>
+  sandbox?: Record<string, ApiValue>
   paths?: Record<string, ApiValue>
   update?: Record<string, ApiValue>
 }
@@ -4216,6 +4217,7 @@ export interface AgentSettings {
 
 export interface SecuritySettings {
   autonomy_mode: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
+  change_contract_mode: 'observe' | 'enforce'
   require_approval_for_file_write: boolean
   require_approval_for_exec: boolean
   command_rules: CommandRule[]
@@ -4232,6 +4234,16 @@ export interface SecuritySettings {
   max_file_write_size_mb: number
   file_ops_scope: 'workspace' | 'any'
   file_undo_max_size_mb: number
+}
+
+export interface SandboxSettings {
+  mode: 'off' | 'preferred' | 'required'
+  backend: string | null
+  backend_available: boolean
+  capabilities: { exec_containment: boolean }
+  status: 'off' | 'degraded' | 'blocked'
+  degraded: boolean
+  host_execution_allowed: boolean
 }
 
 export interface CommandRule {
@@ -4349,6 +4361,7 @@ export interface Settings {
   channels: Record<string, ApiValue>
   web: Record<string, ApiValue>
   security?: SecuritySettings
+  sandbox: SandboxSettings
   paths?: Record<string, ApiValue>
   update?: Record<string, ApiValue>
 }
@@ -4921,6 +4934,7 @@ export async function fetchSettings(): Promise<Settings> {
     channels: payload.channels,
     web: payload.web,
     security: normalizeSecuritySettings(payload.security),
+    sandbox: normalizeSandboxSettings(payload.sandbox),
     paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }
@@ -5109,6 +5123,7 @@ export interface AgentSettingsUpdate {
 
 export interface SecuritySettingsUpdate {
   autonomy_mode?: 'trusted_workspace' | 'strict' | 'high_autonomy' | 'auto_review'
+  change_contract_mode?: 'observe' | 'enforce'
   require_approval_for_file_write?: boolean
   require_approval_for_exec?: boolean
   command_rules?: CommandRule[]
@@ -5146,6 +5161,7 @@ export interface UpdateSettingsInput {
   gguf?: Partial<GGUFSettings>
   vllm?: Partial<VLLMSettings>
   security?: SecuritySettingsUpdate
+  sandbox?: Pick<SandboxSettings, 'mode'>
   paths?: PathSettingsUpdate
   download_missing_models?: boolean
   reload_voice?: boolean
@@ -5245,6 +5261,7 @@ function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined
 
   return {
     autonomy_mode: normalizedAutonomyMode,
+    change_contract_mode: getString(value.change_contract_mode) === 'enforce' ? 'enforce' : 'observe',
     require_approval_for_file_write:
       getBoolean(value.require_approval_for_file_write) ?? false,
     require_approval_for_exec: getBoolean(value.require_approval_for_exec) ?? true,
@@ -5309,6 +5326,30 @@ function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined
     max_file_write_size_mb: getNumber(value.max_file_write_size_mb) ?? 10.0,
     file_ops_scope: getString(value.file_ops_scope) === 'any' ? 'any' : 'workspace',
     file_undo_max_size_mb: getNumber(value.file_undo_max_size_mb) ?? 2.0,
+  }
+}
+
+function normalizeSandboxSettings(value: unknown): SandboxSettings {
+  const record = isRecord(value) ? value : {}
+  const rawMode = getString(record.mode)
+  const mode: SandboxSettings['mode'] =
+    rawMode === 'preferred' || rawMode === 'required' ? rawMode : 'off'
+  const rawStatus = getString(record.status)
+  const status: SandboxSettings['status'] =
+    rawStatus === 'degraded' || rawStatus === 'blocked' ? rawStatus : 'off'
+  const capabilities = isRecord(record.capabilities) ? record.capabilities : {}
+
+  return {
+    mode,
+    backend: getString(record.backend),
+    backend_available: getBoolean(record.backend_available) ?? false,
+    capabilities: {
+      exec_containment: getBoolean(capabilities.exec_containment) ?? false,
+    },
+    status,
+    degraded: getBoolean(record.degraded) ?? mode !== 'off',
+    host_execution_allowed:
+      getBoolean(record.host_execution_allowed) ?? mode !== 'required',
   }
 }
 
@@ -5383,6 +5424,7 @@ export async function updateSettings(input: UpdateSettingsInput): Promise<Settin
     channels: payload.channels,
     web: payload.web,
     security: normalizeSecuritySettings(payload.security),
+    sandbox: normalizeSandboxSettings(payload.sandbox),
     paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }
@@ -5425,6 +5467,7 @@ export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> 
     channels: payload.channels,
     web: payload.web,
     security: normalizeSecuritySettings(payload.security),
+    sandbox: normalizeSandboxSettings(payload.sandbox),
     paths: isRecord(payload.paths) ? payload.paths as Record<string, ApiValue> : undefined,
     update: isRecord(payload.update) ? payload.update as Record<string, ApiValue> : undefined,
   }

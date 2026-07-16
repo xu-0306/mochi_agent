@@ -28,6 +28,7 @@ from mochi.config.schema import (
     MochiConfig,
     OllamaConfig,
     RegisteredTTSVoiceConfig,
+    SandboxConfig,
     SecurityConfig,
     TelegramPlatformConfig,
     ToolsConfig,
@@ -227,6 +228,7 @@ class SecuritySettingsPatch(BaseModel):
     """可由 WebGUI 更新的非敏感安全設定。"""
 
     autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] | None = None
+    change_contract_mode: Literal["observe", "enforce"] | None = None
     require_approval_for_file_write: bool | None = None
     require_approval_for_exec: bool | None = None
     command_rules: list[dict[str, Any]] | None = None
@@ -243,6 +245,12 @@ class SecuritySettingsPatch(BaseModel):
     max_file_write_size_mb: float | None = Field(default=None, ge=0.0)
     file_ops_scope: Literal["workspace", "any"] | None = None
     file_undo_max_size_mb: float | None = Field(default=None, ge=0.0)
+
+
+class SandboxSettingsPatch(BaseModel):
+    """Execution sandbox rollout mode; status is derived from backend availability."""
+
+    mode: Literal["off", "preferred", "required"] | None = None
 
 
 class ToolsSettingsPatch(BaseModel):
@@ -345,6 +353,7 @@ class UpdateSettingsRequest(BaseModel):
     paths: PathSettingsPatch | None = None
     channels: ChannelsSettingsPatch | None = None
     security: SecuritySettingsPatch | None = None
+    sandbox: SandboxSettingsPatch | None = None
     tools: ToolsSettingsPatch | None = None
     local_models: LocalModelSettingsPatch | None = None
     ollama: OllamaSettingsPatch | None = None
@@ -664,6 +673,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
         },
         "security": {
             "autonomy_mode": config.security.autonomy_mode,
+            "change_contract_mode": config.security.change_contract_mode,
             "require_approval_for_file_write": config.security.require_approval_for_file_write,
             "require_approval_for_exec": config.security.require_approval_for_exec,
             "command_rules": [rule.model_dump() for rule in config.security.command_rules],
@@ -680,6 +690,21 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "max_file_write_size_mb": config.security.max_file_write_size_mb,
             "file_ops_scope": config.security.file_ops_scope,
             "file_undo_max_size_mb": config.security.file_undo_max_size_mb,
+        },
+        "sandbox": {
+            "mode": config.sandbox.mode,
+            "backend": None,
+            "backend_available": False,
+            "capabilities": {"exec_containment": False},
+            "status": (
+                "off"
+                if config.sandbox.mode == "off"
+                else "degraded"
+                if config.sandbox.mode == "preferred"
+                else "blocked"
+            ),
+            "degraded": config.sandbox.mode != "off",
+            "host_execution_allowed": config.sandbox.mode != "required",
         },
         "paths": {
             "workspace_dir": config.workspace_dir,
@@ -807,6 +832,14 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
             {
                 **config.security.model_dump(),
                 **security_updates,
+            }
+        )
+
+    if payload.sandbox is not None:
+        updates["sandbox"] = SandboxConfig.model_validate(
+            {
+                **config.sandbox.model_dump(),
+                **payload.sandbox.model_dump(exclude_unset=True),
             }
         )
 

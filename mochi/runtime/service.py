@@ -26,7 +26,7 @@ from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiA
 from mochi.api.routes.chat import _serialize_event
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config.manager import save_config
-from mochi.config.schema import CommandRuleConfig, MochiConfig, SecurityConfig
+from mochi.config.schema import CommandRuleConfig, MochiConfig, SandboxConfig, SecurityConfig
 from mochi.goal_intent import (
     GoalStrategySelectionResult,
     select_goal_strategy_from_registry,
@@ -494,6 +494,7 @@ class RuntimeService:
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._active_agent_run_jobs: dict[str, asyncio.Task[None]] = {}
         self._security_config = SecurityConfig()
+        self._sandbox_config = SandboxConfig()
         self._bound_config: MochiConfig | None = None
         self._bound_config_path: str | Path | None = None
         self._scheduler_poll_interval_seconds = self._DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS
@@ -511,6 +512,9 @@ class RuntimeService:
     def update_security_config(self, security: SecurityConfig) -> None:
         self._security_config = security
 
+    def update_sandbox_config(self, sandbox: SandboxConfig) -> None:
+        self._sandbox_config = sandbox
+
     def bind_app_config(
         self,
         *,
@@ -519,6 +523,65 @@ class RuntimeService:
     ) -> None:
         self._bound_config = config
         self._bound_config_path = config_path
+        self.update_security_config(config.security)
+        self.update_sandbox_config(config.sandbox)
+
+    def protected_workspace_session_projection(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Project independent file-contract and exec-sandbox rollout decisions."""
+        change_mode = self._security_config.change_contract_mode
+        sandbox_mode = self._sandbox_config.mode
+        observing = change_mode == "observe"
+        sandbox_required = sandbox_mode == "required"
+        return {
+            "session_id": session_id,
+            "change_contract": {
+                "mode": change_mode,
+                "backend": "legacy_file_mutation",
+                "contract_available": False,
+                "capabilities": {
+                    "legacy_file_mutation": True,
+                    "edited_patch_replay": False,
+                    "contract_enforcement": False,
+                },
+                "status": "observing" if observing else "blocked",
+                "degraded": not observing,
+                "file_mutation_decision": (
+                    "allow_legacy" if observing else "reject_contract_unavailable"
+                ),
+                "legacy_undo_decision": (
+                    "allow_legacy" if observing else "reject_contract_unavailable"
+                ),
+                "shadow_decision": (
+                    "would_reject_contract_unavailable" if observing else None
+                ),
+            },
+            "sandbox": {
+                "mode": sandbox_mode,
+                "backend": None,
+                "backend_available": False,
+                "capabilities": {"exec_containment": False},
+                "status": (
+                    "off"
+                    if sandbox_mode == "off"
+                    else "degraded"
+                    if sandbox_mode == "preferred"
+                    else "blocked"
+                ),
+                "degraded": sandbox_mode != "off",
+                "host_execution_allowed": not sandbox_required,
+                "exec_decision": (
+                    "reject_backend_unavailable"
+                    if sandbox_required
+                    else "allow_host_degraded"
+                    if sandbox_mode == "preferred"
+                    else "allow_host"
+                ),
+            },
+        }
 
     async def _persist_command_rule(self, rule: dict[str, Any] | None) -> dict[str, Any] | None:
         validated_rule = _validated_command_rule(rule)

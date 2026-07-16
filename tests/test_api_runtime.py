@@ -11,6 +11,8 @@ import time
 from typing import Any
 import sys
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from mochi.agents.events import (
@@ -41,6 +43,66 @@ from mochi.runtime.service import (
 )
 from mochi.runtime.store import RuntimeStore
 from mochi.utils.shell_providers import BaseShellProvider, SubprocessSpec
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(
+            ("observe", "allow_legacy", "allow_legacy", "would_reject_contract_unavailable"),
+            id="observe-non-blocking",
+        ),
+        pytest.param(
+            ("enforce", "reject_contract_unavailable", "reject_contract_unavailable", None),
+            id="enforce-fail-closed",
+        ),
+    ]
+)
+def change_contract_path(
+    request: pytest.FixtureRequest,
+) -> tuple[str, str, str, str | None]:
+    """Reusable observe/enforce contract paths for rollout-gate tests."""
+    return request.param
+
+
+@pytest.mark.parametrize(
+    ("sandbox_mode", "expected_exec_decision", "expected_sandbox_status"),
+    [
+        ("off", "allow_host", "off"),
+        ("preferred", "allow_host_degraded", "degraded"),
+        ("required", "reject_backend_unavailable", "blocked"),
+    ],
+)
+def test_protected_workspace_decision_matrix_keeps_axes_independent(
+    tmp_path: Path,
+    change_contract_path: tuple[str, str, str, str | None],
+    sandbox_mode: str,
+    expected_exec_decision: str,
+    expected_sandbox_status: str,
+) -> None:
+    change_mode, expected_file_decision, expected_undo_decision, expected_shadow = (
+        change_contract_path
+    )
+    config = MochiConfig.model_validate(
+        {
+            "security": {"change_contract_mode": change_mode},
+            "sandbox": {"mode": sandbox_mode},
+        }
+    )
+    service = RuntimeService(engine=object(), store=RuntimeStore(tmp_path / "runtime.db"))
+    service.bind_app_config(config=config, config_path=None)
+
+    projection = service.protected_workspace_session_projection(session_id="session-rollout")
+
+    assert projection["session_id"] == "session-rollout"
+    assert projection["change_contract"]["mode"] == change_mode
+    assert projection["change_contract"]["file_mutation_decision"] == expected_file_decision
+    assert projection["change_contract"]["legacy_undo_decision"] == expected_undo_decision
+    assert projection["change_contract"]["shadow_decision"] == expected_shadow
+    assert projection["sandbox"]["mode"] == sandbox_mode
+    assert projection["sandbox"]["exec_decision"] == expected_exec_decision
+    assert projection["sandbox"]["status"] == expected_sandbox_status
+    assert projection["sandbox"]["backend"] is None
+    assert projection["sandbox"]["capabilities"] == {"exec_containment": False}
 
 
 def test_chat_serializer_preserves_final_answer_metadata() -> None:

@@ -701,6 +701,9 @@ class CommandRuleConfig(BaseModel):
 class SecurityConfig(BaseModel):
     """安全設定。"""
 
+    change_contract_mode: Literal["observe", "enforce"] = "observe"
+    """File-change contract rollout mode; independent from execution sandboxing."""
+
     autonomy_mode: Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"] = "trusted_workspace"
     """Autonomy preset mapped to runtime approval behavior."""
 
@@ -810,6 +813,13 @@ class SecurityConfig(BaseModel):
                 file_ops_scope=file_ops_scope,
             ),
         }
+
+
+class SandboxConfig(BaseModel):
+    """Execution sandbox rollout settings; no containment backend exists yet."""
+
+    mode: Literal["off", "preferred", "required"] = "off"
+    """Exec containment policy, independent from the file-change contract mode."""
 
 
 class WebConfig(BaseModel):
@@ -1067,6 +1077,9 @@ class MochiConfig(BaseModel):
 
     # 安全
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+
+    # Execution sandbox rollout
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
 
     # Web API
     web: WebConfig = Field(default_factory=WebConfig)

@@ -924,6 +924,7 @@ def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> N
     assert payload["web"] == {"host": "127.0.0.1", "port": 9000}
     assert payload["security"] == {
         "autonomy_mode": "trusted_workspace",
+        "change_contract_mode": "observe",
         "require_approval_for_file_write": False,
         "require_approval_for_exec": True,
         "command_rules": [],
@@ -1468,6 +1469,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
         }
         assert payload["security"] == {
             "autonomy_mode": "auto_review",
+            "change_contract_mode": "observe",
             "require_approval_for_file_write": False,
             "require_approval_for_exec": False,
             "command_rules": [],
@@ -1509,6 +1511,71 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
     assert followup_payload["security"]["exec_session_output_limit"] == 16384
     assert followup_payload["security"]["file_ops_scope"] == "any"
     assert followup_payload["security"]["file_undo_max_size_mb"] == 1.5
+
+
+def test_settings_round_trip_exposes_independent_protected_workspace_axes(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(tmp_path / "workspace"),
+            "security": {"change_contract_mode": "enforce"},
+            "sandbox": {"mode": "preferred"},
+        }
+    )
+    app = _create_test_app(config=config)
+
+    with TestClient(app) as client:
+        initial = client.get("/v1/settings")
+        updated = client.patch(
+            "/v1/settings",
+            json={
+                "security": {"change_contract_mode": "observe"},
+                "sandbox": {"mode": "required"},
+                "persist": False,
+            },
+        )
+        followup = client.get("/v1/settings")
+
+    assert initial.status_code == 200
+    assert initial.json()["security"]["change_contract_mode"] == "enforce"
+    assert initial.json()["sandbox"] == {
+        "mode": "preferred",
+        "backend": None,
+        "backend_available": False,
+        "capabilities": {"exec_containment": False},
+        "status": "degraded",
+        "degraded": True,
+        "host_execution_allowed": True,
+    }
+    assert updated.status_code == 200
+    assert updated.json()["security"]["change_contract_mode"] == "observe"
+    assert updated.json()["sandbox"] == {
+        "mode": "required",
+        "backend": None,
+        "backend_available": False,
+        "capabilities": {"exec_containment": False},
+        "status": "blocked",
+        "degraded": True,
+        "host_execution_allowed": False,
+    }
+    assert followup.status_code == 200
+    assert followup.json()["security"]["change_contract_mode"] == "observe"
+    assert followup.json()["sandbox"]["mode"] == "required"
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"security": {"change_contract_mode": "hybrid"}},
+        {"sandbox": {"mode": "observe"}},
+    ],
+)
+def test_settings_rejects_invalid_protected_workspace_modes(patch: dict[str, object]) -> None:
+    app = _create_test_app(config=MochiConfig())
+
+    with TestClient(app) as client:
+        response = client.patch("/v1/settings", json={**patch, "persist": False})
+
+    assert response.status_code == 422
 
 
 def test_settings_patch_persists_auto_output_token_mode(tmp_path: Path) -> None:
@@ -1609,6 +1676,7 @@ def test_settings_patch_applies_autonomy_mode_defaults(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["security"] == {
         "autonomy_mode": "high_autonomy",
+        "change_contract_mode": "observe",
         "require_approval_for_file_write": False,
         "require_approval_for_exec": False,
         "command_rules": [],
