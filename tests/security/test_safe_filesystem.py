@@ -369,6 +369,93 @@ def test_manifest_projection_fully_validates_raw_mappings() -> None:
     with pytest.raises(ValueError, match="lowercase hexadecimal"):
         manifest_digest_projection(payload)
 
+
+def test_authorized_file_binding_captures_all_content_and_metadata_hashes() -> None:
+    from mochi.security.safe_filesystem import (
+        resolve_authorized_file_binding,
+    )
+
+    authorization = _authorization()
+    entry = authorization.file_request.entries[0]
+
+    binding = resolve_authorized_file_binding(
+        canonical_relative_path="safe/note.txt",
+        authorization=authorization,
+        captured_identity=entry.base_identity,
+        canonicalize_authorized_path=lambda path: path,
+    )
+
+    assert binding.base_sha256 == entry.base_sha256
+    assert binding.after_sha256 == entry.after_sha256
+    assert binding.base_metadata_sha256 == entry.base_metadata_sha256
+    assert binding.after_metadata_sha256 == entry.after_metadata_sha256
+
+
+def test_authorized_file_binding_rejects_tampered_or_alternate_entry_substitution() -> None:
+    from mochi.security.file_contract import FileChangeRequest
+    from mochi.security.safe_filesystem import (
+        resolve_authorized_file_binding,
+    )
+
+    original = _authorization()
+    first_entry = original.file_request.entries[0]
+    alternate_entry = replace(
+        first_entry,
+        entry_id="0002",
+        relative_path="safe/other.txt",
+        base_sha256=_sha("alternate-base"),
+        after_sha256=_sha("alternate-after"),
+        base_metadata_sha256=_sha("alternate-base-metadata"),
+        after_metadata_sha256=_sha("alternate-after-metadata"),
+    )
+    authorization = replace(
+        original,
+        file_request=FileChangeRequest(
+            entries=(first_entry, alternate_entry),
+            patch_sha256=original.file_request.patch_sha256,
+        ),
+    )
+
+    def resolve(path: str, envelope=authorization):
+        return resolve_authorized_file_binding(
+            canonical_relative_path=path,
+            authorization=envelope,
+            captured_identity=first_entry.base_identity,
+            canonicalize_authorized_path=lambda value: value,
+        )
+
+    expected = resolve("safe/note.txt")
+    alternate = resolve("safe/other.txt")
+    tampered_entry = replace(
+        first_entry,
+        after_sha256=_sha("tampered-after"),
+        after_metadata_sha256=_sha("tampered-after-metadata"),
+    )
+    tampered_authorization = replace(
+        original,
+        file_request=FileChangeRequest(
+            entries=(tampered_entry,),
+            patch_sha256=original.file_request.patch_sha256,
+        ),
+    )
+    tampered = resolve("safe/note.txt", tampered_authorization)
+
+    assert alternate != expected
+    assert tampered != expected
+    assert alternate.after_sha256 == alternate_entry.after_sha256
+    assert tampered.after_sha256 == tampered_entry.after_sha256
+    assert tampered.after_metadata_sha256 == (
+        tampered_entry.after_metadata_sha256
+    )
+    assert tampered.authorization_digest != expected.authorization_digest
+    hash_only_alternate = replace(
+        alternate,
+        entry_id=expected.entry_id,
+        canonical_relative_path=expected.canonical_relative_path,
+    )
+    assert hash_only_alternate != expected
+
+
 class _FakePosixAdapter:
     O_RDONLY = 0
     O_WRONLY = 1
@@ -1205,6 +1292,10 @@ def test_facade_create_temp_returns_backend_issued_staged_capability() -> None:
         base_identity=FileIdentity(
             "posix", "1", "41", 1, False
         ),
+        base_sha256=_sha("base-content"),
+        after_sha256=_sha("after-content"),
+        base_metadata_sha256=_sha("base-metadata"),
+        after_metadata_sha256=_sha("after-metadata"),
         authorization_digest=staged.authorization_digest,
     )
     with pytest.raises(AttributeError, match="immutable"):

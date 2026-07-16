@@ -54,6 +54,10 @@ class AuthorizedFileBinding:
     canonical_relative_path: str
     operation: Literal["add", "update", "delete", "rename"]
     base_identity: FileIdentity
+    base_sha256: str | None
+    after_sha256: str | None
+    base_metadata_sha256: str | None
+    after_metadata_sha256: str | None
     authorization_digest: str
 
 
@@ -101,6 +105,10 @@ def resolve_authorized_file_binding(
         canonical_relative_path=canonical_relative_path,
         operation=entry.operation,
         base_identity=captured_identity,
+        base_sha256=entry.base_sha256,
+        after_sha256=entry.after_sha256,
+        base_metadata_sha256=entry.base_metadata_sha256,
+        after_metadata_sha256=entry.after_metadata_sha256,
         authorization_digest=authorization_request_digest(authorization),
     )
 
