@@ -112,6 +112,7 @@ class _BehavioralTransactionOwner:
         self.discarded_temp: StagedTemp | None = None
         self.successor_identity = FileIdentity("posix", "1", "99", 1, False)
         self.replace_result: object = self.successor_identity
+        self.temp_parent = object()
         self.target = SafeTarget._create(
             basename="note.txt",
             identity=self.binding.base_identity,
@@ -142,7 +143,7 @@ class _BehavioralTransactionOwner:
             identity=self.successor_identity,
             binding=self.binding,
             owner=self,
-            parent=target._parent,
+            parent=self.temp_parent,
         )
         self.issued_temp = temp
         self.temp_live = self.temp_resource_open = True
@@ -164,8 +165,6 @@ class _BehavioralTransactionOwner:
             object.__setattr__(
                 temp, "_authorization_digest", _sha_label("different-auth")
             )
-        elif self.temp_tamper == "parent":
-            object.__setattr__(temp, "_parent", object())
         return temp
 
     def write_temp(self, temp: StagedTemp, data: memoryview) -> int:
@@ -413,6 +412,45 @@ def test_owner_binding_requires_exact_authorized_binding(
     assert not target.closed
 
 
+def test_distinct_parent_owner_temp_completes_transaction() -> None:
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    owner, target, snapshot = _transaction()
+    assert owner.temp_parent is not target._parent
+
+    result = atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert result.successor_identity == owner.successor_identity
+    assert owner.original_bytes == _AFTER_BYTES
+    assert owner.issued_temp is not None and owner.issued_temp.closed
+    assert target.closed
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["binding", "authorization_digest"],
+)
+def test_semantic_temp_mismatch_is_discarded_after_owner_claim(
+    tamper: str,
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    owner, target, snapshot = _transaction()
+    owner.temp_tamper = tamper
+
+    with pytest.raises(UnsafeFilesystemTarget, match="staged temp"):
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert owner.events == ["create_temp", "discard_temp"]
+    assert owner.discard_attempts == 1
+    assert owner.discarded_temp is owner.issued_temp
+    assert owner.issued_temp is not None and owner.issued_temp.closed
+    assert not owner.temp_live and not owner.temp_resource_open
+    assert owner.original_bytes == _BASE_BYTES
+    assert owner.original_identity == owner.binding.base_identity
+    assert owner.target_resource_open and not target.closed
+
 @pytest.mark.parametrize(
     "tamper",
     [
@@ -420,9 +458,6 @@ def test_owner_binding_requires_exact_authorized_binding(
         "closed",
         "authenticity",
         "foreign_owner",
-        "binding",
-        "authorization_digest",
-        "parent",
     ],
 )
 def test_untrusted_temp_candidate_is_rejected_before_staging(
