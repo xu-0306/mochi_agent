@@ -298,7 +298,12 @@ def check_file_tool_path(
     scope: str,
     access: str = "write",
 ) -> tuple[Path | None, SecurityDecision | None]:
-    """Resolve a tool path and reject suspicious or protected locations."""
+    """Run policy preflight only; this does not authorize a filesystem mutation.
+
+    The returned path is suitable for policy/UI decisions, never as a mutation
+    capability. Call ``SafeFilesystem.prepare_target`` after preflight and pass
+    its ``SafeTarget`` to every mutation primitive.
+    """
     raw_path = str(path)
     if _is_suspicious_raw_path(raw_path):
         return (
