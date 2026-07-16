@@ -75,6 +75,8 @@ class _BehavioralTransactionOwner:
         self.binding_calls = 0
         self.write_plan = list(write_plan or [])
         self.failures = dict(failures or {})
+        self.committed_replace_failure: BaseException | None = None
+        self.discard_attempts = 0
         self.original_bytes = _BASE_BYTES
         self.original_metadata_sha256 = self.binding.base_metadata_sha256
         self.original_identity = self.binding.base_identity
@@ -192,9 +194,12 @@ class _BehavioralTransactionOwner:
         self.target_resource_open = False
         source._mark_closed()
         destination._mark_closed()
+        if self.committed_replace_failure is not None:
+            raise self.committed_replace_failure
         return self.successor_identity
 
     def discard_temp(self, temp: StagedTemp) -> None:
+        self.discard_attempts += 1
         assert temp is self.issued_temp and self.temp_live
         self.events.append("discard_temp")
         self.discarded_temp = temp
@@ -440,6 +445,34 @@ def test_replace_precommit_failure_discards_temp_and_preserves_target() -> None:
     assert not owner.temp_live
     assert owner.original_live and owner.original_bytes == _BASE_BYTES
     assert owner.target_resource_open and not target.closed
+
+
+def test_committed_replace_failure_is_not_discarded_or_wrapped() -> None:
+    from mochi.security.safe_filesystem import (
+        CommittedFilesystemMutationError,
+    )
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    committed = CommittedFilesystemMutationError(
+        phase="release_target",
+        cause=OSError("target release failed after replace"),
+    )
+    owner, target, snapshot = _transaction()
+    owner.committed_replace_failure = committed
+
+    with pytest.raises(CommittedFilesystemMutationError) as raised:
+        atomic_write_bytes(target, _AFTER_BYTES, snapshot)
+
+    assert raised.value is committed
+    assert owner.discard_attempts == 0
+    assert getattr(committed, "__notes__", ()) == ()
+    assert owner.events[-1] == "replace"
+    assert owner.original_bytes == _AFTER_BYTES
+    assert owner.original_identity == owner.successor_identity
+    assert owner.issued_temp is not None and owner.issued_temp.closed
+    assert target.closed
+    assert not owner.temp_live and not owner.temp_resource_open
+    assert not owner.target_resource_open
 
 
 def test_success_runs_exact_foundation_sequence_and_consumes_operands() -> None:

@@ -12,6 +12,9 @@ from ..security.file_contract import FileIdentity as _FileIdentity
 from ..security.safe_filesystem import (
     AuthorizedFileBinding as _AuthorizedFileBinding,
 )
+from ..security.safe_filesystem import (
+    CommittedFilesystemMutationError as _CommittedFilesystemMutationError,
+)
 from ..security.safe_filesystem import SafeTarget as _SafeTarget
 from ..security.safe_filesystem import StagedTemp as _StagedTemp
 from ..security.safe_filesystem import (
@@ -183,6 +186,8 @@ def atomic_write_bytes(
         owner.flush_temp(temp)
         owner.revalidate_base(target, metadata_snapshot)
         successor_identity = owner.replace(temp, target)
+    except _CommittedFilesystemMutationError:
+        raise
     except BaseException as primary:
         if temp is not None:
             try:
