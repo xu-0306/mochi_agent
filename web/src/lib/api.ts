@@ -5350,7 +5350,11 @@ function normalizeSandboxSettings(value: unknown): SandboxSettings {
     rawPolicyDecision === 'prefer_sandbox_backend' ||
     rawPolicyDecision === 'reject_backend_unavailable'
       ? rawPolicyDecision
-      : 'allow_host'
+      : mode === 'preferred'
+        ? 'prefer_sandbox_backend'
+        : mode === 'required'
+          ? 'reject_backend_unavailable'
+          : 'allow_host'
   const capabilities = isRecord(record.capabilities) ? record.capabilities : {}
 
   return {

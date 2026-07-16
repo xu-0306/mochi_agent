@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 from pathlib import Path
 
@@ -92,6 +93,39 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
         update_response = client.patch("/v1/sessions/alpha", json={"title": "Alpha"})
         assert update_response.status_code == 200
         assert update_response.json()["protected_workspace"] == alpha_projection
+
+        assert getattr(app.state, "runtime_service", None) is None
+
+
+@pytest.mark.parametrize("sandbox_mode", ["off", "preferred", "required"])
+def test_session_and_settings_share_sandbox_rollout_projection(
+    tmp_path: Path,
+    sandbox_mode: str,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate(
+        {
+            "sessions_dir": str(sessions_dir),
+            "sandbox": {"mode": sandbox_mode},
+        }
+    )
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        session_response = client.post(
+            "/v1/sessions",
+            json={"session_id": f"sandbox-{sandbox_mode}"},
+        )
+        settings_response = client.get("/v1/settings")
+
+    assert session_response.status_code == 200
+    assert settings_response.status_code == 200
+    assert (
+        session_response.json()["protected_workspace"]["sandbox"]
+        == settings_response.json()["sandbox"]
+    )
+    assert importlib.util.find_spec("mochi.security.rollout") is not None
+    assert getattr(app.state, "runtime_service", None) is None
 
 
 def test_get_missing_session_returns_empty_events(tmp_path: Path) -> None:

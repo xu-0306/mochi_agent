@@ -14,12 +14,14 @@ from pydantic import BaseModel, Field
 from mochi.api.routes.approvals import _get_runtime_service
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
+from mochi.config.schema import MochiConfig
 from mochi.runtime.models import (
     AgentRunMessageRequest,
     SessionSubagentMessageRequest,
     SubagentTranscriptDetail,
     SubagentTranscriptSummary,
 )
+from mochi.security.rollout import project_protected_workspace_rollout
 from mochi.sessions.store import SessionStore
 from mochi.terminal_goal_helpers import normalize_goal_session_state
 
@@ -161,9 +163,15 @@ def _get_session_store(app: object, *, config: object | None = None) -> SessionS
     return store
 
 
-async def _protected_workspace_projection(app: object, session_id: str) -> dict[str, Any]:
-    service = await _get_runtime_service(app)
-    return service.protected_workspace_session_projection(session_id=session_id)
+def _protected_workspace_projection(
+    config: MochiConfig,
+    session_id: str,
+) -> dict[str, Any]:
+    return project_protected_workspace_rollout(
+        config.security,
+        config.sandbox,
+        session_id=session_id,
+    )
 
 
 async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]]:
@@ -436,7 +444,7 @@ async def create_session(
         return {
             "type": "session",
             "session_id": session_id,
-            "protected_workspace": await _protected_workspace_projection(app, session_id),
+            "protected_workspace": _protected_workspace_projection(config, session_id),
         }
 
     if request is not None and request.project_id is not None:
@@ -459,7 +467,7 @@ async def create_session(
     return {
         "type": "session",
         "session_id": session_id,
-        "protected_workspace": await _protected_workspace_projection(app, session_id),
+        "protected_workspace": _protected_workspace_projection(config, session_id),
     }
 
 
@@ -472,8 +480,8 @@ async def list_sessions(http_request: Request) -> dict[str, object]:
     items = await _list_session_summaries(store)
     for item in items:
         session_id = str(item["session_id"])
-        item["protected_workspace"] = await _protected_workspace_projection(
-            app, session_id
+        item["protected_workspace"] = _protected_workspace_projection(
+            config, session_id
         )
     return {"type": "sessions", "items": items}
 
@@ -493,7 +501,7 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "workflow": _session_workflow_state(events),
         "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
-        "protected_workspace": await _protected_workspace_projection(app, session_id),
+        "protected_workspace": _protected_workspace_projection(config, session_id),
         "events": events,
     }
 
@@ -848,7 +856,7 @@ async def update_session(
         "workflow": _session_workflow_state(events),
         "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
-        "protected_workspace": await _protected_workspace_projection(app, session_id),
+        "protected_workspace": _protected_workspace_projection(config, session_id),
         "events": events,
     }
 

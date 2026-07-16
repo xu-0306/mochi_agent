@@ -37,6 +37,7 @@ from mochi.config.schema import (
 )
 from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.security.policy import autonomy_mode_defaults
+from mochi.security.rollout import project_sandbox_rollout
 from mochi.tools.web_search_providers import build_web_search_provider_status_payload
 from mochi.voice.model_manager import (
     ensure_model_available,
@@ -691,33 +692,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "file_ops_scope": config.security.file_ops_scope,
             "file_undo_max_size_mb": config.security.file_undo_max_size_mb,
         },
-        "sandbox": {
-            "mode": config.sandbox.mode,
-            "backend": None,
-            "backend_available": False,
-            "capabilities": {"exec_containment": False},
-            "enforcement_active": False,
-            "configured_policy_decision": (
-                "allow_host"
-                if config.sandbox.mode == "off"
-                else "prefer_sandbox_backend"
-                if config.sandbox.mode == "preferred"
-                else "reject_backend_unavailable"
-            ),
-            "effective_exec_behavior": "host_execution_available",
-            "status": (
-                "not_enforced"
-                if config.sandbox.mode == "off"
-                else "configured_unavailable"
-            ),
-            "degraded": config.sandbox.mode != "off",
-            "degraded_reason": (
-                None
-                if config.sandbox.mode == "off"
-                else "sandbox_backend_unavailable_and_pipeline_not_connected"
-            ),
-            "host_execution_allowed": True,
-        },
+        "sandbox": project_sandbox_rollout(config.sandbox),
         "paths": {
             "workspace_dir": config.workspace_dir,
             "sessions_dir": config.sessions_dir,

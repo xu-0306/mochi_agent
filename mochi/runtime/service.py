@@ -83,6 +83,7 @@ from mochi.runtime.recovery import (
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
 from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
+from mochi.security.rollout import project_protected_workspace_rollout
 from mochi.tools.base import ToolExecutionContext, ToolResult
 from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_exec_runtime
 from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileWriteTool
@@ -532,62 +533,11 @@ class RuntimeService:
         session_id: str | None = None,
     ) -> dict[str, Any]:
         """Project configured rollout intent separately from effective legacy behavior."""
-        change_mode = self._security_config.change_contract_mode
-        sandbox_mode = self._sandbox_config.mode
-        observing = change_mode == "observe"
-        sandbox_configured = sandbox_mode != "off"
-        return {
-            "session_id": session_id,
-            "change_contract": {
-                "mode": change_mode,
-                "backend": "legacy_file_mutation",
-                "contract_available": False,
-                "capabilities": {
-                    "legacy_file_mutation": True,
-                    "edited_patch_replay": False,
-                    "contract_enforcement": False,
-                },
-                "configured_policy_decision": (
-                    "allow_legacy" if observing else "reject_contract_unavailable"
-                ),
-                "enforcement_active": False,
-                "effective_file_behavior": "legacy_mutation_allowed",
-                "effective_undo_behavior": "legacy_undo_available",
-                "status": "not_enforced" if observing else "configured_unavailable",
-                "degraded": not observing,
-                "degraded_reason": (
-                    None if observing else "file_contract_pipeline_not_connected"
-                ),
-                "shadow_decision": (
-                    "would_reject_contract_unavailable" if observing else None
-                ),
-            },
-            "sandbox": {
-                "mode": sandbox_mode,
-                "backend": None,
-                "backend_available": False,
-                "capabilities": {"exec_containment": False},
-                "configured_policy_decision": (
-                    "allow_host"
-                    if sandbox_mode == "off"
-                    else "prefer_sandbox_backend"
-                    if sandbox_mode == "preferred"
-                    else "reject_backend_unavailable"
-                ),
-                "enforcement_active": False,
-                "effective_exec_behavior": "host_execution_available",
-                "status": (
-                    "configured_unavailable" if sandbox_configured else "not_enforced"
-                ),
-                "degraded": sandbox_configured,
-                "degraded_reason": (
-                    "sandbox_backend_unavailable_and_pipeline_not_connected"
-                    if sandbox_configured
-                    else None
-                ),
-                "host_execution_allowed": True,
-            },
-        }
+        return project_protected_workspace_rollout(
+            self._security_config,
+            self._sandbox_config,
+            session_id=session_id,
+        )
 
     async def _persist_command_rule(self, rule: dict[str, Any] | None) -> dict[str, Any] | None:
         validated_rule = _validated_command_rule(rule)
