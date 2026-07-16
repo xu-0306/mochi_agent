@@ -24,7 +24,7 @@ def _create_test_app(*, config: MochiConfig, session_store: SessionStore | None 
 
 
 def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
-    """`/v1/sessions` 應可建立、列出並讀取 session。"""
+    """`/v1/sessions` should consistently expose protected-workspace rollout status."""
     sessions_dir = tmp_path / "sessions"
     config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
     app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
@@ -32,7 +32,13 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
     with TestClient(app) as client:
         create_response = client.post("/v1/sessions", json={"session_id": "alpha"})
         assert create_response.status_code == 200
-        assert create_response.json() == {"type": "session", "session_id": "alpha"}
+        create_payload = create_response.json()
+        assert create_payload["type"] == "session"
+        assert create_payload["session_id"] == "alpha"
+        alpha_projection = create_payload["protected_workspace"]
+        assert alpha_projection["session_id"] == "alpha"
+        assert alpha_projection["change_contract"]["enforcement_active"] is False
+        assert alpha_projection["sandbox"]["effective_exec_behavior"] == "host_execution_available"
 
         alpha_path = sessions_dir / "alpha.jsonl"
         old_timestamp = 1_700_000_000
@@ -44,6 +50,7 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
         assert auto_payload["type"] == "session"
         assert auto_payload["session_id"]
         assert auto_payload["session_id"] != "alpha"
+        assert auto_payload["protected_workspace"]["session_id"] == auto_payload["session_id"]
 
         list_response = client.get("/v1/sessions")
         assert list_response.status_code == 200
@@ -58,6 +65,8 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
         assert list_payload["items"][1]["title"] == "alpha"
         assert list_payload["items"][1]["project_id"] is None
         assert list_payload["items"][1]["goal"] is None
+        assert list_payload["items"][0]["protected_workspace"] == auto_payload["protected_workspace"]
+        assert list_payload["items"][1]["protected_workspace"] == alpha_projection
 
         get_response = client.get("/v1/sessions/alpha")
         assert get_response.status_code == 200
@@ -69,6 +78,7 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
             "workflow": None,
             "goal": None,
             "security_override": None,
+            "protected_workspace": alpha_projection,
             "events": [
                 {
                     "type": "session_meta",
@@ -78,6 +88,10 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
                 }
             ],
         }
+
+        update_response = client.patch("/v1/sessions/alpha", json={"title": "Alpha"})
+        assert update_response.status_code == 200
+        assert update_response.json()["protected_workspace"] == alpha_projection
 
 
 def test_get_missing_session_returns_empty_events(tmp_path: Path) -> None:
@@ -90,7 +104,12 @@ def test_get_missing_session_returns_empty_events(tmp_path: Path) -> None:
         response = client.get("/v1/sessions/missing")
 
     assert response.status_code == 200
-    assert response.json() == {
+    payload = response.json()
+    projection = payload.pop("protected_workspace")
+    assert projection["session_id"] == "missing"
+    assert projection["change_contract"]["effective_file_behavior"] == "legacy_mutation_allowed"
+    assert projection["sandbox"]["enforcement_active"] is False
+    assert payload == {
         "type": "session",
         "session_id": "missing",
         "title": "missing",
@@ -767,7 +786,10 @@ def test_sessions_routes_fall_back_to_config_sessions_dir(tmp_path: Path) -> Non
         response = client.post("/v1/sessions", json={"session_id": "from-config"})
 
     assert response.status_code == 200
-    assert response.json() == {"type": "session", "session_id": "from-config"}
+    payload = response.json()
+    projection = payload.pop("protected_workspace")
+    assert projection["session_id"] == "from-config"
+    assert payload == {"type": "session", "session_id": "from-config"}
     events = asyncio.run(SessionStore(sessions_dir).load_session("from-config"))
     assert len(events) == 1
     assert events[0]["type"] == "session_meta"
@@ -1542,8 +1564,12 @@ def test_settings_round_trip_exposes_independent_protected_workspace_axes(tmp_pa
         "backend": None,
         "backend_available": False,
         "capabilities": {"exec_containment": False},
-        "status": "degraded",
+        "enforcement_active": False,
+        "configured_policy_decision": "prefer_sandbox_backend",
+        "effective_exec_behavior": "host_execution_available",
+        "status": "configured_unavailable",
         "degraded": True,
+        "degraded_reason": "sandbox_backend_unavailable_and_pipeline_not_connected",
         "host_execution_allowed": True,
     }
     assert updated.status_code == 200
@@ -1553,9 +1579,13 @@ def test_settings_round_trip_exposes_independent_protected_workspace_axes(tmp_pa
         "backend": None,
         "backend_available": False,
         "capabilities": {"exec_containment": False},
-        "status": "blocked",
+        "enforcement_active": False,
+        "configured_policy_decision": "reject_backend_unavailable",
+        "effective_exec_behavior": "host_execution_available",
+        "status": "configured_unavailable",
         "degraded": True,
-        "host_execution_allowed": False,
+        "degraded_reason": "sandbox_backend_unavailable_and_pipeline_not_connected",
+        "host_execution_allowed": True,
     }
     assert followup.status_code == 200
     assert followup.json()["security"]["change_contract_mode"] == "observe"

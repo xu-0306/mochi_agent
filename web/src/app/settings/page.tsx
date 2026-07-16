@@ -5700,11 +5700,11 @@ function SecuritySettingsForm({
             <Select value={changeContractMode} onValueChange={(value) => setChangeContractMode(value as api.SecuritySettings['change_contract_mode'])}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="observe">Observe — legacy file changes continue</SelectItem>
-                <SelectItem value="enforce">Enforce — fail closed without contract</SelectItem>
+                <SelectItem value="observe">Observe — shadow only; legacy tools unchanged</SelectItem>
+                <SelectItem value="enforce">Enforce intent — integration pending</SelectItem>
               </SelectContent>
             </Select>
-            <p className="text-[11px] text-muted-foreground">{changeContractMode === 'observe' ? 'Shadow would-reject only; legacy mutation and Undo remain unchanged.' : 'File mutation and legacy Undo are blocked until the new contract is available.'}</p>
+            <p className="text-[11px] text-muted-foreground">Enforcement active: no. {changeContractMode === 'observe' ? 'Shadow would-reject only; legacy mutation and Undo remain unchanged.' : 'Reject is configured policy intent, but file and Undo pipeline integration is pending; effective legacy behavior remains active.'}</p>
           </label>
           <label className="space-y-1.5">
             <SettingLabel>Execution sandbox</SettingLabel>
@@ -5712,11 +5712,11 @@ function SecuritySettingsForm({
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="off">Off — host execution permitted</SelectItem>
-                <SelectItem value="preferred">Preferred — degrade to host</SelectItem>
-                <SelectItem value="required">Required — fail closed</SelectItem>
+                <SelectItem value="preferred">Preferred intent — host remains effective</SelectItem>
+                <SelectItem value="required">Required intent — integration pending</SelectItem>
               </SelectContent>
             </Select>
-            <p className="text-[11px] text-muted-foreground">Backend: {sandbox?.backend_available ? sandbox.backend ?? 'available' : 'unavailable; no exec containment is active'}. Status: {sandbox?.status ?? 'off'}.</p>
+            <p className="text-[11px] text-muted-foreground">Backend: {sandbox?.backend_available ? sandbox.backend ?? 'available' : 'unavailable'}. Enforcement active: {sandbox?.enforcement_active ? 'yes' : 'no'}. Effective behavior: {sandbox?.effective_exec_behavior ?? 'host_execution_available'}. Pipeline integration is pending.</p>
           </label>
         </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">

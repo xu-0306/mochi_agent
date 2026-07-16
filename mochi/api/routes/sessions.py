@@ -161,6 +161,11 @@ def _get_session_store(app: object, *, config: object | None = None) -> SessionS
     return store
 
 
+async def _protected_workspace_projection(app: object, session_id: str) -> dict[str, Any]:
+    service = await _get_runtime_service(app)
+    return service.protected_workspace_session_projection(session_id=session_id)
+
+
 async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]]:
     """掃描 sessions 目錄，回傳摘要列表。"""
     sessions_dir = Path(store._sessions_dir).expanduser()  # noqa: SLF001
@@ -379,7 +384,7 @@ async def create_session(
     request: CreateSessionRequest | None = None,
     *,
     http_request: Request,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """建立新 session，並寫入 metadata event。"""
     app = http_request.app
     config = await _get_config(app)
@@ -428,7 +433,11 @@ async def create_session(
         for event in _cloneable_session_events(source_events, until_turn_id=fork_until_turn_id):
             await store.save_event(session_id, event)
 
-        return {"type": "session", "session_id": session_id}
+        return {
+            "type": "session",
+            "session_id": session_id,
+            "protected_workspace": await _protected_workspace_projection(app, session_id),
+        }
 
     if request is not None and request.project_id is not None:
         project_store = _get_project_store(app, config=config)
@@ -447,7 +456,11 @@ async def create_session(
     )
     if request is not None and request.project_id is not None:
         await _append_project_assignment_event(store, session_id, request.project_id)
-    return {"type": "session", "session_id": session_id}
+    return {
+        "type": "session",
+        "session_id": session_id,
+        "protected_workspace": await _protected_workspace_projection(app, session_id),
+    }
 
 
 @router.get("/sessions")
@@ -456,7 +469,13 @@ async def list_sessions(http_request: Request) -> dict[str, object]:
     app = http_request.app
     config = await _get_config(app)
     store = _get_session_store(app, config=config)
-    return {"type": "sessions", "items": await _list_session_summaries(store)}
+    items = await _list_session_summaries(store)
+    for item in items:
+        session_id = str(item["session_id"])
+        item["protected_workspace"] = await _protected_workspace_projection(
+            app, session_id
+        )
+    return {"type": "sessions", "items": items}
 
 
 @router.get("/sessions/{session_id}")
@@ -474,6 +493,7 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "workflow": _session_workflow_state(events),
         "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
+        "protected_workspace": await _protected_workspace_projection(app, session_id),
         "events": events,
     }
 
@@ -828,6 +848,7 @@ async def update_session(
         "workflow": _session_workflow_state(events),
         "goal": _session_goal_state(events),
         "security_override": _session_security_override(events),
+        "protected_workspace": await _protected_workspace_projection(app, session_id),
         "events": events,
     }
 

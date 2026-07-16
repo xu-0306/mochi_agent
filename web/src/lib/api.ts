@@ -4241,8 +4241,12 @@ export interface SandboxSettings {
   backend: string | null
   backend_available: boolean
   capabilities: { exec_containment: boolean }
-  status: 'off' | 'degraded' | 'blocked'
+  enforcement_active: boolean
+  configured_policy_decision: 'allow_host' | 'prefer_sandbox_backend' | 'reject_backend_unavailable'
+  effective_exec_behavior: 'host_execution_available'
+  status: 'not_enforced' | 'configured_unavailable'
   degraded: boolean
+  degraded_reason: string | null
   host_execution_allowed: boolean
 }
 
@@ -5336,7 +5340,17 @@ function normalizeSandboxSettings(value: unknown): SandboxSettings {
     rawMode === 'preferred' || rawMode === 'required' ? rawMode : 'off'
   const rawStatus = getString(record.status)
   const status: SandboxSettings['status'] =
-    rawStatus === 'degraded' || rawStatus === 'blocked' ? rawStatus : 'off'
+    rawStatus === 'not_enforced' || rawStatus === 'configured_unavailable'
+      ? rawStatus
+      : mode === 'off'
+        ? 'not_enforced'
+        : 'configured_unavailable'
+  const rawPolicyDecision = getString(record.configured_policy_decision)
+  const configuredPolicyDecision: SandboxSettings['configured_policy_decision'] =
+    rawPolicyDecision === 'prefer_sandbox_backend' ||
+    rawPolicyDecision === 'reject_backend_unavailable'
+      ? rawPolicyDecision
+      : 'allow_host'
   const capabilities = isRecord(record.capabilities) ? record.capabilities : {}
 
   return {
@@ -5346,10 +5360,13 @@ function normalizeSandboxSettings(value: unknown): SandboxSettings {
     capabilities: {
       exec_containment: getBoolean(capabilities.exec_containment) ?? false,
     },
+    enforcement_active: getBoolean(record.enforcement_active) ?? false,
+    configured_policy_decision: configuredPolicyDecision,
+    effective_exec_behavior: 'host_execution_available',
     status,
     degraded: getBoolean(record.degraded) ?? mode !== 'off',
-    host_execution_allowed:
-      getBoolean(record.host_execution_allowed) ?? mode !== 'required',
+    degraded_reason: getString(record.degraded_reason),
+    host_execution_allowed: getBoolean(record.host_execution_allowed) ?? true,
   }
 }
 

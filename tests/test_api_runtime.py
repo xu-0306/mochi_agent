@@ -42,65 +42,88 @@ from mochi.runtime.service import (
     _resolve_agent_run_resume_strategy,
 )
 from mochi.runtime.store import RuntimeStore
+from mochi.sessions.store import SessionStore
 from mochi.utils.shell_providers import BaseShellProvider, SubprocessSpec
 
 
 @pytest.fixture(
     params=[
         pytest.param(
-            ("observe", "allow_legacy", "allow_legacy", "would_reject_contract_unavailable"),
+            ("observe", "allow_legacy", "would_reject_contract_unavailable", "not_enforced"),
             id="observe-non-blocking",
         ),
         pytest.param(
-            ("enforce", "reject_contract_unavailable", "reject_contract_unavailable", None),
-            id="enforce-fail-closed",
+            ("enforce", "reject_contract_unavailable", None, "configured_unavailable"),
+            id="enforce-policy-fail-closed",
         ),
     ]
 )
 def change_contract_path(
     request: pytest.FixtureRequest,
-) -> tuple[str, str, str, str | None]:
+) -> tuple[str, str, str | None, str]:
     """Reusable observe/enforce contract paths for rollout-gate tests."""
     return request.param
 
 
 @pytest.mark.parametrize(
-    ("sandbox_mode", "expected_exec_decision", "expected_sandbox_status"),
+    (
+        "sandbox_mode",
+        "expected_policy_decision",
+        "expected_sandbox_status",
+        "expected_degraded",
+    ),
     [
-        ("off", "allow_host", "off"),
-        ("preferred", "allow_host_degraded", "degraded"),
-        ("required", "reject_backend_unavailable", "blocked"),
+        ("off", "allow_host", "not_enforced", False),
+        ("preferred", "prefer_sandbox_backend", "configured_unavailable", True),
+        ("required", "reject_backend_unavailable", "configured_unavailable", True),
     ],
 )
-def test_protected_workspace_decision_matrix_keeps_axes_independent(
+def test_session_api_protected_workspace_matrix_keeps_policy_and_effective_behavior_distinct(
     tmp_path: Path,
-    change_contract_path: tuple[str, str, str, str | None],
+    change_contract_path: tuple[str, str, str | None, str],
     sandbox_mode: str,
-    expected_exec_decision: str,
+    expected_policy_decision: str,
     expected_sandbox_status: str,
+    expected_degraded: bool,
 ) -> None:
-    change_mode, expected_file_decision, expected_undo_decision, expected_shadow = (
+    change_mode, expected_file_policy, expected_shadow, expected_change_status = (
         change_contract_path
     )
+    sessions_dir = tmp_path / "sessions"
     config = MochiConfig.model_validate(
         {
+            "sessions_dir": str(sessions_dir),
             "security": {"change_contract_mode": change_mode},
             "sandbox": {"mode": sandbox_mode},
         }
     )
-    service = RuntimeService(engine=object(), store=RuntimeStore(tmp_path / "runtime.db"))
-    service.bind_app_config(config=config, config_path=None)
+    app = create_app()
+    app.state.config_factory = lambda: config
+    app.state.session_store = SessionStore(sessions_dir)
 
-    projection = service.protected_workspace_session_projection(session_id="session-rollout")
+    with TestClient(app) as client:
+        created = client.post("/v1/sessions")
+        assert created.status_code == 200
+        session_id = created.json()["session_id"]
+        response = client.get(f"/v1/sessions/{session_id}")
 
-    assert projection["session_id"] == "session-rollout"
+    assert response.status_code == 200
+    projection = response.json()["protected_workspace"]
+    assert projection["session_id"] == session_id
     assert projection["change_contract"]["mode"] == change_mode
-    assert projection["change_contract"]["file_mutation_decision"] == expected_file_decision
-    assert projection["change_contract"]["legacy_undo_decision"] == expected_undo_decision
+    assert projection["change_contract"]["configured_policy_decision"] == expected_file_policy
+    assert projection["change_contract"]["enforcement_active"] is False
+    assert projection["change_contract"]["effective_file_behavior"] == "legacy_mutation_allowed"
+    assert projection["change_contract"]["effective_undo_behavior"] == "legacy_undo_available"
     assert projection["change_contract"]["shadow_decision"] == expected_shadow
+    assert projection["change_contract"]["status"] == expected_change_status
     assert projection["sandbox"]["mode"] == sandbox_mode
-    assert projection["sandbox"]["exec_decision"] == expected_exec_decision
+    assert projection["sandbox"]["configured_policy_decision"] == expected_policy_decision
+    assert projection["sandbox"]["enforcement_active"] is False
+    assert projection["sandbox"]["effective_exec_behavior"] == "host_execution_available"
+    assert projection["sandbox"]["host_execution_allowed"] is True
     assert projection["sandbox"]["status"] == expected_sandbox_status
+    assert projection["sandbox"]["degraded"] is expected_degraded
     assert projection["sandbox"]["backend"] is None
     assert projection["sandbox"]["capabilities"] == {"exec_containment": False}
 

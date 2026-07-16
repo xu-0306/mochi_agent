@@ -531,11 +531,11 @@ class RuntimeService:
         *,
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        """Project independent file-contract and exec-sandbox rollout decisions."""
+        """Project configured rollout intent separately from effective legacy behavior."""
         change_mode = self._security_config.change_contract_mode
         sandbox_mode = self._sandbox_config.mode
         observing = change_mode == "observe"
-        sandbox_required = sandbox_mode == "required"
+        sandbox_configured = sandbox_mode != "off"
         return {
             "session_id": session_id,
             "change_contract": {
@@ -547,13 +547,16 @@ class RuntimeService:
                     "edited_patch_replay": False,
                     "contract_enforcement": False,
                 },
-                "status": "observing" if observing else "blocked",
-                "degraded": not observing,
-                "file_mutation_decision": (
+                "configured_policy_decision": (
                     "allow_legacy" if observing else "reject_contract_unavailable"
                 ),
-                "legacy_undo_decision": (
-                    "allow_legacy" if observing else "reject_contract_unavailable"
+                "enforcement_active": False,
+                "effective_file_behavior": "legacy_mutation_allowed",
+                "effective_undo_behavior": "legacy_undo_available",
+                "status": "not_enforced" if observing else "configured_unavailable",
+                "degraded": not observing,
+                "degraded_reason": (
+                    None if observing else "file_contract_pipeline_not_connected"
                 ),
                 "shadow_decision": (
                     "would_reject_contract_unavailable" if observing else None
@@ -564,22 +567,25 @@ class RuntimeService:
                 "backend": None,
                 "backend_available": False,
                 "capabilities": {"exec_containment": False},
-                "status": (
-                    "off"
+                "configured_policy_decision": (
+                    "allow_host"
                     if sandbox_mode == "off"
-                    else "degraded"
+                    else "prefer_sandbox_backend"
                     if sandbox_mode == "preferred"
-                    else "blocked"
+                    else "reject_backend_unavailable"
                 ),
-                "degraded": sandbox_mode != "off",
-                "host_execution_allowed": not sandbox_required,
-                "exec_decision": (
-                    "reject_backend_unavailable"
-                    if sandbox_required
-                    else "allow_host_degraded"
-                    if sandbox_mode == "preferred"
-                    else "allow_host"
+                "enforcement_active": False,
+                "effective_exec_behavior": "host_execution_available",
+                "status": (
+                    "configured_unavailable" if sandbox_configured else "not_enforced"
                 ),
+                "degraded": sandbox_configured,
+                "degraded_reason": (
+                    "sandbox_backend_unavailable_and_pipeline_not_connected"
+                    if sandbox_configured
+                    else None
+                ),
+                "host_execution_allowed": True,
             },
         }
 

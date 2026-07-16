@@ -696,15 +696,27 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "backend": None,
             "backend_available": False,
             "capabilities": {"exec_containment": False},
-            "status": (
-                "off"
+            "enforcement_active": False,
+            "configured_policy_decision": (
+                "allow_host"
                 if config.sandbox.mode == "off"
-                else "degraded"
+                else "prefer_sandbox_backend"
                 if config.sandbox.mode == "preferred"
-                else "blocked"
+                else "reject_backend_unavailable"
+            ),
+            "effective_exec_behavior": "host_execution_available",
+            "status": (
+                "not_enforced"
+                if config.sandbox.mode == "off"
+                else "configured_unavailable"
             ),
             "degraded": config.sandbox.mode != "off",
-            "host_execution_allowed": config.sandbox.mode != "required",
+            "degraded_reason": (
+                None
+                if config.sandbox.mode == "off"
+                else "sandbox_backend_unavailable_and_pipeline_not_connected"
+            ),
+            "host_execution_allowed": True,
         },
         "paths": {
             "workspace_dir": config.workspace_dir,
