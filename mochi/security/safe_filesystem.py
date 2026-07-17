@@ -13,7 +13,10 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
+
+if TYPE_CHECKING:
+    from ..tools.file_transaction import FileMetadataSnapshot
 
 from .file_contract import (
     AuthorizationEnvelope,
@@ -29,6 +32,24 @@ class UnsafeFilesystemTarget(PermissionError):
 
 class SafeFilesystemUnavailable(RuntimeError):
     """Raised when the native enforcing backend is unavailable."""
+
+
+class UnsupportedSecurityMetadata(RuntimeError):
+    """Raised when security metadata cannot be captured fail-closed."""
+
+    def __init__(
+        self, *, phase: str, platform: str, cause: BaseException
+    ) -> None:
+        self.phase = phase
+        self.platform = platform
+        self.cause = cause
+        try:
+            detail = str(cause)
+        except BaseException:
+            detail = f"<{type(cause).__name__} could not be formatted>"
+        super().__init__(
+            f"security metadata {phase} unavailable on {platform}: {detail}"
+        )
 
 
 class CommittedFilesystemMutationError(RuntimeError):
@@ -332,13 +353,19 @@ class _Backend(Protocol):
 
     def replace(
         self, source: StagedTemp, destination: SafeTarget
-    ) -> None: ...
+    ) -> object: ...
 
     def release_target(self, target: SafeTarget) -> None: ...
 
     def release_temp(self, temp: StagedTemp) -> None: ...
 
     def close(self) -> None: ...
+
+
+class _MetadataBackend(Protocol):
+    def capture_metadata(
+        self, target: SafeTarget
+    ) -> FileMetadataSnapshot: ...
 
 
 class SafeFilesystem:
@@ -382,6 +409,27 @@ class SafeFilesystem:
             )
         return self._backend.create_temp(destination)
 
+    def capture_metadata(
+        self, target: SafeTarget
+    ) -> FileMetadataSnapshot:
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            target, SafeTarget
+        ):
+            raise TypeError("metadata capture requires SafeTarget")
+        capture = getattr(self._backend, "capture_metadata", None)
+        if capture is None or not callable(capture):
+            cause = SafeFilesystemUnavailable(
+                "native security metadata capture is not implemented"
+            )
+            error = UnsupportedSecurityMetadata(
+                phase="capture",
+                platform=os.name,
+                cause=cause,
+            )
+            raise error from cause
+        backend = cast("_MetadataBackend", self._backend)
+        return backend.capture_metadata(target)
+
     def unlink(self, target: SafeTarget) -> None:
         if not isinstance(target, SafeTarget):
             raise TypeError("filesystem mutation requires SafeTarget")
@@ -389,7 +437,7 @@ class SafeFilesystem:
 
     def replace(
         self, source: StagedTemp, destination: SafeTarget
-    ) -> None:
+    ) -> FileIdentity:
         if not isinstance(source, StagedTemp):
             raise TypeError(
                 "replace source must be a StagedTemp capability"
@@ -398,7 +446,10 @@ class SafeFilesystem:
             raise TypeError(
                 "replace destination must be a SafeTarget capability"
             )
-        self._backend.replace(source, destination)
+        return cast(
+            FileIdentity,
+            self._backend.replace(source, destination),
+        )
 
     def close(self) -> None:
         self._backend.close()
@@ -420,5 +471,6 @@ __all__ = [
     "SafeTarget",
     "StagedTemp",
     "UnsafeFilesystemTarget",
+    "UnsupportedSecurityMetadata",
     "resolve_authorized_file_binding",
 ]
