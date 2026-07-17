@@ -48,7 +48,7 @@ class _IssuedPosixTarget:
     identity: FileIdentity
     binding: AuthorizedFileBinding
     parent_fd: int
-    file_fd: int | None
+    file_fd: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +75,50 @@ class PosixSafeFilesystem:
     """Mutate through pinned parent FDs and relative basenames."""
 
     def __init__(self, workspace: str | Path, *, adapter: Any = os) -> None:
+        required_constants = (
+            "O_RDONLY",
+            "O_RDWR",
+            "O_CREAT",
+            "O_EXCL",
+            "O_DIRECTORY",
+            "O_NOFOLLOW",
+        )
+        required_calls = (
+            "open",
+            "close",
+            "dup",
+            "fstat",
+            "stat",
+            "pread",
+            "write",
+            "fsync",
+            "listxattr",
+            "getxattr",
+            "fchown",
+            "fchmod",
+            "removexattr",
+            "setxattr",
+            "unlink",
+            "replace",
+        )
+        missing: list[str] = []
+        for name in required_constants:
+            try:
+                int(getattr(adapter, name))
+            except (AttributeError, TypeError, ValueError):
+                missing.append(name)
+        missing.extend(
+            name
+            for name in required_calls
+            if not callable(getattr(adapter, name, None))
+        )
+        if missing:
+            raise RuntimeError(
+                "POSIX enforcing mode requires primitives: "
+                + ", ".join(missing)
+            )
         self._adapter = adapter
         self._platform = str(getattr(adapter, "platform", sys.platform))
-        self._transaction_primitives = hasattr(adapter, "O_RDWR")
         self._closed = False
         self._issued: dict[int, _IssuedPosixTarget] = {}
         self._temps: dict[int, _IssuedPosixTemp] = {}
@@ -255,25 +296,24 @@ class PosixSafeFilesystem:
                     self._segments(path)
                 ),
             )
-            if self._transaction_primitives:
-                flags = int(self._adapter.O_RDONLY) | int(
-                    self._adapter.O_NOFOLLOW
+            flags = int(self._adapter.O_RDONLY) | int(
+                self._adapter.O_NOFOLLOW
+            )
+            file_fd = int(
+                self._adapter.open(
+                    basename, flags, dir_fd=parent_fd
                 )
-                file_fd = int(
-                    self._adapter.open(
-                        basename, flags, dir_fd=parent_fd
-                    )
+            )
+            fd_identity = self._identity_of_fd(file_fd)
+            current_identity = self._identity_at(parent_fd, basename)
+            if (
+                fd_identity != path_identity
+                or current_identity != path_identity
+                or fd_identity != binding.base_identity
+            ):
+                raise UnsafeFilesystemTarget(
+                    "retained file identity does not match authorized target"
                 )
-                fd_identity = self._identity_of_fd(file_fd)
-                current_identity = self._identity_at(parent_fd, basename)
-                if (
-                    fd_identity != path_identity
-                    or current_identity != path_identity
-                    or fd_identity != binding.base_identity
-                ):
-                    raise UnsafeFilesystemTarget(
-                        "retained file identity does not match authorized target"
-                    )
             target = SafeTarget._create(
                 basename=basename,
                 identity=path_identity,
@@ -347,12 +387,11 @@ class PosixSafeFilesystem:
         path_identity = self._identity_at(
             record.parent_fd, record.basename
         )
-        if record.file_fd is not None:
-            fd_identity = self._identity_of_fd(record.file_fd)
-            if fd_identity != record.identity:
-                raise UnsafeFilesystemTarget(
-                    "retained file identity changed after authorization"
-                )
+        fd_identity = self._identity_of_fd(record.file_fd)
+        if fd_identity != record.identity:
+            raise UnsafeFilesystemTarget(
+                "retained file identity changed after authorization"
+            )
         if path_identity != record.identity:
             raise UnsafeFilesystemTarget(
                 "file identity changed after authorization"
@@ -439,12 +478,6 @@ class PosixSafeFilesystem:
         from ..tools.file_transaction import FileMetadataSnapshot
 
         record = self._validated(target)
-        if record.file_fd is None:
-            cause = RuntimeError(
-                "retained target descriptor is unavailable"
-            )
-            error = self._unsupported("capture", cause)
-            raise error from cause
         native = self._capture_native_metadata(record.file_fd)
         digest = self._metadata_digest(native)
         if (
@@ -527,11 +560,10 @@ class PosixSafeFilesystem:
                 self._adapter.unlink(basename, dir_fd=parent_fd)
             except BaseException as cleanup:
                 self._add_cleanup_note(primary, cleanup)
-            if hasattr(self._adapter, "fsync"):
-                try:
-                    self._adapter.fsync(parent_fd)
-                except BaseException as cleanup:
-                    self._add_cleanup_note(primary, cleanup)
+            try:
+                self._adapter.fsync(parent_fd)
+            except BaseException as cleanup:
+                self._add_cleanup_note(primary, cleanup)
         try:
             self._adapter.close(parent_fd)
         except BaseException as cleanup:
@@ -549,13 +581,8 @@ class PosixSafeFilesystem:
         file_fd: int | None = None
         basename: str | None = None
         try:
-            access_flag = (
-                int(self._adapter.O_RDWR)
-                if self._transaction_primitives
-                else int(self._adapter.O_WRONLY)
-            )
             flags = (
-                access_flag
+                int(self._adapter.O_RDWR)
                 | int(self._adapter.O_CREAT)
                 | int(self._adapter.O_EXCL)
                 | int(self._adapter.O_NOFOLLOW)
@@ -626,29 +653,37 @@ class PosixSafeFilesystem:
             snapshot, record.binding, record.target
         )
         native = issued.native
-        current = self._adapter.fstat(record.file_fd)
-        if (
-            int(current.st_uid) != native.uid
-            or int(current.st_gid) != native.gid
-        ):
-            self._adapter.fchown(
-                record.file_fd, native.uid, native.gid
+        try:
+            current = self._adapter.fstat(record.file_fd)
+            if (
+                int(current.st_uid) != native.uid
+                or int(current.st_gid) != native.gid
+            ):
+                self._adapter.fchown(
+                    record.file_fd, native.uid, native.gid
+                )
+            self._adapter.fchmod(record.file_fd, native.mode)
+            current_names = sorted(
+                self._raw_xattr_name(name)
+                for name in self._adapter.listxattr(record.file_fd)
             )
-        self._adapter.fchmod(record.file_fd, native.mode)
-        current_names = sorted(
-            self._raw_xattr_name(name)
-            for name in self._adapter.listxattr(record.file_fd)
-        )
-        desired = dict(native.xattrs)
-        for name in sorted(set(current_names) - set(desired)):
-            self._adapter.removexattr(record.file_fd, name)
-        acl_name = b"system.posix_acl_access"
-        for name in sorted(name for name in desired if name != acl_name):
-            self._adapter.setxattr(record.file_fd, name, desired[name])
-        if acl_name in desired:
-            self._adapter.setxattr(
-                record.file_fd, acl_name, desired[acl_name]
-            )
+            desired = dict(native.xattrs)
+            for name in sorted(set(current_names) - set(desired)):
+                self._adapter.removexattr(record.file_fd, name)
+            acl_name = b"system.posix_acl_access"
+            for name in sorted(
+                name for name in desired if name != acl_name
+            ):
+                self._adapter.setxattr(
+                    record.file_fd, name, desired[name]
+                )
+            if acl_name in desired:
+                self._adapter.setxattr(
+                    record.file_fd, acl_name, desired[acl_name]
+                )
+        except BaseException as cause:
+            error = self._unsupported("apply", cause)
+            raise error from cause
 
     @staticmethod
     def _hash_reader(read: Callable[[int, int], bytes]) -> str:
@@ -703,10 +738,6 @@ class PosixSafeFilesystem:
         issued = self._snapshot_record(
             snapshot, record.binding, target
         )
-        if record.file_fd is None:
-            raise UnsafeFilesystemTarget(
-                "retained target descriptor is unavailable"
-            )
         content_digest = self._content_sha256(record.file_fd)
         native = self._capture_native_metadata(record.file_fd)
         metadata_digest = self._metadata_digest(native)
@@ -750,10 +781,9 @@ class PosixSafeFilesystem:
         error = self._remember_error(
             error, lambda: self._adapter.close(record.file_fd)
         )
-        if hasattr(self._adapter, "fsync"):
-            error = self._remember_error(
-                error, lambda: self._adapter.fsync(record.parent_fd)
-            )
+        error = self._remember_error(
+            error, lambda: self._adapter.fsync(record.parent_fd)
+        )
         error = self._remember_error(
             error, lambda: self._adapter.close(record.parent_fd)
         )
@@ -788,18 +818,6 @@ class PosixSafeFilesystem:
             src_dir_fd=source_record.parent_fd,
             dst_dir_fd=destination_record.parent_fd,
         )
-
-        if not self._transaction_primitives:
-            error = self._consume_temp(source)
-            error = self._remember_error(
-                error, lambda: self.release_target(destination)
-            )
-            if error is not None:
-                outcome = CommittedFilesystemMutationError(
-                    phase="operand_cleanup", cause=error
-                )
-                raise outcome from error
-            return source_record.identity
 
         error: BaseException | None = None
         phase: str | None = None
@@ -863,10 +881,9 @@ class PosixSafeFilesystem:
                 del self._metadata[key]
         target._mark_closed()
         error: BaseException | None = None
-        if record.file_fd is not None:
-            error = self._remember_error(
-                error, lambda: self._adapter.close(record.file_fd)
-            )
+        error = self._remember_error(
+            error, lambda: self._adapter.close(record.file_fd)
+        )
         error = self._remember_error(
             error, lambda: self._adapter.close(record.parent_fd)
         )
@@ -874,17 +891,7 @@ class PosixSafeFilesystem:
             raise error
 
     def release_temp(self, temp: StagedTemp) -> None:
-        error = self._consume_temp(temp)
-        if error is not None:
-            raise error
-
-    def _close_issued_temp(
-        self, record: _IssuedPosixTemp
-    ) -> None:
-        if self._transaction_primitives:
-            self.discard_temp(record.temp)
-        else:
-            self.release_temp(record.temp)
+        self.discard_temp(temp)
 
     def close(self) -> None:
         if self._closed:
@@ -893,7 +900,7 @@ class PosixSafeFilesystem:
         for record in tuple(self._temps.values()):
             error = self._remember_error(
                 error,
-                lambda item=record: self._close_issued_temp(item),
+                lambda item=record: self.release_temp(item.temp),
             )
         for record in tuple(self._issued.values()):
             error = self._remember_error(

@@ -459,10 +459,12 @@ def test_authorized_file_binding_rejects_tampered_or_alternate_entry_substitutio
 class _FakePosixAdapter:
     O_RDONLY = 0
     O_WRONLY = 1
+    O_RDWR = 2
     O_CREAT = 0x40
     O_EXCL = 0x80
     O_DIRECTORY = 0x10000
     O_NOFOLLOW = 0x20000
+    platform = "linux"
 
     def __init__(self, *, link_count: int = 1) -> None:
         self.link_count = link_count
@@ -473,6 +475,14 @@ class _FakePosixAdapter:
             ("safe-original", "note.txt"): "note-original",
             ("outside", "note.txt"): "outside-note",
         }
+        self.content: dict[str, bytearray] = {
+            "note-original": bytearray(b"note"),
+            "outside-note": bytearray(b"outside"),
+        }
+        self.xattrs: dict[str, dict[bytes, bytes]] = {
+            "note-original": {},
+            "outside-note": {},
+        }
         self.unlinked: list[tuple[str, str]] = []
         self.open_calls: list[tuple[str, int | None]] = []
         self.replace_calls: list[tuple[str, str, str, str]] = []
@@ -480,6 +490,7 @@ class _FakePosixAdapter:
         self.dup_calls: list[tuple[int, int]] = []
         self.fstat_calls: list[int] = []
         self.stat_calls: list[tuple[str, int, bool]] = []
+        self.fsync_calls: list[int] = []
 
     def open(
         self,
@@ -489,7 +500,6 @@ class _FakePosixAdapter:
         *,
         dir_fd: int | None = None,
     ) -> int:
-        del mode
         self.open_calls.append((path, dir_fd))
         if dir_fd is None:
             node = "workspace"
@@ -497,8 +507,12 @@ class _FakePosixAdapter:
             parent = self.fd_nodes[dir_fd]
             key = (parent, path)
             if key not in self.children and flags & self.O_CREAT:
-                self.children[key] = f"temp:{path}"
-            node = self.children[key]
+                node = f"temp:{path}"
+                self.children[key] = node
+                self.content[node] = bytearray()
+                self.xattrs[node] = {}
+            else:
+                node = self.children[key]
         fd = self.next_fd
         self.next_fd += 1
         self.fd_nodes[fd] = node
@@ -515,20 +529,33 @@ class _FakePosixAdapter:
         self.close_calls.append(fd)
         self.fd_nodes.pop(fd, None)
 
+    def _stat(self, node: str) -> SimpleNamespace:
+        if node == "workspace":
+            mode, dev, ino = 0o040700, 10, 20
+        elif node in {"safe-original", "outside"}:
+            mode, dev, ino = 0o040700, 10, 21
+        elif node == "note-original":
+            mode, dev, ino = 0o100600, 1, 41
+        elif node == "other-original":
+            mode, dev, ino = 0o100600, 1, 42
+        elif node == "outside-note":
+            mode, dev, ino = 0o100600, 1, 99
+        else:
+            mode, dev, ino = 0o100600, 1, 77
+        return SimpleNamespace(
+            st_mode=mode,
+            st_dev=dev,
+            st_ino=ino,
+            st_nlink=(
+                self.link_count if mode & 0o100000 else 1
+            ),
+            st_uid=1000,
+            st_gid=1000,
+        )
+
     def fstat(self, fd: int) -> SimpleNamespace:
         self.fstat_calls.append(fd)
-        node = self.fd_nodes[fd]
-        is_file = node.startswith("temp:")
-        return SimpleNamespace(
-            st_mode=0o100600 if is_file else 0o040700,
-            st_dev=1 if is_file else 10,
-            st_ino=(
-                77
-                if is_file
-                else (20 if node == "workspace" else 21)
-            ),
-            st_nlink=1,
-        )
+        return self._stat(self.fd_nodes[fd])
 
     def stat(
         self,
@@ -540,19 +567,42 @@ class _FakePosixAdapter:
         assert follow_symlinks is False
         self.stat_calls.append((path, dir_fd, follow_symlinks))
         node = self.children[(self.fd_nodes[dir_fd], path)]
-        return SimpleNamespace(
-            st_mode=0o100600,
-            st_dev=1,
-            st_ino={
-                "note-original": 41,
-                "other-original": 42,
-                "outside-note": 99,
-            }.get(node, 77),
-            st_nlink=self.link_count,
-        )
+        return self._stat(node)
+
+    def write(self, fd: int, data: memoryview | bytes) -> int:
+        node = self.fd_nodes[fd]
+        self.content.setdefault(node, bytearray()).extend(bytes(data))
+        return len(data)
+
+    def pread(self, fd: int, size: int, offset: int) -> bytes:
+        node = self.fd_nodes[fd]
+        return bytes(self.content.get(node, b"")[offset : offset + size])
+
+    def listxattr(self, fd: int) -> list[bytes]:
+        return list(self.xattrs.get(self.fd_nodes[fd], {}))
+
+    def getxattr(self, fd: int, name: bytes) -> bytes:
+        return self.xattrs[self.fd_nodes[fd]][name]
+
+    def fchown(self, fd: int, uid: int, gid: int) -> None:
+        del fd, uid, gid
+
+    def fchmod(self, fd: int, mode: int) -> None:
+        del fd, mode
+
+    def removexattr(self, fd: int, name: bytes) -> None:
+        del self.xattrs[self.fd_nodes[fd]][name]
+
+    def setxattr(self, fd: int, name: bytes, value: bytes) -> None:
+        self.xattrs.setdefault(self.fd_nodes[fd], {})[name] = value
+
+    def fsync(self, fd: int) -> None:
+        self.fsync_calls.append(fd)
 
     def unlink(self, path: str, *, dir_fd: int) -> None:
-        self.unlinked.append((self.fd_nodes[dir_fd], path))
+        parent = self.fd_nodes[dir_fd]
+        self.unlinked.append((parent, path))
+        self.children.pop((parent, path), None)
 
     def replace(
         self,
@@ -562,14 +612,13 @@ class _FakePosixAdapter:
         src_dir_fd: int,
         dst_dir_fd: int,
     ) -> None:
+        source_parent = self.fd_nodes[src_dir_fd]
+        destination_parent = self.fd_nodes[dst_dir_fd]
         self.replace_calls.append(
-            (
-                self.fd_nodes[src_dir_fd],
-                src,
-                self.fd_nodes[dst_dir_fd],
-                dst,
-            )
+            (source_parent, src, destination_parent, dst)
         )
+        node = self.children.pop((source_parent, src))
+        self.children[(destination_parent, dst)] = node
 
 def test_posix_pinned_parent_survives_symlink_rebind() -> None:
     from mochi.security.file_contract import FileIdentity
@@ -2283,3 +2332,25 @@ def test_create_temp_requires_update_or_rename() -> None:
             filesystem.create_temp(destination)
     finally:
         filesystem.close()
+
+def test_facade_replace_discards_backend_specific_successor_result() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.security.safe_filesystem import (
+        SafeFilesystem,
+        SafeTarget,
+        StagedTemp,
+    )
+
+    successor = FileIdentity("posix", "1", "77", 1, False)
+
+    class _Backend:
+        def replace(self, source: object, destination: object) -> FileIdentity:
+            del source, destination
+            return successor
+
+    facade = SafeFilesystem.__new__(SafeFilesystem)
+    facade._backend = _Backend()
+    source = object.__new__(StagedTemp)
+    destination = object.__new__(SafeTarget)
+
+    assert facade.replace(source, destination) is None

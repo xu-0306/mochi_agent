@@ -437,7 +437,7 @@ class SafeFilesystem:
 
     def replace(
         self, source: StagedTemp, destination: SafeTarget
-    ) -> FileIdentity:
+    ) -> None:
         if not isinstance(source, StagedTemp):
             raise TypeError(
                 "replace source must be a StagedTemp capability"
@@ -446,10 +446,7 @@ class SafeFilesystem:
             raise TypeError(
                 "replace destination must be a SafeTarget capability"
             )
-        return cast(
-            FileIdentity,
-            self._backend.replace(source, destination),
-        )
+        self._backend.replace(source, destination)
 
     def close(self) -> None:
         self._backend.close()
