@@ -62,8 +62,12 @@ class CommittedFilesystemMutationError(RuntimeError):
     ) -> None:
         self.phase = phase
         self.cause = cause
+        try:
+            detail = str(cause)
+        except BaseException:
+            detail = f"<{type(cause).__name__} could not be formatted>"
         super().__init__(
-            f"filesystem mutation committed; {phase} failed: {cause}"
+            f"filesystem mutation committed; {phase} failed: {detail}"
         )
 
 

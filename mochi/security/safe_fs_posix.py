@@ -1,10 +1,11 @@
 """Descriptor-relative POSIX filesystem mutation backend.
 
-Pinned parent FDs protect against ancestor and symlink rebinds. Portable
-POSIX Python cannot atomically identity-CAS the final basename, so a hostile
-concurrent writer with write access to the pinned directory can still race
-unlink or replace. The pinned directory itself may also be renamed outside
-the workspace.
+Pinned parent FDs protect against ancestor and symlink rebinds. Final
+descriptor checks are performed immediately before rename. Portable POSIX
+cannot eliminate same-UID mutation between those checks and rename, so this
+backend minimizes that micro-race without claiming to remove it. A hostile
+writer with directory access can also race names, and the pinned directory
+itself may be renamed outside the workspace.
 """
 
 from __future__ import annotations
@@ -19,12 +20,14 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from threading import RLock
+from typing import Any, cast
 
 from .file_contract import AuthorizationEnvelope, FileIdentity
 from .safe_filesystem import (
     AuthorizedFileBinding,
     CommittedFilesystemMutationError,
+    SafeFilesystemUnavailable,
     SafeTarget,
     StagedTemp,
     UnsafeFilesystemTarget,
@@ -72,7 +75,76 @@ class _IssuedMetadataSnapshot:
 
 
 class PosixSafeFilesystem:
-    """Mutate through pinned parent FDs and relative basenames."""
+    """Descriptor-relative mutation with a minimized final-check micro-race."""
+
+    _FD_SEMANTICS = frozenset(
+        {"listxattr", "getxattr", "removexattr", "setxattr"}
+    )
+    _DIR_FD_SEMANTICS = frozenset(
+        {"open", "stat", "unlink", "replace"}
+    )
+    _FOLLOW_SYMLINK_SEMANTICS = frozenset({"stat"})
+
+    @classmethod
+    def _validate_adapter_semantics(cls, adapter: Any) -> None:
+        missing: list[str] = []
+        if adapter is os:
+            fd_functions = {
+                name: getattr(os, name)
+                for name in cls._FD_SEMANTICS
+            }
+            missing.extend(
+                f"{name}(fd)"
+                for name, function in fd_functions.items()
+                if function not in os.supports_fd
+            )
+            dir_functions = {
+                "open": os.open,
+                "stat": os.stat,
+                "unlink": os.unlink,
+            }
+            missing.extend(
+                f"{name}(dir_fd)"
+                for name, function in dir_functions.items()
+                if function not in os.supports_dir_fd
+            )
+            replace_supported = (
+                os.replace in os.supports_dir_fd
+                or os.rename in os.supports_dir_fd
+            )
+            if not replace_supported:
+                missing.append("replace(dir_fd)")
+            if os.stat not in os.supports_follow_symlinks:
+                missing.append("stat(follow_symlinks=False)")
+        else:
+            declarations = (
+                ("supports_fd", cls._FD_SEMANTICS),
+                ("supports_dir_fd", cls._DIR_FD_SEMANTICS),
+                (
+                    "supports_follow_symlinks",
+                    cls._FOLLOW_SYMLINK_SEMANTICS,
+                ),
+            )
+            for attribute, required in declarations:
+                declared = getattr(adapter, attribute, None)
+                if not isinstance(declared, (set, frozenset)):
+                    missing.append(attribute)
+                    continue
+                declared_names: set[str] = set()
+                for item in cast(set[object] | frozenset[object], declared):
+                    if isinstance(item, str):
+                        declared_names.add(item)
+                    else:
+                        missing.append(attribute)
+                missing.extend(
+                    name
+                    for name in sorted(required - declared_names)
+                )
+        if missing:
+            raise SafeFilesystemUnavailable(
+                "POSIX adapter lacks required semantics: "
+                + ", ".join(missing)
+            )
 
     def __init__(self, workspace: str | Path, *, adapter: Any = os) -> None:
         required_constants = (
@@ -113,10 +185,12 @@ class PosixSafeFilesystem:
             if not callable(getattr(adapter, name, None))
         )
         if missing:
-            raise RuntimeError(
+            raise SafeFilesystemUnavailable(
                 "POSIX enforcing mode requires primitives: "
                 + ", ".join(missing)
             )
+        self._validate_adapter_semantics(adapter)
+        self._lock = RLock()
         self._adapter = adapter
         self._platform = str(getattr(adapter, "platform", sys.platform))
         self._closed = False
@@ -266,6 +340,16 @@ class PosixSafeFilesystem:
         return self._identity_from_info(self._adapter.fstat(file_fd))
 
     def prepare_target(
+        self,
+        relative_path: str | Path,
+        authorization: AuthorizationEnvelope,
+    ) -> SafeTarget:
+        with self._lock:
+            return self._prepare_target_locked(
+                relative_path, authorization
+            )
+
+    def _prepare_target_locked(
         self,
         relative_path: str | Path,
         authorization: AuthorizationEnvelope,
@@ -472,9 +556,14 @@ class PosixSafeFilesystem:
     def transaction_binding(
         self, target: SafeTarget
     ) -> AuthorizedFileBinding:
-        return self._validated(target).binding
+        with self._lock:
+            return self._validated(target).binding
 
     def capture_metadata(self, target: SafeTarget):
+        with self._lock:
+            return self._capture_metadata_locked(target)
+
+    def _capture_metadata_locked(self, target: SafeTarget):
         from ..tools.file_transaction import FileMetadataSnapshot
 
         record = self._validated(target)
@@ -493,6 +582,9 @@ class PosixSafeFilesystem:
             binding=record.binding,
             canonical_metadata_sha256=digest,
         )
+        for key, issued in tuple(self._metadata.items()):
+            if issued.target is target:
+                del self._metadata[key]
         self._metadata[id(snapshot)] = _IssuedMetadataSnapshot(
             snapshot=snapshot,
             target=target,
@@ -526,6 +618,10 @@ class PosixSafeFilesystem:
         return record
 
     def unlink(self, target: SafeTarget) -> None:
+        with self._lock:
+            self._unlink_locked(target)
+
+    def _unlink_locked(self, target: SafeTarget) -> None:
         record = self._validated(target)
         if record.binding.operation != "delete":
             raise UnsafeFilesystemTarget(
@@ -571,6 +667,12 @@ class PosixSafeFilesystem:
 
     def create_temp(
         self, target: SafeTarget, *, mode: int = 0o600
+    ) -> StagedTemp:
+        with self._lock:
+            return self._create_temp_locked(target, mode=mode)
+
+    def _create_temp_locked(
+        self, target: SafeTarget, *, mode: int
     ) -> StagedTemp:
         record = self._validated(target)
         if record.binding.operation not in {"update", "rename"}:
@@ -642,10 +744,17 @@ class PosixSafeFilesystem:
             raise
 
     def write_temp(self, temp: StagedTemp, data: memoryview) -> int:
-        record = self._validated_temp(temp)
-        return int(self._adapter.write(record.file_fd, data))
+        with self._lock:
+            record = self._validated_temp(temp)
+            return int(self._adapter.write(record.file_fd, data))
 
     def apply_metadata_snapshot(
+        self, temp: StagedTemp, snapshot: object
+    ) -> None:
+        with self._lock:
+            self._apply_metadata_snapshot_locked(temp, snapshot)
+
+    def _apply_metadata_snapshot_locked(
         self, temp: StagedTemp, snapshot: object
     ) -> None:
         record = self._validated_temp(temp)
@@ -709,6 +818,12 @@ class PosixSafeFilesystem:
     def verify_staged(
         self, temp: StagedTemp, snapshot: object
     ) -> None:
+        with self._lock:
+            self._verify_staged_locked(temp, snapshot)
+
+    def _verify_staged_locked(
+        self, temp: StagedTemp, snapshot: object
+    ) -> None:
         record = self._validated_temp(temp)
         issued = self._snapshot_record(
             snapshot, record.binding, record.target
@@ -728,10 +843,17 @@ class PosixSafeFilesystem:
             )
 
     def flush_temp(self, temp: StagedTemp) -> None:
-        record = self._validated_temp(temp)
-        self._adapter.fsync(record.file_fd)
+        with self._lock:
+            record = self._validated_temp(temp)
+            self._adapter.fsync(record.file_fd)
 
     def revalidate_base(
+        self, target: SafeTarget, snapshot: object
+    ) -> None:
+        with self._lock:
+            self._revalidate_base_locked(target, snapshot)
+
+    def _revalidate_base_locked(
         self, target: SafeTarget, snapshot: object
     ) -> None:
         record = self._validated(target)
@@ -753,6 +875,10 @@ class PosixSafeFilesystem:
             )
 
     def discard_temp(self, temp: StagedTemp) -> None:
+        with self._lock:
+            self._discard_temp_locked(temp)
+
+    def _discard_temp_locked(self, temp: StagedTemp) -> None:
         record = self._temp_record(temp)
         error: BaseException | None = None
         safe_to_unlink = False
@@ -803,7 +929,38 @@ class PosixSafeFilesystem:
         )
         return error
 
+    def _verify_commit_boundary(
+        self,
+        source: _IssuedPosixTemp,
+        destination: _IssuedPosixTarget,
+    ) -> None:
+        staged_content = self._content_sha256(source.file_fd)
+        staged_metadata = self._metadata_digest(
+            self._capture_native_metadata(source.file_fd)
+        )
+        base_content = self._content_sha256(destination.file_fd)
+        base_metadata = self._metadata_digest(
+            self._capture_native_metadata(destination.file_fd)
+        )
+        if (
+            staged_content != source.binding.after_sha256
+            or staged_metadata != source.binding.after_metadata_sha256
+            or base_content != destination.binding.base_sha256
+            or base_metadata
+            != destination.binding.base_metadata_sha256
+        ):
+            raise UnsafeFilesystemTarget(
+                "final content or metadata changed before replace"
+            )
+        self._adapter.fsync(source.file_fd)
+
     def replace(
+        self, source: StagedTemp, destination: SafeTarget
+    ) -> FileIdentity:
+        with self._lock:
+            return self._replace_locked(source, destination)
+
+    def _replace_locked(
         self, source: StagedTemp, destination: SafeTarget
     ) -> FileIdentity:
         source_record = self._validated_temp(source)
@@ -812,6 +969,9 @@ class PosixSafeFilesystem:
             raise UnsafeFilesystemTarget(
                 "replace operands require the same authorization binding"
             )
+        self._verify_commit_boundary(
+            source_record, destination_record
+        )
         self._adapter.replace(
             source_record.basename,
             destination_record.basename,
@@ -844,7 +1004,10 @@ class PosixSafeFilesystem:
             else:
                 self._add_cleanup_note(error, exc)
 
-        temp_error = self._consume_temp(source)
+        try:
+            temp_error = self._consume_temp(source)
+        except BaseException as exc:
+            temp_error = exc
         if temp_error is not None:
             if error is None:
                 error = temp_error
@@ -874,6 +1037,12 @@ class PosixSafeFilesystem:
         return successor_identity
 
     def release_target(self, target: SafeTarget) -> None:
+        with self._lock:
+            if target.closed:
+                return
+            self._release_target_locked(target)
+
+    def _release_target_locked(self, target: SafeTarget) -> None:
         record = self._record(target)
         del self._issued[id(target)]
         for key, snapshot in tuple(self._metadata.items()):
@@ -891,9 +1060,16 @@ class PosixSafeFilesystem:
             raise error
 
     def release_temp(self, temp: StagedTemp) -> None:
-        self.discard_temp(temp)
+        with self._lock:
+            if temp.closed:
+                return
+            self.discard_temp(temp)
 
     def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         if self._closed:
             return
         error: BaseException | None = None

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
 import stat
+import struct
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +103,11 @@ class _PosixAdapter:
     O_DIRECTORY = 0x10000
     O_NOFOLLOW = 0x20000
     platform = "linux"
+    supports_fd = frozenset(
+        {"listxattr", "getxattr", "removexattr", "setxattr"}
+    )
+    supports_dir_fd = frozenset({"open", "stat", "unlink", "replace"})
+    supports_follow_symlinks = frozenset({"stat"})
 
     def __init__(self) -> None:
         self.next_fd = 100
@@ -132,6 +142,7 @@ class _PosixAdapter:
         self.tamper_temp_content_read = False
         self.tamper_temp_metadata_on_second_list = False
         self.temp_listxattr_calls = 0
+        self.after_replace = None
 
     def fail(self, operation: str, error: BaseException) -> None:
         self.failures[operation] = error
@@ -332,6 +343,8 @@ class _PosixAdapter:
         self._raise("replace")
         node = self.children.pop((source_parent, src))
         self.children[(destination_parent, dst)] = node
+        if self.after_replace is not None:
+            self.after_replace()
 
 
 def _filesystem(adapter: _PosixAdapter):
@@ -694,4 +707,321 @@ def test_successor_identity_mismatch_is_committed_and_drains_operands() -> None:
     assert not any(event[0] == "unlink" for event in adapter.events)
     assert target.closed
     assert adapter.fd_nodes == {100: "workspace"}
+    filesystem.close()
+
+def _ready_for_replace(adapter, filesystem, target, snapshot):
+    temp = filesystem.create_temp(target)
+    assert filesystem.write_temp(temp, memoryview(AFTER)) == len(AFTER)
+    filesystem.apply_metadata_snapshot(temp, snapshot)
+    filesystem.verify_staged(temp, snapshot)
+    filesystem.flush_temp(temp)
+    filesystem.revalidate_base(target, snapshot)
+    temp_node = adapter.children[("safe", temp.basename)]
+    return temp, temp_node
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["staged_content", "staged_metadata", "base_content", "base_metadata"],
+)
+def test_replace_rechecks_content_and_metadata_immediately_before_commit(
+    tamper: str,
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    temp, temp_node = _ready_for_replace(
+        adapter, filesystem, target, snapshot
+    )
+    if tamper == "staged_content":
+        adapter.content[temp_node][:] = b"late-staged-tamper"
+    elif tamper == "staged_metadata":
+        adapter.xattrs[temp_node][b"user.alpha"] = b"late-staged-tamper"
+    elif tamper == "base_content":
+        adapter.content["original"][:] = b"late-base-tamper"
+    else:
+        adapter.xattrs["original"][b"user.alpha"] = b"late-base-tamper"
+
+    with pytest.raises(UnsafeFilesystemTarget):
+        filesystem.replace(temp, target)
+
+    assert not any(event[0] == "replace" for event in adapter.events)
+    assert adapter.children[("safe", "note.txt")] == "original"
+    filesystem.discard_temp(temp)
+    target.close()
+    filesystem.close()
+
+
+def test_postreplace_concurrent_temp_close_waits_for_owner_cleanup() -> None:
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    temp, _ = _ready_for_replace(adapter, filesystem, target, snapshot)
+    started = threading.Event()
+    finished = threading.Event()
+    blocked_during_callback: list[bool] = []
+    contender_errors: list[BaseException] = []
+
+    def contender() -> None:
+        started.set()
+        try:
+            temp.close()
+        except BaseException as exc:
+            contender_errors.append(exc)
+        finally:
+            finished.set()
+
+    contender_thread = threading.Thread(target=contender)
+
+    def after_replace() -> None:
+        contender_thread.start()
+        assert started.wait(1)
+        blocked_during_callback.append(not finished.wait(0.05))
+
+    adapter.after_replace = after_replace
+    try:
+        successor = filesystem.replace(temp, target)
+    finally:
+        contender_thread.join(timeout=2)
+        if not target.closed:
+            target.close()
+        filesystem.close()
+
+    assert successor.file_id != "41"
+    assert blocked_during_callback == [True]
+    assert finished.is_set()
+    assert contender_errors == []
+    assert temp.closed and target.closed
+    assert not any(event[0] == "unlink" for event in adapter.events)
+
+
+def test_consume_temp_exception_after_commit_still_drains_destination() -> None:
+    from mochi.security.safe_filesystem import CommittedFilesystemMutationError
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+
+    class _ConsumeRaises(PosixSafeFilesystem):
+        def _consume_temp(self, temp):
+            error = super()._consume_temp(temp)
+            if error is not None:
+                return error
+            raise OSError("consume hook failed")
+
+    adapter = _PosixAdapter()
+    filesystem = _ConsumeRaises("/workspace", adapter=adapter)
+    target = filesystem.prepare_target("safe/note.txt", _authorization())
+    snapshot = filesystem.capture_metadata(target)
+    temp, _ = _ready_for_replace(adapter, filesystem, target, snapshot)
+
+    with pytest.raises(CommittedFilesystemMutationError) as raised:
+        filesystem.replace(temp, target)
+
+    assert raised.value.committed is True
+    assert raised.value.phase == "operand_cleanup"
+    assert isinstance(raised.value.cause, OSError)
+    assert "consume hook failed" in str(raised.value.cause)
+    assert temp.closed and target.closed
+    assert adapter.fd_nodes == {100: "workspace"}
+    filesystem.close()
+
+
+def test_injected_adapter_requires_declared_semantic_capabilities() -> None:
+    from mochi.security.safe_filesystem import SafeFilesystemUnavailable
+
+    adapter = _PosixAdapter()
+    adapter.supports_dir_fd = frozenset({"open", "stat", "unlink"})
+
+    with pytest.raises(SafeFilesystemUnavailable, match="replace"):
+        _filesystem(adapter)
+
+    assert adapter.fd_nodes == {}
+
+
+def test_new_metadata_capture_supersedes_old_snapshot() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    first = filesystem.capture_metadata(target)
+    second = filesystem.capture_metadata(target)
+    try:
+        assert len(filesystem._metadata) == 1
+        temp = filesystem.create_temp(target)
+        try:
+            with pytest.raises(UnsafeFilesystemTarget, match="snapshot"):
+                filesystem.apply_metadata_snapshot(temp, first)
+            filesystem.apply_metadata_snapshot(temp, second)
+        finally:
+            if not temp.closed:
+                filesystem.discard_temp(temp)
+    finally:
+        target.close()
+        filesystem.close()
+
+
+def test_committed_error_survives_hostile_cause_formatting() -> None:
+    from mochi.security.safe_filesystem import CommittedFilesystemMutationError
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    class _BadStringError(OSError):
+        def __str__(self) -> str:
+            raise RuntimeError("hostile formatter")
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    cause = _BadStringError()
+    adapter.fail("fsync:parent", cause)
+
+    with pytest.raises(CommittedFilesystemMutationError) as raised:
+        atomic_write_bytes(target, AFTER, snapshot)
+
+    assert raised.value.committed is True
+    assert raised.value.phase == "parent_fsync"
+    assert raised.value.cause is cause
+    assert raised.value.__cause__ is cause
+    filesystem.close()
+
+
+def _real_metadata_sha(file_fd: int) -> str:
+    names = sorted(
+        os.fsencode(name) if isinstance(name, str) else bytes(name)
+        for name in os.listxattr(file_fd)
+    )
+    attrs = {name: os.getxattr(file_fd, name) for name in names}
+    info = os.fstat(file_fd)
+    return _metadata_sha(
+        uid=info.st_uid,
+        gid=info.st_gid,
+        mode=stat.S_IMODE(info.st_mode),
+        xattrs=attrs,
+    )
+
+
+def _real_authorization(workspace, target, metadata_sha: str):
+    from mochi.security.file_contract import (
+        AuthorizationContext,
+        AuthorizationEnvelope,
+        ChangeEntry,
+        FileChangeRequest,
+        FileIdentity,
+    )
+
+    root_info = workspace.stat()
+    target_info = target.stat()
+    root_identity = FileIdentity(
+        "posix",
+        str(root_info.st_dev),
+        str(root_info.st_ino),
+        root_info.st_nlink,
+        False,
+    )
+    target_identity = FileIdentity(
+        "posix",
+        str(target_info.st_dev),
+        str(target_info.st_ino),
+        target_info.st_nlink,
+        False,
+    )
+    entry = ChangeEntry(
+        entry_id="real-posix",
+        relative_path=target.name,
+        operation="update",
+        base_sha256=_sha(BASE),
+        after_sha256=_sha(AFTER),
+        base_identity=target_identity,
+        before_blob_id="before",
+        after_blob_id="after",
+        mode_before=stat.S_IMODE(target_info.st_mode),
+        mode_after=stat.S_IMODE(target_info.st_mode),
+        base_metadata_sha256=metadata_sha,
+        after_metadata_sha256=metadata_sha,
+        rename_source=None,
+        dependency_group="real-posix",
+    )
+    return AuthorizationEnvelope(
+        schema_version=1,
+        kind="file_change",
+        context=AuthorizationContext(
+            requester_id="requester",
+            session_id="session",
+            task_id="task",
+            workspace_root=str(workspace),
+            workspace_identity=root_identity,
+        ),
+        policy_version="policy-v1",
+        file_request=FileChangeRequest(
+            entries=(entry,), patch_sha256=_sha(b"patch")
+        ),
+        exec_request=None,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires real Linux POSIX APIs")
+@pytest.mark.parametrize("metadata_kind", ["user_xattrs", "posix_acl"])
+def test_real_linux_atomic_replace_preserves_security_metadata(
+    tmp_path, metadata_kind: str
+) -> None:
+    from mochi.security.safe_fs_posix import PosixSafeFilesystem
+    from mochi.tools.file_transaction import atomic_write_bytes
+
+    target_path = tmp_path / "note.txt"
+    target_path.write_bytes(BASE)
+    os.chmod(target_path, 0o640)
+    os.setxattr(target_path, b"user.mochi", b"value")
+    expected_xattrs = {b"user.mochi": b"value"}
+    if metadata_kind == "user_xattrs":
+        raw_name = b"user.mochi-\xff"
+        try:
+            os.setxattr(target_path, raw_name, b"raw-value")
+        except OSError as exc:
+            if exc.errno not in {
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+            }:
+                raise
+        else:
+            expected_xattrs[raw_name] = b"raw-value"
+    else:
+        acl = (
+            struct.pack("<I", 2)
+            + struct.pack("<HHI", 0x01, 0o6, 0xFFFFFFFF)
+            + struct.pack("<HHI", 0x04, 0o4, 0xFFFFFFFF)
+            + struct.pack("<HHI", 0x20, 0o4, 0xFFFFFFFF)
+        )
+        try:
+            os.setxattr(target_path, ACL, acl)
+        except OSError as exc:
+            if exc.errno in {
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+                errno.EPERM,
+            }:
+                pytest.skip(f"POSIX ACL xattr unsupported: errno {exc.errno}")
+            raise
+        expected_xattrs[ACL] = os.getxattr(target_path, ACL)
+
+    file_fd = os.open(target_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata_sha = _real_metadata_sha(file_fd)
+    finally:
+        os.close(file_fd)
+    authorization = _real_authorization(
+        tmp_path, target_path, metadata_sha
+    )
+    filesystem = PosixSafeFilesystem(tmp_path)
+    target = filesystem.prepare_target(target_path.name, authorization)
+    snapshot = filesystem.capture_metadata(target)
+
+    result = atomic_write_bytes(target, AFTER, snapshot)
+
+    assert result.bytes_written == len(AFTER)
+    assert target_path.read_bytes() == AFTER
+    for name, value in expected_xattrs.items():
+        assert os.getxattr(target_path, name) == value
+    assert stat.S_IMODE(target_path.stat().st_mode) == 0o640
+    assert target.closed
     filesystem.close()

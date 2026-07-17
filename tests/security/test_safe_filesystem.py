@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
@@ -103,6 +104,43 @@ def _authorization() -> AuthorizationEnvelope:
         "safe/note.txt",
         FileIdentity("posix", "1", "41", 1, False),
     )
+
+
+def _posix_atomic_authorization() -> AuthorizationEnvelope:
+    authorization = _authorization()
+    request = authorization.file_request
+    assert request is not None
+    metadata = {
+        "gid": 1000,
+        "mode": 0o600,
+        "uid": 1000,
+        "xattrs": [],
+    }
+    metadata_sha = hashlib.sha256(
+        json.dumps(
+            metadata, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+    ).hexdigest()
+    entry = replace(
+        request.entries[0],
+        base_metadata_sha256=metadata_sha,
+        after_metadata_sha256=metadata_sha,
+    )
+    return replace(
+        authorization,
+        file_request=replace(request, entries=(entry,)),
+    )
+
+
+def _stage_posix_atomic_temp(filesystem, destination):
+    snapshot = filesystem.capture_metadata(destination)
+    staged = filesystem.create_temp(destination)
+    payload = b"after-content"
+    assert filesystem.write_temp(
+        staged, memoryview(payload)
+    ) == len(payload)
+    filesystem.apply_metadata_snapshot(staged, snapshot)
+    return staged
 
 def _manifest(
     *, entries: tuple[ChangeEntry, ...] | None = None
@@ -465,6 +503,11 @@ class _FakePosixAdapter:
     O_DIRECTORY = 0x10000
     O_NOFOLLOW = 0x20000
     platform = "linux"
+    supports_fd = frozenset(
+        {"listxattr", "getxattr", "removexattr", "setxattr"}
+    )
+    supports_dir_fd = frozenset({"open", "stat", "unlink", "replace"})
+    supports_follow_symlinks = frozenset({"stat"})
 
     def __init__(self, *, link_count: int = 1) -> None:
         self.link_count = link_count
@@ -476,7 +519,7 @@ class _FakePosixAdapter:
             ("outside", "note.txt"): "outside-note",
         }
         self.content: dict[str, bytearray] = {
-            "note-original": bytearray(b"note"),
+            "note-original": bytearray(b"base-content"),
             "outside-note": bytearray(b"outside"),
         }
         self.xattrs: dict[str, dict[bytes, bytes]] = {
@@ -1391,10 +1434,10 @@ def test_posix_staged_temp_is_identity_checked_and_replaced_relative() -> None:
     adapter = _FakePosixAdapter()
     filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
     destination = filesystem.prepare_target(
-        "safe/note.txt", _authorization()
+        "safe/note.txt", _posix_atomic_authorization()
     )
 
-    staged = filesystem.create_temp(destination)
+    staged = _stage_posix_atomic_temp(filesystem, destination)
 
     assert isinstance(staged, StagedTemp)
     assert staged.identity.file_id == "77"
@@ -1886,9 +1929,9 @@ def test_posix_post_replace_cleanup_reports_committed_outcome() -> None:
     adapter = TempCloseFailure()
     filesystem = PosixSafeFilesystem("/workspace", adapter=adapter)
     destination = filesystem.prepare_target(
-        "safe/note.txt", _authorization()
+        "safe/note.txt", _posix_atomic_authorization()
     )
-    staged = filesystem.create_temp(destination)
+    staged = _stage_posix_atomic_temp(filesystem, destination)
     adapter.armed = True
 
     with pytest.raises(
@@ -1920,9 +1963,9 @@ def test_posix_precommit_replace_failure_keeps_capabilities_live() -> None:
         "/workspace", adapter=ReplaceFailure()
     )
     destination = filesystem.prepare_target(
-        "safe/note.txt", _authorization()
+        "safe/note.txt", _posix_atomic_authorization()
     )
-    staged = filesystem.create_temp(destination)
+    staged = _stage_posix_atomic_temp(filesystem, destination)
 
     with pytest.raises(OSError, match="did not commit") as raised:
         filesystem.replace(staged, destination)
