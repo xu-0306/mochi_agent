@@ -738,6 +738,14 @@ def _windows_authorization(
     )
 
 class _FakeWindowsAdapter:
+    semantics = frozenset({
+        "content_read_at", "content_write", "file_flush", "directory_flush",
+        "change_token", "security_capture", "security_apply",
+        "relative_rename", "handle_disposition", "duplicate_handle",
+    })
+    platform = "win32-fake"
+    sacl_state = "inaccessible"
+
     def __init__(
         self,
         *,
@@ -923,6 +931,54 @@ class _FakeWindowsAdapter:
         self.paths[node] = f"{self.paths[parent]}/{basename}"
         self.renamed = True
 
+    def duplicate_handle(self, handle: object) -> object:
+        self.calls.append(("DuplicateHandle", handle))
+        duplicate = object()
+        self.nodes[duplicate] = self.nodes[handle]
+        return duplicate
+
+    def sacl_access(self, handle: object) -> str:
+        del handle
+        return self.sacl_state
+
+    def read_at(self, handle: object, size: int, offset: int) -> bytes:
+        del handle, size, offset
+        return b""
+
+    def write(self, handle: object, data: memoryview) -> int:
+        self.calls.append(("WriteFile", handle, len(data)))
+        return len(data)
+
+    def flush_file(self, handle: object) -> None:
+        self.calls.append(("FlushFileBuffers", handle))
+
+    def flush_directory(self, handle: object) -> None:
+        self.calls.append(("NtFlushBuffersFile", handle))
+
+    def change_token(self, handle: object) -> object:
+        return self.identity(handle)
+
+    def security_descriptor(
+        self, handle: object, *, include_sacl: bool
+    ) -> object:
+        del handle, include_sacl
+        return SimpleNamespace(
+            raw_descriptor=b"fake",
+            owner=None,
+            group=None,
+            dacl=None,
+            dacl_present=False,
+            dacl_protected=False,
+            sacl=None,
+            sacl_present=False,
+            sacl_protected=False,
+            sacl_state=self.sacl_state,
+        )
+
+    def apply_security_descriptor(
+        self, handle: object, metadata: object
+    ) -> None:
+        self.calls.append(("SetKernelObjectSecurity", handle, metadata))
     def close(self, handle: object) -> None:
         self.calls.append(("CloseHandle", handle))
         self.nodes.pop(handle, None)
