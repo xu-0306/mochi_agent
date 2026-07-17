@@ -120,13 +120,37 @@ class _PosixAdapter:
         }
         self.info = {
             "workspace": dict(
-                mode=0o040700, dev=10, ino=20, nlink=1, uid=1000, gid=1000
+                mode=0o040700,
+                dev=10,
+                ino=20,
+                nlink=1,
+                uid=1000,
+                gid=1000,
+                size=0,
+                mtime_ns=1,
+                ctime_ns=1,
             ),
             "safe": dict(
-                mode=0o040700, dev=10, ino=21, nlink=1, uid=1000, gid=1000
+                mode=0o040700,
+                dev=10,
+                ino=21,
+                nlink=1,
+                uid=1000,
+                gid=1000,
+                size=0,
+                mtime_ns=1,
+                ctime_ns=1,
             ),
             "original": dict(
-                mode=0o100640, dev=1, ino=41, nlink=1, uid=1000, gid=1001
+                mode=0o100640,
+                dev=1,
+                ino=41,
+                nlink=1,
+                uid=1000,
+                gid=1001,
+                size=len(BASE),
+                mtime_ns=1,
+                ctime_ns=1,
             ),
         }
         self.content = {"original": bytearray(BASE)}
@@ -143,6 +167,9 @@ class _PosixAdapter:
         self.tamper_temp_metadata_on_second_list = False
         self.temp_listxattr_calls = 0
         self.after_replace = None
+        self.on_base_pread = None
+        self.on_temp_fsync = None
+        self.missing_change_token_field: str | None = None
 
     def fail(self, operation: str, error: BaseException) -> None:
         self.failures[operation] = error
@@ -156,14 +183,44 @@ class _PosixAdapter:
         values = dict(self.info[node])
         if node == "original" and self.target_fstat_ino is not None:
             values["ino"] = self.target_fstat_ino
-        return SimpleNamespace(
-            st_mode=values["mode"],
-            st_dev=values["dev"],
-            st_ino=values["ino"],
-            st_nlink=values["nlink"],
-            st_uid=values["uid"],
-            st_gid=values["gid"],
+        result = {
+            "st_mode": values["mode"],
+            "st_dev": values["dev"],
+            "st_ino": values["ino"],
+            "st_nlink": values["nlink"],
+            "st_uid": values["uid"],
+            "st_gid": values["gid"],
+            "st_size": values["size"],
+            "st_mtime_ns": values["mtime_ns"],
+            "st_ctime_ns": values["ctime_ns"],
+        }
+        if self.missing_change_token_field is not None:
+            result.pop(self.missing_change_token_field, None)
+        return SimpleNamespace(**result)
+
+    def _touch_content(self, node: str) -> None:
+        self.info[node]["size"] = len(self.content[node])
+        self.info[node]["mtime_ns"] += 1
+        self.info[node]["ctime_ns"] += 1
+
+    def _touch_metadata(self, node: str) -> None:
+        self.info[node]["ctime_ns"] += 1
+
+    def _add_file(self, node: str, content: bytes) -> None:
+        self.info[node] = dict(
+            mode=0o100640,
+            dev=1,
+            ino=self.next_ino,
+            nlink=1,
+            uid=1000,
+            gid=1001,
+            size=len(content),
+            mtime_ns=1,
+            ctime_ns=1,
         )
+        self.next_ino += 1
+        self.content[node] = bytearray(content)
+        self.xattrs[node] = dict(XATTRS)
 
     def open(
         self,
@@ -191,6 +248,9 @@ class _PosixAdapter:
                     nlink=1,
                     uid=2000,
                     gid=2000,
+                    size=0,
+                    mtime_ns=1,
+                    ctime_ns=1,
                 )
                 self.next_ino += 1
                 self.content[node] = bytearray()
@@ -256,6 +316,7 @@ class _PosixAdapter:
         offset = self.offsets[fd]
         payload = bytes(data[:written])
         self.content[node][offset : offset + written] = payload
+        self._touch_content(node)
         self.offsets[fd] += written
         self.events.append(("write", node, payload, offset))
         return written
@@ -264,9 +325,14 @@ class _PosixAdapter:
         node = self.fd_nodes[fd]
         self.events.append(("pread", node, offset))
         self._raise(f"pread:{node}")
+        if node == "original" and self.on_base_pread is not None:
+            callback = self.on_base_pread
+            self.on_base_pread = None
+            callback()
         if self.tamper_temp_content_read and node.startswith("temp:"):
             self.tamper_temp_content_read = False
             self.content[node][:] = b"tampered-content"
+            self._touch_content(node)
         return bytes(self.content[node][offset : offset + size])
 
     def listxattr(self, fd: int) -> list[bytes]:
@@ -282,6 +348,7 @@ class _PosixAdapter:
             ):
                 self.tamper_temp_metadata_on_second_list = False
                 self.xattrs[node][b"user.alpha"] = b"tampered"
+                self._touch_metadata(node)
         return list(self.xattrs[node])
 
     def getxattr(self, fd: int, name: bytes) -> bytes:
@@ -297,30 +364,38 @@ class _PosixAdapter:
         self._raise("fchown")
         self.info[node]["uid"] = uid
         self.info[node]["gid"] = gid
+        self._touch_metadata(node)
 
     def fchmod(self, fd: int, mode: int) -> None:
         node = self.fd_nodes[fd]
         self.events.append(("fchmod", node, mode))
         self._raise("fchmod")
         self.info[node]["mode"] = 0o100000 | mode
+        self._touch_metadata(node)
 
     def removexattr(self, fd: int, name: bytes) -> None:
         node = self.fd_nodes[fd]
         self.events.append(("removexattr", node, name))
         self._raise("removexattr")
         del self.xattrs[node][name]
+        self._touch_metadata(node)
 
     def setxattr(self, fd: int, name: bytes, value: bytes) -> None:
         node = self.fd_nodes[fd]
         self.events.append(("setxattr", node, name))
         self._raise("setxattr")
         self.xattrs[node][name] = value
+        self._touch_metadata(node)
 
     def fsync(self, fd: int) -> None:
         node = self.fd_nodes[fd]
         kind = "temp" if node.startswith("temp:") else "parent"
         self.events.append(("fsync", node))
         self._raise(f"fsync:{kind}")
+        if node.startswith("temp:") and self.on_temp_fsync is not None:
+            callback = self.on_temp_fsync
+            self.on_temp_fsync = None
+            callback()
 
     def unlink(self, path: str, *, dir_fd: int) -> None:
         parent = self.fd_nodes[dir_fd]
@@ -884,6 +959,171 @@ def test_committed_error_survives_hostile_cause_formatting() -> None:
     filesystem.close()
 
 
+
+
+@pytest.mark.parametrize("operand", ["source", "destination"])
+def test_replace_revalidates_basenames_after_final_staged_fsync(
+    operand: str,
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    temp, temp_node = _ready_for_replace(
+        adapter, filesystem, target, snapshot
+    )
+    hostile_node = f"hostile:{operand}"
+    hostile_content = f"{operand}-rebind".encode()
+    adapter._add_file(hostile_node, hostile_content)
+    basename = temp.basename if operand == "source" else "note.txt"
+    key = ("safe", basename)
+
+    def rebind_name() -> None:
+        adapter.children[key] = hostile_node
+
+    adapter.on_temp_fsync = rebind_name
+    try:
+        with pytest.raises(UnsafeFilesystemTarget):
+            filesystem.replace(temp, target)
+
+        assert not any(event[0] == "replace" for event in adapter.events)
+        assert adapter.children[key] == hostile_node
+        assert bytes(adapter.content[hostile_node]) == hostile_content
+        assert bytes(adapter.content["original"]) == BASE
+        if operand == "source":
+            assert adapter.children[("safe", "note.txt")] == "original"
+        else:
+            assert adapter.children[("safe", temp.basename)] == temp_node
+
+        unlink_count = sum(event[0] == "unlink" for event in adapter.events)
+        if operand == "source":
+            with pytest.raises(UnsafeFilesystemTarget, match="discard"):
+                filesystem.discard_temp(temp)
+        else:
+            filesystem.discard_temp(temp)
+        discarded = [
+            event for event in adapter.events if event[0] == "unlink"
+        ][unlink_count:]
+        if operand == "source":
+            assert discarded == []
+        else:
+            assert len(discarded) == 1
+            assert discarded[0][-1] == temp_node
+    finally:
+        if not temp.closed:
+            filesystem.discard_temp(temp)
+        if not target.closed:
+            target.close()
+        filesystem.close()
+
+
+def test_replace_rejects_staged_mutation_while_base_is_hashed() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    temp, temp_node = _ready_for_replace(
+        adapter, filesystem, target, snapshot
+    )
+
+    def mutate_staged() -> None:
+        adapter.content[temp_node][:] = b"staged-race"
+        adapter._touch_content(temp_node)
+
+    adapter.on_base_pread = mutate_staged
+    try:
+        with pytest.raises(UnsafeFilesystemTarget):
+            filesystem.replace(temp, target)
+
+        assert not any(event[0] == "replace" for event in adapter.events)
+        assert adapter.children[("safe", "note.txt")] == "original"
+        assert bytes(adapter.content["original"]) == BASE
+        assert adapter.children[("safe", temp.basename)] == temp_node
+        filesystem.discard_temp(temp)
+        assert any(
+            event[0] == "unlink" and event[-1] == temp_node
+            for event in adapter.events
+        )
+    finally:
+        if not temp.closed:
+            filesystem.discard_temp(temp)
+        if not target.closed:
+            target.close()
+        filesystem.close()
+
+
+@pytest.mark.parametrize("mutation", ["content", "metadata"])
+def test_replace_rejects_base_mutation_during_final_staged_fsync(
+    mutation: str,
+) -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    temp, temp_node = _ready_for_replace(
+        adapter, filesystem, target, snapshot
+    )
+
+    def mutate_base() -> None:
+        if mutation == "content":
+            adapter.content["original"][:] = b"hostile-base-race"
+            adapter._touch_content("original")
+        else:
+            adapter.xattrs["original"][b"user.alpha"] = b"hostile-metadata"
+            adapter._touch_metadata("original")
+
+    adapter.on_temp_fsync = mutate_base
+    try:
+        with pytest.raises(UnsafeFilesystemTarget):
+            filesystem.replace(temp, target)
+
+        assert not any(event[0] == "replace" for event in adapter.events)
+        assert adapter.children[("safe", "note.txt")] == "original"
+        if mutation == "content":
+            assert bytes(adapter.content["original"]) == b"hostile-base-race"
+        else:
+            assert (
+                adapter.xattrs["original"][b"user.alpha"]
+                == b"hostile-metadata"
+            )
+        assert adapter.children[("safe", temp.basename)] == temp_node
+        filesystem.discard_temp(temp)
+        assert any(
+            event[0] == "unlink" and event[-1] == temp_node
+            for event in adapter.events
+        )
+    finally:
+        if not temp.closed:
+            filesystem.discard_temp(temp)
+        if not target.closed:
+            target.close()
+        filesystem.close()
+
+
+def test_replace_fails_closed_without_high_resolution_change_token() -> None:
+    from mochi.security.safe_filesystem import SafeFilesystemUnavailable
+
+    adapter = _PosixAdapter()
+    filesystem, target = _prepared(adapter)
+    snapshot = filesystem.capture_metadata(target)
+    temp, _ = _ready_for_replace(adapter, filesystem, target, snapshot)
+    adapter.missing_change_token_field = "st_mtime_ns"
+    try:
+        with pytest.raises(SafeFilesystemUnavailable, match="st_mtime_ns"):
+            filesystem.replace(temp, target)
+
+        assert not any(event[0] == "replace" for event in adapter.events)
+    finally:
+        adapter.missing_change_token_field = None
+        if not temp.closed:
+            filesystem.discard_temp(temp)
+        if not target.closed:
+            target.close()
+        filesystem.close()
+
 def _real_metadata_sha(file_fd: int) -> str:
     names = sorted(
         os.fsencode(name) if isinstance(name, str) else bytes(name)
@@ -971,6 +1211,7 @@ def test_real_linux_atomic_replace_preserves_security_metadata(
     os.chmod(target_path, 0o640)
     os.setxattr(target_path, b"user.mochi", b"value")
     expected_xattrs = {b"user.mochi": b"value"}
+    expected_mode = stat.S_IMODE(target_path.stat().st_mode)
     if metadata_kind == "user_xattrs":
         raw_name = b"user.mochi-\xff"
         try:
@@ -985,11 +1226,15 @@ def test_real_linux_atomic_replace_preserves_security_metadata(
         else:
             expected_xattrs[raw_name] = b"raw-value"
     else:
+        owner_uid = target_path.stat().st_uid
+        named_uid = owner_uid + 1 if owner_uid < 0xFFFFFFFE else owner_uid - 1
         acl = (
             struct.pack("<I", 2)
             + struct.pack("<HHI", 0x01, 0o6, 0xFFFFFFFF)
+            + struct.pack("<HHI", 0x02, 0o4, named_uid)
             + struct.pack("<HHI", 0x04, 0o4, 0xFFFFFFFF)
-            + struct.pack("<HHI", 0x20, 0o4, 0xFFFFFFFF)
+            + struct.pack("<HHI", 0x10, 0o4, 0xFFFFFFFF)
+            + struct.pack("<HHI", 0x20, 0o0, 0xFFFFFFFF)
         )
         try:
             os.setxattr(target_path, ACL, acl)
@@ -999,10 +1244,16 @@ def test_real_linux_atomic_replace_preserves_security_metadata(
                 errno.ENOTSUP,
                 errno.EOPNOTSUPP,
                 errno.EPERM,
+                errno.EACCES,
+                errno.EROFS,
             }:
-                pytest.skip(f"POSIX ACL xattr unsupported: errno {exc.errno}")
+                pytest.skip(
+                    "POSIX ACL fixture rejected or unsupported: "
+                    f"errno {exc.errno}"
+                )
             raise
         expected_xattrs[ACL] = os.getxattr(target_path, ACL)
+        expected_mode = stat.S_IMODE(target_path.stat().st_mode)
 
     file_fd = os.open(target_path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
@@ -1022,6 +1273,6 @@ def test_real_linux_atomic_replace_preserves_security_metadata(
     assert target_path.read_bytes() == AFTER
     for name, value in expected_xattrs.items():
         assert os.getxattr(target_path, name) == value
-    assert stat.S_IMODE(target_path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(target_path.stat().st_mode) == expected_mode
     assert target.closed
     filesystem.close()

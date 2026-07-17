@@ -1,11 +1,12 @@
 """Descriptor-relative POSIX filesystem mutation backend.
 
-Pinned parent FDs protect against ancestor and symlink rebinds. Final
-descriptor checks are performed immediately before rename. Portable POSIX
-cannot eliminate same-UID mutation between those checks and rename, so this
-backend minimizes that micro-race without claiming to remove it. A hostile
-writer with directory access can also race names, and the pinned directory
-itself may be renamed outside the workspace.
+Pinned parent FDs protect against ancestor and symlink rebinds. Stable
+descriptor tokens plus retained-FD and basename identity checks are performed
+immediately before rename. Portable POSIX cannot eliminate same-UID mutation
+between the final completed checks and rename, so this backend minimizes that
+micro-race without claiming to remove it. A hostile writer with directory
+access can also race names, and the pinned directory itself may be renamed
+outside the workspace.
 """
 
 from __future__ import annotations
@@ -42,6 +43,16 @@ class _NativeMetadata:
     gid: int
     mode: int
     xattrs: tuple[tuple[bytes, bytes], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FileChangeToken:
+    device: int
+    inode: int
+    link_count: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +349,36 @@ class PosixSafeFilesystem:
 
     def _identity_of_fd(self, file_fd: int) -> FileIdentity:
         return self._identity_from_info(self._adapter.fstat(file_fd))
+
+    def _change_token(self, file_fd: int) -> _FileChangeToken:
+        info = self._adapter.fstat(file_fd)
+        required = (
+            "st_dev",
+            "st_ino",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        missing = [name for name in required if not hasattr(info, name)]
+        if missing:
+            raise SafeFilesystemUnavailable(
+                "POSIX stable change token requires fstat fields: "
+                + ", ".join(missing)
+            )
+        try:
+            return _FileChangeToken(
+                device=int(info.st_dev),
+                inode=int(info.st_ino),
+                link_count=int(info.st_nlink),
+                size=int(info.st_size),
+                mtime_ns=int(info.st_mtime_ns),
+                ctime_ns=int(info.st_ctime_ns),
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise SafeFilesystemUnavailable(
+                "POSIX fstat returned an invalid stable change token"
+            ) from exc
 
     def prepare_target(
         self,
@@ -929,19 +970,52 @@ class PosixSafeFilesystem:
         )
         return error
 
+    def _verify_final_identity(
+        self,
+        record: _IssuedPosixTemp | _IssuedPosixTarget,
+        *,
+        label: str,
+    ) -> None:
+        fd_identity = self._identity_of_fd(record.file_fd)
+        if fd_identity != record.identity:
+            raise UnsafeFilesystemTarget(
+                f"{label} retained file identity changed before replace"
+            )
+        path_identity = self._identity_at(
+            record.parent_fd, record.basename
+        )
+        if path_identity != record.identity:
+            raise UnsafeFilesystemTarget(
+                f"{label} basename identity changed before replace"
+            )
+
     def _verify_commit_boundary(
         self,
         source: _IssuedPosixTemp,
         destination: _IssuedPosixTarget,
     ) -> None:
+        staged_before = self._change_token(source.file_fd)
         staged_content = self._content_sha256(source.file_fd)
         staged_metadata = self._metadata_digest(
             self._capture_native_metadata(source.file_fd)
         )
+        staged_after = self._change_token(source.file_fd)
+        if staged_before != staged_after:
+            raise UnsafeFilesystemTarget(
+                "staged file changed during final validation"
+            )
+
+        base_before = self._change_token(destination.file_fd)
         base_content = self._content_sha256(destination.file_fd)
         base_metadata = self._metadata_digest(
             self._capture_native_metadata(destination.file_fd)
         )
+        base_after = self._change_token(destination.file_fd)
+        if base_before != base_after:
+            raise UnsafeFilesystemTarget(
+                "base file changed during final validation"
+            )
+
         if (
             staged_content != source.binding.after_sha256
             or staged_metadata != source.binding.after_metadata_sha256
@@ -952,7 +1026,18 @@ class PosixSafeFilesystem:
             raise UnsafeFilesystemTarget(
                 "final content or metadata changed before replace"
             )
+
         self._adapter.fsync(source.file_fd)
+        if self._change_token(source.file_fd) != staged_after:
+            raise UnsafeFilesystemTarget(
+                "staged file changed before replace"
+            )
+        if self._change_token(destination.file_fd) != base_after:
+            raise UnsafeFilesystemTarget(
+                "base file changed before replace"
+            )
+        self._verify_final_identity(source, label="staged")
+        self._verify_final_identity(destination, label="destination")
 
     def replace(
         self, source: StagedTemp, destination: SafeTarget

@@ -534,6 +534,13 @@ class _FakePosixAdapter:
         self.fstat_calls: list[int] = []
         self.stat_calls: list[tuple[str, int, bool]] = []
         self.fsync_calls: list[int] = []
+        self.change_clock = 1
+        self.mtime_ns: dict[str, int] = {
+            node: self.change_clock for node in self.content
+        }
+        self.ctime_ns: dict[str, int] = {
+            node: self.change_clock for node in self.content
+        }
 
     def open(
         self,
@@ -554,6 +561,8 @@ class _FakePosixAdapter:
                 self.children[key] = node
                 self.content[node] = bytearray()
                 self.xattrs[node] = {}
+                self.mtime_ns[node] = self.change_clock
+                self.ctime_ns[node] = self.change_clock
             else:
                 node = self.children[key]
         fd = self.next_fd
@@ -571,6 +580,15 @@ class _FakePosixAdapter:
     def close(self, fd: int) -> None:
         self.close_calls.append(fd)
         self.fd_nodes.pop(fd, None)
+
+    def _touch_content(self, node: str) -> None:
+        self.change_clock += 1
+        self.mtime_ns[node] = self.change_clock
+        self.ctime_ns[node] = self.change_clock
+
+    def _touch_metadata(self, node: str) -> None:
+        self.change_clock += 1
+        self.ctime_ns[node] = self.change_clock
 
     def _stat(self, node: str) -> SimpleNamespace:
         if node == "workspace":
@@ -594,6 +612,9 @@ class _FakePosixAdapter:
             ),
             st_uid=1000,
             st_gid=1000,
+            st_size=len(self.content.get(node, b"")),
+            st_mtime_ns=self.mtime_ns.get(node, 1),
+            st_ctime_ns=self.ctime_ns.get(node, 1),
         )
 
     def fstat(self, fd: int) -> SimpleNamespace:
@@ -615,6 +636,7 @@ class _FakePosixAdapter:
     def write(self, fd: int, data: memoryview | bytes) -> int:
         node = self.fd_nodes[fd]
         self.content.setdefault(node, bytearray()).extend(bytes(data))
+        self._touch_content(node)
         return len(data)
 
     def pread(self, fd: int, size: int, offset: int) -> bytes:
@@ -628,16 +650,22 @@ class _FakePosixAdapter:
         return self.xattrs[self.fd_nodes[fd]][name]
 
     def fchown(self, fd: int, uid: int, gid: int) -> None:
-        del fd, uid, gid
+        del uid, gid
+        self._touch_metadata(self.fd_nodes[fd])
 
     def fchmod(self, fd: int, mode: int) -> None:
-        del fd, mode
+        del mode
+        self._touch_metadata(self.fd_nodes[fd])
 
     def removexattr(self, fd: int, name: bytes) -> None:
-        del self.xattrs[self.fd_nodes[fd]][name]
+        node = self.fd_nodes[fd]
+        del self.xattrs[node][name]
+        self._touch_metadata(node)
 
     def setxattr(self, fd: int, name: bytes, value: bytes) -> None:
-        self.xattrs.setdefault(self.fd_nodes[fd], {})[name] = value
+        node = self.fd_nodes[fd]
+        self.xattrs.setdefault(node, {})[name] = value
+        self._touch_metadata(node)
 
     def fsync(self, fd: int) -> None:
         self.fsync_calls.append(fd)
