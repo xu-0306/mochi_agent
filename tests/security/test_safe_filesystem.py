@@ -737,6 +737,39 @@ def _windows_authorization(
         operation,
     )
 
+
+def _windows_atomic_authorization() -> AuthorizationEnvelope:
+    authorization = _windows_authorization()
+    request = authorization.file_request
+    assert request is not None
+    metadata = {
+        "owner": None,
+        "group": None,
+        "dacl": None,
+        "dacl_present": False,
+        "dacl_protected": False,
+        "sacl": None,
+        "sacl_present": False,
+        "sacl_protected": False,
+        "sacl_state": "inaccessible",
+    }
+    metadata_sha256 = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    content_sha256 = hashlib.sha256(b"").hexdigest()
+    entry = replace(
+        request.entries[0],
+        base_sha256=content_sha256,
+        after_sha256=content_sha256,
+        base_metadata_sha256=metadata_sha256,
+        after_metadata_sha256=metadata_sha256,
+    )
+    return replace(
+        authorization, file_request=replace(request, entries=(entry,))
+    )
+
 class _FakeWindowsAdapter:
     semantics = frozenset({
         "content_read_at", "content_write", "file_flush", "directory_flush",
@@ -1617,8 +1650,9 @@ def test_windows_replace_reopens_and_verifies_successor_relative() -> None:
         "C:/workspace", adapter=adapter, enforce=True
     )
     destination = filesystem.prepare_target(
-        "safe/note.txt", _windows_authorization()
+        "safe/note.txt", _windows_atomic_authorization()
     )
+    filesystem.capture_metadata(destination)
     staged = filesystem.create_temp(destination)
     assert isinstance(staged, StagedTemp)
     staged_handle = adapter.temp_handles[-1]
@@ -1685,8 +1719,9 @@ def test_windows_replace_rejects_unverified_successor(
         "C:/workspace", adapter=adapter, enforce=True
     )
     destination = filesystem.prepare_target(
-        "safe/note.txt", _windows_authorization()
+        "safe/note.txt", _windows_atomic_authorization()
     )
+    filesystem.capture_metadata(destination)
     staged = filesystem.create_temp(destination)
     if mismatch == "source_path":
         adapter.source_path_after_rename = (
@@ -2080,8 +2115,9 @@ def test_windows_post_replace_cleanup_reports_committed_outcome() -> None:
         "C:/workspace", adapter=adapter, enforce=True
     )
     destination = filesystem.prepare_target(
-        "safe/note.txt", _windows_authorization()
+        "safe/note.txt", _windows_atomic_authorization()
     )
+    filesystem.capture_metadata(destination)
     staged = filesystem.create_temp(destination)
 
     with pytest.raises(

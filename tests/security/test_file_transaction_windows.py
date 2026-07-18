@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
@@ -14,6 +15,13 @@ from tests.security.test_safe_filesystem import (
     _FakeWindowsAdapter,
     _windows_authorization,
 )
+
+if TYPE_CHECKING:
+    from mochi.security.safe_filesystem import SafeTarget
+    from mochi.security.safe_fs_windows import (
+        WindowsSafeFilesystem,
+        _WindowsSecurityMetadata,  # pyright: ignore[reportPrivateUsage]
+    )
 
 BASE = b"base-content"
 AFTER = b"after-content"
@@ -391,6 +399,130 @@ def test_concurrent_close_and_replace_are_serialized() -> None:
 
 
 
+
+
+
+def _uncaptured_transaction(
+    adapter: _StatefulWindowsAdapter,
+) -> tuple[WindowsSafeFilesystem, SafeTarget]:
+    from mochi.security.safe_fs_windows import WindowsSafeFilesystem
+
+    filesystem = WindowsSafeFilesystem("C:/workspace", adapter=adapter)
+    target = filesystem.prepare_target("safe/note.txt", _authorized(adapter))
+    return filesystem, target
+
+
+def test_replace_rejects_arbitrary_staged_bytes_without_exact_snapshot() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _StatefulWindowsAdapter()
+    filesystem, target = _uncaptured_transaction(adapter)
+    temp = filesystem.create_temp(target)
+    filesystem.write_temp(temp, memoryview(b"arbitrary-unapproved-bytes"))
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="exact owner-issued"):
+            filesystem.replace(temp, target)
+        assert not adapter.renamed
+        assert not temp.closed
+        assert not target.closed
+        assert bytes(adapter.contents["note-original"]) == BASE
+    finally:
+        temp.close()
+        target.close()
+        filesystem.close()
+
+
+def test_replace_rejects_mutated_base_without_exact_snapshot() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter = _StatefulWindowsAdapter()
+    filesystem, target = _uncaptured_transaction(adapter)
+    temp = filesystem.create_temp(target)
+    filesystem.write_temp(temp, memoryview(AFTER))
+    adapter.contents["note-original"] = bytearray(b"mutated-base")
+    adapter.tokens["note-original"] += 1
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="exact owner-issued"):
+            filesystem.replace(temp, target)
+        assert not adapter.renamed
+        assert not temp.closed
+        assert not target.closed
+        assert bytes(adapter.contents["note-original"]) == b"mutated-base"
+    finally:
+        temp.close()
+        target.close()
+        filesystem.close()
+
+
+def test_replace_rejects_snapshot_record_with_foreign_binding() -> None:
+    from mochi.security.safe_filesystem import UnsafeFilesystemTarget
+
+    adapter, filesystem, target, snapshot = _transaction()
+    temp = filesystem.create_temp(target)
+    filesystem.write_temp(temp, memoryview(AFTER))
+    filesystem.apply_metadata_snapshot(temp, snapshot)
+    issued = filesystem._metadata[id(snapshot)]  # pyright: ignore[reportPrivateUsage]
+    filesystem._metadata[id(snapshot)] = replace(  # pyright: ignore[reportPrivateUsage]
+        issued, binding=replace(issued.binding)
+    )
+    try:
+        with pytest.raises(UnsafeFilesystemTarget, match="exact owner-issued"):
+            filesystem.replace(temp, target)
+        assert not adapter.renamed
+        assert not temp.closed
+        assert not target.closed
+        assert bytes(adapter.contents["note-original"]) == BASE
+    finally:
+        temp.close()
+        target.close()
+        filesystem.close()
+
+
+def test_structural_descriptor_components_preserve_conditional_ace() -> None:
+    from mochi.security.safe_fs_windows import (
+        WindowsSafeFilesystem,
+        _WindowsNativeAdapter,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    def capture(
+        condition: str,
+        *,
+        sacl_state: Literal["included", "inaccessible"] = "included",
+    ) -> _WindowsSecurityMetadata:
+        dacl = f'D:(XA;;FR;;;WD;(@Resource.note == "{condition}"))'
+        return _WindowsNativeAdapter._security_metadata_from_components(  # pyright: ignore[reportPrivateUsage]
+            raw_descriptor=b"self-relative",
+            owner="O:SY",
+            group="G:SY",
+            dacl=dacl,
+            dacl_present=True,
+            dacl_protected=False,
+            sacl=None,
+            sacl_present=False,
+            sacl_protected=False,
+            sacl_state=sacl_state,
+        )
+
+    with_marker = capture("literal S: stays in the DACL")
+    changed = capture("literal S: changed condition")
+    inaccessible = capture(
+        "literal S: stays in the DACL", sacl_state="inaccessible"
+    )
+
+    assert isinstance(with_marker.dacl, str)
+    assert "S:" in with_marker.dacl
+    assert with_marker.sacl is None
+    assert not with_marker.sacl_present
+    with_marker_digest = WindowsSafeFilesystem._metadata_digest(  # pyright: ignore[reportPrivateUsage]
+        with_marker
+    )
+    changed_digest = WindowsSafeFilesystem._metadata_digest(  # pyright: ignore[reportPrivateUsage]
+        changed
+    )
+    assert with_marker_digest != changed_digest
+    assert inaccessible.sacl_state == "inaccessible"
+    assert inaccessible.sacl is None
+    assert not inaccessible.sacl_present
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows NTFS semantics")
 def test_native_windows_atomic_write_preserves_security(tmp_path: Path) -> None:

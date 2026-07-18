@@ -527,29 +527,65 @@ class _WindowsNativeAdapter:
         )
 
 
+    def _security_component_sddl(
+        self, descriptor: object, information: int,
+    ) -> str:
+        from ctypes import wintypes
+
+        convert = (
+            self._advapi32
+            .ConvertSecurityDescriptorToStringSecurityDescriptorW
+        )
+        text = wintypes.LPWSTR()
+        length = wintypes.ULONG()
+        convert.argtypes = [
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        convert.restype = wintypes.BOOL
+        if not convert(
+            descriptor, 1, information, ctypes.byref(text),
+            ctypes.byref(length),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return text.value or ""
+        finally:
+            self._kernel32.LocalFree(text)
+
     @staticmethod
-    def _sddl_sections(value: str) -> dict[str, str | None]:
-        markers: list[tuple[int, str]] = []
-        for name in ("O", "G", "D", "S"):
-            index = value.find(name + ":")
-            if index >= 0:
-                markers.append((index, name))
-        markers.sort()
-        result: dict[str, str | None] = {
-            "O": None, "G": None, "D": None, "S": None
-        }
-        for position, (start, name) in enumerate(markers):
-            end = (
-                markers[position + 1][0]
-                if position + 1 < len(markers) else len(value)
-            )
-            result[name] = value[start + 2 : end]
-        return result
+    def _security_metadata_from_components(
+        *,
+        raw_descriptor: bytes,
+        owner: bytes | str | None,
+        group: bytes | str | None,
+        dacl: bytes | str | None,
+        dacl_present: bool,
+        dacl_protected: bool,
+        sacl: bytes | str | None,
+        sacl_present: bool,
+        sacl_protected: bool,
+        sacl_state: Literal["included", "inaccessible"],
+    ) -> _WindowsSecurityMetadata:
+        return _WindowsSecurityMetadata(
+            raw_descriptor=raw_descriptor,
+            owner=owner,
+            group=group,
+            dacl=dacl,
+            dacl_present=dacl_present,
+            dacl_protected=dacl_protected,
+            sacl=sacl,
+            sacl_present=sacl_present,
+            sacl_protected=sacl_protected,
+            sacl_state=sacl_state,
+        )
 
     def security_descriptor(
         self, handle: object, *, include_sacl: bool,
     ) -> _WindowsSecurityMetadata:
         from ctypes import wintypes
+
         OWNER = 0x1
         GROUP = 0x2
         DACL = 0x4
@@ -572,25 +608,67 @@ class _WindowsNativeAdapter:
             raise ctypes.WinError(ctypes.get_last_error())
         raw = bytes(buffer.raw[: needed.value])
 
-        convert = (
-            self._advapi32
-            .ConvertSecurityDescriptorToStringSecurityDescriptorW
-        )
-        text = wintypes.LPWSTR()
-        length = wintypes.ULONG()
-        convert.argtypes = [
-            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-            ctypes.POINTER(wintypes.LPWSTR),
-            ctypes.POINTER(wintypes.ULONG),
+        owner_pointer = wintypes.LPVOID()
+        owner_defaulted = wintypes.BOOL()
+        get_owner = self._advapi32.GetSecurityDescriptorOwner
+        get_owner.argtypes = [
+            wintypes.LPVOID, ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.BOOL),
         ]
-        convert.restype = wintypes.BOOL
-        if not convert(buffer, 1, info, ctypes.byref(text), ctypes.byref(length)):
+        get_owner.restype = wintypes.BOOL
+        if not get_owner(
+            buffer, ctypes.byref(owner_pointer),
+            ctypes.byref(owner_defaulted),
+        ):
             raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            sddl = text.value or ""
-        finally:
-            self._kernel32.LocalFree(text)
-        sections = self._sddl_sections(sddl)
+
+        group_pointer = wintypes.LPVOID()
+        group_defaulted = wintypes.BOOL()
+        get_group = self._advapi32.GetSecurityDescriptorGroup
+        get_group.argtypes = [
+            wintypes.LPVOID, ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        get_group.restype = wintypes.BOOL
+        if not get_group(
+            buffer, ctypes.byref(group_pointer),
+            ctypes.byref(group_defaulted),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        dacl_present_value = wintypes.BOOL()
+        dacl_pointer = wintypes.LPVOID()
+        dacl_defaulted = wintypes.BOOL()
+        get_dacl = self._advapi32.GetSecurityDescriptorDacl
+        get_dacl.argtypes = [
+            wintypes.LPVOID, ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.BOOL),
+        ]
+        get_dacl.restype = wintypes.BOOL
+        if not get_dacl(
+            buffer, ctypes.byref(dacl_present_value),
+            ctypes.byref(dacl_pointer), ctypes.byref(dacl_defaulted),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        dacl_present = bool(dacl_present_value.value)
+
+        sacl_present = False
+        sacl_pointer = wintypes.LPVOID()
+        if include_sacl:
+            sacl_present_value = wintypes.BOOL()
+            sacl_defaulted = wintypes.BOOL()
+            get_sacl = self._advapi32.GetSecurityDescriptorSacl
+            get_sacl.argtypes = [
+                wintypes.LPVOID, ctypes.POINTER(wintypes.BOOL),
+                ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.BOOL),
+            ]
+            get_sacl.restype = wintypes.BOOL
+            if not get_sacl(
+                buffer, ctypes.byref(sacl_present_value),
+                ctypes.byref(sacl_pointer), ctypes.byref(sacl_defaulted),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            sacl_present = bool(sacl_present_value.value)
 
         control = wintypes.WORD()
         revision = wintypes.DWORD()
@@ -605,13 +683,32 @@ class _WindowsNativeAdapter:
         ):
             raise ctypes.WinError(ctypes.get_last_error())
         flags = int(control.value)
-        return _WindowsSecurityMetadata(
+
+        owner = (
+            self._security_component_sddl(buffer, OWNER)
+            if owner_pointer.value else None
+        )
+        group = (
+            self._security_component_sddl(buffer, GROUP)
+            if group_pointer.value else None
+        )
+        dacl = (
+            self._security_component_sddl(buffer, DACL)
+            if dacl_present and dacl_pointer.value else None
+        )
+        sacl = (
+            self._security_component_sddl(buffer, SACL)
+            if include_sacl and sacl_present and sacl_pointer.value else None
+        )
+        return self._security_metadata_from_components(
             raw_descriptor=raw,
-            owner=sections["O"], group=sections["G"],
-            dacl=sections["D"], dacl_present=sections["D"] is not None,
+            owner=owner,
+            group=group,
+            dacl=dacl,
+            dacl_present=dacl_present,
             dacl_protected=bool(flags & 0x1000),
-            sacl=sections["S"] if include_sacl else None,
-            sacl_present=include_sacl and sections["S"] is not None,
+            sacl=sacl,
+            sacl_present=sacl_present,
             sacl_protected=bool(flags & 0x2000) if include_sacl else False,
             sacl_state="included" if include_sacl else "inaccessible",
         )
@@ -1384,6 +1481,23 @@ class WindowsSafeFilesystem(_WindowsStructuralSafeFilesystem):
             )
         return record
 
+    def _commit_snapshot_record(
+        self, binding: AuthorizedFileBinding, target: SafeTarget,
+    ) -> _IssuedWindowsMetadataSnapshot:
+        issued = next(
+            (
+                candidate
+                for candidate in self._metadata.values()
+                if candidate.target is target
+            ),
+            None,
+        )
+        if issued is None:
+            raise UnsafeFilesystemTarget(
+                "metadata snapshot is not an exact owner-issued snapshot"
+            )
+        return self._snapshot_record(issued.snapshot, binding, target)
+
     def _temp_record(self, temp: StagedTemp) -> _AtomicIssuedWindowsTemp:
         if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             temp, StagedTemp
@@ -1634,34 +1748,28 @@ class WindowsSafeFilesystem(_WindowsStructuralSafeFilesystem):
         with self._lock:
             source_record = self._validated_temp(source)
             destination_record = self._validated(destination)
-            if source_record.binding is not destination_record.binding:
+            if (
+                source_record.binding is not destination_record.binding
+                or source_record.target is not destination
+            ):
                 raise UnsafeFilesystemTarget(
                     "replace operands require the same authorization binding"
                 )
-            has_snapshot = any(
-                issued.target is destination
-                for issued in self._metadata.values()
+            self._commit_snapshot_record(
+                destination_record.binding, destination
             )
-            if has_snapshot:
-                staged_token = self._verify_commit_file(
-                    source_record.file_handle,
-                    expected_content=source_record.binding.after_sha256,
-                    expected_metadata=source_record.binding.after_metadata_sha256,
-                    label="staged",
-                )
-                base_token = self._verify_commit_file(
-                    destination_record.pin.file_handle,
-                    expected_content=destination_record.binding.base_sha256,
-                    expected_metadata=destination_record.binding.base_metadata_sha256,
-                    label="base",
-                )
-            else:
-                staged_token = self._adapter.change_token(
-                    source_record.file_handle
-                )
-                base_token = self._adapter.change_token(
-                    destination_record.pin.file_handle
-                )
+            staged_token = self._verify_commit_file(
+                source_record.file_handle,
+                expected_content=source_record.binding.after_sha256,
+                expected_metadata=source_record.binding.after_metadata_sha256,
+                label="staged",
+            )
+            base_token = self._verify_commit_file(
+                destination_record.pin.file_handle,
+                expected_content=destination_record.binding.base_sha256,
+                expected_metadata=destination_record.binding.base_metadata_sha256,
+                label="base",
+            )
             self._adapter.flush_file(source_record.file_handle)
             if self._adapter.change_token(source_record.file_handle) != staged_token:
                 raise UnsafeFilesystemTarget("staged file changed before replace")
