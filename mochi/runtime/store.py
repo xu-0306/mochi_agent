@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from mochi.runtime.goal_strategy_registry import DEFAULT_GOAL_STRATEGY_ID, get_goal_strategy_entry
+from mochi.runtime.runtime_approval_lifecycle import (
+    RuntimeApprovalLifecycleMixin,
+    initialize_runtime_approval_schema,
+)
 
 _UNSET = object()
 _DEFAULT_GOAL_EXECUTION_MODE = "single_agent"
@@ -26,7 +30,7 @@ _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
 }
 
 
-class RuntimeStore:
+class RuntimeStore(RuntimeApprovalLifecycleMixin):
     """Persist task runs, task events, and approval requests."""
 
     def __init__(self, db_path: Path) -> None:
@@ -480,6 +484,7 @@ class RuntimeStore:
             _ensure_column(conn, "task_runs", "task_type", "TEXT")
             _ensure_column(conn, "task_runs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "approval_requests", "metadata_json", "TEXT")
+            initialize_runtime_approval_schema(conn)
             _ensure_column(conn, "agent_runs", "title", "TEXT")
             _ensure_column(conn, "agent_runs", "topic", "TEXT")
             _ensure_column(conn, "agent_runs", "project_id", "TEXT")
@@ -760,7 +765,7 @@ class RuntimeStore:
 
         return await asyncio.to_thread(_op)
 
-    async def create_approval_request(
+    async def _legacy_create_approval_request(
         self,
         *,
         approval_id: str,
@@ -801,7 +806,7 @@ class RuntimeStore:
         await asyncio.to_thread(_op)
         return await self.get_approval_request(approval_id) or {}
 
-    async def get_approval_request(self, approval_id: str) -> dict[str, Any] | None:
+    async def _legacy_get_approval_request(self, approval_id: str) -> dict[str, Any] | None:
         await self.initialize()
 
         def _op() -> dict[str, Any] | None:
@@ -820,7 +825,7 @@ class RuntimeStore:
 
         return await asyncio.to_thread(_op)
 
-    async def list_approval_requests(self, *, status: str | None = None) -> list[dict[str, Any]]:
+    async def _legacy_list_approval_requests(self, *, status: str | None = None) -> list[dict[str, Any]]:
         await self.initialize()
 
         def _op() -> list[dict[str, Any]]:
@@ -845,7 +850,7 @@ class RuntimeStore:
 
         return await asyncio.to_thread(_op)
 
-    async def resolve_approval_request(
+    async def _legacy_resolve_approval_request(
         self,
         approval_id: str,
         *,
@@ -877,7 +882,7 @@ class RuntimeStore:
         await asyncio.to_thread(_op)
         return await self.get_approval_request(approval_id)
 
-    async def update_approval_request_metadata(
+    async def _legacy_update_approval_request_metadata(
         self,
         approval_id: str,
         *,
@@ -905,7 +910,7 @@ class RuntimeStore:
         await asyncio.to_thread(_op)
         return await self.get_approval_request(approval_id)
 
-    async def get_pending_approval_for_task(self, task_id: str) -> dict[str, Any] | None:
+    async def _legacy_get_pending_approval_for_task(self, task_id: str) -> dict[str, Any] | None:
         await self.initialize()
 
         def _op() -> dict[str, Any] | None:

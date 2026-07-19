@@ -5,12 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 
 from mochi.api.server import _get_config, _get_or_create_engine
 from mochi.runtime.active_goal_turn_selector import build_active_goal_turn_selector
-from mochi.runtime.approvals import PersistentApprovalStore
+from mochi.runtime.approvals import (
+    ApprovalConflict,
+    ApprovalExpired,
+    ApprovalRequesterMismatch,
+    PersistentApprovalStore,
+)
 from mochi.runtime.models import ApprovalResolution
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
@@ -39,6 +43,12 @@ async def resolve_approval(
             rule=payload.rule,
             replay_override=payload.replay_override.model_dump() if payload.replay_override is not None else None,
         )
+    except ApprovalExpired as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    except ApprovalRequesterMismatch as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if approval is None:

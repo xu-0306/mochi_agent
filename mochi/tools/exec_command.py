@@ -9,10 +9,14 @@ from typing import Any
 from uuid import uuid4
 
 from mochi.config import defaults
-from mochi.runtime.approvals import ApprovalStore, InMemoryApprovalStore
+from mochi.runtime.approval_state_machine import derive_approval_binding
+from mochi.runtime.approvals import (
+    APPROVAL_OWNER_TASK_ID_KEY,
+    ApprovalStore,
+    InMemoryApprovalStore,
+)
 from mochi.runtime.exec_runtime import ExecRuntime
-from mochi.runtime.exec_sessions import ExecSessionStatus
-from mochi.runtime.exec_sessions import SessionPollResult
+from mochi.runtime.exec_sessions import ExecSessionStatus, SessionPollResult
 from mochi.security import deny_security_decision
 from mochi.tools.base import (
     BaseTool,
@@ -21,7 +25,11 @@ from mochi.tools.base import (
     ToolResult,
 )
 from mochi.utils.command_security import CommandSecurityPolicy, CommandSecurityResult
-from mochi.utils.security import build_policy_metadata, normalize_workspace_dir, resolve_path_in_workspace
+from mochi.utils.security import (
+    build_policy_metadata,
+    normalize_workspace_dir,
+    resolve_path_in_workspace,
+)
 
 _SHARED_RUNTIME: ExecRuntime | None = None
 _SHARED_APPROVAL_STORE: ApprovalStore | None = None
@@ -305,11 +313,32 @@ class ExecCommandTool(BaseTool):
                 ),
                 "background": background,
                 "tty": tty,
+                "sandbox_permissions": sandbox_permissions,
                 "log_path": resolved_layout.get("log_path"),
                 "checkpoint_dir": resolved_layout.get("checkpoint_dir"),
                 "detached_layout": dict(resolved_layout),
                 "approval_state": "approved",
             }
+            owner_task_id = str(
+                permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
+            ).strip()
+            requester_id, request_digest, context_digest = derive_approval_binding(
+                requester_id=(
+                    f"runtime-task:{owner_task_id}"
+                    if owner_task_id
+                    else "runtime-service"
+                ),
+                request={
+                    "command": command,
+                    "shell": shell or "auto",
+                    "scope": "dangerous_command",
+                    "command_payload": approval_payload,
+                },
+                authorization_context={
+                    "source": "exec_command",
+                    "owner_task_id": owner_task_id or None,
+                },
+            )
             request = self._approval_store.create(
                 approval_id=approval_id,
                 command=command,
@@ -321,8 +350,20 @@ class ExecCommandTool(BaseTool):
                     "policy_reason": classification.reason,
                     "rule_id": classification.rule_id,
                     "suggested_rule": suggested_rule,
+                    **(
+                        {APPROVAL_OWNER_TASK_ID_KEY: owner_task_id}
+                        if (
+                            owner_task_id := str(
+                                permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
+                            ).strip()
+                        )
+                        else {}
+                    ),
                 },
                 command_payload=approval_payload,
+                requester_id=requester_id,
+                request_digest=request_digest,
+                context_digest=context_digest,
             )
             return ToolResult(
                 error="Exec command requires approval.",

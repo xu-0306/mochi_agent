@@ -9,10 +9,10 @@ import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
-from hashlib import sha1
 from datetime import UTC, datetime, timedelta, timezone
+from hashlib import sha1
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -41,7 +41,15 @@ from mochi.runtime.agent_run_packages import (
     build_dataset_package,
     summarize_package_materialization,
 )
-from mochi.runtime.approvals import ApprovalDecision, ApprovalStatus, ApprovalStore
+from mochi.runtime.approval_state_machine import derive_approval_binding
+from mochi.runtime.approvals import (
+    APPROVAL_OWNER_TASK_ID_KEY,
+    ApprovalConflict,
+    ApprovalDecision,
+    ApprovalRequesterMismatch,
+    ApprovalStatus,
+    ApprovalStore,
+)
 from mochi.runtime.collector_contracts import (
     COLLECTOR_SHARD_MANIFEST_ARTIFACT_TYPE,
     FAILED_COLLECTOR_SHARD_STATUSES,
@@ -51,15 +59,15 @@ from mochi.runtime.collector_contracts import (
     collector_record_provenance_for_index,
     collector_record_provenance_list_from_dataset_records,
     collector_record_provenance_list_from_result,
-    dedupe_collector_shard_manifests,
+    collector_shard_manifests_from_result,
     dedupe_collector_dataset_records,
+    dedupe_collector_shard_manifests,
     extract_collector_shard_manifests,
     extract_persisted_collector_dataset_records,
-    collector_shard_manifests_from_result,
 )
 from mochi.runtime.delegate import set_delegate_subagent_task_launcher
-from mochi.runtime.execution_transcript import normalize_subagent_event
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.runtime.execution_transcript import normalize_subagent_event
 from mochi.runtime.goal_strategy_registry import (
     DEFAULT_GOAL_STRATEGY_ID,
     get_goal_strategy_entry,
@@ -82,12 +90,15 @@ from mochi.runtime.recovery import (
 )
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
-from mochi.security.policy import build_runtime_permission_policy_dict, resolve_runtime_permission_policy
+from mochi.security.policy import (
+    build_runtime_permission_policy_dict,
+    resolve_runtime_permission_policy,
+)
 from mochi.security.rollout import project_protected_workspace_rollout
 from mochi.tools.base import ToolExecutionContext, ToolResult
 from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_exec_runtime
-from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileWriteTool
 from mochi.tools.file_mutations import summarize_file_change_payload
+from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileWriteTool
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 DELEGATED_TASK_RESUMABLE_STATUS = {
@@ -565,20 +576,31 @@ class RuntimeService:
         self._goal_lease_ttl_seconds = max(1.0, float(seconds))
 
     async def start(self) -> None:
-        if self._file_transaction_recovery is not None:
-            await self._file_transaction_recovery()
-        recover_detached = getattr(self._exec_runtime, "recover_detached_sessions", None)
-        if callable(recover_detached):
-            await recover_detached()
         active = self._scheduler_task
         if active is not None and not active.done():
             return
+        if self._file_transaction_recovery is not None:
+            await self._file_transaction_recovery()
+        recover_detached = getattr(self._exec_runtime, 'recover_detached_sessions', None)
+        if callable(recover_detached):
+            await recover_detached()
+        await self._recover_stale_approval_consumptions()
         await self._recover_goals_on_startup()
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task = asyncio.create_task(
             self._scheduler_loop(),
-            name="runtime-agent-run-scheduler",
+            name='runtime-agent-run-scheduler',
         )
+
+    async def _recover_stale_approval_consumptions(self) -> None:
+        await self._store.recover_stale_approval_consumptions()
+        recover_exec_approvals = getattr(
+            self._exec_approval_store,
+            "recover_stale_consumptions",
+            None,
+        )
+        if callable(recover_exec_approvals):
+            await asyncio.to_thread(recover_exec_approvals)
 
     async def close(self) -> None:
         current_loop = asyncio.get_running_loop()
@@ -5331,6 +5353,7 @@ class RuntimeService:
     async def _scheduler_loop(self) -> None:
         while True:
             try:
+                await self._recover_stale_approval_consumptions()
                 await self._process_goal_supervision()
                 await self._process_due_agent_runs()
                 await asyncio.wait_for(
@@ -6677,7 +6700,12 @@ class RuntimeService:
         self,
         approval: Mapping[str, Any],
     ) -> Any | None:
-        metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
+        raw_metadata = approval.get("metadata")
+        metadata = (
+            dict(cast(Mapping[str, Any], raw_metadata))
+            if isinstance(raw_metadata, dict)
+            else {}
+        )
         linked_exec_approval_id = _linked_exec_approval_id(metadata)
         if not isinstance(linked_exec_approval_id, str) or not linked_exec_approval_id:
             return None
@@ -6708,9 +6736,20 @@ class RuntimeService:
         rehydrated_metadata = _rehydrate_exec_approval_metadata_from_task_approval(approval)
         if task_id:
             rehydrated_metadata["rehydrated_from_task_id"] = task_id
+            rehydrated_metadata[APPROVAL_OWNER_TASK_ID_KEY] = task_id
         approval_id = str(approval.get("id") or "").strip()
         if approval_id:
             rehydrated_metadata["rehydrated_from_approval_request_id"] = approval_id
+        rehydrated_binding = _approval_binding_kwargs(
+            f"runtime-task:{task_id}",
+            {
+                "command": command,
+                "shell": shell,
+                "scope": scope,
+                "command_payload": command_payload,
+            },
+            {"source": "exec_command", "owner_task_id": task_id or None},
+        )
         rehydrated = self._exec_approval_store.create(
             approval_id=linked_exec_approval_id,
             command=command,
@@ -6719,23 +6758,51 @@ class RuntimeService:
             reason=reason,
             metadata=rehydrated_metadata,
             command_payload=command_payload,
+            **rehydrated_binding,
         )
-        decision = _approval_decision_from_status(str(approval.get("status") or "").strip())
+        outer_status = str(approval.get('status') or '').strip()
+        decision = _approval_decision_from_status(outer_status)
+        raw_execution_result = metadata.get("execution_result")
         execution_result = (
-            metadata.get("execution_result")
-            if isinstance(metadata.get("execution_result"), dict)
+            dict(cast(Mapping[str, Any], raw_execution_result))
+            if isinstance(raw_execution_result, dict)
             else None
         )
+        if outer_status in {'consumed', 'execution_failed', 'consuming'}:
+            resolved = self._exec_approval_store.resolve(
+                linked_exec_approval_id,
+                decision='approve_once',
+                reason=str(approval.get('reason') or '').strip() or reason,
+                **_exec_approval_binding_kwargs(rehydrated),
+            )
+            if resolved is None:
+                return None
+            lease_owner = f'runtime-service-rehydrate:{id(self)}'
+            execution_key = f'rehydrated-linked-execution:{approval_id}'
+            claim = self._exec_approval_store.consume(
+                linked_exec_approval_id,
+                execution_idempotency_key=execution_key,
+                lease_owner=lease_owner,
+                **_exec_approval_binding_kwargs(rehydrated),
+            )
+            return self._exec_approval_store.complete_consumption(
+                linked_exec_approval_id,
+                execution_idempotency_key=execution_key,
+                lease_owner=lease_owner,
+                lease_token=claim.consume_lease_token or '',
+                execution_result=execution_result or {'status': 'unknown'},
+                succeeded=outer_status == 'consumed',
+            )
         if decision is None:
             return rehydrated
         resolved = self._exec_approval_store.resolve(
             linked_exec_approval_id,
             decision=decision,
-            reason=str(approval.get("reason") or "").strip() or reason,
+            reason=str(approval.get('reason') or '').strip() or reason,
             execution_result=execution_result,
+            **_exec_approval_binding_kwargs(rehydrated),
         )
         return resolved or rehydrated
-
     async def _persist_task_linked_exec_approval_metadata(
         self,
         approval: Mapping[str, Any],
@@ -6808,6 +6875,18 @@ class RuntimeService:
     ) -> dict[str, Any] | None:
         current = await self._store.get_approval_request(approval_id)
         if current is None:
+            task_linked_owner = next(
+                (
+                    item
+                    for item in await self._store.list_approval_requests()
+                    if _linked_exec_approval_id(item.get('metadata')) == approval_id
+                ),
+                None,
+            )
+            if task_linked_owner is not None:
+                raise ApprovalConflict(
+                    'Resolve task-linked exec approvals through their task approval ID.'
+                )
             linked_run_context = await self._find_linked_agent_run_for_exec_approval(approval_id)
             existing_exec = self._exec_approval_store.get(approval_id)
             if existing_exec is None and linked_run_context is not None:
@@ -6819,25 +6898,57 @@ class RuntimeService:
                 )
             if existing_exec is None:
                 return None
+            owner_task_id = str(
+                existing_exec.metadata.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
+            ).strip()
+            if owner_task_id:
+                raise ApprovalConflict(
+                    "Resolve task-linked exec approvals through their task approval ID."
+                )
             if replay_override is not None:
-                raise ValueError("replay_override is only supported for task file-mutation approvals.")
-            effective_decision, saved_rule = await self._resolve_approval_decision_and_saved_rule(
-                decision=decision,
-                rule=rule,
-                suggested_rules=[existing_exec.metadata.get("suggested_rule")],
+                raise ValueError(
+                    'replay_override is only supported for task file-mutation approvals.'
+                )
+            effective_decision, saved_rule = (
+                await self._resolve_approval_decision_and_saved_rule(
+                    decision=decision,
+                    rule=rule,
+                    suggested_rules=[existing_exec.metadata.get('suggested_rule')],
+                )
             )
-            execution_result: dict[str, Any] | None = None
-            if effective_decision != "reject":
-                execution_result = await self._execute_approved_exec_request(existing_exec)
             resolved_exec = self._exec_approval_store.resolve(
                 approval_id,
                 decision=effective_decision,
                 reason=reason,
-                metadata={"saved_rule": saved_rule} if isinstance(saved_rule, dict) else None,
-                execution_result=execution_result,
+                **_exec_approval_binding_kwargs(existing_exec),
+                metadata={'saved_rule': saved_rule} if isinstance(saved_rule, dict) else None,
+                rule_side_effect=(
+                    self._approval_rule_side_effect(saved_rule)
+                    if effective_decision == 'approve_and_save_rule'
+                    else None
+                ),
             )
             if resolved_exec is None:
                 return None
+            execution_result: dict[str, Any] | None = None
+            if effective_decision != 'reject':
+                lease_owner = f'runtime-service:{id(self)}'
+                claim = self._exec_approval_store.consume(
+                    approval_id,
+                    execution_idempotency_key=f'approval-execution:{approval_id}',
+                    lease_owner=lease_owner,
+                    **_exec_approval_binding_kwargs(existing_exec),
+                )
+                execution_result = await self._execute_approved_exec_request(claim)
+                succeeded = is_successful_exec_approval_result(execution_result)
+                resolved_exec = self._exec_approval_store.complete_consumption(
+                    approval_id,
+                    execution_idempotency_key=f'approval-execution:{approval_id}',
+                    lease_owner=lease_owner,
+                    lease_token=claim.consume_lease_token or '',
+                    execution_result=execution_result,
+                    succeeded=succeeded,
+                )
             if linked_run_context is not None:
                 linked_run, pending_entry = linked_run_context
                 await self._append_goal_operator_approval_audit_log(
@@ -6845,11 +6956,11 @@ class RuntimeService:
                     decision=effective_decision,
                     reason=reason,
                     run=linked_run,
-                    source="linked_exec_approval_rehydrated",
+                    source='linked_exec_approval_rehydrated',
                     linked_exec_approval_id=approval_id,
                     auto_resume_linked_run=auto_resume_linked_run,
                 )
-                if effective_decision == "reject":
+                if effective_decision == 'reject':
                     await self._fail_linked_agent_run_for_rejected_exec_approval(
                         run=linked_run,
                         approval_id=approval_id,
@@ -6863,7 +6974,7 @@ class RuntimeService:
                         pending_entry=pending_entry,
                         execution_result=execution_result,
                         resume_strategy=(
-                            "continue_from_checkpoint" if auto_resume_linked_run else None
+                            'continue_from_checkpoint' if auto_resume_linked_run else None
                         ),
                     )
             return _exec_approval_summary(resolved_exec)
@@ -6894,19 +7005,32 @@ class RuntimeService:
                     linked_exec.metadata.get("suggested_rule") if linked_exec is not None else None,
                 ],
             )
+        if linked_exec_approval_id and linked_exec is not None:
+            _preflight_exec_approval_binding(linked_exec)
+
         approval = await self._store.resolve_approval_request(
             approval_id,
             decision=effective_decision,
             reason=reason,
+            **_task_approval_binding_kwargs(current),
+            rule_side_effect=(
+                self._approval_rule_side_effect(saved_rule)
+                if effective_decision == 'approve_and_save_rule'
+                else None
+            ),
         )
         if approval is None:
             return None
         if linked_exec_approval_id:
             linked_exec = self._exec_approval_store.resolve(
                 linked_exec_approval_id,
-                decision=effective_decision,
+                decision='reject' if effective_decision == 'reject' else 'approve_once',
                 reason=reason,
-                metadata={"saved_rule": saved_rule} if isinstance(saved_rule, dict) else None,
+                **_exec_approval_binding_kwargs(linked_exec),
+                metadata={
+                    'resolution_kind': effective_decision,
+                    **({'saved_rule': saved_rule} if isinstance(saved_rule, dict) else {}),
+                },
             )
             if linked_exec is not None:
                 await self._persist_task_linked_exec_approval_metadata(
@@ -6920,24 +7044,38 @@ class RuntimeService:
                 decision=effective_decision,
                 reason=reason,
                 run=linked_run,
-                source="approval_request_resolution",
+                source='approval_request_resolution',
                 task_approval_id=approval_id,
                 linked_exec_approval_id=linked_exec_approval_id,
                 auto_resume_linked_run=auto_resume_linked_run,
             )
-        if effective_decision == "reject":
+        if effective_decision == 'reject':
             await self._store.update_task_status(
-                approval["task_id"],
-                "cancelled",
-                error="Approval rejected",
+                approval['task_id'],
+                'cancelled',
+                error='Approval rejected',
             )
             return self._task_approval_summary(approval)
+        lease_owner = f'runtime-service:{id(self)}'
+        execution_key = f'approval-execution:{approval_id}'
+        claim = await self._store.consume_approval_request(
+            approval_id,
+            execution_idempotency_key=execution_key,
+            lease_owner=lease_owner,
+            **_task_approval_binding_kwargs(current),
+        )
         if await self._try_complete_task_with_file_mutation(
             approval,
             current=current,
             replay_override=replay_override,
         ):
-            return self._task_approval_summary(approval)
+            completed = await self._complete_runtime_approval_claim(
+                approval=approval,
+                claim=claim,
+                execution_key=execution_key,
+                lease_owner=lease_owner,
+            )
+            return self._task_approval_summary(completed)
         if await self._try_complete_task_with_linked_exec(
             approval,
             current=current,
@@ -6946,20 +7084,53 @@ class RuntimeService:
             decision=effective_decision,
             saved_rule=saved_rule,
         ):
-            return self._task_approval_summary(approval)
+            completed = await self._complete_runtime_approval_claim(
+                approval=approval,
+                claim=claim,
+                execution_key=execution_key,
+                lease_owner=lease_owner,
+            )
+            return self._task_approval_summary(completed)
         override = _approval_override(current, replay_override=replay_override)
         await self._store.update_task_status(
-            approval["task_id"],
-            "resumed",
+            approval['task_id'],
+            'resumed',
             error=None,
             permission_override=override,
         )
-        self._active_jobs[approval["task_id"]] = asyncio.create_task(
-            self._run_task(task_id=approval["task_id"], permission_override=override),
+        self._active_jobs[approval['task_id']] = asyncio.create_task(
+            self._run_task(task_id=approval['task_id'], permission_override=override),
             name=f"runtime-task-resume-{approval['task_id']}",
         )
-        return self._task_approval_summary(approval)
+        completed = await self._store.complete_approval_consumption(
+            approval_id,
+            execution_idempotency_key=execution_key,
+            lease_owner=lease_owner,
+            lease_token=str(claim.get('consume_lease_token') or ''),
+            execution_result={'status': 'dispatched'},
+            succeeded=True,
+        )
+        return self._task_approval_summary(completed)
 
+    async def _complete_runtime_approval_claim(
+        self,
+        *,
+        approval: dict[str, Any],
+        claim: dict[str, Any],
+        execution_key: str,
+        lease_owner: str,
+    ) -> dict[str, Any]:
+        task = await self._store.get_task_run(str(approval['task_id']))
+        task_status = str((task or {}).get('status') or 'unknown')
+        succeeded = task_status not in {'failed', 'cancelled'}
+        return await self._store.complete_approval_consumption(
+            str(approval['id']),
+            execution_idempotency_key=execution_key,
+            lease_owner=lease_owner,
+            lease_token=str(claim.get('consume_lease_token') or ''),
+            execution_result={'status': task_status},
+            succeeded=succeeded,
+        )
     async def _append_goal_operator_approval_audit_log(
         self,
         *,
@@ -7387,6 +7558,13 @@ class RuntimeService:
         )
         metadata = _rehydrate_exec_approval_metadata_from_pending_entry(pending_entry)
         metadata["rehydrated_from_agent_run_id"] = str(run.get("id") or "")
+        binding = _exec_approval_binding_from_values(
+            command=command,
+            shell=shell,
+            scope=scope,
+            command_payload=command_payload,
+            owner_task_id=str(metadata.get(APPROVAL_OWNER_TASK_ID_KEY) or "").strip() or None,
+        )
         return self._exec_approval_store.create(
             approval_id=approval_id,
             command=command,
@@ -7395,8 +7573,10 @@ class RuntimeService:
             reason=reason,
             metadata=metadata,
             command_payload=command_payload,
+            requester_id=binding["requester_id"],
+            request_digest=binding["request_digest"],
+            context_digest=binding["context_digest"],
         )
-
     async def _resolve_approval_decision_and_saved_rule(
         self,
         *,
@@ -7404,17 +7584,29 @@ class RuntimeService:
         rule: dict[str, Any] | None,
         suggested_rules: list[Any] | None = None,
     ) -> tuple[ApprovalDecision, dict[str, Any] | None]:
-        if decision != "approve_and_save_rule":
+        if decision != 'approve_and_save_rule':
             return decision, None
         candidates: list[dict[str, Any] | None] = [rule]
         for candidate in suggested_rules or []:
             candidates.append(candidate if isinstance(candidate, dict) else None)
         for candidate in candidates:
-            saved_rule = await self._persist_command_rule(candidate)
-            if saved_rule is not None:
-                return "approve_and_save_rule", saved_rule
-        return "approve_once", None
+            validated = _validated_command_rule(candidate)
+            if validated is not None:
+                return 'approve_and_save_rule', validated.model_dump(mode='python')
+        raise ValueError('approve_and_save_rule requires a valid command rule.')
 
+    def _approval_rule_side_effect(
+        self,
+        rule: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if rule is None:
+            return None
+        if self._bound_config_path is None:
+            raise RuntimeError('Runtime service is not bound to a config path.')
+        return {
+            'payload': dict(rule),
+            'target_config_path': str(self._bound_config_path),
+        }
     async def _maybe_auto_reject_linked_goal_approval_wait(
         self,
         *,
@@ -7463,6 +7655,7 @@ class RuntimeService:
                         approval_id,
                         decision="reject",
                         reason=error_message,
+                        **_exec_approval_binding_kwargs(existing_exec),
                     )
                 updated_summary = _apply_exec_approval_resolution_to_agent_run_summary(
                     {**updated_run, "summary": updated_summary},
@@ -7529,17 +7722,12 @@ class RuntimeService:
         existing = self._exec_approval_store.get(exec_approval_id)
         if existing is None:
             return
-        decision = _approval_decision_from_status(existing.status)
-        if decision is None:
-            return
         execution_result = _poll_to_execution_result(
             poll,
             previous_result=existing.execution_result,
         )
-        self._exec_approval_store.resolve(
+        self._exec_approval_store.record_execution_result(
             exec_approval_id,
-            decision=decision,
-            reason=existing.reason,
             execution_result=execution_result,
         )
 
@@ -7567,14 +7755,24 @@ class RuntimeService:
             )
             return True
 
-        await self._store.update_task_status(approval["task_id"], "resumed", error=None)
-        execution_result = await self._execute_approved_exec_request(linked)
-        self._exec_approval_store.resolve(
+        linked_lease_owner = f'runtime-service:{id(self)}'
+        linked_execution_key = f'linked-execution:{linked_exec_approval_id}'
+        linked_claim = self._exec_approval_store.consume(
             linked_exec_approval_id,
-            decision=decision,
-            reason=reason,
-            metadata={"saved_rule": saved_rule} if isinstance(saved_rule, dict) else None,
+            execution_idempotency_key=linked_execution_key,
+            lease_owner=linked_lease_owner,
+            **_exec_approval_binding_kwargs(linked),
+        )
+        await self._store.update_task_status(approval['task_id'], 'resumed', error=None)
+        execution_result = await self._execute_approved_exec_request(linked_claim)
+        linked_succeeded = is_successful_exec_approval_result(execution_result)
+        self._exec_approval_store.complete_consumption(
+            linked_exec_approval_id,
+            execution_idempotency_key=linked_execution_key,
+            lease_owner=linked_lease_owner,
+            lease_token=linked_claim.consume_lease_token or '',
             execution_result=execution_result,
+            succeeded=linked_succeeded,
         )
         updated_linked = self._exec_approval_store.get(linked_exec_approval_id)
         if updated_linked is not None:
@@ -7588,9 +7786,8 @@ class RuntimeService:
             execution_result=execution_result,
         )
 
-        task_status = str(execution_result.get("status") or "")
         final_answer = _final_answer_from_exec_result(execution_result)
-        if task_status in {"completed", "running"}:
+        if linked_succeeded:
             if final_answer is not None:
                 await self._store.append_task_event(
                     approval["task_id"],
@@ -7722,7 +7919,7 @@ class RuntimeService:
                 "result": execution_result,
                 "error": (
                     None
-                    if result_status in {"completed", "running"}
+                    if is_successful_exec_approval_result(execution_result)
                     else _exec_error_message(execution_result)
                 ),
                 "metadata": {
@@ -7780,6 +7977,7 @@ class RuntimeService:
                 self._security_config,
                 overrides=permission_override,
             )
+            effective_permission_policy[APPROVAL_OWNER_TASK_ID_KEY] = task_id
             stream = self._engine.chat(
                 task["input"],
                 session_id=task.get("session_id"),
@@ -7822,6 +8020,18 @@ class RuntimeService:
                     request_event=request_event,
                     approval_metadata=approval_metadata,
                 )
+                task_approval_binding = _approval_binding_kwargs(
+                    f"runtime-task:{task_id}",
+                    {
+                        "tool_name": str(request_event.get("tool_name", "")),
+                        "arguments": dict(request_event.get("arguments") or {}),
+                    },
+                    {
+                        "source": "runtime_task_approval",
+                        "task_id": task_id,
+                        "call_id": call_id,
+                    },
+                )
                 await self._store.create_approval_request(
                     approval_id=str(uuid4()),
                     task_id=task_id,
@@ -7829,6 +8039,7 @@ class RuntimeService:
                     tool_name=str(request_event.get("tool_name", "")),
                     arguments=dict(request_event.get("arguments") or {}),
                     metadata=approval_metadata,
+                    **task_approval_binding,
                 )
                 await self._store.update_task_status(task_id, "awaiting_approval", final_answer=final_answer)
                 return
@@ -12811,6 +13022,9 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
         decision = "approve_and_save_rule"
     elif status == "rejected":
         decision = "reject"
+    resolution_kind = approval.get("resolution_kind")
+    if isinstance(resolution_kind, str) and resolution_kind:
+        decision = resolution_kind
     metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
     security_decision = SecurityDecision.from_metadata(metadata)
     file_change_summary = summarize_file_change_payload(metadata)
@@ -12846,6 +13060,8 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
         "created_at": approval["created_at"],
         "resolved_at": approval.get("resolved_at"),
         "decision": decision,
+        "resolution_kind": resolution_kind if isinstance(resolution_kind, str) else None,
+        "rule_persistence_status": approval.get("rule_persistence_status", "not_requested"),
         "reason": approval.get("reason"),
         "requires_approval": security_decision.requires_approval if security_decision else bool(metadata.get("requires_approval", False)),
         "policy_reason": security_decision.reason if security_decision else metadata.get("reason"),
@@ -12875,6 +13091,9 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
     elif status == "rejected":
         decision = "reject"
 
+    resolution_kind = getattr(approval, "resolution_kind", None)
+    if isinstance(resolution_kind, str) and resolution_kind:
+        decision = resolution_kind
     command = str(getattr(approval, "command", ""))
     shell = str(getattr(approval, "shell", "auto"))
     scope = str(getattr(approval, "scope", "dangerous_command"))
@@ -12900,6 +13119,10 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
         "created_at": str(getattr(approval, "created_at", "")),
         "resolved_at": getattr(approval, "resolved_at", None),
         "decision": decision,
+        "resolution_kind": resolution_kind if isinstance(resolution_kind, str) else None,
+        "rule_persistence_status": (
+            "pending" if resolution_kind == "approve_and_save_rule" else "not_requested"
+        ),
         "reason": reason_text,
         "requires_approval": True,
         "policy_reason": reason_text,
@@ -13163,6 +13386,114 @@ def _build_approval_exec_session_payload(
     }
 
 
+def is_successful_exec_approval_result(result: Mapping[str, Any]) -> bool:
+    status = str(result.get("status") or "")
+    if status == "completed":
+        return True
+    return (
+        status == "running"
+        and bool(result.get("background"))
+        and isinstance(result.get("session_id"), str)
+        and bool(str(result.get("session_id")).strip())
+    )
+
+def _approval_binding_kwargs(
+    requester_id: str,
+    request: Mapping[str, Any],
+    authorization_context: Mapping[str, Any],
+) -> dict[str, str]:
+    requester, request_digest, context_digest = derive_approval_binding(
+        requester_id=requester_id,
+        request=request,
+        authorization_context=authorization_context,
+    )
+    return {
+        "requester_id": requester,
+        "request_digest": request_digest,
+        "context_digest": context_digest,
+    }
+
+
+def _exec_approval_binding_from_values(
+    *,
+    command: str,
+    shell: str,
+    scope: str,
+    command_payload: Mapping[str, Any] | None,
+    owner_task_id: str | None,
+) -> dict[str, str]:
+    normalized_owner_task_id = str(owner_task_id or "").strip() or None
+    requester_id = (
+        f"runtime-task:{normalized_owner_task_id}"
+        if normalized_owner_task_id
+        else "runtime-service"
+    )
+    return _approval_binding_kwargs(
+        requester_id,
+        {
+            "command": command,
+            "shell": shell,
+            "scope": scope,
+            "command_payload": (
+                dict(command_payload)
+                if isinstance(command_payload, Mapping)
+                else None
+            ),
+        },
+        {
+            "source": "exec_command",
+            "owner_task_id": normalized_owner_task_id,
+        },
+    )
+
+
+def _exec_approval_binding_kwargs(approval: Any | None) -> dict[str, str]:
+    if approval is None or str(getattr(approval, "requester_id", "legacy")) == "legacy":
+        return {}
+    metadata = getattr(approval, "metadata", None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    return _exec_approval_binding_from_values(
+        command=str(getattr(approval, "command", "")),
+        shell=str(getattr(approval, "shell", "")),
+        scope=str(getattr(approval, "scope", "")),
+        command_payload=getattr(approval, "command_payload", None),
+        owner_task_id=str(metadata.get(APPROVAL_OWNER_TASK_ID_KEY) or "").strip() or None,
+    )
+
+def _preflight_exec_approval_binding(approval: Any | None) -> None:
+    binding = _exec_approval_binding_kwargs(approval)
+    if not binding:
+        return
+    if str(getattr(approval, "requester_id", "")) != binding["requester_id"]:
+        raise ApprovalRequesterMismatch(
+            "Approval requester does not match the bound requester."
+        )
+    if str(getattr(approval, "request_digest", "")) != binding["request_digest"]:
+        raise ApprovalConflict("Approval request digest does not match the bound request.")
+    if str(getattr(approval, "context_digest", "")) != binding["context_digest"]:
+        raise ApprovalConflict("Approval context digest does not match the bound context.")
+
+def _task_approval_binding_kwargs(approval: Mapping[str, Any]) -> dict[str, str]:
+    if str(approval.get("requester_id") or "legacy") == "legacy":
+        return {}
+    task_id = str(approval.get("task_id") or "").strip()
+    return _approval_binding_kwargs(
+        f"runtime-task:{task_id}",
+        {
+            "tool_name": str(approval.get("tool_name") or ""),
+            "arguments": (
+                dict(approval.get("arguments"))
+                if isinstance(approval.get("arguments"), Mapping)
+                else {}
+            ),
+        },
+        {
+            "source": "runtime_task_approval",
+            "task_id": task_id,
+            "call_id": str(approval.get("call_id") or ""),
+        },
+    )
+
 def _linked_exec_approval_id(metadata: Any) -> str | None:
     if not isinstance(metadata, dict):
         return None
@@ -13176,10 +13507,18 @@ def _linked_exec_approval_id(metadata: Any) -> str | None:
 
 
 def _to_exec_approval_status(status: str | None) -> ApprovalStatus | None:
-    if status in {"pending", "approved_once", "approved_and_saved_rule", "rejected"}:
+    if status in {
+        'pending',
+        'approved_once',
+        'rejected',
+        'expired',
+        'superseded',
+        'consuming',
+        'consumed',
+        'execution_failed',
+    }:
         return status
     return None
-
 
 def _exec_result_field(result: Any, key: str) -> Any:
     if not isinstance(result, dict):
@@ -13195,7 +13534,12 @@ def _final_answer_from_exec_result(result: dict[str, Any]) -> str | None:
     if isinstance(stderr, str) and stderr.strip():
         return stderr.strip()
     session_id = result.get("session_id")
-    if result.get("status") == "running" and isinstance(session_id, str) and session_id.strip():
+    if (
+        result.get("status") == "running"
+        and is_successful_exec_approval_result(result)
+        and isinstance(session_id, str)
+        and session_id.strip()
+    ):
         return f"Exec session started in background: {session_id.strip()}"
     return None
 

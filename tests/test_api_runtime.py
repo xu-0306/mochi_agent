@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 import asyncio
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
+import sqlite3
+import sys
 import threading
 import time
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
-import sys
 
 import pytest
-
 from fastapi.testclient import TestClient
 
 from mochi.agents.events import (
@@ -29,17 +29,25 @@ from mochi.agents.multi_agent.orchestrator import (
     MultiAgentRunEvent,
     MultiAgentRunResult,
 )
-from mochi.backends.base import BackendRequestError
-from mochi.backends.types import GenerationResult, Message
 from mochi.api.routes.chat import _serialize_event
 from mochi.api.server import create_app
+from mochi.backends.base import BackendRequestError
+from mochi.backends.types import GenerationResult, Message
 from mochi.config.schema import MochiConfig
-from mochi.runtime.approvals import InMemoryApprovalStore, PersistentApprovalStore
+from mochi.runtime.approval_state_machine import derive_approval_binding
+from mochi.runtime.approvals import (
+    APPROVAL_OWNER_TASK_ID_KEY,
+    ApprovalConflict,
+    ApprovalRequesterMismatch,
+    InMemoryApprovalStore,
+    PersistentApprovalStore,
+)
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.service import (
     RuntimeService,
     _ensure_agent_run_resume_payload,
     _resolve_agent_run_resume_strategy,
+    is_successful_exec_approval_result,
 )
 from mochi.runtime.store import RuntimeStore
 from mochi.sessions.store import SessionStore
@@ -1826,7 +1834,7 @@ def test_agent_run_resume_endpoint_resolves_exec_approval_before_resuming(
 
     resolved = exec_approval_store.get(approval_id)
     assert resolved is not None
-    assert resolved.status == "approved_once"
+    assert resolved.status == "consumed"
     assert resolved.execution_result is not None
 
 
@@ -2041,7 +2049,7 @@ def test_approval_resolve_endpoint_auto_resumes_linked_agent_run(
             json={"decision": "approve_once", "reason": "allow linked auto resume"},
         )
         assert resolve_response.status_code == 200
-        assert resolve_response.json()["status"] == "approved_once"
+        assert resolve_response.json()["status"] == "consumed"
 
         completed = _wait_agent_run_until(client, run_id, {"succeeded"}, timeout_seconds=4.0)
         assert completed["summary"]["final_answer"] == "Approval auto-resume completed."
@@ -2049,7 +2057,7 @@ def test_approval_resolve_endpoint_auto_resumes_linked_agent_run(
     assert resumed_payloads
     resolved = exec_approval_store.get(approval_id)
     assert resolved is not None
-    assert resolved.status == "approved_once"
+    assert resolved.status == "consumed"
     assert resolved.execution_result is not None
 
 
@@ -2150,7 +2158,7 @@ def test_approval_resolve_endpoint_after_restart_auto_resumes_linked_agent_run(
             json={"decision": "approve_once", "reason": "allow linked restart auto resume"},
         )
         assert resolve_response.status_code == 200
-        assert resolve_response.json()["status"] == "approved_once"
+        assert resolve_response.json()["status"] == "consumed"
 
         completed = _wait_agent_run_until(
             restarted_client,
@@ -2163,7 +2171,7 @@ def test_approval_resolve_endpoint_after_restart_auto_resumes_linked_agent_run(
     assert resumed_payloads
     resolved = restarted_exec_approval_store.get(approval_id)
     assert resolved is not None
-    assert resolved.status == "approved_once"
+    assert resolved.status == "consumed"
     assert resolved.execution_result is not None
 
 
@@ -2240,12 +2248,14 @@ def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
         "require_approval_for_file_write": False,
         "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
+        APPROVAL_OWNER_TASK_ID_KEY: task_id,
     }
     assert engine.permission_policy_calls[1] == {
         "autonomy_mode": "trusted_workspace",
         "require_approval_for_file_write": False,
         "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
+        APPROVAL_OWNER_TASK_ID_KEY: task_id,
         "approved_tool_calls": [
             {
                 "tool_name": "exec_command",
@@ -2336,7 +2346,7 @@ def test_file_mutation_approval_uses_replay_override_and_downgrades_save_rule(tm
         )
         assert resolve_response.status_code == 200
         resolved = resolve_response.json()
-        assert resolved["status"] == "approved_once"
+        assert resolved["status"] == "consumed"
         assert resolved["decision"] == "approve_once"
 
         done_payload = _wait_until(client, task_id, {"succeeded"})
@@ -2726,21 +2736,21 @@ def test_approvals_api_includes_and_resolves_standalone_exec_approvals(tmp_path:
         assert resolve_response.status_code == 200
         resolved = resolve_response.json()
         assert resolved["approval_id"] == created.approval_id
-        assert resolved["status"] == "approved_once"
+        assert resolved["status"] == "consumed"
         assert resolved["reason"] == "allowed"
         assert resolved["source"] == "exec_runtime"
         assert resolved["execution_result"]["status"] == "completed"
         assert "approved exec" in resolved["execution_result"]["stdout"]
         assert resolved["exec_session_id"] is not None
 
-        approved_response = client.get("/v1/approvals?status=approved_once")
+        approved_response = client.get("/v1/approvals?status=consumed")
         assert approved_response.status_code == 200
         approved_items = approved_response.json()
         assert any(item["approval_id"] == created.approval_id for item in approved_items)
 
     updated = exec_approval_store.get(created.approval_id)
     assert updated is not None
-    assert updated.status == "approved_once"
+    assert updated.status == "consumed"
     assert updated.execution_result is not None
     assert updated.execution_result["status"] == "completed"
 
@@ -2823,7 +2833,7 @@ def test_approvals_api_persists_standalone_exec_approvals_across_runtime_restart
         assert resolve_response.status_code == 200
         resolved = resolve_response.json()
         assert resolved["approval_id"] == exec_approval_id
-        assert resolved["status"] == "approved_once"
+        assert resolved["status"] == "consumed"
         assert resolved["execution_result"]["status"] == "completed"
         assert resolved["exec_session_id"] is not None
 
@@ -2844,11 +2854,11 @@ def test_approvals_api_persists_standalone_exec_approvals_across_runtime_restart
     final_app.state.runtime_service = final_runtime_service
 
     with TestClient(final_app) as final_client:
-        approved_response = final_client.get("/v1/approvals?status=approved_once")
+        approved_response = final_client.get("/v1/approvals?status=consumed")
         assert approved_response.status_code == 200
         approved_items = approved_response.json()
         approved = next(item for item in approved_items if item["approval_id"] == exec_approval_id)
-        assert approved["exec_status"] == "approved_once"
+        assert approved["exec_status"] == "consumed"
         assert approved["exec_session_id"] is not None
         assert approved["execution_result"]["status"] == "completed"
         assert "approved exec" in approved["execution_result"]["stdout"]
@@ -2903,7 +2913,7 @@ def test_runtime_task_resolve_syncs_linked_exec_approval(tmp_path: Path) -> None
         )
         assert resolve_response.status_code == 200
         resolved = resolve_response.json()
-        assert resolved["status"] == "approved_once"
+        assert resolved["status"] == "consumed"
         assert resolved["exec_approval_id"] == "exec-approval-linked-runtime-1"
         assert resolved["execution_result"]["status"] == "completed"
         assert "linked exec approved" in resolved["execution_result"]["stdout"]
@@ -2917,7 +2927,7 @@ def test_runtime_task_resolve_syncs_linked_exec_approval(tmp_path: Path) -> None
 
     linked = exec_approval_store.get(engine.linked_exec_approval_id or "")
     assert linked is not None
-    assert linked.status == "approved_once"
+    assert linked.status == "consumed"
     assert linked.execution_result is not None
     assert linked.execution_result["status"] == "completed"
     assert "linked exec approved" in linked.execution_result["stdout"]
@@ -2995,7 +3005,7 @@ def test_task_exec_approval_remains_resolvable_after_runtime_restart(tmp_path: P
         )
         assert resolve_response.status_code == 200
         resolved = resolve_response.json()
-        assert resolved["status"] == "approved_once"
+        assert resolved["status"] == "consumed"
         assert resolved["execution_result"]["status"] == "completed"
         assert "linked exec approved" in resolved["execution_result"]["stdout"]
 
@@ -3005,7 +3015,7 @@ def test_task_exec_approval_remains_resolvable_after_runtime_restart(tmp_path: P
 
     rehydrated = restarted_exec_approval_store.get("exec-approval-linked-runtime-1")
     assert rehydrated is not None
-    assert rehydrated.status == "approved_once"
+    assert rehydrated.status == "consumed"
     assert rehydrated.execution_result is not None
     assert rehydrated.execution_result["status"] == "completed"
 
@@ -3071,12 +3081,12 @@ def test_task_exec_approval_result_stays_visible_after_runtime_restart(tmp_path:
     )
 
     with TestClient(restarted_app) as restarted_client:
-        approved_response = restarted_client.get("/v1/approvals?status=approved_once")
+        approved_response = restarted_client.get("/v1/approvals?status=consumed")
         assert approved_response.status_code == 200
         approved = next(item for item in approved_response.json() if item["approval_id"] == approval_id)
         assert approved["source"] == "task_runtime"
         assert approved["exec_approval_id"] == "exec-approval-linked-runtime-1"
-        assert approved["exec_status"] == "approved_once"
+        assert approved["exec_status"] == "consumed"
         assert approved["exec_session_id"] is not None
         assert approved["execution_result"]["status"] == "completed"
         assert "linked exec approved" in approved["execution_result"]["stdout"]
@@ -3126,7 +3136,7 @@ def test_approval_exec_session_endpoints_support_live_standalone_exec_sessions(t
         assert resolve_response.status_code == 200
         resolved = resolve_response.json()
         session_id = resolved["exec_session_id"]
-        assert resolved["exec_status"] == "approved_once"
+        assert resolved["exec_status"] == "consumed"
         assert session_id is not None
 
         session_response = client.get(
@@ -3139,7 +3149,7 @@ def test_approval_exec_session_endpoints_support_live_standalone_exec_sessions(t
         assert session_payload["source"] == "exec_runtime"
         assert session_payload["exec_approval_id"] == created.approval_id
         assert session_payload["session_id"] == session_id
-        assert session_payload["status"] == "approved_once"
+        assert session_payload["status"] == "consumed"
         assert session_payload["live_status"] == "available"
         assert session_payload["session"]["status"] in {"running", "completed"}
 
@@ -3151,7 +3161,7 @@ def test_approval_exec_session_endpoints_support_live_standalone_exec_sessions(t
         assert stop_payload["stop_status"] in {"killed", "completed"}
         assert stop_payload["session"]["status"] in {"killed", "completed"}
 
-        approved_response = client.get("/v1/approvals?status=approved_once")
+        approved_response = client.get("/v1/approvals?status=consumed")
         assert approved_response.status_code == 200
         approved_items = approved_response.json()
         updated = next(item for item in approved_items if item["approval_id"] == created.approval_id)
@@ -3270,7 +3280,7 @@ def test_linked_runtime_approval_stop_persists_latest_exec_state(tmp_path: Path)
         assert stop_payload["session_id"] == session_id
         assert stop_payload["session"]["status"] in {"killed", "completed"}
 
-        approved_response = client.get("/v1/approvals?status=approved_once")
+        approved_response = client.get("/v1/approvals?status=consumed")
         assert approved_response.status_code == 200
         approved_items = approved_response.json()
         updated = next(item for item in approved_items if item["approval_id"] == approval_id)
@@ -3279,88 +3289,84 @@ def test_linked_runtime_approval_stop_persists_latest_exec_state(tmp_path: Path)
         assert updated["exec_session_id"] == session_id
 
 
-def test_standalone_exec_approval_save_rule_without_valid_rule_downgrades_to_approve_once(
+def test_standalone_exec_approval_save_rule_without_valid_rule_is_rejected(
     tmp_path: Path,
 ) -> None:
     app = create_app()
     app.state.engine_factory = lambda: _RuntimeFakeEngine()
     app.state.config_factory = lambda: MochiConfig.model_validate(
-        {"sessions_dir": str(tmp_path / "sessions")}
+        {'sessions_dir': str(tmp_path / 'sessions')}
     )
 
     exec_approval_store = InMemoryApprovalStore()
     created = exec_approval_store.create(
-        approval_id="exec-approval-no-rule-1",
-        command="print('approved exec')",
-        shell="test",
-        scope="dangerous_command",
-        reason="requires review",
+        approval_id='exec-approval-no-rule-1',
+        command='print(''approved exec'')',
+        shell='test',
+        scope='dangerous_command',
+        reason='requires review',
         command_payload={
-            "command": "print('approved exec')",
-            "shell": "test",
-            "workdir": str(tmp_path),
-            "env": None,
-            "timeout_sec": 5.0,
-            "background": False,
-            "tty": False,
-            "approval_state": "approved",
+            'command': 'print(''approved exec'')',
+            'shell': 'test',
+            'workdir': str(tmp_path),
+            'env': None,
+            'timeout_sec': 5.0,
+            'background': False,
+            'tty': False,
+            'approval_state': 'approved',
         },
     )
     runtime_service = RuntimeService(
         engine=_RuntimeFakeEngine(),
-        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+        store=RuntimeStore(tmp_path / 'sessions' / 'runtime.db'),
         exec_approval_store=exec_approval_store,
         exec_runtime=ExecRuntime(
-            providers={"test": _ApiRuntimePythonDirectProvider()},
-            default_shell="test",
+            providers={'test': _ApiRuntimePythonDirectProvider()},
+            default_shell='test',
         ),
     )
     app.state.runtime_service = runtime_service
 
     with TestClient(app) as client:
-        resolve_response = client.post(
-            f"/v1/approvals/{created.approval_id}/resolve",
-            json={"decision": "approve_and_save_rule", "reason": "allow but no rule"},
+        response = client.post(
+            f'/v1/approvals/{created.approval_id}/resolve',
+            json={'decision': 'approve_and_save_rule', 'reason': 'allow but no rule'},
         )
-        assert resolve_response.status_code == 200
-        resolved = resolve_response.json()
-        assert resolved["status"] == "approved_once"
-        assert resolved["decision"] == "approve_once"
+        assert response.status_code == 400
+        assert 'valid command rule' in response.json()['detail']
 
     updated = exec_approval_store.get(created.approval_id)
     assert updated is not None
-    assert updated.status == "approved_once"
-    assert updated.metadata.get("saved_rule") is None
+    assert updated.status == 'pending'
+    assert exec_approval_store.list_side_effects(created.approval_id) == []
 
 
-def test_task_approval_save_rule_without_valid_rule_downgrades_to_approve_once(tmp_path: Path) -> None:
+def test_task_approval_save_rule_without_valid_rule_is_rejected(tmp_path: Path) -> None:
     app = create_app()
     engine = _RuntimeFakeEngine()
     app.state.engine_factory = lambda: engine
     app.state.config_factory = lambda: MochiConfig.model_validate(
-        {"sessions_dir": str(tmp_path / "sessions")}
+        {'sessions_dir': str(tmp_path / 'sessions')}
     )
 
     with TestClient(app) as client:
         create_response = client.post(
-            "/v1/tasks",
-            json={"input_message": "run shell approval", "workspace_dir": str(tmp_path / "workspace")},
+            '/v1/tasks',
+            json={'input_message': 'run shell approval', 'workspace_dir': str(tmp_path / 'workspace')},
         )
         assert create_response.status_code == 200
-        task_id = create_response.json()["task_id"]
+        task_id = create_response.json()['task_id']
+        waiting = _wait_until(client, task_id, {'awaiting_approval'})
+        approval_id = waiting['pending_approval']['id']
 
-        waiting = _wait_until(client, task_id, {"awaiting_approval"})
-        approval_id = waiting["pending_approval"]["id"]
-
-        resolve_response = client.post(
-            f"/v1/approvals/{approval_id}/resolve",
-            json={"decision": "approve_and_save_rule", "reason": "allow but no rule"},
+        response = client.post(
+            f'/v1/approvals/{approval_id}/resolve',
+            json={'decision': 'approve_and_save_rule', 'reason': 'allow but no rule'},
         )
-        assert resolve_response.status_code == 200
-        resolved = resolve_response.json()
-        assert resolved["status"] == "approved_once"
-        assert resolved["decision"] == "approve_once"
-
+        assert response.status_code == 400
+        assert 'valid command rule' in response.json()['detail']
+        pending = client.get('/v1/approvals?status=pending').json()
+        assert any(item['approval_id'] == approval_id for item in pending)
 
 def test_agent_runs_api_flow(tmp_path: Path) -> None:
     app = create_app()
@@ -5359,6 +5365,7 @@ def test_task_resume_endpoint_applies_approval_override(tmp_path: Path) -> None:
         "require_approval_for_file_write": False,
         "require_approval_for_exec": True,
         "file_ops_scope": "workspace",
+        APPROVAL_OWNER_TASK_ID_KEY: task_id,
         "approved_tool_calls": [
             {
                 "tool_name": "exec_command",
@@ -5366,3 +5373,462 @@ def test_task_resume_endpoint_applies_approval_override(tmp_path: Path) -> None:
             }
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"status": "completed"}, True),
+        ({"status": "running", "background": True, "session_id": "exec-1"}, True),
+        ({"status": "running", "background": False, "session_id": "exec-1"}, False),
+        ({"status": "failed"}, False),
+        ({"status": "timed_out"}, False),
+        ({"status": "killed"}, False),
+    ],
+)
+def test_exec_approval_success_classification_is_explicit(
+    result: dict[str, object],
+    expected: bool,
+) -> None:
+    assert is_successful_exec_approval_result(result) is expected
+
+
+def test_runtime_service_marks_failed_standalone_exec_approval_execution_failed(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        approvals = InMemoryApprovalStore()
+        approvals.create(
+            approval_id="exec-approval-failed-standalone",
+            command="raise SystemExit(1)",
+            shell="test",
+            scope="dangerous_command",
+            command_payload={
+                "command": "raise SystemExit(1)",
+                "shell": "test",
+                "workdir": str(tmp_path),
+                "env": None,
+                "timeout_sec": 5.0,
+                "background": False,
+                "tty": False,
+                "approval_state": "approved",
+            },
+        )
+        service = RuntimeService(
+            engine=_RuntimeFakeEngine(),
+            store=RuntimeStore(tmp_path / "runtime.db"),
+            exec_approval_store=approvals,
+            exec_runtime=ExecRuntime(
+                providers={"test": _ApiRuntimePythonDirectProvider()},
+                default_shell="test",
+            ),
+        )
+        resolved = await service.resolve_approval(
+            "exec-approval-failed-standalone",
+            decision="approve_once",
+        )
+        assert resolved is not None
+        assert resolved["status"] == "execution_failed"
+        assert resolved["execution_result"]["status"] == "failed"
+
+    asyncio.run(scenario())
+
+
+def test_runtime_service_marks_failed_task_linked_exec_execution_failed(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime_store = RuntimeStore(tmp_path / "runtime.db")
+        await runtime_store.initialize()
+        await runtime_store.create_task_run(
+            task_id="failed-linked-task",
+            input_text="run failing command",
+            session_id=None,
+            project_id=None,
+            workspace_dir=str(tmp_path),
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            inference_overrides={},
+        )
+        approvals = InMemoryApprovalStore()
+        approvals.create(
+            approval_id="exec-approval-failed-linked",
+            command="raise SystemExit(1)",
+            shell="test",
+            scope="dangerous_command",
+            command_payload={
+                "command": "raise SystemExit(1)",
+                "shell": "test",
+                "workdir": str(tmp_path),
+                "env": None,
+                "timeout_sec": 5.0,
+                "background": False,
+                "tty": False,
+                "approval_state": "approved",
+            },
+        )
+        await runtime_store.create_approval_request(
+            approval_id="task-approval-failed-linked",
+            task_id="failed-linked-task",
+            call_id="call-failed-linked",
+            tool_name="exec_command",
+            arguments={"command": "raise SystemExit(1)", "shell": "test"},
+            metadata={"approval_id": "exec-approval-failed-linked"},
+        )
+        service = RuntimeService(
+            engine=_RuntimeFakeEngine(),
+            store=runtime_store,
+            exec_approval_store=approvals,
+            exec_runtime=ExecRuntime(
+                providers={"test": _ApiRuntimePythonDirectProvider()},
+                default_shell="test",
+            ),
+        )
+        resolved = await service.resolve_approval(
+            "task-approval-failed-linked",
+            decision="approve_once",
+        )
+        assert resolved is not None
+        assert resolved["status"] == "execution_failed"
+        linked = approvals.get("exec-approval-failed-linked")
+        assert linked is not None
+        assert linked.status == "execution_failed"
+        assert linked.execution_result is not None
+        assert linked.execution_result["status"] == "failed"
+        task = await runtime_store.get_task_run("failed-linked-task")
+        assert task is not None
+        assert task["status"] == "failed"
+        assert task["final_answer"] is None
+
+    asyncio.run(scenario())
+
+def test_runtime_service_rejects_tampered_standalone_exec_binding_before_execution(
+    tmp_path: Path,
+) -> None:
+    class _RecordingProvider(_ApiRuntimePythonDirectProvider):
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def build_subprocess_spec(self, command: str, *, tty: bool = False) -> SubprocessSpec:
+            self.commands.append(command)
+            return super().build_subprocess_spec(command, tty=tty)
+
+    async def scenario() -> None:
+        approvals = InMemoryApprovalStore()
+        command_payload = {
+            "command": "print('must not run')",
+            "shell": "test",
+            "workdir": str(tmp_path),
+            "env": None,
+            "timeout_sec": 5.0,
+            "background": False,
+            "tty": False,
+            "approval_state": "approved",
+        }
+        approvals.create(
+            approval_id="tampered-standalone-binding",
+            command="print('must not run')",
+            shell="test",
+            scope="dangerous_command",
+            command_payload=command_payload,
+            requester_id="runtime-service",
+            request_digest="0" * 64,
+            context_digest="1" * 64,
+        )
+        provider = _RecordingProvider()
+        service = RuntimeService(
+            engine=_RuntimeFakeEngine(),
+            store=RuntimeStore(tmp_path / "runtime.db"),
+            exec_approval_store=approvals,
+            exec_runtime=ExecRuntime(providers={"test": provider}, default_shell="test"),
+        )
+
+        with pytest.raises(ApprovalConflict):
+            await service.resolve_approval(
+                "tampered-standalone-binding",
+                decision="approve_once",
+            )
+
+        stored = approvals.get("tampered-standalone-binding")
+        assert stored is not None
+        assert stored.status == "pending"
+        assert provider.commands == []
+
+    asyncio.run(scenario())
+
+
+def test_runtime_task_approval_binding_normal_flow_and_sqlite_tamper_conflict(
+    tmp_path: Path,
+) -> None:
+    normal_sessions_dir = tmp_path / "normal-sessions"
+    normal_app = create_app()
+    normal_engine = _RuntimeFakeEngine()
+    normal_app.state.engine_factory = lambda: normal_engine
+    normal_app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(normal_sessions_dir)}
+    )
+
+    with TestClient(normal_app) as client:
+        created = client.post(
+            "/v1/tasks",
+            json={"input_message": "run bound approval", "workspace_dir": str(tmp_path / "workspace")},
+        )
+        assert created.status_code == 200
+        task_id = created.json()["task_id"]
+        waiting = _wait_until(client, task_id, {"awaiting_approval"})
+        approval_id = waiting["pending_approval"]["id"]
+        stored = asyncio.run(
+            RuntimeStore(normal_sessions_dir / "runtime.db").get_approval_request(approval_id)
+        )
+        assert stored is not None
+        assert stored["requester_id"] == f"runtime-task:{task_id}"
+        assert len(stored["request_digest"]) == 64
+        assert len(stored["context_digest"]) == 64
+
+        resolved = client.post(
+            f"/v1/approvals/{approval_id}/resolve",
+            json={"decision": "approve_once", "reason": "normal bound approval"},
+        )
+        assert resolved.status_code == 200
+        assert _wait_until(client, task_id, {"succeeded"})["status"] == "succeeded"
+
+    tampered_sessions_dir = tmp_path / "tampered-sessions"
+    tampered_app = create_app()
+    tampered_engine = _RuntimeFakeEngine()
+    tampered_app.state.engine_factory = lambda: tampered_engine
+    tampered_app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tampered_sessions_dir)}
+    )
+
+    with TestClient(tampered_app) as client:
+        created = client.post(
+            "/v1/tasks",
+            json={"input_message": "tamper bound approval", "workspace_dir": str(tmp_path / "workspace")},
+        )
+        assert created.status_code == 200
+        task_id = created.json()["task_id"]
+        waiting = _wait_until(client, task_id, {"awaiting_approval"})
+        approval_id = waiting["pending_approval"]["id"]
+
+        # Deliberately mutate persisted binding columns to simulate database tampering.
+        with sqlite3.connect(tampered_sessions_dir / "runtime.db") as conn:
+            conn.execute(
+                """
+                UPDATE approval_requests
+                SET request_digest=?, context_digest=?
+                WHERE id=?
+                """,
+                ("0" * 64, "1" * 64, approval_id),
+            )
+
+        conflict = client.post(
+            f"/v1/approvals/{approval_id}/resolve",
+            json={"decision": "approve_once", "reason": "must not resolve"},
+        )
+        assert conflict.status_code == 409
+        pending = client.get("/v1/approvals?status=pending")
+        assert pending.status_code == 200
+        assert any(item["approval_id"] == approval_id for item in pending.json())
+        assert len(tampered_engine.permission_policy_calls) == 1
+
+def test_runtime_service_marks_foreground_running_task_linked_exec_failed(
+    tmp_path: Path,
+) -> None:
+    class _ForegroundRunningService(RuntimeService):
+        async def _execute_approved_exec_request(self, approval: Any) -> dict[str, Any]:
+            del approval
+            return {
+                "status": "running",
+                "background": False,
+                "session_id": "foreground-session",
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+            }
+
+    async def scenario() -> None:
+        runtime_store = RuntimeStore(tmp_path / "runtime.db")
+        await runtime_store.initialize()
+        await runtime_store.create_task_run(
+            task_id="foreground-running-linked-task",
+            input_text="run foreground command",
+            session_id=None,
+            project_id=None,
+            workspace_dir=str(tmp_path),
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            inference_overrides={},
+        )
+        approvals = InMemoryApprovalStore()
+        approvals.create(
+            approval_id="exec-approval-foreground-running",
+            command="print('foreground')",
+            shell="test",
+            scope="dangerous_command",
+            command_payload={
+                "command": "print('foreground')",
+                "shell": "test",
+                "workdir": str(tmp_path),
+                "env": None,
+                "timeout_sec": 5.0,
+                "background": False,
+                "tty": False,
+                "approval_state": "approved",
+            },
+        )
+        await runtime_store.create_approval_request(
+            approval_id="task-approval-foreground-running",
+            task_id="foreground-running-linked-task",
+            call_id="call-foreground-running",
+            tool_name="exec_command",
+            arguments={"command": "print('foreground')", "shell": "test"},
+            metadata={"approval_id": "exec-approval-foreground-running"},
+        )
+        service = _ForegroundRunningService(
+            engine=_RuntimeFakeEngine(),
+            store=runtime_store,
+            exec_approval_store=approvals,
+            exec_runtime=ExecRuntime(
+                providers={"test": _ApiRuntimePythonDirectProvider()},
+                default_shell="test",
+            ),
+        )
+
+        resolved = await service.resolve_approval(
+            "task-approval-foreground-running",
+            decision="approve_once",
+        )
+        assert resolved is not None
+        assert resolved["status"] == "execution_failed"
+
+        linked = approvals.get("exec-approval-foreground-running")
+        assert linked is not None
+        assert linked.status == "execution_failed"
+        task = await runtime_store.get_task_run("foreground-running-linked-task")
+        assert task is not None
+        assert task["status"] == "failed"
+        assert task["final_answer"] is None
+        events = await runtime_store.get_task_events("foreground-running-linked-task")
+        result_event = next(event for event in events if event["type"] == "tool_call_result")
+        assert result_event["error"] is not None
+        assert result_event["metadata"]["status"] == "running"
+
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize(
+    ("tampered_requester_id", "tampered_request_digest", "expected_error"),
+    [
+        pytest.param(None, "0" * 64, ApprovalConflict, id="request-digest"),
+        pytest.param(
+            "tampered-requester",
+            None,
+            ApprovalRequesterMismatch,
+            id="requester",
+        ),
+    ],
+)
+def test_runtime_service_rejects_tampered_task_linked_exec_binding_before_outer_transition(
+    tmp_path: Path,
+    tampered_requester_id: str | None,
+    tampered_request_digest: str | None,
+    expected_error: type[ApprovalConflict] | type[ApprovalRequesterMismatch],
+) -> None:
+    class _RecordingProvider(_ApiRuntimePythonDirectProvider):
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def build_subprocess_spec(self, command: str, *, tty: bool = False) -> SubprocessSpec:
+            self.commands.append(command)
+            return super().build_subprocess_spec(command, tty=tty)
+
+    async def scenario() -> None:
+        task_id = "tampered-linked-binding-task"
+        approval_id = "task-approval-tampered-linked-binding"
+        linked_approval_id = "exec-approval-tampered-linked-binding"
+        runtime_store = RuntimeStore(tmp_path / "runtime.db")
+        await runtime_store.initialize()
+        await runtime_store.create_task_run(
+            task_id=task_id,
+            input_text="run bound linked command",
+            session_id=None,
+            project_id=None,
+            workspace_dir=str(tmp_path),
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            inference_overrides={},
+        )
+        _, task_request_digest, task_context_digest = derive_approval_binding(
+            requester_id=f"runtime-task:{task_id}",
+            request={
+                "tool_name": "exec_command",
+                "arguments": {"command": "print('linked')", "shell": "test"},
+            },
+            authorization_context={
+                "source": "runtime_task_approval",
+                "task_id": task_id,
+                "call_id": "call-tampered-linked-binding",
+            },
+        )
+        await runtime_store.create_approval_request(
+            approval_id=approval_id,
+            task_id=task_id,
+            call_id="call-tampered-linked-binding",
+            tool_name="exec_command",
+            arguments={"command": "print('linked')", "shell": "test"},
+            metadata={"approval_id": linked_approval_id},
+            requester_id=f"runtime-task:{task_id}",
+            request_digest=task_request_digest,
+            context_digest=task_context_digest,
+        )
+        command_payload = {
+            "command": "print('linked')",
+            "shell": "test",
+            "workdir": str(tmp_path),
+            "env": None,
+            "timeout_sec": 5.0,
+            "background": False,
+            "tty": False,
+            "approval_state": "approved",
+        }
+        requester_id, request_digest, context_digest = derive_approval_binding(
+            requester_id=f"runtime-task:{task_id}",
+            request={
+                "command": "print('linked')",
+                "shell": "test",
+                "scope": "dangerous_command",
+                "command_payload": command_payload,
+            },
+            authorization_context={"source": "exec_command", "owner_task_id": task_id},
+        )
+        approvals = InMemoryApprovalStore()
+        approvals.create(
+            approval_id=linked_approval_id,
+            command="print('linked')",
+            shell="test",
+            scope="dangerous_command",
+            metadata={APPROVAL_OWNER_TASK_ID_KEY: task_id},
+            command_payload=command_payload,
+            requester_id=tampered_requester_id or requester_id,
+            request_digest=tampered_request_digest or request_digest,
+            context_digest=context_digest,
+        )
+        provider = _RecordingProvider()
+        service = RuntimeService(
+            engine=_RuntimeFakeEngine(),
+            store=runtime_store,
+            exec_approval_store=approvals,
+            exec_runtime=ExecRuntime(providers={"test": provider}, default_shell="test"),
+        )
+
+        with pytest.raises(expected_error):
+            await service.resolve_approval(approval_id, decision="approve_once")
+
+        outer = await runtime_store.get_approval_request(approval_id)
+        assert outer is not None
+        assert outer["status"] == "pending"
+        linked = approvals.get(linked_approval_id)
+        assert linked is not None
+        assert linked.status == "pending"
+        assert provider.commands == []
+
+    asyncio.run(scenario())

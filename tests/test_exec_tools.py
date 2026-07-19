@@ -7,7 +7,10 @@ import sys
 
 import pytest
 
-from mochi.runtime.approvals import InMemoryApprovalStore
+from mochi.runtime.approvals import (
+    APPROVAL_OWNER_TASK_ID_KEY,
+    InMemoryApprovalStore,
+)
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.tools.base import ActiveToolController, ToolExecutionContext
 from mochi.tools.exec_command import ExecCommandTool
@@ -193,6 +196,11 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
     stored = approvals.get(approval_id)
     assert stored is not None
     assert stored.status == "pending"
+    assert stored.requester_id == "runtime-service"
+    assert len(stored.request_digest) == 64
+    assert len(stored.context_digest) == 64
+    assert set(stored.request_digest) <= set("0123456789abcdef")
+    assert set(stored.context_digest) <= set("0123456789abcdef")
 
 
 @pytest.mark.asyncio
@@ -252,6 +260,7 @@ async def test_exec_command_auto_review_still_requests_manual_approval_for_escal
             permission_policy={
                 "autonomy_mode": "auto_review",
                 "require_approval_for_exec": False,
+                APPROVAL_OWNER_TASK_ID_KEY: "runtime-task-1",
             }
         ),
     )
@@ -260,7 +269,11 @@ async def test_exec_command_auto_review_still_requests_manual_approval_for_escal
     assert result.metadata["status"] == "approval_pending"
     assert result.metadata["requires_approval"] is True
     assert result.metadata["approval_id"] is not None
-    assert approvals.list(status="pending") != []
+    pending = approvals.list(status="pending")
+    assert pending != []
+    assert pending[0].command_payload is not None
+    assert pending[0].command_payload["sandbox_permissions"] == "require_escalated"
+    assert pending[0].metadata[APPROVAL_OWNER_TASK_ID_KEY] == "runtime-task-1"
 
 
 @pytest.mark.asyncio
