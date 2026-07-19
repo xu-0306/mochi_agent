@@ -485,12 +485,14 @@ class RuntimeService:
         exec_approval_store: ApprovalStore | None = None,
         exec_runtime: ExecRuntime | None = None,
         active_goal_turn_selector: ActiveGoalTurnSelector | None = None,
+        file_transaction_recovery: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
         self._engine = engine
         self._store = store
         self._exec_approval_store = exec_approval_store or get_shared_exec_approval_store()
         self._exec_runtime = exec_runtime or get_shared_exec_runtime()
         self._active_goal_turn_selector = active_goal_turn_selector
+        self._file_transaction_recovery = file_transaction_recovery
         self._runtime_tasks_root = Path("sessions") / "runtime-tasks"
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._active_agent_run_jobs: dict[str, asyncio.Task[None]] = {}
@@ -563,6 +565,8 @@ class RuntimeService:
         self._goal_lease_ttl_seconds = max(1.0, float(seconds))
 
     async def start(self) -> None:
+        if self._file_transaction_recovery is not None:
+            await self._file_transaction_recovery()
         recover_detached = getattr(self._exec_runtime, "recover_detached_sessions", None)
         if callable(recover_detached):
             await recover_detached()

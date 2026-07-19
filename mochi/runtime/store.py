@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from mochi.runtime.goal_strategy_registry import DEFAULT_GOAL_STRATEGY_ID, get_goal_strategy_entry
 
@@ -33,6 +34,12 @@ class RuntimeStore:
         self._lock = asyncio.Lock()
         self._initialized = False
 
+    @property
+    def database_path(self) -> Path:
+        """Return the exact SQLite path used by durable runtime facades."""
+
+        return self._db_path
+
     async def initialize(self) -> None:
         async with self._lock:
             if self._initialized:
@@ -44,6 +51,7 @@ class RuntimeStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            _initialize_change_set_schema(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_runs (
@@ -3672,3 +3680,149 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     if column in columns:
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+def _initialize_change_set_schema(conn: sqlite3.Connection) -> None:
+    """Create the durable Task 3 schema without mutating existing rows."""
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS change_sets (
+            id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL,
+            requester_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            workspace_root TEXT NOT NULL,
+            workspace_identity_json TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            authorization_envelope_json TEXT NOT NULL,
+            patch_sha256 TEXT,
+            policy_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            applied_at TEXT,
+            updated_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS change_entries (
+            id TEXT PRIMARY KEY,
+            change_set_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            relative_path TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            base_sha256 TEXT,
+            after_sha256 TEXT,
+            base_identity_json TEXT,
+            before_blob_id TEXT,
+            after_blob_id TEXT,
+            mode_before INTEGER,
+            mode_after INTEGER,
+            base_metadata_blob_id TEXT,
+            after_metadata_blob_id TEXT,
+            rename_source TEXT,
+            dependency_group TEXT,
+            UNIQUE(change_set_id, ordinal),
+            UNIQUE(change_set_id, id),
+            FOREIGN KEY(change_set_id) REFERENCES change_sets(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS applied_change_entries (
+            change_set_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            applied_sha256 TEXT,
+            applied_identity_json TEXT,
+            applied_metadata_sha256 TEXT,
+            applied_at TEXT NOT NULL,
+            PRIMARY KEY(change_set_id, entry_id),
+            FOREIGN KEY(change_set_id, entry_id)
+                REFERENCES change_entries(change_set_id, id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS change_blobs (
+            id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL UNIQUE,
+            size_bytes INTEGER NOT NULL,
+            content BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS blob_references (
+            blob_id TEXT NOT NULL,
+            owner_type TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            retained_until TEXT,
+            state TEXT NOT NULL,
+            PRIMARY KEY(blob_id, owner_type, owner_id, purpose),
+            FOREIGN KEY(blob_id) REFERENCES change_blobs(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS undo_retention (
+            change_set_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            retained_until TEXT,
+            expired_at TEXT,
+            PRIMARY KEY(change_set_id, entry_id),
+            FOREIGN KEY(change_set_id, entry_id)
+                REFERENCES change_entries(change_set_id, id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS file_transaction_journal (
+            id TEXT PRIMARY KEY,
+            change_set_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(change_set_id) REFERENCES change_sets(id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS file_transaction_entries (
+            journal_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            base_sha256 TEXT,
+            after_sha256 TEXT,
+            base_identity_json TEXT,
+            staged_name TEXT,
+            staged_identity_json TEXT,
+            rollback_blob_id TEXT,
+            rollback_staged_name TEXT,
+            rollback_staged_identity_json TEXT,
+            rollback_successor_identity_json TEXT,
+            base_metadata_blob_id TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(journal_id, entry_id),
+            UNIQUE(journal_id, ordinal),
+            FOREIGN KEY(journal_id)
+                REFERENCES file_transaction_journal(id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS change_set_idempotency
+        ON change_sets(
+            schema_version,
+            requester_id,
+            session_id,
+            IFNULL(task_id, ''),
+            workspace_identity_json,
+            request_digest
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_change_entries_change_set_ordinal
+        ON change_entries(change_set_id, ordinal);
+
+        CREATE INDEX IF NOT EXISTS idx_blob_references_state_retained
+        ON blob_references(state, retained_until);
+
+        CREATE INDEX IF NOT EXISTS idx_file_transaction_journal_status_updated
+        ON file_transaction_journal(status, updated_at);
+        """
+    )
