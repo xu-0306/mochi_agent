@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_turn_decision_route_classifies_blocked_explanation_question(
     tmp_path: Path,
 ) -> None:

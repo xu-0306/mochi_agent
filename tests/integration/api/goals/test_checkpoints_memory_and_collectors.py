@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_propagates_linked_recovery_state_and_checkpoint_to_health(
     tmp_path: Path,
     monkeypatch: Any,

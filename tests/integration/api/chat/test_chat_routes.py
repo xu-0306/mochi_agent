@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_chat_route_returns_bounded_response_with_serialized_events() -> None:
     """`POST /v1/chat` 應收斂事件流並回傳 final answer/trajectory。"""
     app, engine = _build_app()

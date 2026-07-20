@@ -5,8 +5,8 @@ import pytest
 
 from mochi.tools.collector_adapter import CollectorRequestPolicy
 from mochi.tools.discourse_topic_adapter import (
-    DiscourseTopicCollectTool,
     DiscourseTopicCollectorAdapter,
+    DiscourseTopicCollectTool,
 )
 
 

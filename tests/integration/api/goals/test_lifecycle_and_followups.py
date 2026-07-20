@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_create_normalizes_prompt_duration_into_runtime_contract(tmp_path: Path) -> None:
     with _create_goal_test_client(tmp_path) as client:
         create_response = client.post(

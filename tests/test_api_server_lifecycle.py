@@ -495,8 +495,8 @@ def test_channels_control_returns_503_when_manager_is_missing() -> None:
 
 def test_channels_start_lazily_builds_manager_from_current_config(monkeypatch) -> None:
     """`/v1/channels/{name}/start` 應可用目前 config lazy 建立 manager。"""
-    from mochi.channels.manager import ChannelManager
     import mochi.api.server as server_module
+    from mochi.channels.manager import ChannelManager
 
     app = create_app()
     app.state.config_factory = lambda: MochiConfig.model_validate(

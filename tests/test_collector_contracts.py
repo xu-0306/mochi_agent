@@ -4,8 +4,8 @@ from mochi.runtime.collector_contracts import (
     build_collector_state_manifest,
     collector_dataset_record_identity,
     collector_record_provenance_list_from_dataset_records,
-    dedupe_collector_shard_manifests,
     dedupe_collector_dataset_records,
+    dedupe_collector_shard_manifests,
     extract_collector_shard_manifests,
     extract_persisted_collector_dataset_records,
 )

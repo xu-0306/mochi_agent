@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_operator_audit_log_can_filter_to_selected_goal(tmp_path: Path) -> None:
     app, runtime_service = _create_goal_test_app(tmp_path)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_agent_engine_cancel_chat_run_cancels_active_run() -> None:
     engine = AgentEngine.__new__(AgentEngine)
     started = threading.Event()

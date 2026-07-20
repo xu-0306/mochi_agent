@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_models_route_returns_active_model_without_leaking_secrets() -> None:
     """`GET /v1/models` 應只回傳非敏感模型資訊。"""
     app, _engine = _build_app()

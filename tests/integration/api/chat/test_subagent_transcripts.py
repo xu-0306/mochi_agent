@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_session_subagent_api_lists_details_and_appends_guidance(tmp_path: Path) -> None:
     sessions_dir = tmp_path / "sessions"
     runtime_db = sessions_dir / "runtime.db"

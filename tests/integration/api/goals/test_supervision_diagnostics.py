@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_supervisor_opens_and_resolves_generation_refresh_overdue_report_only(
     tmp_path: Path,
 ) -> None:

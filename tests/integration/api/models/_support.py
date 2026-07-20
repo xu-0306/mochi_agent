@@ -6,6 +6,7 @@ from __future__ import annotations
 from tests.integration.api.chat import _support as _chat_support
 from tests.integration.api.chat._support import *
 
+
 class _FakeManagedVLLMRuntimeManager:
     def __init__(self, *, base_url: str = "http://localhost:8000/v1") -> None:
         self.base_url = base_url

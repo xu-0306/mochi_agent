@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
 import sqlite3
 import sys
 import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,18 +18,19 @@ from fastapi.testclient import TestClient
 from mochi.agents.multi_agent.orchestrator import MultiAgentRunResult
 from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
+from mochi.runtime.approvals import InMemoryApprovalStore
+from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.goal_strategy_registry import (
     GoalStrategyRegistryEntryData,
     registered_goal_strategy_entries_for_test,
 )
-from mochi.runtime.approvals import InMemoryApprovalStore
-from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
 from mochi.utils.shell_providers import BaseShellProvider, SubprocessSpec
 from tests.support.app_factories import create_runtime_test_app
 from tests.support.exec_providers import PythonDirectProvider as _GoalApiPythonDirectProvider
 from tests.support.polling import wait_for_status
+
 
 def _create_goal_test_client(tmp_path: Path) -> TestClient:
     app, _runtime_service = create_runtime_test_app(tmp_path / "sessions")

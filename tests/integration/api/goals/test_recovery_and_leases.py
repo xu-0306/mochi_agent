@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_startup_recovery_repairs_claimed_linked_run_without_stalling(
     tmp_path: Path,
     monkeypatch: Any,

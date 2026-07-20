@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_pending_goal_proposal_intent_route_uses_bounded_engine_invoke(tmp_path: Path) -> None:
     class _FakeEngine:
         def __init__(self) -> None:

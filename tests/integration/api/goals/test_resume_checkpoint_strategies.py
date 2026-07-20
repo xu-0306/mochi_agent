@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_resume_continue_from_checkpoint_injects_latest_memory_snapshot_guidance(
     tmp_path: Path,
     monkeypatch: Any,

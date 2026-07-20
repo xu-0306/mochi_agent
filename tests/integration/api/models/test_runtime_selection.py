@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 @pytest.mark.parametrize(('provider', 'default_base_url'), [('sglang', 'http://localhost:30000/v1'), ('tensorrt_llm', 'http://localhost:8000/v1')])
 def test_models_configure_route_supports_external_openai_compat_presets_without_managed_vllm_path(
     provider: str,

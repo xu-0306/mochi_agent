@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_resume_reuses_stalled_linked_run_as_manual_refresh(
     tmp_path: Path,
     monkeypatch: Any,

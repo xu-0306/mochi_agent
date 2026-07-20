@@ -20,19 +20,27 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from starlette.requests import Request as StarletteRequest
 
+from mochi.agents.engine import (
+    AgentEngine,
+    _build_response_language_prompt_addendum,
+    _merge_prompt_addenda,
+)
 from mochi.agents.events import (
     FinalAnswerEvent,
     ThinkingEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
-from mochi.agents.engine import (
-    AgentEngine,
-    _build_response_language_prompt_addendum,
-    _merge_prompt_addenda,
+from mochi.agents.invocation import (
+    AgentInvocationDiagnostics,
+    AgentInvocationRequest,
+    AgentInvocationResult,
 )
-from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest, AgentInvocationResult
-from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunEvent, MultiAgentRunResult
+from mochi.agents.multi_agent.orchestrator import (
+    MultiAgentOrchestrator,
+    MultiAgentRunEvent,
+    MultiAgentRunResult,
+)
 from mochi.api.routes.chat import _stream_chat_events
 from mochi.api.server import create_app
 from mochi.auth.models import OpenAICodexAuthProfile
@@ -41,8 +49,8 @@ from mochi.auth.openai_codex import (
     OpenAICodexAuthService,
     _profile_refresh_lock_path,
 )
-from mochi.backends.router import BackendRouter
 from mochi.backends.local_models import LocalModelConvertExecutionResult
+from mochi.backends.router import BackendRouter
 from mochi.backends.types import AttachmentRef, GenerationResult, ModelInfo
 from mochi.config.manager import load_config
 from mochi.config.schema import MochiConfig

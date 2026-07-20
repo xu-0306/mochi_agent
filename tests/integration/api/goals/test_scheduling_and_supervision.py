@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_health_surfaces_context_handoff_telemetry_and_resolves_report_only_finding(
     tmp_path: Path,
 ) -> None:

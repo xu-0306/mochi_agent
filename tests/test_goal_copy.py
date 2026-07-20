@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from mochi.goal_proposal_copy import (
-    build_goal_command_help_message,
     build_goal_chrome_copy,
-    build_goal_status_label,
+    build_goal_command_help_message,
     build_goal_follow_up_message,
     build_goal_lifecycle_message,
     build_goal_proposal_assistant_copy_fallback,
+    build_goal_status_label,
 )
 from mochi.terminal_goal_helpers import (
     build_goal_summary_from_goal,

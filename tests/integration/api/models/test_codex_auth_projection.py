@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_openai_codex_import_route_stores_cli_login_under_mochi_state_root(
     tmp_path: Path,
     monkeypatch: Any,

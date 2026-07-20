@@ -2,6 +2,7 @@
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_goal_surfaces_waiting_approval_and_checkpoint_policy_in_health(
     tmp_path: Path,
     monkeypatch: Any,

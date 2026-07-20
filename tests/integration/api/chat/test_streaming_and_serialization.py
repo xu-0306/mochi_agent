@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._support import *  # noqa: F401,F403
 
+
 def test_chat_stream_route_returns_sse_events_incrementally() -> None:
     """`POST /v1/chat/stream` 應以 SSE 逐筆送出 serialized chat events。"""
     app, engine = _build_app()
