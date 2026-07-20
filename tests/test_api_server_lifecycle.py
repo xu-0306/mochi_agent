@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -18,6 +19,9 @@ from mochi.api.server import (
     create_app,
 )
 from mochi.config.schema import MochiConfig
+from mochi.runtime.delegate import get_delegate_subagent_task_launcher
+from mochi.runtime.service import RuntimeService
+from mochi.runtime.store import RuntimeStore
 
 
 @dataclass
@@ -48,6 +52,15 @@ class _FakeEngine:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _FakeExecRuntime:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self, *, preserve_detached: bool = True) -> None:
+        del preserve_detached
+        self.close_calls += 1
 
 
 class _FakeVLLMManager:
@@ -130,6 +143,28 @@ def test_shutdown_engine_stops_vllm_runtime_manager_without_engine() -> None:
 
     assert manager.stop_calls == 1
     assert app.state.vllm_runtime_manager is None
+
+
+def test_runtime_service_close_releases_only_its_delegate_launcher(tmp_path: Path) -> None:
+    first = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "first" / "runtime.db"),
+        exec_runtime=_FakeExecRuntime(),
+    )
+    second = RuntimeService(
+        engine=object(),
+        store=RuntimeStore(tmp_path / "second" / "runtime.db"),
+        exec_runtime=_FakeExecRuntime(),
+    )
+    second_launcher = get_delegate_subagent_task_launcher()
+    assert second_launcher is not None
+
+    asyncio.run(first.close())
+
+    assert get_delegate_subagent_task_launcher() is second_launcher
+
+    asyncio.run(second.close())
+    assert get_delegate_subagent_task_launcher() is None
 
 
 def test_merge_voice_bridge_diagnostics_accumulates_counts_and_replaces_last_failure() -> None:

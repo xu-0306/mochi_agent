@@ -96,6 +96,11 @@ CLAUDE.md
 Mochi_Spec.md
 Makefile
 docs/
+!docs/
+!docs/testing/
+!docs/testing/README.md
+!docs/testing/test-suite-baseline.md
+!docs/testing/test-inventory.txt
 documents/
 implementation_plan.md
 scripts/

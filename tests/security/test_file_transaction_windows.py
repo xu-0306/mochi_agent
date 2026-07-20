@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal
 
 import pytest
 
-from tests.security.test_safe_filesystem import (
+from tests.security.safe_filesystem._support import (
     _FakeWindowsAdapter,
     _windows_authorization,
 )

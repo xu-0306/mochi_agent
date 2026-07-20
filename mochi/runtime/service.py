@@ -65,7 +65,10 @@ from mochi.runtime.collector_contracts import (
     extract_collector_shard_manifests,
     extract_persisted_collector_dataset_records,
 )
-from mochi.runtime.delegate import set_delegate_subagent_task_launcher
+from mochi.runtime.delegate import (
+    get_delegate_subagent_task_launcher,
+    set_delegate_subagent_task_launcher,
+)
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.execution_transcript import normalize_subagent_event
 from mochi.runtime.goal_strategy_registry import (
@@ -518,7 +521,8 @@ class RuntimeService:
         self._goal_supervision_lock = asyncio.Lock()
         self._runtime_owner_id = f"runtime-{uuid4()}"
         self._delegated_subagent_live_subscribers: dict[str, set[_DelegatedSubagentLiveSubscription]] = {}
-        set_delegate_subagent_task_launcher(self.create_delegated_subagent_task)
+        self._delegate_subagent_task_launcher = self.create_delegated_subagent_task
+        set_delegate_subagent_task_launcher(self._delegate_subagent_task_launcher)
 
     def set_runtime_tasks_root(self, root_dir: Path) -> None:
         self._runtime_tasks_root = Path(root_dir)
@@ -660,6 +664,9 @@ class RuntimeService:
                 await close_exec_runtime(preserve_detached=True)
             else:
                 await close_exec_runtime()
+
+        if get_delegate_subagent_task_launcher() is self._delegate_subagent_task_launcher:
+            set_delegate_subagent_task_launcher(None)
 
     async def create_task(self, payload: TaskCreateRequest) -> dict[str, Any]:
         task_id = str(uuid4())

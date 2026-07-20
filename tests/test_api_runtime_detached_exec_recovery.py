@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
-import pytest
 
 from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
-from tests.test_api_runtime import (
-    _ApiRuntimePythonDirectProvider,
+from tests.integration.api.runtime._support import (
     _BACKGROUND_SMOKE_COMMAND_RULE,
+    _ApiRuntimePythonDirectProvider,
     _BackgroundControlledExecAgentRunEngine,
     _wait_agent_run_until,
 )
@@ -64,26 +62,6 @@ def _wait_for_detached_exec_job(
         items = detached_artifact["metadata"]["content"].get("items") or []
         if items:
             return dict(items[0])
-        execution_results_artifact = next(
-            (
-                artifact
-                for artifact in last_payload["artifacts"]
-                if artifact["artifact_type"] == "execution_results"
-            ),
-            None,
-        )
-        if execution_results_artifact is not None:
-            results = execution_results_artifact["metadata"]["content"].get("items") or []
-            if results:
-                error = results[0].get("error")
-                if (
-                    isinstance(error, str)
-                    and "_watch_detached_session" in error
-                ):
-                    pytest.skip(
-                        "Detached exec restart recovery is unavailable in this runtime build: "
-                        f"{error}"
-                    )
         time.sleep(0.05)
     raise AssertionError(f"Detached exec job was not materialized in time: {last_payload}")
 
@@ -186,7 +164,7 @@ def test_agent_run_detached_exec_recovers_after_runtime_restart(tmp_path: Path) 
         assert first_poll_payload["session_id"] == session_id
         assert first_poll_payload["lease"]["manifest_path"] == str(manifest_path)
 
-        asyncio.run(runtime_service.close())
+        client.portal.call(runtime_service.close)
         runtime_service = _build_runtime_service(db_path=db_path, state_root=state_root, engine=engine)
         app.state.runtime_service = runtime_service
 
@@ -224,4 +202,4 @@ def test_agent_run_detached_exec_recovers_after_runtime_restart(tmp_path: Path) 
         assert reattach_events
         assert reattach_events[-1]["session_id"] == session_id
 
-        asyncio.run(runtime_service.close())
+        client.portal.call(runtime_service.close)

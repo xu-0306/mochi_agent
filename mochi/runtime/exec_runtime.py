@@ -654,9 +654,16 @@ class ExecRuntime:
             return
         wait_task = session.wait_task
         if wait_task is not None and not wait_task.done():
-            wait_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await wait_task
+            task_loop = wait_task.get_loop()
+            current_loop = asyncio.get_running_loop()
+            if task_loop is current_loop:
+                wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wait_task
+            elif task_loop.is_running():
+                task_loop.call_soon_threadsafe(wait_task.cancel)
+            else:
+                wait_task.cancel()
         session.wait_task = None
         session.stdout_task = None
         session.stderr_task = None
