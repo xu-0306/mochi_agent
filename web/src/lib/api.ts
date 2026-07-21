@@ -5154,6 +5154,11 @@ export interface UndoFileWriteInput {
   encoding?: string
 }
 
+export interface UndoChangeSetInput {
+  entry_ids: string[]
+  request_digest: string
+}
+
 export interface UpdateSettingsInput {
   agent?: AgentSettingsUpdate
   voice?: VoiceSettingsUpdate
@@ -5456,6 +5461,19 @@ export async function undoFileWrite(input: UndoFileWriteInput): Promise<Record<s
     method: 'POST',
     body: JSON.stringify(input),
   })
+}
+
+export async function undoChangeSet(
+  changeSetId: string,
+  input: UndoChangeSetInput
+): Promise<Record<string, unknown>> {
+  return requestJson<Record<string, unknown>>(
+    '/changes/' + encodeURIComponent(changeSetId) + '/undo',
+    {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }
+  )
 }
 
 export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> {

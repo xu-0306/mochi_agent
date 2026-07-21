@@ -49,6 +49,16 @@ export interface FileChangeSummary {
   deletions: number
   undoAvailable: boolean
   undoAction: 'restore' | 'delete' | null
+  changeSetId: string | null
+  entryId: string | null
+  requestDigest: string | null
+  dependencyGroup: string | null
+  undoEntryIds: string[]
+  undoStatus: string | null
+  retainedUntil: string | null
+  undoReason: string | null
+  changeContractMode: 'observe' | 'enforce'
+  wouldRejectLegacyUndo: boolean
 }
 
 export interface FileChangeGroupSummary {
@@ -268,6 +278,18 @@ function normalizeFileChangeRecord(
     deletions: getNumber(payload.deleted_lines) ?? stats.deletions,
     undoAvailable: getBoolean(payload.undo_available) ?? false,
     undoAction: undoAction === 'restore' || undoAction === 'delete' ? undoAction : null,
+    changeSetId: getString(payload.change_set_id),
+    entryId: getString(payload.entry_id),
+    requestDigest: getString(payload.request_digest),
+    dependencyGroup: getString(payload.dependency_group),
+    undoEntryIds: getStringArray(payload.undo_entry_ids),
+    undoStatus: getString(payload.undo_status),
+    retainedUntil: getString(payload.retained_until),
+    undoReason: getString(payload.undo_reason),
+    changeContractMode:
+      getString(payload.change_contract_mode) === 'enforce' ? 'enforce' : 'observe',
+    wouldRejectLegacyUndo:
+      getBoolean(payload.would_reject_legacy_undo) ?? false,
   }
 }
 
@@ -422,6 +444,16 @@ function buildApplyPatchDiff(
     deletions: stats.deletions,
     undoAvailable: false,
     undoAction: null,
+    changeSetId: null,
+    entryId: null,
+    requestDigest: null,
+    dependencyGroup: null,
+    undoEntryIds: [],
+    undoStatus: null,
+    retainedUntil: null,
+    undoReason: null,
+    changeContractMode: 'observe',
+    wouldRejectLegacyUndo: false,
   }
 }
 
@@ -518,6 +550,16 @@ export function extractFileChangeGroupFromToolData(input: {
       input.toolArgs?.new_content,
     undo_available: input.toolMeta?.undo_available,
     undo_action: input.toolMeta?.undo_action,
+    change_set_id: input.toolMeta?.change_set_id,
+    entry_id: input.toolMeta?.entry_id,
+    request_digest: input.toolMeta?.request_digest,
+    dependency_group: input.toolMeta?.dependency_group,
+    undo_entry_ids: input.toolMeta?.undo_entry_ids,
+    undo_status: input.toolMeta?.undo_status,
+    retained_until: input.toolMeta?.retained_until,
+    undo_reason: input.toolMeta?.undo_reason,
+    change_contract_mode: input.toolMeta?.change_contract_mode,
+    would_reject_legacy_undo: input.toolMeta?.would_reject_legacy_undo,
     diff: input.toolMeta?.diff,
     diff_available: input.toolMeta?.diff_available,
     status: input.toolMeta?.status,

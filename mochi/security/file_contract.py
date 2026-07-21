@@ -528,6 +528,46 @@ class AuthorizationEnvelope:
 
 
 @dataclass(frozen=True, slots=True)
+class AppliedChangeRecord:
+    """Authoritative state observed after one manifest entry was applied."""
+
+    change_set_id: str
+    entry_id: str
+    applied_sha256: str | None
+    applied_identity: FileIdentity | None
+    applied_metadata_sha256: str | None
+    applied_at: str
+
+    def __post_init__(self) -> None:
+        _string(self.change_set_id, "change_set_id")
+        _string(self.entry_id, "entry_id")
+        _string(self.applied_at, "applied_at")
+        _sha256_digest(self.applied_sha256, "applied_sha256", optional=True)
+        _sha256_digest(
+            self.applied_metadata_sha256,
+            "applied_metadata_sha256",
+            optional=True,
+        )
+        if self.applied_identity is not None and not isinstance(
+            self.applied_identity, FileIdentity
+        ):
+            raise ValueError("applied_identity must be a FileIdentity or None")
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "change_set_id": self.change_set_id,
+            "entry_id": self.entry_id,
+            "applied_sha256": self.applied_sha256,
+            "applied_identity": (
+                None
+                if self.applied_identity is None
+                else self.applied_identity.to_dict()
+            ),
+            "applied_metadata_sha256": self.applied_metadata_sha256,
+            "applied_at": self.applied_at,
+        }
+
+@dataclass(frozen=True, slots=True)
 class ChangeManifest:
     version: int
     change_set_id: str
@@ -723,6 +763,7 @@ def preview_idempotency_key(envelope: AuthorizationEnvelope) -> PreviewIdempoten
 
 __all__ = [
     "AuthorizationContext",
+    "AppliedChangeRecord",
     "AuthorizationEnvelope",
     "ChangeEntry",
     "ChangeManifest",

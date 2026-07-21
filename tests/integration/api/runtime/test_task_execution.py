@@ -227,7 +227,7 @@ def test_file_mutation_approval_binds_edited_patch_preview(
         )
         assert resolve_response.status_code == 200, resolve_response.json()
         resolved = resolve_response.json()
-        assert resolved["status"] == "consumed"
+        assert resolved["status"] == "consumed", resolved
         assert resolved["decision"] == "approve_once"
         if change_contract_mode == "observe":
             assert resolved["would_reject_edited_patch"] is True
@@ -236,7 +236,35 @@ def test_file_mutation_approval_binds_edited_patch_preview(
         assert done_payload["status"] == "succeeded"
         assert done_payload["final_answer"] == "Applied approved file change to notes.py."
 
-    assert (task_workspace / "notes.py").read_text(encoding="utf-8") == "print('gamma')\n"
+        if change_contract_mode == "enforce":
+            result_event = next(
+                event
+                for event in reversed(done_payload["events"])
+                if event.get("type") == "tool_call_result"
+            )
+            assert "original_content" not in result_event["metadata"]
+            protected_change = result_event["metadata"]["file_changes"][0]
+            assert "original_content" not in protected_change
+            assert protected_change["undo_status"] == "retained"
+            assert protected_change["undo_available"] is True
+            assert protected_change["undo_entry_ids"] == [
+                protected_change["entry_id"]
+            ]
+            undo_response = client.post(
+                f"/v1/changes/{protected_change['change_set_id']}/undo",
+                json={
+                    "entry_ids": protected_change["undo_entry_ids"],
+                    "request_digest": protected_change["request_digest"],
+                },
+            )
+            assert undo_response.status_code == 200, undo_response.json()
+
+    expected_content = (
+        "print('alpha')\n"
+        if change_contract_mode == "enforce"
+        else "print('gamma')\n"
+    )
+    assert (task_workspace / "notes.py").read_text(encoding="utf-8") == expected_content
     assert len(engine.permission_policy_calls) == 1
 
 

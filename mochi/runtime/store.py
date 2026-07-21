@@ -3830,6 +3830,12 @@ def _initialize_change_set_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_blob_references_state_retained
         ON blob_references(state, retained_until);
 
+        CREATE INDEX IF NOT EXISTS idx_blob_references_owner_purpose_state
+        ON blob_references(owner_type, owner_id, purpose, state);
+
+        CREATE INDEX IF NOT EXISTS idx_undo_retention_status_retained
+        ON undo_retention(status, retained_until);
+
         CREATE INDEX IF NOT EXISTS idx_file_transaction_journal_status_updated
         ON file_transaction_journal(status, updated_at);
         """

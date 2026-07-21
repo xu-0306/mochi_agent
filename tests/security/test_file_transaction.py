@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 from dataclasses import FrozenInstanceError, fields, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, get_type_hints
 
 import pytest
@@ -806,3 +807,76 @@ def test_public_contract_exposes_no_path_or_raw_resource_api() -> None:
         for name in public_names + contract_fields
         for token in forbidden
     )
+
+def test_undo_cas_rejects_same_content_with_replaced_identity() -> None:
+    from mochi.security.file_contract import FileIdentity
+    from mochi.tools.file_transaction import (
+        UndoCASConflict,
+        UndoCASObservation,
+        validate_undo_cas,
+    )
+
+    digest = _sha_label("same-content")
+    metadata = _sha_label("same-metadata")
+    expected = UndoCASObservation(
+        identity=FileIdentity("posix", "1", "41", 1, False),
+        content_sha256=digest,
+        metadata_sha256=metadata,
+    )
+    replaced = UndoCASObservation(
+        identity=FileIdentity("posix", "1", "99", 1, False),
+        content_sha256=digest,
+        metadata_sha256=metadata,
+    )
+
+    with pytest.raises(UndoCASConflict, match="undo_target_changed"):
+        validate_undo_cas(expected, replaced)
+
+def test_undo_staging_failure_cleans_previously_staged_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mochi.tools.file_transaction as transaction
+    from mochi.tools.file_transaction import (
+        UndoMutation,
+        execute_authoritative_undo,
+        observe_undo_target,
+    )
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"after-one")
+    second.write_bytes(b"after-two")
+    mutations = (
+        UndoMutation(
+            entry_id="entry-one",
+            relative_name="first.txt",
+            operation="restore",
+            expected=observe_undo_target(first),
+            restore_content=b"before-one",
+        ),
+        UndoMutation(
+            entry_id="entry-two",
+            relative_name="second.txt",
+            operation="restore",
+            expected=observe_undo_target(second),
+            restore_content=b"before-two",
+        ),
+    )
+    real_stage = transaction._stage_undo_bytes
+    stage_calls = 0
+
+    def fail_second_stage(target: Path, content: bytes, mode: int | None) -> Path:
+        nonlocal stage_calls
+        stage_calls += 1
+        if stage_calls == 2:
+            raise OSError("injected staging failure")
+        return real_stage(target, content, mode)
+
+    monkeypatch.setattr(transaction, "_stage_undo_bytes", fail_second_stage)
+    with pytest.raises(OSError, match="injected staging failure"):
+        execute_authoritative_undo(tmp_path, mutations)
+
+    assert list(tmp_path.glob(".mochi-undo-*")) == []
+    assert first.read_bytes() == b"after-one"
+    assert second.read_bytes() == b"after-two"

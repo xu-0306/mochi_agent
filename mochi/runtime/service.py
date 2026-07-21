@@ -94,6 +94,7 @@ from mochi.runtime.recovery import (
 )
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
+from mochi.security.file_contract import AppliedChangeRecord
 from mochi.security.policy import (
     build_runtime_permission_policy_dict,
     resolve_runtime_permission_policy,
@@ -110,6 +111,7 @@ from mochi.tools.file_ops import (
     prepare_patch_change_contract,
     revalidate_patch_change_contract,
 )
+from mochi.tools.file_transaction import observe_undo_target
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 DELEGATED_TASK_RESUMABLE_STATUS = {
@@ -7929,6 +7931,17 @@ class RuntimeService:
             )
             return True
 
+        try:
+            await self._attach_file_mutation_undo_contract(
+                current=current,
+                result=result,
+            )
+        except Exception as exc:
+            result.error = (
+                "File change applied, but authoritative undo retention could not "
+                f"be established: {exc}"
+            )
+
         await self._append_task_file_mutation_result_event(
             approval=approval,
             tool_name=tool_name,
@@ -7992,6 +8005,118 @@ class RuntimeService:
         )
         return True
 
+    async def _attach_file_mutation_undo_contract(
+        self,
+        *,
+        current: Mapping[str, Any],
+        result: ToolResult,
+    ) -> None:
+        if result.error is not None:
+            return
+
+        metadata = dict(result.metadata)
+        raw_changes = metadata.get("file_changes")
+        file_changes = (
+            [dict(item) for item in raw_changes if isinstance(item, dict)]
+            if isinstance(raw_changes, list)
+            else []
+        )
+        mode = self._security_config.change_contract_mode
+        metadata["change_contract_mode"] = mode
+
+        if mode == "observe":
+            for change in file_changes:
+                change["change_contract_mode"] = "observe"
+                change["would_reject_legacy_undo"] = True
+            metadata["file_changes"] = file_changes
+            metadata["would_reject_legacy_undo"] = True
+            result.metadata = metadata
+            return
+
+        approval_metadata = current.get("metadata")
+        approval_metadata = (
+            approval_metadata if isinstance(approval_metadata, Mapping) else {}
+        )
+        change_set_id = approval_metadata.get("change_set_id")
+        if not isinstance(change_set_id, str) or not change_set_id:
+            raise RuntimeError("approved file change is missing change_set_id")
+
+        change_store = ChangeSetStore(self._store)
+        loaded = await change_store.get_change_set(change_set_id)
+        if loaded is None:
+            raise RuntimeError("approved change set was not found")
+        manifest = loaded["manifest"]
+        applied_at = _to_iso_utc(_utcnow())
+        records: list[AppliedChangeRecord] = []
+        for entry in manifest.entries:
+            target = Path(manifest.workspace_root) / Path(entry.relative_path)
+            observation = await asyncio.to_thread(observe_undo_target, target)
+            if entry.after_sha256 is None:
+                if (
+                    observation.identity is not None
+                    or observation.content_sha256 is not None
+                    or observation.metadata_sha256 is not None
+                ):
+                    raise RuntimeError(
+                        f"applied state mismatch for {entry.relative_path}"
+                    )
+            elif (
+                observation.identity is None
+                or observation.content_sha256 != entry.after_sha256
+                or observation.metadata_sha256 is None
+            ):
+                raise RuntimeError(
+                    f"applied state mismatch for {entry.relative_path}"
+                )
+            records.append(
+                AppliedChangeRecord(
+                    change_set_id=change_set_id,
+                    entry_id=entry.entry_id,
+                    applied_sha256=observation.content_sha256,
+                    applied_identity=observation.identity,
+                    applied_metadata_sha256=observation.metadata_sha256,
+                    applied_at=applied_at,
+                )
+            )
+
+        retained_until = _to_iso_utc(_utcnow() + timedelta(hours=24))
+        projections = await change_store.activate_undo_retention(
+            change_set_id=change_set_id,
+            records=tuple(records),
+            retained_until=retained_until,
+        )
+        projection_by_path = {
+            entry.relative_path.replace("\\", "/"): projection
+            for entry, projection in zip(manifest.entries, projections, strict=True)
+        }
+        fallback_projection = projections[0] if len(projections) == 1 else None
+        protected_changes: list[dict[str, Any]] = []
+        for change in file_changes:
+            relative_path = change.get("relative_path")
+            normalized_path = (
+                relative_path.replace("\\", "/")
+                if isinstance(relative_path, str)
+                else None
+            )
+            projection = (
+                projection_by_path.get(normalized_path)
+                if normalized_path is not None
+                else fallback_projection
+            )
+            if projection is None:
+                raise RuntimeError("file result does not match approved manifest")
+            change.pop("original_content", None)
+            change.update(projection)
+            change["change_contract_mode"] = "enforce"
+            change["would_reject_legacy_undo"] = False
+            protected_changes.append(change)
+
+        metadata.pop("original_content", None)
+        metadata["file_changes"] = protected_changes
+        metadata["undo_status"] = "retained"
+        metadata["retained_until"] = retained_until
+        metadata["would_reject_legacy_undo"] = False
+        result.metadata = metadata
     async def _append_task_exec_result_event(
         self,
         *,

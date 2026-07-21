@@ -4729,17 +4729,35 @@ export default function ChatPage() {
   ])
 
   const handleUndoFileChange = React.useCallback(async (change: FileChangeSummary) => {
-    if (!change.undoAvailable || !change.undoAction) {
+    if (
+      change.changeSetId &&
+      change.entryId &&
+      change.requestDigest &&
+      change.undoStatus === 'retained'
+    ) {
+      await api.undoChangeSet(change.changeSetId, {
+        entry_ids:
+          change.undoEntryIds.length > 0
+            ? change.undoEntryIds
+            : [change.entryId],
+        request_digest: change.requestDigest,
+      })
+    } else if (
+      change.changeContractMode === 'observe' &&
+      change.undoAvailable &&
+      change.undoAction
+    ) {
+      await api.undoFileWrite({
+        file_path: change.filePath,
+        original_content: change.originalContent,
+        session_id: currentSessionId ?? undefined,
+        action: change.undoAction,
+        encoding: 'utf-8',
+      })
+    } else {
       return
     }
 
-    await api.undoFileWrite({
-      file_path: change.filePath,
-      original_content: change.originalContent,
-      session_id: currentSessionId ?? undefined,
-      action: change.undoAction,
-      encoding: 'utf-8',
-    })
     const workspaceState = useWorkspaceStore.getState()
     await workspaceState.loadChanges()
     await workspaceState.loadTree(workspaceState.currentPath)

@@ -36,6 +36,20 @@ function groupIcon(sourceTool: string) {
   return Files
 }
 
+function undoIssueLabel(status: string | null, reason: string | null): string | null {
+  const value = [status, reason].filter(Boolean).join(' ').toLowerCase()
+  if (value.includes('expired') || value.includes('410')) {
+    return 'Undo expired'
+  }
+  if (value.includes('conflict') || value.includes('changed') || value.includes('409')) {
+    return 'File changed — undo blocked'
+  }
+  if (reason) {
+    return reason
+  }
+  return null
+}
+
 function statusTone(status: string): string {
   const normalized = status.toLowerCase()
   if (normalized === 'added') {
@@ -56,6 +70,7 @@ export function FileChangeCard({ group, onUndo, actions }: FileChangeCardProps) 
   ))
   const [undoingPaths, setUndoingPaths] = React.useState<Record<string, boolean>>({})
   const [undonePaths, setUndonePaths] = React.useState<Record<string, boolean>>({})
+  const [undoErrors, setUndoErrors] = React.useState<Record<string, string>>({})
   const Icon = groupIcon(group.sourceTool)
 
   React.useEffect(() => {
@@ -94,9 +109,15 @@ export function FileChangeCard({ group, onUndo, actions }: FileChangeCardProps) 
     }
 
     setUndoingPaths((current) => ({ ...current, [change.filePath]: true }))
+    setUndoErrors((current) => ({ ...current, [change.filePath]: '' }))
     try {
       await onUndo(change)
       setUndonePaths((current) => ({ ...current, [change.filePath]: true }))
+    } catch (error) {
+      setUndoErrors((current) => ({
+        ...current,
+        [change.filePath]: error instanceof Error ? error.message : 'Undo failed',
+      }))
     } finally {
       setUndoingPaths((current) => ({ ...current, [change.filePath]: false }))
     }
@@ -139,7 +160,23 @@ export function FileChangeCard({ group, onUndo, actions }: FileChangeCardProps) 
       <div className="space-y-3 px-3 py-3">
         {group.files.map((file) => {
           const isExpanded = Boolean(expandedPaths[file.filePath])
-          const canUndo = file.undoAvailable && Boolean(onUndo) && !undonePaths[file.filePath]
+          const authoritativeUndo =
+            file.changeSetId !== null &&
+            file.entryId !== null &&
+            file.requestDigest !== null &&
+            file.undoStatus === 'retained'
+          const legacyObserveUndo =
+            file.changeContractMode === 'observe' &&
+            file.undoAvailable &&
+            file.undoAction !== null
+          const canUndo =
+            Boolean(onUndo) &&
+            (authoritativeUndo || legacyObserveUndo) &&
+            !undonePaths[file.filePath]
+          const undoIssue = undoIssueLabel(
+            file.undoStatus,
+            undoErrors[file.filePath] || file.undoReason
+          )
 
           return (
             <div
@@ -167,9 +204,19 @@ export function FileChangeCard({ group, onUndo, actions }: FileChangeCardProps) 
                     <span className="rounded-full border border-rose-400/20 bg-rose-400/10 px-2 py-0.5 text-[10px] font-medium text-rose-200">
                       -{file.deletions}
                     </span>
-                    {file.undoAvailable && !undonePaths[file.filePath] ? (
+                    {authoritativeUndo && !undonePaths[file.filePath] ? (
                       <span className="rounded-full border border-primary-400/20 bg-primary-500/10 px-2 py-0.5 text-[10px] font-medium text-primary-200">
                         Undo ready
+                      </span>
+                    ) : null}
+                    {legacyObserveUndo && !authoritativeUndo && !undonePaths[file.filePath] ? (
+                      <span className="rounded-full border border-amber-300/20 bg-amber-300/10 px-2 py-0.5 text-[10px] font-medium text-amber-100">
+                        Legacy undo (observe mode)
+                      </span>
+                    ) : null}
+                    {undoIssue ? (
+                      <span className="rounded-full border border-rose-400/20 bg-rose-400/10 px-2 py-0.5 text-[10px] font-medium text-rose-200">
+                        {undoIssue}
                       </span>
                     ) : null}
                     {undonePaths[file.filePath] ? (
@@ -181,6 +228,11 @@ export function FileChangeCard({ group, onUndo, actions }: FileChangeCardProps) 
                   <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
                     {file.displayPath}
                   </p>
+                  {file.retainedUntil && authoritativeUndo ? (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Undo retained until {new Date(file.retainedUntil).toLocaleString()}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="flex items-center gap-1.5">
                   <CopyButton

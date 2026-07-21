@@ -882,7 +882,7 @@ class FileWriteTool(BaseTool):
         def _sync_write() -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if append else "w"
-            with path.open(mode=mode, encoding=encoding) as file:
+            with path.open(mode=mode, encoding=encoding, newline="") as file:
                 file.write(content)
             return len(content.encode(encoding))
 

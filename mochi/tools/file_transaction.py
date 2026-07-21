@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import hashlib as _hashlib
+import json as _json
+import os as _os
 import re as _re
+import stat as _stat
+import tempfile as _tempfile
 from contextlib import suppress as _suppress
 from dataclasses import dataclass as _dataclass
+from pathlib import Path as _Path
 from typing import Literal as _Literal
 from typing import Protocol as _Protocol
 from typing import cast as _cast
@@ -308,6 +313,195 @@ def atomic_write_bytes(
     )
 
 
+@_dataclass(frozen=True, slots=True)
+class UndoCASObservation:
+    """Content, identity, and metadata observed for an undo target."""
+
+    identity: _FileIdentity | None
+    content_sha256: str | None
+    metadata_sha256: str | None
+
+    def __post_init__(self) -> None:
+        for name in ("content_sha256", "metadata_sha256"):
+            value = getattr(self, name)
+            if value is not None and not _is_sha256(value):
+                raise ValueError(f"{name} must be lowercase hexadecimal SHA-256")
+
+
+@_dataclass(frozen=True, slots=True)
+class UndoMutation:
+    """One server-authoritative inverse mutation."""
+
+    entry_id: str
+    relative_name: str
+    operation: _Literal["restore", "delete"]
+    expected: UndoCASObservation
+    restore_content: bytes | None
+    restore_mode: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.entry_id or not self.relative_name:
+            raise ValueError("undo mutation identity must not be empty")
+        if self.operation not in {"restore", "delete"}:
+            raise ValueError("undo operation must be restore or delete")
+        if self.operation == "restore" and not isinstance(self.restore_content, bytes):
+            raise ValueError("restore mutations require authoritative bytes")
+        if self.operation == "delete" and self.restore_content is not None:
+            raise ValueError("delete mutations must not contain restore bytes")
+
+
+class UndoCASConflict(RuntimeError):
+    """The live target no longer matches the recorded applied state."""
+
+
+def _undo_identity(info: _os.stat_result) -> _FileIdentity:
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    return _FileIdentity(
+        platform="windows" if _os.name == "nt" else "posix",
+        volume_id=str(int(info.st_dev)),
+        file_id=str(int(info.st_ino)),
+        link_count=max(1, int(info.st_nlink)),
+        is_reparse_point=bool(attributes & 0x400),
+    )
+
+
+def _undo_metadata_sha256(info: _os.stat_result) -> str:
+    payload = {
+        "mode": _stat.S_IMODE(info.st_mode),
+        "uid": getattr(info, "st_uid", None),
+        "gid": getattr(info, "st_gid", None),
+        "file_attributes": getattr(info, "st_file_attributes", None),
+    }
+    raw = _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return _hashlib.sha256(raw).hexdigest()
+
+
+def observe_undo_target(target: _Path) -> UndoCASObservation:
+    """Capture the three-way CAS state without following links."""
+
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return UndoCASObservation(None, None, None)
+    if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISREG(info.st_mode):
+        raise UndoCASConflict("undo_target_changed")
+    identity = _undo_identity(info)
+    if identity.is_reparse_point or identity.link_count != 1:
+        raise UndoCASConflict("undo_target_changed")
+    content = target.read_bytes()
+    after = target.lstat()
+    if _undo_identity(after) != identity:
+        raise UndoCASConflict("undo_target_changed")
+    return UndoCASObservation(
+        identity=identity,
+        content_sha256=_hashlib.sha256(content).hexdigest(),
+        metadata_sha256=_undo_metadata_sha256(after),
+    )
+
+
+def validate_undo_cas(
+    expected: UndoCASObservation,
+    current: UndoCASObservation,
+) -> None:
+    """Require exact content, identity, and metadata equality."""
+
+    if current != expected:
+        raise UndoCASConflict("undo_target_changed")
+
+
+def _undo_target(workspace: _Path, relative_name: str) -> _Path:
+    relative = _Path(relative_name)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise UndoCASConflict("undo_target_changed")
+    root = workspace.resolve(strict=True)
+    target = (root / relative).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise UndoCASConflict("undo_target_changed") from exc
+    return target
+
+
+def _stage_undo_bytes(target: _Path, content: bytes, mode: int | None) -> _Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_name = _tempfile.mkstemp(prefix=f".mochi-undo-{target.name}.", dir=target.parent)
+    staged = _Path(raw_name)
+    try:
+        with _os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(content)
+            stream.flush()
+            _os.fsync(stream.fileno())
+        if mode is not None:
+            _os.chmod(staged, mode)
+        return staged
+    except BaseException:
+        with _suppress(OSError):
+            staged.unlink()
+        raise
+
+
+def execute_authoritative_undo(
+    workspace: _Path,
+    mutations: tuple[UndoMutation, ...],
+) -> dict[str, UndoCASObservation]:
+    """Validate all targets, then apply and reverse-rollback as a group."""
+
+    if not mutations or len({item.entry_id for item in mutations}) != len(mutations):
+        raise ValueError("undo mutations must be non-empty and unique")
+    targets: dict[str, _Path] = {}
+    rollback: dict[str, tuple[bytes | None, int | None]] = {}
+    staged: dict[str, _Path] = {}
+    committed: list[str] = []
+    try:
+        for mutation in mutations:
+            target = _undo_target(workspace, mutation.relative_name)
+            current = observe_undo_target(target)
+            validate_undo_cas(mutation.expected, current)
+            targets[mutation.entry_id] = target
+            rollback[mutation.entry_id] = (
+                target.read_bytes() if current.identity is not None else None,
+                _stat.S_IMODE(target.stat().st_mode) if current.identity is not None else None,
+            )
+            if mutation.operation == "restore":
+                staged[mutation.entry_id] = _stage_undo_bytes(
+                    target,
+                    _cast(bytes, mutation.restore_content),
+                    mutation.restore_mode,
+                )
+
+        for mutation in mutations:
+            validate_undo_cas(
+                mutation.expected,
+                observe_undo_target(targets[mutation.entry_id]),
+            )
+        for mutation in mutations:
+            target = targets[mutation.entry_id]
+            if mutation.operation == "delete":
+                target.unlink()
+            else:
+                _os.replace(staged.pop(mutation.entry_id), target)
+            committed.append(mutation.entry_id)
+    except BaseException:
+        for entry_id in reversed(committed):
+            target = targets[entry_id]
+            content, mode = rollback[entry_id]
+            with _suppress(BaseException):
+                if content is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    replacement = _stage_undo_bytes(target, content, mode)
+                    _os.replace(replacement, target)
+        raise
+    finally:
+        for candidate in staged.values():
+            with _suppress(OSError):
+                candidate.unlink()
+
+    return {
+        mutation.entry_id: observe_undo_target(targets[mutation.entry_id])
+        for mutation in mutations
+    }
+
 __all__ = [
     "AtomicWriteResult",
     "DurableMutationParticipant",
@@ -317,6 +511,12 @@ __all__ = [
     "RecoveryObservation",
     "StagedMutation",
     "StagedRollback",
+    "UndoCASConflict",
+    "UndoCASObservation",
+    "UndoMutation",
+    "execute_authoritative_undo",
+    "observe_undo_target",
+    "validate_undo_cas",
     "atomic_write_bytes",
     "classify_journal_entry",
     "execute_durable_file_transaction",

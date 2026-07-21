@@ -66,6 +66,22 @@ def test_runtime_store_persists_tasks_events_and_approvals(tmp_path: Path) -> No
     )
 
 
+def test_runtime_store_indexes_authoritative_undo_lookup(tmp_path: Path) -> None:
+    db_path = tmp_path / "sessions" / "runtime.db"
+    store = RuntimeStore(db_path)
+    asyncio.run(store.initialize())
+
+    with sqlite3.connect(db_path) as conn:
+        indexes = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+
+    assert "idx_blob_references_owner_purpose_state" in indexes
+    assert "idx_undo_retention_status_retained" in indexes
+
 def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
     goal = asyncio.run(

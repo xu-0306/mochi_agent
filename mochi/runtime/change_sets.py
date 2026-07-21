@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from mochi.security.file_contract import (
+    AppliedChangeRecord,
     AuthorizationEnvelope,
     ChangeEntry,
     ChangeManifest,
@@ -30,6 +31,14 @@ class ChangeSetConflict(RuntimeError):
 
 class BlobNotFound(KeyError):
     """Raised when a reference targets a blob that was never persisted."""
+
+
+class UndoConflict(RuntimeError):
+    """Undo selection or authoritative state is inconsistent."""
+
+
+class UndoUnavailable(RuntimeError):
+    """Undo retention is known but no longer available."""
 
 
 JournalEntryState = Literal[
@@ -518,6 +527,319 @@ class ChangeSetStore:
 
         return await asyncio.to_thread(operation)
 
+    async def activate_undo_retention(
+        self,
+        *,
+        change_set_id: str,
+        records: tuple[AppliedChangeRecord, ...],
+        retained_until: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically record applied state and activate authoritative undo refs."""
+
+        await self._initialize()
+
+        def operation() -> tuple[dict[str, Any], ...]:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                loaded = self._load_change_set(conn, change_set_id)
+                if loaded is None:
+                    raise KeyError(change_set_id)
+                if loaded["status"] not in {"prepared", "applied"}:
+                    raise UndoConflict("undo_retention_not_reactivatable")
+                manifest = loaded["manifest"]
+                entries = {entry.entry_id: entry for entry in manifest.entries}
+                record_map = {record.entry_id: record for record in records}
+                if (
+                    len(record_map) != len(records)
+                    or set(record_map) != set(entries)
+                    or any(record.change_set_id != change_set_id for record in records)
+                ):
+                    raise UndoConflict("applied_records_do_not_match_manifest")
+                groups: dict[str, tuple[str, ...]] = {}
+                for entry in manifest.entries:
+                    group_key = entry.dependency_group or entry.entry_id
+                    groups[group_key] = tuple(
+                        item.entry_id
+                        for item in manifest.entries
+                        if (item.dependency_group or item.entry_id) == group_key
+                    )
+                projections: list[dict[str, Any]] = []
+                for entry in manifest.entries:
+                    record = record_map[entry.entry_id]
+                    existing_retention = conn.execute(
+                        """
+                        SELECT status FROM undo_retention
+                        WHERE change_set_id=? AND entry_id=?
+                        """,
+                        (change_set_id, entry.entry_id),
+                    ).fetchone()
+                    if (
+                        existing_retention is not None
+                        and str(existing_retention["status"]) != "retained"
+                    ):
+                        raise UndoConflict("undo_retention_not_reactivatable")
+                    conn.execute(
+                        """
+                        INSERT INTO applied_change_entries(
+                            change_set_id, entry_id, applied_sha256,
+                            applied_identity_json, applied_metadata_sha256,
+                            applied_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(change_set_id, entry_id)
+                        DO UPDATE SET applied_sha256=excluded.applied_sha256,
+                                      applied_identity_json=excluded.applied_identity_json,
+                                      applied_metadata_sha256=excluded.applied_metadata_sha256,
+                                      applied_at=excluded.applied_at
+                        """,
+                        (
+                            change_set_id,
+                            entry.entry_id,
+                            record.applied_sha256,
+                            _identity_json(record.applied_identity),
+                            record.applied_metadata_sha256,
+                            record.applied_at,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO undo_retention(
+                            change_set_id, entry_id, status,
+                            retained_until, expired_at
+                        ) VALUES (?, ?, 'retained', ?, NULL)
+                        ON CONFLICT(change_set_id, entry_id)
+                        DO UPDATE SET status='retained',
+                                      retained_until=excluded.retained_until,
+                                      expired_at=NULL
+                        """,
+                        (change_set_id, entry.entry_id, retained_until),
+                    )
+                    if entry.before_blob_id is not None:
+                        if conn.execute(
+                            "SELECT 1 FROM change_blobs WHERE id=?",
+                            (entry.before_blob_id,),
+                        ).fetchone() is None:
+                            raise BlobNotFound(entry.before_blob_id)
+                        conn.execute(
+                            """
+                            INSERT INTO blob_references(
+                                blob_id, owner_type, owner_id, purpose,
+                                retained_until, state
+                            ) VALUES (?, 'change_entry', ?, 'undo', ?, 'active')
+                            ON CONFLICT(blob_id, owner_type, owner_id, purpose)
+                            DO UPDATE SET retained_until=excluded.retained_until,
+                                          state='active'
+                            """,
+                            (
+                                entry.before_blob_id,
+                                f"{change_set_id}:{entry.entry_id}",
+                                retained_until,
+                            ),
+                        )
+                    group_key = entry.dependency_group or entry.entry_id
+                    projections.append(
+                        {
+                            "change_set_id": change_set_id,
+                            "entry_id": entry.entry_id,
+                            "request_digest": manifest.request_digest,
+                            "dependency_group": entry.dependency_group,
+                            "undo_entry_ids": list(groups[group_key]),
+                            "undo_status": "retained",
+                            "retained_until": retained_until,
+                            "undo_available": True,
+                        }
+                    )
+                conn.commit()
+                return tuple(projections)
+
+        return await asyncio.to_thread(operation)
+
+    async def get_undo_material(
+        self,
+        *,
+        change_set_id: str,
+        entry_ids: tuple[str, ...],
+        request_digest: str,
+        now: str,
+    ) -> dict[str, Any]:
+        """Load retained server bytes after validating selection and expiry."""
+
+        if not entry_ids or len(set(entry_ids)) != len(entry_ids):
+            raise UndoConflict("invalid_undo_selection")
+        await self._initialize()
+
+        def operation() -> dict[str, Any]:
+            expired = False
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                loaded = self._load_change_set(conn, change_set_id)
+                if loaded is None:
+                    raise KeyError(change_set_id)
+                if loaded["status"] != "applied":
+                    raise UndoConflict("change_set_not_applied")
+                manifest = loaded["manifest"]
+                if manifest.request_digest != request_digest:
+                    raise UndoConflict("undo_digest_mismatch")
+                entries = {entry.entry_id: entry for entry in manifest.entries}
+                selected = set(entry_ids)
+                if not selected <= set(entries):
+                    raise UndoConflict("unknown_change_entry")
+                for entry_id in selected:
+                    group = entries[entry_id].dependency_group
+                    if group is None:
+                        continue
+                    required = {
+                        item.entry_id
+                        for item in manifest.entries
+                        if item.dependency_group == group
+                    }
+                    if not required <= selected:
+                        raise UndoConflict("partial_dependency_group")
+
+                material: list[dict[str, Any]] = []
+                for entry in manifest.entries:
+                    if entry.entry_id not in selected:
+                        continue
+                    retention = conn.execute(
+                        """
+                        SELECT status, retained_until, expired_at
+                        FROM undo_retention
+                        WHERE change_set_id=? AND entry_id=?
+                        """,
+                        (change_set_id, entry.entry_id),
+                    ).fetchone()
+                    if retention is None:
+                        raise UndoUnavailable("undo_not_retained")
+                    if str(retention["status"]) != "retained":
+                        reason = (
+                            "undo_retention_expired"
+                            if str(retention["status"]) == "expired"
+                            else "undo_not_retained"
+                        )
+                        raise UndoUnavailable(reason)
+                    retained_until = retention["retained_until"]
+                    if not isinstance(retained_until, str) or retained_until <= now:
+                        expired = True
+                        conn.execute(
+                            """
+                            UPDATE undo_retention
+                            SET status='expired', expired_at=?
+                            WHERE change_set_id=? AND entry_id=?
+                            """,
+                            (now, change_set_id, entry.entry_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE blob_references
+                            SET state='expired'
+                            WHERE owner_type='change_entry' AND owner_id=?
+                              AND purpose='undo' AND state='active'
+                            """,
+                            (f"{change_set_id}:{entry.entry_id}",),
+                        )
+                        continue
+                    applied = conn.execute(
+                        """
+                        SELECT applied_sha256, applied_identity_json,
+                               applied_metadata_sha256, applied_at
+                        FROM applied_change_entries
+                        WHERE change_set_id=? AND entry_id=?
+                        """,
+                        (change_set_id, entry.entry_id),
+                    ).fetchone()
+                    if applied is None:
+                        raise UndoConflict("applied_change_record_missing")
+                    before_content: bytes | None = None
+                    if entry.operation != "add":
+                        if entry.before_blob_id is None:
+                            raise UndoUnavailable("undo_not_retained")
+                        reference = conn.execute(
+                            """
+                            SELECT state FROM blob_references
+                            WHERE blob_id=? AND owner_type='change_entry'
+                              AND owner_id=? AND purpose='undo'
+                            """,
+                            (
+                                entry.before_blob_id,
+                                f"{change_set_id}:{entry.entry_id}",
+                            ),
+                        ).fetchone()
+                        blob = conn.execute(
+                            "SELECT content FROM change_blobs WHERE id=?",
+                            (entry.before_blob_id,),
+                        ).fetchone()
+                        if (
+                            reference is None
+                            or str(reference["state"]) != "active"
+                            or blob is None
+                        ):
+                            raise UndoUnavailable("undo_not_retained")
+                        before_content = bytes(blob["content"])
+                    material.append(
+                        {
+                            "entry": entry,
+                            "applied": AppliedChangeRecord(
+                                change_set_id=change_set_id,
+                                entry_id=entry.entry_id,
+                                applied_sha256=applied["applied_sha256"],
+                                applied_identity=_identity_from_json(
+                                    applied["applied_identity_json"]
+                                ),
+                                applied_metadata_sha256=applied[
+                                    "applied_metadata_sha256"
+                                ],
+                                applied_at=str(applied["applied_at"]),
+                            ),
+                            "before_content": before_content,
+                            "retained_until": retained_until,
+                        }
+                    )
+                conn.commit()
+            if expired:
+                raise UndoUnavailable("undo_retention_expired")
+            return {
+                "manifest": manifest,
+                "envelope": loaded["envelope"],
+                "entries": tuple(material),
+            }
+
+        return await asyncio.to_thread(operation)
+
+    async def consume_undo_retention(
+        self,
+        *,
+        change_set_id: str,
+        entry_ids: tuple[str, ...],
+    ) -> None:
+        """Mark authoritative material consumed and release its blob refs."""
+
+        await self._initialize()
+
+        def operation() -> None:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                for entry_id in entry_ids:
+                    cursor = conn.execute(
+                        """
+                        UPDATE undo_retention
+                        SET status='undone'
+                        WHERE change_set_id=? AND entry_id=? AND status='retained'
+                        """,
+                        (change_set_id, entry_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise UndoConflict("undo_retention_changed")
+                    conn.execute(
+                        """
+                        UPDATE blob_references
+                        SET state='released'
+                        WHERE owner_type='change_entry' AND owner_id=?
+                          AND purpose='undo' AND state='active'
+                        """,
+                        (f"{change_set_id}:{entry_id}",),
+                    )
+                conn.commit()
+
+        await asyncio.to_thread(operation)
     async def set_undo_retention(
         self,
         *,
@@ -1090,4 +1412,6 @@ __all__ = [
     "ChangeSetStore",
     "JournalEntryRecord",
     "JournalEntryState",
+    "UndoConflict",
+    "UndoUnavailable",
 ]
