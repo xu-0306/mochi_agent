@@ -84,6 +84,7 @@ from mochi.runtime.models import (
     AgentRunGuidanceRequest,
     AgentRunMessageRequest,
     AgentRunSubagentMessageRequest,
+    AutoReviewSummary,
     GoalCreateRequest,
     TaskCreateRequest,
     TaskMessageRequest,
@@ -13249,6 +13250,7 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
     if isinstance(resolution_kind, str) and resolution_kind:
         decision = resolution_kind
     metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
+    auto_review = _auto_review_summary(metadata)
     security_decision = SecurityDecision.from_metadata(metadata)
     file_change_summary = summarize_file_change_payload(metadata)
     file_change_summary.pop("status", None)
@@ -13310,6 +13312,7 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
         "supersedes_approval_id": metadata.get("supersedes_approval_id"),
         "superseded_by_approval_id": metadata.get("superseded_by_approval_id"),
         "would_reject_edited_patch": bool(metadata.get("would_reject_edited_patch", False)),
+        **auto_review,
         **file_change_summary,
     }
 
@@ -13334,6 +13337,7 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
     reason_text = reason if isinstance(reason, str) else None
     metadata = getattr(approval, "metadata", None)
     metadata_dict = metadata if isinstance(metadata, dict) else {}
+    auto_review = _auto_review_summary(metadata_dict)
 
     return {
         "approval_id": str(getattr(approval, "approval_id", "")),
@@ -13371,7 +13375,53 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
         "exec_session_id": _exec_result_field(getattr(approval, "execution_result", None), "session_id"),
         "exec_status": status,
         "execution_result": getattr(approval, "execution_result", None),
+        **auto_review,
     }
+
+
+def _auto_review_summary(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize reviewer metadata before exposing it through approval APIs."""
+
+    decision = metadata.get("auto_review_decision")
+    if decision not in {"allow", "require_approval", "deny"}:
+        decision = None
+    source = metadata.get("auto_review_source")
+    if source not in {"policy_auto_allow", "reviewed_allow"}:
+        source = None
+    summary = AutoReviewSummary(
+        auto_review_decision=decision,
+        auto_review_input_digest=(
+            metadata.get("auto_review_input_digest")
+            if isinstance(metadata.get("auto_review_input_digest"), str)
+            else None
+        ),
+        auto_review_policy_version=(
+            metadata.get("auto_review_policy_version")
+            if isinstance(metadata.get("auto_review_policy_version"), str)
+            else None
+        ),
+        auto_review_reviewer_version=(
+            metadata.get("auto_review_reviewer_version")
+            if isinstance(metadata.get("auto_review_reviewer_version"), str)
+            else None
+        ),
+        auto_review_risk_factors=[
+            str(value)
+            for value in metadata.get("auto_review_risk_factors", [])
+            if isinstance(value, str)
+        ]
+        if isinstance(metadata.get("auto_review_risk_factors"), list)
+        else [],
+        auto_review_reason_codes=[
+            str(value)
+            for value in metadata.get("auto_review_reason_codes", [])
+            if isinstance(value, str)
+        ]
+        if isinstance(metadata.get("auto_review_reason_codes"), list)
+        else [],
+        auto_review_source=source,
+    )
+    return summary.model_dump(mode="python")
 
 
 def _task_exec_command_payload_from_approval_request(

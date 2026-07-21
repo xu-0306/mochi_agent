@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -9,6 +11,19 @@ if TYPE_CHECKING:
     from mochi.config.schema import SecurityConfig
 
 AutonomyMode = Literal["trusted_workspace", "strict", "high_autonomy", "auto_review"]
+
+
+def policy_projection_version(namespace: str, projection: dict[str, Any]) -> str:
+    """Return a deterministic version for the exact policy inputs used by a decision."""
+
+    payload = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"{namespace}-v1:{hashlib.sha256(payload).hexdigest()}"
 
 _AUTONOMY_DEFAULTS: dict[AutonomyMode, dict[str, Any]] = {
     "strict": {

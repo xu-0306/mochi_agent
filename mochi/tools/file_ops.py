@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import os
 import stat
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -18,16 +17,25 @@ from mochi.config.schema import SecurityConfig
 from mochi.runtime.change_sets import ChangeSetStore
 from mochi.runtime.store import RuntimeStore
 from mochi.security import require_approval_decision, with_task_isolation_scope
+from mochi.security.auto_review import (
+    AutoReviewDecision,
+    AutoReviewFacts,
+    AutoReviewVerificationError,
+    auto_review_metadata,
+    review_authorization_envelope,
+    verify_auto_review_decision,
+)
 from mochi.security.file_contract import (
     AuthorizationContext,
     AuthorizationEnvelope,
     ChangeEntry,
     ChangeManifest,
     FileChangeRequest,
-    FileIdentity,
     authorization_request_digest,
     canonical_json,
+    capture_file_identity,
 )
+from mochi.security.policy import policy_projection_version
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
 from mochi.tools.file_mutations import (
     PatchValidationError,
@@ -85,21 +93,7 @@ def file_change_policy_version(security: SecurityConfig) -> str:
         "max_file_write_size_mb": str(security.max_file_write_size_mb),
         "file_undo_max_size_mb": str(security.file_undo_max_size_mb),
     }
-    digest = hashlib.sha256(canonical_json(projection).encode("utf-8")).hexdigest()
-    return f"file-policy-v1:{digest}"
-
-
-def _capture_file_identity(path: Path) -> FileIdentity:
-    info = path.stat()
-    platform = "windows" if os.name == "nt" else "posix"
-    attributes = int(getattr(info, "st_file_attributes", 0))
-    return FileIdentity(
-        platform=platform,
-        volume_id=str(int(info.st_dev)),
-        file_id=str(int(info.st_ino)),
-        link_count=max(1, int(info.st_nlink)),
-        is_reparse_point=bool(attributes & 0x400),
-    )
+    return policy_projection_version("file-policy", projection)
 
 
 def _content_digest(content: bytes | None) -> str | None:
@@ -109,6 +103,188 @@ def _content_digest(content: bytes | None) -> str | None:
 def _context_digest(context: AuthorizationContext) -> str:
     payload = canonical_json(context.to_dict()).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+async def _prepare_file_auto_review(
+    *,
+    workspace_root: Path,
+    tool_name: str,
+    path_scope: str,
+    changes: list[tuple[Path, str, bytes | None, bytes | None]],
+    patch_sha256: str | None,
+    context: ToolExecutionContext | None,
+) -> tuple[AutoReviewDecision, AuthorizationEnvelope] | None:
+    permission_policy = context.permission_policy if context is not None else {}
+    autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
+    if autonomy_mode not in {"auto_review", "high_autonomy"}:
+        return None
+
+    owner_task_id = str(permission_policy.get("approval_owner_task_id") or "").strip() or None
+    authorization_context = AuthorizationContext(
+        requester_id=(
+            f"runtime-task:{owner_task_id}" if owner_task_id else "runtime-service"
+        ),
+        session_id=(
+            str(context.session_id).strip()
+            if context is not None and context.session_id
+            else owner_task_id or "runtime-session"
+        ),
+        task_id=owner_task_id,
+        workspace_root=str(workspace_root),
+        workspace_identity=await asyncio.to_thread(capture_file_identity, workspace_root),
+    )
+    entries: list[ChangeEntry] = []
+    for ordinal, (target, operation, before, after) in enumerate(changes):
+        relative_path = target.relative_to(workspace_root).as_posix()
+        base_identity = (
+            None
+            if before is None
+            else await asyncio.to_thread(capture_file_identity, target)
+        )
+        mode_before = None
+        if before is not None:
+            info = await asyncio.to_thread(target.stat)
+            mode_before = stat.S_IMODE(info.st_mode)
+        entry_seed = canonical_json(
+            {
+                "ordinal": ordinal,
+                "operation": operation,
+                "relative_path": relative_path,
+                "base_sha256": _content_digest(before),
+                "after_sha256": _content_digest(after),
+            }
+        )
+        entries.append(
+            ChangeEntry(
+                entry_id=hashlib.sha256(entry_seed.encode("utf-8")).hexdigest(),
+                relative_path=relative_path,
+                operation=operation,  # type: ignore[arg-type]
+                base_sha256=_content_digest(before),
+                after_sha256=_content_digest(after),
+                base_identity=base_identity,
+                before_blob_id=None,
+                after_blob_id=None,
+                mode_before=mode_before,
+                mode_after=mode_before if after is not None else None,
+                base_metadata_sha256=None,
+                after_metadata_sha256=None,
+                rename_source=None,
+                dependency_group=None,
+            )
+        )
+    policy_version = policy_projection_version(
+        "file-auto-review-policy",
+        {
+            "autonomy_mode": autonomy_mode,
+            "file_write_scope": path_scope,
+            "require_approval_for_file_write": bool(
+                permission_policy.get("require_approval_for_file_write")
+            ),
+            "tool_name": tool_name,
+        },
+    )
+    envelope = AuthorizationEnvelope(
+        schema_version=1,
+        kind="file_change",
+        context=authorization_context,
+        policy_version=policy_version,
+        file_request=FileChangeRequest(
+            entries=tuple(entries),
+            patch_sha256=patch_sha256,
+        ),
+        exec_request=None,
+    )
+    decision = review_authorization_envelope(
+        envelope,
+        facts=AutoReviewFacts(
+            policy_action="ask",
+            policy_rule_id="file_mutation_requires_review",
+        ),
+    )
+    return decision, envelope
+
+
+async def _verify_file_auto_review(
+    decision: AutoReviewDecision,
+    envelope: AuthorizationEnvelope,
+) -> None:
+    workspace_root = Path(envelope.context.workspace_root)
+    current_identity = await asyncio.to_thread(capture_file_identity, workspace_root)
+    verify_auto_review_decision(
+        decision,
+        envelope,
+        current_workspace_identity=current_identity,
+    )
+    request = envelope.file_request
+    if request is None:
+        raise AutoReviewVerificationError("file review envelope lost its file request")
+    for entry in request.entries:
+        target = workspace_root / Path(entry.relative_path)
+        exists = await asyncio.to_thread(target.exists)
+        if entry.operation == "add":
+            if exists:
+                raise AutoReviewVerificationError("reviewed add target now exists")
+            continue
+        if not exists or not await asyncio.to_thread(target.is_file):
+            raise AutoReviewVerificationError("reviewed file base is missing")
+        current = await asyncio.to_thread(target.read_bytes)
+        if _content_digest(current) != entry.base_sha256:
+            raise AutoReviewVerificationError("reviewed file base content is stale")
+        identity = await asyncio.to_thread(capture_file_identity, target)
+        if identity != entry.base_identity:
+            raise AutoReviewVerificationError("reviewed file base identity changed")
+
+
+async def _enforce_file_auto_review(
+    *,
+    workspace_root: Path,
+    tool_name: str,
+    path_scope: str,
+    changes: list[tuple[Path, str, bytes | None, bytes | None]],
+    patch_sha256: str | None,
+    context: ToolExecutionContext | None,
+    metadata: dict[str, Any],
+    approved: bool,
+) -> ToolResult | None:
+    if approved:
+        return None
+    try:
+        reviewed = await _prepare_file_auto_review(
+            workspace_root=workspace_root,
+            tool_name=tool_name,
+            path_scope=path_scope,
+            changes=changes,
+            patch_sha256=patch_sha256,
+            context=context,
+        )
+        if reviewed is None:
+            return None
+        decision, envelope = reviewed
+        metadata.update(auto_review_metadata(decision))
+        if decision.decision != "allow":
+            metadata["status"] = "denied"
+            metadata["requires_approval"] = decision.decision == "require_approval"
+            return ToolResult(
+                error=f"Auto review {decision.decision.replace('_', ' ')} for file mutation.",
+                metadata=metadata,
+                retryable=decision.decision == "require_approval",
+            )
+        await _verify_file_auto_review(decision, envelope)
+        metadata["auto_review_execution_verified"] = True
+        return None
+    except (AutoReviewVerificationError, OSError, RuntimeError, ValueError) as exc:
+        metadata.update(
+            {
+                "status": "denied",
+                "auto_review_execution_verified": False,
+                "auto_review_verification_error": str(exc),
+            }
+        )
+        return ToolResult(
+            error=f"Auto review verification failed before file mutation: {exc}",
+            metadata=metadata,
+            retryable=False,
+        )
 
 
 async def prepare_patch_change_contract(
@@ -133,7 +309,7 @@ async def prepare_patch_change_contract(
         undo_max_size_mb=security.file_undo_max_size_mb,
     )
     change_store = ChangeSetStore(runtime_store)
-    workspace_identity = await asyncio.to_thread(_capture_file_identity, workspace_root)
+    workspace_identity = await asyncio.to_thread(capture_file_identity, workspace_root)
     policy_version = file_change_policy_version(security)
     patch_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
     context = AuthorizationContext(
@@ -157,7 +333,7 @@ async def prepare_patch_change_contract(
         base_identity = (
             None
             if not item.existed_before
-            else await asyncio.to_thread(_capture_file_identity, item.target)
+            else await asyncio.to_thread(capture_file_identity, item.target)
         )
         mode_before = None
         if item.existed_before:
@@ -285,7 +461,7 @@ async def revalidate_patch_change_contract(
         if str(workspace_root) != manifest.workspace_root:
             raise FileChangeContractConflict("workspace_context_changed")
         current_workspace_identity = await asyncio.to_thread(
-            _capture_file_identity,
+            capture_file_identity,
             workspace_root,
         )
         if current_workspace_identity != manifest.workspace_identity:
@@ -311,7 +487,7 @@ async def revalidate_patch_change_contract(
             current = await asyncio.to_thread(target.read_bytes)
             if _content_digest(current) != entry.base_sha256:
                 raise FileChangeContractConflict("base_content_changed")
-            identity = await asyncio.to_thread(_capture_file_identity, target)
+            identity = await asyncio.to_thread(capture_file_identity, target)
             if identity != entry.base_identity:
                 raise FileChangeContractConflict("base_identity_changed")
     except FileChangeContractConflict:
@@ -865,6 +1041,26 @@ class FileWriteTool(BaseTool):
                 metadata=metadata,
             )
 
+        review_error = await _enforce_file_auto_review(
+            workspace_root=workspace_root,
+            tool_name=self.name,
+            path_scope=self._path_scope,
+            changes=[
+                (
+                    target,
+                    "add" if not existed_before else "update",
+                    await asyncio.to_thread(target.read_bytes) if existed_before else None,
+                    merged_content.encode(active_encoding),
+                )
+            ],
+            patch_sha256=None,
+            context=context,
+            metadata=metadata,
+            approved=approved,
+        )
+        if review_error is not None:
+            return review_error
+
         bytes_written = await self._writer(target, content if append else merged_content, append, active_encoding)
 
         await _refresh_read_state_cache(
@@ -1036,6 +1232,26 @@ class FileEditTool(FileWriteTool):
                 metadata=metadata,
             )
 
+        review_error = await _enforce_file_auto_review(
+            workspace_root=workspace_root,
+            tool_name=self.name,
+            path_scope=self._path_scope,
+            changes=[
+                (
+                    target,
+                    "update",
+                    await asyncio.to_thread(target.read_bytes),
+                    new_content.encode(active_encoding),
+                )
+            ],
+            patch_sha256=None,
+            context=context,
+            metadata=metadata,
+            approved=approved,
+        )
+        if review_error is not None:
+            return review_error
+
         bytes_written = await self._writer(target, new_content, False, active_encoding)
         await _refresh_read_state_cache(
             context=context,
@@ -1149,6 +1365,32 @@ class ApplyPatchTool(FileWriteTool):
                 error="Patch application requires approval.",
                 metadata=metadata,
             )
+
+        review_changes: list[tuple[Path, str, bytes | None, bytes | None]] = []
+        for item in prepared:
+            before = (
+                await asyncio.to_thread(item.target.read_bytes)
+                if await asyncio.to_thread(item.target.exists)
+                else None
+            )
+            after = (
+                item.new_content.encode(active_encoding)
+                if item.new_content is not None
+                else None
+            )
+            review_changes.append((item.target, item.operation.kind, before, after))
+        review_error = await _enforce_file_auto_review(
+            workspace_root=workspace_root,
+            tool_name=self.name,
+            path_scope=self._path_scope,
+            changes=review_changes,
+            patch_sha256=hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+            context=context,
+            metadata=metadata,
+            approved=approved,
+        )
+        if review_error is not None:
+            return review_error
 
         total_bytes_written = 0
         for item in prepared:

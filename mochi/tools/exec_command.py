@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,24 @@ from mochi.runtime.approvals import (
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.exec_sessions import ExecSessionStatus, SessionPollResult
 from mochi.security import deny_security_decision
+from mochi.security.auto_review import (
+    AutoReviewDecision,
+    AutoReviewFacts,
+    AutoReviewVerificationError,
+    auto_review_metadata,
+    review_authorization_envelope,
+    verify_auto_review_decision,
+)
+from mochi.security.file_contract import (
+    AuthorizationContext,
+    AuthorizationEnvelope,
+    EnvVarHash,
+    ExecRequest,
+    ResourceLimits,
+    canonical_json,
+    capture_file_identity,
+)
+from mochi.security.policy import policy_projection_version
 from mochi.tools.base import (
     BaseTool,
     ToolCancellationResult,
@@ -33,6 +53,94 @@ from mochi.utils.security import (
 
 _SHARED_RUNTIME: ExecRuntime | None = None
 _SHARED_APPROVAL_STORE: ApprovalStore | None = None
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _build_exec_authorization_envelope(
+    *,
+    command: str,
+    shell: str | None,
+    classification: CommandSecurityResult,
+    workspace_root: Path,
+    resolved_cwd: Path,
+    normalized_env: dict[str, str] | None,
+    timeout_sec: float,
+    background: bool,
+    tty: bool,
+    sandbox_permissions: str,
+    autonomy_mode: str,
+    effective_require_approval: bool,
+    context: ToolExecutionContext | None,
+    owner_task_id: str | None,
+) -> AuthorizationEnvelope:
+    parsed_tokens = classification.parsed_tokens
+    if not parsed_tokens:
+        raise ValueError("canonical exec authorization requires parsed command tokens")
+    workspace_identity = capture_file_identity(workspace_root)
+    requester_id = (
+        f"runtime-task:{owner_task_id}" if owner_task_id else "runtime-service"
+    )
+    authorization_context = AuthorizationContext(
+        requester_id=requester_id,
+        session_id=(
+            str(context.session_id).strip()
+            if context is not None and context.session_id
+            else owner_task_id or "runtime-session"
+        ),
+        task_id=owner_task_id,
+        workspace_root=str(workspace_root),
+        workspace_identity=workspace_identity,
+    )
+    env_hashes = tuple(
+        EnvVarHash(key=str(key), value_sha256=_sha256(value))
+        for key, value in sorted((normalized_env or {}).items())
+    )
+    sandbox_plan = {
+        "backend": "host",
+        "background": bool(background),
+        "filesystem_enforced": False,
+        "network_enforced": False,
+        "process_enforced": False,
+        "timeout_milliseconds": int(math.ceil(timeout_sec * 1000)),
+        "tty": bool(tty),
+    }
+    policy_version = policy_projection_version(
+        "exec-policy",
+        {
+            "autonomy_mode": autonomy_mode,
+            "classification_action": classification.action,
+            "classification_rule_id": classification.rule_id,
+            "require_approval_for_exec": effective_require_approval,
+            "reviewer_contract": "deterministic-v1",
+        },
+    )
+    return AuthorizationEnvelope(
+        schema_version=1,
+        kind="exec",
+        context=authorization_context,
+        policy_version=policy_version,
+        file_request=None,
+        exec_request=ExecRequest(
+            command_utf8_sha256=_sha256(command),
+            shell=shell,
+            executable=parsed_tokens[0],
+            argv=tuple(parsed_tokens[1:]),
+            resolved_cwd=str(resolved_cwd),
+            env=env_hashes,
+            network_policy="allow",
+            resource_limits=ResourceLimits(
+                timeout_seconds=max(1, int(math.ceil(timeout_sec))),
+                memory_limit_mb=0,
+                output_limit_bytes=1_048_576,
+            ),
+            requested_escalation=sandbox_permissions,
+            sandbox_backend="host",
+            sandbox_capability_plan_digest=_sha256(canonical_json(sandbox_plan)),
+        ),
+    )
 
 
 def _build_suggested_rule(
@@ -245,6 +353,16 @@ class ExecCommandTool(BaseTool):
             except ValueError as exc:
                 return ToolResult(error=str(exc))
 
+        if timeout is None:
+            timeout_sec = float(self._default_timeout_sec)
+        else:
+            try:
+                timeout_sec = float(timeout)
+            except (TypeError, ValueError):
+                return ToolResult(error="`timeout` must be a number.")
+            if timeout_sec <= 0:
+                return ToolResult(error="`timeout` must be greater than 0.")
+
         security = CommandSecurityPolicy(
             command_rules=self._command_rules,
             workspace_dir=resolved_cwd,
@@ -261,12 +379,6 @@ class ExecCommandTool(BaseTool):
         if isinstance(permission_policy.get("require_approval_for_exec"), bool):
             effective_require_approval = bool(permission_policy.get("require_approval_for_exec"))
         autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
-        auto_review_policy_allow = (
-            classification.action == "ask"
-            and not effective_require_approval
-            and autonomy_mode in {"auto_review", "high_autonomy"}
-            and sandbox_permissions != "require_escalated"
-        )
         if classification.action == "deny":
             decision = deny_security_decision(
                 reason=classification.reason,
@@ -288,10 +400,77 @@ class ExecCommandTool(BaseTool):
                 retryable=False,
             )
 
+        owner_task_id = str(
+            permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
+        ).strip() or None
+        review_envelope: AuthorizationEnvelope | None = None
+        review_decision: AutoReviewDecision | None = None
+        if (
+            autonomy_mode in {"auto_review", "high_autonomy"}
+            and not effective_require_approval
+        ):
+            try:
+                review_envelope = _build_exec_authorization_envelope(
+                    command=command,
+                    shell=shell,
+                    classification=classification,
+                    workspace_root=workspace_root,
+                    resolved_cwd=resolved_cwd,
+                    normalized_env=normalized_env,
+                    timeout_sec=timeout_sec,
+                    background=background,
+                    tty=tty,
+                    sandbox_permissions=sandbox_permissions,
+                    autonomy_mode=autonomy_mode,
+                    effective_require_approval=effective_require_approval,
+                    context=context,
+                    owner_task_id=owner_task_id,
+                )
+                review_decision = review_authorization_envelope(
+                    review_envelope,
+                    facts=AutoReviewFacts(
+                        policy_action=classification.action,
+                        policy_rule_id=classification.rule_id,
+                        protected_path=classification.rule_id == "protected_path",
+                        workspace_escape=classification.rule_id == "workspace_escape",
+                        unknown_shell_parse=classification.rule_id == "parse_error",
+                    ),
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                return ToolResult(
+                    error=f"Auto review could not bind the authorization envelope: {exc}",
+                    metadata={
+                        "status": "denied",
+                        "auto_review_decision": "deny",
+                        "auto_review_reason_codes": ["authorization_envelope_invalid"],
+                    },
+                    retryable=False,
+                )
+
+        auto_review_policy_allow = bool(
+            classification.action == "ask"
+            and review_decision is not None
+            and review_decision.decision == "allow"
+        )
+        if review_decision is not None and review_decision.decision == "deny":
+            return ToolResult(
+                error="Auto review denied the exec authorization envelope.",
+                metadata={
+                    "status": "denied",
+                    **auto_review_metadata(review_decision),
+                    **_build_classification_metadata(classification, shell=shell),
+                },
+                retryable=False,
+            )
+
         needs_approval = (
             effective_require_approval
             or (classification.action == "ask" and not auto_review_policy_allow)
             or sandbox_permissions == "require_escalated"
+            or (
+                review_decision is not None
+                and review_decision.decision == "require_approval"
+            )
         )
         if needs_approval:
             reason = (
@@ -306,11 +485,7 @@ class ExecCommandTool(BaseTool):
                 "shell": shell,
                 "workdir": str(resolved_cwd),
                 "env": normalized_env,
-                "timeout_sec": (
-                    float(timeout)
-                    if timeout is not None and not isinstance(timeout, bool)
-                    else float(self._default_timeout_sec)
-                ),
+                "timeout_sec": timeout_sec,
                 "background": background,
                 "tty": tty,
                 "sandbox_permissions": sandbox_permissions,
@@ -319,9 +494,6 @@ class ExecCommandTool(BaseTool):
                 "detached_layout": dict(resolved_layout),
                 "approval_state": "approved",
             }
-            owner_task_id = str(
-                permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
-            ).strip()
             requester_id, request_digest, context_digest = derive_approval_binding(
                 requester_id=(
                     f"runtime-task:{owner_task_id}"
@@ -351,12 +523,13 @@ class ExecCommandTool(BaseTool):
                     "rule_id": classification.rule_id,
                     "suggested_rule": suggested_rule,
                     **(
+                        auto_review_metadata(review_decision)
+                        if review_decision is not None
+                        else {}
+                    ),
+                    **(
                         {APPROVAL_OWNER_TASK_ID_KEY: owner_task_id}
-                        if (
-                            owner_task_id := str(
-                                permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
-                            ).strip()
-                        )
+                        if owner_task_id
                         else {}
                     ),
                 },
@@ -377,6 +550,11 @@ class ExecCommandTool(BaseTool):
                     "approval_kind": "exec",
                     "approval_scope": request.scope,
                     "reason": request.reason,
+                    **(
+                        auto_review_metadata(review_decision)
+                        if review_decision is not None
+                        else {}
+                    ),
                     **_build_classification_metadata(
                         classification,
                         shell=shell,
@@ -394,16 +572,23 @@ class ExecCommandTool(BaseTool):
                 retryable=True,
             )
 
-        timeout_sec: float | None
-        if timeout is None:
-            timeout_sec = float(self._default_timeout_sec)
-        else:
+        if review_decision is not None and review_envelope is not None:
             try:
-                timeout_sec = float(timeout)
-            except (TypeError, ValueError):
-                return ToolResult(error="`timeout` must be a number.")
-            if timeout_sec <= 0:
-                return ToolResult(error="`timeout` must be greater than 0.")
+                verify_auto_review_decision(
+                    review_decision,
+                    review_envelope,
+                    current_workspace_identity=capture_file_identity(workspace_root),
+                )
+            except (AutoReviewVerificationError, OSError) as exc:
+                return ToolResult(
+                    error=f"Auto review verification failed before execution: {exc}",
+                    metadata={
+                        "status": "denied",
+                        **auto_review_metadata(review_decision),
+                        "auto_review_execution_verified": False,
+                    },
+                    retryable=False,
+                )
 
         try:
             async def _bind_active_session(poll: SessionPollResult) -> None:
@@ -486,6 +671,9 @@ class ExecCommandTool(BaseTool):
                 policy_reason=policy_reason,
             )
         )
+        if review_decision is not None:
+            metadata.update(auto_review_metadata(review_decision))
+            metadata["auto_review_execution_verified"] = True
         metadata["auto_reviewed_policy_ask"] = auto_review_policy_allow
         metadata["approval_id"] = None
         if result.status == ExecSessionStatus.KILLED:

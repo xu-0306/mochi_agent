@@ -252,6 +252,38 @@ async def test_file_write_new_file_uses_delete_undo_action(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_file_write_auto_review_records_digest_bound_reviewed_allow(
+    tmp_path: Path,
+) -> None:
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        session_id="session-1",
+        permission_policy={
+            "autonomy_mode": "auto_review",
+            "require_approval_for_file_write": False,
+            "file_write_scope": "workspace",
+        },
+    )
+    writer = FileWriteTool(workspace_dir=tmp_path, require_approval=False)
+
+    result = await writer.execute(
+        path="reviewed.txt",
+        content="reviewed content",
+        context=context,
+    )
+
+    assert result.error is None
+    assert (tmp_path / "reviewed.txt").read_text(encoding="utf-8") == "reviewed content"
+    assert result.metadata["auto_review_decision"] == "allow"
+    assert result.metadata["auto_review_source"] == "reviewed_allow"
+    assert result.metadata["auto_review_reason_codes"] == ["reviewed_allow"]
+    assert result.metadata["auto_review_risk_factors"] == []
+    assert result.metadata["auto_review_reviewer_version"] == "deterministic-v1"
+    assert len(result.metadata["auto_review_input_digest"]) == 64
+    assert result.metadata["auto_review_execution_verified"] is True
+
+
+@pytest.mark.asyncio
 async def test_file_write_approval_returns_normalized_file_change_metadata(tmp_path: Path) -> None:
     writer = FileWriteTool(workspace_dir=tmp_path, require_approval=True)
 

@@ -344,6 +344,18 @@ function ApprovalReviewCard({
           <p>
             Decision: <span className="text-foreground">{approval.security_decision ? formatMetadataLabel(approval.security_decision) : '-'}</span>
           </p>
+          {approval.auto_review_decision ? (
+            <p>
+              Auto review:{' '}
+              <span className="text-foreground">
+                {approval.auto_review_source === 'policy_auto_allow'
+                  ? 'Policy auto-allow'
+                  : approval.auto_review_source === 'reviewed_allow'
+                    ? 'Reviewed allow'
+                    : formatMetadataLabel(approval.auto_review_decision)}
+              </span>
+            </p>
+          ) : null}
           <p>
             Kind: <span className="text-foreground">{formatMetadataLabel(approval.approval_kind)}</span>
           </p>
@@ -379,6 +391,21 @@ function ApprovalReviewCard({
               Policy: <span className="font-mono text-foreground">{displayedPolicy}</span>
             </p>
           ) : null}
+          {approval.auto_review_policy_version ? (
+            <p className="break-all">
+              Review policy: <span className="font-mono text-foreground">{approval.auto_review_policy_version}</span>
+            </p>
+          ) : null}
+          {approval.auto_review_reviewer_version ? (
+            <p className="break-all">
+              Reviewer: <span className="font-mono text-foreground">{approval.auto_review_reviewer_version}</span>
+            </p>
+          ) : null}
+          {approval.auto_review_input_digest ? (
+            <p className="break-all">
+              Review digest: <span className="font-mono text-foreground">{approval.auto_review_input_digest}</span>
+            </p>
+          ) : null}
           {approval.superseded_by_approval_id ? (
             <p className="text-amber-200">
               Superseded by: {approval.superseded_by_approval_id}
@@ -393,6 +420,12 @@ function ApprovalReviewCard({
         {approval.policy_reason ? (
           <div className="rounded-lg border border-amber-400/20 bg-amber-400/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-100">
             <span className="font-medium text-amber-50">Policy reason:</span> {approval.policy_reason}
+          </div>
+        ) : null}
+        {approval.auto_review_risk_factors.length > 0 ? (
+          <div className="rounded-lg border border-amber-400/20 bg-amber-400/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-100">
+            <span className="font-medium text-amber-50">Review risk factors:</span>{' '}
+            {approval.auto_review_risk_factors.map(formatMetadataLabel).join(', ')}
           </div>
         ) : null}
         {approval.reason ? (

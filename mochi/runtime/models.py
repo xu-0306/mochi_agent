@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from mochi.backends.inference_capabilities import ReasoningEffort
-from mochi.api.attachment_schema import AttachmentPayload
-from mochi.runtime.goal_strategy_registry import get_goal_strategy_entry
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from mochi.api.attachment_schema import AttachmentPayload
+from mochi.backends.inference_capabilities import ReasoningEffort
+from mochi.runtime.goal_strategy_registry import get_goal_strategy_entry
 
 
 class TaskCreateRequest(BaseModel):
@@ -72,6 +73,20 @@ class ApprovalResolution(BaseModel):
     reason: str | None = None
     rule: dict[str, Any] | None = None
     replay_override: ApprovalReplayOverride | None = None
+
+
+class AutoReviewSummary(BaseModel):
+    """UI-safe projection of one deterministic auto-review decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto_review_decision: Literal["allow", "require_approval", "deny"] | None = None
+    auto_review_input_digest: str | None = None
+    auto_review_policy_version: str | None = None
+    auto_review_reviewer_version: str | None = None
+    auto_review_risk_factors: list[str] = Field(default_factory=list)
+    auto_review_reason_codes: list[str] = Field(default_factory=list)
+    auto_review_source: Literal["policy_auto_allow", "reviewed_allow"] | None = None
 
 
 GoalExecutionMode = Literal["single_agent", "workflow"]

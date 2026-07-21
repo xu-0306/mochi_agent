@@ -232,6 +232,13 @@ async def test_exec_command_auto_review_allows_policy_ask_without_manual_approva
     assert result.metadata["status"] == "completed"
     assert result.metadata["policy_state"] == "allow"
     assert result.metadata["auto_reviewed_policy_ask"] is True
+    assert result.metadata["auto_review_decision"] == "allow"
+    assert result.metadata["auto_review_source"] == "reviewed_allow"
+    assert result.metadata["auto_review_risk_factors"] == []
+    assert result.metadata["auto_review_reason_codes"] == ["reviewed_allow"]
+    assert result.metadata["auto_review_reviewer_version"] == "deterministic-v1"
+    assert len(result.metadata["auto_review_input_digest"]) == 64
+    assert result.metadata["auto_review_execution_verified"] is True
     assert result.metadata["approval_id"] is None
     assert approvals.list(status="pending") == []
     assert isinstance(result.output, dict)
@@ -274,6 +281,49 @@ async def test_exec_command_auto_review_still_requests_manual_approval_for_escal
     assert pending[0].command_payload is not None
     assert pending[0].command_payload["sandbox_permissions"] == "require_escalated"
     assert pending[0].metadata[APPROVAL_OWNER_TASK_ID_KEY] == "runtime-task-1"
+    assert pending[0].metadata["auto_review_decision"] == "require_approval"
+    assert pending[0].metadata["auto_review_risk_factors"] == ["require_escalated"]
+    assert pending[0].metadata["auto_review_reviewer_version"] == "deterministic-v1"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_auto_review_requires_approval_for_network_credential_exposure() -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    approvals = InMemoryApprovalStore()
+    tool = ExecCommandTool(
+        runtime=runtime,
+        approval_store=approvals,
+        require_approval=False,
+        workspace_dir="H:/_python/agent_mochi",
+        allowed_env_vars=["API_TOKEN"],
+    )
+
+    result = await tool.execute(
+        command="fg",
+        shell="test",
+        env={"API_TOKEN": "known-secret"},
+        context=ToolExecutionContext(
+            session_id="session-1",
+            permission_policy={
+                "autonomy_mode": "auto_review",
+                "require_approval_for_exec": False,
+            },
+        ),
+    )
+
+    assert result.error == "Exec command requires approval."
+    assert result.metadata["auto_review_decision"] == "require_approval"
+    assert result.metadata["auto_review_risk_factors"] == [
+        "network_credential_exposure"
+    ]
+    pending = approvals.list(status="pending")
+    assert len(pending) == 1
+    assert pending[0].metadata["auto_review_input_digest"] == result.metadata[
+        "auto_review_input_digest"
+    ]
 
 
 @pytest.mark.asyncio

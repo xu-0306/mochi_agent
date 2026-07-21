@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import ClassVar, Literal, TypeAlias
 
@@ -122,6 +124,20 @@ class FileIdentity:
             link_count=_integer(data["link_count"], "link_count"),  # type: ignore[arg-type]
             is_reparse_point=_boolean(data["is_reparse_point"], "is_reparse_point"),
         )
+
+
+def capture_file_identity(path: str | Path) -> FileIdentity:
+    """Capture the portable identity projection used by authorization envelopes."""
+
+    info = Path(path).stat()
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    return FileIdentity(
+        platform="windows" if os.name == "nt" else "posix",
+        volume_id=str(int(info.st_dev)),
+        file_id=str(int(info.st_ino)),
+        link_count=max(1, int(info.st_nlink)),
+        is_reparse_point=bool(attributes & 0x400),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +524,12 @@ class AuthorizationEnvelope:
             "exec_request": None if self.exec_request is None else self.exec_request.to_dict(),
         }
 
+    @property
+    def request_digest(self) -> str:
+        """Return the SHA-256 identity of this exact canonical envelope."""
+
+        return authorization_request_digest(self)
+
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> AuthorizationEnvelope:
         _check_fields(data, cls._FIELDS)
@@ -778,6 +800,7 @@ __all__ = [
     "canonical_json",
     "canonical_manifest_digest",
     "canonical_value",
+    "capture_file_identity",
     "manifest_digest_projection",
     "preview_idempotency_key",
 ]

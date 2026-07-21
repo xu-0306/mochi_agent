@@ -5581,6 +5581,13 @@ export interface ApprovalSummary {
   supersedes_approval_id: string | null
   superseded_by_approval_id: string | null
   would_reject_edited_patch: boolean
+  auto_review_decision: 'allow' | 'require_approval' | 'deny' | null
+  auto_review_input_digest: string | null
+  auto_review_policy_version: string | null
+  auto_review_reviewer_version: string | null
+  auto_review_risk_factors: string[]
+  auto_review_reason_codes: string[]
+  auto_review_source: 'policy_auto_allow' | 'reviewed_allow' | null
 }
 
 export interface CreateTaskInput {
@@ -5791,6 +5798,26 @@ function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
     supersedes_approval_id: getNullableString(record.supersedes_approval_id),
     superseded_by_approval_id: getNullableString(record.superseded_by_approval_id),
     would_reject_edited_patch: getBoolean(record.would_reject_edited_patch) ?? false,
+    auto_review_decision:
+      getString(record.auto_review_decision) === 'allow' ||
+      getString(record.auto_review_decision) === 'require_approval' ||
+      getString(record.auto_review_decision) === 'deny'
+        ? getString(record.auto_review_decision) as 'allow' | 'require_approval' | 'deny'
+        : null,
+    auto_review_input_digest: getNullableString(record.auto_review_input_digest),
+    auto_review_policy_version: getNullableString(record.auto_review_policy_version),
+    auto_review_reviewer_version: getNullableString(record.auto_review_reviewer_version),
+    auto_review_risk_factors: Array.isArray(record.auto_review_risk_factors)
+      ? record.auto_review_risk_factors.filter((value): value is string => typeof value === 'string')
+      : [],
+    auto_review_reason_codes: Array.isArray(record.auto_review_reason_codes)
+      ? record.auto_review_reason_codes.filter((value): value is string => typeof value === 'string')
+      : [],
+    auto_review_source:
+      getString(record.auto_review_source) === 'policy_auto_allow' ||
+      getString(record.auto_review_source) === 'reviewed_allow'
+        ? getString(record.auto_review_source) as 'policy_auto_allow' | 'reviewed_allow'
+        : null,
   }
 }
 
