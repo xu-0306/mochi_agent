@@ -14,7 +14,6 @@ from mochi.agents.events import FinalAnswerEvent, TextChunkEvent
 from mochi.channels.base import BaseChannel, SendResult
 from mochi.channels.discord_adapter import DiscordAdapter, _normalize_pcm16_for_discord
 from mochi.channels.discord_voice_ingress import DiscordVoiceIngress, _normalize_discord_receive_pcm
-from mochi.channels.discord_voice_runtime import DiscordVoiceRuntime
 from mochi.channels.events import (
     Attachment,
     AttachmentEvent,
