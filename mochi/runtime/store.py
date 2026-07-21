@@ -1940,6 +1940,9 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         def _op() -> None:
             with sqlite3.connect(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
+                # Serialize the read/insert decision so concurrent supervisors
+                # cannot both observe a missing lease and insert it.
+                conn.execute("BEGIN IMMEDIATE")
                 existing = conn.execute(
                     """
                     SELECT owner_id, acquired_at, expires_at, takeover_count, metadata_json
