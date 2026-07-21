@@ -1850,7 +1850,8 @@ async def _chat_tui_async(
             "[dim]File write approval: "
             f"{'on' if security.require_approval_for_file_write else 'off'}[/dim]"
         )
-        console.print(f"[dim]File scope: {security.file_ops_scope}[/dim]")
+        console.print(f"[dim]File read scope: {security.file_read_scope}[/dim]")
+        console.print(f"[dim]File write scope: {security.file_write_scope}[/dim]")
 
     def _print_approval_summary(item: dict[str, object]) -> None:
         approval_id = str(item.get("approval_id") or "?")

@@ -3838,7 +3838,9 @@ def _resolve_agent_run_evidence_permission_policy(
         "autonomy_mode",
         "require_approval_for_file_write",
         "require_approval_for_exec",
-        "file_ops_scope",
+        "file_read_scope",
+        "file_write_scope",
+        "file_ops_scope",  # Legacy override input; policy output omits it.
         "approved_tool_calls",
         "denied_tool_calls",
         "blocked_web_domains",

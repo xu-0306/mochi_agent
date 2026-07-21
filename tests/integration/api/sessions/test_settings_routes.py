@@ -177,7 +177,8 @@ def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> N
         "exec_default_timeout_sec": 30,
         "exec_session_output_limit": 8000,
         "max_file_write_size_mb": 10.0,
-        "file_ops_scope": "workspace",
+        "file_read_scope": "workspace",
+        "file_write_scope": "workspace",
         "file_undo_max_size_mb": 2.0,
     }
     assert "discord-secret-token" not in response.text
@@ -670,7 +671,8 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
                     "exec_default_timeout_sec": 90,
                     "exec_session_output_limit": 16384,
                     "max_file_write_size_mb": 3.5,
-                    "file_ops_scope": "any",
+                    "file_read_scope": "any",
+                    "file_write_scope": "any",
                     "file_undo_max_size_mb": 1.5,
                 },
             },
@@ -740,7 +742,8 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
             "exec_default_timeout_sec": 90,
             "exec_session_output_limit": 16384,
             "max_file_write_size_mb": 3.5,
-            "file_ops_scope": "any",
+            "file_read_scope": "any",
+            "file_write_scope": "any",
             "file_undo_max_size_mb": 1.5,
         }
 
@@ -765,7 +768,8 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
     assert followup_payload["security"]["agent_run_default_on_subagent_disconnect"] == "pause"
     assert followup_payload["security"]["exec_default_timeout_sec"] == 90
     assert followup_payload["security"]["exec_session_output_limit"] == 16384
-    assert followup_payload["security"]["file_ops_scope"] == "any"
+    assert followup_payload["security"]["file_read_scope"] == "any"
+    assert followup_payload["security"]["file_write_scope"] == "any"
     assert followup_payload["security"]["file_undo_max_size_mb"] == 1.5
 
 
@@ -963,7 +967,8 @@ def test_settings_patch_applies_autonomy_mode_defaults(tmp_path: Path) -> None:
         "exec_default_timeout_sec": 30,
         "exec_session_output_limit": 8000,
         "max_file_write_size_mb": 10.0,
-        "file_ops_scope": "any",
+        "file_read_scope": "workspace",
+        "file_write_scope": "workspace",
         "file_undo_max_size_mb": 2.0,
     }
 

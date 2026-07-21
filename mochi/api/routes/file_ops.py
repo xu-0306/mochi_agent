@@ -76,7 +76,7 @@ async def undo_file_write(
     config = await _get_config(request.app)
     if config.security.change_contract_mode == "enforce":
         raise HTTPException(status_code=409, detail="legacy_undo_requires_change_id")
-    scope = config.security.file_ops_scope
+    scope = config.security.file_write_scope
     workspace_dir = await _resolve_workspace_dir_for_session(
         request,
         payload.session_id,

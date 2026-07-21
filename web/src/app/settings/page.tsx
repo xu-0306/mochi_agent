@@ -5565,7 +5565,8 @@ function SecuritySettingsForm({
   >(security?.agent_run_default_on_subagent_disconnect ?? 'retry_then_degrade')
   const [execDefaultTimeoutSec, setExecDefaultTimeoutSec] = React.useState(String(security?.exec_default_timeout_sec ?? 30))
   const [execSessionOutputLimit, setExecSessionOutputLimit] = React.useState(String(security?.exec_session_output_limit ?? 8000))
-  const [fileOpsScope, setFileOpsScope] = React.useState<'workspace' | 'any'>(security?.file_ops_scope ?? 'workspace')
+  const [fileReadScope, setFileReadScope] = React.useState<'workspace' | 'any'>(security?.file_read_scope ?? 'workspace')
+  const [fileWriteScope, setFileWriteScope] = React.useState<'workspace' | 'any'>(security?.file_write_scope ?? 'workspace')
   const [maxFileWriteSizeMb, setMaxFileWriteSizeMb] = React.useState(String(security?.max_file_write_size_mb ?? 10.0))
   const [fileUndoMaxSizeMb, setFileUndoMaxSizeMb] = React.useState(String(security?.file_undo_max_size_mb ?? 2.0))
   const [submitting, setSubmitting] = React.useState(false)
@@ -5589,7 +5590,8 @@ function SecuritySettingsForm({
     setAgentRunDefaultOnSubagentDisconnect(security?.agent_run_default_on_subagent_disconnect ?? 'retry_then_degrade')
     setExecDefaultTimeoutSec(String(security?.exec_default_timeout_sec ?? 30))
     setExecSessionOutputLimit(String(security?.exec_session_output_limit ?? 8000))
-    setFileOpsScope(security?.file_ops_scope ?? 'workspace')
+    setFileReadScope(security?.file_read_scope ?? 'workspace')
+    setFileWriteScope(security?.file_write_scope ?? 'workspace')
     setMaxFileWriteSizeMb(String(security?.max_file_write_size_mb ?? 10.0))
     setFileUndoMaxSizeMb(String(security?.file_undo_max_size_mb ?? 2.0))
   }, [security, sandbox])
@@ -5599,24 +5601,28 @@ function SecuritySettingsForm({
     if (value === 'strict') {
       setRequireFileWriteApproval(true)
       setRequireExecApproval(true)
-      setFileOpsScope('workspace')
+      setFileReadScope('workspace')
+      setFileWriteScope('workspace')
       return
     }
     if (value === 'trusted_workspace') {
       setRequireFileWriteApproval(false)
       setRequireExecApproval(true)
-      setFileOpsScope('workspace')
+      setFileReadScope('workspace')
+      setFileWriteScope('workspace')
       return
     }
     if (value === 'high_autonomy') {
       setRequireFileWriteApproval(false)
       setRequireExecApproval(false)
-      setFileOpsScope('any')
+      setFileReadScope('workspace')
+      setFileWriteScope('workspace')
       return
     }
     setRequireFileWriteApproval(false)
     setRequireExecApproval(false)
-    setFileOpsScope('workspace')
+    setFileReadScope('workspace')
+    setFileWriteScope('workspace')
   }
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -5650,7 +5656,8 @@ function SecuritySettingsForm({
           agent_run_default_on_subagent_disconnect: agentRunDefaultOnSubagentDisconnect,
           exec_default_timeout_sec: Number.parseInt(execDefaultTimeoutSec, 10) || 30,
           exec_session_output_limit: Number.parseInt(execSessionOutputLimit, 10) || 8000,
-          file_ops_scope: fileOpsScope,
+          file_read_scope: fileReadScope,
+          file_write_scope: fileWriteScope,
           max_file_write_size_mb: Number.parseFloat(maxFileWriteSizeMb) || 10.0,
           file_undo_max_size_mb: Number.parseFloat(fileUndoMaxSizeMb) || 2.0,
         },
@@ -5811,12 +5818,20 @@ function SecuritySettingsForm({
           </label>
         </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-          <label className="space-y-1.5 md:col-span-1">
-            <SettingLabel>{t('settings.security.fileScope')}</SettingLabel>
-            <Select value={fileOpsScope} onValueChange={(value) => setFileOpsScope(value as 'workspace' | 'any')}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.fileReadScope')}</SettingLabel>
+            <Select value={fileReadScope} onValueChange={(value) => setFileReadScope(value as 'workspace' | 'any')}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="workspace">{t('settings.security.fileScope.workspace')}</SelectItem>
+                <SelectItem value="any">{t('settings.security.fileScope.any')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+          <label className="space-y-1.5">
+            <SettingLabel>{t('settings.security.fileWriteScope')}</SettingLabel>
+            <Select value={fileWriteScope} onValueChange={(value) => setFileWriteScope(value as 'workspace' | 'any')}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="workspace">{t('settings.security.fileScope.workspace')}</SelectItem>
                 <SelectItem value="any">{t('settings.security.fileScope.any')}</SelectItem>

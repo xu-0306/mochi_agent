@@ -202,8 +202,23 @@ async def list_filesystem_roots(request: Request) -> dict[str, Any]:
 
 
 @router.get("/list")
-async def list_directory(path: str = Query(..., min_length=1)) -> dict[str, Any]:
-    current, selected_path = _coerce_browse_directory(path)
+async def list_directory(
+    request: Request,
+    path: str = Query(..., min_length=1),
+) -> dict[str, Any]:
+    config = await _get_config(request.app)
+    resolved, security_decision = check_file_tool_path(
+        path,
+        workspace_dir=normalize_workspace_dir(config.workspace_dir),
+        scope=config.security.file_read_scope,
+        access="read",
+    )
+    if security_decision is not None or resolved is None:
+        raise HTTPException(
+            status_code=403,
+            detail=security_decision.reason if security_decision is not None else "Path denied",
+        )
+    current, selected_path = _coerce_browse_directory(str(resolved))
 
     try:
         entries = list(current.iterdir())
@@ -281,11 +296,23 @@ async def import_local_files(
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    if target_dir:
-        import_root = _path_from_client(target_dir)
-    else:
-        config = await _get_config(request.app)
-        import_root = normalize_workspace_dir(config.workspace_dir)
+    config = await _get_config(request.app)
+    requested_root = (
+        _path_from_client(target_dir)
+        if target_dir
+        else normalize_workspace_dir(config.workspace_dir)
+    )
+    import_root, security_decision = check_file_tool_path(
+        requested_root,
+        workspace_dir=normalize_workspace_dir(config.workspace_dir),
+        scope=config.security.file_write_scope,
+        access="write",
+    )
+    if security_decision is not None or import_root is None:
+        raise HTTPException(
+            status_code=403,
+            detail=security_decision.reason if security_decision is not None else "Path denied",
+        )
 
     upload_root = import_root / "browser-imports"
     package_root = upload_root / f"{int(time.time())}-{_safe_package_name(package_name)}"
@@ -364,7 +391,7 @@ async def _resolve_preview_target(request: Request, path: str) -> Path:
     resolved, security_decision = check_file_tool_path(
         path,
         workspace_dir=normalize_workspace_dir(config.workspace_dir),
-        scope="any",
+        scope=config.security.file_read_scope,
         access="read",
     )
     if security_decision is not None or resolved is None:

@@ -983,7 +983,8 @@ def test_task_resume_endpoint_applies_approval_override(tmp_path: Path) -> None:
         "autonomy_mode": "trusted_workspace",
         "require_approval_for_file_write": False,
         "require_approval_for_exec": True,
-        "file_ops_scope": "workspace",
+        "file_read_scope": "workspace",
+        "file_write_scope": "workspace",
         APPROVAL_OWNER_TASK_ID_KEY: task_id,
         "approved_tool_calls": [
             {

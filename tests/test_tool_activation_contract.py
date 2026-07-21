@@ -182,7 +182,8 @@ def _activation_context(workspace_dir: str) -> ToolExecutionContext:
         permission_policy={
             "autonomy_mode": "auto_review",
             "require_approval_for_file_write": False,
-            "file_ops_scope": "workspace",
+            "file_read_scope": "workspace",
+            "file_write_scope": "workspace",
         },
         state={
             "tool_activation_policy": {
@@ -318,7 +319,8 @@ async def test_denied_hidden_file_write_activation_is_not_replayed_forever() -> 
         permission_policy={
             "autonomy_mode": "strict",
             "require_approval_for_file_write": True,
-            "file_ops_scope": "workspace",
+            "file_read_scope": "workspace",
+            "file_write_scope": "workspace",
         },
         state={
             "tool_activation_policy": {

@@ -195,7 +195,8 @@ security:
   require_approval_for_file_write: false
   require_approval_for_exec: true
   max_file_write_size_mb: 10.0
-  file_ops_scope: "workspace"
+  file_read_scope: "workspace"
+  file_write_scope: "workspace"
   file_undo_max_size_mb: 2.0
 
 # Web API 伺服器設定

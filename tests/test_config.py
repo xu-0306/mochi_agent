@@ -127,7 +127,8 @@ def test_default_config_is_valid() -> None:
     assert cfg.security.change_contract_mode == "observe"
     assert cfg.security.require_approval_for_exec is True
     assert cfg.security.require_approval_for_file_write is False
-    assert cfg.security.file_ops_scope == "workspace"
+    assert cfg.security.file_read_scope == "workspace"
+    assert cfg.security.file_write_scope == "workspace"
     assert cfg.security.file_undo_max_size_mb == 2.0
     assert cfg.sandbox.mode == "off"
     assert cfg.workspace_dir == defaults.default_workspace_dir()
@@ -237,7 +238,8 @@ def test_default_yaml_parseable() -> None:
     assert cfg.security.change_contract_mode == "observe"
     assert cfg.security.require_approval_for_exec is True
     assert cfg.security.require_approval_for_file_write is False
-    assert cfg.security.file_ops_scope == "workspace"
+    assert cfg.security.file_read_scope == "workspace"
+    assert cfg.security.file_write_scope == "workspace"
     assert cfg.security.file_undo_max_size_mb == 2.0
 
 
@@ -256,6 +258,29 @@ def test_legacy_config_without_protected_workspace_axes_uses_safe_rollout_defaul
     assert cfg.security.change_contract_mode == "observe"
     assert cfg.sandbox.mode == "off"
 
+
+def test_legacy_file_scope_migrates_one_way_to_independent_scopes() -> None:
+    cfg = MochiConfig.model_validate(
+        {
+            "security": {
+                "file_ops_scope": "any",
+                "file_read_scope": "workspace",
+            }
+        }
+    )
+
+    assert cfg.security.file_read_scope == "workspace"
+    assert cfg.security.file_write_scope == "any"
+    assert "file_ops_scope" not in cfg.security.model_dump()
+
+
+def test_high_autonomy_keeps_workspace_file_boundaries() -> None:
+    cfg = MochiConfig.model_validate(
+        {"security": {"autonomy_mode": "high_autonomy"}}
+    )
+
+    assert cfg.security.file_read_scope == "workspace"
+    assert cfg.security.file_write_scope == "workspace"
 
 @pytest.mark.parametrize(
     ("payload", "invalid_value"),

@@ -478,6 +478,61 @@ def test_registry_factory_registers_tool_search(tmp_path: Path) -> None:
     assert "web_crawl" in factory.tool_groups["web"]
 
 
+@pytest.mark.asyncio
+async def test_registry_factory_propagates_independent_file_scopes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(workspace),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "security": {
+                "file_read_scope": "any",
+                "file_write_scope": "workspace",
+            },
+        }
+    )
+    factory = ToolRegistryFactory(
+        config,
+        memory_store=MemoryStore(db_path=tmp_path / "memory.db"),
+    )
+    registry = factory.create_registry(str(workspace))
+    reader = registry.get("file_read")
+    writer = registry.get("file_write")
+
+    assert reader is not None
+    assert writer is not None
+    read_tool_names = (
+        "file_read",
+        "tool_result_read",
+        "repo_map",
+        "read_symbol",
+        "csv_read",
+        "docx_read",
+        "pdf_read",
+        "notebook_read",
+    )
+    write_tool_names = ("file_write", "file_edit", "apply_patch")
+    for tool_name in read_tool_names:
+        tool = registry.get(tool_name)
+        assert tool is not None
+        assert getattr(tool, "_path_scope") == "any"
+    for tool_name in write_tool_names:
+        tool = registry.get(tool_name)
+        assert tool is not None
+        assert getattr(tool, "_path_scope") == "workspace"
+    read_result = await reader.execute(path=str(outside))
+    write_result = await writer.execute(path=str(outside), content="blocked")
+
+    assert read_result.error is None
+    assert read_result.output == "outside"
+    assert write_result.error is not None
+    assert "outside workspace" in write_result.error
+    assert outside.read_text(encoding="utf-8") == "outside"
+
 def test_registry_factory_caches_registries_per_workspace(tmp_path: Path) -> None:
     config = MochiConfig.model_validate(
         {
@@ -672,7 +727,8 @@ def _tool_activation_context(
         permission_policy={
             "autonomy_mode": "auto_review",
             "require_approval_for_file_write": False,
-            "file_ops_scope": "workspace",
+            "file_read_scope": "workspace",
+            "file_write_scope": "workspace",
             **(permission_policy or {}),
         },
         state={

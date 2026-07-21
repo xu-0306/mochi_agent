@@ -81,7 +81,7 @@ def file_change_policy_version(security: SecurityConfig) -> str:
         "change_contract_mode": security.change_contract_mode,
         "autonomy_mode": security.autonomy_mode,
         "require_approval_for_file_write": security.require_approval_for_file_write,
-        "file_ops_scope": security.file_ops_scope,
+        "file_write_scope": security.file_write_scope,
         "max_file_write_size_mb": str(security.max_file_write_size_mb),
         "file_undo_max_size_mb": str(security.file_undo_max_size_mb),
     }
@@ -128,7 +128,7 @@ async def prepare_patch_change_contract(
     prepared, change_payload = await prepare_apply_patch(
         patch=patch,
         workspace_dir=workspace_root,
-        path_scope=security.file_ops_scope,
+        path_scope=security.file_write_scope,
         encoding=encoding,
         undo_max_size_mb=security.file_undo_max_size_mb,
     )

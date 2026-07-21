@@ -751,8 +751,11 @@ class SecurityConfig(BaseModel):
     max_file_write_size_mb: float = 10.0
     """允許寫入的最大檔案大小（MB）。"""
 
-    file_ops_scope: Literal["workspace", "any"] = "workspace"
-    """檔案操作範圍（workspace / any）。"""
+    file_read_scope: Literal["workspace", "any"] = "workspace"
+    """Allowed file read boundary (workspace / any)."""
+
+    file_write_scope: Literal["workspace", "any"] = "workspace"
+    """Allowed file mutation boundary (workspace / any)."""
 
     file_undo_max_size_mb: float = 2.0
     """允許保存 undo 的最大檔案大小（MB）。"""
@@ -765,6 +768,10 @@ class SecurityConfig(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
+        legacy_file_scope = normalized.pop("file_ops_scope", None)
+        if legacy_file_scope in {"workspace", "any"}:
+            normalized.setdefault("file_read_scope", legacy_file_scope)
+            normalized.setdefault("file_write_scope", legacy_file_scope)
         legacy_shell_approval = normalized.pop("require_approval_for_shell", None)
         normalized.pop("shell_command_allowlist", None)
         if "require_approval_for_exec" not in normalized and isinstance(legacy_shell_approval, bool):
@@ -782,7 +789,8 @@ class SecurityConfig(BaseModel):
         relevant_keys = {
             "require_approval_for_exec",
             "require_approval_for_file_write",
-            "file_ops_scope",
+            "file_read_scope",
+            "file_write_scope",
         }
         if not any(key in normalized for key in relevant_keys):
             return normalized
@@ -799,10 +807,10 @@ class SecurityConfig(BaseModel):
                 cls.model_fields["require_approval_for_file_write"].default,
             )
         )
-        file_ops_scope = str(
+        file_write_scope = str(
             normalized.get(
-                "file_ops_scope",
-                cls.model_fields["file_ops_scope"].default,
+                "file_write_scope",
+                cls.model_fields["file_write_scope"].default,
             )
         )
         return {
@@ -810,7 +818,7 @@ class SecurityConfig(BaseModel):
             "autonomy_mode": infer_autonomy_mode(
                 require_approval_for_exec=require_exec,
                 require_approval_for_file_write=require_file_write,
-                file_ops_scope=file_ops_scope,
+                file_write_scope=file_write_scope,
             ),
         }
 

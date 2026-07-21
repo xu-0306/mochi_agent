@@ -286,7 +286,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileReadTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_read_scope,
         )
 
     def _build_tool_result_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -294,7 +294,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return ToolResultReadTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_read_scope,
         )
 
     def _build_glob_search(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -311,14 +311,18 @@ class ToolRegistryFactory:
         workspace_dir: str,
         services: dict[str, Any],
     ) -> BaseTool | None:
-        del config, services
+        del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         try:
             from mochi.tools.repo_map import RepoMapTool
         except ModuleNotFoundError as exc:
             if exc.name != "mochi.tools.repo_map":
                 raise
             return None
-        return RepoMapTool(workspace_dir=workspace_dir)
+        return RepoMapTool(
+            workspace_dir=workspace_dir,
+            path_scope=runtime_policy.file_read_scope,
+        )
 
     def _build_read_symbol(
         self,
@@ -326,21 +330,25 @@ class ToolRegistryFactory:
         workspace_dir: str,
         services: dict[str, Any],
     ) -> BaseTool | None:
-        del config, services
+        del services
+        runtime_policy = resolve_runtime_permission_policy(config.security)
         try:
             from mochi.tools.repo_map import ReadSymbolTool
         except ModuleNotFoundError as exc:
             if exc.name != "mochi.tools.repo_map":
                 raise
             return None
-        return ReadSymbolTool(workspace_dir=workspace_dir)
+        return ReadSymbolTool(
+            workspace_dir=workspace_dir,
+            path_scope=runtime_policy.file_read_scope,
+        )
 
     def _build_csv_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del services
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return CsvReadTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_read_scope,
         )
 
     def _build_docx_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -348,7 +356,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return DocxReadTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_read_scope,
         )
 
     def _build_pdf_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -356,7 +364,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return PdfReadTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_read_scope,
         )
 
     def _build_notebook_read(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -364,7 +372,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return NotebookReadTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_read_scope,
         )
 
     def _build_file_write(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -372,7 +380,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileWriteTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_write_scope,
             require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
@@ -383,7 +391,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return FileEditTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_write_scope,
             require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
@@ -394,7 +402,7 @@ class ToolRegistryFactory:
         runtime_policy = resolve_runtime_permission_policy(config.security)
         return ApplyPatchTool(
             workspace_dir=workspace_dir,
-            path_scope=runtime_policy.file_ops_scope,
+            path_scope=runtime_policy.file_write_scope,
             require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,

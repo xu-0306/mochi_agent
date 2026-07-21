@@ -66,7 +66,7 @@ def test_filesystem_list_returns_single_level_metadata(tmp_path: Path) -> None:
     child_dir.mkdir()
     child_file.write_text("hello", encoding="utf-8")
 
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
 
     with TestClient(app) as client:
         response = client.get("/v1/filesystem/list", params={"path": str(root)})
@@ -94,7 +94,7 @@ def test_filesystem_list_returns_single_level_metadata(tmp_path: Path) -> None:
 
 def test_filesystem_list_not_found_and_not_directory(tmp_path: Path) -> None:
     """無法推導 parent 的路徑才應回傳 not found。"""
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
 
     with TestClient(app) as client:
         missing_response = client.get(
@@ -108,7 +108,7 @@ def test_filesystem_list_not_found_and_not_directory(tmp_path: Path) -> None:
 
 def test_filesystem_list_file_path_lists_parent_directory(tmp_path: Path) -> None:
     """檔案路徑應視為 picker selected path，並列出 parent directory。"""
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
     existing_file = tmp_path / "single.txt"
     existing_file.write_text("x", encoding="utf-8")
 
@@ -124,7 +124,7 @@ def test_filesystem_list_file_path_lists_parent_directory(tmp_path: Path) -> Non
 
 def test_filesystem_list_missing_file_name_lists_existing_parent(tmp_path: Path) -> None:
     """尚未存在的檔案名如 1.txt 應列 parent，不應直接報錯。"""
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
     target = tmp_path / "1.txt"
 
     with TestClient(app) as client:
@@ -151,7 +151,7 @@ def test_filesystem_select_directory_returns_native_selection(
 
     filesystem_module = sys.modules["mochi.api.routes.filesystem"]
     monkeypatch.setattr(filesystem_module, "_select_native_directory", fake_select_native_directory)
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
 
     with TestClient(app) as client:
         response = client.post(
@@ -180,7 +180,7 @@ def test_filesystem_select_directory_reports_cancel(tmp_path: Path, monkeypatch)
 
     filesystem_module = sys.modules["mochi.api.routes.filesystem"]
     monkeypatch.setattr(filesystem_module, "_select_native_directory", fake_select_native_directory)
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
 
     with TestClient(app) as client:
         response = client.post(
@@ -199,7 +199,7 @@ def test_filesystem_select_directory_reports_cancel(tmp_path: Path, monkeypatch)
 
 def test_filesystem_import_uploads_file_to_target_dir(tmp_path: Path) -> None:
     """本機 picker 上傳的檔案應保存到後端受控目錄並回傳 server path。"""
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
 
     with TestClient(app) as client:
         response = client.post(
@@ -232,7 +232,12 @@ def test_filesystem_import_defaults_to_workspace_browser_imports(tmp_path: Path)
     """Without a target dir, imports should land under the configured workspace."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(workspace)}))
+    app = _create_test_app(MochiConfig.model_validate(
+            {
+                "workspace_dir": str(workspace),
+                "security": {"file_read_scope": "any"},
+            }
+        ))
 
     with TestClient(app) as client:
         response = client.post(
@@ -252,7 +257,7 @@ def test_filesystem_import_defaults_to_workspace_browser_imports(tmp_path: Path)
 
 def test_filesystem_import_multiple_files_keep_package_root_authoritative(tmp_path: Path) -> None:
     """Multi-file imports should keep the package directory as imported_path."""
-    app = _create_test_app(MochiConfig.model_validate({}))
+    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(tmp_path)}))
 
     with TestClient(app) as client:
         response = client.post(
@@ -281,6 +286,21 @@ def test_filesystem_import_multiple_files_keep_package_root_authoritative(tmp_pa
     assert {path.read_text(encoding="utf-8") for path in saved_paths} == {"one", "two"}
 
 
+def test_filesystem_file_rejects_external_path_by_default(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "outside.txt"
+    external.write_text("blocked", encoding="utf-8")
+    app = _create_test_app(
+        MochiConfig.model_validate({"workspace_dir": str(workspace)})
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/v1/filesystem/file", params={"path": str(external)})
+
+    assert response.status_code == 403
+    assert "outside workspace" in response.json()["detail"]
+
 def test_filesystem_file_serves_workspace_preview_asset(tmp_path: Path) -> None:
     """`/v1/filesystem/file` should serve normal local files, not just workspace files."""
     workspace = tmp_path / "workspace"
@@ -288,7 +308,12 @@ def test_filesystem_file_serves_workspace_preview_asset(tmp_path: Path) -> None:
     image = tmp_path / "preview.txt"
     image.write_text("hello preview", encoding="utf-8")
 
-    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(workspace)}))
+    app = _create_test_app(MochiConfig.model_validate(
+            {
+                "workspace_dir": str(workspace),
+                "security": {"file_read_scope": "any"},
+            }
+        ))
 
     with TestClient(app) as client:
         response = client.get("/v1/filesystem/file", params={"path": str(image)})
@@ -301,7 +326,12 @@ def test_filesystem_file_blocks_suspicious_path(tmp_path: Path) -> None:
     """Preview routes should still reject suspicious raw path spellings."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(workspace)}))
+    app = _create_test_app(MochiConfig.model_validate(
+            {
+                "workspace_dir": str(workspace),
+                "security": {"file_read_scope": "any"},
+            }
+        ))
 
     with TestClient(app) as client:
         response = client.get("/v1/filesystem/file", params={"path": "\\\\?\\C:\\temp\\oops.txt"})
@@ -330,7 +360,12 @@ def test_filesystem_preview_text_extracts_external_docx_text(tmp_path: Path) -> 
             ),
         )
 
-    app = _create_test_app(MochiConfig.model_validate({"workspace_dir": str(workspace)}))
+    app = _create_test_app(MochiConfig.model_validate(
+            {
+                "workspace_dir": str(workspace),
+                "security": {"file_read_scope": "any"},
+            }
+        ))
 
     with TestClient(app) as client:
         response = client.get("/v1/filesystem/preview-text", params={"path": str(docx_path)})

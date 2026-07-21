@@ -4232,7 +4232,8 @@ export interface SecuritySettings {
   exec_default_timeout_sec: number
   exec_session_output_limit: number
   max_file_write_size_mb: number
-  file_ops_scope: 'workspace' | 'any'
+  file_read_scope: 'workspace' | 'any'
+  file_write_scope: 'workspace' | 'any'
   file_undo_max_size_mb: number
 }
 
@@ -5142,7 +5143,8 @@ export interface SecuritySettingsUpdate {
   exec_default_timeout_sec?: number
   exec_session_output_limit?: number
   max_file_write_size_mb?: number
-  file_ops_scope?: 'workspace' | 'any'
+  file_read_scope?: 'workspace' | 'any'
+  file_write_scope?: 'workspace' | 'any'
   file_undo_max_size_mb?: number
 }
 
@@ -5333,7 +5335,8 @@ function normalizeSecuritySettings(value: unknown): SecuritySettings | undefined
     exec_default_timeout_sec: getNumber(value.exec_default_timeout_sec) ?? 30,
     exec_session_output_limit: getNumber(value.exec_session_output_limit) ?? 8000,
     max_file_write_size_mb: getNumber(value.max_file_write_size_mb) ?? 10.0,
-    file_ops_scope: getString(value.file_ops_scope) === 'any' ? 'any' : 'workspace',
+    file_read_scope: getString(value.file_read_scope) === 'any' ? 'any' : 'workspace',
+    file_write_scope: getString(value.file_write_scope) === 'any' ? 'any' : 'workspace',
     file_undo_max_size_mb: getNumber(value.file_undo_max_size_mb) ?? 2.0,
   }
 }

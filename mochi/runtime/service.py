@@ -7441,7 +7441,7 @@ class RuntimeService:
         )
         common: dict[str, Any] = {
             "workspace_dir": workspace_dir,
-            "path_scope": runtime_policy.file_ops_scope,
+            "path_scope": runtime_policy.file_write_scope,
             "require_approval": False,
             "max_write_size_mb": self._security_config.max_file_write_size_mb,
             "undo_max_size_mb": self._security_config.file_undo_max_size_mb,

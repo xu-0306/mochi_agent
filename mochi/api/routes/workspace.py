@@ -29,6 +29,7 @@ from mochi.utils.security import (
     is_path_within_workspace,
     normalize_workspace_dir,
     resolve_path_in_workspace,
+    resolve_path_with_scope,
 )
 
 router = APIRouter(prefix="/v1/workspace", tags=["workspace"])
@@ -58,7 +59,13 @@ async def get_workspace_tree(
         session_id=session_id,
         project_id=project_id,
     )
-    current, selected_path = _coerce_workspace_browse_directory(workspace_root, path)
+    config = await _get_config(request.app)
+    read_scope = config.security.file_read_scope
+    current, selected_path = _coerce_workspace_browse_directory(
+        workspace_root,
+        path,
+        read_scope,
+    )
 
     try:
         entries = await asyncio.to_thread(lambda: list(current.iterdir()))
@@ -70,7 +77,7 @@ async def get_workspace_tree(
     items: list[dict[str, Any]] = []
     for entry in sorted(entries, key=lambda item: item.name.lower()):
         resolved_entry = entry.resolve(strict=False)
-        if not is_path_within_workspace(resolved_entry, workspace_root):
+        if read_scope == "workspace" and not is_path_within_workspace(resolved_entry, workspace_root):
             continue
         try:
             is_dir = entry.is_dir()
@@ -117,7 +124,12 @@ async def get_workspace_file(
         session_id=session_id,
         project_id=project_id,
     )
-    target = _resolve_workspace_file_target(workspace_root, path)
+    config = await _get_config(request.app)
+    target = _resolve_workspace_file_target(
+        workspace_root,
+        path,
+        config.security.file_read_scope,
+    )
     media_type, _ = mimetypes.guess_type(target.name)
     return FileResponse(target, media_type=media_type or "application/octet-stream")
 
@@ -135,7 +147,12 @@ async def preview_workspace_file(
         session_id=session_id,
         project_id=project_id,
     )
-    target = _resolve_workspace_file_target(workspace_root, path)
+    config = await _get_config(request.app)
+    target = _resolve_workspace_file_target(
+        workspace_root,
+        path,
+        config.security.file_read_scope,
+    )
     suffix = target.suffix.lower()
     if suffix == ".docx":
         payload = await _preview_docx(target, max_chars)
@@ -498,12 +515,13 @@ async def _resolve_workspace_scope_from_approval(
 def _coerce_workspace_browse_directory(
     workspace_root: Path,
     raw_path: str | None,
+    read_scope: str,
 ) -> tuple[Path, Path | None]:
     if raw_path is None or not raw_path.strip():
         return workspace_root, None
 
     try:
-        requested = resolve_path_in_workspace(raw_path, workspace_root)
+        requested = resolve_path_with_scope(raw_path, workspace_root, read_scope)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if requested.exists():
@@ -514,14 +532,22 @@ def _coerce_workspace_browse_directory(
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     parent = requested.parent
-    if is_path_within_workspace(parent, workspace_root) and parent.exists() and parent.is_dir():
+    if (
+        (read_scope == "any" or is_path_within_workspace(parent, workspace_root))
+        and parent.exists()
+        and parent.is_dir()
+    ):
         return parent, requested
     raise HTTPException(status_code=404, detail="Path not found")
 
 
-def _resolve_workspace_file_target(workspace_root: Path, raw_path: str) -> Path:
+def _resolve_workspace_file_target(
+    workspace_root: Path,
+    raw_path: str,
+    read_scope: str,
+) -> Path:
     try:
-        target = resolve_path_in_workspace(raw_path, workspace_root)
+        target = resolve_path_with_scope(raw_path, workspace_root, read_scope)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if not target.exists() or not target.is_file():

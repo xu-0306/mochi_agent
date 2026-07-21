@@ -17,6 +17,8 @@ def _create_test_app(
     sessions_dir: Path,
     projects_path: Path,
     change_contract_mode: str = "observe",
+    file_read_scope: str = "workspace",
+    file_write_scope: str = "workspace",
 ):
     app = create_app()
     app.state.config_factory = lambda: MochiConfig.model_validate(
@@ -24,7 +26,11 @@ def _create_test_app(
             "model": "ollama:test",
             "workspace_dir": str(workspace_dir),
             "sessions_dir": str(sessions_dir),
-            "security": {"change_contract_mode": change_contract_mode},
+            "security": {
+                "change_contract_mode": change_contract_mode,
+                "file_read_scope": file_read_scope,
+                "file_write_scope": file_write_scope,
+            },
         }
     )
     app.state.session_store = SessionStore(sessions_dir)
@@ -96,6 +102,28 @@ def test_workspace_routes_resolve_session_workspace_and_enforce_scope(tmp_path: 
         )
         assert denied.status_code == 403
 
+
+def test_workspace_preview_honors_explicit_any_read_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external.txt"
+    external.write_text("allowed read", encoding="utf-8")
+    app = _create_test_app(
+        workspace_dir=workspace,
+        sessions_dir=tmp_path / "sessions",
+        projects_path=tmp_path / "projects.json",
+        file_read_scope="any",
+        file_write_scope="workspace",
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/workspace/preview",
+            params={"path": str(external)},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "allowed read"
 
 def test_workspace_changes_and_diff_report_git_backed_workspace_state(tmp_path: Path) -> None:
     workspace_dir = tmp_path / "repo"

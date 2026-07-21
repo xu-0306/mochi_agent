@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from mochi.config.schema import SecurityConfig
 from mochi.security import (
     SecurityDecision,
@@ -55,6 +57,32 @@ def test_runtime_policy_allows_runtime_overrides() -> None:
     assert policy.require_approval_for_exec is False
 
 
+def test_runtime_policy_resolves_read_and_write_scope_independently() -> None:
+    security = SecurityConfig(
+        file_read_scope="workspace",
+        file_write_scope="any",
+    )
+
+    policy = resolve_runtime_permission_policy(
+        security,
+        overrides={"file_read_scope": "any", "file_write_scope": "workspace"},
+    )
+
+    assert policy.file_read_scope == "any"
+    assert policy.file_write_scope == "workspace"
+    assert "file_ops_scope" not in policy.to_dict()
+
+
+def test_runtime_policy_accepts_legacy_scope_override_without_reexporting_it() -> None:
+    policy = resolve_runtime_permission_policy(
+        SecurityConfig(),
+        overrides={"file_ops_scope": "any"},
+    )
+
+    assert policy.file_read_scope == "any"
+    assert policy.file_write_scope == "any"
+    assert "file_ops_scope" not in policy.to_dict()
+
 def test_infer_autonomy_mode_for_legacy_strict_config() -> None:
     security = SecurityConfig.model_validate(
         {
@@ -66,6 +94,23 @@ def test_infer_autonomy_mode_for_legacy_strict_config() -> None:
 
     assert security.autonomy_mode == "strict"
 
+
+def test_production_code_has_no_legacy_scope_consumers() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "mochi"
+    forbidden = (
+        "runtime_policy.file_ops_scope",
+        "config.security.file_ops_scope",
+        "security.file_ops_scope",
+    )
+
+    consumers = [
+        f"{path.relative_to(source_root)}:{pattern}"
+        for path in source_root.rglob("*.py")
+        for pattern in forbidden
+        if pattern in path.read_text(encoding="utf-8")
+    ]
+
+    assert consumers == []
 
 def test_require_approval_decision_serializes_metadata() -> None:
     decision = require_approval_decision(

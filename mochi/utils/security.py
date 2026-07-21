@@ -316,8 +316,7 @@ def check_file_tool_path(
         )
 
     try:
-        effective_scope = "any" if access == "read" else scope
-        resolved = resolve_path_with_scope(raw_path, workspace_dir, effective_scope)
+        resolved = resolve_path_with_scope(raw_path, workspace_dir, scope)
     except ValueError as exc:
         return (
             None,

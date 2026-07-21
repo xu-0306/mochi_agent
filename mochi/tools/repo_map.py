@@ -15,7 +15,7 @@ from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from mochi.utils.security import (
     check_file_tool_path,
     normalize_workspace_dir,
-    resolve_path_in_workspace,
+    resolve_path_with_scope,
 )
 
 _IGNORED_DIRS = {
@@ -278,6 +278,7 @@ class RepoMapTool(BaseTool):
         self,
         *,
         workspace_dir: str | Path | None = None,
+        path_scope: str = "workspace",
         default_max_files: int = 50,
         max_files: int = 200,
         default_max_symbols_per_file: int = 8,
@@ -286,6 +287,7 @@ class RepoMapTool(BaseTool):
         max_parse_bytes: int = 200_000,
     ) -> None:
         self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
+        self._path_scope = path_scope
         self._default_max_files = max(1, int(default_max_files))
         self._max_files = max(self._default_max_files, int(max_files))
         self._default_max_symbols_per_file = max(1, int(default_max_symbols_per_file))
@@ -369,7 +371,7 @@ class RepoMapTool(BaseTool):
                 checked_root, security_decision = check_file_tool_path(
                     path,
                     workspace_dir=workspace_root,
-                    scope="workspace",
+                    scope=self._path_scope,
                     access="read",
                 )
                 if security_decision is not None or checked_root is None:
@@ -377,7 +379,7 @@ class RepoMapTool(BaseTool):
                         error=security_decision.reason if security_decision is not None else "Path denied.",
                         metadata=security_decision.to_metadata() if security_decision is not None else {},
                     )
-                search_root = resolve_path_in_workspace(checked_root, workspace_root)
+                search_root = resolve_path_with_scope(checked_root, workspace_root, self._path_scope)
         except ValueError as exc:
             return ToolResult(error=str(exc))
 
@@ -504,11 +506,13 @@ class ReadSymbolTool(BaseTool):
         self,
         *,
         workspace_dir: str | Path | None = None,
+        path_scope: str = "workspace",
         default_max_lines: int = 200,
         max_lines: int = 400,
         max_parse_bytes: int = 300_000,
     ) -> None:
         self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
+        self._path_scope = path_scope
         self._default_max_lines = max(1, int(default_max_lines))
         self._max_lines = max(self._default_max_lines, int(max_lines))
         self._max_parse_bytes = max(1, int(max_parse_bytes))
@@ -601,7 +605,7 @@ class ReadSymbolTool(BaseTool):
                     error=security_decision.reason if security_decision is not None else "Path denied.",
                     metadata=security_decision.to_metadata() if security_decision is not None else {},
                 )
-            target = resolve_path_in_workspace(checked_target, workspace_root)
+            target = resolve_path_with_scope(checked_target, workspace_root, self._path_scope)
         except ValueError as exc:
             return ToolResult(error=str(exc))
 

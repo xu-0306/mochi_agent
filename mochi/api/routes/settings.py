@@ -244,7 +244,8 @@ class SecuritySettingsPatch(BaseModel):
     exec_default_timeout_sec: int | None = Field(default=None, ge=1, le=86_400)
     exec_session_output_limit: int | None = Field(default=None, ge=256, le=1_000_000)
     max_file_write_size_mb: float | None = Field(default=None, ge=0.0)
-    file_ops_scope: Literal["workspace", "any"] | None = None
+    file_read_scope: Literal["workspace", "any"] | None = None
+    file_write_scope: Literal["workspace", "any"] | None = None
     file_undo_max_size_mb: float | None = Field(default=None, ge=0.0)
 
 
@@ -689,7 +690,8 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
             "exec_default_timeout_sec": config.security.exec_default_timeout_sec,
             "exec_session_output_limit": config.security.exec_session_output_limit,
             "max_file_write_size_mb": config.security.max_file_write_size_mb,
-            "file_ops_scope": config.security.file_ops_scope,
+            "file_read_scope": config.security.file_read_scope,
+            "file_write_scope": config.security.file_write_scope,
             "file_undo_max_size_mb": config.security.file_undo_max_size_mb,
         },
         "sandbox": project_sandbox_rollout(config.sandbox),
@@ -812,7 +814,8 @@ def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -
             for key in (
                 "require_approval_for_file_write",
                 "require_approval_for_exec",
-                "file_ops_scope",
+                "file_read_scope",
+                "file_write_scope",
             ):
                 security_updates.setdefault(key, mode_defaults[key])
         updates["security"] = SecurityConfig.model_validate(
