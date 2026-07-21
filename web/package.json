@@ -42,6 +42,7 @@
     "test:reasoning-continuity-badges": "node --experimental-strip-types ./scripts/test-reasoning-continuity-badges.mjs",
     "test:reasoning-display-policy": "node --experimental-strip-types ./scripts/test-reasoning-display-policy.mjs",
     "test:diff-viewer-lines": "node --experimental-strip-types ./scripts/test-diff-viewer-lines.mjs",
+    "test:approval-contract": "node --experimental-strip-types ./scripts/test-approval-contract.mjs",
     "test:voice-capture": "node --experimental-strip-types ./scripts/test-voice-capture.mjs",
     "test:voice-overlay-phase": "node --experimental-strip-types ./scripts/test-voice-overlay-phase.mjs",
     "test:voice-settings-modes": "node --experimental-strip-types ./scripts/test-voice-settings-modes.mjs",

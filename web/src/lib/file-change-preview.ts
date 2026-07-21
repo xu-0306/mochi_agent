@@ -66,6 +66,14 @@ export interface PatchPreviewResult {
   warnings: string[]
   patchText: string | null
   files: FileChangeSummary[]
+  changeSetId: string | null
+  requestDigest: string | null
+  expiresAt: string | null
+  policyVersion: string | null
+  changeContractMode: 'observe' | 'enforce'
+  replacementApprovalId: string | null
+  approvalState: string | null
+  wouldRejectEditedPatch: boolean
 }
 
 export function getFileName(filePath: string): string {
@@ -558,5 +566,13 @@ export function extractPatchPreviewResult(value: unknown): PatchPreviewResult {
     ],
     patchText: extractPatchText(record) ?? extractPatchText(previewRecord ?? {}),
     files: fileChanges,
+    changeSetId: getString(record.change_set_id),
+    requestDigest: getString(record.request_digest),
+    expiresAt: getString(record.expires_at),
+    policyVersion: getString(record.policy_version),
+    changeContractMode: getString(record.change_contract_mode) === 'enforce' ? 'enforce' : 'observe',
+    replacementApprovalId: getString(record.replacement_approval_id),
+    approvalState: getString(record.approval_state),
+    wouldRejectEditedPatch: getBoolean(record.would_reject_edited_patch) ?? false,
   }
 }

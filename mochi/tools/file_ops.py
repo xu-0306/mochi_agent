@@ -3,12 +3,31 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import contextlib
+import hashlib
+import os
+import stat
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from mochi.config import defaults
+from mochi.config.schema import SecurityConfig
+from mochi.runtime.change_sets import ChangeSetStore
+from mochi.runtime.store import RuntimeStore
 from mochi.security import require_approval_decision, with_task_isolation_scope
+from mochi.security.file_contract import (
+    AuthorizationContext,
+    AuthorizationEnvelope,
+    ChangeEntry,
+    ChangeManifest,
+    FileChangeRequest,
+    FileIdentity,
+    authorization_request_digest,
+    canonical_json,
+)
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
 from mochi.tools.file_mutations import (
     PatchValidationError,
@@ -46,11 +65,259 @@ def _build_path_denial_metadata(
             "path_scope": path_scope,
         }
     )
-    try:
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
         metadata["resolved_path"] = str(resolve_path_with_scope(path, workspace_root, "any"))
-    except (OSError, RuntimeError, ValueError):
-        pass
     return metadata
+
+
+class FileChangeContractConflict(RuntimeError):
+    """Raised when an immutable patch preview no longer matches execution state."""
+
+
+def file_change_policy_version(security: SecurityConfig) -> str:
+    """Return a stable digest for file-authorization policy inputs."""
+
+    projection = {
+        "change_contract_mode": security.change_contract_mode,
+        "autonomy_mode": security.autonomy_mode,
+        "require_approval_for_file_write": security.require_approval_for_file_write,
+        "file_ops_scope": security.file_ops_scope,
+        "max_file_write_size_mb": str(security.max_file_write_size_mb),
+        "file_undo_max_size_mb": str(security.file_undo_max_size_mb),
+    }
+    digest = hashlib.sha256(canonical_json(projection).encode("utf-8")).hexdigest()
+    return f"file-policy-v1:{digest}"
+
+
+def _capture_file_identity(path: Path) -> FileIdentity:
+    info = path.stat()
+    platform = "windows" if os.name == "nt" else "posix"
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    return FileIdentity(
+        platform=platform,
+        volume_id=str(int(info.st_dev)),
+        file_id=str(int(info.st_ino)),
+        link_count=max(1, int(info.st_nlink)),
+        is_reparse_point=bool(attributes & 0x400),
+    )
+
+
+def _content_digest(content: bytes | None) -> str | None:
+    return None if content is None else hashlib.sha256(content).hexdigest()
+
+
+def _context_digest(context: AuthorizationContext) -> str:
+    payload = canonical_json(context.to_dict()).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def prepare_patch_change_contract(
+    *,
+    runtime_store: RuntimeStore,
+    patch: str,
+    workspace_dir: str | Path,
+    security: SecurityConfig,
+    requester_id: str,
+    session_id: str,
+    task_id: str | None,
+    encoding: str = "utf-8",
+) -> tuple[list[Any], dict[str, Any], dict[str, Any]]:
+    """Prepare and persist a canonical immutable patch manifest."""
+
+    workspace_root = normalize_workspace_dir(workspace_dir)
+    prepared, change_payload = await prepare_apply_patch(
+        patch=patch,
+        workspace_dir=workspace_root,
+        path_scope=security.file_ops_scope,
+        encoding=encoding,
+        undo_max_size_mb=security.file_undo_max_size_mb,
+    )
+    change_store = ChangeSetStore(runtime_store)
+    workspace_identity = await asyncio.to_thread(_capture_file_identity, workspace_root)
+    policy_version = file_change_policy_version(security)
+    patch_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
+    context = AuthorizationContext(
+        requester_id=requester_id,
+        session_id=session_id,
+        task_id=task_id,
+        workspace_root=str(workspace_root),
+        workspace_identity=workspace_identity,
+    )
+
+    entries: list[ChangeEntry] = []
+    for ordinal, item in enumerate(prepared):
+        before = (
+            None
+            if not item.existed_before
+            else await asyncio.to_thread(item.target.read_bytes)
+        )
+        after = None if item.new_content is None else item.new_content.encode(encoding)
+        before_blob_id = None if before is None else await change_store.put_blob(before)
+        after_blob_id = None if after is None else await change_store.put_blob(after)
+        base_identity = (
+            None
+            if not item.existed_before
+            else await asyncio.to_thread(_capture_file_identity, item.target)
+        )
+        mode_before = None
+        if item.existed_before:
+            info = await asyncio.to_thread(item.target.stat)
+            mode_before = stat.S_IMODE(info.st_mode)
+        relative_path = item.target.relative_to(workspace_root).as_posix()
+        entry_seed = canonical_json(
+            {
+                "context": context.to_dict(),
+                "policy_version": policy_version,
+                "patch_sha256": patch_sha256,
+                "ordinal": ordinal,
+                "relative_path": relative_path,
+                "operation": item.operation.kind,
+                "base_sha256": _content_digest(before),
+                "after_sha256": _content_digest(after),
+            }
+        )
+        entries.append(
+            ChangeEntry(
+                entry_id=hashlib.sha256(entry_seed.encode("utf-8")).hexdigest(),
+                relative_path=relative_path,
+                operation=item.operation.kind,
+                base_sha256=_content_digest(before),
+                after_sha256=_content_digest(after),
+                base_identity=base_identity,
+                before_blob_id=before_blob_id,
+                after_blob_id=after_blob_id,
+                mode_before=mode_before,
+                mode_after=mode_before if after is not None else None,
+                base_metadata_sha256=None,
+                after_metadata_sha256=None,
+                rename_source=None,
+                dependency_group=None,
+            )
+        )
+
+    file_request = FileChangeRequest(entries=tuple(entries), patch_sha256=patch_sha256)
+    envelope = AuthorizationEnvelope(
+        schema_version=1,
+        kind="file_change",
+        context=context,
+        policy_version=policy_version,
+        file_request=file_request,
+        exec_request=None,
+    )
+    request_digest = authorization_request_digest(envelope)
+    now = datetime.now(UTC)
+    manifest = ChangeManifest(
+        version=1,
+        change_set_id=str(uuid4()),
+        workspace_root=str(workspace_root),
+        workspace_identity=workspace_identity,
+        tool_name="apply_patch",
+        intent="mutate",
+        entries=file_request.entries,
+        patch_sha256=patch_sha256,
+        policy_version=policy_version,
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(minutes=15)).isoformat(),
+        request_digest=request_digest,
+        ui_metadata={
+            "encoding": encoding,
+            "change_count": change_payload.get("change_count", 0),
+        },
+    )
+    persisted = await change_store.persist_manifest(manifest, envelope)
+    stored_manifest = persisted["manifest"]
+    contract = {
+        "change_set_id": stored_manifest.change_set_id,
+        "request_digest": stored_manifest.request_digest,
+        "expires_at": stored_manifest.expires_at,
+        "policy_version": stored_manifest.policy_version,
+        "change_contract_mode": security.change_contract_mode,
+        "context_digest": _context_digest(envelope.context),
+    }
+    return prepared, change_payload, contract
+
+
+async def revalidate_patch_change_contract(
+    *,
+    runtime_store: RuntimeStore,
+    approval: Mapping[str, Any],
+    task: Mapping[str, Any],
+    security: SecurityConfig,
+) -> ChangeManifest:
+    """Reload and compare a bound manifest immediately before mutation."""
+
+    metadata = approval.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    change_set_id = metadata.get("change_set_id")
+    if not isinstance(change_set_id, str) or not change_set_id:
+        raise FileChangeContractConflict("change_set_missing")
+
+    change_store = ChangeSetStore(runtime_store)
+    persisted = await change_store.get_change_set(change_set_id)
+    if persisted is None:
+        raise FileChangeContractConflict("change_set_missing")
+    manifest = persisted["manifest"]
+    envelope = persisted["envelope"]
+    try:
+        if persisted["status"] != "prepared":
+            raise FileChangeContractConflict("change_set_not_prepared")
+        if datetime.fromisoformat(manifest.expires_at) <= datetime.now(UTC):
+            raise FileChangeContractConflict("change_set_expired")
+        if approval.get("request_digest") != manifest.request_digest:
+            raise FileChangeContractConflict("approval_digest_mismatch")
+        if metadata.get("request_digest") != manifest.request_digest:
+            raise FileChangeContractConflict("approval_metadata_digest_mismatch")
+        if manifest.policy_version != file_change_policy_version(security):
+            raise FileChangeContractConflict("policy_changed")
+        if str(task.get("id") or "") != str(envelope.context.task_id or ""):
+            raise FileChangeContractConflict("task_context_changed")
+        if str(task.get("session_id") or "draft-session") != envelope.context.session_id:
+            raise FileChangeContractConflict("session_context_changed")
+
+        workspace_value = (
+            task.get("task_workspace_dir")
+            or task.get("project_workspace_dir")
+            or task.get("workspace_dir")
+        )
+        if not isinstance(workspace_value, str):
+            raise FileChangeContractConflict("workspace_context_missing")
+        workspace_root = normalize_workspace_dir(workspace_value)
+        if str(workspace_root) != manifest.workspace_root:
+            raise FileChangeContractConflict("workspace_context_changed")
+        current_workspace_identity = await asyncio.to_thread(
+            _capture_file_identity,
+            workspace_root,
+        )
+        if current_workspace_identity != manifest.workspace_identity:
+            raise FileChangeContractConflict("workspace_identity_changed")
+
+        arguments = approval.get("arguments")
+        arguments = arguments if isinstance(arguments, Mapping) else {}
+        patch = arguments.get("patch")
+        if not isinstance(patch, str):
+            raise FileChangeContractConflict("server_patch_missing")
+        if hashlib.sha256(patch.encode("utf-8")).hexdigest() != manifest.patch_sha256:
+            raise FileChangeContractConflict("server_patch_digest_mismatch")
+
+        for entry in manifest.entries:
+            target = workspace_root / Path(entry.relative_path)
+            exists = await asyncio.to_thread(target.exists)
+            if entry.operation == "add":
+                if exists:
+                    raise FileChangeContractConflict("base_path_now_exists")
+                continue
+            if not exists or not await asyncio.to_thread(target.is_file):
+                raise FileChangeContractConflict("base_path_missing")
+            current = await asyncio.to_thread(target.read_bytes)
+            if _content_digest(current) != entry.base_sha256:
+                raise FileChangeContractConflict("base_content_changed")
+            identity = await asyncio.to_thread(_capture_file_identity, target)
+            if identity != entry.base_identity:
+                raise FileChangeContractConflict("base_identity_changed")
+    except FileChangeContractConflict:
+        await change_store.mark_change_set_status(change_set_id, status="conflicted")
+        raise
+    return manifest
 
 
 class FileReadTool(BaseTool):

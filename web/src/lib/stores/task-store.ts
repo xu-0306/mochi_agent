@@ -347,6 +347,33 @@ export const useTaskStore = create<TaskStore>((set, get) => ({
       if (get().approvalReviewStates[approvalId]?.patchText !== patchText) {
         return
       }
+      if (preview.replacementApprovalId) {
+        const approvals = await fetchApprovals()
+        const replacement = approvals.find(
+          (item) => item.approval_id === preview.replacementApprovalId
+        )
+        if (replacement) {
+          set((state) => {
+            const reconciled = reconcileApprovalReviewStates(
+              state.approvalReviewStates,
+              approvals
+            )
+            return {
+              approvals,
+              approvalReviewStates: {
+                ...reconciled,
+                [replacement.approval_id]: {
+                  ...buildApprovalReviewState(replacement),
+                  isEditingPatch: true,
+                  preview,
+                  lastPreviewedPatchText: patchText,
+                },
+              },
+            }
+          })
+          return
+        }
+      }
       set((state) => ({
         approvalReviewStates: {
           ...state.approvalReviewStates,

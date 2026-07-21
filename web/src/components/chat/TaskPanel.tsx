@@ -247,6 +247,14 @@ function ApprovalReviewCard({
     warnings: [],
     patchText: reviewState.patchText,
     files: [],
+    changeSetId: null,
+    requestDigest: null,
+    expiresAt: null,
+    policyVersion: null,
+    changeContractMode: approval.change_contract_mode,
+    replacementApprovalId: null,
+    approvalState: null,
+    wouldRejectEditedPatch: false,
   }, reviewState.patchText)
   const reviewGroups = reviewState.isEditingPatch && previewGroup
     ? [previewGroup]
@@ -258,6 +266,16 @@ function ApprovalReviewCard({
     reviewState.preview.valid === false ||
     reviewState.previewError !== null
   )
+  const contractPreview = reviewState.preview
+  const changeContractMode = contractPreview?.changeContractMode ?? approval.change_contract_mode
+  const effectiveApprovalId =
+    contractPreview?.replacementApprovalId ?? approval.approval_id
+  const shouldReplayEditedPatch =
+    reviewState.isEditingPatch && patchTextChanged && changeContractMode === 'observe'
+  const displayedDigest = contractPreview?.requestDigest ?? approval.request_digest
+  const displayedExpiry = contractPreview?.expiresAt ?? approval.change_expires_at
+  const displayedPolicy = contractPreview?.policyVersion ?? approval.change_policy_version
+  const displayedApprovalState = contractPreview?.approvalState ?? approval.approval_state
 
   React.useEffect(() => {
     if (!canEditPatch || !reviewState.isEditingPatch) {
@@ -338,6 +356,34 @@ function ApprovalReviewCard({
           <p>
             Replay safe: <span className="text-foreground">{approval.replay_safe ? 'Yes' : 'No'}</span>
           </p>
+          <p>
+            Change contract: <span className="text-foreground">{changeContractMode}</span>
+          </p>
+          {displayedApprovalState ? (
+            <p>
+              Approval state: <span className="text-foreground">{formatMetadataLabel(displayedApprovalState)}</span>
+            </p>
+          ) : null}
+          {displayedDigest ? (
+            <p className="break-all">
+              Digest: <span className="font-mono text-foreground">{displayedDigest}</span>
+            </p>
+          ) : null}
+          {displayedExpiry ? (
+            <p>
+              Expires: <span className="text-foreground">{displayedExpiry}</span>
+            </p>
+          ) : null}
+          {displayedPolicy ? (
+            <p className="break-all">
+              Policy: <span className="font-mono text-foreground">{displayedPolicy}</span>
+            </p>
+          ) : null}
+          {approval.superseded_by_approval_id ? (
+            <p className="text-amber-200">
+              Superseded by: {approval.superseded_by_approval_id}
+            </p>
+          ) : null}
           {approval.policy_source ? (
             <p>
               Policy source: <span className="text-foreground">{formatMetadataLabel(approval.policy_source)}</span>
@@ -540,6 +586,11 @@ function ApprovalReviewCard({
         </div>
       ) : null}
 
+      {(contractPreview?.wouldRejectEditedPatch || approval.would_reject_edited_patch) ? (
+        <p className="mb-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-100">
+          Observe mode allowed this legacy edited-patch replay. Enforce mode requires the new digest-bound approval.
+        </p>
+      ) : null}
       {patchValidationBlocked ? (
         <p className="mb-3 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
           Approval is blocked until the edited patch validates successfully.
@@ -552,9 +603,9 @@ function ApprovalReviewCard({
           variant="secondary"
           className="h-7 rounded-full px-3 text-xs"
           disabled={patchValidationBlocked}
-          loading={isResolvingApprovalKey === `${approval.approval_id}:approve_once`}
-          onClick={() => void onResolve(approval.approval_id, 'approve_once', {
-            replayOverride: reviewState.isEditingPatch && patchTextChanged
+          loading={isResolvingApprovalKey === `${effectiveApprovalId}:approve_once`}
+          onClick={() => void onResolve(effectiveApprovalId, 'approve_once', {
+            replayOverride: shouldReplayEditedPatch
               ? { patchText: reviewState.patchText }
               : undefined,
           })}
@@ -567,14 +618,14 @@ function ApprovalReviewCard({
             variant="secondary"
             className="h-7 rounded-full px-3 text-xs"
             disabled={patchValidationBlocked}
-            loading={isResolvingApprovalKey === `${approval.approval_id}:approve_and_save_rule`}
+            loading={isResolvingApprovalKey === `${effectiveApprovalId}:approve_and_save_rule`}
             onClick={() =>
               void onResolve(
-                approval.approval_id,
+                effectiveApprovalId,
                 'approve_and_save_rule',
                 {
                   rule: approval.suggested_rule ?? undefined,
-                  replayOverride: reviewState.isEditingPatch && patchTextChanged
+                  replayOverride: shouldReplayEditedPatch
                     ? { patchText: reviewState.patchText }
                     : undefined,
                 }
@@ -588,8 +639,8 @@ function ApprovalReviewCard({
           size="sm"
           variant="outline"
           className="h-7 rounded-full px-3 text-xs"
-          loading={isResolvingApprovalKey === `${approval.approval_id}:reject`}
-          onClick={() => void onReject(approval.approval_id)}
+          loading={isResolvingApprovalKey === `${effectiveApprovalId}:reject`}
+          onClick={() => void onReject(effectiveApprovalId)}
         >
           Reject
         </Button>

@@ -5551,6 +5551,15 @@ export interface ApprovalSummary {
   file_change_groups: FileChangeGroupSummary[]
   editable_patch_text: string | null
   patch_validation_supported: boolean
+  change_set_id: string | null
+  request_digest: string | null
+  change_contract_mode: 'observe' | 'enforce'
+  change_expires_at: string | null
+  change_policy_version: string | null
+  approval_state: string | null
+  supersedes_approval_id: string | null
+  superseded_by_approval_id: string | null
+  would_reject_edited_patch: boolean
 }
 
 export interface CreateTaskInput {
@@ -5752,6 +5761,15 @@ function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
       getBoolean(record.patch_validation_supported) ??
       getBoolean(record.supports_patch_validation) ??
       editablePatchText !== null,
+    change_set_id: getNullableString(record.change_set_id),
+    request_digest: getNullableString(record.request_digest),
+    change_contract_mode: getString(record.change_contract_mode) === 'enforce' ? 'enforce' : 'observe',
+    change_expires_at: getNullableString(record.change_expires_at),
+    change_policy_version: getNullableString(record.change_policy_version),
+    approval_state: getNullableString(record.approval_state),
+    supersedes_approval_id: getNullableString(record.supersedes_approval_id),
+    superseded_by_approval_id: getNullableString(record.superseded_by_approval_id),
+    would_reject_edited_patch: getBoolean(record.would_reject_edited_patch) ?? false,
   }
 }
 
@@ -5861,10 +5879,8 @@ export async function resolveApproval(
             arguments: {
               patch: input.replayOverride.patchText ?? '',
             },
-            patch_text: input.replayOverride.patchText ?? null,
           }
         : undefined,
-      edited_patch_text: input.replayOverride?.patchText ?? undefined,
     }),
   })
   return normalizeApprovalSummary(payload)

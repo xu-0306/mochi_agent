@@ -50,6 +50,7 @@ from mochi.runtime.approvals import (
     ApprovalStatus,
     ApprovalStore,
 )
+from mochi.runtime.change_sets import ChangeSetStore
 from mochi.runtime.collector_contracts import (
     COLLECTOR_SHARD_MANIFEST_ARTIFACT_TYPE,
     FAILED_COLLECTOR_SHARD_STATUSES,
@@ -100,8 +101,15 @@ from mochi.security.policy import (
 from mochi.security.rollout import project_protected_workspace_rollout
 from mochi.tools.base import ToolExecutionContext, ToolResult
 from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_exec_runtime
-from mochi.tools.file_mutations import summarize_file_change_payload
-from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileWriteTool
+from mochi.tools.file_mutations import PatchValidationError, summarize_file_change_payload
+from mochi.tools.file_ops import (
+    ApplyPatchTool,
+    FileChangeContractConflict,
+    FileEditTool,
+    FileWriteTool,
+    prepare_patch_change_contract,
+    revalidate_patch_change_contract,
+)
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 DELEGATED_TASK_RESUMABLE_STATUS = {
@@ -6676,7 +6684,7 @@ class RuntimeService:
             return None
         return _task_summary((await self._store.get_task_run(task_id)) or task)
 
-    def _prepare_task_approval_request_metadata(
+    async def _prepare_task_approval_request_metadata(
         self,
         *,
         task: Mapping[str, Any],
@@ -6685,6 +6693,33 @@ class RuntimeService:
     ) -> dict[str, Any]:
         metadata = dict(approval_metadata or {})
         tool_name = str(request_event.get("tool_name") or "").strip()
+        if tool_name == "apply_patch":
+            arguments = request_event.get("arguments")
+            arguments = arguments if isinstance(arguments, Mapping) else {}
+            patch = arguments.get("patch")
+            workspace_dir = (
+                task.get("task_workspace_dir")
+                or task.get("project_workspace_dir")
+                or task.get("workspace_dir")
+            )
+            if isinstance(patch, str) and isinstance(workspace_dir, str):
+                try:
+                    _, change_payload, contract = await prepare_patch_change_contract(
+                        runtime_store=self._store,
+                        patch=patch,
+                        workspace_dir=workspace_dir,
+                        security=self._security_config,
+                        requester_id=f"runtime-task:{task.get('id')}",
+                        session_id=str(task.get("session_id") or "draft-session"),
+                        task_id=str(task.get("id") or ""),
+                        encoding=str(arguments.get("encoding") or "utf-8"),
+                    )
+                except (OSError, PatchValidationError, ValueError) as exc:
+                    metadata["change_contract_error"] = str(exc)
+                else:
+                    metadata.update(change_payload)
+                    metadata.update(contract)
+            return metadata
         if tool_name != "exec_command":
             return metadata
         linked_exec_approval_id = _linked_exec_approval_id(metadata)
@@ -6985,6 +7020,23 @@ class RuntimeService:
                         ),
                     )
             return _exec_approval_summary(resolved_exec)
+        if _is_file_mutation_approval(current):
+            mode = self._security_config.change_contract_mode
+            if mode == "enforce" and replay_override is not None:
+                raise ApprovalConflict("edited_patch_requires_new_preview")
+            if mode == "enforce" and decision != "reject":
+                task = await self._store.get_task_run(str(current.get("task_id") or ""))
+                if task is None:
+                    raise ApprovalConflict("change_set_conflicted")
+                try:
+                    await revalidate_patch_change_contract(
+                        runtime_store=self._store,
+                        approval=current,
+                        task=task,
+                        security=self._security_config,
+                    )
+                except FileChangeContractConflict as exc:
+                    raise ApprovalConflict("change_set_conflicted") from exc
         linked_exec_approval_id = _linked_exec_approval_id(current.get("metadata"))
         linked_exec = (
             self._exec_approval_store.get(linked_exec_approval_id)
@@ -7082,7 +7134,13 @@ class RuntimeService:
                 execution_key=execution_key,
                 lease_owner=lease_owner,
             )
-            return self._task_approval_summary(completed)
+            summary = self._task_approval_summary(completed)
+            if (
+                replay_override is not None
+                and self._security_config.change_contract_mode == "observe"
+            ):
+                summary["would_reject_edited_patch"] = True
+            return summary
         if await self._try_complete_task_with_linked_exec(
             approval,
             current=current,
@@ -7323,6 +7381,17 @@ class RuntimeService:
                 ToolResult(error="Associated task not found for file-mutation approval."),
             )
 
+        if self._security_config.change_contract_mode == "enforce":
+            try:
+                await revalidate_patch_change_contract(
+                    runtime_store=self._store,
+                    approval=current,
+                    task=task,
+                    security=self._security_config,
+                )
+            except FileChangeContractConflict as exc:
+                raise ApprovalConflict("change_set_conflicted") from exc
+            replay_override = None
         approved_call = _approved_tool_call(current, replay_override=replay_override)
         tool_name = str(approved_call.get("tool_name") or "")
         tool = self._build_file_mutation_tool(tool_name=tool_name, task=task)
@@ -7866,7 +7935,15 @@ class RuntimeService:
             result=result,
         )
         final_answer = _final_answer_from_file_mutation_result(result)
+        metadata = current.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        change_set_id = metadata.get("change_set_id")
         if result.error is None:
+            if isinstance(change_set_id, str) and change_set_id:
+                await ChangeSetStore(self._store).mark_change_set_status(
+                    change_set_id,
+                    status="applied",
+                )
             if final_answer is not None:
                 await self._store.append_task_event(
                     approval["task_id"],
@@ -7887,6 +7964,12 @@ class RuntimeService:
                 final_answer=final_answer,
             )
             return True
+
+        if isinstance(change_set_id, str) and change_set_id:
+            await ChangeSetStore(self._store).mark_change_set_status(
+                change_set_id,
+                status="conflicted",
+            )
 
         await self._store.append_task_event(
             approval["task_id"],
@@ -8022,23 +8105,31 @@ class RuntimeService:
                     continue
                 request_event = pending_requests[call_id]
                 approval_metadata = metadata if isinstance(metadata, dict) else {}
-                approval_metadata = self._prepare_task_approval_request_metadata(
+                approval_metadata = await self._prepare_task_approval_request_metadata(
                     task=task,
                     request_event=request_event,
                     approval_metadata=approval_metadata,
                 )
-                task_approval_binding = _approval_binding_kwargs(
-                    f"runtime-task:{task_id}",
-                    {
-                        "tool_name": str(request_event.get("tool_name", "")),
-                        "arguments": dict(request_event.get("arguments") or {}),
-                    },
-                    {
-                        "source": "runtime_task_approval",
-                        "task_id": task_id,
-                        "call_id": call_id,
-                    },
-                )
+                if isinstance(approval_metadata.get("request_digest"), str):
+                    task_approval_binding = {
+                        "requester_id": f"runtime-task:{task_id}",
+                        "request_digest": str(approval_metadata["request_digest"]),
+                        "context_digest": str(approval_metadata["context_digest"]),
+                        "expires_at": str(approval_metadata["expires_at"]),
+                    }
+                else:
+                    task_approval_binding = _approval_binding_kwargs(
+                        f"runtime-task:{task_id}",
+                        {
+                            "tool_name": str(request_event.get("tool_name", "")),
+                            "arguments": dict(request_event.get("arguments") or {}),
+                        },
+                        {
+                            "source": "runtime_task_approval",
+                            "task_id": task_id,
+                            "call_id": call_id,
+                        },
+                    )
                 await self._store.create_approval_request(
                     approval_id=str(uuid4()),
                     task_id=task_id,
@@ -13035,6 +13126,7 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
     metadata = approval.get("metadata") if isinstance(approval.get("metadata"), dict) else {}
     security_decision = SecurityDecision.from_metadata(metadata)
     file_change_summary = summarize_file_change_payload(metadata)
+    file_change_summary.pop("status", None)
     linked_exec_approval_id = _linked_exec_approval_id(metadata)
     exec_session_id = metadata.get("session_id") if isinstance(metadata.get("session_id"), str) else None
     exec_status = (
@@ -13084,6 +13176,15 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
         "exec_session_id": exec_session_id,
         "exec_status": exec_status,
         "execution_result": execution_result,
+        "change_set_id": metadata.get("change_set_id"),
+        "request_digest": metadata.get("request_digest"),
+        "change_contract_mode": metadata.get("change_contract_mode"),
+        "change_expires_at": metadata.get("expires_at"),
+        "change_policy_version": metadata.get("policy_version"),
+        "approval_state": metadata.get("approval_state"),
+        "supersedes_approval_id": metadata.get("supersedes_approval_id"),
+        "superseded_by_approval_id": metadata.get("superseded_by_approval_id"),
+        "would_reject_edited_patch": bool(metadata.get("would_reject_edited_patch", False)),
         **file_change_summary,
     }
 
@@ -13481,26 +13582,14 @@ def _preflight_exec_approval_binding(approval: Any | None) -> None:
         raise ApprovalConflict("Approval context digest does not match the bound context.")
 
 def _task_approval_binding_kwargs(approval: Mapping[str, Any]) -> dict[str, str]:
-    if str(approval.get("requester_id") or "legacy") == "legacy":
+    requester_id = str(approval.get("requester_id") or "legacy")
+    if requester_id == "legacy":
         return {}
-    task_id = str(approval.get("task_id") or "").strip()
-    return _approval_binding_kwargs(
-        f"runtime-task:{task_id}",
-        {
-            "tool_name": str(approval.get("tool_name") or ""),
-            "arguments": (
-                dict(approval.get("arguments"))
-                if isinstance(approval.get("arguments"), Mapping)
-                else {}
-            ),
-        },
-        {
-            "source": "runtime_task_approval",
-            "task_id": task_id,
-            "call_id": str(approval.get("call_id") or ""),
-        },
-    )
-
+    return {
+        "requester_id": requester_id,
+        "request_digest": str(approval.get("request_digest") or ""),
+        "context_digest": str(approval.get("context_digest") or ""),
+    }
 def _linked_exec_approval_id(metadata: Any) -> str | None:
     if not isinstance(metadata, dict):
         return None

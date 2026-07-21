@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mochi.api.server import create_app
@@ -78,7 +79,7 @@ def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
             f"/v1/approvals/{approval_id}/resolve",
             json={"decision": "approve_once", "reason": "allowed"},
         )
-        assert resolve_response.status_code == 200
+        assert resolve_response.status_code == 200, resolve_response.json()
         resolved = resolve_response.json()
         assert resolved["reason"] == "allowed"
         assert resolved["approval_kind"] == "exec"
@@ -112,7 +113,11 @@ def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
         str(expected_task_workspace),
     ]
 
-def test_file_mutation_approval_uses_replay_override_and_downgrades_save_rule(tmp_path: Path) -> None:
+@pytest.mark.parametrize("change_contract_mode", ["observe", "enforce"])
+def test_file_mutation_approval_binds_edited_patch_preview(
+    tmp_path: Path,
+    change_contract_mode: str,
+) -> None:
     app = create_app()
     engine = _RuntimeFileMutationFakeEngine()
     sessions_dir = tmp_path / "sessions"
@@ -123,6 +128,7 @@ def test_file_mutation_approval_uses_replay_override_and_downgrades_save_rule(tm
         {
             "sessions_dir": str(sessions_dir),
             "workspace_dir": str(project_workspace),
+            "security": {"change_contract_mode": change_contract_mode},
         }
     )
 
@@ -152,6 +158,7 @@ def test_file_mutation_approval_uses_replay_override_and_downgrades_save_rule(tm
         assert approval["allowed_decisions"] == ["approve_once", "reject"]
         assert approval["change_count"] == 1
         assert approval["file_changes"][0]["relative_path"] == "notes.py"
+        assert len(approval["request_digest"]) == 64
 
         edited_patch = "\n".join(
             [
@@ -175,22 +182,55 @@ def test_file_mutation_approval_uses_replay_override_and_downgrades_save_rule(tm
         assert preview_payload["valid"] is True
         assert preview_payload["workspace_dir"] == str(task_workspace.resolve())
         assert preview_payload["file_changes"][0]["relative_path"] == "notes.py"
+        assert preview_payload["change_contract_mode"] == change_contract_mode
+        assert len(preview_payload["request_digest"]) == 64
+
+        repeated_preview = client.post(
+            "/v1/workspace/patch/preview",
+            json={"approval_id": approval_id, "patch": edited_patch},
+        )
+        assert repeated_preview.status_code == 200
+        repeated_payload = repeated_preview.json()
+        assert repeated_payload["change_set_id"] == preview_payload["change_set_id"]
+        assert (
+            repeated_payload["replacement_approval_id"]
+            == preview_payload["replacement_approval_id"]
+        )
+
+        if change_contract_mode == "observe":
+            assert preview_payload["replacement_approval_id"] is None
+            assert preview_payload["would_reject_edited_patch"] is True
+            approval_to_resolve = approval_id
+            replay_override = {
+                "tool_name": "apply_patch",
+                "arguments": {"patch": edited_patch},
+            }
+        else:
+            approval_to_resolve = preview_payload["replacement_approval_id"]
+            assert approval_to_resolve != approval_id
+            assert preview_payload["approval_state"] == "replacement_pending"
+            replay_override = None
+            old_response = client.post(
+                f"/v1/approvals/{approval_id}/resolve",
+                json={"decision": "approve_once"},
+            )
+            assert old_response.status_code == 409
+            assert (task_workspace / "notes.py").read_text(encoding="utf-8") == "print('alpha')\n"
 
         resolve_response = client.post(
-            f"/v1/approvals/{approval_id}/resolve",
+            f"/v1/approvals/{approval_to_resolve}/resolve",
             json={
                 "decision": "approve_and_save_rule",
                 "reason": "apply edited patch",
-                "replay_override": {
-                    "tool_name": "apply_patch",
-                    "arguments": {"patch": edited_patch},
-                },
+                **({"replay_override": replay_override} if replay_override else {}),
             },
         )
-        assert resolve_response.status_code == 200
+        assert resolve_response.status_code == 200, resolve_response.json()
         resolved = resolve_response.json()
         assert resolved["status"] == "consumed"
         assert resolved["decision"] == "approve_once"
+        if change_contract_mode == "observe":
+            assert resolved["would_reject_edited_patch"] is True
 
         done_payload = _wait_until(client, task_id, {"succeeded"})
         assert done_payload["status"] == "succeeded"
@@ -199,6 +239,50 @@ def test_file_mutation_approval_uses_replay_override_and_downgrades_save_rule(tm
     assert (task_workspace / "notes.py").read_text(encoding="utf-8") == "print('gamma')\n"
     assert len(engine.permission_policy_calls) == 1
 
+
+def test_enforced_file_approval_rejects_stale_manifest_without_writing(
+    tmp_path: Path,
+) -> None:
+    app = create_app()
+    engine = _RuntimeFileMutationFakeEngine()
+    sessions_dir = tmp_path / "sessions"
+    project_workspace = tmp_path / "project-workspace"
+    project_workspace.mkdir(parents=True)
+    app.state.engine_factory = lambda: engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "sessions_dir": str(sessions_dir),
+            "workspace_dir": str(project_workspace),
+            "security": {"change_contract_mode": "enforce"},
+        }
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/tasks",
+            json={
+                "input_message": "edit notes",
+                "session_id": "runtime-s1",
+                "workspace_dir": str(project_workspace),
+            },
+        ).json()
+        task_id = created["task_id"]
+        task_workspace = sessions_dir / "runtime-tasks" / task_id / "workspace"
+        task_workspace.mkdir(parents=True, exist_ok=True)
+        target = task_workspace / "notes.py"
+        target.write_text("print('alpha')\n", encoding="utf-8")
+        waiting = _wait_until(client, task_id, {"awaiting_approval"})
+        approval_id = waiting["pending_approval"]["id"]
+        target.write_text("print('external')\n", encoding="utf-8")
+
+        response = client.post(
+            f"/v1/approvals/{approval_id}/resolve",
+            json={"decision": "approve_once"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "change_set_conflicted"
+    assert target.read_text(encoding="utf-8") == "print('external')\n"
 def test_controlled_subagent_execution_task_runs_in_task_workspace(tmp_path: Path) -> None:
     app = create_app()
     engine = _AgentRunModelBackedEngine()

@@ -534,6 +534,103 @@ class RuntimeApprovalLifecycleMixin:
         await asyncio.to_thread(_op)
         return cast(dict[str, Any], await self.get_approval_request(approval_id))
 
+    async def supersede_and_create_approval_request(
+        self: _RuntimeStoreShape,
+        approval_id: str,
+        *,
+        replacement_approval_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        metadata: dict[str, Any],
+        requester_id: str,
+        request_digest: str,
+        context_digest: str,
+        expires_at: str,
+        reason: str = "superseded_by_new_preview",
+    ) -> dict[str, Any]:
+        """Atomically supersede one pending approval and insert its replacement."""
+
+        await self.initialize()
+        validate_ttl(_DEFAULT_TTL_SECONDS, expires_at=expires_at)
+
+        def _op() -> None:
+            with sqlite3.connect(self.database_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM approval_requests WHERE id=?",
+                    (approval_id,),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    raise ApprovalConflict("Only pending approvals can be superseded.")
+                transition = supersede_approval(_lifecycle_state(row))
+                now = transition.resolved_at or _now_iso()
+                old_metadata = json.loads(row["metadata_json"] or "{}")
+                old_metadata["superseded_by_approval_id"] = replacement_approval_id
+                cursor = conn.execute(
+                    """
+                    UPDATE approval_requests
+                    SET status=?,reason=?,resolved_at=?,updated_at=?,metadata_json=?
+                    WHERE id=? AND status='pending' AND expires_at>?
+                    """,
+                    (
+                        transition.status,
+                        reason,
+                        transition.resolved_at,
+                        now,
+                        json.dumps(old_metadata, ensure_ascii=False),
+                        approval_id,
+                        now,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    raise ApprovalConflict(
+                        "Approval supersede lost its compare-and-swap race."
+                    )
+                replacement_metadata = dict(metadata)
+                replacement_metadata["supersedes_approval_id"] = approval_id
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO approval_requests(
+                            id,task_id,call_id,tool_name,arguments_json,metadata_json,
+                            status,reason,resolved_at,created_at,updated_at,
+                            requester_id,request_digest,context_digest,expires_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            replacement_approval_id,
+                            str(row["task_id"]),
+                            str(row["call_id"]),
+                            tool_name,
+                            json.dumps(arguments, ensure_ascii=False),
+                            json.dumps(replacement_metadata, ensure_ascii=False),
+                            "pending",
+                            None,
+                            None,
+                            now,
+                            now,
+                            requester_id,
+                            request_digest,
+                            context_digest,
+                            expires_at,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    conn.rollback()
+                    raise ApprovalConflict(
+                        f"Approval {replacement_approval_id} already exists."
+                    ) from exc
+                conn.commit()
+
+        await asyncio.to_thread(_op)
+        return cast(
+            dict[str, Any],
+            await self.get_approval_request(replacement_approval_id),
+        )
+
     async def recover_stale_approval_consumptions(
         self: _RuntimeStoreShape,
     ) -> int:

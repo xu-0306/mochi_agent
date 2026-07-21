@@ -11,13 +11,20 @@ from mochi.projects.store import ProjectStore
 from mochi.sessions.store import SessionStore
 
 
-def _create_test_app(*, workspace_dir: Path, sessions_dir: Path, projects_path: Path):
+def _create_test_app(
+    *,
+    workspace_dir: Path,
+    sessions_dir: Path,
+    projects_path: Path,
+    change_contract_mode: str = "observe",
+):
     app = create_app()
     app.state.config_factory = lambda: MochiConfig.model_validate(
         {
             "model": "ollama:test",
             "workspace_dir": str(workspace_dir),
             "sessions_dir": str(sessions_dir),
+            "security": {"change_contract_mode": change_contract_mode},
         }
     )
     app.state.session_store = SessionStore(sessions_dir)
@@ -241,3 +248,55 @@ def test_workspace_patch_preview_returns_validation_errors(tmp_path: Path) -> No
         denied_payload = denied.json()
         assert denied_payload["valid"] is False
         assert denied_payload["validation_errors"]
+
+def test_workspace_patch_preview_persists_idempotent_digest_bound_manifest(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "workspace"
+    sessions_dir = tmp_path / "sessions"
+    workspace_dir.mkdir(parents=True)
+    target = workspace_dir / "notes.py"
+    target.write_text("print('alpha')\n", encoding="utf-8")
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: notes.py",
+            "@@",
+            "-print('alpha')",
+            "+print('beta')",
+            "*** End Patch",
+        ]
+    )
+    app = _create_test_app(
+        workspace_dir=workspace_dir,
+        sessions_dir=sessions_dir,
+        projects_path=tmp_path / "projects.json",
+        change_contract_mode="enforce",
+    )
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/workspace/patch/preview",
+            json={"session_id": "session-a", "patch": patch},
+        )
+        second = client.post(
+            "/v1/workspace/patch/preview",
+            json={"session_id": "session-a", "patch": patch},
+        )
+        other_context = client.post(
+            "/v1/workspace/patch/preview",
+            json={"session_id": "session-b", "patch": patch},
+        )
+
+    assert first.status_code == 200
+    first_payload = first.json()
+    second_payload = second.json()
+    other_payload = other_context.json()
+    assert first_payload["change_contract_mode"] == "enforce"
+    assert first_payload["policy_version"]
+    assert first_payload["expires_at"]
+    assert len(first_payload["request_digest"]) == 64
+    assert first_payload["change_set_id"] == second_payload["change_set_id"]
+    assert first_payload["request_digest"] == second_payload["request_digest"]
+    assert first_payload["change_set_id"] != other_payload["change_set_id"]
+    assert first_payload["request_digest"] != other_payload["request_digest"]

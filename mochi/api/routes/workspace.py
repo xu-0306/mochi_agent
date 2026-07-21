@@ -7,6 +7,7 @@ import mimetypes
 import subprocess
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
@@ -16,10 +17,19 @@ from mochi.api.routes.filesystem import _preview_docx, _preview_pdf, _preview_te
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
 from mochi.projects.execution_scope import ExecutionScopeResolver
+from mochi.runtime.approvals import ApprovalConflict
 from mochi.runtime.store import RuntimeStore
 from mochi.sessions.store import SessionStore
-from mochi.tools.file_mutations import PatchValidationError, prepare_apply_patch
-from mochi.utils.security import is_path_within_workspace, normalize_workspace_dir, resolve_path_in_workspace
+from mochi.tools.file_mutations import PatchValidationError
+from mochi.tools.file_ops import (
+    file_change_policy_version,
+    prepare_patch_change_contract,
+)
+from mochi.utils.security import (
+    is_path_within_workspace,
+    normalize_workspace_dir,
+    resolve_path_in_workspace,
+)
 
 router = APIRouter(prefix="/v1/workspace", tags=["workspace"])
 
@@ -245,13 +255,45 @@ async def preview_workspace_patch(
         approval_id=payload.approval_id,
     )
     config = await _get_config(request.app)
+    runtime_store = await _get_runtime_store(request)
+    approval: dict[str, Any] | None = None
+    task: dict[str, Any] | None = None
+    if payload.approval_id:
+        approval = await runtime_store.get_approval_request(payload.approval_id)
+        if approval is None:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        task_id = approval.get("task_id")
+        task = (
+            await runtime_store.get_task_run(task_id)
+            if isinstance(task_id, str) and task_id
+            else None
+        )
+
+    requester_id = (
+        str(approval.get("requester_id") or f"runtime-task:{approval.get('task_id')}")
+        if approval is not None
+        else "workspace-preview"
+    )
+    session_id = (
+        str(task.get("session_id") or "draft-session")
+        if task is not None
+        else payload.session_id or "draft-session"
+    )
+    task_id = (
+        str(approval.get("task_id"))
+        if approval is not None and approval.get("task_id")
+        else None
+    )
     try:
-        _, change_payload = await prepare_apply_patch(
+        _, change_payload, contract = await prepare_patch_change_contract(
+            runtime_store=runtime_store,
             patch=payload.patch,
             workspace_dir=workspace_root,
-            path_scope=config.security.file_ops_scope,
+            security=config.security,
+            requester_id=requester_id,
+            session_id=session_id,
+            task_id=task_id,
             encoding=payload.encoding,
-            undo_max_size_mb=config.security.file_undo_max_size_mb,
         )
     except PatchValidationError as exc:
         return {
@@ -270,11 +312,91 @@ async def preview_workspace_patch(
             "errors": [str(exc)],
             "validation_errors": [str(exc)],
             "warnings": [],
+            "change_contract_mode": config.security.change_contract_mode,
+            "change_set_id": None,
+            "request_digest": None,
+            "expires_at": None,
+            "policy_version": file_change_policy_version(config.security),
+            "replacement_approval_id": None,
+            "approval_state": "invalid",
+            "would_reject_edited_patch": False,
         }
 
+    replacement_approval_id: str | None = None
+    approval_state = "preview_only"
+    would_reject_edited_patch = False
+    if approval is not None:
+        approval_metadata = approval.get("metadata")
+        approval_metadata = (
+            approval_metadata if isinstance(approval_metadata, dict) else {}
+        )
+        current_approval_state = str(approval.get("status") or "pending")
+        stored_arguments = approval.get("arguments")
+        stored_arguments = stored_arguments if isinstance(stored_arguments, dict) else {}
+        stored_patch = stored_arguments.get("patch")
+        patch_changed = not isinstance(stored_patch, str) or stored_patch != payload.patch
+        if config.security.change_contract_mode == "observe":
+            would_reject_edited_patch = patch_changed
+            approval_state = "shadow_preview"
+        elif not patch_changed:
+            approval_state = current_approval_state
+        elif current_approval_state == "superseded":
+            existing_replacement_id = approval_metadata.get(
+                "superseded_by_approval_id"
+            )
+            existing_replacement = (
+                await runtime_store.get_approval_request(existing_replacement_id)
+                if isinstance(existing_replacement_id, str)
+                else None
+            )
+            if (
+                existing_replacement is None
+                or existing_replacement.get("request_digest")
+                != contract["request_digest"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Approval was superseded by another patch preview.",
+                )
+            replacement_approval_id = existing_replacement_id
+            approval_state = "replacement_pending"
+        else:
+            replacement_approval_id = str(uuid4())
+            replacement_metadata = {
+                **(
+                    dict(approval.get("metadata"))
+                    if isinstance(approval.get("metadata"), dict)
+                    else {}
+                ),
+                **change_payload,
+                **contract,
+                "approval_state": "replacement_pending",
+            }
+            try:
+                await runtime_store.supersede_and_create_approval_request(
+                    str(approval["id"]),
+                    replacement_approval_id=replacement_approval_id,
+                    tool_name="apply_patch",
+                    arguments={"patch": payload.patch, "encoding": payload.encoding},
+                    metadata=replacement_metadata,
+                    requester_id=requester_id,
+                    request_digest=str(contract["request_digest"]),
+                    context_digest=str(contract["context_digest"]),
+                    expires_at=str(contract["expires_at"]),
+                )
+            except ApprovalConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            approval_state = "replacement_pending"
+
+    warnings: list[str] = []
+    if would_reject_edited_patch:
+        warnings.append(
+            "Observe mode executed the legacy edited patch; enforce mode would "
+            "require the replacement approval."
+        )
     return {
         "type": "workspace_patch_preview",
-        "session_id": payload.session_id or "draft-session",
+        "session_id": payload.session_id or session_id,
         "project_id": resolved_project_id,
         "workspace_dir": str(workspace_root),
         "valid": True,
@@ -285,9 +407,13 @@ async def preview_workspace_patch(
         ),
         "patch_text": payload.patch,
         **change_payload,
+        **contract,
+        "replacement_approval_id": replacement_approval_id,
+        "approval_state": approval_state,
+        "would_reject_edited_patch": would_reject_edited_patch,
         "errors": [],
         "validation_errors": [],
-        "warnings": [],
+        "warnings": warnings,
     }
 
 
@@ -307,7 +433,7 @@ async def resolve_workspace_scope(
 
     config = await _get_config(request.app)
     resolver = ExecutionScopeResolver(
-        default_workspace_dir=str(getattr(config, "workspace_dir")),
+        default_workspace_dir=str(config.workspace_dir),
         session_store=await _get_session_store(request),
         project_store=_get_project_store(request.app, config=config),
     )
