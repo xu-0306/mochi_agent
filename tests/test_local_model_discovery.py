@@ -719,7 +719,7 @@ class _FakeResponse:
     def json(self) -> dict[str, object]:
         return self._json_data
 
-    async def __aenter__(self) -> "_FakeResponse":
+    async def __aenter__(self) -> _FakeResponse:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

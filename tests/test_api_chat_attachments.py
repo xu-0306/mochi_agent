@@ -213,7 +213,6 @@ def test_chat_route_serializes_workspace_tool_exposure_and_transport_diagnostics
                 "session_id": "session-diagnostics",
             },
         )
-        session_response = client.get("/v1/sessions/session-diagnostics")
 
     assert response.status_code == 200
     payload = response.json()

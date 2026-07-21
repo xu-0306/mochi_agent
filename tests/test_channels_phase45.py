@@ -1105,7 +1105,7 @@ def test_build_channel_manager_injects_voice_runtime_integrations(monkeypatch: p
     adapter = manager.get("discord")
 
     assert adapter is not None
-    runtime = getattr(adapter, "_voice_runtime")
+    runtime = adapter._voice_runtime
     assert runtime._voice_session_factory is not None
     assert runtime._reply_synthesizer is not None
 
