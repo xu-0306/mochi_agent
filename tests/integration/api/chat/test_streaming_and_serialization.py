@@ -27,20 +27,19 @@ def test_chat_stream_route_returns_sse_events_incrementally() -> None:
     """`POST /v1/chat/stream` 應以 SSE 逐筆送出 serialized chat events。"""
     app, engine = _build_app()
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={"message": "現在幾點？", "session_id": "session-42"},
-        ) as response:
-            chunks = [
-                line.removeprefix("data: ")
-                for line in response.iter_lines()
-                if line.startswith("data: ")
-            ]
-            session_id = response.headers["x-session-id"]
-            cache_control = response.headers["cache-control"]
-            content_type = response.headers["content-type"]
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={"message": "現在幾點？", "session_id": "session-42"},
+    ) as response:
+        chunks = [
+            line.removeprefix("data: ")
+            for line in response.iter_lines()
+            if line.startswith("data: ")
+        ]
+        session_id = response.headers["x-session-id"]
+        cache_control = response.headers["cache-control"]
+        content_type = response.headers["content-type"]
 
     assert response.status_code == 200
     assert engine.chat_calls == [("現在幾點？", "session-42")]

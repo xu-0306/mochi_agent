@@ -196,9 +196,8 @@ async def test_codex_backend_raises_auth_specific_error_when_refresh_fails_after
             "post",
             new_callable=AsyncMock,
             side_effect=unauthorized,
-        ):
-            with pytest.raises(BackendRequestError) as exc_info:
-                await backend.generate(messages=[Message(role="user", content="hi")], stream=False)
+        ), pytest.raises(BackendRequestError) as exc_info:
+            await backend.generate(messages=[Message(role="user", content="hi")], stream=False)
     finally:
         await backend.close()
 

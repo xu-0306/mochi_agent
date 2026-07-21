@@ -151,26 +151,25 @@ def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_ra
     engine.close = _noop_close.__get__(engine, AgentEngine)  # type: ignore[attr-defined]
     app, _ = _build_app(engine=engine)  # type: ignore[arg-type]
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={"message": "finish first", "session_id": "session-complete-race"},
-        ) as response:
-            seen_final = False
-            for line in response.iter_lines():
-                if not line.startswith("data: "):
-                    continue
-                payload = json.loads(line.removeprefix("data: "))
-                if payload.get("type") == "final_answer":
-                    seen_final = True
-                    break
-            assert seen_final is True
-            turn_id = response.headers["x-turn-id"]
-            cancel_response = client.post(
-                "/v1/chat/session-complete-race/cancel",
-                json={"turn_id": turn_id},
-            )
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={"message": "finish first", "session_id": "session-complete-race"},
+    ) as response:
+        seen_final = False
+        for line in response.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = json.loads(line.removeprefix("data: "))
+            if payload.get("type") == "final_answer":
+                seen_final = True
+                break
+        assert seen_final is True
+        turn_id = response.headers["x-turn-id"]
+        cancel_response = client.post(
+            "/v1/chat/session-complete-race/cancel",
+            json={"turn_id": turn_id},
+        )
 
     assert cancel_response.status_code == 200
     assert cancel_response.json()["status"] == "already_completed"

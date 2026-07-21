@@ -226,9 +226,8 @@ def test_goal_strategy_registry_endpoint_includes_test_injected_entries(
         selection_guidance="Injected strategy used for route registry tests.",
     )
 
-    with registered_goal_strategy_entries_for_test((injected,)):
-        with _create_goal_test_client(tmp_path) as client:
-            response = client.get("/v1/goals/strategies")
+    with registered_goal_strategy_entries_for_test((injected,)), _create_goal_test_client(tmp_path) as client:
+        response = client.get("/v1/goals/strategies")
 
     assert response.status_code == 200
     entries = {entry["id"]: entry for entry in response.json()["entries"]}
@@ -587,14 +586,13 @@ def test_goal_create_selects_injected_registry_strategy_from_semantic_registry_e
         ),
     )
 
-    with registered_goal_strategy_entries_for_test((injected,)):
-        with _create_goal_test_client(tmp_path) as client:
-            create_response = client.post(
-                "/v1/goals",
-                json={
-                    "objective": "Merge overlapping field notes into a reconciled panorama map for this expedition.",
-                },
-            )
+    with registered_goal_strategy_entries_for_test((injected,)), _create_goal_test_client(tmp_path) as client:
+        create_response = client.post(
+            "/v1/goals",
+            json={
+                "objective": "Merge overlapping field notes into a reconciled panorama map for this expedition.",
+            },
+        )
 
     assert create_response.status_code == 200
     created = create_response.json()

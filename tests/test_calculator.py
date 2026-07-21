@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 import pytest
 
 from mochi.tools.calculator import CalculatorTool, safe_evaluate

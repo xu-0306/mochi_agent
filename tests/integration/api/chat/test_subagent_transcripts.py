@@ -514,20 +514,19 @@ def test_chat_subagent_stream_projects_live_delegated_runtime_events(tmp_path: P
     app.state.session_store = SessionStore(sessions_dir)
     app.state.runtime_service = runtime_service
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={
-                "message": "Delegate this and keep streaming live status.",
-                "session_id": "session-live-projection",
-            },
-        ) as response:
-            chunks = [
-                line.removeprefix("data: ")
-                for line in response.iter_lines()
-                if line.startswith("data: ")
-            ]
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={
+            "message": "Delegate this and keep streaming live status.",
+            "session_id": "session-live-projection",
+        },
+    ) as response:
+        chunks = [
+            line.removeprefix("data: ")
+            for line in response.iter_lines()
+            if line.startswith("data: ")
+        ]
 
     assert response.status_code == 200
     assert engine.chat_calls == [
@@ -646,20 +645,19 @@ def test_chat_subagent_stream_projects_live_delegated_control_events(tmp_path: P
     app.state.session_store = SessionStore(sessions_dir)
     app.state.runtime_service = runtime_service
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={
-                "message": "Delegate and stream live control events.",
-                "session_id": "session-subagent-live-control-stream",
-            },
-        ) as response:
-            chunks = [
-                line.removeprefix("data: ")
-                for line in response.iter_lines()
-                if line.startswith("data: ")
-            ]
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={
+            "message": "Delegate and stream live control events.",
+            "session_id": "session-subagent-live-control-stream",
+        },
+    ) as response:
+        chunks = [
+            line.removeprefix("data: ")
+            for line in response.iter_lines()
+            if line.startswith("data: ")
+        ]
 
     assert response.status_code == 200
     assert engine.chat_calls == [

@@ -1590,20 +1590,19 @@ def test_build_subagent_lifecycle_events_tracks_delegate_result_status(
         store=RuntimeStore(sessions_dir / "runtime-status.db"),
     )
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={
-                "message": "Delegate the comparison.",
-                "session_id": f"session-status-{delegate_status}",
-            },
-        ) as response:
-            chunks = [
-                line.removeprefix("data: ")
-                for line in response.iter_lines()
-                if line.startswith("data: ")
-            ]
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={
+            "message": "Delegate the comparison.",
+            "session_id": f"session-status-{delegate_status}",
+        },
+    ) as response:
+        chunks = [
+            line.removeprefix("data: ")
+            for line in response.iter_lines()
+            if line.startswith("data: ")
+        ]
 
     assert response.status_code == 200
     events = [json.loads(chunk) for chunk in chunks]
