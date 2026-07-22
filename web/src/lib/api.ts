@@ -4264,16 +4264,24 @@ export interface SecuritySettings {
 
 export interface SandboxSettings {
   mode: 'off' | 'preferred' | 'required'
-  backend: string | null
+  backend: string
+  backend_version: string
   backend_available: boolean
-  capabilities: { exec_containment: boolean }
+  capabilities: {
+    exec_containment: boolean
+    filesystem: boolean
+    process: boolean
+    network: boolean
+    detached: boolean
+  }
   enforcement_active: boolean
   configured_policy_decision: 'allow_host' | 'prefer_sandbox_backend' | 'reject_backend_unavailable'
-  effective_exec_behavior: 'host_execution_available'
-  status: 'not_enforced' | 'configured_unavailable'
+  effective_exec_behavior: 'host_execution_available' | 'host_execution_degraded' | 'sandbox_execution_active' | 'sandbox_execution_required' | 'execution_blocked'
+  status: 'not_enforced' | 'configured_unavailable' | 'degraded' | 'enforced'
   degraded: boolean
   degraded_reason: string | null
   host_execution_allowed: boolean
+  last_probe_at: string | null
 }
 
 export interface CommandRule {
@@ -5378,7 +5386,8 @@ function normalizeSandboxSettings(value: unknown): SandboxSettings {
     rawMode === 'preferred' || rawMode === 'required' ? rawMode : 'off'
   const rawStatus = getString(record.status)
   const status: SandboxSettings['status'] =
-    rawStatus === 'not_enforced' || rawStatus === 'configured_unavailable'
+    rawStatus === 'not_enforced' || rawStatus === 'configured_unavailable' ||
+    rawStatus === 'degraded' || rawStatus === 'enforced'
       ? rawStatus
       : mode === 'off'
         ? 'not_enforced'
@@ -5394,21 +5403,35 @@ function normalizeSandboxSettings(value: unknown): SandboxSettings {
           ? 'reject_backend_unavailable'
           : 'allow_host'
   const capabilities = isRecord(record.capabilities) ? record.capabilities : {}
+  const rawEffectiveBehavior = getString(record.effective_exec_behavior)
+  const effectiveExecBehavior: SandboxSettings['effective_exec_behavior'] =
+    rawEffectiveBehavior === 'host_execution_degraded' ||
+    rawEffectiveBehavior === 'sandbox_execution_active' ||
+    rawEffectiveBehavior === 'sandbox_execution_required' ||
+    rawEffectiveBehavior === 'execution_blocked'
+      ? rawEffectiveBehavior
+      : 'host_execution_available'
 
   return {
     mode,
-    backend: getString(record.backend),
+    backend: getString(record.backend) ?? 'host',
+    backend_version: getString(record.backend_version) ?? 'unknown',
     backend_available: getBoolean(record.backend_available) ?? false,
     capabilities: {
       exec_containment: getBoolean(capabilities.exec_containment) ?? false,
+      filesystem: getBoolean(capabilities.filesystem) ?? false,
+      process: getBoolean(capabilities.process) ?? false,
+      network: getBoolean(capabilities.network) ?? false,
+      detached: getBoolean(capabilities.detached) ?? false,
     },
     enforcement_active: getBoolean(record.enforcement_active) ?? false,
     configured_policy_decision: configuredPolicyDecision,
-    effective_exec_behavior: 'host_execution_available',
+    effective_exec_behavior: effectiveExecBehavior,
     status,
     degraded: getBoolean(record.degraded) ?? mode !== 'off',
     degraded_reason: getString(record.degraded_reason),
-    host_execution_allowed: getBoolean(record.host_execution_allowed) ?? true,
+    host_execution_allowed: getBoolean(record.host_execution_allowed) ?? mode !== 'required',
+    last_probe_at: getString(record.last_probe_at),
   }
 }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -12,13 +13,15 @@ from mochi.runtime.approvals import (
     InMemoryApprovalStore,
 )
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.runtime.sandbox import SandboxPlan
+from mochi.runtime.sandbox.base import HostSandboxBackend
 from mochi.tools.base import ActiveToolController, ToolExecutionContext
 from mochi.tools.exec_command import ExecCommandTool
 from mochi.tools.kill_session import KillSessionTool
 from mochi.tools.list_sessions import ListSessionsTool
 from mochi.tools.read_session import ReadSessionTool
 from mochi.tools.write_stdin import WriteStdinTool
-from mochi.utils.shell_providers import BaseShellProvider, SubprocessSpec
+from mochi.utils.shell_providers import BaseShellProvider, CmdProvider, SubprocessSpec
 
 
 def _allow_rule(*tokens: str, shells: list[str] | None = None) -> dict[str, object]:
@@ -171,7 +174,7 @@ async def test_exec_command_foreground_cancellation_reports_cancelled_status() -
 @pytest.mark.asyncio
 async def test_exec_command_returns_approval_pending_metadata() -> None:
     runtime = ExecRuntime(
-        providers={"test": _PythonDirectProvider()},
+        providers={"test": _PythonDirectProvider(), "cmd": CmdProvider()},
         default_shell="test",
     )
     approvals = InMemoryApprovalStore()
@@ -201,6 +204,65 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
     assert len(stored.context_digest) == 64
     assert set(stored.request_digest) <= set("0123456789abcdef")
     assert set(stored.context_digest) <= set("0123456789abcdef")
+    assert isinstance(stored.command_payload, dict)
+    sandbox_plan = stored.command_payload.get("sandbox_plan")
+    assert isinstance(sandbox_plan, dict)
+    assert SandboxPlan.from_dict(sandbox_plan).digest == sandbox_plan["plan_digest"]
+
+
+@pytest.mark.asyncio
+async def test_exec_command_preferred_mode_reports_host_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    monkeypatch.setattr(
+        "mochi.runtime.exec_runtime.select_sandbox_backend",
+        lambda mode: HostSandboxBackend(degraded_reason=f"{mode}_backend_unavailable"),
+    )
+    tool = ExecCommandTool(
+        runtime=runtime,
+        workspace_dir=tmp_path,
+        command_rules=[_allow_rule("fg", shells=["test"])],
+        sandbox_mode="preferred",
+    )
+
+    result = await tool.execute(command="fg", shell="test")
+
+    assert result.error is None
+    assert result.metadata["sandbox_backend"] == "host"
+    assert result.metadata["sandbox_degraded"] is True
+    assert result.metadata["sandbox_degraded_reason"] == "preferred_backend_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_required_mode_blocks_when_backend_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    monkeypatch.setattr(
+        "mochi.runtime.exec_runtime.select_sandbox_backend",
+        lambda mode: HostSandboxBackend(degraded_reason=f"{mode}_backend_unavailable"),
+    )
+    tool = ExecCommandTool(
+        runtime=runtime,
+        workspace_dir=tmp_path,
+        command_rules=[_allow_rule("fg", shells=["test"])],
+        sandbox_mode="required",
+    )
+
+    result = await tool.execute(command="fg", shell="test")
+
+    assert result.error is not None
+    assert result.metadata["status"] == "denied"
+    assert result.metadata["sandbox_enforcement_unavailable"] is True
 
 
 @pytest.mark.asyncio

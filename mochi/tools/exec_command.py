@@ -19,6 +19,7 @@ from mochi.runtime.approvals import (
 )
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.exec_sessions import ExecSessionStatus, SessionPollResult
+from mochi.runtime.sandbox import SandboxMode, SandboxPlan
 from mochi.security import deny_security_decision
 from mochi.security.auto_review import (
     AutoReviewDecision,
@@ -34,7 +35,6 @@ from mochi.security.file_contract import (
     EnvVarHash,
     ExecRequest,
     ResourceLimits,
-    canonical_json,
     capture_file_identity,
 )
 from mochi.security.policy import policy_projection_version
@@ -67,14 +67,12 @@ def _build_exec_authorization_envelope(
     workspace_root: Path,
     resolved_cwd: Path,
     normalized_env: dict[str, str] | None,
-    timeout_sec: float,
-    background: bool,
-    tty: bool,
     sandbox_permissions: str,
     autonomy_mode: str,
     effective_require_approval: bool,
     context: ToolExecutionContext | None,
     owner_task_id: str | None,
+    sandbox_plan: SandboxPlan,
 ) -> AuthorizationEnvelope:
     parsed_tokens = classification.parsed_tokens
     if not parsed_tokens:
@@ -98,15 +96,6 @@ def _build_exec_authorization_envelope(
         EnvVarHash(key=str(key), value_sha256=_sha256(value))
         for key, value in sorted((normalized_env or {}).items())
     )
-    sandbox_plan = {
-        "backend": "host",
-        "background": bool(background),
-        "filesystem_enforced": False,
-        "network_enforced": False,
-        "process_enforced": False,
-        "timeout_milliseconds": int(math.ceil(timeout_sec * 1000)),
-        "tty": bool(tty),
-    }
     policy_version = policy_projection_version(
         "exec-policy",
         {
@@ -126,19 +115,22 @@ def _build_exec_authorization_envelope(
         exec_request=ExecRequest(
             command_utf8_sha256=_sha256(command),
             shell=shell,
-            executable=parsed_tokens[0],
-            argv=tuple(parsed_tokens[1:]),
+            executable=sandbox_plan.executable,
+            argv=sandbox_plan.argv,
             resolved_cwd=str(resolved_cwd),
             env=env_hashes,
-            network_policy="allow",
+            network_policy=sandbox_plan.network_policy,
             resource_limits=ResourceLimits(
-                timeout_seconds=max(1, int(math.ceil(timeout_sec))),
-                memory_limit_mb=0,
-                output_limit_bytes=1_048_576,
+                timeout_seconds=max(
+                    1,
+                    int(math.ceil(sandbox_plan.resource_limits.timeout_milliseconds / 1000)),
+                ),
+                memory_limit_mb=sandbox_plan.resource_limits.memory_limit_mb,
+                output_limit_bytes=sandbox_plan.resource_limits.output_limit_bytes,
             ),
             requested_escalation=sandbox_permissions,
-            sandbox_backend="host",
-            sandbox_capability_plan_digest=_sha256(canonical_json(sandbox_plan)),
+            sandbox_backend=sandbox_plan.backend,
+            sandbox_capability_plan_digest=sandbox_plan.digest,
         ),
     )
 
@@ -174,6 +166,21 @@ def _build_classification_metadata(
     metadata["rule_id"] = classification.rule_id
     metadata["suggested_rule"] = _build_suggested_rule(classification, shell=shell)
     return metadata
+
+
+def _sandbox_metadata(plan: SandboxPlan) -> dict[str, Any]:
+    capabilities = plan.capabilities
+    enforcement_active = bool(plan.mode != "off" and capabilities.complete)
+    return {
+        "sandbox_mode": plan.mode,
+        "sandbox_backend": plan.backend,
+        "sandbox_backend_version": plan.backend_version,
+        "sandbox_plan_digest": plan.digest,
+        "sandbox_enforcement_active": enforcement_active,
+        "sandbox_degraded": bool(plan.mode == "preferred" and not enforcement_active),
+        "sandbox_degraded_reason": capabilities.degraded_reason,
+        "sandbox_capabilities": capabilities.to_dict(),
+    }
 
 
 def get_shared_exec_runtime() -> ExecRuntime:
@@ -221,6 +228,7 @@ class ExecCommandTool(BaseTool):
         allowed_env_vars: list[str] | None = None,
         require_approval: bool = False,
         default_timeout_sec: int = 30,
+        sandbox_mode: SandboxMode = "off",
     ) -> None:
         self._runtime = runtime or get_shared_exec_runtime()
         self._approval_store = approval_store or get_shared_exec_approval_store()
@@ -229,6 +237,7 @@ class ExecCommandTool(BaseTool):
         self._allowed_env_vars = [str(item) for item in (allowed_env_vars or [])]
         self._require_approval = bool(require_approval)
         self._default_timeout_sec = max(1, int(default_timeout_sec))
+        self._sandbox_mode: SandboxMode = sandbox_mode
 
     @property
     def name(self) -> str:
@@ -400,6 +409,30 @@ class ExecCommandTool(BaseTool):
                 retryable=False,
             )
 
+        try:
+            sandbox_plan = self._runtime.build_sandbox_plan(
+                command=command,
+                mode=self._sandbox_mode,
+                shell=shell,
+                cwd=resolved_cwd,
+                env=normalized_env,
+                timeout_sec=timeout_sec,
+                requested_escalation=sandbox_permissions,
+                workspace_root=workspace_root,
+                background=background,
+                tty=tty,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return ToolResult(
+                error=f"Exec sandbox plan could not be created: {exc}",
+                metadata={
+                    "status": "denied",
+                    "sandbox_mode": self._sandbox_mode,
+                    "sandbox_enforcement_unavailable": True,
+                },
+                retryable=False,
+            )
+
         owner_task_id = str(
             permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or ""
         ).strip() or None
@@ -417,14 +450,12 @@ class ExecCommandTool(BaseTool):
                     workspace_root=workspace_root,
                     resolved_cwd=resolved_cwd,
                     normalized_env=normalized_env,
-                    timeout_sec=timeout_sec,
-                    background=background,
-                    tty=tty,
                     sandbox_permissions=sandbox_permissions,
                     autonomy_mode=autonomy_mode,
                     effective_require_approval=effective_require_approval,
                     context=context,
                     owner_task_id=owner_task_id,
+                    sandbox_plan=sandbox_plan,
                 )
                 review_decision = review_authorization_envelope(
                     review_envelope,
@@ -493,6 +524,7 @@ class ExecCommandTool(BaseTool):
                 "checkpoint_dir": resolved_layout.get("checkpoint_dir"),
                 "detached_layout": dict(resolved_layout),
                 "approval_state": "approved",
+                "sandbox_plan": sandbox_plan.to_dict(),
             }
             requester_id, request_digest, context_digest = derive_approval_binding(
                 requester_id=(
@@ -568,6 +600,7 @@ class ExecCommandTool(BaseTool):
                         tty=tty,
                         approval_state="pending",
                     ),
+                    **_sandbox_metadata(sandbox_plan),
                 },
                 retryable=True,
             )
@@ -637,9 +670,13 @@ class ExecCommandTool(BaseTool):
                 log_path=resolved_layout.get("log_path"),
                 checkpoint_dir=resolved_layout.get("checkpoint_dir"),
                 session_started_callback=_bind_active_session,
+                sandbox_plan=sandbox_plan,
             )
         except Exception as exc:
-            return ToolResult(error=f"Exec command failed: {exc}")
+            return ToolResult(
+                error=f"Exec command failed: {exc}",
+                metadata=_sandbox_metadata(sandbox_plan),
+            )
 
         effective_layout = _realize_detached_layout(
             session_id=result.session_id,
@@ -657,6 +694,7 @@ class ExecCommandTool(BaseTool):
             tty=tty,
             approval_state=result.approval_state,
         )
+        metadata.update(_sandbox_metadata(sandbox_plan))
         policy_reason = classification.reason
         if auto_review_policy_allow:
             policy_reason = (

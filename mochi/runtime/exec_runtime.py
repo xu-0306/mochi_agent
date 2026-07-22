@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import math
 import os
 import signal
 import subprocess
@@ -21,6 +22,16 @@ from mochi.runtime.exec_sessions import (
     SessionPollResult,
     utc_now,
 )
+from mochi.runtime.sandbox import (
+    SandboxMode,
+    SandboxPlan,
+    SandboxResourceLimits,
+    SandboxUnavailableError,
+    backend_for_plan,
+    create_sandbox_plan,
+    select_sandbox_backend,
+)
+from mochi.runtime.sandbox.base import validate_plan_facts
 from mochi.utils.shell_providers import BaseShellProvider, default_shell_providers
 
 ProcessLauncher = Callable[..., Awaitable[asyncio.subprocess.Process]]
@@ -63,6 +74,7 @@ class ExecRuntime:
         log_path: str | Path | None = None,
         checkpoint_dir: str | Path | None = None,
         session_started_callback: Callable[[SessionPollResult], Awaitable[None] | None] | None = None,
+        sandbox_plan: SandboxPlan | dict[str, object] | None = None,
     ) -> SessionPollResult:
         """Start a command and optionally keep it as a detached background session."""
         normalized_command = command.strip()
@@ -72,6 +84,28 @@ class ExecRuntime:
         session_id = f"exec-{next(self._session_seq)}"
         provider = self._resolve_provider(shell)
         spec = provider.build_subprocess_spec(normalized_command, tty=tty)
+        resolved_cwd = Path(cwd or Path.cwd()).resolve()
+        launch_executable = spec.executable
+        launch_args = spec.args
+        launch_env = env
+        if sandbox_plan is not None:
+            plan = (
+                sandbox_plan
+                if isinstance(sandbox_plan, SandboxPlan)
+                else SandboxPlan.from_dict(sandbox_plan)
+            )
+            validate_plan_facts(
+                plan,
+                executable=spec.executable,
+                argv=spec.args,
+                cwd=resolved_cwd,
+                env=env,
+                timeout_sec=timeout_sec,
+            )
+            launch = backend_for_plan(plan).prepare_launch(plan, env=env)
+            launch_executable = launch.executable
+            launch_args = launch.args
+            launch_env = launch.env
         persisted_detached = background and self._state_root is not None
         resolved_log_path = self._resolve_log_path(
             session_id=session_id,
@@ -97,37 +131,39 @@ class ExecRuntime:
         if persisted_detached:
             if resolved_log_path is None:
                 raise RuntimeError("Detached persisted sessions require a log path.")
-            log_handle = Path(resolved_log_path).open("ab")
-            try:
-                popen_kwargs: dict[str, object] = {
-                    "stdin": subprocess.DEVNULL,
-                    "stdout": log_handle,
-                    "stderr": log_handle,
-                    "cwd": str(cwd) if cwd is not None else None,
-                    "env": env,
-                }
+            with Path(resolved_log_path).open("ab") as log_handle:
                 if sys.platform == "win32":
-                    popen_kwargs["creationflags"] = (
-                        subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                    detached_process = subprocess.Popen(
+                        [launch_executable, *launch_args],
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=log_handle,
+                        cwd=str(resolved_cwd),
+                        env=launch_env,
+                        creationflags=(
+                            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                        ),
                     )
                 else:
-                    popen_kwargs["start_new_session"] = True
-                detached_process = subprocess.Popen(
-                    [spec.executable, *spec.args],
-                    **popen_kwargs,
-                )
-            finally:
-                log_handle.close()
+                    detached_process = subprocess.Popen(
+                        [launch_executable, *launch_args],
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=log_handle,
+                        cwd=str(resolved_cwd),
+                        env=launch_env,
+                        start_new_session=True,
+                    )
             pid = detached_process.pid
         else:
             process = await self._process_launcher(
-                spec.executable,
-                *spec.args,
+                launch_executable,
+                *launch_args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd) if cwd is not None else None,
-                env=env,
+                cwd=str(resolved_cwd),
+                env=launch_env,
             )
             pid = process.pid
 
@@ -135,7 +171,7 @@ class ExecRuntime:
             session_id=session_id,
             shell=provider.canonical_name,
             command=normalized_command,
-            cwd=str(cwd) if cwd is not None else None,
+            cwd=str(resolved_cwd),
             pid=pid,
             status=ExecSessionStatus.RUNNING,
             background=background,
@@ -184,6 +220,58 @@ class ExecRuntime:
         if poll is None:
             raise RuntimeError(f"Session disappeared unexpectedly: {session.session_id}")
         return poll
+
+    def build_sandbox_plan(
+        self,
+        *,
+        command: str,
+        mode: SandboxMode,
+        shell: str | None,
+        cwd: str | Path,
+        env: dict[str, str] | None,
+        timeout_sec: float,
+        requested_escalation: str,
+        workspace_root: str | Path,
+        background: bool,
+        tty: bool,
+    ) -> SandboxPlan:
+        """Resolve the shell provider once and capture approval-bound launch facts."""
+        provider = self._resolve_provider(shell)
+        spec = provider.build_subprocess_spec(command.strip(), tty=tty)
+        backend = select_sandbox_backend(mode)
+        capabilities = backend.probe()
+        if mode == "required" and not capabilities.complete:
+            raise SandboxUnavailableError(
+                capabilities.degraded_reason or "Required sandbox backend is unavailable."
+            )
+        if background and not capabilities.detached:
+            if mode == "required":
+                raise SandboxUnavailableError(
+                    "Required sandbox backend does not support detached execution."
+                )
+            from mochi.runtime.sandbox.base import HostSandboxBackend
+
+            backend = HostSandboxBackend(
+                degraded_reason="sandbox_backend_does_not_support_detached_execution"
+            )
+        return create_sandbox_plan(
+            mode=mode,
+            executable=spec.executable,
+            argv=spec.args,
+            cwd=cwd,
+            read_roots=(workspace_root,),
+            write_roots=(workspace_root,),
+            network_policy="allow" if mode == "off" else "deny",
+            env=env,
+            resource_limits=SandboxResourceLimits(
+                timeout_milliseconds=int(math.ceil(timeout_sec * 1000)),
+                memory_limit_mb=0,
+                max_processes=64,
+                output_limit_bytes=self._output_tail_limit,
+            ),
+            requested_escalation=requested_escalation,
+            backend=backend,
+        )
 
     async def read_session(
         self,
@@ -398,7 +486,9 @@ class ExecRuntime:
             wait_closed = getattr(stdin, "wait_closed", None)
             if callable(wait_closed):
                 with contextlib.suppress(Exception):
-                    await wait_closed()
+                    wait_result = wait_closed()
+                    if inspect.isawaitable(wait_result):
+                        await wait_result
         transport = getattr(process, "_transport", None)
         close = getattr(transport, "close", None)
         if callable(close):

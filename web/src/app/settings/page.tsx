@@ -5722,11 +5722,11 @@ function SecuritySettingsForm({
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="off">Off — host execution permitted</SelectItem>
-                <SelectItem value="preferred">Preferred intent — host remains effective</SelectItem>
-                <SelectItem value="required">Required intent — integration pending</SelectItem>
+                <SelectItem value="preferred">Preferred — degrade to host when unavailable</SelectItem>
+                <SelectItem value="required">Required — block when containment is unavailable</SelectItem>
               </SelectContent>
             </Select>
-            <p className="text-[11px] text-muted-foreground">Backend: {sandbox?.backend_available ? sandbox.backend ?? 'available' : 'unavailable'}. Enforcement active: {sandbox?.enforcement_active ? 'yes' : 'no'}. Effective behavior: {sandbox?.effective_exec_behavior ?? 'host_execution_available'}. Pipeline integration is pending.</p>
+            <p className="text-[11px] text-muted-foreground">Backend: {sandbox?.backend ?? 'host'} {sandbox?.backend_version ?? ''}. Enforcement active: {sandbox?.enforcement_active ? 'yes' : 'no'}. Effective behavior: {sandbox?.effective_exec_behavior ?? 'host_execution_available'}.{sandbox?.degraded_reason ? ` Reason: ${sandbox.degraded_reason}.` : ''}</p>
           </label>
         </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">

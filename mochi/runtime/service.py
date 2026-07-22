@@ -7670,10 +7670,18 @@ class RuntimeService:
             }
 
         workdir = payload.get("workdir")
+        requested_shell = payload.get("shell")
+        replay_shell = (
+            str(requested_shell)
+            if isinstance(requested_shell, str)
+            and requested_shell.strip()
+            and requested_shell.strip().lower() != "auto"
+            else None
+        )
         try:
             poll = await self._exec_runtime.start_command(
                 command=str(payload.get("command") or ""),
-                shell=str(payload.get("shell") or "auto"),
+                shell=replay_shell,
                 cwd=str(workdir) if isinstance(workdir, str) and workdir else None,
                 env=payload.get("env") if isinstance(payload.get("env"), dict) else None,
                 timeout_sec=float(payload.get("timeout_sec")) if payload.get("timeout_sec") is not None else None,
@@ -7684,6 +7692,11 @@ class RuntimeService:
                 checkpoint_dir=(
                     str(payload.get("checkpoint_dir"))
                     if isinstance(payload.get("checkpoint_dir"), str)
+                    else None
+                ),
+                sandbox_plan=(
+                    payload.get("sandbox_plan")
+                    if isinstance(payload.get("sandbox_plan"), dict)
                     else None
                 ),
             )
@@ -7709,6 +7722,21 @@ class RuntimeService:
             "checkpoint_dir": (
                 str(payload.get("checkpoint_dir"))
                 if isinstance(payload.get("checkpoint_dir"), str)
+                else None
+            ),
+            "sandbox_plan_digest": (
+                payload.get("sandbox_plan", {}).get("plan_digest")
+                if isinstance(payload.get("sandbox_plan"), dict)
+                else None
+            ),
+            "sandbox_backend": (
+                payload.get("sandbox_plan", {}).get("backend")
+                if isinstance(payload.get("sandbox_plan"), dict)
+                else None
+            ),
+            "sandbox_mode": (
+                payload.get("sandbox_plan", {}).get("mode")
+                if isinstance(payload.get("sandbox_plan"), dict)
                 else None
             ),
         }

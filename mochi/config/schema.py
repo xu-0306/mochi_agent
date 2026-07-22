@@ -829,7 +829,7 @@ class SecurityConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    """Execution sandbox rollout settings; no containment backend exists yet."""
+    """Execution sandbox rollout settings."""
 
     mode: Literal["off", "preferred", "required"] = "off"
     """Exec containment policy, independent from the file-change contract mode."""

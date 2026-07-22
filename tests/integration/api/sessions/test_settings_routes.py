@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from mochi.api.server import create_app
-from mochi.config.schema import MochiConfig, VoiceConfig
+from mochi.config.schema import MochiConfig, SandboxConfig, VoiceConfig
+from mochi.security.rollout import project_sandbox_rollout
 
 from ._support import _create_test_app
 
@@ -838,6 +839,8 @@ def test_settings_round_trip_exposes_independent_protected_workspace_axes(tmp_pa
             "sandbox": {"mode": "preferred"},
         }
     )
+    expected_preferred = project_sandbox_rollout(config.sandbox)
+    expected_required = project_sandbox_rollout(SandboxConfig(mode="required"))
     app = _create_test_app(config=config)
 
     with TestClient(app) as client:
@@ -854,34 +857,18 @@ def test_settings_round_trip_exposes_independent_protected_workspace_axes(tmp_pa
 
     assert initial.status_code == 200
     assert initial.json()["security"]["change_contract_mode"] == "enforce"
-    assert initial.json()["sandbox"] == {
-        "mode": "preferred",
-        "backend": None,
-        "backend_available": False,
-        "capabilities": {"exec_containment": False},
-        "enforcement_active": False,
-        "configured_policy_decision": "prefer_sandbox_backend",
-        "effective_exec_behavior": "host_execution_available",
-        "status": "configured_unavailable",
-        "degraded": True,
-        "degraded_reason": "sandbox_backend_unavailable_and_pipeline_not_connected",
-        "host_execution_allowed": True,
-    }
+    initial_sandbox = initial.json()["sandbox"]
+    initial_probe_at = initial_sandbox.pop("last_probe_at")
+    expected_preferred.pop("last_probe_at")
+    assert initial_probe_at is None or isinstance(initial_probe_at, str)
+    assert initial_sandbox == expected_preferred
     assert updated.status_code == 200
     assert updated.json()["security"]["change_contract_mode"] == "observe"
-    assert updated.json()["sandbox"] == {
-        "mode": "required",
-        "backend": None,
-        "backend_available": False,
-        "capabilities": {"exec_containment": False},
-        "enforcement_active": False,
-        "configured_policy_decision": "reject_backend_unavailable",
-        "effective_exec_behavior": "host_execution_available",
-        "status": "configured_unavailable",
-        "degraded": True,
-        "degraded_reason": "sandbox_backend_unavailable_and_pipeline_not_connected",
-        "host_execution_allowed": True,
-    }
+    updated_sandbox = updated.json()["sandbox"]
+    updated_probe_at = updated_sandbox.pop("last_probe_at")
+    expected_required.pop("last_probe_at")
+    assert updated_probe_at is None or isinstance(updated_probe_at, str)
+    assert updated_sandbox == expected_required
     assert followup.status_code == 200
     assert followup.json()["security"]["change_contract_mode"] == "observe"
     assert followup.json()["sandbox"]["mode"] == "required"

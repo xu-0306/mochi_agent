@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Literal, TypedDict
 
 from mochi.config.schema import SandboxConfig, SecurityConfig
+from mochi.runtime.sandbox.base import HostSandboxBackend
+from mochi.runtime.sandbox.selector import observed_platform_capabilities
 
 
 class ChangeContractCapabilities(TypedDict):
@@ -28,15 +30,20 @@ class ChangeContractRollout(TypedDict):
     shadow_decision: str | None
 
 
-class SandboxCapabilities(TypedDict):
+class SandboxCapabilityRollout(TypedDict):
     exec_containment: bool
+    filesystem: bool
+    process: bool
+    network: bool
+    detached: bool
 
 
 class SandboxRollout(TypedDict):
     mode: Literal["off", "preferred", "required"]
-    backend: None
+    backend: str
+    backend_version: str
     backend_available: bool
-    capabilities: SandboxCapabilities
+    capabilities: SandboxCapabilityRollout
     configured_policy_decision: str
     enforcement_active: bool
     effective_exec_behavior: str
@@ -44,6 +51,7 @@ class SandboxRollout(TypedDict):
     degraded: bool
     degraded_reason: str | None
     host_execution_allowed: bool
+    last_probe_at: str | None
 
 
 class ProtectedWorkspaceRollout(TypedDict):
@@ -83,14 +91,52 @@ def project_change_contract_rollout(security: SecurityConfig) -> ChangeContractR
 
 
 def project_sandbox_rollout(sandbox: SandboxConfig) -> SandboxRollout:
-    """Project configured sandbox intent while host execution remains effective."""
+    """Project configured intent using observed backend capabilities."""
     mode = sandbox.mode
-    configured = mode != "off"
+    observed = (
+        HostSandboxBackend().probe()
+        if mode == "off"
+        else observed_platform_capabilities()
+    )
+    containment_available = observed.complete
+    enforcement_active = mode != "off" and containment_available
+    host_execution_allowed = mode != "required"
+    if mode == "off":
+        status = "not_enforced"
+        effective_behavior = "host_execution_available"
+        degraded = False
+        degraded_reason = None
+    elif containment_available:
+        status = "enforced"
+        effective_behavior = (
+            "sandbox_execution_active"
+            if mode == "preferred"
+            else "sandbox_execution_required"
+        )
+        degraded = False
+        degraded_reason = None
+    elif mode == "preferred":
+        status = "degraded"
+        effective_behavior = "host_execution_degraded"
+        degraded = True
+        degraded_reason = observed.degraded_reason or "sandbox_backend_incomplete"
+    else:
+        status = "configured_unavailable"
+        effective_behavior = "execution_blocked"
+        degraded = True
+        degraded_reason = observed.degraded_reason or "sandbox_backend_incomplete"
     return {
         "mode": mode,
-        "backend": None,
-        "backend_available": False,
-        "capabilities": {"exec_containment": False},
+        "backend": observed.backend,
+        "backend_version": observed.version,
+        "backend_available": observed.available,
+        "capabilities": {
+            "exec_containment": containment_available,
+            "filesystem": observed.filesystem,
+            "process": observed.process,
+            "network": observed.network,
+            "detached": observed.detached,
+        },
         "configured_policy_decision": (
             "allow_host"
             if mode == "off"
@@ -98,16 +144,13 @@ def project_sandbox_rollout(sandbox: SandboxConfig) -> SandboxRollout:
             if mode == "preferred"
             else "reject_backend_unavailable"
         ),
-        "enforcement_active": False,
-        "effective_exec_behavior": "host_execution_available",
-        "status": "configured_unavailable" if configured else "not_enforced",
-        "degraded": configured,
-        "degraded_reason": (
-            "sandbox_backend_unavailable_and_pipeline_not_connected"
-            if configured
-            else None
-        ),
-        "host_execution_allowed": True,
+        "enforcement_active": enforcement_active,
+        "effective_exec_behavior": effective_behavior,
+        "status": status,
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
+        "host_execution_allowed": host_execution_allowed,
+        "last_probe_at": observed.last_probe_at,
     }
 
 

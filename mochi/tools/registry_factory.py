@@ -8,43 +8,48 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import SecretStr
 
-from mochi.security.policy import resolve_runtime_permission_policy
 from mochi.runtime.approvals import PersistentApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.security.policy import resolve_runtime_permission_policy
 from mochi.tools.base import BaseTool
 from mochi.tools.collector_adapter import CollectorRequestPolicy
-from mochi.tools.exec_command import ExecCommandTool
-from mochi.tools.execute_code import ExecuteCodeTool
-from mochi.tools.execute_code_v2 import ExecuteCodeV2Tool
 from mochi.tools.csv_read import CsvReadTool
 from mochi.tools.delegate_subagent_task import DelegateSubagentTaskTool
 from mochi.tools.discourse_topic_adapter import DiscourseTopicCollectTool
 from mochi.tools.docx_read import DocxReadTool
+from mochi.tools.exec_command import ExecCommandTool
+from mochi.tools.execute_code import ExecuteCodeTool
+from mochi.tools.execute_code_v2 import ExecuteCodeV2Tool
 from mochi.tools.file_ops import ApplyPatchTool, FileEditTool, FileReadTool, FileWriteTool
 from mochi.tools.glob_search import GlobSearchTool
 from mochi.tools.grep_search import GrepSearchTool
 from mochi.tools.kill_session import KillSessionTool
+from mochi.tools.list_sessions import ListSessionsTool
 from mochi.tools.literature_search import (
     ArxivSearchTool,
     CrossrefSearchTool,
     PubMedSearchTool,
     SemanticScholarSearchTool,
 )
-from mochi.tools.list_sessions import ListSessionsTool
-from mochi.tools.mcp_client import MCPCallTool, McpListResourcesTool, McpReadResourceTool, McpRuntimeManager
+from mochi.tools.mcp_client import (
+    MCPCallTool,
+    McpListResourcesTool,
+    McpReadResourceTool,
+    McpRuntimeManager,
+)
+from mochi.tools.memory_delete import MemoryDeleteTool
+from mochi.tools.memory_export import MemoryExportTool
 from mochi.tools.memory_save import MemorySaveTool
 from mochi.tools.memory_search import MemorySearchTool
 from mochi.tools.memory_update import MemoryUpdateTool
-from mochi.tools.memory_delete import MemoryDeleteTool
-from mochi.tools.memory_export import MemoryExportTool
 from mochi.tools.notebook_read import NotebookReadTool
 from mochi.tools.pdf_read import PdfReadTool
 from mochi.tools.process_control import ProcessPollTool, ProcessStopTool
 from mochi.tools.process_service import ProcessService
 from mochi.tools.read_session import ReadSessionTool
 from mochi.tools.registry import ToolRegistry
-from mochi.tools.tool_search import ToolSearchTool
 from mochi.tools.tool_result_read import ToolResultReadTool
+from mochi.tools.tool_search import ToolSearchTool
 from mochi.tools.web_crawl import WebCrawlTool
 from mochi.tools.web_fetch import WebFetchTool
 from mochi.tools.web_search import WebSearchTool
@@ -263,6 +268,7 @@ class ToolRegistryFactory:
             allowed_env_vars=config.security.exec_allowed_env_vars,
             require_approval=runtime_policy.require_approval_for_exec,
             default_timeout_sec=config.security.exec_default_timeout_sec,
+            sandbox_mode=config.sandbox.mode,
         )
 
     def _build_read_session(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:

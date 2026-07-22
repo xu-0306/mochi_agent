@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.exec_sessions import ExecSessionStatus
+from mochi.runtime.sandbox import SandboxPlanMismatch, SandboxUnavailableError
+from mochi.runtime.sandbox.base import HostSandboxBackend
+from mochi.runtime.service import RuntimeService
 from mochi.utils.shell_providers import (
     BaseShellProvider,
     BashProvider,
@@ -153,3 +158,169 @@ async def test_exec_runtime_close_releases_sessions() -> None:
     await runtime.close()
 
     assert runtime.list_sessions() == []
+
+
+@pytest.mark.asyncio
+async def test_exec_runtime_revalidates_and_launches_approved_sandbox_plan(
+    tmp_path: Path,
+) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    command = "print('sandbox-plan')"
+    plan = runtime.build_sandbox_plan(
+        command=command,
+        mode="off",
+        shell="test",
+        cwd=tmp_path,
+        env=None,
+        timeout_sec=5,
+        requested_escalation="use_default",
+        workspace_root=tmp_path,
+        background=False,
+        tty=False,
+    )
+
+    result = await runtime.start_command(
+        command=command,
+        shell="test",
+        cwd=tmp_path,
+        timeout_sec=5,
+        sandbox_plan=plan.to_dict(),
+    )
+
+    assert result.status == ExecSessionStatus.COMPLETED
+    assert "sandbox-plan" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_exec_runtime_rejects_tampered_sandbox_replay(tmp_path: Path) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    plan = runtime.build_sandbox_plan(
+        command="print('approved')",
+        mode="off",
+        shell="test",
+        cwd=tmp_path,
+        env=None,
+        timeout_sec=5,
+        requested_escalation="use_default",
+        workspace_root=tmp_path,
+        background=False,
+        tty=False,
+    ).to_dict()
+    plan["argv"] = ["-c", "print('tampered')"]
+
+    with pytest.raises(SandboxPlanMismatch):
+        await runtime.start_command(
+            command="print('approved')",
+            shell="test",
+            cwd=tmp_path,
+            timeout_sec=5,
+            sandbox_plan=plan,
+        )
+
+
+@pytest.mark.asyncio
+async def test_exec_runtime_rejects_valid_plan_replayed_for_different_command(
+    tmp_path: Path,
+) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    plan = runtime.build_sandbox_plan(
+        command="print('approved')",
+        mode="off",
+        shell="test",
+        cwd=tmp_path,
+        env=None,
+        timeout_sec=5,
+        requested_escalation="use_default",
+        workspace_root=tmp_path,
+        background=False,
+        tty=False,
+    )
+
+    with pytest.raises(SandboxPlanMismatch, match="no longer matches"):
+        await runtime.start_command(
+            command="print('different')",
+            shell="test",
+            cwd=tmp_path,
+            timeout_sec=5,
+            sandbox_plan=plan,
+        )
+
+
+def test_exec_runtime_required_mode_fails_closed_without_complete_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    monkeypatch.setattr(
+        "mochi.runtime.exec_runtime.select_sandbox_backend",
+        lambda mode: HostSandboxBackend(degraded_reason=f"{mode}_backend_unavailable"),
+    )
+
+    with pytest.raises(SandboxUnavailableError, match="required_backend_unavailable"):
+        runtime.build_sandbox_plan(
+            command="print('blocked')",
+            mode="required",
+            shell="test",
+            cwd=tmp_path,
+            env=None,
+            timeout_sec=5,
+            requested_escalation="use_default",
+            workspace_root=tmp_path,
+            background=False,
+            tty=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_approved_exec_replay_uses_serialized_sandbox_plan(tmp_path: Path) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    command = "print('approved-replay')"
+    plan = runtime.build_sandbox_plan(
+        command=command,
+        mode="off",
+        shell="test",
+        cwd=tmp_path,
+        env=None,
+        timeout_sec=5,
+        requested_escalation="use_default",
+        workspace_root=tmp_path,
+        background=False,
+        tty=False,
+    )
+    service = object.__new__(RuntimeService)
+    service._exec_runtime = runtime
+    approval = SimpleNamespace(
+        command_payload={
+            "command": command,
+            "shell": "test",
+            "workdir": str(tmp_path),
+            "env": None,
+            "timeout_sec": 5,
+            "background": False,
+            "tty": False,
+            "approval_state": "approved",
+            "sandbox_plan": plan.to_dict(),
+        }
+    )
+
+    result = await service._execute_approved_exec_request(approval)
+
+    assert result["status"] == "completed"
+    assert result["sandbox_plan_digest"] == plan.digest
+    assert result["sandbox_backend"] == "host"
+    assert "approved-replay" in result["stdout"]

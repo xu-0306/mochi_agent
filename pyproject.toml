@@ -114,7 +114,12 @@ markers = [
     "windows: requires Windows-native ACL, Win32, or reparse-point behavior",
     "posix: requires POSIX dir-fd, symlink, or native filesystem behavior",
     "network: requires live external network access and is excluded from the offline suite",
+    "real_linux_sandbox: requires a functional bubblewrap namespace backend",
+    "real_windows_sandbox: requires the packaged native Windows AppContainer broker",
 ]
+
+[tool.hatch.build.targets.wheel]
+artifacts = ["mochi/runtime/sandbox/bin/*.exe"]
 
 [tool.pyright]
 pythonVersion = "3.11"
