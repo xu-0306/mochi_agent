@@ -67,6 +67,14 @@ function formatRulePreview(rule: api.CommandRule | null): string {
   return `Allow commands that ${matchLabel} "${target}"${shells}.`
 }
 
+function rulePersistenceLabel(status: api.ApprovalSummary['rule_persistence_status']): string {
+  if (status === 'pending') return 'Pending delivery'
+  if (status === 'retrying') return 'Retrying safely'
+  if (status === 'delivered') return 'Saved'
+  if (status === 'failed') return 'Not saved'
+  return 'Not requested'
+}
+
 function formatExecOutputTail(value: string, maxLines = 8, maxChars = 1000): string | null {
   const trimmed = value.trim()
   if (!trimmed) {
@@ -439,6 +447,29 @@ function ApprovalReviewCard({
             <p className="leading-relaxed text-muted-foreground">
               {formatRulePreview(approval.suggested_rule)}
             </p>
+          </div>
+        ) : null}
+        {approval.rule_persistence_status !== 'not_requested' ? (
+          <div className="rounded-lg border border-white/8 bg-canvas/75 px-2.5 py-2">
+            <p>
+              Execution status:{' '}
+              <span className="font-medium text-foreground">{execStatus ?? approval.status}</span>
+            </p>
+            <p>
+              Rule persistence:{' '}
+              <span className="font-medium text-foreground">
+                {rulePersistenceLabel(approval.rule_persistence_status)}
+              </span>
+            </p>
+            {approval.rule_persistence_status === 'failed' ? (
+              <p className="mt-1 text-rose-200">
+                This execution was already handled, but the rule was not saved.
+                Open Settings to save it manually; do not resend the execution.
+                {approval.rule_persistence_error
+                  ? ` ${approval.rule_persistence_error}`
+                  : ''}
+              </p>
+            ) : null}
           </div>
         ) : null}
       </div>

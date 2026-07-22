@@ -6,10 +6,13 @@ import base64
 import inspect
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, cast
 
 from fastapi import Body, FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+
 try:
     from loguru import logger
 except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
@@ -65,6 +68,7 @@ def create_app() -> FastAPI:
     )
     app.state.config = None
     app.state.config_path = None
+    app.state.config_revision = None
     app.state.engine = None
     app.state.engine_factory = None
     app.state.config_factory = None
@@ -506,19 +510,78 @@ async def _rebuild_channel_manager(app: FastAPI) -> Any:
     return manager
 
 
+_CONFIG_REVISION_CONTEXT: ContextVar[str | None] = ContextVar(
+    "mochi_api_config_revision",
+    default=None,
+)
+
+
+def _current_config_revision() -> str | None:
+    """Return the revision bound to the current async request context."""
+
+    return _CONFIG_REVISION_CONTEXT.get()
+
+
 async def _get_config(app: FastAPI) -> Any:
     """取得 API status endpoint 使用的設定物件。"""
     existing = cast(Any | None, getattr(app.state, "config", None))
     if existing is not None:
+        config_path = getattr(app.state, "config_path", None)
+        if config_path is not None:
+            from mochi.config.manager import config_revision, load_config_snapshot
+
+            current_revision = config_revision(config_path)
+            known_revision = getattr(app.state, "config_revision", None)
+            if not isinstance(known_revision, str) and Path(config_path).expanduser().exists():
+                snapshot = load_config_snapshot(config_path)
+                app.state.config = snapshot.config
+                app.state.config_revision = snapshot.revision
+                _CONFIG_REVISION_CONTEXT.set(snapshot.revision)
+                return snapshot.config
+            if isinstance(known_revision, str) and known_revision != current_revision:
+                snapshot = load_config_snapshot(config_path)
+                app.state.config = snapshot.config
+                app.state.config_revision = snapshot.revision
+                _CONFIG_REVISION_CONTEXT.set(snapshot.revision)
+                return snapshot.config
+            if not isinstance(known_revision, str):
+                app.state.config_revision = current_revision
+                known_revision = current_revision
+            _CONFIG_REVISION_CONTEXT.set(
+                known_revision if isinstance(known_revision, str) else None
+            )
+        else:
+            revision = getattr(app.state, "config_revision", None)
+            _CONFIG_REVISION_CONTEXT.set(revision if isinstance(revision, str) else None)
         return existing
 
     factory = cast(Callable[[], Any] | Callable[[FastAPI], Any] | None, app.state.config_factory)
     if factory is not None:
-        return await _maybe_await(_call_with_supported_kwargs(factory, app=app))
+        config = await _maybe_await(_call_with_supported_kwargs(factory, app=app))
+        config_path = getattr(app.state, "config_path", None)
+        if config_path is not None:
+            from mochi.config.manager import config_revision, load_config_snapshot
 
-    from mochi.config.manager import load_config
+            revision = config_revision(config_path)
+            if Path(config_path).expanduser().exists():
+                snapshot = load_config_snapshot(config_path)
+                config = snapshot.config
+                revision = snapshot.revision
+            app.state.config = config
+            app.state.config_revision = revision
+            _CONFIG_REVISION_CONTEXT.set(revision)
+            return config
+        _CONFIG_REVISION_CONTEXT.set(None)
+        return config
 
-    return load_config()
+    from mochi.config.manager import load_config_snapshot
+
+    snapshot = load_config_snapshot(getattr(app.state, "config_path", None))
+    app.state.config = snapshot.config
+    app.state.config_path = snapshot.path
+    app.state.config_revision = snapshot.revision
+    _CONFIG_REVISION_CONTEXT.set(snapshot.revision)
+    return snapshot.config
 
 
 def _channel_status(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,7 @@ from mochi.runtime.change_sets import (
     UndoConflict,
     UndoUnavailable,
 )
+from mochi.runtime.security_audit import SecurityAuditEvent, file_content_observation
 from mochi.runtime.store import RuntimeStore
 from mochi.security.file_contract import (
     AuthorizationContext,
@@ -47,6 +49,7 @@ from mochi.utils.security import (
 )
 
 router = APIRouter(prefix="/v1", tags=["file_ops"])
+_security_audit_logger = logging.getLogger(__name__)
 
 
 class FileUndoRequest(BaseModel):
@@ -63,7 +66,7 @@ class ChangeUndoRequest(BaseModel):
     """Identity-only request for authoritative retained undo material."""
 
     entry_ids: list[str] = Field(min_length=1)
-    request_digest: str = Field(min_length=64, max_length=64)
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 @router.post("/tools/file/undo")
@@ -74,6 +77,7 @@ async def undo_file_write(
     """Run the legacy raw-content undo only while the rollout is observing."""
 
     config = await _get_config(request.app)
+    runtime_store = await _get_runtime_store(request)
     if config.security.change_contract_mode == "enforce":
         raise HTTPException(status_code=409, detail="legacy_undo_requires_change_id")
     scope = config.security.file_write_scope
@@ -87,11 +91,45 @@ async def undo_file_write(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    audit_subject_id = hashlib.sha256(str(target).encode()).hexdigest()
+    await _append_security_audit_best_effort(
+        runtime_store,
+        SecurityAuditEvent(
+            event_type="undo_requested",
+            subject_type="file",
+            subject_id=audit_subject_id,
+            outcome="requested",
+            details={
+                "session_id": payload.session_id,
+                "action": payload.action,
+                "path": str(target),
+                "content": (
+                    file_content_observation(
+                        payload.original_content or "",
+                        reason_code="legacy_undo_restore",
+                    )
+                    if payload.action == "restore"
+                    else None
+                ),
+            },
+        )
+    )
+
     if payload.action == "delete":
         if target.exists() and target.is_dir():
             raise HTTPException(status_code=400, detail="Path is not a file")
         if target.exists():
             await asyncio.to_thread(target.unlink)
+        await _append_security_audit_best_effort(
+            runtime_store,
+            SecurityAuditEvent(
+                event_type="undo_applied",
+                subject_type="file",
+                subject_id=audit_subject_id,
+                outcome="deleted",
+                details={"session_id": payload.session_id, "path": str(target)},
+            )
+        )
         return {
             "type": "file_undo",
             "action": "delete",
@@ -119,6 +157,20 @@ async def undo_file_write(
         return len(original_content.encode(payload.encoding))
 
     bytes_written = await asyncio.to_thread(_write)
+    await _append_security_audit_best_effort(
+        runtime_store,
+        SecurityAuditEvent(
+            event_type="undo_applied",
+            subject_type="file",
+            subject_id=audit_subject_id,
+            outcome="restored",
+            details={
+                "session_id": payload.session_id,
+                "path": str(target),
+                "bytes_written": bytes_written,
+            },
+        )
+    )
     return {
         "type": "file_undo",
         "action": "restore",
@@ -142,6 +194,17 @@ async def undo_change_set(
     change_store = ChangeSetStore(runtime_store)
     now = datetime.now(UTC)
     entry_ids = tuple(payload.entry_ids)
+    await _append_security_audit_best_effort(
+        runtime_store,
+        SecurityAuditEvent(
+            event_type="undo_requested",
+            subject_type="change_set",
+            subject_id=change_set_id,
+            request_digest=payload.request_digest,
+            outcome="requested",
+            details={"entry_ids": list(entry_ids)},
+        )
+    )
     try:
         material = await change_store.get_undo_material(
             change_set_id=change_set_id,
@@ -297,6 +360,21 @@ async def undo_change_set(
         change_set_id=change_set_id,
         entry_ids=entry_ids,
     )
+    await _append_security_audit_best_effort(
+        runtime_store,
+        SecurityAuditEvent(
+            event_type="undo_applied",
+            subject_type="change_set",
+            subject_id=change_set_id,
+            request_digest=payload.request_digest,
+            outcome="applied",
+            details={
+                "entry_ids": list(entry_ids),
+                "inverse_change_set_id": inverse_manifest.change_set_id,
+                "inverse_request_digest": inverse_manifest.request_digest,
+            },
+        )
+    )
     return {
         "type": "change_undo",
         "status": "applied",
@@ -307,6 +385,20 @@ async def undo_change_set(
         "inverse_request_digest": inverse_manifest.request_digest,
         "change_contract_mode": config.security.change_contract_mode,
     }
+
+
+async def _append_security_audit_best_effort(
+    store: RuntimeStore,
+    event: SecurityAuditEvent,
+) -> None:
+    try:
+        await store.append_security_audit_event(event)
+    except Exception as exc:  # pragma: no cover - best-effort audit boundary
+        _security_audit_logger.warning(
+            "Security audit event %s could not be persisted (%s).",
+            event.event_type,
+            exc.__class__.__name__,
+        )
 
 
 def _path_identity(path: Path) -> FileIdentity:

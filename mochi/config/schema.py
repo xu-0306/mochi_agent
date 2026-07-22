@@ -718,6 +718,11 @@ class SecurityConfig(BaseModel):
     )
     """Persisted explicit exec command rules."""
 
+    applied_rule_side_effect_ids: list[str] = Field(
+        default_factory=lambda: _empty_list_typed(str)
+    )
+    """Internal idempotency markers for delivered approval rule side effects."""
+
     agent_run_default_max_wall_clock_sec: int | None = Field(default=None, ge=1, le=86_400)
     """Default agent-run wall-clock guard. `None` disables the default deadline."""
 

@@ -199,6 +199,16 @@ export class ApiError extends Error {
   }
 }
 
+export class SettingsRevisionConflict extends ApiError {
+  readonly currentRevision: string | null
+
+  constructor(status: number, message: string, payload?: unknown, currentRevision?: string | null) {
+    super(status, message, payload)
+    this.name = 'SettingsRevisionConflict'
+    this.currentRevision = currentRevision ?? null
+  }
+}
+
 async function parseResponseBody(response: Response): Promise<unknown> {
   const contentType = response.headers.get('content-type') ?? ''
 
@@ -281,6 +291,20 @@ async function requestJson<T>(path: string, init?: RequestInit, target: RequestT
   const payload = await parseResponseBody(response)
 
   if (!response.ok) {
+    const conflictDetail = isRecord(payload) && isRecord(payload.detail)
+      ? payload.detail
+      : null
+    if (
+      response.status === 409 &&
+      conflictDetail?.code === 'settings_revision_conflict'
+    ) {
+      throw new SettingsRevisionConflict(
+        response.status,
+        'Settings were modified by another process. Reload and review before retrying.',
+        payload,
+        getString(conflictDetail.current_revision)
+      )
+    }
     throw new ApiError(
       response.status,
       getApiMessage(payload, response.statusText || 'Request failed'),
@@ -4162,6 +4186,7 @@ export async function previewWorkspacePatch(
 
 interface BackendSettings {
   type: 'settings'
+  revision: string
   model: string
   model_config?: Record<string, ApiValue>
   model_setup?: Record<string, ApiValue>
@@ -4350,6 +4375,7 @@ export interface VoiceSettings extends Record<string, unknown> {
 
 export interface Settings {
   type: 'settings'
+  revision: string
   model: string
   model_config?: Record<string, ApiValue>
   model_setup?: Record<string, ApiValue>
@@ -4913,10 +4939,14 @@ function normalizeVoiceCatalog(payload: unknown): VoiceCatalog {
   }
 }
 
+let latestSettingsRevision: string | null = null
+
 export async function fetchSettings(): Promise<Settings> {
   const payload = await requestJson<BackendSettings>('/settings')
+  latestSettingsRevision = payload.revision
   return {
     type: payload.type,
+    revision: payload.revision,
     model: payload.model,
     model_config: isRecord(payload.model_config)
       ? payload.model_config as Record<string, ApiValue>
@@ -5423,14 +5453,23 @@ function normalizeVllmSettings(value: unknown): VLLMSettings | undefined {
   }
 }
 
-export async function updateSettings(input: UpdateSettingsInput): Promise<Settings> {
+export async function updateSettings(
+  input: UpdateSettingsInput,
+  expectedRevision: string | null = latestSettingsRevision
+): Promise<Settings> {
+  if (!expectedRevision) {
+    throw new ApiError(0, 'Settings revision is unavailable. Reload settings before saving.')
+  }
   const payload = await requestJson<BackendSettings>('/settings', {
     method: 'PATCH',
+    headers: { 'If-Match': `"${expectedRevision}"` },
     body: JSON.stringify(input),
   })
 
+  latestSettingsRevision = payload.revision
   return {
     type: payload.type,
+    revision: payload.revision,
     model: payload.model,
     model_config: isRecord(payload.model_config)
       ? payload.model_config as Record<string, ApiValue>
@@ -5479,14 +5518,23 @@ export async function undoChangeSet(
   )
 }
 
-export async function setupDiscord(input: DiscordSetupInput): Promise<Settings> {
+export async function setupDiscord(
+  input: DiscordSetupInput,
+  expectedRevision: string | null = latestSettingsRevision
+): Promise<Settings> {
+  if (!expectedRevision) {
+    throw new ApiError(0, 'Settings revision is unavailable. Reload settings before saving.')
+  }
   const payload = await requestJson<BackendSettings>('/setup/discord', {
     method: 'POST',
+    headers: { 'If-Match': `"${expectedRevision}"` },
     body: JSON.stringify(input),
   })
 
+  latestSettingsRevision = payload.revision
   return {
     type: payload.type,
+    revision: payload.revision,
     model: payload.model,
     model_config: isRecord(payload.model_config)
       ? payload.model_config as Record<string, ApiValue>
@@ -5588,6 +5636,9 @@ export interface ApprovalSummary {
   auto_review_risk_factors: string[]
   auto_review_reason_codes: string[]
   auto_review_source: 'policy_auto_allow' | 'reviewed_allow' | null
+  rule_persistence_status: 'not_requested' | 'pending' | 'retrying' | 'delivered' | 'failed'
+  side_effect_id: string | null
+  rule_persistence_error: string | null
 }
 
 export interface CreateTaskInput {
@@ -5778,6 +5829,17 @@ function normalizeApprovalSummary(payload: unknown): ApprovalSummary {
     exec_session_id: getNullableString(record.exec_session_id),
     exec_status: getNullableString(record.exec_status),
     execution_result: record.execution_result ?? null,
+    rule_persistence_status: (() => {
+      const status = getString(record.rule_persistence_status)
+      return status === 'pending' ||
+        status === 'retrying' ||
+        status === 'delivered' ||
+        status === 'failed'
+        ? status
+        : 'not_requested'
+    })(),
+    side_effect_id: getNullableString(record.side_effect_id),
+    rule_persistence_error: getNullableString(record.rule_persistence_error),
     allowed_decisions: Array.isArray(record.allowed_decisions)
       ? record.allowed_decisions.filter(
           (item): item is string => typeof item === 'string' && item.length > 0

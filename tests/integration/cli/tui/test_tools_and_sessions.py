@@ -173,11 +173,20 @@ async def test_chat_tui_async_tools_commands_show_and_update_web_search_settings
         ]
     )
 
-    monkeypatch.setattr("mochi.config.manager.load_config", lambda config_path=None: fake_config)  # noqa: ARG005
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config_snapshot",
+        lambda config_path=None: SimpleNamespace(config=fake_config, revision="revision-1"),  # noqa: ARG005
+    )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", _FakeEngine)
     monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
 
-    def fake_save_config(config, config_path=None):  # noqa: ANN001, ARG001
+    def fake_save_config(  # noqa: ANN001, ARG001
+        config,
+        config_path=None,
+        *,
+        expected_revision,
+    ):
+        assert expected_revision == "revision-1"
         saved["path"] = config_path
         saved["engine"] = config.tools.web_search_engine
         saved["fallback"] = list(config.tools.web_search_fallback_engines)
@@ -256,7 +265,10 @@ async def test_chat_tui_async_tools_key_commands_mask_and_clear_secrets(
         ]
     )
 
-    monkeypatch.setattr("mochi.config.manager.load_config", lambda config_path=None: fake_config)  # noqa: ARG005
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config_snapshot",
+        lambda config_path=None: SimpleNamespace(config=fake_config, revision="revision-1"),  # noqa: ARG005
+    )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", _FakeEngine)
 
     def fake_console_input(prompt="", **kwargs):  # noqa: ANN001, ARG001
@@ -264,7 +276,13 @@ async def test_chat_tui_async_tools_key_commands_mask_and_clear_secrets(
 
     monkeypatch.setattr("mochi.main.console.input", fake_console_input)
 
-    def fake_save_config(config, config_path=None):  # noqa: ANN001, ARG001
+    def fake_save_config(  # noqa: ANN001, ARG001
+        config,
+        config_path=None,
+        *,
+        expected_revision,
+    ):
+        assert expected_revision == "revision-1"
         tools = config.tools
         saved_keys.append(
             (
@@ -418,12 +436,21 @@ async def test_chat_tui_async_supports_approval_and_safety_commands(
         await service.start()
         return service
 
-    monkeypatch.setattr("mochi.config.manager.load_config", lambda config_path=None: fake_config)  # noqa: ARG005
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config_snapshot",
+        lambda config_path=None: SimpleNamespace(config=fake_config, revision="revision-1"),  # noqa: ARG005
+    )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", _FakeEngine)
     monkeypatch.setattr("mochi.main._create_tui_runtime_service", fake_runtime_service_factory)
     monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
 
-    def fake_save_config(config, config_path=None):  # noqa: ANN001, ARG001
+    def fake_save_config(  # noqa: ANN001, ARG001
+        config,
+        config_path=None,
+        *,
+        expected_revision,
+    ):
+        assert expected_revision == "revision-1"
         saved_modes.append(config.security.autonomy_mode)
         return tmp_path / "saved-config.yaml"
 

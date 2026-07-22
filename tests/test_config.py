@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import multiprocessing
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
 from mochi.config import defaults
 from mochi.config import manager as config_manager
-from mochi.config.manager import load_config, save_config
+from mochi.config.manager import (
+    EMPTY_CONFIG_REVISION,
+    ConfigRevisionConflict,
+    load_config,
+    load_config_snapshot,
+    save_config,
+)
 from mochi.config.schema import MochiConfig
 
 
@@ -17,6 +26,27 @@ def _config_without_paths(tmp_path: Path) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("model: ollama:test\n", encoding="utf-8")
     return config_path
+
+
+def _config_race_worker(
+    config_path: str,
+    ready_queue: Any,
+    start_event: Any,
+    result_queue: Any,
+    model: str,
+) -> None:
+    snapshot = load_config_snapshot(config_path)
+    ready_queue.put(model)
+    if not start_event.wait(15):
+        result_queue.put((model, "timeout"))
+        return
+    updated = snapshot.config.model_copy(update={"model": model})
+    try:
+        save_config(updated, config_path, expected_revision=snapshot.revision)
+    except ConfigRevisionConflict:
+        result_queue.put((model, "conflict"))
+    else:
+        result_queue.put((model, "saved"))
 
 
 def test_default_config_is_valid() -> None:
@@ -785,12 +815,188 @@ def test_save_config_preserves_secret_values(tmp_path: Path) -> None:
         }
     )
 
-    save_config(cfg, config_path)
+    save_config(cfg, config_path, expected_revision=EMPTY_CONFIG_REVISION)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
     assert raw["openai_compat"]["api_key"] == "sk-local-secret"
     assert raw["channels"]["discord"]["bot_token"] == "discord-local-secret"
     assert "**********" not in config_path.read_text(encoding="utf-8")
+
+
+def test_config_snapshot_revision_uses_exact_file_bytes(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_bytes(b"model: ollama:first\n")
+
+    first = load_config_snapshot(config_path)
+    config_path.write_bytes(b"model: ollama:first\r\n")
+    second = load_config_snapshot(config_path)
+
+    assert first.config.model == second.config.model == "ollama:first"
+    assert first.revision != second.revision
+
+
+def test_default_snapshot_binds_cas_to_user_write_target_not_project_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_default = tmp_path / "project-default.yaml"
+    user_target = tmp_path / "user" / "config.yaml"
+    legacy_target = tmp_path / "legacy" / "config.yaml"
+    project_default.write_text("model: ollama:project-default\n", encoding="utf-8")
+    monkeypatch.setattr(config_manager, "PROJECT_DEFAULT_CONFIG_PATH", project_default)
+    monkeypatch.setattr(config_manager, "user_config_path", lambda: user_target)
+    monkeypatch.setattr(config_manager, "_legacy_home_config_path", lambda: legacy_target)
+
+    snapshot = load_config_snapshot()
+
+    assert snapshot.config.model == "ollama:project-default"
+    assert snapshot.path == user_target
+    assert snapshot.exists is False
+    assert snapshot.revision == EMPTY_CONFIG_REVISION
+
+    save_config(
+        snapshot.config.model_copy(update={"model": "ollama:user-choice"}),
+        expected_revision=snapshot.revision,
+    )
+    assert load_config(user_target).model == "ollama:user-choice"
+    assert project_default.read_text(encoding="utf-8") == "model: ollama:project-default\n"
+
+
+def test_save_config_requires_matching_revision_and_preserves_winner(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    initial = load_config_snapshot(config_path)
+    winner = MochiConfig(model="ollama:winner")
+    stale = MochiConfig(model="ollama:stale")
+
+    save_config(winner, config_path, expected_revision=initial.revision)
+    with pytest.raises(ConfigRevisionConflict) as exc_info:
+        save_config(stale, config_path, expected_revision=initial.revision)
+
+    assert exc_info.value.current_revision == load_config_snapshot(config_path).revision
+    assert load_config(config_path).model == "ollama:winner"
+    assert not list(tmp_path.glob(".config.yaml.*.tmp"))
+
+
+def test_config_snapshot_pairs_config_with_the_exact_bytes_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    first_bytes = b"model: ollama:first\n"
+    second_bytes = b"model: ollama:second\n"
+    config_path.write_bytes(first_bytes)
+    original_read_bytes = Path.read_bytes
+
+    def racing_read_bytes(path: Path) -> bytes:
+        data = original_read_bytes(path)
+        if path == config_path:
+            config_path.write_bytes(second_bytes)
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read_bytes)
+    snapshot = load_config_snapshot(config_path)
+
+    assert snapshot.config.model == "ollama:first"
+    assert snapshot.revision == hashlib.sha256(first_bytes).hexdigest()
+    assert config_path.read_text(encoding="utf-8") == second_bytes.decode("utf-8")
+
+
+def test_config_lock_failure_does_not_unlock_or_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    unlock_calls: list[object | None] = []
+
+    def fail_lock(_handle: Any) -> object:
+        raise OSError("lock failed")
+
+    monkeypatch.setattr(config_manager, "_lock_file", fail_lock)
+    monkeypatch.setattr(
+        config_manager,
+        "_unlock_file",
+        lambda _handle, token: unlock_calls.append(token),
+    )
+
+    with pytest.raises(OSError, match="lock failed"):
+        save_config(
+            MochiConfig(model="ollama:not-written"),
+            config_path,
+            expected_revision=EMPTY_CONFIG_REVISION,
+        )
+
+    assert not config_path.exists()
+    assert unlock_calls == []
+
+
+def test_config_replace_failure_preserves_original_and_cleans_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    original = b"model: ollama:original\n"
+    config_path.write_bytes(original)
+    snapshot = load_config_snapshot(config_path)
+    monkeypatch.setattr(
+        config_manager,
+        "_atomic_replace",
+        lambda _source, _target: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        save_config(
+            snapshot.config.model_copy(update={"model": "ollama:new"}),
+            config_path,
+            expected_revision=snapshot.revision,
+        )
+
+    assert config_path.read_bytes() == original
+    assert not list(tmp_path.glob(".config.yaml.*.tmp"))
+
+
+def test_two_process_config_race_has_one_winner_and_one_conflict(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model: ollama:initial\n", encoding="utf-8")
+    context = multiprocessing.get_context("spawn")
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    start_event = context.Event()
+    processes = [
+        context.Process(
+            target=_config_race_worker,
+            args=(
+                str(config_path),
+                ready_queue,
+                start_event,
+                result_queue,
+                model,
+            ),
+        )
+        for model in ("ollama:first-writer", "ollama:second-writer")
+    ]
+    for process in processes:
+        process.start()
+    try:
+        assert {ready_queue.get(timeout=20) for _ in processes} == {
+            "ollama:first-writer",
+            "ollama:second-writer",
+        }
+        start_event.set()
+        outcomes = [result_queue.get(timeout=20) for _ in processes]
+        for process in processes:
+            process.join(timeout=20)
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert sorted(status for _model, status in outcomes) == ["conflict", "saved"]
+    winner = load_config_snapshot(config_path).config.model
+    assert winner in {"ollama:first-writer", "ollama:second-writer"}
 
 
 def test_openai_compat_provider_accepts_vllm() -> None:

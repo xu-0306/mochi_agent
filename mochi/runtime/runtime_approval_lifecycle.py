@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from mochi.runtime.approval_lifecycle import build_rule_side_effect
+from mochi.runtime.approval_side_effects import public_side_effect_projection
 from mochi.runtime.approval_state_machine import (
     DEFAULT_APPROVAL_TTL_SECONDS as _DEFAULT_TTL_SECONDS,
 )
@@ -37,6 +38,7 @@ from mochi.runtime.approval_state_machine import (
 from mochi.runtime.approval_state_machine import (
     utc_now_iso as _now_iso,
 )
+from mochi.runtime.security_audit import audit_details
 
 
 class _RuntimeStoreShape(Protocol):
@@ -118,14 +120,20 @@ def initialize_runtime_approval_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _decode(row: sqlite3.Row, *, rule_status: str | None = None) -> dict[str, Any]:
+def _decode(
+    row: sqlite3.Row,
+    *,
+    rule_effect: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     item = dict(row)
     item["arguments"] = json.loads(item.pop("arguments_json") or "{}")
     item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
     result = item.pop("execution_result_json", None)
     item["execution_result"] = json.loads(result) if isinstance(result, str) and result else None
-    item["rule_persistence_status"] = rule_status or (
-        "not_requested" if item.get("resolution_kind") != "approve_and_save_rule" else "pending"
+    item.update(
+        public_side_effect_projection(rule_effect)
+        if item.get("resolution_kind") == "approve_and_save_rule"
+        else public_side_effect_projection(None)
     )
     return item
 
@@ -231,10 +239,14 @@ class RuntimeApprovalLifecycleMixin:
                 if row is None:
                     return None
                 status_row = conn.execute(
-                    "SELECT status FROM approval_side_effects WHERE approval_id=? ORDER BY created_at DESC LIMIT 1",
+                    """
+                    SELECT side_effect_id,status,last_error
+                    FROM approval_side_effects
+                    WHERE approval_id=? ORDER BY created_at DESC LIMIT 1
+                    """,
                     (approval_id,),
                 ).fetchone()
-            return _decode(row, rule_status=str(status_row[0]) if status_row else None)
+            return _decode(row, rule_effect=dict(status_row) if status_row else None)
 
         return await asyncio.to_thread(_op)
     async def list_approval_requests(
@@ -255,12 +267,15 @@ class RuntimeApprovalLifecycleMixin:
                 sql += " ORDER BY datetime(created_at) DESC"
                 rows = conn.execute(sql, params).fetchall()
                 effects = {
-                    str(row[0]): str(row[1])
-                    for row in conn.execute(
-                        "SELECT approval_id,status FROM approval_side_effects ORDER BY created_at"
+                    str(effect_row["approval_id"]): dict(effect_row)
+                    for effect_row in conn.execute(
+                        """
+                        SELECT approval_id,side_effect_id,status,last_error
+                        FROM approval_side_effects ORDER BY created_at
+                        """
                     ).fetchall()
                 }
-            return [_decode(row, rule_status=effects.get(str(row["id"]))) for row in rows]
+            return [_decode(row, rule_effect=effects.get(str(row["id"]))) for row in rows]
 
         return await asyncio.to_thread(_op)
     async def resolve_approval_request(
@@ -467,7 +482,7 @@ class RuntimeApprovalLifecycleMixin:
                     """,
                     (
                         transition.status,
-                        json.dumps(execution_result, ensure_ascii=False),
+                        json.dumps(audit_details(execution_result), ensure_ascii=False),
                         transition.consumed_at,
                         now,
                         approval_id,

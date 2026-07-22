@@ -6,7 +6,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +15,17 @@ from mochi.runtime.runtime_approval_lifecycle import (
     RuntimeApprovalLifecycleMixin,
     initialize_runtime_approval_schema,
 )
+from mochi.runtime.security_audit import (
+    SecurityAuditEvent,
+    redact_for_persistence,
+    security_audit_projection,
+)
 
 _UNSET = object()
 _DEFAULT_GOAL_EXECUTION_MODE = "single_agent"
 _DEFAULT_SINGLE_AGENT_GOAL_PROTOCOL = "autonomous_single_agent"
+_SECURITY_AUDIT_RETENTION_DAYS = 90
+_SECURITY_AUDIT_MAX_EVENTS = 10_000
 _GOAL_EXECUTION_MODES = {"single_agent", "workflow"}
 _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
     "cancelled",
@@ -309,6 +316,26 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     details_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS security_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT,
+                    request_digest TEXT,
+                    outcome TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_security_audit_event_created
+                ON security_audit_events(event_type, created_at DESC)
                 """
             )
             conn.execute(
@@ -695,6 +722,8 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
     async def append_task_event(self, task_id: str, event: dict[str, Any]) -> None:
         await self.initialize()
         now = _now_iso()
+        projected = redact_for_persistence(event)
+        safe_event = projected if isinstance(projected, dict) else {}
 
         def _op() -> None:
             with sqlite3.connect(self._db_path) as conn:
@@ -705,7 +734,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 seq = int(row[0]) if row else 1
                 conn.execute(
                     "INSERT INTO task_events(task_id, seq, event_json, created_at) VALUES (?, ?, ?, ?)",
-                    (task_id, seq, json.dumps(event, ensure_ascii=False), now),
+                    (task_id, seq, json.dumps(safe_event, ensure_ascii=False), now),
                 )
                 conn.commit()
 
@@ -2384,6 +2413,137 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
 
         await asyncio.to_thread(_op)
         return await self.get_goal_operator_controls(scope=scope) or {}
+
+    async def append_security_audit_event(
+        self,
+        event: SecurityAuditEvent,
+    ) -> dict[str, Any]:
+        """Persist an allowlisted, centrally redacted security audit event."""
+
+        await self.initialize()
+        now = _now_iso()
+        projection = security_audit_projection(event)
+
+        def _op() -> int:
+            with sqlite3.connect(self._db_path) as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO security_audit_events (
+                        event_type, subject_type, subject_id, request_digest,
+                        outcome, details_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        projection["event_type"],
+                        projection["subject_type"],
+                        projection["subject_id"],
+                        projection["request_digest"],
+                        projection["outcome"],
+                        json.dumps(projection["details"], ensure_ascii=False),
+                        now,
+                    ),
+                )
+                cutoff = (datetime.now(UTC) - timedelta(days=_SECURITY_AUDIT_RETENTION_DAYS)).isoformat()
+                conn.execute(
+                    "DELETE FROM security_audit_events WHERE created_at<?",
+                    (cutoff,),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM security_audit_events
+                    WHERE id NOT IN (
+                        SELECT id FROM security_audit_events
+                        ORDER BY id DESC LIMIT ?
+                    )
+                    """,
+                    (_SECURITY_AUDIT_MAX_EVENTS,),
+                )
+                conn.commit()
+                return int(cursor.lastrowid)
+
+        event_id = await asyncio.to_thread(_op)
+        rows = await self.list_security_audit_events(limit=1, event_id=event_id)
+        return rows[0] if rows else {}
+
+    async def list_security_audit_events(
+        self,
+        *,
+        event_type: str | None = None,
+        event_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return only the public security-audit projection."""
+
+        await self.initialize()
+        bounded_limit = max(1, min(int(limit), 1000))
+
+        def _op() -> list[dict[str, Any]]:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if event_type is not None:
+                clauses.append("event_type=?")
+                params.append(event_type)
+            if event_id is not None:
+                clauses.append("id=?")
+                params.append(event_id)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            sql = (
+                "SELECT id,event_type,subject_type,subject_id,request_digest,"
+                "outcome,details_json,created_at FROM security_audit_events"
+                f"{where} ORDER BY id DESC LIMIT ?"
+            )
+            params.append(bounded_limit)
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(sql, tuple(params)).fetchall()
+            output: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                item["details"] = json.loads(item.pop("details_json") or "{}")
+                output.append(item)
+            return output
+
+        return await asyncio.to_thread(_op)
+
+    async def prune_security_audit_events(
+        self,
+        *,
+        retention_days: int = _SECURITY_AUDIT_RETENTION_DAYS,
+        max_events: int = _SECURITY_AUDIT_MAX_EVENTS,
+    ) -> int:
+        """Delete expired/overflow audit rows and return the removed count."""
+
+        await self.initialize()
+        bounded_days = max(1, int(retention_days))
+        bounded_max = max(1, int(max_events))
+        cutoff = (datetime.now(UTC) - timedelta(days=bounded_days)).isoformat()
+
+        def _op() -> int:
+            with sqlite3.connect(self._db_path) as conn:
+                before = int(
+                    conn.execute("SELECT COUNT(*) FROM security_audit_events").fetchone()[0]
+                )
+                conn.execute(
+                    "DELETE FROM security_audit_events WHERE created_at<?",
+                    (cutoff,),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM security_audit_events
+                    WHERE id NOT IN (
+                        SELECT id FROM security_audit_events
+                        ORDER BY id DESC LIMIT ?
+                    )
+                    """,
+                    (bounded_max,),
+                )
+                after = int(
+                    conn.execute("SELECT COUNT(*) FROM security_audit_events").fetchone()[0]
+                )
+                conn.commit()
+            return before - after
+
+        return await asyncio.to_thread(_op)
 
     async def append_goal_operator_audit_log(
         self,

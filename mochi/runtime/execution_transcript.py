@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from hashlib import sha1
 from typing import Any
 
+from mochi.runtime.security_audit import redact_for_persistence
+
 _SENSITIVE_KEY_PARTS = (
     "api_key",
     "authorization",
@@ -242,7 +244,9 @@ def normalize_subagent_event(
         )
     )
 
-    return {key: value for key, value in normalized.items() if value is not None}
+    projected = {key: value for key, value in normalized.items() if value is not None}
+    redacted = redact_for_persistence(projected)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _source_contract_fields(

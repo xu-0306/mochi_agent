@@ -174,7 +174,14 @@ async def test_chat_tui_async_streaming_and_session_switch(monkeypatch, capsys) 
         fake_engine_ref["engine"] = engine
         return engine
 
-    monkeypatch.setattr("mochi.config.manager.load_config", fake_load_config)
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config_snapshot",
+        lambda config_path=None: SimpleNamespace(  # noqa: ARG005
+            config=fake_load_config(),
+            revision="revision-1",
+            path="config.yaml",
+        ),
+    )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", fake_engine_factory)
     monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
 

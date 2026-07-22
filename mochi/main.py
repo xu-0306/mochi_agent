@@ -1717,9 +1717,10 @@ async def _create_tui_runtime_service(
     *,
     engine: object,
     config: object,
-    config_path: str | None,
+    config_path: str | Path | None,
 ) -> object:
     from mochi.config import defaults
+    from mochi.config.manager import user_config_path
     from mochi.config.schema import SecurityConfig
     from mochi.runtime.active_goal_turn_selector import build_active_goal_turn_selector
     from mochi.runtime.service import RuntimeService
@@ -1739,7 +1740,10 @@ async def _create_tui_runtime_service(
         security = SecurityConfig.model_validate(payload)
         setattr(config, "security", security)
     service.update_security_config(security)
-    service.bind_app_config(config=config, config_path=config_path)
+    service.bind_app_config(
+        config=config,
+        config_path=(config_path if config_path is not None else user_config_path()),
+    )
     service.set_runtime_tasks_root(Path(sessions_dir) / "runtime-tasks")
     await service.start()
     return service
@@ -1760,7 +1764,7 @@ async def _chat_tui_async(
         TextChunkEvent,
         ToolCallResultEvent,
     )
-    from mochi.config.manager import load_config, save_config
+    from mochi.config.manager import ConfigRevisionConflict, load_config_snapshot, save_config
     from mochi.config.schema import SecurityConfig
     from mochi.security.policy import autonomy_mode_defaults
     from mochi.sessions.store import SessionStore
@@ -1775,7 +1779,9 @@ async def _chat_tui_async(
         console.print("[red]max_turns must be greater than 0.[/red]")
         sys.exit(1)
 
-    cfg = load_config(config_path)
+    config_snapshot = load_config_snapshot(config_path)
+    config_write_path = config_path if config_path is not None else config_snapshot.path
+    cfg = config_snapshot.config
     if model:
         cfg.model = model
 
@@ -1814,7 +1820,7 @@ async def _chat_tui_async(
         return await _create_tui_runtime_service(
             engine=engine,
             config=cfg,
-            config_path=config_path,
+            config_path=config_write_path,
         )
 
     async def _ensure_runtime_service() -> object:
@@ -1955,7 +1961,20 @@ async def _chat_tui_async(
             console.print(f"[dim]{spec.canonical_name}: {status}[/dim]")
 
     async def _persist_tool_settings() -> None:
-        path = save_config(cfg, config_path)
+        nonlocal config_snapshot
+        try:
+            path = save_config(
+                cfg,
+                config_write_path,
+                expected_revision=config_snapshot.revision,
+            )
+        except ConfigRevisionConflict:
+            console.print(
+                "[red]Config changed on disk. Reload the TUI, review the new settings, "
+                "and apply this edit again.[/red]"
+            )
+            return
+        config_snapshot = load_config_snapshot(config_write_path)
         await _reset_engine()
         console.print(f"[dim]Saved config: {path}[/dim]")
 
@@ -2973,9 +2992,10 @@ async def _channels_voice_settings_async(
     reply_model_mode: str | None,
     reply_model: str | None,
 ) -> None:
-    from mochi.config.manager import load_config, save_config
+    from mochi.config.manager import ConfigRevisionConflict, load_config_snapshot, save_config
 
-    cfg = load_config(config_path)
+    config_snapshot = load_config_snapshot(config_path)
+    cfg = config_snapshot.config
     updates_requested = any(
         value is not None
         for value in (tts_voice, session_mode, reply_model_mode, reply_model)
@@ -3044,7 +3064,17 @@ async def _channels_voice_settings_async(
             )
             sys.exit(1)
 
-    path = save_config(cfg, config_path)
+    try:
+        path = save_config(
+            cfg,
+            config_path,
+            expected_revision=config_snapshot.revision,
+        )
+    except ConfigRevisionConflict:
+        console.print(
+            "[red]Config changed on disk. Reload, review, and retry the voice settings update.[/red]"
+        )
+        sys.exit(1)
     console.print(f"[green]Saved Discord voice settings:[/green] {path}")
 
 

@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 from mochi.api.server import (
     _call_with_supported_kwargs,
+    _current_config_revision,
     _get_config,
     _get_or_create_engine,
     _maybe_await,
@@ -57,7 +58,7 @@ from mochi.backends.vllm_utils import (
     normalize_vllm_managed_model_spec as shared_normalize_vllm_managed_model_spec,
     resolve_vllm_managed_model_spec as shared_resolve_vllm_managed_model_spec,
 )
-from mochi.config.manager import save_config
+from mochi.config.manager import ConfigRevisionConflict, config_revision, save_config
 from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 
@@ -2289,7 +2290,21 @@ def _persist_config_if_enabled(
     config_path = getattr(request.app.state, "config_path", None)
     if config_path is None and getattr(request.app.state, "config_factory", None) is not None:
         return None
-    return save_config(config, config_path)
+    expected = _current_config_revision()
+    if not isinstance(expected, str) or not expected:
+        expected = config_revision(config_path)
+    try:
+        path = save_config(config, config_path, expected_revision=expected)
+    except ConfigRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "settings_revision_conflict",
+                "current_revision": exc.current_revision,
+            },
+        ) from exc
+    request.app.state.config_revision = config_revision(path)
+    return path
 
 
 def _should_use_managed_vllm_mode(payload: ConfigureModelRequest) -> bool:

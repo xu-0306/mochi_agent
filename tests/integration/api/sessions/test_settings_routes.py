@@ -6,9 +6,64 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig, VoiceConfig
 
 from ._support import _create_test_app
+
+
+def test_settings_revision_etag_and_conflict_preserve_winner(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    app = create_app()
+    app.state.config = MochiConfig(model="ollama:initial")
+    app.state.config_path = config_path
+
+    with TestClient(app) as client:
+        initial = client.get("/v1/settings")
+        assert initial.status_code == 200
+        initial_revision = initial.json()["revision"]
+        assert initial.headers["etag"] == f'"{initial_revision}"'
+
+        missing = client.patch(
+            "/v1/settings",
+            json={"agent": {"temperature": 0.2}},
+        )
+        assert missing.status_code == 428
+
+        saved = client.patch(
+            "/v1/settings",
+            headers={"If-Match": f'"{initial_revision}"'},
+            json={"agent": {"temperature": 0.2}},
+        )
+        assert saved.status_code == 200
+        saved_revision = saved.json()["revision"]
+        assert saved_revision != initial_revision
+        assert saved.headers["etag"] == f'"{saved_revision}"'
+
+        external = config_path.read_text(encoding="utf-8") + "\nlog_level: DEBUG\n"
+        config_path.write_text(external, encoding="utf-8")
+        conflict = client.patch(
+            "/v1/settings",
+            headers={"If-Match": f'"{saved_revision}"'},
+            json={"agent": {"temperature": 0.4}},
+        )
+        assert conflict.status_code == 409
+        conflict_revision = conflict.json()["detail"]["current_revision"]
+
+        reloaded = client.get("/v1/settings")
+        assert reloaded.status_code == 200
+        assert reloaded.json()["revision"] == conflict_revision
+        retried = client.patch(
+            "/v1/settings",
+            headers={"If-Match": f'"{conflict_revision}"'},
+            json={"agent": {"temperature": 0.4}},
+        )
+        assert retried.status_code == 200
+
+    detail = conflict.json()["detail"]
+    assert detail["code"] == "settings_revision_conflict"
+    assert detail["current_revision"] != saved_revision
+    assert "log_level: DEBUG" in config_path.read_text(encoding="utf-8")
 
 
 def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> None:

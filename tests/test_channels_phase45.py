@@ -366,6 +366,7 @@ async def test_channel_manager_persists_shared_voice_updates_to_config_file(
             }
         }
     )
+    config_path.write_text("model: ollama:external-winner\n", encoding="utf-8")
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
     engine = FakeEngine()
     manager = build_channel_manager(
@@ -410,6 +411,7 @@ async def test_channel_manager_persists_shared_voice_updates_to_config_file(
     assert sent[-1][1] == "Updated Discord voice setting: reply_model_id=ollama:qwen2.5"
     assert saved.voice.reply_model_mode == "configured_model"
     assert saved.voice.reply_model_id == "ollama:qwen2.5"
+    assert saved.model == "ollama:external-winner"
     assert engine.apply_config_calls[-1][1] is True
 
 

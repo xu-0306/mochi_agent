@@ -267,12 +267,16 @@ async def test_chat_tui_async_goal_command_runs_as_autonomous_chat_without_pendi
     inputs = iter(["/goal ship this fix without a proposal UI", "/exit"])
 
     monkeypatch.setattr(
-        "mochi.config.manager.load_config",
+        "mochi.config.manager.load_config_snapshot",
         lambda config_path=None: SimpleNamespace(  # noqa: ARG005
-            model="ollama:base",
-            sessions_dir="/tmp/mochi-sessions",
-            security=SecurityConfig(),
-            agent=SimpleNamespace(system_prompt="Base prompt."),
+            config=SimpleNamespace(
+                model="ollama:base",
+                sessions_dir="/tmp/mochi-sessions",
+                security=SecurityConfig(),
+                agent=SimpleNamespace(system_prompt="Base prompt."),
+            ),
+            revision="revision-1",
+            path="config.yaml",
         ),
     )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005

@@ -97,6 +97,33 @@ def test_models_configure_route_supports_ollama_without_leaking_key() -> None:
     assert response.json()["available_models"][0]["id"] == "ollama:qwen2.5"
     assert response.json()["available_models"][0]["model"] == "qwen2.5"
 
+
+def test_models_configure_preserves_unrelated_external_config_update(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    app, _engine = _build_app(config_path=config_path)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/models/configure",
+            json={"provider": "ollama", "model": "first"},
+        )
+        assert first.status_code == 200
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + "\nlog_level: DEBUG\n",
+            encoding="utf-8",
+        )
+        second = client.post(
+            "/v1/models/configure",
+            json={"provider": "ollama", "model": "second"},
+        )
+
+    assert second.status_code == 200
+    saved = load_config(config_path)
+    assert saved.log_level == "DEBUG"
+    assert saved.model == "ollama:second"
+
 def test_models_configure_route_supports_openai_compat_without_returning_api_key() -> None:
     """`POST /v1/models/configure` 應接收 API key 但不得回傳原文。"""
     app, engine = _build_app()

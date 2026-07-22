@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, SecretStr
 
 from mochi.api.server import _get_config, _maybe_await, _rebuild_channel_manager
@@ -14,7 +14,12 @@ from mochi.auth.openai_codex import OpenAICodexAuthService, normalize_openai_cod
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.backends.vllm_utils import configured_vllm_launch_mode
 from mochi.config.defaults import DEFAULT_EDGE_TTS_VOICE_PRESETS
-from mochi.config.manager import save_config
+from mochi.config.manager import (
+    EMPTY_CONFIG_REVISION,
+    ConfigRevisionConflict,
+    config_revision,
+    save_config,
+)
 from mochi.config.schema import (
     AgentConfig,
     ChannelsConfig,
@@ -22,8 +27,8 @@ from mochi.config.schema import (
     GGUFConfig,
     InferencePreset,
     LearningConfig,
-    LocalModelConfig,
     LocaleDefaultsConfig,
+    LocalModelConfig,
     MemoryConfig,
     MochiConfig,
     OllamaConfig,
@@ -395,15 +400,21 @@ def _stringify_path(value: Any) -> str | None:
 
 
 @router.get("/settings")
-async def get_settings(request: Request) -> dict[str, Any]:
+async def get_settings(request: Request, response: Response) -> dict[str, Any]:
     """回傳非敏感設定摘要。"""
     app = request.app
     config = await _get_config(app)
-    return _settings_payload(config)
+    revision = _app_config_revision(request)
+    response.headers["ETag"] = _quoted_etag(revision)
+    return _settings_payload(config, revision=revision)
 
 
 @router.patch("/settings")
-async def update_settings(request: Request, payload: UpdateSettingsRequest) -> dict[str, Any]:
+async def update_settings(
+    request: Request,
+    payload: UpdateSettingsRequest,
+    response: Response,
+) -> dict[str, Any]:
     """更新 WebGUI 可編輯的非敏感 runtime 設定。"""
     config = await _get_config(request.app)
     updated = _apply_settings_patch(config, payload)
@@ -414,6 +425,23 @@ async def update_settings(request: Request, payload: UpdateSettingsRequest) -> d
         prepare_tts=_payload_updates_tts(payload.voice),
     )
 
+    expected_revision = _required_if_match(request) if _persistence_enabled(request, payload.persist) else None
+    try:
+        persisted_path = _persist_config_if_enabled(
+            request,
+            updated,
+            payload.persist,
+            expected_revision=expected_revision,
+        )
+    except ConfigRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "settings_revision_conflict",
+                "current_revision": exc.current_revision,
+            },
+        ) from exc
+
     request.app.state.config = updated
     engine = getattr(request.app.state, "engine", None)
     if engine is not None:
@@ -423,20 +451,24 @@ async def update_settings(request: Request, payload: UpdateSettingsRequest) -> d
     if payload.channels is not None and getattr(request.app.state, "channel_manager", None) is not None:
         await _rebuild_channel_manager(request.app)
 
-    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
-
-    response = _settings_payload(updated)
-    response["update"] = {
+    revision = _app_config_revision(request)
+    response.headers["ETag"] = _quoted_etag(revision)
+    response_payload = _settings_payload(updated, revision=revision)
+    response_payload["update"] = {
         "type": "settings_update",
         "download": download_result,
         "persisted": persisted_path is not None,
         "config_path": str(persisted_path) if persisted_path is not None else None,
     }
-    return response
+    return response_payload
 
 
 @router.post("/setup/discord")
-async def setup_discord(request: Request, payload: DiscordSetupRequest) -> dict[str, Any]:
+async def setup_discord(
+    request: Request,
+    payload: DiscordSetupRequest,
+    response: Response,
+) -> dict[str, Any]:
     """以專用安全路徑設定 Discord token 與頻道選項。"""
     config = await _get_config(request.app)
     try:
@@ -444,6 +476,23 @@ async def setup_discord(request: Request, payload: DiscordSetupRequest) -> dict[
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _ensure_config_directories(updated)
+
+    expected_revision = _required_if_match(request) if _persistence_enabled(request, payload.persist) else None
+    try:
+        persisted_path = _persist_config_if_enabled(
+            request,
+            updated,
+            payload.persist,
+            expected_revision=expected_revision,
+        )
+    except ConfigRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "settings_revision_conflict",
+                "current_revision": exc.current_revision,
+            },
+        ) from exc
 
     request.app.state.config = updated
     engine = getattr(request.app.state, "engine", None)
@@ -457,9 +506,10 @@ async def setup_discord(request: Request, payload: DiscordSetupRequest) -> dict[
     ):
         await _rebuild_channel_manager(request.app)
 
-    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
-    response = _settings_payload(updated)
-    response["update"] = {
+    revision = _app_config_revision(request)
+    response.headers["ETag"] = _quoted_etag(revision)
+    response_payload = _settings_payload(updated, revision=revision)
+    response_payload["update"] = {
         "type": "discord_setup",
         "persisted": persisted_path is not None,
         "config_path": str(persisted_path) if persisted_path is not None else None,
@@ -470,10 +520,10 @@ async def setup_discord(request: Request, payload: DiscordSetupRequest) -> dict[
             "voice_enabled": updated.channels.discord.voice_enabled,
         },
     }
-    return response
+    return response_payload
 
 
-def _settings_payload(config: MochiConfig) -> dict[str, Any]:
+def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> dict[str, Any]:
     """建立 WebGUI 使用的非敏感設定 payload。"""
     trajectory_path = Path(config.workspace_dir).expanduser() / "trajectories.jsonl"
     skills_db_path = resolve_skills_db_path(
@@ -486,6 +536,7 @@ def _settings_payload(config: MochiConfig) -> dict[str, Any]:
     voice_recommendations = get_voice_recommendations_payload()
     return {
         "type": "settings",
+        "revision": revision or EMPTY_CONFIG_REVISION,
         "model": config.model,
         "model_config": {
             "provider": configured_provider,
@@ -941,13 +992,59 @@ def _persist_config_if_enabled(
     request: Request,
     config: MochiConfig,
     persist: bool,
+    *,
+    expected_revision: str | None,
 ) -> Path | None:
     if not persist:
         return None
     config_path = getattr(request.app.state, "config_path", None)
     if config_path is None and getattr(request.app.state, "config_factory", None) is not None:
         return None
-    return save_config(config, config_path)
+    if expected_revision is None:
+        raise RuntimeError("Persistent settings updates require an expected revision.")
+    path = save_config(config, config_path, expected_revision=expected_revision)
+    request.app.state.config_revision = config_revision(path)
+    return path
+
+
+def _persistence_enabled(request: Request, persist: bool) -> bool:
+    if not persist:
+        return False
+    return not (
+        getattr(request.app.state, "config_path", None) is None
+        and getattr(request.app.state, "config_factory", None) is not None
+    )
+
+
+def _app_config_revision(request: Request) -> str:
+    value = getattr(request.app.state, "config_revision", None)
+    if isinstance(value, str) and value:
+        return value
+    if getattr(request.app.state, "config_factory", None) is not None:
+        return EMPTY_CONFIG_REVISION
+    revision = config_revision(getattr(request.app.state, "config_path", None))
+    request.app.state.config_revision = revision
+    return revision
+
+
+def _required_if_match(request: Request) -> str:
+    value = request.headers.get("if-match")
+    if value is None:
+        raise HTTPException(
+            status_code=428,
+            detail={"code": "settings_revision_required"},
+        )
+    normalized = value.strip()
+    if len(normalized) < 2 or normalized[0] != '"' or normalized[-1] != '"':
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_settings_revision"},
+        )
+    return normalized[1:-1]
+
+
+def _quoted_etag(revision: str) -> str:
+    return f'"{revision}"'
 
 
 def _normalize_empty_paths(values: dict[str, Any], nullable_path_keys: set[str]) -> dict[str, Any]:

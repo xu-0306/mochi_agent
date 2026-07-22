@@ -10,6 +10,9 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 
+from mochi.config.manager import load_config_snapshot
+from mochi.runtime import approval_side_effect_worker as side_effect_worker_module
+from mochi.runtime.approval_side_effect_worker import ApprovalSideEffectWorker
 from mochi.runtime.approvals import (
     APPROVAL_OWNER_TASK_ID_KEY,
     ApprovalConflict,
@@ -86,6 +89,203 @@ def test_resolve_save_rule_is_single_use_and_outbox_is_atomic(tmp_path: Path) ->
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM approval_side_effects").fetchone()[0] == 1
+
+
+def test_rule_outbox_delivery_is_restart_safe_and_independent_from_execution(tmp_path: Path) -> None:
+    db_path = tmp_path / "approvals.db"
+    config_path = tmp_path / "config.yaml"
+    store = PersistentApprovalStore(db_path)
+    _create_exec(store)
+    store.resolve(
+        "approval-1",
+        decision="approve_and_save_rule",
+        requester_id="requester-1",
+        request_digest="a" * 64,
+        context_digest="b" * 64,
+        rule_side_effect={
+            "payload": {
+                "tokens": ["echo", "ok"],
+                "decision": "allow",
+                "match": "exact",
+                "shells": ["powershell"],
+            },
+            "target_config_path": str(config_path),
+        },
+    )
+    claim = store.consume(
+        "approval-1",
+        execution_idempotency_key="execution-1",
+        lease_owner="execution-worker",
+        requester_id="requester-1",
+        request_digest="a" * 64,
+        context_digest="b" * 64,
+    )
+    store.complete_consumption(
+        "approval-1",
+        execution_idempotency_key="execution-1",
+        lease_owner="execution-worker",
+        lease_token=claim.consume_lease_token or "",
+        execution_result={"status": "completed"},
+    )
+
+    first_worker = ApprovalSideEffectWorker([db_path])
+    delivered = asyncio.run(first_worker.deliver_available())
+
+    assert delivered[0]["status"] == "delivered"
+    snapshot = load_config_snapshot(config_path)
+    assert [rule.tokens for rule in snapshot.config.security.command_rules] == [["echo", "ok"]]
+    effect = store.list_side_effects("approval-1")[0]
+    assert effect["status"] == "delivered"
+
+    # Simulate a crash after config replace but before the delivered DB mark.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE approval_side_effects
+            SET status='retrying',lease_owner=NULL,lease_expires_at=NULL,delivered_at=NULL
+            WHERE side_effect_id=?
+            """,
+            (effect["side_effect_id"],),
+        )
+        conn.commit()
+    restarted_worker = ApprovalSideEffectWorker([db_path])
+    replay = asyncio.run(restarted_worker.deliver_available())
+
+    assert replay[0]["status"] == "delivered"
+    restarted = load_config_snapshot(config_path).config
+    assert [rule.tokens for rule in restarted.security.command_rules] == [["echo", "ok"]]
+    assert restarted.security.applied_rule_side_effect_ids == [effect["side_effect_id"]]
+    assert store.get("approval-1").status == "consumed"  # type: ignore[union-attr]
+
+
+def test_two_workers_claim_one_rule_side_effect_once(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        db_path = tmp_path / "approvals.db"
+        config_path = tmp_path / "config.yaml"
+        store = PersistentApprovalStore(db_path)
+        _create_exec(store)
+        store.resolve(
+            "approval-1",
+            decision="approve_and_save_rule",
+            requester_id="requester-1",
+            request_digest="a" * 64,
+            context_digest="b" * 64,
+            rule_side_effect={
+                "payload": {
+                    "tokens": ["echo", "once"],
+                    "decision": "allow",
+                    "match": "exact",
+                    "shells": ["powershell"],
+                },
+                "target_config_path": str(config_path),
+            },
+        )
+
+        first, second = await asyncio.gather(
+            ApprovalSideEffectWorker([db_path]).deliver_available(max_items=1),
+            ApprovalSideEffectWorker([db_path]).deliver_available(max_items=1),
+        )
+
+        delivered = [item for item in [*first, *second] if item["status"] == "delivered"]
+        assert len(delivered) == 1
+        effect = store.list_side_effects("approval-1")[0]
+        assert effect["status"] == "delivered"
+        snapshot = load_config_snapshot(config_path)
+        assert [rule.tokens for rule in snapshot.config.security.command_rules] == [
+            ["echo", "once"]
+        ]
+        assert snapshot.config.security.applied_rule_side_effect_ids == [
+            effect["side_effect_id"]
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_retryable_rule_delivery_uses_backoff_instead_of_hot_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "approvals.db"
+    config_path = tmp_path / "config.yaml"
+    store = PersistentApprovalStore(db_path)
+    _create_exec(store)
+    store.resolve(
+        "approval-1",
+        decision="approve_and_save_rule",
+        requester_id="requester-1",
+        request_digest="a" * 64,
+        context_digest="b" * 64,
+        rule_side_effect={
+            "payload": {
+                "tokens": ["echo", "retry"],
+                "decision": "allow",
+                "match": "exact",
+                "shells": ["powershell"],
+            },
+            "target_config_path": str(config_path),
+        },
+    )
+    monkeypatch.setattr(
+        side_effect_worker_module,
+        "save_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace busy")),
+    )
+
+    results = asyncio.run(ApprovalSideEffectWorker([db_path]).deliver_available(max_items=32))
+
+    assert len(results) == 1
+    assert results[0]["status"] == "retrying"
+    effect = store.list_side_effects("approval-1")[0]
+    assert effect["status"] == "retrying"
+    assert effect["attempts"] == 1
+    assert datetime.fromisoformat(effect["lease_expires_at"]) > datetime.now(UTC)
+
+
+def test_invalid_rule_delivery_is_permanently_failed(tmp_path: Path) -> None:
+    db_path = tmp_path / "approvals.db"
+    store = PersistentApprovalStore(db_path)
+    _create_exec(store)
+    store.resolve(
+        "approval-1",
+        decision="approve_and_save_rule",
+        requester_id="requester-1",
+        request_digest="a" * 64,
+        context_digest="b" * 64,
+        rule_side_effect={
+            "payload": {"tokens": "not-a-token-list"},
+            "target_config_path": str(tmp_path / "config.yaml"),
+        },
+    )
+
+    results = asyncio.run(ApprovalSideEffectWorker([db_path]).deliver_available())
+
+    assert results[0]["status"] == "failed"
+    assert store.list_side_effects("approval-1")[0]["status"] == "failed"
+
+
+def test_malformed_outbox_json_is_permanently_failed(tmp_path: Path) -> None:
+    db_path = tmp_path / "approvals.db"
+    store = PersistentApprovalStore(db_path)
+    _create_exec(store)
+    store.resolve(
+        "approval-1",
+        decision="approve_and_save_rule",
+        requester_id="requester-1",
+        request_digest="a" * 64,
+        context_digest="b" * 64,
+        rule_side_effect={
+            "payload": {"tokens": ["echo", "ok"], "decision": "allow"},
+            "target_config_path": str(tmp_path / "config.yaml"),
+        },
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE approval_side_effects SET payload_json='{' ")
+        conn.commit()
+
+    results = asyncio.run(ApprovalSideEffectWorker([db_path]).deliver_available())
+
+    assert results[0]["status"] == "failed"
+    assert store.list_side_effects("approval-1")[0]["status"] == "failed"
 
 
 def test_expired_and_requester_mismatch_fail_closed(tmp_path: Path) -> None:
@@ -395,6 +595,8 @@ def test_periodic_recovery_sweeps_lease_that_expires_after_startup(tmp_path: Pat
         )
         service.set_scheduler_poll_interval(0.05)
         await service.start()
+        assert service._side_effect_task is not None
+        assert not service._side_effect_task.done()
         try:
             for _ in range(40):
                 if exec_store.get("approval-1").status == "execution_failed":  # type: ignore[union-attr]
@@ -403,6 +605,7 @@ def test_periodic_recovery_sweeps_lease_that_expires_after_startup(tmp_path: Pat
             assert exec_store.get("approval-1").status == "execution_failed"  # type: ignore[union-attr]
         finally:
             await service.close()
+        assert service._side_effect_task is None
 
     asyncio.run(scenario())
 

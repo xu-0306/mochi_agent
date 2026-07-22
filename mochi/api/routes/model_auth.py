@@ -11,12 +11,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from mochi.api.server import _get_config
+from mochi.api.server import _current_config_revision, _get_config
 from mochi.auth.openai_codex import (
     OPENAI_CODEX_DEFAULT_PROFILE_ID,
     OpenAICodexAuthService,
 )
-from mochi.config.manager import save_config
+from mochi.config.manager import ConfigRevisionConflict, config_revision, save_config
 from mochi.config.schema import MochiConfig
 
 router = APIRouter(prefix="/v1/model-auth")
@@ -94,7 +94,21 @@ def _persist_config_if_possible(request: Request, config: MochiConfig) -> Path |
     config_path = getattr(request.app.state, "config_path", None)
     if config_path is None and getattr(request.app.state, "config_factory", None) is not None:
         return None
-    return save_config(config, config_path)
+    expected = _current_config_revision()
+    if not isinstance(expected, str) or not expected:
+        expected = config_revision(config_path)
+    try:
+        path = save_config(config, config_path, expected_revision=expected)
+    except ConfigRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "settings_revision_conflict",
+                "current_revision": exc.current_revision,
+            },
+        ) from exc
+    request.app.state.config_revision = config_revision(path)
+    return path
 
 
 def _set_active_profile(request: Request, config: MochiConfig, profile_id: str | None) -> MochiConfig:

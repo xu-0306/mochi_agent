@@ -40,6 +40,7 @@ from mochi.runtime.approval_state_machine import (
 from mochi.runtime.approval_state_machine import (
     is_expired as _is_expired,
 )
+from mochi.runtime.security_audit import audit_details
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -358,7 +359,7 @@ class InMemoryApprovalStore:
                 reason=reason if reason is not None else current.reason,
                 metadata=dict(merged),
                 execution_result=(
-                    dict(execution_result)
+                    audit_details(execution_result)
                     if isinstance(execution_result, dict)
                     else current.execution_result
                 ),
@@ -437,7 +438,7 @@ class InMemoryApprovalStore:
             completed = replace(
                 current,
                 status=transition.status,
-                execution_result=dict(execution_result),
+                execution_result=audit_details(execution_result),
                 consume_lease_owner=transition.consume_lease_owner,
                 consume_lease_token=transition.consume_lease_token,
                 consume_lease_expires_at=transition.consume_lease_expires_at,
@@ -465,7 +466,7 @@ class InMemoryApprovalStore:
                 current,
                 status=transition.status,
                 execution_result=(
-                    dict(execution_result)
+                    audit_details(execution_result)
                     if isinstance(execution_result, dict)
                     else current.execution_result
                 ),
@@ -489,7 +490,7 @@ class InMemoryApprovalStore:
                 _lifecycle_state(current)
             ):
                 return None
-            updated = replace(current, execution_result=dict(execution_result))
+            updated = replace(current, execution_result=audit_details(execution_result))
             self._items[approval_id] = deepcopy(updated)
             return deepcopy(updated)
 
@@ -540,6 +541,10 @@ class PersistentApprovalStore:
         self._db_path = Path(db_path)
         self._lock = Lock()
         self._initialize()
+
+    @property
+    def database_path(self) -> Path:
+        return self._db_path
 
     def create(
         self,
@@ -668,7 +673,7 @@ class PersistentApprovalStore:
                     transition.status,
                     reason if reason is not None else current.reason,
                     json.dumps(merged, ensure_ascii=False),
-                    json.dumps(execution_result, ensure_ascii=False)
+                    json.dumps(audit_details(execution_result), ensure_ascii=False)
                     if isinstance(execution_result, dict)
                     else None,
                     now,
@@ -807,7 +812,7 @@ class PersistentApprovalStore:
                 """,
                 (
                     transition.status,
-                    json.dumps(execution_result, ensure_ascii=False),
+                    json.dumps(audit_details(execution_result), ensure_ascii=False),
                     transition.consumed_at,
                     now,
                     approval_id,
@@ -856,7 +861,7 @@ class PersistentApprovalStore:
                 """,
                 (
                     transition.status,
-                    json.dumps(execution_result, ensure_ascii=False)
+                    json.dumps(audit_details(execution_result), ensure_ascii=False)
                     if isinstance(execution_result, dict)
                     else current.execution_result
                     and json.dumps(current.execution_result, ensure_ascii=False),
@@ -885,7 +890,7 @@ class PersistentApprovalStore:
                 WHERE approval_id=? AND status IN ('consumed','execution_failed')
                 """,
                 (
-                    json.dumps(execution_result, ensure_ascii=False),
+                    json.dumps(audit_details(execution_result), ensure_ascii=False),
                     utc_now_iso(),
                     approval_id,
                 ),
@@ -958,7 +963,11 @@ class PersistentApprovalStore:
         output: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            raw_payload = item.pop("payload_json", None)
+            try:
+                item["payload"] = json.loads(raw_payload or "{}")
+            except (json.JSONDecodeError, TypeError):
+                item["payload"] = None
             output.append(item)
         return output
 

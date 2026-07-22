@@ -504,6 +504,9 @@ function localizeDiscordValue(value: string | null, namespace: string, t: Transl
 }
 
 function messageWithDetail(label: string, error: unknown): string {
+  if (error instanceof api.SettingsRevisionConflict) {
+    return `${label}: Settings were modified by another process. Your unsaved edits were kept; reload, review, and retry.`
+  }
   if (error instanceof Error && error.message.trim()) {
     return `${label}: ${error.message}`
   }

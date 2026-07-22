@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 import yaml
+
 try:
     from loguru import logger
 except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
@@ -17,8 +23,45 @@ from pydantic import SecretStr
 
 from mochi.config import defaults
 from mochi.config.schema import MochiConfig
+from mochi.runtime.security_audit import register_known_secrets
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _WindowsOverlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+else:
+    _WindowsOverlapped = object  # type: ignore[misc,assignment]
 
 PROJECT_DEFAULT_CONFIG_PATH = Path("configs/default.yaml")
+EMPTY_CONFIG_REVISION = hashlib.sha256(b"").hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigSnapshot:
+    """Validated config paired with the exact on-disk byte revision."""
+
+    config: MochiConfig
+    revision: str
+    path: Path
+    exists: bool
+
+
+class ConfigRevisionConflict(RuntimeError):
+    """Raised when a compare-and-swap config write observes stale bytes."""
+
+    def __init__(self, *, expected_revision: str, current_revision: str, path: Path) -> None:
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+        self.path = path
+        super().__init__(f"Config revision conflict for {path}.")
 
 
 def _safe_debug_log(message: str, *args: Any) -> None:
@@ -272,23 +315,73 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
             prepared = _apply_env_overrides(_apply_platform_path_defaults(raw))
             normalized = _normalize_windows_runtime_paths(prepared)
             config = MochiConfig.model_validate(normalized)
+            register_known_secrets(config)
             if config_path is None and _should_persist_windows_migration(
                 source_path=path,
                 original=prepared,
                 normalized=normalized,
             ):
-                save_config(config, user_config_path())
+                target = user_config_path()
+                save_config(
+                    config,
+                    target,
+                    expected_revision=config_revision(target),
+                )
             return config
 
     _safe_debug_log("No config file found, using defaults.")
-    return MochiConfig.model_validate(
+    config = MochiConfig.model_validate(
         _normalize_windows_runtime_paths(
             _apply_env_overrides(_apply_platform_path_defaults({}))
         )
     )
+    register_known_secrets(config)
+    return config
 
 
-def save_config(config: MochiConfig, config_path: str | Path | None = None) -> Path:
+def load_config_snapshot(config_path: str | Path | None = None) -> ConfigSnapshot:
+    """Load validated config plus SHA-256 of the exact selected file bytes."""
+
+    if config_path is None:
+        # Preserve the existing one-time Windows migration before selecting the
+        # write target. Project/legacy defaults may seed the config value, but
+        # compare-and-swap must bind to the user file that save_config(None) writes.
+        fallback_config = load_config()
+        path = user_config_path().expanduser()
+    else:
+        fallback_config = None
+        path = Path(config_path).expanduser()
+    try:
+        raw = path.read_bytes()
+        exists = True
+    except FileNotFoundError:
+        raw = b""
+        exists = False
+    config = _config_from_bytes(raw) if exists else fallback_config or _config_from_bytes(b"")
+    register_known_secrets(config)
+    return ConfigSnapshot(
+        config=config,
+        revision=_revision(raw),
+        path=path,
+        exists=exists,
+    )
+
+
+def config_revision(config_path: str | Path | None = None) -> str:
+    path = _selected_config_path(config_path)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raw = b""
+    return _revision(raw)
+
+
+def save_config(
+    config: MochiConfig,
+    config_path: str | Path | None = None,
+    *,
+    expected_revision: str,
+) -> Path:
     """將設定保存成 YAML，預設寫入使用者設定檔。
 
     `SecretStr` 會以原始值寫入本機檔案；呼叫端仍需避免將檔案內容回傳到 API。
@@ -296,13 +389,170 @@ def save_config(config: MochiConfig, config_path: str | Path | None = None) -> P
     path = Path(config_path) if config_path is not None else user_config_path()
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    register_known_secrets(config)
     data = _serialize_for_yaml(config.model_dump(mode="python"))
-    path.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+    encoded = yaml.safe_dump(data, allow_unicode=True, sort_keys=False).encode("utf-8")
+    with _config_path_lock(path):
+        current_revision = config_revision(path)
+        if current_revision != expected_revision:
+            raise ConfigRevisionConflict(
+                expected_revision=expected_revision,
+                current_revision=current_revision,
+                path=path,
+            )
+        _atomic_write_config(path, encoded)
     _safe_debug_log("Saved config to {}", path)
     return path
+
+
+def _selected_config_path(config_path: str | Path | None) -> Path:
+    if config_path is not None:
+        return Path(config_path).expanduser()
+    return user_config_path().expanduser()
+
+
+def _revision(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _config_from_bytes(raw: bytes) -> MochiConfig:
+    loaded = yaml.safe_load(raw.decode("utf-8")) if raw else {}
+    prepared = _apply_env_overrides(
+        _apply_platform_path_defaults(_coerce_mapping(loaded or {}))
+    )
+    normalized = _normalize_windows_runtime_paths(prepared)
+    return MochiConfig.model_validate(normalized)
+
+
+@contextmanager
+def _config_path_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    lock_token: object | None = None
+    locked = False
+    try:
+        lock_token = _lock_file(handle)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                _unlock_file(handle, lock_token)
+        finally:
+            handle.close()
+
+
+def _lock_file(handle: BinaryIO) -> object | None:
+    if os.name != "nt":
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return None
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    overlapped = _WindowsOverlapped()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    lock_file_ex = kernel32.LockFileEx
+    lock_file_ex.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_WindowsOverlapped),
+    ]
+    lock_file_ex.restype = wintypes.BOOL
+    os_handle = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
+    if not lock_file_ex(os_handle, 0x2, 0, 1, 0, ctypes.byref(overlapped)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return overlapped
+
+
+def _unlock_file(handle: BinaryIO, lock_token: object | None) -> None:
+    if os.name != "nt":
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    overlapped = (
+        lock_token if isinstance(lock_token, _WindowsOverlapped) else _WindowsOverlapped()
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    unlock_file_ex = kernel32.UnlockFileEx
+    unlock_file_ex.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_WindowsOverlapped),
+    ]
+    unlock_file_ex.restype = wintypes.BOOL
+    os_handle = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
+    if not unlock_file_ex(os_handle, 0, 1, 0, ctypes.byref(overlapped)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _atomic_write_config(path: Path, encoded: bytes) -> None:
+    existing_mode = path.stat().st_mode if path.exists() else None
+    file_descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if existing_mode is not None and os.name != "nt":
+            os.chmod(temp_path, existing_mode)
+        _atomic_replace(temp_path, path)
+        _fsync_parent(path.parent)
+    except BaseException:
+        with suppress(OSError):
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_replace(source: Path, target: Path) -> None:
+    if os.name != "nt" or not target.exists():
+        os.replace(source, target)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    replace_file = kernel32.ReplaceFileW
+    replace_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    replace_file.restype = wintypes.BOOL
+    if not replace_file(str(target), str(source), None, 0x1, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _fsync_parent(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _serialize_for_yaml(value: Any) -> Any:

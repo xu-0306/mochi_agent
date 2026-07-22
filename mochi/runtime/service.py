@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -25,7 +26,7 @@ from mochi.agents.multi_agent.execution_policy import (
 from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunRequest
 from mochi.api.routes.chat import _serialize_event
 from mochi.backends.inference_capabilities import ReasoningEffort
-from mochi.config.manager import save_config
+from mochi.config.manager import load_config_snapshot, save_config
 from mochi.config.schema import CommandRuleConfig, MochiConfig, SandboxConfig, SecurityConfig
 from mochi.goal_intent import (
     GoalStrategySelectionResult,
@@ -41,6 +42,8 @@ from mochi.runtime.agent_run_packages import (
     build_dataset_package,
     summarize_package_materialization,
 )
+from mochi.runtime.approval_side_effect_worker import ApprovalSideEffectWorker
+from mochi.runtime.approval_side_effects import public_side_effect_projection
 from mochi.runtime.approval_state_machine import derive_approval_binding
 from mochi.runtime.approvals import (
     APPROVAL_OWNER_TASK_ID_KEY,
@@ -93,6 +96,12 @@ from mochi.runtime.recovery import (
     build_resource_exhaustion_report,
     classify_agent_run_recovery_issue,
 )
+from mochi.runtime.security_audit import (
+    SecurityAuditEvent,
+    file_content_observation,
+    redact_for_persistence,
+    security_audit_digest,
+)
 from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
 from mochi.security.file_contract import AppliedChangeRecord
@@ -113,6 +122,8 @@ from mochi.tools.file_ops import (
     revalidate_patch_change_contract,
 )
 from mochi.tools.file_transaction import observe_undo_target
+
+_security_audit_logger = logging.getLogger(__name__)
 
 TASK_STATUS_RUNNING = {"queued", "running", "resumed"}
 DELEGATED_TASK_RESUMABLE_STATUS = {
@@ -529,6 +540,13 @@ class RuntimeService:
         self._goal_lease_ttl_seconds = self._DEFAULT_GOAL_LEASE_TTL_SECONDS
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
+        self._side_effect_stop_event = asyncio.Event()
+        self._side_effect_task: asyncio.Task[None] | None = None
+        approval_db_path = getattr(self._exec_approval_store, "database_path", None)
+        side_effect_paths = [self._store.database_path]
+        if isinstance(approval_db_path, Path):
+            side_effect_paths.append(approval_db_path)
+        self._side_effect_worker = ApprovalSideEffectWorker(side_effect_paths)
         self._goal_supervision_lock = asyncio.Lock()
         self._runtime_owner_id = f"runtime-{uuid4()}"
         self._delegated_subagent_live_subscribers: dict[str, set[_DelegatedSubagentLiveSubscription]] = {}
@@ -573,14 +591,19 @@ class RuntimeService:
             return None
         if self._bound_config is None:
             raise RuntimeError("Runtime service is not bound to an app config.")
-        existing_rules = list(self._bound_config.security.command_rules)
+        snapshot = load_config_snapshot(self._bound_config_path)
+        existing_rules = list(snapshot.config.security.command_rules)
         if validated_rule not in existing_rules:
             existing_rules.append(validated_rule)
-        updated_security = self._bound_config.security.model_copy(
+        updated_security = snapshot.config.security.model_copy(
             update={"command_rules": existing_rules}
         )
-        self._bound_config = self._bound_config.model_copy(update={"security": updated_security})
-        save_config(self._bound_config, self._bound_config_path)
+        self._bound_config = snapshot.config.model_copy(update={"security": updated_security})
+        save_config(
+            self._bound_config,
+            self._bound_config_path,
+            expected_revision=snapshot.revision,
+        )
         self.update_security_config(self._bound_config.security)
         return validated_rule.model_dump(mode="python")
 
@@ -606,6 +629,11 @@ class RuntimeService:
             self._scheduler_loop(),
             name='runtime-agent-run-scheduler',
         )
+        self._side_effect_stop_event = asyncio.Event()
+        self._side_effect_task = asyncio.create_task(
+            self._approval_side_effect_loop(),
+            name="runtime-approval-side-effect-worker",
+        )
 
     async def _recover_stale_approval_consumptions(self) -> None:
         await self._store.recover_stale_approval_consumptions()
@@ -616,6 +644,52 @@ class RuntimeService:
         )
         if callable(recover_exec_approvals):
             await asyncio.to_thread(recover_exec_approvals)
+
+    async def _approval_side_effect_loop(self) -> None:
+        while not self._side_effect_stop_event.is_set():
+            await self._deliver_and_audit_approval_side_effects()
+            try:
+                await asyncio.wait_for(self._side_effect_stop_event.wait(), timeout=0.5)
+            except TimeoutError:
+                continue
+
+    async def deliver_approval_side_effects_once(self) -> list[dict[str, Any]]:
+        """Run one deterministic worker pass for tests and operator recovery."""
+
+        return await self._deliver_and_audit_approval_side_effects()
+
+    async def _deliver_and_audit_approval_side_effects(self) -> list[dict[str, Any]]:
+        results = await self._side_effect_worker.deliver_available()
+        for result in results:
+            status = str(result.get("status") or "retrying")
+            event_type = {
+                "delivered": "rule_persistence_delivered",
+                "failed": "rule_persistence_failed",
+            }.get(status, "rule_persistence_retrying")
+            await self.record_security_audit_event(
+                SecurityAuditEvent(
+                    event_type=event_type,
+                    subject_type="approval_side_effect",
+                    subject_id=str(result.get("side_effect_id") or "") or None,
+                    outcome=status,
+                    details={
+                        "approval_id": result.get("approval_id"),
+                        "error": result.get("error"),
+                    },
+                )
+            )
+        return results
+
+    async def record_security_audit_event(self, event: SecurityAuditEvent) -> dict[str, Any]:
+        try:
+            return await self._store.append_security_audit_event(event)
+        except Exception as exc:  # pragma: no cover - best-effort audit boundary
+            _security_audit_logger.warning(
+                "Security audit event %s could not be persisted (%s).",
+                event.event_type,
+                exc.__class__.__name__,
+            )
+            return {}
 
     async def close(self) -> None:
         current_loop = asyncio.get_running_loop()
@@ -632,6 +706,7 @@ class RuntimeService:
                 return False
 
         self._scheduler_stop_event.set()
+        self._side_effect_stop_event.set()
         scheduler_task = self._scheduler_task
         if scheduler_task is not None and not scheduler_task.done():
             scheduler_task.cancel()
@@ -641,6 +716,15 @@ class RuntimeService:
                 except asyncio.CancelledError:
                     pass
         self._scheduler_task = None
+        side_effect_task = self._side_effect_task
+        if side_effect_task is not None and not side_effect_task.done():
+            side_effect_task.cancel()
+            if _awaitable_in_current_loop(side_effect_task):
+                try:
+                    await side_effect_task
+                except asyncio.CancelledError:
+                    pass
+        self._side_effect_task = None
 
         for job in list(self._active_jobs.values()):
             if not job.done():
@@ -6722,6 +6806,22 @@ class RuntimeService:
                 else:
                     metadata.update(change_payload)
                     metadata.update(contract)
+                    await self.record_security_audit_event(
+                        SecurityAuditEvent(
+                            event_type="manifest_prepared",
+                            subject_type="change_set",
+                            subject_id=str(contract.get("change_set_id") or "") or None,
+                            request_digest=security_audit_digest(
+                                contract.get("request_digest")
+                            ),
+                            outcome="prepared",
+                            details={
+                                "task_id": task.get("id"),
+                                "tool_name": tool_name,
+                                "entry_count": len(change_payload.get("file_changes") or []),
+                            },
+                        )
+                    )
             return metadata
         if tool_name != "exec_command":
             return metadata
@@ -6895,7 +6995,15 @@ class RuntimeService:
                     approval_id = exec_approval.approval_id
                     if approval_id in linked_exec_approval_ids or approval_id in rehydrated_ids:
                         continue
-                    summaries.append(_exec_approval_summary(exec_approval))
+                    summaries.append(
+                        _exec_approval_summary(
+                            exec_approval,
+                            rule_side_effect=_latest_rule_side_effect(
+                                self._exec_approval_store,
+                                exec_approval.approval_id,
+                            ),
+                        )
+                    )
                     rehydrated_ids.add(approval_id)
             for exec_approval in self._exec_approval_store.list(status=exec_status):
                 if (
@@ -6903,7 +7011,15 @@ class RuntimeService:
                     or exec_approval.approval_id in rehydrated_ids
                 ):
                     continue
-                summaries.append(_exec_approval_summary(exec_approval))
+                summaries.append(
+                    _exec_approval_summary(
+                        exec_approval,
+                        rule_side_effect=_latest_rule_side_effect(
+                            self._exec_approval_store,
+                            exec_approval.approval_id,
+                        ),
+                    )
+                )
 
         summaries.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
         return summaries
@@ -6975,6 +7091,16 @@ class RuntimeService:
             )
             if resolved_exec is None:
                 return None
+            await self._record_approval_resolution_audit(
+                approval_id=approval_id,
+                approval=resolved_exec,
+                decision=effective_decision,
+                reason=reason,
+                rule_side_effect=_latest_rule_side_effect(
+                    self._exec_approval_store,
+                    approval_id,
+                ),
+            )
             execution_result: dict[str, Any] | None = None
             if effective_decision != 'reject':
                 lease_owner = f'runtime-service:{id(self)}'
@@ -7022,7 +7148,13 @@ class RuntimeService:
                             'continue_from_checkpoint' if auto_resume_linked_run else None
                         ),
                     )
-            return _exec_approval_summary(resolved_exec)
+            return _exec_approval_summary(
+                resolved_exec,
+                rule_side_effect=_latest_rule_side_effect(
+                    self._exec_approval_store,
+                    approval_id,
+                ),
+            )
         if _is_file_mutation_approval(current):
             mode = self._security_config.change_contract_mode
             if mode == "enforce" and replay_override is not None:
@@ -7039,6 +7171,23 @@ class RuntimeService:
                         security=self._security_config,
                     )
                 except FileChangeContractConflict as exc:
+                    await self.record_security_audit_event(
+                        SecurityAuditEvent(
+                            event_type="mutation_conflicted",
+                            subject_type="change_set",
+                            subject_id=str(
+                                (current.get("metadata") or {}).get("change_set_id")
+                                if isinstance(current.get("metadata"), dict)
+                                else ""
+                            )
+                            or None,
+                            request_digest=security_audit_digest(
+                                current.get("request_digest")
+                            ),
+                            outcome="revalidation_failed",
+                            details={"approval_id": approval_id, "reason": str(exc)},
+                        )
+                    )
                     raise ApprovalConflict("change_set_conflicted") from exc
         linked_exec_approval_id = _linked_exec_approval_id(current.get("metadata"))
         linked_exec = (
@@ -7083,6 +7232,17 @@ class RuntimeService:
         )
         if approval is None:
             return None
+        await self._record_approval_resolution_audit(
+            approval_id=approval_id,
+            approval=approval,
+            decision=effective_decision,
+            reason=reason,
+            rule_side_effect=(
+                await self._store.get_approval_request(approval_id)
+                if effective_decision == "approve_and_save_rule"
+                else None
+            ),
+        )
         if linked_exec_approval_id:
             linked_exec = self._exec_approval_store.resolve(
                 linked_exec_approval_id,
@@ -7179,6 +7339,50 @@ class RuntimeService:
             succeeded=True,
         )
         return self._task_approval_summary(completed)
+
+    async def _record_approval_resolution_audit(
+        self,
+        *,
+        approval_id: str,
+        approval: Any,
+        decision: str,
+        reason: str | None,
+        rule_side_effect: Mapping[str, Any] | None,
+    ) -> None:
+        request_digest = (
+            approval.get("request_digest")
+            if isinstance(approval, Mapping)
+            else getattr(approval, "request_digest", None)
+        )
+        status = (
+            approval.get("status")
+            if isinstance(approval, Mapping)
+            else getattr(approval, "status", None)
+        )
+        await self.record_security_audit_event(
+            SecurityAuditEvent(
+                event_type="approval_resolved",
+                subject_type="approval",
+                subject_id=approval_id,
+                request_digest=security_audit_digest(request_digest),
+                outcome=str(status or decision),
+                details={
+                    "decision": decision,
+                    "reason": reason,
+                    "rule_persistence_status": (
+                        rule_side_effect.get("rule_persistence_status")
+                        or rule_side_effect.get("status")
+                        if isinstance(rule_side_effect, Mapping)
+                        else None
+                    ),
+                    "side_effect_id": (
+                        rule_side_effect.get("side_effect_id")
+                        if isinstance(rule_side_effect, Mapping)
+                        else None
+                    ),
+                },
+            )
+        )
 
     async def _complete_runtime_approval_claim(
         self,
@@ -7339,7 +7543,9 @@ class RuntimeService:
         poll = await self._exec_runtime.read_session(session_id, yield_time_ms=yield_time_ms)
         if poll is None:
             return ("session_unavailable", None)
-        return _build_approval_exec_session_payload(context=context, poll=poll)
+        return _redact_public_approval_summary(
+            _build_approval_exec_session_payload(context=context, poll=poll)
+        )
 
     async def stop_approval_exec_session(self, approval_id: str) -> dict[str, Any] | tuple[str, None]:
         context = await self._get_approval_exec_session_context(approval_id)
@@ -7365,7 +7571,7 @@ class RuntimeService:
                 )
         payload = _build_approval_exec_session_payload(context=context, poll=poll)
         payload["stop_status"] = poll.status.value
-        return payload
+        return _redact_public_approval_summary(payload)
 
     async def _execute_approved_file_mutation(
         self,
@@ -7546,7 +7752,13 @@ class RuntimeService:
                 )
         if standalone is None:
             return ("approval_not_found", None)
-        summary = _exec_approval_summary(standalone)
+        summary = _exec_approval_summary(
+            standalone,
+            rule_side_effect=_latest_rule_side_effect(
+                self._exec_approval_store,
+                approval_id,
+            ),
+        )
         return {
             "approval_id": approval_id,
             "source": summary.get("source"),
@@ -7560,14 +7772,14 @@ class RuntimeService:
     def _enrich_approval_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
         linked_exec_approval_id = summary.get("exec_approval_id")
         if not isinstance(linked_exec_approval_id, str) or not linked_exec_approval_id:
-            return summary
+            return _redact_public_approval_summary(summary)
         linked = self._exec_approval_store.get(linked_exec_approval_id)
         if linked is None:
-            return summary
+            return _redact_public_approval_summary(summary)
         summary["exec_status"] = linked.status
         summary["exec_session_id"] = _exec_result_field(linked.execution_result, "session_id")
         summary["execution_result"] = linked.execution_result
-        return summary
+        return _redact_public_approval_summary(summary)
 
     async def _list_rehydrated_linked_exec_approvals(self) -> list[Any]:
         runs = await self._store.list_agent_runs()
@@ -7925,6 +8137,16 @@ class RuntimeService:
             replay_override=replay_override,
         )
         if tool_name is None or result is None:
+            await self.record_security_audit_event(
+                SecurityAuditEvent(
+                    event_type="mutation_conflicted",
+                    subject_type="approval",
+                    subject_id=str(approval.get("id") or "") or None,
+                    request_digest=security_audit_digest(current.get("request_digest")),
+                    outcome="replay_unavailable",
+                    details={"task_id": approval.get("task_id")},
+                )
+            )
             await self._store.update_task_status(
                 approval["task_id"],
                 "failed",
@@ -7977,6 +8199,24 @@ class RuntimeService:
                 error=None,
                 final_answer=final_answer,
             )
+            await self.record_security_audit_event(
+                SecurityAuditEvent(
+                    event_type="mutation_applied",
+                    subject_type="change_set",
+                    subject_id=(
+                        change_set_id
+                        if isinstance(change_set_id, str) and change_set_id
+                        else None
+                    ),
+                    request_digest=security_audit_digest(current.get("request_digest")),
+                    outcome="applied",
+                    details={
+                        "approval_id": approval.get("id"),
+                        "task_id": approval.get("task_id"),
+                        "tool_name": tool_name,
+                    },
+                )
+            )
             return True
 
         if isinstance(change_set_id, str) and change_set_id:
@@ -8003,6 +8243,25 @@ class RuntimeService:
             "failed",
             error=result.error,
             final_answer=final_answer,
+        )
+        await self.record_security_audit_event(
+            SecurityAuditEvent(
+                event_type="mutation_conflicted",
+                subject_type="change_set",
+                subject_id=(
+                    change_set_id
+                    if isinstance(change_set_id, str) and change_set_id
+                    else None
+                ),
+                request_digest=security_audit_digest(current.get("request_digest")),
+                outcome="failed",
+                details={
+                    "approval_id": approval.get("id"),
+                    "task_id": approval.get("task_id"),
+                    "tool_name": tool_name,
+                    "error": result.error,
+                },
+            )
         )
         return True
 
@@ -8220,6 +8479,16 @@ class RuntimeService:
                 if serialized.get("type") != "tool_call_result":
                     continue
                 metadata = serialized.get("metadata")
+                await self._record_auto_review_audit(
+                    task_id=task_id,
+                    event=serialized,
+                    metadata=metadata if isinstance(metadata, dict) else None,
+                )
+                await self._record_tool_denial_audit(
+                    task_id=task_id,
+                    event=serialized,
+                    metadata=metadata if isinstance(metadata, dict) else None,
+                )
                 requires_approval = (
                     isinstance(metadata, dict) and metadata.get("requires_approval") is True
                 )
@@ -8236,6 +8505,29 @@ class RuntimeService:
                     request_event=request_event,
                     approval_metadata=approval_metadata,
                 )
+                request_tool_name = str(request_event.get("tool_name") or "")
+                if (
+                    request_tool_name in {"file_write", "file_edit"}
+                    and isinstance(approval_metadata.get("change_set_id"), str)
+                ):
+                    await self.record_security_audit_event(
+                        SecurityAuditEvent(
+                            event_type="manifest_prepared",
+                            subject_type="change_set",
+                            subject_id=str(approval_metadata["change_set_id"]),
+                            request_digest=security_audit_digest(
+                                approval_metadata.get("request_digest")
+                            ),
+                            outcome="prepared",
+                            details={
+                                "task_id": task_id,
+                                "tool_name": request_tool_name,
+                                "entry_count": len(
+                                    approval_metadata.get("file_changes") or []
+                                ),
+                            },
+                        )
+                    )
                 if isinstance(approval_metadata.get("request_digest"), str):
                     task_approval_binding = {
                         "requester_id": f"runtime-task:{task_id}",
@@ -8256,7 +8548,7 @@ class RuntimeService:
                             "call_id": call_id,
                         },
                     )
-                await self._store.create_approval_request(
+                created_approval = await self._store.create_approval_request(
                     approval_id=str(uuid4()),
                     task_id=task_id,
                     call_id=call_id,
@@ -8264,6 +8556,24 @@ class RuntimeService:
                     arguments=dict(request_event.get("arguments") or {}),
                     metadata=approval_metadata,
                     **task_approval_binding,
+                )
+                await self.record_security_audit_event(
+                    SecurityAuditEvent(
+                        event_type="approval_created",
+                        subject_type="approval",
+                        subject_id=str(created_approval.get("id") or "") or None,
+                        request_digest=security_audit_digest(
+                            created_approval.get("request_digest")
+                        ),
+                        outcome="pending",
+                        details={
+                            "task_id": task_id,
+                            "call_id": call_id,
+                            "tool_name": request_event.get("tool_name"),
+                            "approval_kind": approval_metadata.get("approval_kind"),
+                            "approval_scope": approval_metadata.get("approval_scope"),
+                        },
+                    )
                 )
                 await self._store.update_task_status(task_id, "awaiting_approval", final_answer=final_answer)
                 return
@@ -8279,6 +8589,78 @@ class RuntimeService:
             current = asyncio.current_task()
             if active is not None and (active is current or active.done()):
                 self._active_jobs.pop(task_id, None)
+
+    async def _record_tool_denial_audit(
+        self,
+        *,
+        task_id: str,
+        event: Mapping[str, Any],
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(metadata, dict):
+            return
+        decision = SecurityDecision.from_metadata(metadata)
+        error_type = str(metadata.get("error_type") or "").strip()
+        if error_type == "file_path_denied":
+            event_type = "path_denied"
+        elif (
+            decision is not None
+            and decision.action == "deny"
+            and decision.approval_scope in {"sandbox", "task_isolation"}
+        ):
+            event_type = "sandbox_denied"
+        else:
+            return
+        await self.record_security_audit_event(
+            SecurityAuditEvent(
+                event_type=event_type,
+                subject_type="tool_call",
+                subject_id=str(event.get("call_id") or "") or None,
+                request_digest=security_audit_digest(metadata.get("request_digest")),
+                outcome="denied",
+                details={
+                    "task_id": task_id,
+                    "tool_name": event.get("tool_name"),
+                    "reason": metadata.get("reason") or event.get("error"),
+                    "path": metadata.get("resolved_path"),
+                    "path_scope": metadata.get("path_scope"),
+                    "policy_source": metadata.get("policy_source"),
+                },
+            )
+        )
+
+    async def _record_auto_review_audit(
+        self,
+        *,
+        task_id: str,
+        event: Mapping[str, Any],
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(metadata, dict):
+            return
+        decision = metadata.get("auto_review_decision")
+        if not isinstance(decision, str) or not decision:
+            return
+        await self.record_security_audit_event(
+            SecurityAuditEvent(
+                event_type="review_decided",
+                subject_type="tool_call",
+                subject_id=str(event.get("call_id") or "") or None,
+                request_digest=security_audit_digest(
+                    metadata.get("auto_review_input_digest")
+                ),
+                outcome=decision,
+                details={
+                    "task_id": task_id,
+                    "tool_name": event.get("tool_name"),
+                    "source": metadata.get("auto_review_source"),
+                    "policy_version": metadata.get("auto_review_policy_version"),
+                    "reviewer_version": metadata.get("auto_review_reviewer_version"),
+                    "risk_factors": metadata.get("auto_review_risk_factors"),
+                    "reason_codes": metadata.get("auto_review_reason_codes"),
+                },
+            )
+        )
 
     async def _run_delegated_multi_agent_task(self, *, task: dict[str, Any], task_id: str) -> None:
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -13274,20 +13656,26 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
         if security_decision is not None
         else metadata.get("approval_kind", "other")
     )
-    return {
+    arguments = _public_approval_arguments(
+        str(tool_name),
+        approval.get("arguments") if isinstance(approval.get("arguments"), dict) else {},
+    )
+    summary = {
         "approval_id": approval["id"],
         "task_id": approval["task_id"],
         "status": status,
         "tool_name": tool_name,
-        "arguments": approval.get("arguments") or {},
-        "command": approval.get("arguments", {}).get("command") if isinstance(approval.get("arguments"), dict) else None,
-        "shell": approval.get("arguments", {}).get("shell") if isinstance(approval.get("arguments"), dict) else None,
+        "arguments": arguments,
+        "command": arguments.get("command"),
+        "shell": arguments.get("shell"),
         "workdir": metadata.get("workdir") if isinstance(metadata.get("workdir"), str) else None,
         "created_at": approval["created_at"],
         "resolved_at": approval.get("resolved_at"),
         "decision": decision,
         "resolution_kind": resolution_kind if isinstance(resolution_kind, str) else None,
         "rule_persistence_status": approval.get("rule_persistence_status", "not_requested"),
+        "side_effect_id": approval.get("side_effect_id"),
+        "rule_persistence_error": approval.get("rule_persistence_error"),
         "reason": approval.get("reason"),
         "requires_approval": security_decision.requires_approval if security_decision else bool(metadata.get("requires_approval", False)),
         "policy_reason": security_decision.reason if security_decision else metadata.get("reason"),
@@ -13315,9 +13703,22 @@ def _approval_summary(approval: dict[str, Any]) -> dict[str, Any]:
         **auto_review,
         **file_change_summary,
     }
+    return _redact_public_approval_summary(summary)
 
 
-def _exec_approval_summary(approval: Any) -> dict[str, Any]:
+def _latest_rule_side_effect(
+    store: ApprovalStore,
+    approval_id: str,
+) -> dict[str, Any] | None:
+    effects = store.list_side_effects(approval_id)
+    return effects[-1] if effects else None
+
+
+def _exec_approval_summary(
+    approval: Any,
+    *,
+    rule_side_effect: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     status = str(getattr(approval, "status", "pending"))
     decision: str | None = None
     if status == "approved_once":
@@ -13339,7 +13740,8 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
     metadata_dict = metadata if isinstance(metadata, dict) else {}
     auto_review = _auto_review_summary(metadata_dict)
 
-    return {
+    rule_projection = public_side_effect_projection(rule_side_effect)
+    summary = {
         "approval_id": str(getattr(approval, "approval_id", "")),
         "task_id": None,
         "status": status,
@@ -13357,8 +13759,10 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
         "resolved_at": getattr(approval, "resolved_at", None),
         "decision": decision,
         "resolution_kind": resolution_kind if isinstance(resolution_kind, str) else None,
-        "rule_persistence_status": (
-            "pending" if resolution_kind == "approve_and_save_rule" else "not_requested"
+        **(
+            rule_projection
+            if resolution_kind == "approve_and_save_rule"
+            else public_side_effect_projection(None)
         ),
         "reason": reason_text,
         "requires_approval": True,
@@ -13377,6 +13781,45 @@ def _exec_approval_summary(approval: Any) -> dict[str, Any]:
         "execution_result": getattr(approval, "execution_result", None),
         **auto_review,
     }
+    return _redact_public_approval_summary(summary)
+
+
+def _public_approval_arguments(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = dict(arguments)
+    if tool_name in _FILE_MUTATION_TOOLS:
+        body_fields = {
+            "content",
+            "patch",
+            "patch_text",
+            "old_text",
+            "new_text",
+            "original_content",
+        }
+        observations: list[dict[str, Any]] = []
+        for key in body_fields:
+            value = projected.pop(key, None)
+            if isinstance(value, (str, bytes)):
+                observations.append(
+                    {
+                        "field": key,
+                        **file_content_observation(
+                            value,
+                            reason_code="approval_preview",
+                        ),
+                    }
+                )
+        if observations:
+            projected["body_observations"] = observations
+    redacted = redact_for_persistence(projected)
+    return redacted if isinstance(redacted, dict) else {}
+
+
+def _redact_public_approval_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    redacted = redact_for_persistence(dict(summary))
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _auto_review_summary(metadata: Mapping[str, Any]) -> dict[str, Any]:

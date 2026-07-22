@@ -75,6 +75,20 @@ class ApprovalResolution(BaseModel):
     replay_override: ApprovalReplayOverride | None = None
 
 
+class ApprovalRulePersistenceProjection(BaseModel):
+    """UI-safe state of the asynchronous save-rule side effect."""
+
+    rule_persistence_status: Literal[
+        "not_requested",
+        "pending",
+        "retrying",
+        "delivered",
+        "failed",
+    ] = "not_requested"
+    side_effect_id: str | None = None
+    rule_persistence_error: str | None = None
+
+
 class AutoReviewSummary(BaseModel):
     """UI-safe projection of one deterministic auto-review decision."""
 

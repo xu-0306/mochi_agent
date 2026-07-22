@@ -546,20 +546,32 @@ class ChannelManager:
         else:
             return
 
+        self._persist_config_updates_if_needed()
+
         if self._engine is not None:
             apply_config = getattr(self._engine, "apply_config", None)
             if callable(apply_config):
                 await apply_config(self._config, reload_voice=True)
 
-        self._persist_config_updates_if_needed()
-
     def _persist_config_updates_if_needed(self) -> None:
         if self._config is None or not self._persist_config_updates:
             return
 
-        from mochi.config.manager import save_config
+        from mochi.config.manager import load_config_snapshot, save_config
 
-        save_config(self._config, self._config_path)
+        snapshot = load_config_snapshot(self._config_path)
+        updated = snapshot.config.model_copy(
+            update={
+                "channels": self._config.channels,
+                "voice": self._config.voice,
+            },
+        )
+        save_config(
+            updated,
+            self._config_path,
+            expected_revision=snapshot.revision,
+        )
+        self._config = updated
 
 
 def build_channel_manager(
