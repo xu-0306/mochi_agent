@@ -691,6 +691,11 @@ class RuntimeService:
             )
             return {}
 
+    async def get_security_release_metrics(self) -> dict[str, Any]:
+        """Expose aggregate release-gate telemetry without paths or file bodies."""
+
+        return await self._store.get_security_release_metrics()
+
     async def close(self) -> None:
         current_loop = asyncio.get_running_loop()
 

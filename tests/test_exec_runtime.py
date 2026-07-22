@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mochi.config.schema import MochiConfig
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.exec_sessions import ExecSessionStatus
 from mochi.runtime.sandbox import SandboxPlanMismatch, SandboxUnavailableError
@@ -31,7 +32,9 @@ class _PythonDirectProvider(BaseShellProvider):
     def aliases(self) -> tuple[str, ...]:
         return ("test",)
 
-    def build_subprocess_spec(self, command: str, *, tty: bool = False) -> SubprocessSpec:
+    def build_subprocess_spec(
+        self, command: str, *, tty: bool = False
+    ) -> SubprocessSpec:
         del tty
         return SubprocessSpec(executable=sys.executable, args=("-c", command))
 
@@ -95,7 +98,9 @@ async def test_exec_runtime_background_incremental_read_and_write_stdin() -> Non
     assert first is not None
     assert "ready" in first.stdout
 
-    wrote = await runtime.write_stdin(started.session_id, chars="abc\n", yield_time_ms=120)
+    wrote = await runtime.write_stdin(
+        started.session_id, chars="abc\n", yield_time_ms=120
+    )
     assert wrote is not None
     assert "echo:abc" in wrote.stdout
 
@@ -283,8 +288,70 @@ def test_exec_runtime_required_mode_fails_closed_without_complete_backend(
         )
 
 
+@pytest.mark.parametrize("change_contract_mode", ["observe", "enforce"])
+@pytest.mark.parametrize("sandbox_mode", ["off", "preferred", "required"])
+def test_file_rollout_and_exec_sandbox_axes_are_orthogonal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    change_contract_mode: str,
+    sandbox_mode: str,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(tmp_path),
+            "security": {
+                "change_contract_mode": change_contract_mode,
+            },
+            "sandbox": {"mode": sandbox_mode},
+        }
+    )
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    monkeypatch.setattr(
+        "mochi.runtime.exec_runtime.select_sandbox_backend",
+        lambda mode: HostSandboxBackend(degraded_reason=f"{mode}_backend_unavailable"),
+    )
+
+    assert config.security.change_contract_mode == change_contract_mode
+    assert config.sandbox.mode == sandbox_mode
+    if sandbox_mode == "required":
+        with pytest.raises(
+            SandboxUnavailableError, match="required_backend_unavailable"
+        ):
+            runtime.build_sandbox_plan(
+                command="print('blocked')",
+                mode=config.sandbox.mode,
+                shell="test",
+                cwd=tmp_path,
+                env=None,
+                timeout_sec=5,
+                requested_escalation="use_default",
+                workspace_root=tmp_path,
+                background=False,
+                tty=False,
+            )
+    else:
+        plan = runtime.build_sandbox_plan(
+            command="print('allowed')",
+            mode=config.sandbox.mode,
+            shell="test",
+            cwd=tmp_path,
+            env=None,
+            timeout_sec=5,
+            requested_escalation="use_default",
+            workspace_root=tmp_path,
+            background=False,
+            tty=False,
+        )
+        assert plan.mode == sandbox_mode
+
+
 @pytest.mark.asyncio
-async def test_approved_exec_replay_uses_serialized_sandbox_plan(tmp_path: Path) -> None:
+async def test_approved_exec_replay_uses_serialized_sandbox_plan(
+    tmp_path: Path,
+) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",

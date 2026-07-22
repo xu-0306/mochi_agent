@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import ClassVar, Literal, TypeAlias
 
 JsonValue: TypeAlias = None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
+AUTHORIZATION_ENVELOPE_SCHEMA_VERSION = 2
 
 VOLATILE_MANIFEST_FIELDS = frozenset(
     {"change_set_id", "created_at", "expires_at", "request_digest", "ui_metadata"}
@@ -141,6 +142,50 @@ def capture_file_identity(path: str | Path) -> FileIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class ContentFidelity:
+    binary: bool
+    encoding: str
+    newline_style: Literal["lf", "crlf", "cr", "mixed", "none"]
+    eof_newline: bool
+
+
+def detect_content_fidelity(content: bytes) -> ContentFidelity:
+    """Return a deterministic, digest-safe description without lossy decoding."""
+
+    binary = b"\0" in content
+    if binary:
+        encoding = "binary"
+    else:
+        try:
+            content.decode("utf-8-sig" if content.startswith(b"\xef\xbb\xbf") else "utf-8")
+            encoding = "utf-8-bom" if content.startswith(b"\xef\xbb\xbf") else "utf-8"
+        except UnicodeDecodeError:
+            encoding = "non-utf8"
+    crlf = content.count(b"\r\n")
+    remainder = content.replace(b"\r\n", b"")
+    lf = remainder.count(b"\n")
+    cr = remainder.count(b"\r")
+    kinds = sum(value > 0 for value in (crlf, lf, cr))
+    newline_style: Literal["lf", "crlf", "cr", "mixed", "none"] = (
+        "mixed"
+        if kinds > 1
+        else "crlf"
+        if crlf
+        else "lf"
+        if lf
+        else "cr"
+        if cr
+        else "none"
+    )
+    return ContentFidelity(
+        binary=binary,
+        encoding=encoding,
+        newline_style=newline_style,
+        eof_newline=content.endswith((b"\n", b"\r")),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ChangeEntry:
     entry_id: str
     relative_path: str
@@ -156,13 +201,17 @@ class ChangeEntry:
     after_metadata_sha256: str | None
     rename_source: str | None
     dependency_group: str | None
+    encoding: str | None = None
+    newline_style: Literal["lf", "crlf", "cr", "mixed", "none"] | None = None
+    eof_newline: bool | None = None
 
     _FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
             "entry_id", "relative_path", "operation", "base_sha256", "after_sha256",
             "base_identity", "before_blob_id", "after_blob_id", "mode_before",
             "mode_after", "base_metadata_sha256", "after_metadata_sha256",
-            "rename_source", "dependency_group",
+            "rename_source", "dependency_group", "encoding", "newline_style",
+            "eof_newline",
         }
     )
 
@@ -191,6 +240,12 @@ class ChangeEntry:
                 raise ValueError(f"{name} must not be negative")
         if self.base_identity is not None and not isinstance(self.base_identity, FileIdentity):
             raise ValueError("base_identity must be a FileIdentity or None")
+        if self.encoding is not None:
+            _string(self.encoding, "encoding")
+        if self.newline_style not in {None, "lf", "crlf", "cr", "mixed", "none"}:
+            raise ValueError("invalid newline_style")
+        if self.eof_newline is not None:
+            _boolean(self.eof_newline, "eof_newline")
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -208,10 +263,19 @@ class ChangeEntry:
             "after_metadata_sha256": self.after_metadata_sha256,
             "rename_source": self.rename_source,
             "dependency_group": self.dependency_group,
+            "encoding": self.encoding,
+            "newline_style": self.newline_style,
+            "eof_newline": self.eof_newline,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> ChangeEntry:
+        data = {
+            "encoding": None,
+            "newline_style": None,
+            "eof_newline": None,
+            **data,
+        }
         _check_fields(data, cls._FIELDS)
         identity_data = data["base_identity"]
         identity = None if identity_data is None else FileIdentity.from_dict(
@@ -237,6 +301,15 @@ class ChangeEntry:
             rename_source=_string(data["rename_source"], "rename_source", optional=True),
             dependency_group=_string(
                 data["dependency_group"], "dependency_group", optional=True
+            ),
+            encoding=_string(data["encoding"], "encoding", optional=True),
+            newline_style=_string(
+                data["newline_style"], "newline_style", optional=True
+            ),  # type: ignore[arg-type]
+            eof_newline=(
+                None
+                if data["eof_newline"] is None
+                else _boolean(data["eof_newline"], "eof_newline")
             ),
         )
 
@@ -493,8 +566,10 @@ class AuthorizationEnvelope:
 
     def __post_init__(self) -> None:
         version = _integer(self.schema_version, "schema_version")
-        if version != 1:
-            raise ValueError("schema_version must be 1")
+        if version not in {1, AUTHORIZATION_ENVELOPE_SCHEMA_VERSION}:
+            raise ValueError(
+                f"schema_version must be 1 or {AUTHORIZATION_ENVELOPE_SCHEMA_VERSION}"
+            )
         if self.kind not in {"file_change", "exec"}:
             raise ValueError("kind must be 'file_change' or 'exec'")
         if not isinstance(self.context, AuthorizationContext):

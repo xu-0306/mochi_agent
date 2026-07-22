@@ -196,11 +196,12 @@ def test_preview_idempotency_key_is_context_scoped_composite() -> None:
 
 
 
-def test_authorization_envelope_supports_only_schema_version_one() -> None:
+def test_authorization_envelope_supports_current_and_migratable_schema_versions() -> None:
     envelope = _authorization()
 
-    with pytest.raises(ValueError, match="schema_version.*1"):
-        replace(envelope, schema_version=2)
+    assert replace(envelope, schema_version=1).schema_version == 1
+    with pytest.raises(ValueError, match="schema_version"):
+        replace(envelope, schema_version=3)
 
 
 

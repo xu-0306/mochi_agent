@@ -63,7 +63,7 @@ def _file_authorization(
     )
 
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="file_change",
         context=AuthorizationContext(
             requester_id="requester-1",
@@ -662,7 +662,7 @@ def _exec_authorization() -> AuthorizationEnvelope:
     )
 
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="exec",
         context=AuthorizationContext(
             requester_id="requester-1",

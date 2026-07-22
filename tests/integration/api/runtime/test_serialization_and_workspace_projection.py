@@ -25,11 +25,27 @@ from mochi.sessions.store import SessionStore
         "expected_policy_decision",
         "expected_sandbox_status",
         "expected_degraded",
+        "expected_effective_behavior",
+        "expected_host_allowed",
     ),
     [
-        ("off", "allow_host", "not_enforced", False),
-        ("preferred", "prefer_sandbox_backend", "configured_unavailable", True),
-        ("required", "reject_backend_unavailable", "configured_unavailable", True),
+        ("off", "allow_host", "not_enforced", False, "host_execution_available", True),
+        (
+            "preferred",
+            "prefer_sandbox_backend",
+            "degraded",
+            True,
+            "host_execution_degraded",
+            True,
+        ),
+        (
+            "required",
+            "reject_backend_unavailable",
+            "configured_unavailable",
+            True,
+            "execution_blocked",
+            False,
+        ),
     ],
 )
 def test_session_api_protected_workspace_matrix_keeps_policy_and_effective_behavior_distinct(
@@ -39,6 +55,8 @@ def test_session_api_protected_workspace_matrix_keeps_policy_and_effective_behav
     expected_policy_decision: str,
     expected_sandbox_status: str,
     expected_degraded: bool,
+    expected_effective_behavior: str,
+    expected_host_allowed: bool,
 ) -> None:
     change_mode, expected_file_policy, expected_shadow, expected_change_status = (
         change_contract_path
@@ -65,21 +83,46 @@ def test_session_api_protected_workspace_matrix_keeps_policy_and_effective_behav
     projection = response.json()["protected_workspace"]
     assert projection["session_id"] == session_id
     assert projection["change_contract"]["mode"] == change_mode
-    assert projection["change_contract"]["configured_policy_decision"] == expected_file_policy
+    assert (
+        projection["change_contract"]["configured_policy_decision"]
+        == expected_file_policy
+    )
     assert projection["change_contract"]["enforcement_active"] is False
-    assert projection["change_contract"]["effective_file_behavior"] == "legacy_mutation_allowed"
-    assert projection["change_contract"]["effective_undo_behavior"] == "legacy_undo_available"
+    assert (
+        projection["change_contract"]["effective_file_behavior"]
+        == "legacy_mutation_allowed"
+    )
+    assert (
+        projection["change_contract"]["effective_undo_behavior"]
+        == "legacy_undo_available"
+    )
     assert projection["change_contract"]["shadow_decision"] == expected_shadow
     assert projection["change_contract"]["status"] == expected_change_status
     assert projection["sandbox"]["mode"] == sandbox_mode
-    assert projection["sandbox"]["configured_policy_decision"] == expected_policy_decision
+    assert (
+        projection["sandbox"]["configured_policy_decision"] == expected_policy_decision
+    )
     assert projection["sandbox"]["enforcement_active"] is False
-    assert projection["sandbox"]["effective_exec_behavior"] == "host_execution_available"
-    assert projection["sandbox"]["host_execution_allowed"] is True
+    assert (
+        projection["sandbox"]["effective_exec_behavior"] == expected_effective_behavior
+    )
+    assert projection["sandbox"]["host_execution_allowed"] is expected_host_allowed
     assert projection["sandbox"]["status"] == expected_sandbox_status
     assert projection["sandbox"]["degraded"] is expected_degraded
-    assert projection["sandbox"]["backend"] is None
-    assert projection["sandbox"]["capabilities"] == {"exec_containment": False}
+    assert isinstance(projection["sandbox"]["backend"], str)
+    capabilities = projection["sandbox"]["capabilities"]
+    assert set(capabilities) == {
+        "exec_containment",
+        "filesystem",
+        "process",
+        "network",
+        "detached",
+    }
+    assert capabilities["exec_containment"] is False
+    assert capabilities["filesystem"] is False
+    assert capabilities["process"] is False
+    assert capabilities["network"] is False
+
 
 def test_chat_serializer_preserves_final_answer_metadata() -> None:
     serialized = _serialize_event(
@@ -101,6 +144,7 @@ def test_chat_serializer_preserves_final_answer_metadata() -> None:
     assert serialized["metadata"]["runtime_category"] == "truncation"
     assert serialized["metadata"]["error_type"] == "output_truncated"
     assert serialized["metadata"]["truncated"] is True
+
 
 def test_chat_serializer_supports_explicit_tool_and_goal_events() -> None:
     created = _serialize_event(

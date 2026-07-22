@@ -470,7 +470,7 @@ def test_runtime_store_resolve_and_outbox_share_one_transaction(tmp_path: Path) 
 
 def _exec_envelope(*, argv: tuple[str, ...] = ("echo", "ok")) -> AuthorizationEnvelope:
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="exec",
         context=AuthorizationContext(
             requester_id="requester-1",

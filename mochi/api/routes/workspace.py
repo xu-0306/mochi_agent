@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -77,7 +78,9 @@ async def get_workspace_tree(
     items: list[dict[str, Any]] = []
     for entry in sorted(entries, key=lambda item: item.name.lower()):
         resolved_entry = entry.resolve(strict=False)
-        if read_scope == "workspace" and not is_path_within_workspace(resolved_entry, workspace_root):
+        if read_scope == "workspace" and not is_path_within_workspace(
+            resolved_entry, workspace_root
+        ):
             continue
         try:
             is_dir = entry.is_dir()
@@ -236,7 +239,9 @@ async def get_workspace_diff(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     repo_root = _find_git_repo_root(target.parent if target.suffix else target)
     if repo_root is None:
-        raise HTTPException(status_code=404, detail="Workspace is not inside a git repository.")
+        raise HTTPException(
+            status_code=404, detail="Workspace is not inside a git repository."
+        )
 
     items = await asyncio.to_thread(
         _collect_workspace_changes,
@@ -247,7 +252,9 @@ async def get_workspace_diff(
         context_lines,
     )
     if not items:
-        raise HTTPException(status_code=404, detail="No diff available for the requested path.")
+        raise HTTPException(
+            status_code=404, detail="No diff available for the requested path."
+        )
 
     item = items[0]
     return {
@@ -337,6 +344,8 @@ async def preview_workspace_patch(
             "replacement_approval_id": None,
             "approval_state": "invalid",
             "would_reject_edited_patch": False,
+            "content_unavailable_reason": exc.metadata.get("content_kind"),
+            "suggested_tool": exc.metadata.get("suggested_tool"),
         }
 
     replacement_approval_id: str | None = None
@@ -349,18 +358,20 @@ async def preview_workspace_patch(
         )
         current_approval_state = str(approval.get("status") or "pending")
         stored_arguments = approval.get("arguments")
-        stored_arguments = stored_arguments if isinstance(stored_arguments, dict) else {}
+        stored_arguments = (
+            stored_arguments if isinstance(stored_arguments, dict) else {}
+        )
         stored_patch = stored_arguments.get("patch")
-        patch_changed = not isinstance(stored_patch, str) or stored_patch != payload.patch
+        patch_changed = (
+            not isinstance(stored_patch, str) or stored_patch != payload.patch
+        )
         if config.security.change_contract_mode == "observe":
             would_reject_edited_patch = patch_changed
             approval_state = "shadow_preview"
         elif not patch_changed:
             approval_state = current_approval_state
         elif current_approval_state == "superseded":
-            existing_replacement_id = approval_metadata.get(
-                "superseded_by_approval_id"
-            )
+            existing_replacement_id = approval_metadata.get("superseded_by_approval_id")
             existing_replacement = (
                 await runtime_store.get_approval_request(existing_replacement_id)
                 if isinstance(existing_replacement_id, str)
@@ -443,7 +454,9 @@ async def resolve_workspace_scope(
 ) -> tuple[str | None, Path]:
     """Resolve the effective session/project workspace for one request."""
     if approval_id:
-        approval_scope = await _resolve_workspace_scope_from_approval(request, approval_id)
+        approval_scope = await _resolve_workspace_scope_from_approval(
+            request, approval_id
+        )
         if approval_scope is not None:
             return approval_scope
         raise HTTPException(status_code=404, detail="Approval not found")
@@ -555,7 +568,9 @@ def _resolve_workspace_file_target(
     return target
 
 
-def _resolve_workspace_path_filter(workspace_root: Path, raw_path: str | None) -> Path | None:
+def _resolve_workspace_path_filter(
+    workspace_root: Path, raw_path: str | None
+) -> Path | None:
     if raw_path is None or not raw_path.strip():
         return None
     try:
@@ -589,14 +604,19 @@ def _collect_workspace_changes(
     include_diff: bool,
     context_lines: int,
 ) -> list[dict[str, Any]]:
-    pathspec = _git_pathspec(repo_root, filter_path or workspace_root)
+    # Rename/copy detection needs both sides of a status record.  Restricting
+    # Git to only the requested destination path degrades a type-2 record into
+    # an ordinary add/delete pair, so collect the workspace and filter after
+    # parsing the NUL-safe records.
+    pathspec = _git_pathspec(repo_root, workspace_root)
     if pathspec is None:
         return []
 
-    result = _run_git(
+    result = _run_git_bytes(
         repo_root,
         "status",
-        "--porcelain=v1",
+        "--porcelain=v2",
+        "-z",
         "--untracked-files=all",
         "--",
         pathspec,
@@ -606,14 +626,13 @@ def _collect_workspace_changes(
 
     has_head = _run_git(repo_root, "rev-parse", "--verify", "HEAD").returncode == 0
     items: list[dict[str, Any]] = []
-    for raw_line in result.stdout.splitlines():
-        parsed = _parse_git_status_line(raw_line)
-        if parsed is None:
-            continue
+    for parsed in _parse_git_status_porcelain_v2(result.stdout):
         current_abs = (repo_root / parsed["repo_path"]).resolve(strict=False)
         if not is_path_within_workspace(current_abs, workspace_root):
             continue
-        if filter_path is not None and not _path_matches_filter(current_abs, filter_path):
+        if filter_path is not None and not _path_matches_filter(
+            current_abs, filter_path
+        ):
             continue
 
         diff_payload = _build_workspace_diff_payload(
@@ -635,9 +654,24 @@ def _collect_workspace_changes(
             "added_lines": diff_payload["added_lines"],
             "deleted_lines": diff_payload["deleted_lines"],
             "diff_available": diff_payload["diff_available"],
+            "binary": diff_payload["binary"],
+            "encoding": diff_payload["encoding"],
+            "newline_style": diff_payload["newline_style"],
+            "eof_newline": diff_payload["eof_newline"],
+            "mode_before": parsed.get("mode_before"),
+            "mode_after": parsed.get("mode_after"),
+            "rename_source": parsed.get("baseline_repo_path"),
+            "copy_source": (
+                parsed.get("baseline_repo_path")
+                if parsed.get("status") == "copied"
+                else None
+            ),
+            "content_unavailable_reason": diff_payload["content_unavailable_reason"],
         }
         if include_diff:
             item["diff"] = diff_payload["diff"]
+            item["original_content"] = diff_payload["original_content"]
+            item["new_content"] = diff_payload["new_content"]
         items.append(item)
 
     items.sort(key=lambda item: str(item["relative_path"]).lower())
@@ -646,38 +680,117 @@ def _collect_workspace_changes(
 
 def _git_pathspec(repo_root: Path, target_path: Path) -> str | None:
     try:
-        return target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
+        return (
+            target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
+        )
     except ValueError:
         return None
 
 
-def _parse_git_status_line(raw_line: str) -> dict[str, Any] | None:
-    if len(raw_line) < 4:
+def _decode_git_path(value: bytes) -> str:
+    """Decode Git's NUL-delimited raw path without lossy replacement."""
+
+    return value.decode("utf-8", errors="surrogateescape")
+
+
+def _parse_git_mode(value: bytes) -> int | None:
+    if value in {b"", b"000000"}:
+        return None
+    try:
+        return int(value, 8)
+    except ValueError:
         return None
 
-    index_status = raw_line[0]
-    worktree_status = raw_line[1]
-    path_text = raw_line[3:].strip()
-    if not path_text:
-        return None
 
-    baseline_repo_path: str | None = None
-    repo_path = path_text
-    if " -> " in path_text:
-        before, after = path_text.split(" -> ", 1)
-        baseline_repo_path = before.strip()
-        repo_path = after.strip()
+def _parse_git_status_porcelain_v2(payload: bytes) -> list[dict[str, Any]]:
+    """Parse ``git status --porcelain=v2 -z`` records.
 
-    status = _normalize_git_status(index_status, worktree_status)
-    return {
-        "repo_path": repo_path,
-        "baseline_repo_path": baseline_repo_path,
-        "status": status,
-        "staged": index_status not in {" ", "?"},
-    }
+    Type-2 rename/copy records carry their original path in the following NUL
+    field.  Parsing bytes and record types avoids path quoting and the unsafe
+    historical ``" -> "`` filename heuristic.
+    """
+
+    fields = payload.split(b"\0")
+    items: list[dict[str, Any]] = []
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        kind = record[:1]
+        if kind == b"#" or kind == b"!":
+            continue
+        if kind == b"?":
+            items.append(
+                {
+                    "repo_path": _decode_git_path(record[2:]),
+                    "baseline_repo_path": None,
+                    "status": "untracked",
+                    "staged": False,
+                    "mode_before": None,
+                    "mode_after": None,
+                }
+            )
+            continue
+        if kind == b"1":
+            parts = record.split(b" ", 8)
+            if len(parts) != 9:
+                continue
+            xy = parts[1].decode("ascii", errors="strict")
+            items.append(
+                {
+                    "repo_path": _decode_git_path(parts[8]),
+                    "baseline_repo_path": None,
+                    "status": _normalize_git_status(xy[0], xy[1]),
+                    "staged": xy[0] != ".",
+                    "mode_before": _parse_git_mode(parts[3]),
+                    "mode_after": _parse_git_mode(
+                        parts[4] if xy[0] != "." else parts[5]
+                    ),
+                }
+            )
+            continue
+        if kind == b"2":
+            parts = record.split(b" ", 9)
+            if len(parts) != 10 or index >= len(fields):
+                continue
+            original_path = fields[index]
+            index += 1
+            xy = parts[1].decode("ascii", errors="strict")
+            score = parts[8][:1]
+            items.append(
+                {
+                    "repo_path": _decode_git_path(parts[9]),
+                    "baseline_repo_path": _decode_git_path(original_path),
+                    "status": "copied" if score == b"C" else "renamed",
+                    "staged": xy[0] != ".",
+                    "mode_before": _parse_git_mode(parts[3]),
+                    "mode_after": _parse_git_mode(
+                        parts[4] if xy[0] != "." else parts[5]
+                    ),
+                }
+            )
+            continue
+        if kind == b"u":
+            parts = record.split(b" ", 10)
+            if len(parts) == 11:
+                items.append(
+                    {
+                        "repo_path": _decode_git_path(parts[10]),
+                        "baseline_repo_path": None,
+                        "status": "conflicted",
+                        "staged": True,
+                        "mode_before": _parse_git_mode(parts[3]),
+                        "mode_after": _parse_git_mode(parts[6]),
+                    }
+                )
+    return items
 
 
 def _normalize_git_status(index_status: str, worktree_status: str) -> str:
+    index_status = " " if index_status == "." else index_status
+    worktree_status = " " if worktree_status == "." else worktree_status
     combined = f"{index_status}{worktree_status}"
     if combined == "??":
         return "untracked"
@@ -722,39 +835,73 @@ def _build_workspace_diff_payload(
     context_lines: int,
     has_head: bool,
 ) -> dict[str, Any]:
-    import difflib
-
-    before_text = ""
-    after_text = ""
+    before_bytes: bytes | None = None
+    after_bytes: bytes | None = None
     if has_head and status != "untracked":
-        before_text = _read_git_blob(
+        before_bytes = _read_git_blob_bytes(
             repo_root,
             baseline_repo_path or current_repo_path,
         )
     if status != "deleted" and current_abs.exists() and current_abs.is_file():
-        after_text = current_abs.read_text(encoding="utf-8", errors="replace")
+        after_bytes = current_abs.read_bytes()
 
-    diff_lines = list(
-        difflib.unified_diff(
-            before_text.splitlines(),
-            after_text.splitlines(),
-            fromfile=f"a/{(baseline_repo_path or current_repo_path)}",
-            tofile=f"b/{current_repo_path}",
-            lineterm="",
-            n=context_lines,
+    before_fidelity = _inspect_content_fidelity(before_bytes)
+    after_fidelity = _inspect_content_fidelity(after_bytes)
+    selected_fidelity = after_fidelity if after_bytes is not None else before_fidelity
+    binary = bool(before_fidelity["binary"] or after_fidelity["binary"])
+    non_utf8 = any(
+        value is not None and fidelity["encoding"] == "non-utf8"
+        for value, fidelity in (
+            (before_bytes, before_fidelity),
+            (after_bytes, after_fidelity),
         )
     )
-    diff_text = "\n".join(diff_lines) if diff_lines else None
-    added_lines = sum(
-        1
-        for line in diff_lines
-        if line.startswith("+") and not line.startswith("+++")
-    )
-    deleted_lines = sum(
-        1
-        for line in diff_lines
-        if line.startswith("-") and not line.startswith("---")
-    )
+
+    pathspecs = [current_repo_path]
+    if baseline_repo_path and baseline_repo_path != current_repo_path:
+        pathspecs.insert(0, baseline_repo_path)
+    if status == "untracked":
+        diff_result = _run_git_bytes(
+            repo_root,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-index",
+            "--no-color",
+            "--binary",
+            f"--unified={context_lines}",
+            "--",
+            os.devnull,
+            str(current_abs),
+        )
+    else:
+        diff_result = _run_git_bytes(
+            repo_root,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--binary",
+            "--full-index",
+            "--find-renames",
+            "--find-copies",
+            f"--unified={context_lines}",
+            "HEAD",
+            "--",
+            *pathspecs,
+        )
+    diff_bytes = diff_result.stdout
+    unavailable_reason = "binary" if binary else "non_utf8" if non_utf8 else None
+    diff_text: str | None = None
+    if diff_bytes and unavailable_reason is None:
+        try:
+            diff_text = diff_bytes.decode("utf-8", errors="strict").rstrip("\n")
+        except UnicodeDecodeError:
+            unavailable_reason = "non_utf8"
+
+    added_lines, deleted_lines = _count_git_diff_lines(diff_bytes, binary=binary)
     return {
         "path": str(current_abs),
         "relative_path": _relative_path(workspace_root, current_abs),
@@ -763,15 +910,89 @@ def _build_workspace_diff_payload(
         "deleted_lines": deleted_lines,
         "diff_available": diff_text is not None,
         "diff": diff_text if include_diff else None,
-        "original_content": before_text if include_diff else None,
-        "new_content": after_text if include_diff else None,
+        "original_content": (
+            _decode_utf8_content(before_bytes, before_fidelity)
+            if include_diff
+            else None
+        ),
+        "new_content": (
+            _decode_utf8_content(after_bytes, after_fidelity) if include_diff else None
+        ),
+        "binary": binary,
+        "encoding": selected_fidelity["encoding"],
+        "newline_style": selected_fidelity["newline_style"],
+        "eof_newline": selected_fidelity["eof_newline"],
+        "content_unavailable_reason": unavailable_reason,
     }
 
 
-def _read_git_blob(repo_root: Path, repo_path: str) -> str:
-    result = _run_git(repo_root, "show", f"HEAD:{repo_path}")
+def _inspect_content_fidelity(content: bytes | None) -> dict[str, Any]:
+    if content is None:
+        return {
+            "binary": False,
+            "encoding": None,
+            "newline_style": None,
+            "eof_newline": None,
+        }
+    binary = b"\0" in content
+    if binary:
+        encoding = "binary"
+    else:
+        try:
+            content.decode(
+                "utf-8-sig" if content.startswith(b"\xef\xbb\xbf") else "utf-8"
+            )
+            encoding = "utf-8-bom" if content.startswith(b"\xef\xbb\xbf") else "utf-8"
+        except UnicodeDecodeError:
+            encoding = "non-utf8"
+    crlf = content.count(b"\r\n")
+    without_crlf = content.replace(b"\r\n", b"")
+    lf = without_crlf.count(b"\n")
+    cr = without_crlf.count(b"\r")
+    kinds = sum(value > 0 for value in (crlf, lf, cr))
+    newline_style = (
+        "mixed"
+        if kinds > 1
+        else "crlf" if crlf else "lf" if lf else "cr" if cr else "none"
+    )
+    return {
+        "binary": binary,
+        "encoding": encoding,
+        "newline_style": newline_style,
+        "eof_newline": content.endswith((b"\n", b"\r")),
+    }
+
+
+def _decode_utf8_content(content: bytes | None, fidelity: dict[str, Any]) -> str | None:
+    if content is None or fidelity["binary"] or fidelity["encoding"] == "non-utf8":
+        return None
+    encoding = "utf-8-sig" if fidelity["encoding"] == "utf-8-bom" else "utf-8"
+    return content.decode(encoding, errors="strict")
+
+
+def _count_git_diff_lines(diff: bytes, *, binary: bool) -> tuple[int, int]:
+    if binary:
+        return 0, 0
+    additions = 0
+    deletions = 0
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith(b"@@ "):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith(b"+"):
+            additions += 1
+        elif line.startswith(b"-"):
+            deletions += 1
+    return additions, deletions
+
+
+def _read_git_blob_bytes(repo_root: Path, repo_path: str) -> bytes:
+    result = _run_git_bytes(repo_root, "show", f"HEAD:{repo_path}")
     if result.returncode != 0:
-        return ""
+        return b""
     return result.stdout
 
 
@@ -783,4 +1004,13 @@ def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+    )
+
+
+def _run_git_bytes(repo_root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=False,
+        capture_output=True,
+        text=False,
     )

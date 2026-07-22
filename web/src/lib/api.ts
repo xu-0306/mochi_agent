@@ -4034,6 +4034,15 @@ export interface WorkspaceChange {
   addedLines: number
   deletedLines: number
   diffAvailable: boolean
+  binary: boolean
+  encoding: string | null
+  newlineStyle: string | null
+  eofNewline: boolean | null
+  modeBefore: number | null
+  modeAfter: number | null
+  renameSource: string | null
+  copySource: string | null
+  contentUnavailableReason: string | null
 }
 
 export interface WorkspaceChangesResult {
@@ -4143,6 +4152,15 @@ export async function fetchWorkspaceChanges(
       addedLines: getNumber(item.added_lines) ?? 0,
       deletedLines: getNumber(item.deleted_lines) ?? 0,
       diffAvailable: getBoolean(item.diff_available) ?? false,
+      binary: getBoolean(item.binary) ?? false,
+      encoding: getNullableString(item.encoding),
+      newlineStyle: getNullableString(item.newline_style),
+      eofNewline: getBoolean(item.eof_newline),
+      modeBefore: getNumber(item.mode_before),
+      modeAfter: getNumber(item.mode_after),
+      renameSource: getNullableString(item.rename_source),
+      copySource: getNullableString(item.copy_source),
+      contentUnavailableReason: getNullableString(item.content_unavailable_reason),
     })),
   }
 }
@@ -4162,6 +4180,15 @@ export async function fetchWorkspaceDiff(
     addedLines: getNumber(payload.added_lines) ?? 0,
     deletedLines: getNumber(payload.deleted_lines) ?? 0,
     diffAvailable: getBoolean(payload.diff_available) ?? false,
+    binary: getBoolean(payload.binary) ?? false,
+    encoding: getNullableString(payload.encoding),
+    newlineStyle: getNullableString(payload.newline_style),
+    eofNewline: getBoolean(payload.eof_newline),
+    modeBefore: getNumber(payload.mode_before),
+    modeAfter: getNumber(payload.mode_after),
+    renameSource: getNullableString(payload.rename_source),
+    copySource: getNullableString(payload.copy_source),
+    contentUnavailableReason: getNullableString(payload.content_unavailable_reason),
     repoRoot: getString(payload.repo_root) ?? '',
     diff: getString(payload.diff),
     originalContent: getNullableString(payload.original_content),

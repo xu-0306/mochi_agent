@@ -96,7 +96,7 @@ def _seed_authoritative_change(
         workspace_identity=_identity(workspace),
     )
     envelope = AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="file_change",
         context=context,
         policy_version="test-policy",
@@ -107,7 +107,7 @@ def _seed_authoritative_change(
     now = datetime.now(UTC)
     change_set_id = "change-authoritative"
     manifest = ChangeManifest(
-        version=1,
+        version=2,
         change_set_id=change_set_id,
         workspace_root=str(workspace.resolve()),
         workspace_identity=_identity(workspace),

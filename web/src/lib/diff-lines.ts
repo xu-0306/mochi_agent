@@ -11,6 +11,8 @@ export interface DiffDisplayLine {
 export interface DiffDocument {
   filePath: string | null
   lines: DiffDisplayLine[]
+  metadata: string[]
+  binary: boolean
   stats: {
     additions: number
     deletions: number
@@ -68,12 +70,18 @@ function parseUnifiedDiff(
   fallbackFilePath: string | null
 ): DiffDocument | null {
   const lines: DiffDisplayLine[] = []
+  const metadata: string[] = []
   let filePath = fallbackFilePath
   let oldNumber = 0
   let newNumber = 0
   let sawHunk = false
 
   for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith('diff --git ')) {
+      metadata.push(line)
+      continue
+    }
+
     if (line.startsWith('--- ')) {
       filePath = filePath ?? normalizeFilePath(line.slice(4))
       continue
@@ -91,6 +99,11 @@ function parseUnifiedDiff(
         newNumber = header.newStart
         sawHunk = true
       }
+      continue
+    }
+
+    if (!sawHunk && line.length > 0) {
+      metadata.push(line)
       continue
     }
 
@@ -136,12 +149,25 @@ function parseUnifiedDiff(
   }
 
   if (!sawHunk) {
-    return null
+    if (metadata.length === 0) {
+      return null
+    }
+    return {
+      filePath,
+      lines,
+      metadata,
+      binary: metadata.some((line) =>
+        line.startsWith('Binary files ') || line === 'GIT binary patch'
+      ),
+      stats: statsFor(lines),
+    }
   }
 
   return {
     filePath,
     lines,
+    metadata,
+    binary: false,
     stats: statsFor(lines),
   }
 }
@@ -251,6 +277,8 @@ function buildFromContents(input: DiffDocumentInput): DiffDocument {
   return {
     filePath: normalizeFilePath(input.filePath),
     lines,
+    metadata: [],
+    binary: false,
     stats: statsFor(lines),
   }
 }

@@ -512,6 +512,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
             _ensure_column(conn, "task_runs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             _ensure_column(conn, "approval_requests", "metadata_json", "TEXT")
             initialize_runtime_approval_schema(conn)
+            _supersede_legacy_change_approvals(conn)
             _ensure_column(conn, "agent_runs", "title", "TEXT")
             _ensure_column(conn, "agent_runs", "topic", "TEXT")
             _ensure_column(conn, "agent_runs", "project_id", "TEXT")
@@ -2545,6 +2546,102 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
 
         return await asyncio.to_thread(_op)
 
+    async def get_security_release_metrics(self) -> dict[str, Any]:
+        """Return path/body-free counters used by protected-workspace release gates."""
+
+        await self.initialize()
+
+        def _op() -> dict[str, Any]:
+            counters: dict[str, int] = {
+                key: 0
+                for key in (
+                    "change_set.prepared",
+                    "change_set.applied",
+                    "change_set.conflicted",
+                    "change_set.rolled_back",
+                    "change_set.rollback_failed",
+                    "change_set.superseded_schema",
+                    "blob.retained",
+                    "blob.expired",
+                    "approval.expired",
+                    "approval.superseded_schema",
+                    "approval_side_effect.pending",
+                    "approval_side_effect.retried",
+                    "approval_side_effect.delivered",
+                    "approval_side_effect.failed",
+                    "undo.conflict",
+                    "undo.expired",
+                    "digest.schema_mismatch",
+                )
+            }
+            reason_codes: dict[str, int] = {}
+            sandbox: dict[str, int] = {}
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM change_sets GROUP BY status"
+                ):
+                    counters[f"change_set.{row['status']}"] = int(row["count"])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) AS count FROM blob_references GROUP BY state"
+                ):
+                    state = str(row["state"])
+                    key = "blob.retained" if state == "active" else f"blob.{state}"
+                    counters[key] = int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, reason, COUNT(*) AS count "
+                    "FROM approval_requests GROUP BY status, reason"
+                ):
+                    reason = str(row["reason"] or "")
+                    key = (
+                        "approval.superseded_schema"
+                        if reason == "superseded_schema"
+                        else f"approval.{row['status']}"
+                    )
+                    counters[key] = counters.get(key, 0) + int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, attempts, COUNT(*) AS count "
+                    "FROM approval_side_effects GROUP BY status, attempts"
+                ):
+                    status = str(row["status"])
+                    count = int(row["count"])
+                    counters[f"approval_side_effect.{status}"] = (
+                        counters.get(f"approval_side_effect.{status}", 0) + count
+                    )
+                    if int(row["attempts"] or 0) > 1:
+                        counters["approval_side_effect.retried"] += count
+                for row in conn.execute(
+                    "SELECT event_type, outcome, details_json, COUNT(*) AS count "
+                    "FROM security_audit_events "
+                    "GROUP BY event_type, outcome, details_json"
+                ):
+                    event_type = str(row["event_type"])
+                    outcome = str(row["outcome"] or "unknown")
+                    count = int(row["count"])
+                    try:
+                        details = json.loads(str(row["details_json"] or "{}"))
+                    except json.JSONDecodeError:
+                        details = {}
+                    reason = details.get("reason_code") if isinstance(details, dict) else None
+                    if isinstance(reason, str) and reason:
+                        reason_codes[reason] = reason_codes.get(reason, 0) + count
+                    if event_type.startswith("sandbox_"):
+                        backend = details.get("backend") if isinstance(details, dict) else None
+                        label = f"{backend or 'unknown'}.{outcome}"
+                        sandbox[label] = sandbox.get(label, 0) + count
+                    if event_type.startswith("undo_") and outcome in {"conflict", "expired"}:
+                        counters[f"undo.{outcome}"] += count
+                    if reason == "superseded_schema":
+                        counters["digest.schema_mismatch"] += count
+            return {
+                "schema_version": 1,
+                "counters": counters,
+                "reason_codes": reason_codes,
+                "sandbox": sandbox,
+            }
+
+        return await asyncio.to_thread(_op)
+
     async def append_goal_operator_audit_log(
         self,
         *,
@@ -3849,6 +3946,45 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+
+def _supersede_legacy_change_approvals(conn: sqlite3.Connection) -> None:
+    """Invalidate pending approvals bound to a superseded manifest schema."""
+
+    legacy_change_sets = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT id FROM change_sets WHERE status='superseded_schema'"
+        ).fetchall()
+    }
+    if not legacy_change_sets:
+        return
+    rows = conn.execute(
+        "SELECT id, metadata_json FROM approval_requests WHERE status='pending'"
+    ).fetchall()
+    now = datetime.now(UTC).isoformat()
+    for approval_id, metadata_json in rows:
+        try:
+            metadata = json.loads(str(metadata_json or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(metadata, dict) or metadata.get("change_set_id") not in legacy_change_sets:
+            continue
+        metadata["superseded_reason"] = "superseded_schema"
+        conn.execute(
+            """
+            UPDATE approval_requests
+            SET status='superseded', reason='superseded_schema',
+                metadata_json=?, resolved_at=?, updated_at=?
+            WHERE id=? AND status='pending'
+            """,
+            (
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                now,
+                now,
+                approval_id,
+            ),
+        )
+
 def _initialize_change_set_schema(conn: sqlite3.Connection) -> None:
     """Create the durable Task 3 schema without mutating existing rows."""
 
@@ -3893,6 +4029,9 @@ def _initialize_change_set_schema(conn: sqlite3.Connection) -> None:
             after_metadata_blob_id TEXT,
             rename_source TEXT,
             dependency_group TEXT,
+            encoding TEXT,
+            newline_style TEXT,
+            eof_newline INTEGER,
             UNIQUE(change_set_id, ordinal),
             UNIQUE(change_set_id, id),
             FOREIGN KEY(change_set_id) REFERENCES change_sets(id) ON DELETE CASCADE
@@ -3998,5 +4137,15 @@ def _initialize_change_set_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_file_transaction_journal_status_updated
         ON file_transaction_journal(status, updated_at);
+        """
+    )
+    _ensure_column(conn, "change_entries", "encoding", "TEXT")
+    _ensure_column(conn, "change_entries", "newline_style", "TEXT")
+    _ensure_column(conn, "change_entries", "eof_newline", "INTEGER")
+    conn.execute(
+        """
+        UPDATE change_sets
+        SET status='superseded_schema'
+        WHERE schema_version < 2 AND status='prepared'
         """
     )

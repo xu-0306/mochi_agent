@@ -30,6 +30,7 @@ from mochi.security.auto_review import (
     verify_auto_review_decision,
 )
 from mochi.security.file_contract import (
+    AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
     AuthorizationContext,
     AuthorizationEnvelope,
     EnvVarHash,
@@ -107,7 +108,7 @@ def _build_exec_authorization_envelope(
         },
     )
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
         kind="exec",
         context=authorization_context,
         policy_version=policy_version,

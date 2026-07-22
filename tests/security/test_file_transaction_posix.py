@@ -75,7 +75,7 @@ def _authorization():
         dependency_group="posix",
     )
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="file_change",
         context=AuthorizationContext(
             requester_id="requester",
@@ -1181,7 +1181,7 @@ def _real_authorization(workspace, target, metadata_sha: str):
         dependency_group="real-posix",
     )
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="file_change",
         context=AuthorizationContext(
             requester_id="requester",

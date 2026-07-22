@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from mochi.security.file_contract import (
+    AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
     AppliedChangeRecord,
     AuthorizationEnvelope,
     ChangeEntry,
@@ -162,6 +163,8 @@ class ChangeSetStore:
         request = envelope.file_request
         if envelope.kind != "file_change" or request is None:
             raise ValueError("change manifests require a file_change envelope")
+        if envelope.schema_version != AUTHORIZATION_ENVELOPE_SCHEMA_VERSION:
+            raise ChangeSetConflict("superseded_schema")
         digest = authorization_request_digest(envelope)
         if manifest.request_digest != digest:
             raise ChangeSetConflict(
@@ -284,8 +287,9 @@ class ChangeSetStore:
                         base_sha256, after_sha256, base_identity_json,
                         before_blob_id, after_blob_id, mode_before, mode_after,
                         base_metadata_blob_id, after_metadata_blob_id,
-                        rename_source, dependency_group
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        rename_source, dependency_group, encoding, newline_style,
+                        eof_newline
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         entry.entry_id,
@@ -304,6 +308,9 @@ class ChangeSetStore:
                         entry.after_metadata_sha256,
                         entry.rename_source,
                         entry.dependency_group,
+                        entry.encoding,
+                        entry.newline_style,
+                        None if entry.eof_newline is None else int(entry.eof_newline),
                     ),
                 )
             loaded = self._load_change_set(conn, manifest.change_set_id)
@@ -347,6 +354,13 @@ class ChangeSetStore:
                 after_metadata_sha256=entry["after_metadata_blob_id"],
                 rename_source=entry["rename_source"],
                 dependency_group=entry["dependency_group"],
+                encoding=entry["encoding"],
+                newline_style=entry["newline_style"],
+                eof_newline=(
+                    None
+                    if entry["eof_newline"] is None
+                    else bool(entry["eof_newline"])
+                ),
             )
             for entry in entry_rows
         )

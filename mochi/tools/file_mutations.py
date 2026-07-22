@@ -433,10 +433,27 @@ async def prepare_apply_patch(
                 raise PatchValidationError(f"Target file not found for patch: {target}")
             if not await asyncio.to_thread(target.is_file):
                 raise PatchValidationError(f"Path is not a file: {target}")
+            original_bytes = await asyncio.to_thread(target.read_bytes)
+            if b"\0" in original_bytes:
+                raise PatchValidationError(
+                    f"Binary files cannot be edited with a text patch: {target}",
+                    status_code=415,
+                    metadata={
+                        "content_kind": "binary",
+                        "suggested_tool": "binary_asset",
+                    },
+                )
             try:
-                original_content = await asyncio.to_thread(target.read_text, encoding=encoding)
+                original_content = original_bytes.decode(encoding, errors="strict")
             except UnicodeDecodeError as exc:
-                raise PatchValidationError(f"File is not valid {encoding} text: {target}") from exc
+                raise PatchValidationError(
+                    f"File is not valid {encoding} text and cannot use a text patch: {target}",
+                    status_code=415,
+                    metadata={
+                        "content_kind": "non_utf8",
+                        "suggested_tool": "binary_asset",
+                    },
+                ) from exc
             if operation.kind == "delete":
                 new_content = None
             else:

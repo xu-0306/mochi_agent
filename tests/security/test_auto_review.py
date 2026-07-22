@@ -50,7 +50,7 @@ def _exec_envelope(
     env: tuple[EnvVarHash, ...] = (),
 ) -> AuthorizationEnvelope:
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="exec",
         context=_context(),
         policy_version="exec-policy-v1:test",
@@ -89,7 +89,7 @@ def _file_envelope(path: str = "src/app.py") -> AuthorizationEnvelope:
         dependency_group=None,
     )
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="file_change",
         context=_context(),
         policy_version="file-policy-v1:test",
@@ -128,7 +128,11 @@ def test_reviewed_allow_is_deterministic_and_digest_bound() -> None:
         (_file_envelope(".git/config"), _ask_facts(), "protected_path"),
         (_file_envelope("../outside.txt"), _ask_facts(), "workspace_escape"),
         (_file_envelope("C:/outside.txt"), _ask_facts(), "workspace_escape"),
-        (_exec_envelope(escalation="require_escalated"), _ask_facts(), "require_escalated"),
+        (
+            _exec_envelope(escalation="require_escalated"),
+            _ask_facts(),
+            "require_escalated",
+        ),
         (_exec_envelope(), _ask_facts(unknown_shell_parse=True), "unknown_shell_parse"),
         (_exec_envelope(), _ask_facts(identity_mismatch=True), "identity_mismatch"),
         (_file_envelope(), _ask_facts(stale_base=True), "stale_base"),

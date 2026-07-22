@@ -25,6 +25,7 @@ from mochi.security.file_contract import (
     FileChangeRequest,
     FileIdentity,
     authorization_request_digest,
+    canonical_json,
 )
 from mochi.tools.file_transaction import (
     FileTransactionError,
@@ -66,7 +67,7 @@ def _envelope(*, after_sha256: str | None = None) -> AuthorizationEnvelope:
         dependency_group=None,
     )
     return AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=2,
         kind="file_change",
         context=AuthorizationContext(
             requester_id="requester",
@@ -89,7 +90,7 @@ def _manifest(
     request = envelope.file_request
     assert request is not None
     return ChangeManifest(
-        version=1,
+        version=2,
         change_set_id=change_set_id,
         workspace_root=envelope.context.workspace_root,
         workspace_identity=envelope.context.workspace_identity,
@@ -122,16 +123,12 @@ def test_runtime_store_migrates_task3_schema_idempotently(tmp_path: Path) -> Non
     with sqlite3.connect(db_path) as conn:
         tables = {
             str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert expected_tables <= tables
         indexes = {
             str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            )
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
         }
         assert "change_set_idempotency" in indexes
 
@@ -140,9 +137,7 @@ def test_runtime_store_migrates_task3_schema_idempotently(tmp_path: Path) -> Non
     with sqlite3.connect(db_path) as conn:
         assert expected_tables <= {
             str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
 
 
@@ -187,6 +182,116 @@ def test_manifest_persistence_is_scoped_idempotent_and_conflict_safe(
     assert replay["status"] == "applied"
 
 
+def test_manifest_fidelity_fields_round_trip_and_change_digest(tmp_path: Path) -> None:
+    runtime_store = RuntimeStore(tmp_path / "runtime.db")
+    change_store = ChangeSetStore(runtime_store)
+    base = _envelope()
+    assert base.file_request is not None
+    fidelity_entry = replace(
+        base.file_request.entries[0],
+        encoding="utf-8",
+        newline_style="crlf",
+        eof_newline=False,
+        mode_before=0o100644,
+        mode_after=0o100755,
+        rename_source="safe/old note.txt",
+        dependency_group="rename-1",
+    )
+    envelope = replace(
+        base,
+        file_request=FileChangeRequest(entries=(fidelity_entry,), patch_sha256=None),
+    )
+    manifest = _manifest(envelope, change_set_id="change-fidelity")
+
+    persisted = asyncio.run(change_store.persist_manifest(manifest, envelope))
+
+    assert persisted["manifest"].entries == (fidelity_entry,)
+    assert persisted["envelope"] == envelope
+    assert authorization_request_digest(envelope) != authorization_request_digest(base)
+
+
+def test_schema_migration_supersedes_v1_manifest_and_pending_approval(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "runtime.db"
+    runtime_store = RuntimeStore(db_path)
+    asyncio.run(
+        runtime_store.create_task_run(
+            task_id="task-v1",
+            input_text="legacy",
+            session_id="session",
+            project_id=None,
+            workspace_dir="C:/workspace",
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+        )
+    )
+    asyncio.run(
+        runtime_store.create_approval_request(
+            approval_id="approval-v1",
+            task_id="task-v1",
+            call_id="call-v1",
+            tool_name="apply_patch",
+            arguments={"patch": "legacy"},
+            metadata={"change_set_id": "change-v1"},
+        )
+    )
+    envelope = replace(_envelope(), schema_version=1)
+    digest = authorization_request_digest(envelope)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO change_sets(
+                id,schema_version,requester_id,session_id,task_id,workspace_root,
+                workspace_identity_json,tool_name,intent,request_digest,
+                authorization_envelope_json,patch_sha256,policy_version,status,
+                created_at,expires_at,applied_at,updated_at,metadata_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "change-v1",
+                1,
+                envelope.context.requester_id,
+                envelope.context.session_id,
+                envelope.context.task_id,
+                envelope.context.workspace_root,
+                canonical_json(envelope.context.workspace_identity.to_dict()),
+                "apply_patch",
+                "mutate",
+                digest,
+                canonical_json(envelope.to_dict()),
+                None,
+                envelope.policy_version,
+                "prepared",
+                "2026-07-18T00:00:00+00:00",
+                "2026-07-19T00:00:00+00:00",
+                None,
+                "2026-07-18T00:00:00+00:00",
+                "{}",
+            ),
+        )
+        conn.commit()
+
+    runtime_store._initialized = False  # pyright: ignore[reportPrivateUsage]
+    asyncio.run(runtime_store.initialize())
+    approval = asyncio.run(runtime_store.get_approval_request("approval-v1"))
+    with sqlite3.connect(db_path) as conn:
+        status = conn.execute(
+            "SELECT status FROM change_sets WHERE id='change-v1'"
+        ).fetchone()
+
+    assert status == ("superseded_schema",)
+    assert approval is not None
+    assert approval["status"] == "superseded"
+    assert approval["reason"] == "superseded_schema"
+    assert approval["metadata"]["superseded_reason"] == "superseded_schema"
+    metrics = asyncio.run(runtime_store.get_security_release_metrics())
+    assert metrics["counters"]["change_set.superseded_schema"] == 1
+    assert metrics["counters"]["approval.superseded_schema"] == 1
+    assert "path" not in str(metrics).lower()
+    assert "legacy" not in str(metrics).lower()
+
+
 def test_blob_references_and_gc_preserve_live_data(tmp_path: Path) -> None:
     runtime_store = RuntimeStore(tmp_path / "runtime.db")
     change_store = ChangeSetStore(runtime_store)
@@ -208,12 +313,8 @@ def test_blob_references_and_gc_preserve_live_data(tmp_path: Path) -> None:
     assert asyncio.run(change_store.get_blob(blob_id)) == b"authoritative-before"
 
     expired_at = (now + timedelta(hours=2)).isoformat()
-    assert asyncio.run(
-        change_store.expire_blob_references(now=expired_at)
-    ) == 1
-    assert asyncio.run(
-        change_store.collect_garbage(now=expired_at)
-    ) == (blob_id,)
+    assert asyncio.run(change_store.expire_blob_references(now=expired_at)) == 1
+    assert asyncio.run(change_store.collect_garbage(now=expired_at)) == (blob_id,)
     assert asyncio.run(change_store.get_blob(blob_id)) is None
 
 
@@ -379,11 +480,14 @@ def test_recovery_classifies_identity_content_and_metadata_together(
 ) -> None:
     envelope = _envelope()
     manifest = _manifest(envelope)
-    assert classify_journal_entry(
-        _recovery_entry(manifest),
-        observation,
-        after_metadata_sha256=manifest.entries[0].after_metadata_sha256,
-    ) == expected
+    assert (
+        classify_journal_entry(
+            _recovery_entry(manifest),
+            observation,
+            after_metadata_sha256=manifest.entries[0].after_metadata_sha256,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -424,16 +528,13 @@ def test_recover_incomplete_transactions_converges_only_proven_states(
         }
     )
 
-    recovered = asyncio.run(
-        recover_incomplete_file_transactions(change_store, adapter)
-    )
+    recovered = asyncio.run(recover_incomplete_file_transactions(change_store, adapter))
     assert recovered[0]["status"] == expected_status
     persisted = asyncio.run(change_store.get_journal("journal-recovery"))
     assert persisted is not None
     assert persisted["status"] == expected_status
     if expected_status == "rolled_back":
         assert adapter.discarded == ["entry-1"]
-
 
 
 def test_runtime_service_runs_file_recovery_before_other_startup_work(
@@ -462,7 +563,6 @@ def test_runtime_service_runs_file_recovery_before_other_startup_work(
 
     asyncio.run(scenario())
     assert order[:2] == ["files", "exec"]
-
 
 
 class _TransactionParticipant:
@@ -518,9 +618,7 @@ class _TransactionParticipant:
         return StagedRollback(
             entry_id=self.entry.entry_id,
             staged_name=f".rollback-{self.entry.entry_id}",
-            staged_identity=_identity(
-                f"rollback-stage-{self.entry.entry_id}"
-            ),
+            staged_identity=_identity(f"rollback-stage-{self.entry.entry_id}"),
         )
 
     def rollback(
@@ -706,9 +804,7 @@ def test_commit_verification_mismatch_fails_closed_as_interference(
             )
         )
     assert raised.value.status == "interference"
-    assert not any(
-        event.startswith(("discard:", "rollback:")) for event in events
-    )
+    assert not any(event.startswith(("discard:", "rollback:")) for event in events)
     journal = asyncio.run(change_store.get_journal("journal-interference"))
     assert journal is not None
     assert journal["status"] == "interference"
@@ -729,8 +825,7 @@ def test_terminal_finalize_sets_applied_at_and_releases_all_transaction_refs(
             manifest,
             journal_id="journal-finalize",
             participants=tuple(
-                _TransactionParticipant(entry, [])
-                for entry in manifest.entries
+                _TransactionParticipant(entry, []) for entry in manifest.entries
             ),
         )
     )
@@ -755,9 +850,7 @@ def test_rollback_failure_retains_transaction_refs_for_recovery(
     db_path = tmp_path / "runtime.db"
     runtime_store = RuntimeStore(db_path)
     change_store = ChangeSetStore(runtime_store)
-    envelope, manifest = _two_entry_manifest(
-        change_set_id="change-rollback-failure"
-    )
+    envelope, manifest = _two_entry_manifest(change_set_id="change-rollback-failure")
     asyncio.run(change_store.persist_manifest(manifest, envelope))
     participants = (
         _TransactionParticipant(

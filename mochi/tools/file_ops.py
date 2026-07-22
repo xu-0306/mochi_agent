@@ -26,6 +26,7 @@ from mochi.security.auto_review import (
     verify_auto_review_decision,
 )
 from mochi.security.file_contract import (
+    AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
     AuthorizationContext,
     AuthorizationEnvelope,
     ChangeEntry,
@@ -34,6 +35,7 @@ from mochi.security.file_contract import (
     authorization_request_digest,
     canonical_json,
     capture_file_identity,
+    detect_content_fidelity,
 )
 from mochi.security.policy import policy_projection_version
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
@@ -100,6 +102,17 @@ def _content_digest(content: bytes | None) -> str | None:
     return None if content is None else hashlib.sha256(content).hexdigest()
 
 
+def _content_fidelity_projection(
+    before: bytes | None,
+    after: bytes | None,
+) -> tuple[str | None, str | None, bool | None]:
+    content = after if after is not None else before
+    if content is None:
+        return None, None, None
+    fidelity = detect_content_fidelity(content)
+    return fidelity.encoding, fidelity.newline_style, fidelity.eof_newline
+
+
 def _context_digest(context: AuthorizationContext) -> str:
     payload = canonical_json(context.to_dict()).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -135,6 +148,10 @@ async def _prepare_file_auto_review(
     )
     entries: list[ChangeEntry] = []
     for ordinal, (target, operation, before, after) in enumerate(changes):
+        entry_encoding, newline_style, eof_newline = _content_fidelity_projection(
+            before,
+            after,
+        )
         relative_path = target.relative_to(workspace_root).as_posix()
         base_identity = (
             None
@@ -170,6 +187,9 @@ async def _prepare_file_auto_review(
                 after_metadata_sha256=None,
                 rename_source=None,
                 dependency_group=None,
+                encoding=entry_encoding,
+                newline_style=newline_style,  # type: ignore[arg-type]
+                eof_newline=eof_newline,
             )
         )
     policy_version = policy_projection_version(
@@ -184,7 +204,7 @@ async def _prepare_file_auto_review(
         },
     )
     envelope = AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
         kind="file_change",
         context=authorization_context,
         policy_version=policy_version,
@@ -328,6 +348,10 @@ async def prepare_patch_change_contract(
             else await asyncio.to_thread(item.target.read_bytes)
         )
         after = None if item.new_content is None else item.new_content.encode(encoding)
+        entry_encoding, newline_style, eof_newline = _content_fidelity_projection(
+            before,
+            after,
+        )
         before_blob_id = None if before is None else await change_store.put_blob(before)
         after_blob_id = None if after is None else await change_store.put_blob(after)
         base_identity = (
@@ -368,12 +392,15 @@ async def prepare_patch_change_contract(
                 after_metadata_sha256=None,
                 rename_source=None,
                 dependency_group=None,
+                encoding=entry_encoding,
+                newline_style=newline_style,  # type: ignore[arg-type]
+                eof_newline=eof_newline,
             )
         )
 
     file_request = FileChangeRequest(entries=tuple(entries), patch_sha256=patch_sha256)
     envelope = AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
         kind="file_change",
         context=context,
         policy_version=policy_version,
@@ -383,7 +410,7 @@ async def prepare_patch_change_contract(
     request_digest = authorization_request_digest(envelope)
     now = datetime.now(UTC)
     manifest = ChangeManifest(
-        version=1,
+        version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
         change_set_id=str(uuid4()),
         workspace_root=str(workspace_root),
         workspace_identity=workspace_identity,
@@ -745,7 +772,7 @@ class FileReadTool(BaseTool):
 
     @staticmethod
     async def _default_reader(path: Path, encoding: str) -> str:
-        return await asyncio.to_thread(path.read_text, encoding=encoding)
+        return await asyncio.to_thread(_read_text_preserving_newlines, path, encoding)
 
     def _resolve_tool_result_reference(
         self,
@@ -1423,10 +1450,15 @@ async def _load_existing_content(target: Path, encoding: str) -> ToolResult:
     if not target.is_file():
         return ToolResult(error=f"Path is not a file: {target}")
     try:
-        text = await asyncio.to_thread(target.read_text, encoding=encoding)
+        text = await asyncio.to_thread(_read_text_preserving_newlines, target, encoding)
     except UnicodeDecodeError:
         return ToolResult(error=f"File is not valid {encoding} text: {target}")
     return ToolResult(output=text)
+
+
+def _read_text_preserving_newlines(path: Path, encoding: str) -> str:
+    with path.open("r", encoding=encoding, errors="strict", newline="") as stream:
+        return stream.read()
 
 
 async def _check_stale_write_guard(

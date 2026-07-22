@@ -25,6 +25,7 @@ from mochi.runtime.change_sets import (
 from mochi.runtime.security_audit import SecurityAuditEvent, file_content_observation
 from mochi.runtime.store import RuntimeStore
 from mochi.security.file_contract import (
+    AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
     AuthorizationContext,
     AuthorizationEnvelope,
     ChangeEntry,
@@ -33,6 +34,7 @@ from mochi.security.file_contract import (
     FileIdentity,
     authorization_request_digest,
     canonical_json,
+    detect_content_fidelity,
 )
 from mochi.sessions.store import SessionStore
 from mochi.tools.file_ops import file_change_policy_version
@@ -264,6 +266,21 @@ async def undo_change_set(
                 after_metadata_sha256=entry.base_metadata_sha256,
                 rename_source=entry.rename_source,
                 dependency_group=entry.dependency_group,
+                encoding=(
+                    detect_content_fidelity(before_content).encoding
+                    if before_content is not None
+                    else None
+                ),
+                newline_style=(
+                    detect_content_fidelity(before_content).newline_style
+                    if before_content is not None
+                    else None
+                ),
+                eof_newline=(
+                    detect_content_fidelity(before_content).eof_newline
+                    if before_content is not None
+                    else None
+                ),
             )
         )
         mutations.append(
@@ -293,7 +310,7 @@ async def undo_change_set(
         workspace_identity=original_envelope.context.workspace_identity,
     )
     envelope = AuthorizationEnvelope(
-        schema_version=1,
+        schema_version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
         kind="file_change",
         context=context,
         policy_version=file_change_policy_version(config.security),
@@ -302,7 +319,7 @@ async def undo_change_set(
     )
     inverse_digest = authorization_request_digest(envelope)
     inverse_manifest = ChangeManifest(
-        version=1,
+        version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
         change_set_id=str(uuid4()),
         workspace_root=str(workspace),
         workspace_identity=context.workspace_identity,

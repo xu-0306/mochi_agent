@@ -24,6 +24,8 @@ const added = buildDiffDocument({
 
 assert.equal(added.filePath, 'notes.txt')
 assert.deepEqual(added.stats, { additions: 1, deletions: 0 })
+assert.deepEqual(added.metadata, [])
+assert.equal(added.binary, false)
 assert.deepEqual(added.lines, [
   {
     kind: 'added',
@@ -65,6 +67,35 @@ assert.deepEqual(
   ]
 )
 assert.deepEqual(modified.stats, { additions: 2, deletions: 1 })
+
+const metadataOnlyRename = buildDiffDocument({
+  diff: [
+    'diff --git a/old name.txt b/new name.txt',
+    'similarity index 100%',
+    'rename from old name.txt',
+    'rename to new name.txt',
+  ].join('\n'),
+  filePath: 'new name.txt',
+})
+assert.deepEqual(metadataOnlyRename.lines, [])
+assert.deepEqual(metadataOnlyRename.metadata, [
+  'diff --git a/old name.txt b/new name.txt',
+  'similarity index 100%',
+  'rename from old name.txt',
+  'rename to new name.txt',
+])
+assert.equal(metadataOnlyRename.binary, false)
+
+const modeOnly = buildDiffDocument({
+  diff: [
+    'diff --git a/tool.sh b/tool.sh',
+    'old mode 100644',
+    'new mode 100755',
+  ].join('\n'),
+  filePath: 'tool.sh',
+})
+assert.deepEqual(modeOnly.metadata.slice(1), ['old mode 100644', 'new mode 100755'])
+assert.deepEqual(modeOnly.stats, { additions: 0, deletions: 0 })
 
 const repoMapProjection = extractFileChangeGroupFromToolData({
   id: 'repo-map-result',
