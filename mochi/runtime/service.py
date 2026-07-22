@@ -13760,11 +13760,36 @@ def _task_approval_binding_kwargs(approval: Mapping[str, Any]) -> dict[str, str]
     requester_id = str(approval.get("requester_id") or "legacy")
     if requester_id == "legacy":
         return {}
-    return {
-        "requester_id": requester_id,
-        "request_digest": str(approval.get("request_digest") or ""),
-        "context_digest": str(approval.get("context_digest") or ""),
-    }
+
+    task_id = str(approval.get("task_id") or "").strip()
+    call_id = str(approval.get("call_id") or "").strip()
+    canonical_requester_id = f"runtime-task:{task_id}" if task_id else requester_id
+
+    # File-mutation approvals have a separate authoritative change-set contract.
+    # Its request/context digests are checked against the persisted manifest before
+    # this binding is consumed, so keep those values for that contract path.
+    if _is_file_mutation_approval(dict(approval)):
+        return {
+            "requester_id": canonical_requester_id,
+            "request_digest": str(approval.get("request_digest") or ""),
+            "context_digest": str(approval.get("context_digest") or ""),
+        }
+
+    arguments = approval.get("arguments")
+    return _approval_binding_kwargs(
+        canonical_requester_id,
+        {
+            "tool_name": str(approval.get("tool_name") or ""),
+            "arguments": dict(arguments) if isinstance(arguments, Mapping) else {},
+        },
+        {
+            "source": "runtime_task_approval",
+            "task_id": task_id,
+            "call_id": call_id,
+        },
+    )
+
+
 def _linked_exec_approval_id(metadata: Any) -> str | None:
     if not isinstance(metadata, dict):
         return None

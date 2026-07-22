@@ -72,7 +72,7 @@
     "clsx": "^2.1.1",
     "fuse.js": "^7.0.0",
     "lucide-react": "^0.378.0",
-    "next": "^16.2.4",
+    "next": "^16.2.11",
     "prism-react-renderer": "^2.4.1",
     "react": "18.3.1",
     "react-diff-viewer-continued": "^4.2.0",
@@ -92,13 +92,14 @@
     "@typescript-eslint/parser": "^8.59.0",
     "autoprefixer": "^10.4.19",
     "eslint": "^9.39.4",
-    "eslint-config-next": "^16.2.4",
+    "eslint-config-next": "^16.2.11",
     "postcss": "^8.5.12",
     "tailwindcss": "^3.4.3",
     "tailwindcss-animate": "^1.0.7",
     "typescript": "^5.4.5"
   },
   "overrides": {
-    "postcss": "$postcss"
+    "postcss": "$postcss",
+    "sharp": "0.35.3"
   }
 }

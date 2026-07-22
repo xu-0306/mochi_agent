@@ -6399,7 +6399,7 @@ function PreferencesPanel() {
   )
 }
 
-export default function SettingsPage() {
+function SettingsPageContent() {
   const { t } = useI18n()
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -6850,5 +6850,13 @@ export default function SettingsPage() {
         ) : null}
       </div>
     </div>
+  )
+}
+
+export default function SettingsPage() {
+  return (
+    <React.Suspense fallback={null}>
+      <SettingsPageContent />
+    </React.Suspense>
   )
 }
