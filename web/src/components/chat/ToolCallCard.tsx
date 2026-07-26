@@ -8,7 +8,10 @@ import {
   ChevronDown,
   ChevronRight,
   ExternalLink,
+  BadgeCheck,
+  Play,
   Settings2,
+  ShieldCheck,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n'
@@ -17,9 +20,13 @@ import {
   delegatedSubagentTitle,
   resolveDelegatedSubagentView,
 } from '@/lib/subagent-tasks'
+import { projectConcreteToolWorkflow } from '@/lib/tool-workflow-observability'
+import { useToolWorkflowAggregateCall } from '@/lib/tool-workflow-aggregate'
 
 interface ToolCallCardProps {
   toolName: string
+  sessionId?: string | null
+  turnId?: string | null
   args?: Record<string, unknown>
   result?: unknown
   metadata?: Record<string, unknown>
@@ -55,6 +62,8 @@ function getEvidenceNotice(metadata?: Record<string, unknown>): string | null {
 
 export function ToolCallCard({
   toolName,
+  sessionId,
+  turnId,
   args,
   result,
   metadata,
@@ -74,15 +83,69 @@ export function ToolCallCard({
       : null
   const [open, setOpen] = React.useState(!isResult || isError || Boolean(evidenceNotice))
   const headerLabel = delegatedSubagent ? delegatedSubagentTitle(delegatedSubagent) : toolName
+  const workflow = projectConcreteToolWorkflow({
+    toolName,
+    result,
+    metadata,
+    isResult,
+    errorMessage,
+  })
+  const aggregateView = useToolWorkflowAggregateCall(sessionId, turnId, callId)
+  const aggregateCall = aggregateView?.call
+  const aggregateAuthoritative = Boolean(aggregateView?.authoritative && aggregateCall)
+  const aggregateWorkflow = aggregateCall
+    ? {
+        ...workflow,
+        activationStatus: aggregateCall.activation_status,
+        activationAuthorizesCall: null,
+        reviewStatus: aggregateCall.review_status,
+        approvalStatus: aggregateCall.review_status,
+        autoReviewDecision: 'not_observed',
+        autoReviewSource: null,
+        executionStatus: aggregateAuthoritative ? aggregateCall.execution_status : 'not_observed',
+        operationId: aggregateCall.operation_id,
+        changedPaths: aggregateAuthoritative ? aggregateCall.changed_paths : [],
+        verificationStatus: aggregateAuthoritative ? aggregateCall.verification_status : 'not_observed',
+        retryStatus: 'not_observed',
+        blocker: aggregateCall.blocker ?? aggregateView?.diagnostic ?? null,
+      }
+    : aggregateView
+      ? {
+          ...workflow,
+          executionStatus: 'not_observed',
+          verificationStatus: 'not_observed',
+          blocker: aggregateView.diagnostic ?? 'No matching durable aggregate call was observed.',
+        }
+      : {
+          ...workflow,
+          executionStatus: 'not_observed',
+          verificationStatus: 'not_observed',
+          blocker: 'Durable tool workflow evidence is not available for this call.',
+        }
+  const displayedWorkflow = aggregateWorkflow
+  const isVerifiedSuccess = Boolean(
+    aggregateAuthoritative &&
+      aggregateCall?.execution_status === 'succeeded' &&
+      ['verified', 'not_required'].includes(aggregateCall.verification_status)
+  )
+  const aggregateFailure = Boolean(
+    aggregateAuthoritative &&
+      aggregateCall &&
+      ['failed', 'abandoned', 'cancelled', 'unknown'].includes(aggregateCall.execution_status)
+  )
+  const displayError = aggregateCall ? aggregateFailure : isError
+  const statusLabel = (value: string) => value.replaceAll('_', ' ')
 
   return (
     <div
       className={cn(
         'max-w-[560px] rounded-lg border text-sm font-mono',
         isResult
-          ? isError
+          ? displayError
             ? 'border-border border-l-[3px] border-l-error bg-error/5'
-            : 'border-border border-l-[3px] border-l-success bg-surface-layer'
+            : isVerifiedSuccess
+              ? 'border-border border-l-[3px] border-l-success bg-surface-layer'
+              : 'border-border border-l-[3px] border-l-warning bg-surface-layer'
           : 'border-border bg-secondary/10'
       )}
     >
@@ -90,9 +153,9 @@ export function ToolCallCard({
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition-colors duration-150 hover:bg-white/5"
       >
-        {isError ? (
+        {displayError ? (
           <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-error" />
-        ) : isResult ? (
+        ) : isVerifiedSuccess ? (
           <CheckCircle2 className="h-3.5 w-3.5 text-success shrink-0" />
         ) : (
           <Settings2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
@@ -103,8 +166,10 @@ export function ToolCallCard({
           {status === 'calling' && (
             <span className="ml-2 text-muted-foreground animate-pulse">{t('chat.tool.running')}</span>
           )}
-          {isError ? (
+          {displayError ? (
             <span className="ml-2 text-error">{t('chat.tool.failed')}</span>
+          ) : aggregateView ? (
+            <span className="ml-2 text-warning">{statusLabel(displayedWorkflow.executionStatus)}</span>
           ) : null}
           {evidenceNotice ? (
             <span className="ml-2 text-amber-300">insufficient evidence</span>
@@ -168,6 +233,67 @@ export function ToolCallCard({
               </p>
             </div>
           ) : null}
+          <div className="mb-2 border-y border-border/70 py-2 font-sans">
+            {displayedWorkflow.activationStatus ? (
+              <div className="mb-2 flex items-start gap-2">
+                <Settings2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary-300" />
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Activation</p>
+                  <p className="mt-0.5 text-xs text-foreground/90">
+                    {statusLabel(displayedWorkflow.activationStatus)}
+                  </p>
+                  <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
+                    Activation changes callable schemas only; it does not authorize the concrete tool call.
+                  </p>
+                </div>
+              </div>
+            ) : null}
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-muted-foreground">
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  <p className="text-[10px] uppercase tracking-[0.08em]">Call review</p>
+                </div>
+                <p className="mt-1 break-words text-xs text-foreground/90">
+                  {statusLabel(displayedWorkflow.reviewStatus)}
+                </p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Auto Review: {statusLabel(displayedWorkflow.autoReviewDecision)}
+                </p>
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-muted-foreground">
+                  <Play className="h-3.5 w-3.5" />
+                  <p className="text-[10px] uppercase tracking-[0.08em]">Execution</p>
+                </div>
+                <p className="mt-1 break-words text-xs text-foreground/90">
+                  {statusLabel(displayedWorkflow.executionStatus)}
+                </p>
+                {displayedWorkflow.operationId ? (
+                  <p className="mt-0.5 break-all text-[11px] text-muted-foreground">
+                    {displayedWorkflow.operationId}
+                  </p>
+                ) : null}
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-muted-foreground">
+                  <BadgeCheck className="h-3.5 w-3.5" />
+                  <p className="text-[10px] uppercase tracking-[0.08em]">Verification</p>
+                </div>
+                <p className="mt-1 break-words text-xs text-foreground/90">
+                  {statusLabel(displayedWorkflow.verificationStatus)}
+                </p>
+                {displayedWorkflow.changedPaths.length > 0 ? (
+                  <p className="mt-0.5 break-all text-[11px] text-muted-foreground">
+                    {displayedWorkflow.changedPaths.join(', ')}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+            {displayedWorkflow.blocker ? (
+              <p className="mt-2 break-words text-xs text-error/90">{displayedWorkflow.blocker}</p>
+            ) : null}
+          </div>
           {!isResult && args && (
             <div>
               <p className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">{t('chat.tool.args')}</p>

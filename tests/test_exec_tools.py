@@ -64,6 +64,122 @@ _SCRIPT_BY_COMMAND = {
 }
 
 
+def _effective_exec_policy(
+    *,
+    require_approval: bool,
+    hard_denies: list[str] | None = None,
+    snapshot_id: str = "policy-test-exec",
+    policy_version: str = "effective-policy-v1:test-exec",
+) -> dict[str, object]:
+    return {
+        "policy_snapshot_id": snapshot_id,
+        "policy_version": policy_version,
+        "source_chain": ["security_config", "session_override"],
+        "autonomy_mode": "strict" if require_approval else "auto_review",
+        "require_approval_for_file_write": True,
+        "require_approval_for_exec": require_approval,
+        "file_read_scope": "workspace",
+        "file_write_scope": "workspace",
+        "hard_denies": list(hard_denies or []),
+    }
+
+
+@pytest.mark.asyncio
+async def test_exec_command_hard_deny_prevents_execution() -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    tool = ExecCommandTool(
+        runtime=runtime,
+        require_approval=False,
+        workspace_dir="H:/_python/agent_mochi",
+        command_rules=[_allow_rule("fg", shells=["test"])],
+    )
+
+    result = await tool.execute(
+        command="fg",
+        shell="test",
+        context=ToolExecutionContext(
+            permission_policy=_effective_exec_policy(
+                require_approval=False,
+                hard_denies=["exec"],
+            )
+        ),
+    )
+
+    assert result.error is not None
+    assert result.metadata["status"] == "denied"
+    assert result.metadata["hard_deny"] == "exec"
+    assert result.metadata["policy_snapshot_id"] == "policy-test-exec"
+    assert result.metadata["effective_policy_version"] == "effective-policy-v1:test-exec"
+    assert runtime.list_sessions() == []
+
+
+@pytest.mark.asyncio
+async def test_cached_exec_command_uses_each_call_policy_snapshot(tmp_path: Path) -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    approvals = InMemoryApprovalStore()
+    tool = ExecCommandTool(
+        runtime=runtime,
+        approval_store=approvals,
+        require_approval=True,
+        workspace_dir=tmp_path,
+        command_rules=[_allow_rule("fg", shells=["test"])],
+    )
+
+    allowed = await tool.execute(
+        command="fg",
+        shell="test",
+        context=ToolExecutionContext(
+            permission_policy=_effective_exec_policy(
+                require_approval=False,
+                snapshot_id="policy-exec-allow",
+                policy_version="effective-policy-v1:exec-allow",
+            )
+        ),
+    )
+    pending = await tool.execute(
+        command="fg",
+        shell="test",
+        context=ToolExecutionContext(
+            permission_policy=_effective_exec_policy(
+                require_approval=True,
+                snapshot_id="policy-exec-approval",
+                policy_version="effective-policy-v1:exec-approval",
+            )
+        ),
+    )
+    sessions_before_deny = list(runtime.list_sessions())
+    approvals_before_deny = approvals.list(status="pending")
+    denied = await tool.execute(
+        command="fg",
+        shell="test",
+        context=ToolExecutionContext(
+            permission_policy=_effective_exec_policy(
+                require_approval=False,
+                hard_denies=["exec"],
+                snapshot_id="policy-exec-deny",
+                policy_version="effective-policy-v1:exec-deny",
+            )
+        ),
+    )
+
+    assert allowed.error is None
+    assert allowed.metadata["policy_snapshot_id"] == "policy-exec-allow"
+    assert pending.metadata["requires_approval"] is True
+    assert pending.metadata["policy_snapshot_id"] == "policy-exec-approval"
+    assert denied.metadata["status"] == "denied"
+    assert denied.metadata["security_decision"] == "deny"
+    assert denied.metadata["hard_deny"] == "exec"
+    assert denied.metadata["policy_snapshot_id"] == "policy-exec-deny"
+    assert runtime.list_sessions() == sessions_before_deny
+    assert approvals.list(status="pending") == approvals_before_deny
+
+
 @pytest.mark.asyncio
 async def test_exec_command_foreground_success() -> None:
     runtime = ExecRuntime(
@@ -185,7 +301,17 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
         workspace_dir="H:/_python/agent_mochi",
     )
 
-    result = await tool.execute(command="cmd /c more notes.txt", shell="cmd")
+    result = await tool.execute(
+        command="cmd /c more notes.txt",
+        shell="cmd",
+        context=ToolExecutionContext(
+            permission_policy=_effective_exec_policy(
+                require_approval=True,
+                snapshot_id="policy-approval",
+                policy_version="effective-policy-v1:approval",
+            )
+        ),
+    )
 
     assert result.error is not None
     assert result.metadata["status"] == "approval_pending"
@@ -205,6 +331,11 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
     assert set(stored.request_digest) <= set("0123456789abcdef")
     assert set(stored.context_digest) <= set("0123456789abcdef")
     assert isinstance(stored.command_payload, dict)
+    assert stored.metadata["tool_name"] == "exec_command"
+    assert stored.metadata["policy_snapshot_id"] == "policy-approval"
+    assert stored.metadata["effective_policy_version"] == "effective-policy-v1:approval"
+    assert stored.command_payload["policy_snapshot_id"] == "policy-approval"
+    assert stored.command_payload["effective_policy_version"] == "effective-policy-v1:approval"
     sandbox_plan = stored.command_payload.get("sandbox_plan")
     assert isinstance(sandbox_plan, dict)
     assert SandboxPlan.from_dict(sandbox_plan).digest == sandbox_plan["plan_digest"]

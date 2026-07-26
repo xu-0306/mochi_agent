@@ -104,7 +104,7 @@ const directChatBranch = directChatBranchMatch[1]
 
 assert.match(
   pageSource,
-  /if\s*\(\s*route\.kind === 'direct_chat'[\s\S]*?hasActiveNonTerminalGoal[\s\S]*?pending_proposal === null[\s\S]*?await handleActiveGoalDirectTurnDecision\(/,
+  /if\s*\(\s*route\.kind === 'direct_chat'[\s\S]*?hasActiveNonTerminalGoal[\s\S]*?pending_proposal === null[\s\S]*?await activeGoalDirectTurnDecisionRef\.current\(/,
   'page.tsx should classify eligible active-goal natural-language direct chat turns before submitting ordinary chat'
 )
 

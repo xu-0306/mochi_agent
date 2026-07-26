@@ -283,6 +283,176 @@ async def test_file_write_auto_review_records_digest_bound_reviewed_allow(
     assert result.metadata["auto_review_execution_verified"] is True
 
 
+async def _execute_file_mutation_for_policy_test(
+    *,
+    tool: Any,
+    workspace: Path,
+    context: ToolExecutionContext,
+    suffix: str,
+) -> tuple[ToolResult, Path]:
+    target = workspace / f"policy-{suffix}.txt"
+    if tool.name == "file_write":
+        result = await tool.execute(
+            path=target.name,
+            content="new content",
+            context=context,
+        )
+    elif tool.name == "file_edit":
+        target.write_text("old content", encoding="utf-8")
+        read_result = await FileReadTool(workspace_dir=workspace).execute(
+            path=target.name,
+            context=context,
+        )
+        assert read_result.error is None
+        result = await tool.execute(
+            path=target.name,
+            old_string="old content",
+            new_string="new content",
+            context=context,
+        )
+    else:
+        result = await tool.execute(
+            patch="\n".join(
+                [
+                    "*** Begin Patch",
+                    f"*** Add File: {target.name}",
+                    "+new content",
+                    "*** End Patch",
+                ]
+            ),
+            context=context,
+        )
+    return result, target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_factory",
+    [
+        FileWriteTool,
+        FileEditTool,
+        ApplyPatchTool,
+    ],
+)
+async def test_context_auto_review_overrides_cached_strict_file_policy(
+    tmp_path: Path,
+    tool_factory: Any,
+) -> None:
+    tool = tool_factory(
+        workspace_dir=tmp_path,
+        path_scope="workspace",
+        require_approval=True,
+    )
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        session_id="session-auto-review",
+        permission_policy={
+            "policy_snapshot_id": "policy-auto-review",
+            "policy_version": "effective-policy-v1:auto-review",
+            "autonomy_mode": "auto_review",
+            "require_approval_for_file_write": False,
+            "file_write_scope": "workspace",
+        },
+    )
+
+    result, target = await _execute_file_mutation_for_policy_test(
+        tool=tool,
+        workspace=tmp_path,
+        context=context,
+        suffix=f"auto-{tool.name}",
+    )
+
+    assert result.error is None
+    assert target.read_text(encoding="utf-8").rstrip("\n") == "new content"
+    assert result.metadata["require_approval_for_file_write"] is False
+    assert result.metadata["path_scope"] == "workspace"
+    assert result.metadata["file_permission_policy_source"] == "execution_context"
+    assert result.metadata["policy_snapshot_id"] == "policy-auto-review"
+    assert result.metadata["effective_policy_version"] == (
+        "effective-policy-v1:auto-review"
+    )
+    assert result.metadata["auto_review_decision"] == "allow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_factory",
+    [
+        FileWriteTool,
+        FileEditTool,
+        ApplyPatchTool,
+    ],
+)
+async def test_context_strict_overrides_cached_permissive_file_policy(
+    tmp_path: Path,
+    tool_factory: Any,
+) -> None:
+    tool = tool_factory(
+        workspace_dir=tmp_path,
+        path_scope="any",
+        require_approval=False,
+    )
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        permission_policy={
+            "autonomy_mode": "strict",
+            "require_approval_for_file_write": True,
+            "file_write_scope": "workspace",
+        },
+    )
+
+    result, target = await _execute_file_mutation_for_policy_test(
+        tool=tool,
+        workspace=tmp_path,
+        context=context,
+        suffix=f"strict-{tool.name}",
+    )
+
+    assert result.error is not None
+    assert result.metadata["requires_approval"] is True
+    assert result.metadata["require_approval_for_file_write"] is True
+    assert result.metadata["path_scope"] == "workspace"
+    assert result.metadata["file_permission_policy_source"] == "execution_context"
+    assert not target.exists() or target.read_text(encoding="utf-8") == "old content"
+
+
+@pytest.mark.asyncio
+async def test_task_sandbox_is_hard_ceiling_for_context_file_write_scope(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    outside_sandbox = tmp_path / "outside.txt"
+    tool = FileWriteTool(
+        workspace_dir=tmp_path,
+        path_scope="any",
+        require_approval=False,
+    )
+    context = ToolExecutionContext(
+        workspace_dir=str(tmp_path),
+        task_sandbox_dir=str(sandbox),
+        permission_policy={
+            "autonomy_mode": "high_autonomy",
+            "require_approval_for_file_write": False,
+            "file_write_scope": "any",
+        },
+    )
+
+    result = await tool.execute(
+        path=str(outside_sandbox),
+        content="blocked",
+        context=context,
+    )
+
+    assert result.error is not None
+    assert "outside workspace" in result.error
+    assert result.metadata["path_scope"] == "workspace"
+    assert result.metadata["file_permission_policy_source"].endswith(
+        "+task_sandbox_ceiling"
+    )
+    assert not outside_sandbox.exists()
+
+
 @pytest.mark.asyncio
 async def test_file_write_approval_returns_normalized_file_change_metadata(tmp_path: Path) -> None:
     writer = FileWriteTool(workspace_dir=tmp_path, require_approval=True)
@@ -668,6 +838,8 @@ async def test_tool_search_hidden_core_mutation_tools_include_activation_request
         "tool_name": tool_name,
         "required_intent": "workspace_write",
         "policy_check": "required",
+        "activation_tool": "tool_activate",
+        "arguments": {"tool_name": tool_name},
     }
 
 
@@ -691,7 +863,9 @@ async def test_tool_search_callable_file_write_omits_activation_request(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_tool_search_hidden_read_only_tool_omits_activation_request(tmp_path: Path) -> None:
+async def test_tool_search_hidden_read_only_tool_points_to_activation_broker(
+    tmp_path: Path,
+) -> None:
     registry = ToolRegistry(discover_builtin=False)
     registry.register(ToolSearchTool(catalog_provider=registry.list_tools))
     registry.register(FileReadTool(workspace_dir=tmp_path))
@@ -706,7 +880,12 @@ async def test_tool_search_hidden_read_only_tool_omits_activation_request(tmp_pa
     assert result.error is None
     match = next(item for item in result.output if item["name"] == "file_read")
     assert match["callable_this_turn"] is False
-    assert "activation_request" not in match
+    assert match["activation_request"] == {
+        "tool_name": "file_read",
+        "policy_check": "required",
+        "activation_tool": "tool_activate",
+        "arguments": {"tool_name": "file_read"},
+    }
 
 
 @pytest.mark.asyncio
@@ -746,7 +925,6 @@ def _make_tool_activation_workspace() -> Path:
 def _tool_activation_context(
     *,
     workspace: Path,
-    routed_intent: str = "workspace_write",
     execution_profile: str = "chat",
     tool_mode: str = "auto",
     discoverable_tool_names: list[str] | None = None,
@@ -765,7 +943,11 @@ def _tool_activation_context(
         },
         state={
             "tool_activation_policy": {
-                "routed_intent": routed_intent,
+                "capability_enforcement_mode": "enforce",
+                "mutation_requirement": "required",
+                "requested_operations": ["workspace_write"],
+                "required_capabilities": ["workspace_write"],
+                "activation_allowed_tool_names": list(discoverable_tool_names or []),
                 "execution_profile": execution_profile,
                 "tool_mode": tool_mode,
                 "discoverable_tool_names": list(discoverable_tool_names or []),
@@ -814,13 +996,6 @@ def test_registry_view_workspace_write_activation_promotes_hidden_file_write() -
         (
             {"tool_denylist": ["file_write"], "discoverable_tool_names": []},
             "denylist_blocked",
-        ),
-        (
-            {
-                "discoverable_tool_names": ["file_write"],
-                "permission_policy": {"require_approval_for_file_write": True},
-            },
-            "approval_required",
         ),
     ],
 )
@@ -962,29 +1137,47 @@ def test_activation_denial_re_evaluates_after_workspace_fix() -> None:
     assert view.get("file_write") is not None
 
 @pytest.mark.parametrize(
-    ("tool_name", "tool_factory", "approval_kind"),
+    ("tool_name", "tool_factory", "approval_kind", "arguments"),
     [
         (
             "file_write",
             lambda workspace: FileWriteTool(workspace_dir=workspace, require_approval=False),
             "file_write",
+            {"path": "approval.txt", "content": "new content"},
         ),
         (
             "file_edit",
             lambda workspace: FileEditTool(workspace_dir=workspace, require_approval=False),
             "file_edit",
+            {
+                "path": "approval.txt",
+                "old_string": "old content",
+                "new_string": "new content",
+            },
         ),
         (
             "apply_patch",
             lambda workspace: ApplyPatchTool(workspace_dir=workspace, require_approval=False),
             "apply_patch",
+            {
+                "patch": "\n".join(
+                    [
+                        "*** Begin Patch",
+                        "*** Add File: approval.txt",
+                        "+new content",
+                        "*** End Patch",
+                    ]
+                )
+            },
         ),
     ],
 )
-def test_activation_approval_kind_matches_tool(
+@pytest.mark.asyncio
+async def test_activation_defers_tool_specific_approval_to_call(
     tool_name: str,
     tool_factory: Any,
     approval_kind: str,
+    arguments: dict[str, str],
 ) -> None:
     workspace = _make_tool_activation_workspace()
     registry = ToolRegistry(discover_builtin=False)
@@ -996,12 +1189,25 @@ def test_activation_approval_kind_matches_tool(
         permission_policy={"require_approval_for_file_write": True},
     )
 
-    result = view.request_tool_activation(tool_name, context=context)
+    if tool_name == "file_edit":
+        (workspace / "approval.txt").write_text("old content", encoding="utf-8")
+        read_result = await FileReadTool(workspace_dir=workspace).execute(
+            path="approval.txt",
+            context=context,
+        )
+        assert read_result.error is None
 
-    assert result.error is not None
-    assert result.metadata["error_type"] == "tool_activation_denied"
-    assert result.metadata["approval_kind"] == approval_kind
-    assert result.metadata["runtime_category"] == "tool_activation"
+    activation = view.request_tool_activation(tool_name, context=context)
+    call_result = await view.execute(tool_name, arguments, context=context)
+
+    assert activation.error is None
+    assert activation.metadata["status"] == "tool_activated"
+    assert activation.metadata["activation_authorizes_tool_call"] is False
+    assert activation.metadata["authorization_required_for_call"] is True
+    assert activation.metadata["authorization_state"] == "deferred_to_tool_call"
+    assert call_result.error is not None
+    assert call_result.metadata["requires_approval"] is True
+    assert call_result.metadata["approval_kind"] == approval_kind
 
 def test_activation_denial_isolated_between_registry_views() -> None:
     workspace = _make_tool_activation_workspace()
@@ -1009,7 +1215,10 @@ def test_activation_denial_isolated_between_registry_views() -> None:
     registry.register(FileWriteTool(workspace_dir=workspace, require_approval=False))
     denied_view = registry.create_view([], tool_search_catalog_names=["file_read"])
     allowed_view = registry.create_view([], tool_search_catalog_names=["file_write"])
-    context = _tool_activation_context(workspace=workspace, discoverable_tool_names=[])
+    context = _tool_activation_context(
+        workspace=workspace,
+        discoverable_tool_names=["file_write"],
+    )
 
     denied = denied_view.request_tool_activation("file_write", context=context)
     promoted = allowed_view.request_tool_activation("file_write", context=context)

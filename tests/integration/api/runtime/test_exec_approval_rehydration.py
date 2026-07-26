@@ -416,11 +416,17 @@ def test_task_exec_approval_result_stays_visible_after_runtime_restart(tmp_path:
     ("result", "expected"),
     [
         ({"status": "completed"}, True),
+        ({"status": "completed", "exit_code": 0}, True),
+        ({"status": "completed", "exit_code": 3}, False),
+        ({"status": "completed", "timed_out": True}, False),
         ({"status": "running", "background": True, "session_id": "exec-1"}, True),
+        ({"status": "running", "background": True, "session_id": " "}, False),
         ({"status": "running", "background": False, "session_id": "exec-1"}, False),
         ({"status": "failed"}, False),
         ({"status": "timed_out"}, False),
         ({"status": "killed"}, False),
+        ({"status": "cancelled"}, False),
+        ({"status": "execution_failed"}, False),
     ],
 )
 def test_exec_approval_success_classification_is_explicit(
@@ -536,6 +542,89 @@ def test_runtime_service_marks_failed_task_linked_exec_execution_failed(
         assert task["final_answer"] is None
 
     asyncio.run(scenario())
+
+
+def test_runtime_service_marks_completed_nonzero_task_linked_exec_execution_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        runtime_store = RuntimeStore(tmp_path / "runtime.db")
+        await runtime_store.initialize()
+        await runtime_store.create_task_run(
+            task_id="completed-nonzero-linked-task",
+            input_text="run a command that exits nonzero",
+            session_id=None,
+            project_id=None,
+            workspace_dir=str(tmp_path),
+            project_workspace_dir=None,
+            task_workspace_dir=None,
+            inference_overrides={},
+        )
+        approvals = InMemoryApprovalStore()
+        approvals.create(
+            approval_id="exec-approval-completed-nonzero-linked",
+            command="exit 3",
+            shell="test",
+            scope="dangerous_command",
+            command_payload={
+                "command": "exit 3",
+                "shell": "test",
+                "workdir": str(tmp_path),
+                "env": None,
+                "timeout_sec": 5.0,
+                "background": False,
+                "tty": False,
+                "approval_state": "approved",
+            },
+        )
+        await runtime_store.create_approval_request(
+            approval_id="task-approval-completed-nonzero-linked",
+            task_id="completed-nonzero-linked-task",
+            call_id="call-completed-nonzero-linked",
+            tool_name="exec_command",
+            arguments={"command": "exit 3", "shell": "test"},
+            metadata={"approval_id": "exec-approval-completed-nonzero-linked"},
+        )
+        service = RuntimeService(
+            engine=_RuntimeFakeEngine(),
+            store=runtime_store,
+            exec_approval_store=approvals,
+            exec_runtime=ExecRuntime(
+                providers={"test": _ApiRuntimePythonDirectProvider()},
+                default_shell="test",
+            ),
+        )
+
+        async def completed_nonzero_exec(*_: object, **__: object) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "exit_code": 3,
+                "timed_out": False,
+                "background": False,
+                "stderr": "command exited with code 3",
+            }
+
+        monkeypatch.setattr(service, "_execute_approved_exec_request", completed_nonzero_exec)
+        resolved = await service.resolve_approval(
+            "task-approval-completed-nonzero-linked",
+            decision="approve_once",
+        )
+        assert resolved is not None
+        assert resolved["status"] == "execution_failed"
+        linked = approvals.get("exec-approval-completed-nonzero-linked")
+        assert linked is not None
+        assert linked.status == "execution_failed"
+        assert linked.execution_result is not None
+        assert linked.execution_result["status"] == "completed"
+        assert linked.execution_result["exit_code"] == 3
+        task = await runtime_store.get_task_run("completed-nonzero-linked-task")
+        assert task is not None
+        assert task["status"] == "failed"
+        assert task["final_answer"] == "command exited with code 3"
+
+    asyncio.run(scenario())
+
 
 def test_runtime_service_rejects_tampered_standalone_exec_binding_before_execution(
     tmp_path: Path,

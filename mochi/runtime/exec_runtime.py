@@ -310,6 +310,17 @@ class ExecRuntime:
 
         return await self._collect_session_output(session)
 
+    async def inspect_session(self, session_id: str) -> SessionPollResult | None:
+        """Return session state without consuming its incremental output buffers."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        await self._refresh_session_state(session)
+        if session.wait_task is not None and session.wait_task.done():
+            await self._refresh_session_state(session)
+        async with session.lock:
+            return self._build_poll_result(session, stdout="", stderr="")
+
     async def write_stdin(
         self,
         session_id: str,

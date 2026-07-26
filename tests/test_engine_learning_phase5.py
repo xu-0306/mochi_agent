@@ -33,6 +33,10 @@ class _LearningBackend(BaseLLMBackend):
         **_: object,
     ) -> GenerationResult | AsyncIterator[StreamChunk] | str:
         del tools, temperature, max_tokens, stream
+        if messages and messages[0].content.startswith(
+            "You are Mochi's internal tool-intent classifier"
+        ):
+            return GenerationResult(content="{}")
         if messages and messages[0].content.startswith("Extract one reusable skill"):
             self.extraction_calls += 1
             return """
@@ -91,6 +95,10 @@ class _MultiToolLearningBackend(BaseLLMBackend):
         **_: object,
     ) -> GenerationResult | str:
         del tools, temperature, max_tokens, stream
+        if messages and messages[0].content.startswith(
+            "You are Mochi's internal tool-intent classifier"
+        ):
+            return GenerationResult(content="{}")
         if messages and messages[0].content.startswith("Extract one reusable skill"):
             self.extraction_calls += 1
             return """
@@ -223,6 +231,17 @@ class _FakeTool(BaseTool):
     @property
     def parameters_schema(self) -> dict:
         return {"type": "object", "properties": {"query": {"type": "string"}}}
+
+    @property
+    def tool_capabilities(self) -> dict[str, object]:
+        return {
+            "domains": ["workspace"],
+            "retrieval_modes": [],
+            "preference_tags": ["read_only"],
+            "read_only": True,
+            "destructive": False,
+            "open_world": False,
+        }
 
     async def execute(self, **kwargs) -> ToolResult:  # noqa: ANN003
         return ToolResult(output=f"observed:{kwargs.get('query', '')}")

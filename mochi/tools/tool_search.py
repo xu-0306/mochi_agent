@@ -151,6 +151,11 @@ class ToolSearchTool(BaseTool):
     @staticmethod
     def _tool_payload(tool: BaseTool, *, callable_names: set[str]) -> dict[str, Any]:
         callable_this_turn = tool.name in callable_names
+        activation_request = ToolSearchTool._activation_request_for_tool(
+            tool,
+            callable_this_turn=callable_this_turn,
+            activation_broker_callable="tool_activate" in callable_names,
+        )
         payload = {
             "name": tool.name,
             "description": tool.description,
@@ -164,13 +169,16 @@ class ToolSearchTool(BaseTool):
             "activation_reason": (
                 None
                 if callable_this_turn
-                else "Tool is discoverable but not exposed as callable in this turn."
+                else (
+                    "Tool is discoverable but not exposed as callable in this turn. "
+                    "Call tool_activate with this tool name to request policy-gated "
+                    "activation."
+                    if activation_request is not None
+                    and activation_request.get("activation_tool") == "tool_activate"
+                    else "Tool is discoverable but not exposed as callable in this turn."
+                )
             ),
         }
-        activation_request = ToolSearchTool._activation_request_for_tool(
-            tool,
-            callable_this_turn=callable_this_turn,
-        )
         if activation_request is not None:
             payload["activation_request"] = activation_request
         return payload
@@ -180,14 +188,22 @@ class ToolSearchTool(BaseTool):
         tool: BaseTool,
         *,
         callable_this_turn: bool,
-    ) -> dict[str, str] | None:
-        if callable_this_turn or tool.is_read_only:
+        activation_broker_callable: bool = False,
+    ) -> dict[str, Any] | None:
+        if callable_this_turn:
             return None
 
+        request: dict[str, Any] = {
+            "tool_name": tool.name,
+            "policy_check": "required",
+        }
         if tool.name in {"file_write", "file_edit", "apply_patch"}:
-            return {
-                "tool_name": tool.name,
-                "required_intent": "workspace_write",
-                "policy_check": "required",
-            }
-        return None
+            request["required_intent"] = "workspace_write"
+        if activation_broker_callable:
+            request.update(
+                {
+                    "activation_tool": "tool_activate",
+                    "arguments": {"tool_name": tool.name},
+                }
+            )
+        return request

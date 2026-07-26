@@ -56,8 +56,8 @@ interface ChatInputProps {
   uploadTargetDir?: string
   queuedAttachments?: ChatAttachment[]
   queuedAttachmentsKey?: string
-  onSend: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[] }) => void
-  onSubmitEdit?: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[] }) => void
+  onSend: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[]; expectedPolicyVersion?: string }) => void
+  onSubmitEdit?: (text: string, options?: { selectedSkillIds?: string[]; attachments?: ChatAttachment[]; expectedPolicyVersion?: string }) => void
   onCancelEdit?: () => void
   onStop?: () => void
   onVoice?: () => void
@@ -745,6 +745,8 @@ export function ChatInput({
     submit(trimmed, {
       selectedSkillIds: selectedSkills.map((skill) => skill.id),
       attachments: attachedFiles,
+      expectedPolicyVersion:
+        contextSnapshot?.tool_workflow.effectivePolicy.policyVersion ?? undefined,
     })
     setValue('')
     setSelectedSkills([])
@@ -1090,6 +1092,27 @@ export function ChatInput({
                               {formatTokenCount(contextSnapshot.context_length)}
                             </p>
                           </div>
+                        </div>
+
+                        <div className="border-y border-border/70 py-2 text-xs">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-muted-foreground">Runtime policy</span>
+                            <span className="font-medium text-foreground">
+                              {contextSnapshot.tool_workflow.effectivePolicy.autonomyMode.replaceAll('_', ' ')}
+                            </span>
+                          </div>
+                          <div className="mt-1 flex items-center justify-between gap-3 text-[11px]">
+                            <span className="text-muted-foreground">Source</span>
+                            <span className="max-w-[190px] truncate text-foreground/90">
+                              {contextSnapshot.tool_workflow.effectivePolicy.sourceChain.join(' -> ') || 'server default'}
+                            </span>
+                          </div>
+                          <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+                            {contextSnapshot.tool_workflow.effectivePolicy.policyVersion ?? 'Policy version unavailable'}
+                          </p>
+                          <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
+                            Auto Review evaluates concrete calls. It does not expose or activate tools.
+                          </p>
                         </div>
 
                         <div className="space-y-1.5 text-[11px]">

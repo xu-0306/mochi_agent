@@ -22,6 +22,7 @@ function resolveApiOrigin() {
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  distDir: process.env.MOCHI_NEXT_DIST_DIR || '.next',
   async rewrites() {
     const apiOrigin = resolveApiOrigin()
     if (!apiOrigin) {

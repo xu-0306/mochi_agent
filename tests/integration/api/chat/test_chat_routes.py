@@ -27,6 +27,13 @@ def test_chat_route_returns_bounded_response_with_serialized_events() -> None:
     assert response.status_code == 200
     assert engine.chat_calls == [("現在幾點？", "session-42")]
     payload = response.json()
+    workflow = payload.pop("tool_workflow")
+    assert workflow["effective_policy"]["review_semantics"] == "concrete_call_only"
+    assert workflow["tool_inventory"]["catalog_scope"] == "policy_eligible"
+    assert workflow["activation"]["status"] == "not_observed"
+    assert workflow["call_review"]["calls"][0]["auto_review_decision"] == "not_observed"
+    assert workflow["execution"]["calls"][0]["status"] == "completed"
+    assert workflow["execution"]["calls"][0]["verification_status"] == "not_observed"
     assert payload["turn_id"]
     payload["turn_id"] = "turn-id"
     assert payload == {

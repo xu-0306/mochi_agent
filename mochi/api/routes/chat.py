@@ -36,8 +36,18 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.api.session_store_binding import resolve_route_session_store
+from mochi.api.tool_workflow_outbox import (
+    ToolWorkflowOutboxError,
+    ToolWorkflowOutboxRepository,
+)
+from mochi.security.policy import EffectivePolicyResolver
 from mochi.sessions.store import SessionStore
 from mochi.utils.streaming import sse_stream
+
+from mochi.api.tool_workflow_observability import (
+    build_tool_workflow_observability,
+)
 
 router = APIRouter(prefix="/v1")
 
@@ -66,6 +76,7 @@ class ChatRequest(BaseModel):
     reasoning_effort: ReasoningEffort | None = None
     selected_skill_ids: list[str] | None = None
     attachments: list[AttachmentPayload] | None = None
+    expected_policy_version: str | None = Field(default=None, min_length=1)
 
 
 class ChatResponse(BaseModel):
@@ -77,6 +88,8 @@ class ChatResponse(BaseModel):
     final_answer: str
     trajectory_id: str | None = None
     events: list[dict[str, Any]]
+    tool_workflow: dict[str, Any]
+    tool_workflow_aggregate: dict[str, Any] | None = None
 
 
 class ChatContextResponse(BaseModel):
@@ -105,6 +118,7 @@ class ChatContextResponse(BaseModel):
     recent_raw_tokens: int = 0
     approximate: bool = True
     reasoning_effort: ReasoningEffort | None = None
+    tool_workflow: dict[str, Any]
 
 
 class ChatCancelRequest(BaseModel):
@@ -120,7 +134,7 @@ class ChatCancelResponse(BaseModel):
     cancel_reason: str | None = None
 
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post("/chat", response_model=ChatResponse, response_model_exclude_none=True)
 async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     """執行 bounded 單輪文字對話並回傳完整事件列表。"""
     if payload.model:
@@ -130,6 +144,10 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     engine = await _get_or_create_chat_engine(request)
     await _ensure_runtime_delegate(request)
     session_id = payload.session_id or str(uuid4())
+    permission_policy = await _resolve_chat_effective_permission_policy(
+        request,
+        session_id,
+    )
     resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
         request,
         payload,
@@ -148,6 +166,7 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         attachments=_resolve_chat_attachments(payload),
         turn_id=turn_id,
         tool_mode=payload.tool_mode,
+        permission_policy=permission_policy,
     )
     events, final_answer, trajectory_id = await _collect_chat_result(stream)
     subagent_events = _synthesize_subagent_events(events)
@@ -163,6 +182,13 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             turn_id=response_turn_id,
             events=subagent_events,
         )
+    aggregate_snapshot = await _get_chat_tool_workflow_snapshot(
+        request,
+        session_id=session_id,
+        turn_id=response_turn_id,
+    )
+    if aggregate_snapshot.get("aggregate") is None:
+        aggregate_snapshot = None
 
     return ChatResponse(
         session_id=session_id,
@@ -170,6 +196,12 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         final_answer=final_answer,
         trajectory_id=trajectory_id,
         events=events,
+        tool_workflow=build_tool_workflow_observability(
+            events=events,
+            effective_policy=permission_policy,
+            expected_policy_version=payload.expected_policy_version,
+        ),
+        tool_workflow_aggregate=aggregate_snapshot,
     )
 
 
@@ -183,25 +215,38 @@ async def chat_context(request: Request, payload: ChatRequest) -> ChatContextRes
     engine = await _get_or_create_chat_engine(request)
     await _ensure_runtime_delegate(request)
     session_id = payload.session_id or "draft-session"
+    permission_policy = await _resolve_chat_effective_permission_policy(
+        request,
+        session_id,
+    )
     resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
         request,
         payload,
         session_id,
     )
 
-    preview = await _maybe_await_result(
-        engine.preview_chat_context(
-            payload.message,
-            session_id=session_id,
-            inference_overrides=_build_inference_overrides(payload),
-            project_id=resolved_project_id,
-            workspace_dir=resolved_workspace_dir,
-            selected_skill_ids=payload.selected_skill_ids,
-            attachments=_resolve_chat_attachments(payload),
-        )
+    preview = await _start_engine_chat_context_preview(
+        engine,
+        message=payload.message,
+        session_id=session_id,
+        inference_overrides=_build_inference_overrides(payload),
+        project_id=resolved_project_id,
+        workspace_dir=resolved_workspace_dir,
+        selected_skill_ids=payload.selected_skill_ids,
+        attachments=_resolve_chat_attachments(payload),
+        permission_policy=permission_policy,
     )
     if isinstance(preview, dict):
-        return ChatContextResponse.model_validate(preview)
+        return ChatContextResponse.model_validate(
+            {
+                **preview,
+                "tool_workflow": build_tool_workflow_observability(
+                    events=(),
+                    effective_policy=permission_policy,
+                    expected_policy_version=payload.expected_policy_version,
+                ),
+            }
+        )
     raise HTTPException(status_code=500, detail="Engine did not return a chat context snapshot.")
 
 
@@ -215,6 +260,10 @@ async def chat_stream(request: Request, payload: ChatRequest) -> StreamingRespon
     engine = await _get_or_create_chat_engine(request)
     await _ensure_runtime_delegate(request)
     session_id = payload.session_id or str(uuid4())
+    permission_policy = await _resolve_chat_effective_permission_policy(
+        request,
+        session_id,
+    )
     resolved_project_id, resolved_workspace_dir = await _resolve_chat_project_context(
         request,
         payload,
@@ -233,6 +282,7 @@ async def chat_stream(request: Request, payload: ChatRequest) -> StreamingRespon
         attachments=_resolve_chat_attachments(payload),
         turn_id=turn_id,
         tool_mode=payload.tool_mode,
+        permission_policy=permission_policy,
     )
     headers = {
         "Cache-Control": "no-cache",
@@ -302,6 +352,7 @@ async def _stream_chat_events(
     stream_task: asyncio.Task[Any] | None = None
     live_task: asyncio.Task[Any] | None = None
     live_subscription: Any | None = None
+    aggregate_seq = 0
 
     from mochi.api.routes.approvals import _get_runtime_service
 
@@ -351,6 +402,21 @@ async def _stream_chat_events(
                 delegated_task_ids.add(task_id)
             events.append(serialized)
             yield serialized
+            for snapshot in await _get_chat_tool_workflow_updates(
+                request,
+                session_id=session_id,
+                turn_id=fallback_turn_id,
+                after_seq=aggregate_seq,
+            ):
+                aggregate = snapshot.get("aggregate")
+                if not isinstance(aggregate, dict):
+                    continue
+                aggregate_seq = max(aggregate_seq, int(aggregate["seq"]))
+                yield {
+                    "_sse_event": "tool_workflow_aggregate",
+                    "_sse_id": aggregate["event_id"],
+                    "_sse_data": snapshot,
+                }
             synthesized = _synthesize_incremental_subagent_events(
                 serialized,
                 pending_requests=pending_subagent_requests,
@@ -408,6 +474,21 @@ async def _stream_chat_events(
                 turn_id=fallback_turn_id,
                 events=events,
             )
+            for snapshot in await _get_chat_tool_workflow_updates(
+                request,
+                session_id=session_id,
+                turn_id=fallback_turn_id,
+                after_seq=aggregate_seq,
+            ):
+                aggregate = snapshot.get("aggregate")
+                if not isinstance(aggregate, dict):
+                    continue
+                aggregate_seq = max(aggregate_seq, int(aggregate["seq"]))
+                yield {
+                    "_sse_event": "tool_workflow_aggregate",
+                    "_sse_id": aggregate["event_id"],
+                    "_sse_data": snapshot,
+                }
 
 
 async def _drain_live_subagent_events(
@@ -851,14 +932,73 @@ def _should_persist_fallback_events(
 
 async def _get_session_store(request: Request) -> SessionStore:
     """取得 chat route 可共用的 SessionStore。"""
-    existing = getattr(request.app.state, "session_store", None)
-    if isinstance(existing, SessionStore):
-        return existing
+    config = await _get_chat_config(request)
+    return resolve_route_session_store(request.app, config)
+
+
+async def _get_chat_tool_workflow_snapshot(
+    request: Request,
+    *,
+    session_id: str,
+    turn_id: str,
+) -> dict[str, Any]:
+    """Read the latest durable aggregate without making it chat authority."""
 
     config = await _get_chat_config(request)
-    store = SessionStore(config.sessions_dir)
-    request.app.state.session_store = store
-    return store
+    store = await _get_session_store(request)
+    engine = getattr(request.app.state, "engine", None)
+    outbox = getattr(engine, "_tool_workflow_outbox", None)
+    if not (
+        isinstance(outbox, ToolWorkflowOutboxRepository)
+        and getattr(outbox, "_session_store", None) is store
+    ):
+        outbox = ToolWorkflowOutboxRepository(
+            store,
+            enabled=bool(config.agent.tool_observability_v1),
+            publication_gate=getattr(engine, "tool_workflow_publication_gate", None),
+        )
+    try:
+        records = list(await outbox.list(session_id, turn_id=turn_id))
+    except ToolWorkflowOutboxError as exc:
+        return {
+            "storage_id": store.storage_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "aggregate": None,
+            "publication_enabled": outbox.enabled,
+            "authoritative": False,
+            "unsupported": True,
+            "error": type(exc).__name__,
+        }
+    records.sort(key=lambda record: int(record["seq"]))
+    return {
+        "storage_id": store.storage_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "aggregate": records[-1] if records else None,
+        "publication_enabled": outbox.enabled,
+        "authoritative": outbox.enabled,
+    }
+
+
+async def _get_chat_tool_workflow_updates(
+    request: Request,
+    *,
+    session_id: str,
+    turn_id: str,
+    after_seq: int,
+) -> list[dict[str, Any]]:
+    snapshot = await _get_chat_tool_workflow_snapshot(
+        request,
+        session_id=session_id,
+        turn_id=turn_id,
+    )
+    if not snapshot.get("authoritative"):
+        return []
+    aggregate = snapshot.get("aggregate")
+    if not isinstance(aggregate, dict) or int(aggregate.get("seq", 0)) <= after_seq:
+        return []
+    return [snapshot]
 
 
 async def _ensure_runtime_delegate(request: Request) -> None:
@@ -879,6 +1019,7 @@ async def _start_engine_chat(
     attachments: list[AttachmentRef],
     turn_id: str,
     tool_mode: ToolMode,
+    permission_policy: dict[str, Any],
 ) -> AsyncIterator[Any]:
     chat_callable = getattr(engine, "chat")
     kwargs: dict[str, Any] = {
@@ -898,7 +1039,57 @@ async def _start_engine_chat(
         kwargs["tool_mode"] = tool_mode
     if signature is None or "turn_id" in signature.parameters:
         kwargs["turn_id"] = turn_id
+    if signature is None or "permission_policy" in signature.parameters:
+        kwargs["permission_policy"] = permission_policy
     return await _maybe_await_result(chat_callable(**kwargs))
+
+
+async def _start_engine_chat_context_preview(
+    engine: Any,
+    *,
+    message: str,
+    session_id: str,
+    inference_overrides: dict[str, Any] | None,
+    project_id: str | None,
+    workspace_dir: str,
+    selected_skill_ids: list[str] | None,
+    attachments: list[AttachmentRef],
+    permission_policy: dict[str, Any],
+) -> Any:
+    preview_callable = getattr(engine, "preview_chat_context")
+    kwargs: dict[str, Any] = {
+        "message": message,
+        "session_id": session_id,
+        "inference_overrides": inference_overrides,
+        "project_id": project_id,
+        "workspace_dir": workspace_dir,
+        "selected_skill_ids": selected_skill_ids,
+        "attachments": attachments,
+    }
+    try:
+        signature = inspect.signature(preview_callable)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is None or "permission_policy" in signature.parameters:
+        kwargs["permission_policy"] = permission_policy
+    return await _maybe_await_result(preview_callable(**kwargs))
+
+
+async def _resolve_chat_effective_permission_policy(
+    request: Request,
+    session_id: str,
+) -> dict[str, Any]:
+    """Resolve the server-owned policy snapshot for one ordinary chat request."""
+    from mochi.api.routes.sessions import _session_security_override
+
+    config = await _get_chat_config(request)
+    store = await _get_session_store(request)
+    events = await store.load_session(session_id)
+    session_override = _session_security_override(events)
+    return EffectivePolicyResolver().resolve(
+        config.security,
+        session_overrides=session_override,
+    ).to_dict()
 
 
 async def _resolve_chat_project_context(

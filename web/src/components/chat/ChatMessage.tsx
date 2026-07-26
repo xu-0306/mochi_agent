@@ -265,6 +265,8 @@ export function ChatMessage({
         >
           <ReasoningPanel
             steps={reasoningSteps ?? []}
+            sessionId={sessionId}
+            turnId={message.turnId}
             isStreaming={isStreaming}
             tokenStats={message.tokenStats}
             onUndoFileChange={onUndoFileChange}

@@ -23,6 +23,10 @@ from pydantic import BaseModel, Field
 
 from mochi.voice.capabilities import get_voice_capabilities
 from mochi.voice.ws_bridge import VoiceWebSocketBridge
+from mochi.sessions.store import (
+    SessionsDirectoryRestartRequired,
+    ensure_sessions_dir_unchanged,
+)
 
 
 def create_app() -> FastAPI:
@@ -69,6 +73,7 @@ def create_app() -> FastAPI:
     app.state.config = None
     app.state.config_path = None
     app.state.config_revision = None
+    app.state.config_reload_status = {"status": "applied"}
     app.state.engine = None
     app.state.engine_factory = None
     app.state.config_factory = None
@@ -522,6 +527,33 @@ def _current_config_revision() -> str | None:
     return _CONFIG_REVISION_CONTEXT.get()
 
 
+def _allow_external_config_reload(
+    app: FastAPI,
+    current: Any,
+    candidate: Any,
+    *,
+    candidate_revision: str,
+    known_revision: str | None,
+) -> bool:
+    """Keep live config stable when an external reload changes sessions_dir."""
+
+    try:
+        ensure_sessions_dir_unchanged(current.sessions_dir, candidate.sessions_dir)
+    except SessionsDirectoryRestartRequired as exc:
+        app.state.config_reload_status = {
+            "status": "pending_restart",
+            "code": exc.code,
+            "pending_revision": candidate_revision,
+            "pending_sessions_dir": str(candidate.sessions_dir),
+        }
+        _CONFIG_REVISION_CONTEXT.set(
+            known_revision if isinstance(known_revision, str) else None
+        )
+        return False
+    app.state.config_reload_status = {"status": "applied"}
+    return True
+
+
 async def _get_config(app: FastAPI) -> Any:
     """取得 API status endpoint 使用的設定物件。"""
     existing = cast(Any | None, getattr(app.state, "config", None))
@@ -534,12 +566,28 @@ async def _get_config(app: FastAPI) -> Any:
             known_revision = getattr(app.state, "config_revision", None)
             if not isinstance(known_revision, str) and Path(config_path).expanduser().exists():
                 snapshot = load_config_snapshot(config_path)
+                if not _allow_external_config_reload(
+                    app,
+                    existing,
+                    snapshot.config,
+                    candidate_revision=snapshot.revision,
+                    known_revision=known_revision,
+                ):
+                    return existing
                 app.state.config = snapshot.config
                 app.state.config_revision = snapshot.revision
                 _CONFIG_REVISION_CONTEXT.set(snapshot.revision)
                 return snapshot.config
             if isinstance(known_revision, str) and known_revision != current_revision:
                 snapshot = load_config_snapshot(config_path)
+                if not _allow_external_config_reload(
+                    app,
+                    existing,
+                    snapshot.config,
+                    candidate_revision=snapshot.revision,
+                    known_revision=known_revision,
+                ):
+                    return existing
                 app.state.config = snapshot.config
                 app.state.config_revision = snapshot.revision
                 _CONFIG_REVISION_CONTEXT.set(snapshot.revision)

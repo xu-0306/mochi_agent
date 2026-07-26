@@ -21,6 +21,609 @@ from tests.unit.engine._support import (
 
 
 @pytest.mark.asyncio
+async def test_react_loop_stops_at_a_durable_approval_interrupt() -> None:
+    from mochi.agents.events import ToolCallCompletedEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+    from mochi.backends.types import ToolCall
+    from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+
+    class _ApprovalTool(BaseTool):
+        @property
+        def name(self) -> str:
+            return "file_write"
+
+        @property
+        def description(self) -> str:
+            return "Creates a durable approval request."
+
+        @property
+        def parameters_schema(self) -> dict:
+            return {"type": "object", "properties": {}, "additionalProperties": False}
+
+        async def execute(self, **_: object) -> ToolResult:
+            return ToolResult(
+                error="File write requires approval.",
+                metadata={
+                    "status": "approval_pending",
+                    "approval_id": "tool-approval-1",
+                    "operation_id": "file-operation-1",
+                    "arguments_digest": "digest-1",
+                },
+            )
+
+    class _Backend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            return GenerationResult(
+                content="",
+                tool_calls=[ToolCall(id="call-1", name="file_write", arguments={})],
+                finish_reason="tool_calls",
+            )
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(_ApprovalTool())
+    context = ToolExecutionContext(
+        workspace_dir=".",
+        state={
+            "ordinary_chat_approval_context": {
+                "source": "ordinary_chat",
+                "resume_cursor": {"turn_id": "turn-1"},
+            }
+        },
+    )
+    backend = _Backend()
+    loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        tool_execution_context=context,
+        max_iterations=3,
+    )
+
+    events = [event async for event in loop.run("system", [], "write a file")]
+
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+    assert len(results) == 1
+    assert results[0].metadata["approval_id"] == "tool-approval-1"
+    assert len(finals) == 1
+    assert finals[0].finish_reason == "approval_required"
+    assert finals[0].metadata["approval_id"] == "tool-approval-1"
+    assert len(backend.calls) == 1
+    assert context.state["ordinary_chat_approval_context"]["resume_cursor"] == {
+        "turn_id": "turn-1",
+        "tool_call_id": "call-1",
+        "tool_name": "file_write",
+    }
+    continuation = context.state["ordinary_chat_approval_context"]["react_continuation"]
+    assert continuation["callable_tool_names"] == ["file_write"]
+    assert [message["role"] for message in continuation["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_loop_continues_from_the_original_approval_transcript() -> None:
+    from mochi.agents.events import ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+    from mochi.backends.types import ToolCall
+    from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+
+    class _ApprovalTool(BaseTool):
+        @property
+        def name(self) -> str:
+            return "file_write"
+
+        @property
+        def description(self) -> str:
+            return "Creates a durable approval request."
+
+        @property
+        def parameters_schema(self) -> dict:
+            return {"type": "object", "properties": {}, "additionalProperties": False}
+
+        async def execute(self, **_: object) -> ToolResult:
+            return ToolResult(
+                error="File write requires approval.",
+                metadata={"status": "approval_pending", "approval_id": "tool-approval-1"},
+            )
+
+    class _Backend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(
+                    content="",
+                    tool_calls=[ToolCall(id="call-1", name="file_write", arguments={})],
+                    finish_reason="tool_calls",
+                )
+            assert messages[-1].role == "tool"
+            assert messages[-1].tool_call_id == "call-1"
+            assert messages[-1].name == "file_write"
+            assert any(
+                message.role == "assistant" and message.tool_calls[0].id == "call-1"
+                for message in messages
+            )
+            return GenerationResult(content="Saved report.md", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(_ApprovalTool())
+    context = ToolExecutionContext(
+        workspace_dir=".",
+        state={
+            "ordinary_chat_approval_context": {
+                "source": "ordinary_chat",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "resume_cursor": {"turn_id": "turn-1"},
+            }
+        },
+    )
+    backend = _Backend()
+    initial_loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        tool_execution_context=context,
+        max_iterations=3,
+    )
+    _ = [event async for event in initial_loop.run("system", [], "write a file")]
+    approval_context = context.state["ordinary_chat_approval_context"]
+    checkpoint = {
+        "source": "ordinary_chat",
+        "tool_name": "file_write",
+        "resume_cursor": dict(approval_context["resume_cursor"]),
+        "react_continuation": approval_context["react_continuation"],
+    }
+
+    resumed_loop = AsyncReActLoop(
+        backend=backend,
+        tool_registry=registry,
+        tool_execution_context=context,
+        max_iterations=3,
+    )
+    events = [
+        event
+        async for event in resumed_loop.resume_from_ordinary_chat_approval(
+            checkpoint=checkpoint,
+            tool_result=ToolResult(output={"path": "report.md"}, metadata={"status": "completed"}),
+        )
+    ]
+
+    results = [event for event in events if isinstance(event, ToolCallResultEvent)]
+    finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
+    assert len(backend.calls) == 2
+    assert len(results) == 1
+    assert results[0].metadata["approval_continuation"] is True
+    assert len(finals) == 1
+    assert finals[0].content == "Saved report.md"
+    assert [message.role for message in resumed_loop.turn_messages] == ["tool", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_react_loop_marks_each_observed_tool_execution_with_an_operation_id() -> None:
+    from mochi.agents.events import ToolCallCompletedEvent, ToolCallResultEvent
+    from mochi.agents.react_loop import AsyncReActLoop
+    from mochi.backends.types import ToolCall
+    from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
+    from mochi.tools.registry import ToolRegistry
+
+    class _ExecTool(BaseTool):
+        @property
+        def name(self) -> str:
+            return "exec_command"
+
+        @property
+        def description(self) -> str:
+            return "Test-only command runner."
+
+        @property
+        def parameters_schema(self) -> dict:
+            return {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": False,
+            }
+
+        async def execute(self, **_: object) -> ToolResult:
+            return ToolResult(
+                output={"exit_code": 0},
+                metadata={"status": "completed"},
+            )
+
+    class _Backend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return GenerationResult(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="exec-call-1",
+                            name="exec_command",
+                            arguments={"command": "pytest -q"},
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return GenerationResult(content="tests completed", finish_reason="stop")
+
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(_ExecTool())
+    events = [
+        event
+        async for event in AsyncReActLoop(
+            backend=_Backend(),
+            tool_registry=registry,
+            tool_execution_context=ToolExecutionContext(workspace_dir="."),
+            max_iterations=3,
+        ).run("system", [], "run tests")
+    ]
+
+    result = next(event for event in events if isinstance(event, ToolCallResultEvent))
+    assert result.metadata["execution_observed"] is True
+    assert str(result.metadata["operation_id"]).startswith("tool-execution-")
+    assert events.index(result) < next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, ToolCallCompletedEvent)
+        and event.call_id == result.call_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_engine_binds_normal_turn_validation_evidence_before_completion(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from mochi.agents.engine import AgentEngine
+    from mochi.agents.events import ToolCallRequestEvent, ToolCallResultEvent
+    from mochi.agents.turn_intent_contract import ActiveTaskState, DeliverableContract
+    from mochi.config.schema import MochiConfig
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    target = tmp_path / "report.md"
+    target.write_text("# Report\n", encoding="utf-8")
+    active_task = ActiveTaskState(
+        goal_id="goal-normal-evidence",
+        objective="write and test report",
+        operations=frozenset({"workspace_write", "execution"}),
+        mutation_requirement="required",
+        deliverables=(
+            DeliverableContract(
+                kind="workspace_artifact",
+                target_hint="report.md",
+                required=True,
+                acceptance_criteria=(
+                    "contains:Report",
+                    {
+                        "schema_version": 1,
+                        "kind": "tool_execution",
+                        "check": "test",
+                        "profile_id": "pytest",
+                        "tool_name": "exec_command",
+                    },
+                ),
+                source_turn_ids=("turn-normal-evidence",),
+            ),
+        ),
+        source_turn_ids=("turn-normal-evidence",),
+        updated_turn_id="turn-normal-evidence",
+    )
+    saved = await engine._conversation_state_repository.save(  # noqa: SLF001
+        "session-normal-evidence",
+        active_task=active_task,
+        expected_revision=0,
+    )
+    assert saved.status == "saved"
+    state = await engine._conversation_state_repository.load(  # noqa: SLF001
+        "session-normal-evidence"
+    )
+    mutation_request = ToolCallRequestEvent(
+        call_id="write-call",
+        tool_name="file_write",
+        arguments={"path": "report.md", "content": "# Report\n"},
+    )
+    mutation_result = ToolCallResultEvent(
+        call_id="write-call",
+        tool_name="file_write",
+        metadata={"resolved_path": str(target)},
+    )
+    test_request = ToolCallRequestEvent(
+        call_id="pytest-call",
+        tool_name="exec_command",
+        arguments={"command": "pytest -q", "shell": "powershell"},
+    )
+    test_result = ToolCallResultEvent(
+        call_id="pytest-call",
+        tool_name="exec_command",
+        result={"exit_code": 0},
+        metadata={"status": "completed", "operation_id": "pytest-operation-1"},
+    )
+
+    receipt, completion_error = await engine._verify_and_complete_active_task(  # noqa: SLF001
+        session_id="session-normal-evidence",
+        turn_id="turn-normal-evidence",
+        workspace_dir=str(tmp_path),
+        active_task=active_task,
+        state_revision=state.state_revision,
+        requests=[mutation_request],
+        results=[mutation_result],
+        evidence_requests=[mutation_request, test_request],
+        evidence_results=[mutation_result, test_result],
+    )
+
+    assert completion_error is None
+    assert receipt["verification_status"] == "verified"
+    assert receipt["targets"][0]["acceptance_checks"][-1]["evidence"][
+        "call_id"
+    ] == "pytest-call"
+    completed = await engine._conversation_state_repository.load(  # noqa: SLF001
+        "session-normal-evidence"
+    )
+    assert completed.active_task is not None
+    assert completed.active_task.status == "completed"
+    await engine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "reported_paths",
+        "expected_checkpoint_status",
+        "expected_task_status",
+        "expected_verification_status",
+        "acceptance_criteria",
+        "profile_registry",
+    ),
+    [
+        (["report.md"], "completed", "completed", "verified", ("contains:Report",), None),
+        (["report.md", "sibling.md"], "blocked", "active", "failed", ("contains:Report",), None),
+        (
+            ["report.md"],
+            "completed",
+            "completed",
+            "verified",
+            (
+                "contains:Report",
+                {
+                    "schema_version": 1,
+                    "kind": "tool_execution",
+                    "check": "test",
+                    "profile_id": "approved-file-write",
+                    "tool_name": "file_write",
+                },
+            ),
+            "approved-file-write",
+        ),
+    ],
+    ids=["authorized-target", "unexpected-sibling", "approval-exact-evidence"],
+)
+async def test_engine_resumes_an_ordinary_chat_approval_without_a_new_user_turn(
+    tmp_path,
+    reported_paths,
+    expected_checkpoint_status,
+    expected_task_status,
+    expected_verification_status,
+    acceptance_criteria,
+    profile_registry,
+) -> None:  # type: ignore[no-untyped-def]
+    from dataclasses import replace
+
+    from mochi.agents.conversation_state_store import TurnCheckpoint
+    from mochi.agents.artifact_verifier import ValidationProfileRegistry
+    from mochi.agents.engine import AgentEngine
+    from mochi.agents.turn_intent_contract import ActiveTaskState, DeliverableContract
+    from mochi.backends.types import ToolCall
+    from mochi.config.schema import MochiConfig
+    from mochi.security.policy import EffectivePolicyResolver
+
+    class _Backend(FakeBackend):
+        async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.generation_kwargs.append(dict(kwargs))
+            assert messages[-1].role == "tool"
+            assert messages[-1].tool_call_id == "call-1"
+            assert sum(message.role == "user" for message in messages) == 1
+            return GenerationResult(content="Saved report.md", finish_reason="stop")
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    backend = _Backend(metadata={"effective_context_length": 32768})
+    validation_profiles = (
+        ValidationProfileRegistry(
+            {
+                "approved-file-write": lambda tool_name, arguments: (
+                    tool_name == "file_write"
+                    and arguments.get("path") == "report.md"
+                ),
+            }
+        )
+        if profile_registry is not None
+        else None
+    )
+    engine = AgentEngine(config, validation_profile_registry=validation_profiles)
+
+    async def _load(_: str) -> _Backend:
+        engine._router._active = backend  # noqa: SLF001
+        return backend
+
+    engine._router.load = _load  # type: ignore[method-assign]
+    policy = EffectivePolicyResolver().resolve(config.security).to_dict()
+    initial_checkpoint = TurnCheckpoint(
+        session_id="chat-session-1",
+        turn_id="turn-1",
+        revision=0,
+        stage="contract_resolved",
+        turn_intent_contract={"turn_id": "turn-1"},
+        capability_plan={
+            "artifact_obligation": {"required": True, "ready": True},
+        },
+        active_goal_id="goal-report",
+        policy_snapshot=policy,
+        inventory_snapshot={"inventory_version": "inventory-test"},
+        activation_state={"activation_allowed_tool_names": ["file_write"]},
+        pending_tool_call={
+            "call_id": "call-1",
+            "tool_name": "file_write",
+            "arguments": {"path": "report.md", "content": "# Report\n"},
+        },
+        resume_cursor={"turn_id": "turn-1", "phase": "approval"},
+    )
+    active_task = ActiveTaskState(
+        goal_id="goal-report",
+        objective="write report",
+        operations=frozenset({"workspace_write"}),
+        mutation_requirement="required",
+        deliverables=(
+            DeliverableContract(
+                kind="workspace_artifact",
+                target_hint="report.md",
+                required=True,
+                acceptance_criteria=acceptance_criteria,
+                source_turn_ids=("turn-1",),
+            ),
+        ),
+        source_turn_ids=("turn-1",),
+        updated_turn_id="turn-1",
+    )
+    state_saved = await engine._conversation_state_repository.save(  # noqa: SLF001
+        "chat-session-1", active_task=active_task, expected_revision=0,
+    )
+    assert state_saved.status == "saved"
+    saved_initial = await engine._turn_checkpoint_repository.save(  # noqa: SLF001
+        initial_checkpoint,
+        expected_revision=0,
+    )
+    assert saved_initial.checkpoint is not None
+    saved_pending = await engine._turn_checkpoint_repository.save(  # noqa: SLF001
+        replace(
+            saved_initial.checkpoint,
+            stage="awaiting_approval",
+            approval_record={
+                "approval_id": "tool-approval-1",
+                "status": "pending",
+                "tool_name": "file_write",
+            },
+        ),
+        expected_revision=1,
+    )
+    assert saved_pending.status == "saved"
+    payload = {
+        "ordinary_chat_checkpoint": {
+            "schema_version": 1,
+            "source": "ordinary_chat",
+            "session_id": "chat-session-1",
+            "turn_id": "turn-1",
+            "resolved_workspace_dir": str(tmp_path.resolve()),
+            "tool_name": "file_write",
+            "normalized_arguments": {"path": "report.md", "content": "# Report\n"},
+            "operation_id": "artifact-op-test",
+            "resume_cursor": {
+                "turn_id": "turn-1",
+                "tool_call_id": "call-1",
+                "tool_name": "file_write",
+            },
+            "react_continuation": {
+                "schema_version": 1,
+                "messages": [
+                    {"role": "system", "content": "system", "tool_calls": []},
+                    {"role": "user", "content": "write report.md", "tool_calls": []},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "name": "file_write",
+                                "arguments": {"path": "report.md", "content": "# Report\n"},
+                            }
+                        ],
+                    },
+                ],
+                "callable_tool_names": ["file_write"],
+                "max_iterations": 3,
+                "requires_file_mutation": True,
+                "generation": {"temperature": 0.7, "max_tokens": 128},
+            },
+        }
+    }
+    (tmp_path / "report.md").write_text("# Report\n", encoding="utf-8")
+    result = await engine.resume_ordinary_chat_approval(
+        approval_id="tool-approval-1",
+        approval_payload=payload,
+        execution_result={
+            "status": "completed",
+            "tool_name": "file_write",
+            "output": {
+                "path": "report.md",
+                **({"exit_code": 0} if profile_registry is not None else {}),
+            },
+            "metadata": {"file_changes": [{"path": path} for path in reported_paths]},
+        },
+        current_permission_policy=policy,
+    )
+
+    assert result["status"] == "continued"
+    assert result["content"] == "Saved report.md"
+    assert result["turn_checkpoint_status"] == expected_checkpoint_status
+    assert result["turn_checkpoint_error"] is None
+    task_after = await engine._conversation_state_repository.load("chat-session-1")  # noqa: SLF001
+    assert task_after.active_task is not None
+    assert task_after.active_task.status == expected_task_status
+    assert task_after.active_task.deliverables[0].status == (
+        "satisfied" if expected_task_status == "completed" else "pending"
+    )
+    assert len(backend.calls) == 1
+    checkpoint_events = await engine._session_store.load_session("chat-session-1")  # noqa: SLF001
+    turn_checkpoints = [
+        event["checkpoint"]["stage"]
+        for event in checkpoint_events
+        if event.get("event") == "turn_execution_checkpoint"
+        and event.get("turn_id") == "turn-1"
+    ]
+    assert turn_checkpoints == [
+        "contract_resolved",
+        "awaiting_approval",
+        "executing",
+        "verifying",
+        expected_checkpoint_status,
+    ]
+    terminal_checkpoint = next(
+        event["checkpoint"]
+        for event in reversed(checkpoint_events)
+        if event.get("event") == "turn_execution_checkpoint"
+        and event.get("turn_id") == "turn-1"
+    )
+    assert (
+        terminal_checkpoint["verification_result"]["verification_status"]
+        == expected_verification_status
+    )
+    assert any(
+        event.get("event") == "artifact_verification_receipt"
+        for event in checkpoint_events
+    )
+    await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_react_loop_rescues_final_text_tool_call_markup() -> None:
     from mochi.agents.events import ToolCallRequestEvent, ToolCallResultEvent
     from mochi.agents.react_loop import AsyncReActLoop

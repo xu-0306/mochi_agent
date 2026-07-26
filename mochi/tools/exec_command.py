@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import logging
 import math
 from collections.abc import Mapping
 from pathlib import Path
@@ -38,7 +40,15 @@ from mochi.security.file_contract import (
     ResourceLimits,
     capture_file_identity,
 )
-from mochi.security.policy import policy_projection_version
+from mochi.security.policy import (
+    effective_policy_snapshot_from_mapping,
+    matching_tool_hard_deny,
+    policy_projection_version,
+)
+from mochi.sessions.timeline_coordinator import (
+    mark_context_side_effect_started,
+    timeline_pending_operation_binding,
+)
 from mochi.tools.base import (
     BaseTool,
     ToolCancellationResult,
@@ -54,10 +64,59 @@ from mochi.utils.security import (
 
 _SHARED_RUNTIME: ExecRuntime | None = None
 _SHARED_APPROVAL_STORE: ApprovalStore | None = None
+_logger = logging.getLogger(__name__)
 
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _ordinary_chat_approval_context(
+    context: ToolExecutionContext | None,
+) -> dict[str, Any] | None:
+    if context is None or not isinstance(context.state, Mapping):
+        return None
+    raw = context.state.get("ordinary_chat_approval_context")
+    if not isinstance(raw, Mapping) or raw.get("source") != "ordinary_chat":
+        return None
+    return dict(raw)
+
+
+async def _observe_ordinary_chat_approval(
+    context: ToolExecutionContext | None,
+    approval: Any,
+) -> None:
+    """Publish the post-commit ordinary-Chat observation when the Engine wired it."""
+
+    if context is None or not isinstance(context.state, Mapping):
+        return
+    observer = context.state.get("tool_workflow_approval_observer")
+    if not callable(observer):
+        return
+    try:
+        result = observer(approval)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        # The approval DB create committed before this optional projection.
+        # Leave the caller's approval-pending result untouched; the runtime
+        # reconciler can republish the durable row without executing a tool.
+        _logger.warning(
+            "ordinary-chat approval observation handoff requires repair: %s (%s)",
+            getattr(approval, "approval_id", ""),
+            type(exc).__name__,
+        )
+
+
+def _approval_payload_digest(value: Mapping[str, Any]) -> str:
+    return _sha256(
+        json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _build_exec_authorization_envelope(
@@ -71,6 +130,7 @@ def _build_exec_authorization_envelope(
     sandbox_permissions: str,
     autonomy_mode: str,
     effective_require_approval: bool,
+    effective_policy_version: str | None,
     context: ToolExecutionContext | None,
     owner_task_id: str | None,
     sandbox_plan: SandboxPlan,
@@ -97,8 +157,8 @@ def _build_exec_authorization_envelope(
         EnvVarHash(key=str(key), value_sha256=_sha256(value))
         for key, value in sorted((normalized_env or {}).items())
     )
-    policy_version = policy_projection_version(
-        "exec-policy",
+    policy_version = effective_policy_version or policy_projection_version(
+        "exec-policy-fallback",
         {
             "autonomy_mode": autonomy_mode,
             "classification_action": classification.action,
@@ -318,6 +378,53 @@ class ExecCommandTool(BaseTool):
     def is_cancellable(self) -> bool:
         return True
 
+    @property
+    def supports_timeline_side_effect_boundary(self) -> bool:
+        return True
+
+    @property
+    def supports_timeline_approval_revocation(self) -> bool:
+        return True
+
+    @property
+    def timeline_approval_mode(self) -> str:
+        return "continuable"
+
+    def revoke_timeline_approval(self, approval_id: str, *, reason: str) -> bool:
+        return self._approval_store.supersede(approval_id, reason=reason).status == "superseded"
+
+    def validates_timeline_approval_binding(
+        self,
+        approval_id: str,
+        *,
+        operation_id: str,
+        arguments_digest: str,
+        call_id: str,
+    ) -> bool:
+        approval = self._approval_store.get(approval_id)
+        if approval is None or approval.status != "pending":
+            return False
+        payload = approval.command_payload
+        checkpoint = (
+            payload.get("ordinary_chat_checkpoint")
+            if isinstance(payload, Mapping)
+            else None
+        )
+        return bool(
+            approval.metadata.get("operation_id") == operation_id
+            and approval.metadata.get("arguments_digest") == arguments_digest
+            and approval.metadata.get("timeline_call_id") == call_id
+            and isinstance(payload, Mapping)
+            and payload.get("operation_id") == operation_id
+            and payload.get("arguments_digest") == arguments_digest
+            and payload.get("timeline_call_id") == call_id
+            and isinstance(checkpoint, Mapping)
+            and checkpoint.get("source") == "ordinary_chat"
+            and checkpoint.get("operation_id") == operation_id
+            and checkpoint.get("arguments_digest") == arguments_digest
+            and checkpoint.get("timeline_call_id") == call_id
+        )
+
     async def execute(
         self,
         *,
@@ -339,6 +446,54 @@ class ExecCommandTool(BaseTool):
         del prefix_rule
         if not command.strip():
             return ToolResult(error="`command` must not be empty.")
+        permission_policy = (
+            context.permission_policy
+            if context is not None and isinstance(context.permission_policy, Mapping)
+            else {}
+        )
+        effective_snapshot = effective_policy_snapshot_from_mapping(permission_policy)
+        effective_require_approval = self._require_approval
+        if isinstance(permission_policy.get("require_approval_for_exec"), bool):
+            effective_require_approval = bool(permission_policy["require_approval_for_exec"])
+        autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
+        policy_metadata = {
+            "policy_snapshot_id": (
+                effective_snapshot.policy_snapshot_id if effective_snapshot is not None else None
+            ),
+            "effective_policy_version": (
+                effective_snapshot.policy_version if effective_snapshot is not None else None
+            ),
+            "effective_policy_source": (
+                "effective_policy_snapshot"
+                if effective_snapshot is not None
+                else "constructor_or_legacy_context_fallback"
+            ),
+        }
+        hard_deny = matching_tool_hard_deny(
+            effective_snapshot or permission_policy,
+            tool_name=self.name,
+            capability="exec",
+        )
+        if hard_deny is not None:
+            reason = f"Execution is prohibited by hard policy selector: {hard_deny}."
+            decision = deny_security_decision(
+                reason=reason,
+                approval_kind="exec",
+                approval_scope="dangerous_command",
+                replay_safe=False,
+                policy_source="effective_policy_hard_deny",
+            )
+            return ToolResult(
+                error=reason,
+                metadata={
+                    "status": "denied",
+                    "hard_deny": hard_deny,
+                    "tool_name": self.name,
+                    **policy_metadata,
+                    **decision.to_metadata(),
+                },
+                retryable=False,
+            )
         if sandbox_permissions not in {"use_default", "require_escalated"}:
             return ToolResult(
                 error="`sandbox_permissions` must be 'use_default' or 'require_escalated'."
@@ -380,15 +535,6 @@ class ExecCommandTool(BaseTool):
             allow_dangerous_interpreters=True,
         )
         classification = security.classify(command, shell=shell, env=normalized_env)
-        permission_policy = (
-            context.permission_policy
-            if context is not None and isinstance(context.permission_policy, Mapping)
-            else {}
-        )
-        effective_require_approval = self._require_approval
-        if isinstance(permission_policy.get("require_approval_for_exec"), bool):
-            effective_require_approval = bool(permission_policy.get("require_approval_for_exec"))
-        autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
         if classification.action == "deny":
             decision = deny_security_decision(
                 reason=classification.reason,
@@ -401,6 +547,7 @@ class ExecCommandTool(BaseTool):
                 error=classification.reason,
                 metadata={
                     "status": "denied",
+                    **policy_metadata,
                     **_build_classification_metadata(
                         classification,
                         shell=shell,
@@ -430,6 +577,7 @@ class ExecCommandTool(BaseTool):
                     "status": "denied",
                     "sandbox_mode": self._sandbox_mode,
                     "sandbox_enforcement_unavailable": True,
+                    **policy_metadata,
                 },
                 retryable=False,
             )
@@ -454,6 +602,11 @@ class ExecCommandTool(BaseTool):
                     sandbox_permissions=sandbox_permissions,
                     autonomy_mode=autonomy_mode,
                     effective_require_approval=effective_require_approval,
+                    effective_policy_version=(
+                        effective_snapshot.policy_version
+                        if effective_snapshot is not None
+                        else None
+                    ),
                     context=context,
                     owner_task_id=owner_task_id,
                     sandbox_plan=sandbox_plan,
@@ -473,6 +626,7 @@ class ExecCommandTool(BaseTool):
                     error=f"Auto review could not bind the authorization envelope: {exc}",
                     metadata={
                         "status": "denied",
+                        **policy_metadata,
                         "auto_review_decision": "deny",
                         "auto_review_reason_codes": ["authorization_envelope_invalid"],
                     },
@@ -489,6 +643,7 @@ class ExecCommandTool(BaseTool):
                 error="Auto review denied the exec authorization envelope.",
                 metadata={
                     "status": "denied",
+                    **policy_metadata,
                     **auto_review_metadata(review_decision),
                     **_build_classification_metadata(classification, shell=shell),
                 },
@@ -512,6 +667,83 @@ class ExecCommandTool(BaseTool):
             )
             approval_id = f"exec-approval-{uuid4().hex[:12]}"
             suggested_rule = _build_suggested_rule(classification, shell=shell)
+            ordinary_chat_context = _ordinary_chat_approval_context(context)
+            execution_arguments = {
+                "command": command,
+                "shell": shell,
+                "workdir": str(resolved_cwd),
+                "env": normalized_env,
+                "timeout": timeout_sec,
+                "background": background,
+                "tty": tty,
+                "sandbox_permissions": sandbox_permissions,
+                "justification": justification,
+                "log_path": resolved_layout.get("log_path"),
+                "checkpoint_dir": resolved_layout.get("checkpoint_dir"),
+                "detached_layout": dict(resolved_layout),
+            }
+            try:
+                timeline_binding = timeline_pending_operation_binding(
+                    context,
+                    tool_name=self.name,
+                )
+            except Exception as exc:
+                return ToolResult(
+                    error=f"timeline_approval_binding_invalid: {exc}",
+                    metadata={
+                        "status": "timeline_approval_binding_invalid",
+                        "tool_name": self.name,
+                        "timeline_fail_closed": True,
+                    },
+                    retryable=False,
+                )
+            if timeline_binding is not None:
+                if ordinary_chat_context is None:
+                    return ToolResult(
+                        error=(
+                            "timeline_approval_binding_invalid: ordinary Chat approval "
+                            "context is missing."
+                        ),
+                        metadata={
+                            "status": "timeline_approval_binding_invalid",
+                            "tool_name": self.name,
+                            "timeline_fail_closed": True,
+                        },
+                        retryable=False,
+                    )
+                resume_cursor = ordinary_chat_context.get("resume_cursor")
+                cursor_call_id = (
+                    str(resume_cursor.get("tool_call_id") or "").strip()
+                    if isinstance(resume_cursor, Mapping)
+                    else ""
+                )
+                call_id = str(timeline_binding["call_id"])
+                if cursor_call_id != call_id:
+                    return ToolResult(
+                        error=(
+                            "timeline_approval_binding_invalid: ordinary Chat resume cursor "
+                            "does not match the precommitted tool call."
+                        ),
+                        metadata={
+                            "status": "timeline_approval_binding_invalid",
+                            "tool_name": self.name,
+                            "timeline_fail_closed": True,
+                        },
+                        retryable=False,
+                    )
+                approval_arguments = dict(timeline_binding["arguments"])
+                arguments_digest = str(timeline_binding["arguments_digest"])
+                operation_id = str(timeline_binding["operation_id"])
+            else:
+                approval_arguments = dict(execution_arguments)
+                arguments_digest = _approval_payload_digest(
+                    {"tool_name": self.name, "arguments": approval_arguments}
+                )
+                operation_id = f"exec-operation-{uuid4().hex}"
+                call_id = None
+            inventory_version = _approval_payload_digest(
+                {"tool_name": self.name, "parameters_schema": self.parameters_schema}
+            )
             approval_payload = {
                 "command": command,
                 "shell": shell,
@@ -526,11 +758,56 @@ class ExecCommandTool(BaseTool):
                 "detached_layout": dict(resolved_layout),
                 "approval_state": "approved",
                 "sandbox_plan": sandbox_plan.to_dict(),
+                "tool_name": self.name,
+                "policy_snapshot_id": policy_metadata["policy_snapshot_id"],
+                "effective_policy_version": policy_metadata[
+                    "effective_policy_version"
+                ],
+                "normalized_arguments": approval_arguments,
+                "execution_arguments": execution_arguments,
+                "arguments_digest": arguments_digest,
+                "operation_id": operation_id,
+                "call_id": call_id,
+                "timeline_call_id": call_id,
+                "tool_inventory_version": inventory_version,
+                "workspace_dir": str(workspace_root),
+                "session_id": context.session_id if context is not None else None,
+                "permission_policy": dict(permission_policy),
             }
+            if ordinary_chat_context is not None:
+                resume_cursor = ordinary_chat_context.get("resume_cursor")
+                approval_payload["ordinary_chat_checkpoint"] = {
+                    "schema_version": 1,
+                    "source": "ordinary_chat",
+                    "session_id": ordinary_chat_context.get("session_id"),
+                    "turn_id": ordinary_chat_context.get("turn_id"),
+                    "resume_cursor": dict(resume_cursor) if isinstance(resume_cursor, Mapping) else {},
+                    "resolved_workspace_dir": str(workspace_root),
+                    "resolved_target": str(resolved_cwd),
+                    "operation_id": operation_id,
+                    "call_id": call_id,
+                    "timeline_call_id": call_id,
+                    "tool_name": self.name,
+                    "normalized_arguments": approval_arguments,
+                    "execution_arguments": execution_arguments,
+                    "arguments_digest": arguments_digest,
+                    "policy_snapshot_id": policy_metadata["policy_snapshot_id"],
+                    "policy_version": policy_metadata["effective_policy_version"],
+                    "inventory_version": inventory_version,
+                    "sandbox_plan_digest": sandbox_plan.to_dict().get("plan_digest"),
+                    "sandbox_authorization_digest": sandbox_plan.approval_digest,
+                    "react_continuation": (
+                        dict(ordinary_chat_context["react_continuation"])
+                        if isinstance(ordinary_chat_context.get("react_continuation"), Mapping)
+                        else None
+                    ),
+                }
             requester_id, request_digest, context_digest = derive_approval_binding(
                 requester_id=(
                     f"runtime-task:{owner_task_id}"
                     if owner_task_id
+                    else f"runtime-session:{context.session_id}"
+                    if ordinary_chat_context is not None and context is not None and context.session_id
                     else "runtime-service"
                 ),
                 request={
@@ -542,6 +819,14 @@ class ExecCommandTool(BaseTool):
                 authorization_context={
                     "source": "exec_command",
                     "owner_task_id": owner_task_id or None,
+                    "workspace_root": str(workspace_root),
+                    "resolved_cwd": str(resolved_cwd),
+                    "policy_snapshot_id": policy_metadata["policy_snapshot_id"],
+                    "policy_version": policy_metadata["effective_policy_version"],
+                    "tool_inventory_version": inventory_version,
+                    "call_id": call_id,
+                    "timeline_call_id": call_id,
+                    "operation_id": operation_id,
                 },
             )
             request = self._approval_store.create(
@@ -551,10 +836,31 @@ class ExecCommandTool(BaseTool):
                 scope="dangerous_command",
                 reason=reason,
                 metadata={
+                    "tool_name": self.name,
+                    **policy_metadata,
                     "policy_state": "ask",
                     "policy_reason": classification.reason,
                     "rule_id": classification.rule_id,
                     "suggested_rule": suggested_rule,
+                    "operation_id": operation_id,
+                    "arguments_digest": arguments_digest,
+                    "tool_inventory_version": inventory_version,
+                    **(
+                        {
+                            "approval_source": "ordinary_chat",
+                            "call_id": call_id,
+                            "timeline_call_id": call_id,
+                            "resume_cursor": (
+                                dict(ordinary_chat_context.get("resume_cursor") or {})
+                                if isinstance(ordinary_chat_context.get("resume_cursor"), Mapping)
+                                else {}
+                            ),
+                            "resolved_workspace_dir": str(workspace_root),
+                            "resolved_target": str(resolved_cwd),
+                        }
+                        if ordinary_chat_context is not None
+                        else {}
+                    ),
                     **(
                         auto_review_metadata(review_decision)
                         if review_decision is not None
@@ -571,6 +877,7 @@ class ExecCommandTool(BaseTool):
                 request_digest=request_digest,
                 context_digest=context_digest,
             )
+            await _observe_ordinary_chat_approval(context, request)
             return ToolResult(
                 error="Exec command requires approval.",
                 metadata={
@@ -583,6 +890,27 @@ class ExecCommandTool(BaseTool):
                     "approval_kind": "exec",
                     "approval_scope": request.scope,
                     "reason": request.reason,
+                    "tool_name": self.name,
+                    "operation_id": operation_id,
+                    "call_id": call_id,
+                    "timeline_call_id": call_id,
+                    "arguments_digest": arguments_digest,
+                    "tool_inventory_version": inventory_version,
+                    **(
+                        {
+                            "resume_cursor": (
+                                dict(ordinary_chat_context.get("resume_cursor") or {})
+                                if isinstance(ordinary_chat_context.get("resume_cursor"), Mapping)
+                                else {}
+                            ),
+                            "approval_source": "ordinary_chat",
+                            "call_id": call_id,
+                            "timeline_call_id": call_id,
+                        }
+                        if ordinary_chat_context is not None
+                        else {}
+                    ),
+                    **policy_metadata,
                     **(
                         auto_review_metadata(review_decision)
                         if review_decision is not None
@@ -618,6 +946,7 @@ class ExecCommandTool(BaseTool):
                     error=f"Auto review verification failed before execution: {exc}",
                     metadata={
                         "status": "denied",
+                        **policy_metadata,
                         **auto_review_metadata(review_decision),
                         "auto_review_execution_verified": False,
                     },
@@ -659,6 +988,7 @@ class ExecCommandTool(BaseTool):
                     callback=_cancel_active_session,
                 )
 
+            await mark_context_side_effect_started(context)
             result = await self._runtime.start_command(
                 command=command,
                 shell=shell,
@@ -676,7 +1006,11 @@ class ExecCommandTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 error=f"Exec command failed: {exc}",
-                metadata=_sandbox_metadata(sandbox_plan),
+                metadata={
+                    **policy_metadata,
+                    **_sandbox_metadata(sandbox_plan),
+                    "timeline_result_disposition": "unknown",
+                },
             )
 
         effective_layout = _realize_detached_layout(
@@ -695,6 +1029,7 @@ class ExecCommandTool(BaseTool):
             tty=tty,
             approval_state=result.approval_state,
         )
+        metadata.update(policy_metadata)
         metadata.update(_sandbox_metadata(sandbox_plan))
         policy_reason = classification.reason
         if auto_review_policy_allow:
@@ -715,6 +1050,15 @@ class ExecCommandTool(BaseTool):
             metadata["auto_review_execution_verified"] = True
         metadata["auto_reviewed_policy_ask"] = auto_review_policy_allow
         metadata["approval_id"] = None
+        metadata["timeline_result_disposition"] = (
+            "failed"
+            if result.status in {
+                ExecSessionStatus.KILLED,
+                ExecSessionStatus.FAILED,
+                ExecSessionStatus.TIMED_OUT,
+            }
+            else "succeeded"
+        )
         if result.status == ExecSessionStatus.KILLED:
             payload["runtime_status"] = result.status.value
             payload["status"] = "cancelled"

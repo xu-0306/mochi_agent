@@ -112,7 +112,19 @@ async def test_exec_command_background_metadata_includes_detached_layout(tmp_pat
         default_shell="test",
         state_root=Path(detached_layout["runtime_state_root"]),
     )
-    tool = ExecCommandTool(runtime=runtime, require_approval=False, workspace_dir=str(tmp_path))
+    tool = ExecCommandTool(
+        runtime=runtime,
+        require_approval=False,
+        workspace_dir=str(tmp_path),
+        command_rules=[
+            {
+                "tokens": ["bg"],
+                "decision": "allow",
+                "match": "exact",
+                "shells": ["test"],
+            }
+        ],
+    )
 
     result = await tool.execute(
         command="bg",

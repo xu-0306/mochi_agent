@@ -1648,7 +1648,7 @@ export default function GoalsPage() {
     const status =
       (getString(recoveryState.status) ?? getString(goalHealth?.linked_agent_run?.status) ?? '').toLowerCase()
     return status === 'awaiting_resources' || status === 'stalled'
-  }, [goalHealth?.linked_agent_run])
+  }, [goalHealth])
 
   return (
     <div className="flex h-full flex-col overflow-hidden">

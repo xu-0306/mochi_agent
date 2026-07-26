@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import json
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 import tempfile
@@ -23,7 +25,23 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 from pydantic import SecretStr
 
 from mochi.agents.compaction import ConversationCompactor
-from mochi.agents.context import ContextManager
+from mochi.agents.capability_exposure_adapter import (
+    ExposurePolicyCeilings,
+    adapt_capability_plan_to_exposure,
+)
+from mochi.agents.capability_planner import CapabilityPlanner
+from mochi.agents.controlled_recovery import (
+    ArtifactReceiptState,
+    ControlledRecoveryCoordinator,
+    ControlledRecoveryDecision,
+    TimelineOperationState,
+)
+from mochi.agents.artifact_verifier import (
+    ArtifactExpectation,
+    ArtifactVerifier,
+    ValidationProfileRegistry,
+)
+from mochi.agents.context import ContextManager, PromptContext
 from mochi.agents.context_snapshot import (
     ChatContextSnapshot,
     estimate_backend_text_tokens,
@@ -48,12 +66,23 @@ from mochi.agents.invocation import (
     AgentInvocationRequest,
     AgentInvocationResult,
 )
+from mochi.agents.conversation_resolver import (
+    ConversationResolution,
+    ConversationResolver,
+)
+from mochi.agents.conversation_state_store import (
+    ConversationStateLoadDiagnostics,
+    ConversationStateRepository,
+    TurnCheckpoint,
+    TurnCheckpointRepository,
+)
+from mochi.agents.model_conversation_interpreter import ModelConversationInterpreter
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
-from mochi.agents.tool_intent_router import (
-    BackendToolIntentClassifier,
-    ToolIntentRoute,
-    ToolIntentRouter,
+from mochi.agents.turn_contract_rollout import (
+    TurnContractRolloutResult,
+    build_capability_plan,
+    conversation_inputs_from_prompt_context,
 )
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.inference_capabilities import (
@@ -96,13 +125,32 @@ from mochi.memory.conversation import ConversationMemory
 from mochi.memory.store import MemoryStore
 from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.projects.store import ProjectStore
-from mochi.security.policy import build_runtime_permission_policy_dict
-from mochi.sessions.store import SessionStore
+from mochi.security.policy import (
+    EffectivePolicyResolver,
+    build_runtime_permission_policy_dict,
+)
+from mochi.api.tool_workflow_outbox import (
+    ToolWorkflowOutboxRepository,
+    ToolWorkflowOutboxVerifierDiagnostics,
+    verify_tool_workflow_outbox_v1,
+)
+from mochi.sessions.store import (
+    SessionStore,
+    ToolWorkflowPublicationGate,
+    ensure_sessions_dir_unchanged,
+)
+from mochi.sessions.timeline_coordinator import (
+    TimelineCoordinator,
+    TimelineTurnCancelled,
+)
+from mochi.sessions.turn_timeline import SessionTurnTimelineRepository
 from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
 from mochi.tools.base import (
     ActiveToolController,
+    BaseTool,
     RunCancellationContext,
     ToolExecutionContext,
+    ToolResult,
     cancel_asyncio_task,
 )
 from mochi.tools.mcp_client import McpRuntimeManager
@@ -124,6 +172,26 @@ _AUTO_RESERVE_OUTPUT_TOKENS_MAX = 3072
 _AUTO_OUTPUT_CONTEXT_RATIO = 0.10
 _AUTO_RESERVE_OUTPUT_RATIO = 0.33
 _AUTO_TOKEN_ROUNDING = 256
+_CONTROLLED_RECOVERY_SCHEMA_VERSION = 1
+_MAX_CONTROLLED_RECOVERY_REPLANS = 1
+_AUTOMATIC_RECOVERY_ACCEPTANCE_CODES = frozenset(
+    {
+        "target_missing",
+        "content_mismatch",
+        "digest_mismatch",
+        "empty_artifact",
+        "contains_mismatch",
+    }
+)
+
+
+class _TurnContractRolloutFailure(RuntimeError):
+    def __init__(self, cause: Exception, *, user_message_persisted: bool) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.user_message_persisted = user_message_persisted
+
+
+ConversationResolverFactory = Callable[[BaseLLMBackend], ConversationResolver]
 
 
 def _active_remote_provider(config: MochiConfig) -> str | None:
@@ -271,6 +339,11 @@ class AgentEngine:
         voice_tts: object | None = None,
         vllm_runtime_manager: object | None = None,
         mcp_runtime_manager: McpRuntimeManager | None = None,
+        conversation_resolver_factory: ConversationResolverFactory | None = None,
+        capability_planner: CapabilityPlanner | None = None,
+        conversation_state_repository: ConversationStateRepository | None = None,
+        turn_checkpoint_repository: TurnCheckpointRepository | None = None,
+        validation_profile_registry: ValidationProfileRegistry | None = None,
     ) -> None:
         """初始化 AgentEngine（同步部分）。
 
@@ -308,8 +381,37 @@ class AgentEngine:
         )
         self._prompt_builder = PromptBuilder(config.agent.system_prompt)
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
-        self._session_store = SessionStore(sessions_dir=config.sessions_dir)
-        self._project_store = ProjectStore(Path(config.workspace_dir).expanduser() / "projects.json")
+        self._tool_workflow_publication_gate = ToolWorkflowPublicationGate(
+            config.agent.tool_observability_v1
+        )
+        self._tool_workflow_verifier_diagnostics = ToolWorkflowOutboxVerifierDiagnostics()
+        self._session_store = self._make_session_store(config)
+        self._tool_workflow_outbox = ToolWorkflowOutboxRepository(
+            self._session_store,
+            enabled=config.agent.tool_observability_v1,
+            publication_gate=self._tool_workflow_publication_gate,
+        )
+        self._owns_conversation_state_repository = conversation_state_repository is None
+        self._owns_turn_checkpoint_repository = turn_checkpoint_repository is None
+        self._conversation_state_repository = (
+            conversation_state_repository
+            or ConversationStateRepository(self._session_store)
+        )
+        self._turn_checkpoint_repository = (
+            turn_checkpoint_repository
+            or TurnCheckpointRepository(self._session_store)
+        )
+        self._conversation_resolver_factory = (
+            conversation_resolver_factory or self._default_conversation_resolver_factory
+        )
+        self._capability_planner = capability_planner or CapabilityPlanner()
+        self._artifact_verifier = ArtifactVerifier(
+            validation_profiles=validation_profile_registry
+        )
+        self._conversation_state_locks: dict[str, asyncio.Lock] = {}
+        self._project_store = ProjectStore(
+            Path(config.workspace_dir).expanduser() / "projects.json"
+        )
         self._execution_scope_resolver = ExecutionScopeResolver(
             default_workspace_dir=config.workspace_dir,
             session_store=self._session_store,
@@ -339,11 +441,11 @@ class AgentEngine:
             mcp_runtime_manager=self._mcp_runtime_manager,
         )
         self._tool_registry = self._tool_registry_factory.create_registry(config.workspace_dir)
-        self._tool_intent_router = ToolIntentRouter()
         self._tool_exposure_planner = ToolExposurePlanner(
             tool_groups=self._tool_registry_factory.tool_groups,
         )
         self._active_chat_runs: dict[tuple[str, str], RunCancellationContext] = {}
+        self._active_chat_timelines: dict[tuple[str, str], TimelineCoordinator] = {}
         self._active_chat_session_index: dict[str, list[str]] = {}
         self._recent_chat_run_states: dict[tuple[str, str], str] = {}
         self._recent_chat_run_turn_by_session: dict[str, str] = {}
@@ -351,9 +453,57 @@ class AgentEngine:
         self._preinitialized_model_info_cache: ModelInfo | None = None
         self._initialized = False
 
+    def _make_session_store(self, config: MochiConfig) -> SessionStore:
+        return SessionStore(
+            sessions_dir=config.sessions_dir,
+            tool_observability_v1=config.agent.tool_observability_v1,
+            tool_workflow_publication_gate=self._tool_workflow_publication_gate,
+            post_strict_commit_observer=self._verify_tool_workflow_commit,
+        )
+
+    async def _verify_tool_workflow_commit(
+        self,
+        snapshot: Any,
+        start_position: int,
+    ) -> None:
+        """Record an incremental exact-snapshot verification off the event loop."""
+
+        try:
+            verification = await asyncio.to_thread(
+                verify_tool_workflow_outbox_v1,
+                snapshot.session_id,
+                snapshot.events,
+                start_position=start_position,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Tool-workflow post-commit verification failed for {}: {}",
+                getattr(snapshot, "session_id", ""),
+                type(exc).__name__,
+            )
+            return
+        self._tool_workflow_verifier_diagnostics.record(verification)
+
+    @property
+    def tool_workflow_publication_gate(self) -> ToolWorkflowPublicationGate:
+        return self._tool_workflow_publication_gate
+
+    def tool_workflow_outbox_verifier_counters_snapshot(self) -> dict[str, int]:
+        return self._tool_workflow_verifier_diagnostics.snapshot()
+
+    async def _observe_tool_workflow_approval(self, approval: Any) -> Any:
+        """Stable context dispatcher; publication policy is read live."""
+
+        outbox = self._tool_workflow_outbox
+        if not outbox.enabled:
+            return None
+        return await outbox.observe_approval(approval)
+
     def _ensure_chat_run_registry(self) -> None:
         if not hasattr(self, "_active_chat_runs"):
             self._active_chat_runs = {}
+        if not hasattr(self, "_active_chat_timelines"):
+            self._active_chat_timelines = {}
         if not hasattr(self, "_active_chat_session_index"):
             self._active_chat_session_index = {}
         if not hasattr(self, "_recent_chat_run_states"):
@@ -369,11 +519,14 @@ class AgentEngine:
         session_id: str,
         turn_id: str,
         cancellation_context: RunCancellationContext,
+        timeline: TimelineCoordinator | None = None,
     ) -> None:
         self._ensure_chat_run_registry()
         key = (session_id, turn_id)
         async with self._chat_run_registry_lock:
             self._active_chat_runs[key] = cancellation_context
+            if timeline is not None:
+                self._active_chat_timelines[key] = timeline
             turns = self._active_chat_session_index.setdefault(session_id, [])
             if turn_id in turns:
                 turns.remove(turn_id)
@@ -393,6 +546,7 @@ class AgentEngine:
         key = (session_id, turn_id)
         async with self._chat_run_registry_lock:
             self._active_chat_runs.pop(key, None)
+            self._active_chat_timelines.pop(key, None)
             turns = self._active_chat_session_index.get(session_id)
             if isinstance(turns, list) and turn_id in turns:
                 turns.remove(turn_id)
@@ -439,6 +593,7 @@ class AgentEngine:
                             key = candidate
                             recent_state = self._recent_chat_run_states[candidate]
             cancellation_context = self._active_chat_runs.get(key) if key is not None else None
+            timeline = self._active_chat_timelines.get(key) if key is not None else None
 
         if key is None:
             return {
@@ -461,6 +616,8 @@ class AgentEngine:
                 "cancel_reason": None,
             }
 
+        if timeline is not None:
+            await timeline.request_cancel()
         snapshot = await cancellation_context.snapshot()
         state = str(snapshot.get("state") or "running")
         if state == "completed":
@@ -476,13 +633,22 @@ class AgentEngine:
         result = await cancellation_context.request_run_cancel()
         post_snapshot = await cancellation_context.snapshot()
         run_state = str(post_snapshot.get("state") or "running")
+        cancel_outcome = (
+            run_state
+            if run_state in {"cancelled", "completed"}
+            else result.state
+        )
         return {
-            "status": "already_completed" if result.state == "completed" else "cancel_requested",
+            "status": "already_completed" if cancel_outcome == "completed" else "cancel_requested",
             "session_id": normalized_session_id,
             "turn_id": key[1],
             "run_state": run_state,
-            "cancel_outcome": result.state,
-            "cancel_reason": result.reason,
+            "cancel_outcome": cancel_outcome,
+            "cancel_reason": (
+                None
+                if cancel_outcome in {"cancelled", "completed"}
+                else result.reason
+            ),
         }
 
     def _preinitialized_active_backend_kwargs(self) -> dict[str, Any]:
@@ -576,6 +742,501 @@ class AgentEngine:
         """Invoke the shared agent runtime and collect finalized output."""
         return await self._invoke_shared_runtime(request)
 
+    async def resume_ordinary_chat_approval(
+        self,
+        *,
+        approval_id: str,
+        approval_payload: Mapping[str, Any],
+        execution_result: Mapping[str, Any],
+        current_permission_policy: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resume an approved Chat tool call inside its original ReAct transcript."""
+        if not self._initialized:
+            await self.initialize()
+        checkpoint = approval_payload.get("ordinary_chat_checkpoint")
+        if not isinstance(checkpoint, Mapping) or checkpoint.get("source") != "ordinary_chat":
+            raise ValueError("Ordinary-Chat approval checkpoint is invalid.")
+        continuation = checkpoint.get("react_continuation")
+        if not isinstance(continuation, Mapping):
+            raise ValueError("Ordinary-Chat approval is missing its ReAct continuation checkpoint.")
+        session_id = checkpoint.get("session_id")
+        original_turn_id = checkpoint.get("turn_id")
+        workspace_dir = checkpoint.get("resolved_workspace_dir")
+        tool_name = checkpoint.get("tool_name")
+        callable_tool_names = continuation.get("callable_tool_names")
+        if (
+            not isinstance(session_id, str)
+            or not session_id.strip()
+            or not isinstance(original_turn_id, str)
+            or not original_turn_id.strip()
+            or not isinstance(workspace_dir, str)
+            or not workspace_dir.strip()
+            or not isinstance(tool_name, str)
+            or not tool_name.strip()
+            or not isinstance(callable_tool_names, list)
+        ):
+            raise ValueError("Ordinary-Chat approval continuation checkpoint is incomplete.")
+        expected_tool_names = [
+            name for name in callable_tool_names if isinstance(name, str) and name
+        ]
+        if tool_name not in expected_tool_names:
+            raise ValueError("Ordinary-Chat approval continuation does not expose its original tool.")
+
+        original_turn_checkpoint: TurnCheckpoint | None = None
+        checkpoint_tracking_status = "not_observed"
+        checkpoint_tracking_error: str | None = None
+        checkpoint_tracking_active = False
+        try:
+            checkpoint_load = await self._turn_checkpoint_repository.load(
+                session_id,
+                original_turn_id,
+            )
+            if checkpoint_load.diagnostics.status == "loaded":
+                original_turn_checkpoint = checkpoint_load.checkpoint
+                if (
+                    original_turn_checkpoint is not None
+                    and original_turn_checkpoint.stage not in {"completed", "blocked"}
+                ):
+                    original_turn_checkpoint, checkpoint_tracking_error = (
+                        await self._transition_turn_checkpoint(
+                            original_turn_checkpoint,
+                            stage="executing",
+                            approval_record={
+                                "approval_id": approval_id,
+                                "status": "approved",
+                                "tool_name": tool_name,
+                            },
+                            resume_cursor={
+                                "turn_id": original_turn_id,
+                                "phase": "approval_continuation",
+                            },
+                        )
+                    )
+                    checkpoint_tracking_status = (
+                        "executing"
+                        if checkpoint_tracking_error is None
+                        else "transition_failed"
+                    )
+                    checkpoint_tracking_active = (
+                        checkpoint_tracking_error is None
+                        and original_turn_checkpoint is not None
+                    )
+                elif original_turn_checkpoint is not None:
+                    checkpoint_tracking_status = original_turn_checkpoint.stage
+            elif checkpoint_load.diagnostics.status in {"invalid", "unsupported_version"}:
+                checkpoint_tracking_status = "invalid"
+                checkpoint_tracking_error = "; ".join(
+                    checkpoint_load.diagnostics.messages
+                )
+        except Exception as exc:
+            checkpoint_tracking_status = "transition_failed"
+            checkpoint_tracking_error = f"{type(exc).__name__}: {exc}"
+
+        resolved_workspace = str(Path(workspace_dir).expanduser().resolve(strict=False))
+        workspace_registry = self._tool_registry
+        if resolved_workspace != str(Path(self._config.workspace_dir).expanduser().resolve(strict=False)):
+            workspace_registry = self._tool_registry_factory.create_registry(resolved_workspace)
+        available_tool_names = {tool.name for tool in workspace_registry.list_tools()}
+        missing_tool_names = sorted(set(expected_tool_names) - available_tool_names)
+        if missing_tool_names:
+            raise ValueError("Ordinary-Chat continuation tool inventory changed while approval was pending.")
+        tool_registry = workspace_registry.create_view(
+            expected_tool_names,
+            tool_search_catalog_names=expected_tool_names,
+            schema_limit=max(1, len(expected_tool_names)),
+        )
+
+        base_context = self._get_tool_execution_context(
+            session_id=session_id,
+            workspace_dir=resolved_workspace,
+            permission_policy_override=dict(current_permission_policy),
+        )
+        tool_execution_context = self._fork_turn_tool_execution_context(base_context)
+        tool_execution_context.permission_policy = dict(current_permission_policy)
+        tool_execution_context.state["ordinary_chat_approval_context"] = {
+            "schema_version": 1,
+            "source": "ordinary_chat",
+            "session_id": session_id,
+            "turn_id": checkpoint.get("turn_id"),
+            "resume_cursor": {
+                "turn_id": checkpoint.get("turn_id"),
+                "phase": "tool_call",
+            },
+        }
+        tool_execution_context.state["tool_workflow_approval_observer"] = (
+            self._observe_tool_workflow_approval
+        )
+        activation_policy = continuation.get("tool_activation_policy")
+        if isinstance(activation_policy, Mapping):
+            tool_execution_context.state["tool_activation_policy"] = dict(activation_policy)
+
+        raw_max_iterations = continuation.get("max_iterations")
+        max_iterations = (
+            raw_max_iterations
+            if isinstance(raw_max_iterations, int) and raw_max_iterations > 0
+            else self._default_max_iterations_for_backend(
+                self._config.agent.max_react_iterations,
+                self._router.active,
+            )
+        )
+        requires_file_mutation = bool(continuation.get("requires_file_mutation")) and tool_name not in {
+            "file_write",
+            "file_edit",
+            "apply_patch",
+        }
+        react_loop = AsyncReActLoop(
+            backend=self._router.active,
+            tool_registry=tool_registry,
+            tool_execution_context=tool_execution_context,
+            max_iterations=max_iterations,
+            requires_file_mutation=requires_file_mutation,
+        )
+        tool_output = execution_result.get("output")
+        if tool_output is None:
+            tool_output = {
+                key: value
+                for key, value in execution_result.items()
+                if key not in {"status", "error", "tool_name", "operation_id", "arguments_digest"}
+            }
+        tool_result = ToolResult(
+            output=tool_output,
+            error=(
+                str(execution_result["error"])
+                if isinstance(execution_result.get("error"), str)
+                and execution_result.get("error")
+                else None
+            ),
+            metadata=(
+                dict(execution_result["metadata"])
+                if isinstance(execution_result.get("metadata"), Mapping)
+                else {}
+            ),
+        )
+
+        resume_turn_id = f"{checkpoint.get('turn_id') or 'chat'}:approval:{approval_id}"
+        events: list[AgentEvent] = []
+        final_text = ""
+        await self._router.mark_backend_busy(self._router.active)
+        try:
+            async for event in react_loop.resume_from_ordinary_chat_approval(
+                checkpoint=checkpoint,
+                tool_result=tool_result,
+            ):
+                event_metadata = getattr(event, "metadata", None)
+                if isinstance(event_metadata, dict):
+                    event_metadata.setdefault("approval_continuation", True)
+                    event_metadata.setdefault("approval_id", approval_id)
+                event.turn_id = resume_turn_id  # type: ignore[attr-defined]
+                if isinstance(event, FinalAnswerEvent):
+                    final_text = event.content
+                events.append(event)
+                await self._persist_turn_event(
+                    session_id,
+                    event,
+                    turn_id=resume_turn_id,
+                    seq=len(events),
+                )
+        finally:
+            await self._router.mark_backend_idle(self._router.active)
+
+        context = await self._get_context(session_id)
+        for message in react_loop.turn_messages:
+            context.add_message(message)
+            await self._persist_session_message(
+                session_id,
+                message,
+                turn_id=resume_turn_id,
+            )
+        if checkpoint_tracking_active and original_turn_checkpoint is not None:
+            execution_receipt, pending_tool_call, _ = (
+                self._turn_execution_checkpoint_data(events)
+            )
+            execution_receipt["approved_execution"] = _checkpoint_json_safe(
+                execution_result
+            )
+            approval_record = {
+                "approval_id": approval_id,
+                "status": "continued",
+                "tool_name": tool_name,
+            }
+            original_turn_checkpoint, checkpoint_tracking_error = (
+                await self._transition_turn_checkpoint(
+                    original_turn_checkpoint,
+                    stage="verifying",
+                    pending_tool_call=pending_tool_call,
+                    approval_record=approval_record,
+                    execution_receipt=execution_receipt,
+                    resume_cursor={
+                        "turn_id": original_turn_id,
+                        "phase": "approval_verification",
+                    },
+                )
+            )
+            checkpoint_tracking_status = (
+                "verifying"
+                if checkpoint_tracking_error is None
+                else "transition_failed"
+            )
+        if checkpoint_tracking_active and original_turn_checkpoint is not None:
+            final_event = next(
+                (event for event in reversed(events) if isinstance(event, FinalAnswerEvent)),
+                None,
+            )
+            artifact_obligation = original_turn_checkpoint.capability_plan.get(
+                "artifact_obligation"
+            )
+            artifact_required = bool(
+                isinstance(artifact_obligation, Mapping)
+                and artifact_obligation.get("required")
+                and artifact_obligation.get("ready")
+            )
+            verification_result: dict[str, Any] = {"verification_status": "not_required"}
+            verification_completion_error: str | None = None
+            if artifact_required:
+                pending = original_turn_checkpoint.pending_tool_call
+                normalized_arguments = checkpoint.get("normalized_arguments")
+                call_id = (
+                    pending.get("call_id")
+                    if isinstance(pending, Mapping)
+                    and isinstance(pending.get("call_id"), str)
+                    else checkpoint.get("resume_cursor", {}).get("tool_call_id")
+                    if isinstance(checkpoint.get("resume_cursor"), Mapping)
+                    else ""
+                )
+                if not isinstance(normalized_arguments, Mapping) or not isinstance(call_id, str) or not call_id:
+                    verification_result = {
+                        "verification_status": "failed",
+                        "errors": ["approval continuation is missing its exact normalized mutation call"],
+                    }
+                else:
+                    state = await self._conversation_state_repository.load(session_id)
+                    active_task = state.active_task
+                    if (
+                        state.diagnostics.status != "loaded"
+                        or active_task is None
+                        or (
+                            original_turn_checkpoint.active_goal_id is not None
+                            and active_task.goal_id != original_turn_checkpoint.active_goal_id
+                        )
+                    ):
+                        verification_result = {
+                            "verification_status": "failed",
+                            "errors": ["approval continuation active task state is unavailable or drifted"],
+                        }
+                    else:
+                        approved_request = ToolCallRequestEvent(
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            arguments=dict(normalized_arguments),
+                        )
+                        approved_result = ToolCallResultEvent(
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            result=tool_output,
+                            error=tool_result.error,
+                            metadata={
+                                **tool_result.metadata,
+                                "operation_id": checkpoint.get("operation_id"),
+                            },
+                        )
+                        verification_result, verification_completion_error = (
+                            await self._verify_and_complete_active_task(
+                                session_id=session_id,
+                                turn_id=original_turn_id,
+                                workspace_dir=resolved_workspace,
+                                active_task=active_task,
+                                state_revision=state.state_revision,
+                                requests=[approved_request],
+                                results=[approved_result],
+                            )
+                        )
+                if final_event is not None:
+                    final_event.metadata["artifact_verification"] = verification_result
+            verification_status = verification_result.get("verification_status")
+            if final_event is None or not final_event.content.strip():
+                terminal_stage: Literal["completed", "blocked"] = "blocked"
+                terminal_reason = "approval_continuation_missing_final_answer"
+            elif verification_completion_error is not None:
+                terminal_stage = "blocked"
+                terminal_reason = "approval_continuation_artifact_completion_failed"
+            elif artifact_required and verification_status != "verified":
+                terminal_stage = "blocked"
+                terminal_reason = "approval_continuation_artifact_unverified"
+            else:
+                terminal_stage = "completed"
+                terminal_reason = (
+                    "approval_continuation_artifact_verified"
+                    if artifact_required
+                    else "approval_continuation_completed"
+                )
+            original_turn_checkpoint, checkpoint_tracking_error = (
+                await self._transition_turn_checkpoint(
+                    original_turn_checkpoint,
+                    stage=terminal_stage,
+                    execution_receipt=execution_receipt,
+                    verification_result=verification_result,
+                    resume_cursor={
+                        "turn_id": original_turn_id,
+                        "phase": (
+                            "completed"
+                            if terminal_stage == "completed"
+                            else "blocked"
+                        ),
+                    },
+                    completion_reason=(
+                        terminal_reason if terminal_stage == "completed" else None
+                    ),
+                    blocker_reason=(
+                        terminal_reason if terminal_stage == "blocked" else None
+                    ),
+                )
+            )
+            checkpoint_tracking_status = (
+                terminal_stage
+                if checkpoint_tracking_error is None
+                else "transition_failed"
+            )
+        return {
+            "status": "continued",
+            "approval_id": approval_id,
+            "turn_id": resume_turn_id,
+            "event_count": len(events),
+            "content": final_text,
+            "final_finish_reason": next(
+                (
+                    event.finish_reason
+                    for event in reversed(events)
+                    if isinstance(event, FinalAnswerEvent)
+                ),
+                None,
+            ),
+            "turn_checkpoint_status": checkpoint_tracking_status,
+            "turn_checkpoint_error": checkpoint_tracking_error,
+        }
+
+    async def begin_ordinary_chat_approval_operation(
+        self,
+        *,
+        approval_id: str,
+        approval_payload: Mapping[str, Any],
+    ) -> None:
+        """Record the exact post-approval effect boundary before replaying it.
+
+        This is intentionally separate from ReAct continuation. The runtime
+        service calls it only after it owns the approval consume lease and has
+        revalidated policy and the durable replay checkpoint.
+        """
+        identity = _ordinary_chat_timeline_operation_identity(approval_payload)
+        if identity is None:
+            raise ValueError("Ordinary-Chat approval has no timeline operation binding.")
+        repository = SessionTurnTimelineRepository(self._session_store)
+        for _ in range(8):
+            loaded = await repository.load(identity["session_id"])
+            if loaded.history_revision is None:
+                raise ValueError("Ordinary-Chat timeline has no durable history revision.")
+            result = await repository.mark_terminal_precommitted_operation_started(
+                identity["session_id"],
+                turn_id=identity["turn_id"],
+                expected_history_revision=loaded.history_revision,
+                operation_id=identity["operation_id"],
+                call_id=identity["call_id"],
+                arguments_digest=identity["arguments_digest"],
+            )
+            if result.status == "rebase_required":
+                continue
+            if result.status != "boundary_updated":
+                raise ValueError(
+                    "Ordinary-Chat approval could not cross its durable effect boundary: "
+                    f"{result.status}: {result.message or ''}"
+                )
+            return
+        raise ValueError("Ordinary-Chat approval timeline repeatedly rebased before start.")
+
+    async def record_ordinary_chat_approval_operation_result(
+        self,
+        *,
+        approval_id: str,
+        approval_payload: Mapping[str, Any],
+        execution_result: Mapping[str, Any],
+        status: Literal["succeeded", "failed", "unknown"],
+    ) -> None:
+        """Persist a known or quarantined post-approval outcome before callback."""
+        identity = _ordinary_chat_timeline_operation_identity(approval_payload)
+        if identity is None:
+            raise ValueError("Ordinary-Chat approval has no timeline operation binding.")
+        repository = SessionTurnTimelineRepository(self._session_store)
+        result_digest = (
+            None
+            if status == "unknown"
+            else _ordinary_chat_timeline_result_digest(execution_result)
+        )
+        receipt_reference = None if status == "unknown" else f"approval:{approval_id}"
+        for _ in range(8):
+            loaded = await repository.load(identity["session_id"])
+            if loaded.history_revision is None:
+                raise ValueError("Ordinary-Chat timeline has no durable history revision.")
+            result = await repository.record_terminal_continuation_result(
+                identity["session_id"],
+                turn_id=identity["turn_id"],
+                expected_history_revision=loaded.history_revision,
+                operation_id=identity["operation_id"],
+                call_id=identity["call_id"],
+                arguments_digest=identity["arguments_digest"],
+                status=status,
+                result_digest=result_digest,
+                receipt_reference=receipt_reference,
+            )
+            if result.status == "rebase_required":
+                continue
+            if result.status != "operation_result":
+                raise ValueError(
+                    "Ordinary-Chat approval could not persist its execution outcome: "
+                    f"{result.status}: {result.message or ''}"
+                )
+            return
+        raise ValueError("Ordinary-Chat approval timeline repeatedly rebased before result.")
+
+    async def abandon_ordinary_chat_approval_operation(
+        self,
+        *,
+        approval_id: str,
+        approval_payload: Mapping[str, Any],
+        reason: str,
+    ) -> None:
+        """Record a known no-effect terminal approval disposition for replanning."""
+        identity = _ordinary_chat_timeline_operation_identity(approval_payload)
+        if identity is None:
+            return
+        repository = SessionTurnTimelineRepository(self._session_store)
+        evidence = {
+            "approval_id": approval_id,
+            "reason": reason,
+            "operation_id": identity["operation_id"],
+        }
+        for _ in range(8):
+            loaded = await repository.load(identity["session_id"])
+            if loaded.history_revision is None:
+                raise ValueError("Ordinary-Chat timeline has no durable history revision.")
+            result = await repository.abandon_terminal_precommitted_operation(
+                identity["session_id"],
+                turn_id=identity["turn_id"],
+                expected_history_revision=loaded.history_revision,
+                operation_id=identity["operation_id"],
+                call_id=identity["call_id"],
+                arguments_digest=identity["arguments_digest"],
+                result_digest=_ordinary_chat_timeline_result_digest(evidence),
+                receipt_reference=f"approval:{approval_id}",
+            )
+            if result.status == "rebase_required":
+                continue
+            if result.status != "operation_abandoned":
+                raise ValueError(
+                    "Ordinary-Chat approval could not record known no-effect outcome: "
+                    f"{result.status}: {result.message or ''}"
+                )
+            return
+        raise ValueError("Ordinary-Chat approval timeline repeatedly rebased before abandonment.")
+
     async def preview_chat_context(
         self,
         message: str,
@@ -604,6 +1265,9 @@ class AgentEngine:
             message,
             selected_skill_ids=selected_skill_ids,
         )
+        contract_tool_preferences = (
+            skill_selection.preferred_tool_names if selected_skill_ids else []
+        )
         skills_context = self._render_skills_context(skill_selection)
         scope = await self._execution_scope_resolver.resolve(
             session_id=session_key,
@@ -624,45 +1288,59 @@ class AgentEngine:
             capabilities,
         )
         reasoning_effort = sanitized.get("reasoning_effort")
-        planner_message = self._build_tool_planner_message(message, attachments)
         attachment_count = self._attachment_count(attachments)
-        workspace_attachment_count = self._workspace_attachment_count(attachments)
-        tool_intent_route = await self._route_tool_intent_for_exposure(
-            message=message,
-            session_bound_workspace=(
-                scope.project_id is not None
-                or effective_workspace_dir != self._config.workspace_dir
-            ),
-            attachment_count=attachment_count,
-            workspace_attachment_count=workspace_attachment_count,
-            active_backend=active_backend,
-            execution_profile="chat",
-            tool_mode="auto",
+        session_bound_workspace = (
+            scope.project_id is not None
+            or effective_workspace_dir != self._config.workspace_dir
         )
-        exposure_plan = self._tool_exposure_planner.plan(
-            message=planner_message,
-            user_intent_message=message,
+        autonomy_mode = (
+            inference_overrides.get("autonomy_mode")
+            if isinstance(inference_overrides, dict)
+            and inference_overrides.get("autonomy_mode")
+            else self._config.security.autonomy_mode
+        )
+        exposure_plan = self._tool_exposure_planner.plan_contract_baseline(
             available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
-            session_bound_workspace=(
-                scope.project_id is not None
-                or effective_workspace_dir != self._config.workspace_dir
-            ),
-            autonomy_mode=(
-                inference_overrides.get("autonomy_mode")
-                if isinstance(inference_overrides, dict) and inference_overrides.get("autonomy_mode")
-                else self._config.security.autonomy_mode
-            ),
-            preferred_tool_names=skill_selection.preferred_tool_names,
-            tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
+            session_bound_workspace=session_bound_workspace,
+            autonomy_mode=autonomy_mode,
             attachment_count=attachment_count,
-            workspace_attachment_count=workspace_attachment_count,
-            routed_intent=tool_intent_route.intent,
-            intent_confidence=tool_intent_route.confidence,
-            intent_source=tool_intent_route.source,
-            intent_rationale=tool_intent_route.rationale,
         )
-        tool_schemas = workspace_registry.get_schemas_for_names(exposure_plan.tool_names)
+        policy_eligible_tool_names = set(exposure_plan.discoverable_tool_names)
+        await self._router.mark_backend_busy(active_backend)
+        try:
+            rollout = await self._resolve_turn_contract_rollout(
+                active_backend=active_backend,
+                session_id=session_key,
+                turn_id=str(uuid4()),
+                message=message,
+                prompt_context=prompt_context,
+                available_tools=available_tools,
+                preferred_tool_names=contract_tool_preferences,
+                policy_eligible_tool_names=policy_eligible_tool_names,
+                execution_profile="chat",
+                tool_mode="auto",
+                workspace_mutation_eligible=bool(str(effective_workspace_dir).strip()),
+                tool_allowlist=None,
+                tool_denylist=None,
+                load_durable_state=False,
+                user_message_already_persisted=False,
+                selected_skill_ids=list(selected_skill_ids or []),
+                attachments=attachments,
+            )
+        finally:
+            await self._router.mark_backend_idle(active_backend)
+        exposure_plan = adapt_capability_plan_to_exposure(
+            baseline_plan=exposure_plan,
+            capability_plan=rollout.capability_plan,
+            contract=rollout.resolution.contract,
+        )
+        preview_registry = workspace_registry.create_view(
+            exposure_plan.tool_names,
+            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+            schema_limit=exposure_plan.limit,
+        )
+        tool_schemas = preview_registry.get_schemas()
         attachment_context = self._build_attachment_prompt_context(
             attachments=attachments,
             available_tool_names=exposure_plan.tool_names,
@@ -808,6 +1486,27 @@ class AgentEngine:
         request.turn_id = turn_id
         request.active_tool_controller = active_tool_controller
         request.cancellation_context = cancellation_context
+        timeline: TimelineCoordinator | None = None
+        if request.execution_profile == "chat" and request.persist_session:
+            timeline = TimelineCoordinator(
+                session_store=self._session_store,
+                session_id=session_key,
+                turn_id=turn_id,
+            )
+            await timeline.admit_user_message(
+                self._session_message_event(
+                    Message(
+                        role="user",
+                        content=request.message,
+                        attachments=list(request.attachments or []),
+                    ),
+                    turn_id=turn_id,
+                    session_id=session_key,
+                    selected_skill_ids=list(request.selected_skill_ids or []),
+                )
+            )
+            request.timeline_user_message_admitted = True
+            request.timeline_coordinator = timeline
         queue: asyncio.Queue[AgentEvent | object] = asyncio.Queue()
         sentinel = object()
         invocation_error: Exception | None = None
@@ -820,10 +1519,17 @@ class AgentEngine:
         async def _run_invocation() -> None:
             nonlocal invocation_error
             try:
+                if timeline is not None:
+                    request.timeline_history_events = list(await timeline.claim())
+                    await timeline.start_heartbeat()
                 await self._invoke_shared_runtime(request, event_callback=_emit_event)
                 snapshot = await cancellation_context.snapshot()
                 if str(snapshot.get("state") or "") != "completed":
                     await cancellation_context.mark_completed()
+            except TimelineTurnCancelled:
+                snapshot = await cancellation_context.snapshot()
+                if str(snapshot.get("state") or "") != "completed":
+                    await cancellation_context.mark_cancelled()
             except asyncio.CancelledError:
                 snapshot = await cancellation_context.snapshot()
                 if str(snapshot.get("state") or "") != "completed":
@@ -833,6 +1539,27 @@ class AgentEngine:
                 invocation_error = exc
             finally:
                 final_snapshot = await cancellation_context.snapshot()
+                if timeline is not None:
+                    transcript_events = tuple(
+                        self._session_message_event(
+                            message,
+                            turn_id=turn_id,
+                            session_id=session_key,
+                        )
+                        for message in (request.timeline_transcript or [])
+                    )
+                    try:
+                        await timeline.finish(
+                            cancelled=str(final_snapshot.get("state") or "") == "cancelled",
+                            failed=(
+                                invocation_error is not None
+                                or request.timeline_pre_effect_failure
+                            ),
+                            companion_events=transcript_events,
+                        )
+                    except Exception as exc:  # pragma: no cover - terminal safety boundary
+                        if invocation_error is None:
+                            invocation_error = exc
                 await self._finalize_chat_run(
                     session_id=session_key,
                     turn_id=turn_id,
@@ -844,6 +1571,7 @@ class AgentEngine:
             session_id=session_key,
             turn_id=turn_id,
             cancellation_context=cancellation_context,
+            timeline=timeline,
         )
         worker = asyncio.create_task(_run_invocation())
         await cancellation_context.bind_generation_cancel_callback(
@@ -858,6 +1586,8 @@ class AgentEngine:
         finally:
             snapshot = await cancellation_context.snapshot()
             if not worker.done() and str(snapshot.get("state") or "") != "completed":
+                if timeline is not None:
+                    await timeline.request_cancel()
                 cancel_result = await cancellation_context.request_generation_cancel()
                 if cancel_result.state == "cancelled":
                     with contextlib.suppress(asyncio.CancelledError):
@@ -879,7 +1609,14 @@ class AgentEngine:
             await self.initialize()
 
         session_key = request.session_id or "default"
-        context = await self._get_context(session_key)
+        if request.timeline_history_events is None:
+            context = await self._get_context(session_key)
+        else:
+            context = self._new_context()
+            self._restore_session_history_events(
+                request.timeline_history_events,
+                context,
+            )
         resolved = self._resolve_inference_params(request.inference_overrides)
         reserve_output_tokens = int(resolved["reserve_output_tokens"])
         prompt_context = await context.prepare_prompt_context(
@@ -892,8 +1629,12 @@ class AgentEngine:
             request.message,
             selected_skill_ids=request.selected_skill_ids,
         )
+        contract_tool_preferences = (
+            skill_selection.preferred_tool_names
+            if request.selected_skill_ids
+            else []
+        )
         skills_context = self._render_skills_context(skill_selection)
-        planner_message = self._build_tool_planner_message(request.message, request.attachments)
         scope = await self._execution_scope_resolver.resolve(
             session_id=session_key,
             project_id=request.project_id,
@@ -928,38 +1669,121 @@ class AgentEngine:
             capabilities,
         )
         reasoning_effort = sanitized.get("reasoning_effort")
-        attachment_count = self._attachment_count(request.attachments)
-        workspace_attachment_count = self._workspace_attachment_count(request.attachments)
-        tool_intent_route = await self._route_tool_intent_for_exposure(
-            message=request.message,
-            session_bound_workspace=session_bound_workspace,
-            attachment_count=attachment_count,
-            workspace_attachment_count=workspace_attachment_count,
-            active_backend=active_backend,
-            execution_profile=request.execution_profile,
-            tool_mode=request.tool_mode,
+        autonomy_mode = self._config.security.autonomy_mode
+        if isinstance(request.permission_policy, dict):
+            requested_autonomy_mode = request.permission_policy.get("autonomy_mode")
+            if (
+                isinstance(requested_autonomy_mode, str)
+                and requested_autonomy_mode.strip()
+            ):
+                autonomy_mode = requested_autonomy_mode
+        preflight_system_prompt = self._prompt_builder.build_system_prompt(
+            skills_context=skills_context,
+            memory_context=self._merge_memory_and_summary_context(
+                memory_context=prompt_context.memory_context,
+                summary=prompt_context.summary,
+            ),
+            attachment_context=self._build_attachment_prompt_context(
+                attachments=request.attachments,
+                available_tool_names=[tool.name for tool in available_tools],
+            ),
+            base_prompt=str(sanitized.get("system_prompt") or resolved["system_prompt"]),
+            task_workspace_dir=request.task_workspace_dir,
+            system_prompt_addendum=_merge_prompt_addenda(
+                _build_response_language_prompt_addendum(
+                    self._config.locale_defaults.response_language,
+                    request.message,
+                ),
+                request.system_prompt_addendum,
+            ),
         )
-        exposure_plan = self._tool_exposure_planner.plan(
-            message=planner_message,
-            user_intent_message=request.message,
+        semantic_preflight_overflow = bool(
+            self._estimate_prompt_budget(
+                system_prompt=preflight_system_prompt,
+                history=prompt_context.history,
+                user_message=request.message,
+                tool_schemas=[],
+                backend=active_backend,
+                model_info=active_backend.get_model_info(),
+                reserve_output_tokens=reserve_output_tokens,
+            )["hard_overflow"]
+        )
+        rollout_turn_id = (
+            str(request.turn_id or "").strip() or str(uuid4())
+            if not semantic_preflight_overflow
+            else None
+        )
+        attachment_count = self._attachment_count(request.attachments)
+        exposure_plan = self._tool_exposure_planner.plan_contract_baseline(
             available_tool_names=[tool.name for tool in available_tools],
             backend=active_backend,
             session_bound_workspace=session_bound_workspace,
-            autonomy_mode=(
-                request.permission_policy.get("autonomy_mode")
-                if isinstance(request.permission_policy, dict)
-                else self._config.security.autonomy_mode
-            ),
-            preferred_tool_names=skill_selection.preferred_tool_names,
-            tool_capabilities={tool.name: tool.tool_capabilities for tool in available_tools},
+            autonomy_mode=autonomy_mode,
             attachment_count=attachment_count,
-            workspace_attachment_count=workspace_attachment_count,
             tool_mode=request.tool_mode,
-            routed_intent=tool_intent_route.intent,
-            intent_confidence=tool_intent_route.confidence,
-            intent_source=tool_intent_route.source,
-            intent_rationale=tool_intent_route.rationale,
         )
+        policy_eligible_tool_names = set(exposure_plan.discoverable_tool_names)
+        turn_contract_rollout: TurnContractRolloutResult | None = None
+        rollout_user_message_persisted = request.timeline_user_message_admitted
+        if not semantic_preflight_overflow:
+            assert rollout_turn_id is not None
+            try:
+                await self._router.mark_backend_busy(active_backend)
+                try:
+                    turn_contract_rollout = await self._resolve_turn_contract_rollout(
+                        active_backend=active_backend,
+                        session_id=session_key,
+                        turn_id=rollout_turn_id,
+                        message=request.message,
+                        prompt_context=prompt_context,
+                        available_tools=available_tools,
+                        preferred_tool_names=contract_tool_preferences,
+                        policy_eligible_tool_names=policy_eligible_tool_names,
+                        execution_profile=request.execution_profile,
+                        tool_mode=request.tool_mode,
+                        workspace_mutation_eligible=bool(
+                            str(effective_workspace_dir).strip()
+                        ),
+                        tool_allowlist=request.tool_allowlist,
+                        tool_denylist=request.tool_denylist,
+                        load_durable_state=request.persist_session,
+                        user_message_already_persisted=request.timeline_user_message_admitted,
+                        selected_skill_ids=list(request.selected_skill_ids or []),
+                        attachments=request.attachments,
+                    )
+                finally:
+                    await self._router.mark_backend_idle(active_backend)
+                rollout_user_message_persisted = (
+                    request.persist_session or request.timeline_user_message_admitted
+                )
+                exposure_plan = adapt_capability_plan_to_exposure(
+                    baseline_plan=exposure_plan,
+                    capability_plan=turn_contract_rollout.capability_plan,
+                    contract=turn_contract_rollout.resolution.contract,
+                    ceilings=ExposurePolicyCeilings(
+                        tool_mode=request.tool_mode,
+                        allowed_tool_names=(
+                            frozenset(request.tool_allowlist)
+                            if request.tool_allowlist is not None
+                            else None
+                        ),
+                        denied_tool_names=frozenset(request.tool_denylist or ()),
+                        sandbox_eligible_tool_names=frozenset(
+                            policy_eligible_tool_names
+                        ),
+                    ),
+                )
+                exposure_plan = self._with_tool_exposure_diagnostic(
+                    exposure_plan,
+                    "turn_contract_rollout",
+                    turn_contract_rollout.diagnostics(),
+                )
+            except Exception as exc:
+                if isinstance(exc, _TurnContractRolloutFailure):
+                    rollout_user_message_persisted = exc.user_message_persisted
+                if owns_invocation_backend:
+                    await active_backend.close()
+                raise
         exposure_plan = self._with_tool_exposure_diagnostic(
             exposure_plan,
             "engine_input",
@@ -986,10 +1810,22 @@ class AgentEngine:
             },
         )
         before_overrides_count = len(exposure_plan.tool_names)
+        effective_tool_names_override = request.tool_names_override
+        if turn_contract_rollout is not None:
+            authoritative_names = set(exposure_plan.tool_names)
+            effective_tool_names_override = (
+                [
+                    name
+                    for name in request.tool_names_override
+                    if name in authoritative_names
+                ]
+                if request.tool_names_override is not None
+                else None
+            )
         exposure_plan = self._apply_invocation_tool_overrides(
             exposure_plan,
             available_tool_names=[tool.name for tool in available_tools],
-            tool_names_override=request.tool_names_override,
+            tool_names_override=effective_tool_names_override,
             tool_allowlist=request.tool_allowlist,
             tool_denylist=request.tool_denylist,
         )
@@ -1050,17 +1886,32 @@ class AgentEngine:
             task_workspace_dir=request.task_workspace_dir,
             system_prompt_addendum=system_prompt_addendum,
         )
-        persist_turn_events = request.persist_session if request.persist_turn_events is None else request.persist_turn_events
-        persist_learning = request.persist_session if request.persist_learning is None else request.persist_learning
-        trajectory_id = self._start_trajectory(request.message) if persist_learning else None
-        turn_id = str(request.turn_id or "").strip() or str(uuid4())
+        persist_turn_events = (
+            request.persist_session
+            if request.persist_turn_events is None
+            else request.persist_turn_events
+        )
+        persist_learning = (
+            request.persist_session
+            if request.persist_learning is None
+            else request.persist_learning
+        )
+        trajectory_id = (
+            self._start_trajectory(request.message) if persist_learning else None
+        )
+        turn_id = rollout_turn_id or str(request.turn_id or "").strip() or str(uuid4())
         turn_event_seq = 0
         user_msg = Message(
             role="user",
             content=request.message,
             attachments=list(request.attachments or []),
         )
-        if request.persist_session:
+        if (
+            request.persist_session
+            and turn_contract_rollout is None
+            and not rollout_user_message_persisted
+            and not request.timeline_user_message_admitted
+        ):
             await self._persist_session_message(
                 session_key,
                 user_msg,
@@ -1074,6 +1925,31 @@ class AgentEngine:
             permission_policy_override=request.permission_policy,
             active_tool_controller=request.active_tool_controller,
         )
+        if turn_contract_rollout is not None:
+            tool_execution_context = self._fork_turn_tool_execution_context(
+                tool_execution_context
+            )
+        if request.execution_profile == "chat":
+            # File/exec tools use this only when a concrete call requires
+            # human review.  It makes that result a durable Chat interrupt and
+            # binds the persisted replay to this exact ReAct cursor.
+            tool_execution_context.state["ordinary_chat_approval_context"] = {
+                "schema_version": 1,
+                "source": "ordinary_chat",
+                "session_id": session_key,
+                "turn_id": turn_id,
+                "resume_cursor": {
+                    "turn_id": turn_id,
+                    "phase": "tool_call",
+                },
+            }
+            tool_execution_context.state["tool_workflow_approval_observer"] = (
+                self._observe_tool_workflow_approval
+            )
+        if request.timeline_coordinator is not None:
+            tool_execution_context.state["timeline_tool_lifecycle"] = (
+                request.timeline_coordinator
+            )
         if request.cancellation_context is not None:
             await request.cancellation_context.bind_active_tool_controller(
                 request.active_tool_controller
@@ -1097,30 +1973,130 @@ class AgentEngine:
         tool_registry = workspace_registry.create_view(
             exposure_plan.tool_names,
             tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+            schema_limit=exposure_plan.limit,
         )
-        tool_activation_policy = tool_execution_context.state.setdefault(
-            "tool_activation_policy",
-            {},
-        )
-        if isinstance(tool_activation_policy, dict):
-            tool_activation_policy.update(
-                {
-                    "routed_intent": tool_intent_route.intent,
-                    "execution_profile": request.execution_profile,
-                    "tool_mode": request.tool_mode,
-                    "discoverable_tool_names": list(exposure_plan.discoverable_tool_names),
-                    "tool_allowlist": (
-                        list(request.tool_allowlist)
-                        if request.tool_allowlist is not None
-                        else None
-                    ),
-                    "tool_denylist": (
-                        list(request.tool_denylist)
-                        if request.tool_denylist is not None
-                        else None
-                    ),
-                }
+        if turn_contract_rollout is None:
+            tool_execution_context.state["tool_activation_policy"] = {
+                "turn_contract_mode": "enforce",
+                "capability_enforcement_mode": "blocked",
+                "mutation_requirement": "unknown",
+                "requested_operations": [],
+                "required_capabilities": [],
+                "activation_allowed_tool_names": [],
+                "execution_profile": request.execution_profile,
+                "tool_mode": "disabled",
+                "discoverable_tool_names": [],
+                "tool_allowlist": [],
+                "tool_denylist": list(request.tool_denylist or ()),
+            }
+        else:
+            contract = turn_contract_rollout.resolution.contract
+            capability_plan = turn_contract_rollout.capability_plan
+            adapter_diagnostics = exposure_plan.diagnostics.get(
+                "capability_exposure_adapter",
+                {},
             )
+            activation_allowed_tool_names = (
+                adapter_diagnostics.get("activation_allowed_tool_names", [])
+                if isinstance(adapter_diagnostics, dict)
+                else []
+            )
+            tool_execution_context.state["tool_activation_policy"] = {
+                "turn_id": turn_id,
+                "turn_contract_mode": turn_contract_rollout.mode,
+                "capability_enforcement_mode": "enforce",
+                "mutation_requirement": contract.mutation_requirement,
+                "requested_operations": sorted(contract.operations),
+                "required_capabilities": sorted(capability_plan.required_capabilities),
+                "activation_allowed_tool_names": list(
+                    activation_allowed_tool_names
+                ),
+                "execution_profile": request.execution_profile,
+                "tool_mode": request.tool_mode,
+                "discoverable_tool_names": list(exposure_plan.discoverable_tool_names),
+                "tool_allowlist": (
+                    list(request.tool_allowlist)
+                    if request.tool_allowlist is not None
+                    else None
+                ),
+                "tool_denylist": (
+                    list(request.tool_denylist)
+                    if request.tool_denylist is not None
+                    else None
+                ),
+            }
+        turn_checkpoint: TurnCheckpoint | None = None
+        turn_checkpoint_error: str | None = None
+        controlled_recovery_reentry_blocker: str | None = None
+        if request.persist_session and turn_contract_rollout is not None:
+            try:
+                initial_checkpoint = self._build_turn_checkpoint(
+                    session_id=session_key,
+                    turn_id=turn_id,
+                    rollout=turn_contract_rollout,
+                    exposure_plan=exposure_plan,
+                    tool_execution_context=tool_execution_context,
+                )
+                checkpoint_save = await self._turn_checkpoint_repository.save(
+                    initial_checkpoint,
+                    expected_revision=0,
+                )
+                if checkpoint_save.status != "saved" or checkpoint_save.checkpoint is None:
+                    if checkpoint_save.status == "conflict":
+                        loaded_checkpoint = await self._turn_checkpoint_repository.load(
+                            session_key,
+                            turn_id,
+                        )
+                        existing = loaded_checkpoint.checkpoint
+                        recovery_state, recovery_error = self._controlled_recovery_state(
+                            existing.execution_receipt if existing is not None else None
+                        )
+                        if (
+                            loaded_checkpoint.diagnostics.status == "loaded"
+                            and existing is not None
+                            and existing.stage not in {"completed", "blocked"}
+                            and recovery_error is None
+                            and recovery_state.get("status") == "reserved"
+                        ):
+                            turn_checkpoint = existing
+                            controlled_recovery_reentry_blocker = (
+                                "controlled_recovery_reservation_requires_manual_replan"
+                            )
+                        else:
+                            turn_checkpoint_error = (
+                                checkpoint_save.message
+                                or "unable to persist initial turn checkpoint"
+                            )
+                    else:
+                        turn_checkpoint_error = (
+                            checkpoint_save.message
+                            or "unable to persist initial turn checkpoint"
+                        )
+                else:
+                    turn_checkpoint = checkpoint_save.checkpoint
+                    turn_checkpoint, turn_checkpoint_error = (
+                        await self._transition_turn_checkpoint(
+                            turn_checkpoint,
+                            stage="executing",
+                            resume_cursor={"turn_id": turn_id, "phase": "react"},
+                        )
+                    )
+            except Exception as exc:
+                turn_checkpoint_error = f"{type(exc).__name__}: {exc}"
+            if turn_checkpoint_error is not None:
+                existing_error = turn_contract_rollout.state_persist_error
+                turn_contract_rollout = replace(
+                    turn_contract_rollout,
+                    state_persist_error="; ".join(
+                        part
+                        for part in (
+                            existing_error,
+                            "turn checkpoint persistence failed: "
+                            + turn_checkpoint_error,
+                        )
+                        if part
+                    ),
+                )
         model_info = active_backend.get_model_info()
         diagnostics = AgentInvocationDiagnostics(
             execution_profile=request.execution_profile,
@@ -1131,12 +2107,15 @@ class AgentEngine:
         )
         tool_exposure_metadata = diagnostics.tool_exposure or exposure_plan.exposure_metadata()
         logger.debug(
-            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, routed_intent={}, route_source={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
+            "Tool exposure plan: backend={}, tool_mode={}, execution_profile={}, contract_operations={}, matched_groups={}, exposed_tools={}, workspace_bound={}, attachment_count={}",
             active_backend.get_model_info().backend_type,
             request.tool_mode,
             request.execution_profile,
-            tool_intent_route.intent,
-            tool_intent_route.source,
+            (
+                sorted(turn_contract_rollout.resolution.contract.operations)
+                if turn_contract_rollout is not None
+                else ["overflow_blocked"]
+            ),
             exposure_plan.matched_groups,
             exposure_plan.tool_names,
             exposure_plan.workspace_bound,
@@ -1145,7 +2124,84 @@ class AgentEngine:
         if request.tool_mode == "required" and not exposure_plan.tool_names:
             diagnostics.fallback_reason = "tool_mode_required_but_no_tools_exposed"
 
-        tool_schemas = workspace_registry.get_schemas_for_names(exposure_plan.tool_names)
+        enforce_blocker = self._turn_contract_enforce_blocker(
+            rollout=turn_contract_rollout,
+            exposure_plan=exposure_plan,
+            callable_tool_names=[
+                schema["function"]["name"] for schema in tool_registry.get_schemas()
+            ],
+        )
+        if controlled_recovery_reentry_blocker is not None:
+            enforce_blocker = (
+                controlled_recovery_reentry_blocker,
+                "A prior corrective recovery was reserved before this turn stopped. "
+                "For safety, it will not be replayed automatically.",
+            )
+        if enforce_blocker is not None:
+            blocker_reason, final_text = enforce_blocker
+            diagnostics.fallback_reason = blocker_reason
+            blocker_metadata = {
+                "runtime_category": "turn_contract",
+                "error_type": blocker_reason,
+                "recoverability": "requires_user_input",
+                "reason": blocker_reason,
+                "tool_exposure": copy.deepcopy(tool_exposure_metadata),
+            }
+            if turn_checkpoint is not None:
+                transitioned_checkpoint, checkpoint_error = (
+                    await self._transition_turn_checkpoint(
+                        turn_checkpoint,
+                        stage="blocked",
+                        blocker_reason=blocker_reason,
+                        resume_cursor={"turn_id": turn_id, "phase": "blocked"},
+                    )
+                )
+                if checkpoint_error is not None:
+                    blocker_metadata["turn_checkpoint_persist_error"] = checkpoint_error
+                else:
+                    turn_checkpoint = transitioned_checkpoint
+            final_event = FinalAnswerEvent(
+                content=final_text,
+                finish_reason=blocker_reason,
+                input_tokens=0,
+                output_tokens=0,
+                metadata=blocker_metadata,
+            )
+            final_event.turn_id = turn_id
+            if persist_turn_events:
+                await self._persist_turn_event(
+                    session_key,
+                    final_event,
+                    turn_id=turn_id,
+                    seq=1,
+                )
+            if event_callback is not None:
+                callback_result = event_callback(final_event)
+                if inspect.isawaitable(callback_result):
+                    await cast(Awaitable[None], callback_result)
+            if persist_learning:
+                await self._finish_learning_cycle(trajectory_id)
+            if request.persist_session:
+                context.add_message(user_msg)
+                assistant_msg = Message(role="assistant", content=final_text)
+                context.add_message(assistant_msg)
+                if request.timeline_user_message_admitted:
+                    request.timeline_transcript = [assistant_msg]
+                else:
+                    await self._persist_session_message(
+                        session_key,
+                        assistant_msg,
+                        turn_id=turn_id,
+                    )
+            if owns_invocation_backend:
+                await active_backend.close()
+            return AgentInvocationResult(
+                content=final_text,
+                events=[final_event],
+                diagnostics=diagnostics,
+            )
+
+        tool_schemas = tool_registry.get_schemas()
         prompt_budget = self._estimate_prompt_budget(
             system_prompt=system_prompt,
             history=prompt_context.history,
@@ -1176,6 +2232,19 @@ class AgentEngine:
                 "model": model_info.name,
                 "backend_type": model_info.backend_type,
             }
+            if turn_checkpoint is not None:
+                transitioned_checkpoint, checkpoint_error = (
+                    await self._transition_turn_checkpoint(
+                        turn_checkpoint,
+                        stage="blocked",
+                        blocker_reason="context_overflow",
+                        resume_cursor={"turn_id": turn_id, "phase": "blocked"},
+                    )
+                )
+                if checkpoint_error is not None:
+                    overflow_metadata["turn_checkpoint_persist_error"] = checkpoint_error
+                else:
+                    turn_checkpoint = transitioned_checkpoint
             final_text = (
                 "The request exceeds the current model context window after compaction. "
                 "Please reduce the prompt, attachments, or history before retrying."
@@ -1215,35 +2284,41 @@ class AgentEngine:
                 context.add_message(user_msg)
                 assistant_msg = Message(role="assistant", content=final_text)
                 context.add_message(assistant_msg)
-                await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
+                if request.timeline_user_message_admitted:
+                    request.timeline_transcript = [assistant_msg]
+                else:
+                    await self._persist_session_message(
+                        session_key, assistant_msg, turn_id=turn_id
+                    )
+            if owns_invocation_backend:
+                await active_backend.close()
             return AgentInvocationResult(
                 content=final_text,
                 events=events,
                 diagnostics=diagnostics,
             )
 
-        workspace_write_obligation_diagnostics = exposure_plan.diagnostics.get(
-            "workspace_write_obligation"
-        )
-        requires_file_mutation = (
-            tool_intent_route.intent == "workspace_write"
-            or (
-                isinstance(workspace_write_obligation_diagnostics, dict)
-                and bool(workspace_write_obligation_diagnostics.get("required"))
+        if turn_contract_rollout is not None:
+            requires_file_mutation = bool(
+                turn_contract_rollout.capability_plan.artifact_obligation.required
+                and turn_contract_rollout.capability_plan.artifact_obligation.ready
+            )
+        else:
+            requires_file_mutation = False
+        react_max_iterations = (
+            request.max_iterations_override
+            if isinstance(request.max_iterations_override, int)
+            and request.max_iterations_override > 0
+            else self._default_max_iterations_for_backend(
+                self._config.agent.max_react_iterations,
+                active_backend,
             )
         )
         react_loop = AsyncReActLoop(
             backend=active_backend,
             tool_registry=tool_registry,
             tool_execution_context=tool_execution_context,
-            max_iterations=(
-                request.max_iterations_override
-                if isinstance(request.max_iterations_override, int) and request.max_iterations_override > 0
-                else self._default_max_iterations_for_backend(
-                    self._config.agent.max_react_iterations,
-                    active_backend,
-                )
-            ),
+            max_iterations=react_max_iterations,
             requires_file_mutation=requires_file_mutation,
         )
         events: list[AgentEvent] = []
@@ -1325,27 +2400,21 @@ class AgentEngine:
                 ),
                 reasoning_effort=cast(ReasoningEffort | None, reasoning_effort),
             ):
-                self._log_agent_event(trajectory_id, event)
                 if isinstance(event, FinalAnswerEvent):
                     final_text = event.content
                     event.trajectory_id = trajectory_id
-                event_metadata = getattr(event, "metadata", None)
-                if isinstance(event_metadata, dict):
-                    event_metadata.setdefault("tool_exposure", copy.deepcopy(tool_exposure_metadata))
-                event.turn_id = turn_id  # type: ignore[attr-defined]
-                turn_event_seq += 1
-                if persist_turn_events:
-                    await self._persist_turn_event(
-                        session_key,
-                        event,
-                        turn_id=turn_id,
-                        seq=turn_event_seq,
-                    )
-                events.append(event)
-                if event_callback is not None:
-                    callback_result = event_callback(event)
-                    if inspect.isawaitable(callback_result):
-                        await cast(Awaitable[None], callback_result)
+                turn_event_seq = await self._record_react_event(
+                    event=event,
+                    trajectory_id=trajectory_id,
+                    tool_exposure_metadata=tool_exposure_metadata,
+                    turn_id=turn_id,
+                    session_id=session_key,
+                    request=request,
+                    persist_turn_events=persist_turn_events,
+                    events=events,
+                    event_callback=event_callback,
+                    turn_event_seq=turn_event_seq,
+                )
         finally:
             await self._router.mark_backend_idle(active_backend)
             if owns_invocation_backend:
@@ -1356,13 +2425,443 @@ class AgentEngine:
 
         if request.persist_session:
             context.add_message(user_msg)
-            for replay_message in react_loop.turn_messages:
+            transcript = react_loop.turn_messages
+            if not transcript:
+                transcript = [Message(role="assistant", content=final_text)]
+            for replay_message in transcript:
                 context.add_message(replay_message)
-                await self._persist_session_message(session_key, replay_message, turn_id=turn_id)
-            if not react_loop.turn_messages:
-                assistant_msg = Message(role="assistant", content=final_text)
-                context.add_message(assistant_msg)
-                await self._persist_session_message(session_key, assistant_msg, turn_id=turn_id)
+            if request.timeline_user_message_admitted:
+                request.timeline_transcript = transcript
+            else:
+                for replay_message in transcript:
+                    await self._persist_session_message(
+                        session_key,
+                        replay_message,
+                        turn_id=turn_id,
+                    )
+
+        checkpoint_transition_error: str | None = None
+        execution_receipt: dict[str, Any] | None = None
+        pending_tool_call: dict[str, Any] | None = None
+        approval_record: dict[str, Any] | None = None
+        if turn_checkpoint is not None:
+            (
+                execution_receipt,
+                pending_tool_call,
+                approval_record,
+            ) = self._turn_execution_checkpoint_data(events)
+            if approval_record is not None:
+                next_checkpoint_stage: Literal["awaiting_approval", "verifying"] = (
+                    "awaiting_approval"
+                )
+                next_cursor = {"turn_id": turn_id, "phase": "approval"}
+            else:
+                next_checkpoint_stage = "verifying"
+                next_cursor = {"turn_id": turn_id, "phase": "verification"}
+            turn_checkpoint, checkpoint_transition_error = (
+                await self._transition_turn_checkpoint(
+                    turn_checkpoint,
+                    stage=next_checkpoint_stage,
+                    pending_tool_call=pending_tool_call,
+                    approval_record=approval_record,
+                    execution_receipt=execution_receipt,
+                    resume_cursor=next_cursor,
+                )
+            )
+            if checkpoint_transition_error is not None:
+                for event in reversed(events):
+                    if isinstance(event, FinalAnswerEvent):
+                        event.metadata["turn_checkpoint_persist_error"] = (
+                            checkpoint_transition_error
+                        )
+                        break
+
+        completion_persist_error: str | None = None
+        if checkpoint_transition_error is None and approval_record is None:
+            completion_persist_error = await self._complete_turn_contract_task_if_satisfied(
+                session_id=session_key,
+                turn_id=turn_id,
+                rollout=turn_contract_rollout,
+                events=events,
+                persist_session=request.persist_session,
+                workspace_dir=effective_workspace_dir,
+            )
+        if completion_persist_error is not None:
+            logger.error(
+                "Unable to persist completed turn-contract task state: {}",
+                completion_persist_error,
+            )
+            for event in reversed(events):
+                if isinstance(event, FinalAnswerEvent):
+                    event.metadata["turn_contract_completion_persist_error"] = (
+                        completion_persist_error
+                    )
+                    break
+
+        controlled_recovery_blocker_reason: str | None = None
+        if turn_checkpoint is not None and approval_record is None:
+            initial_final_event = next(
+                (event for event in reversed(events) if isinstance(event, FinalAnswerEvent)),
+                None,
+            )
+            initial_receipt = (
+                _checkpoint_json_safe(initial_final_event.metadata.get("artifact_verification"))
+                if initial_final_event is not None
+                and isinstance(initial_final_event.metadata.get("artifact_verification"), Mapping)
+                else None
+            )
+            artifact_required = bool(
+                turn_contract_rollout is not None
+                and turn_contract_rollout.capability_plan.artifact_obligation.required
+                and turn_contract_rollout.capability_plan.artifact_obligation.ready
+            )
+            if (
+                artifact_required
+                and initial_receipt is not None
+                and initial_receipt.get("verification_status") == "failed"
+                and request.timeline_coordinator is not None
+            ):
+                recovery_state, recovery_state_error = self._controlled_recovery_state(
+                    execution_receipt
+                )
+                operation, operation_error = self._recovery_operation_from_events(events)
+                decision: ControlledRecoveryDecision | None = None
+                if recovery_state_error is not None:
+                    controlled_recovery_blocker_reason = recovery_state_error
+                elif request.timeline_pre_effect_failure:
+                    controlled_recovery_blocker_reason = "timeline_pre_effect_failure"
+                elif not self._is_automatically_correctable_receipt(initial_receipt):
+                    controlled_recovery_blocker_reason = "artifact_recovery_not_automatable"
+                elif operation_error is not None:
+                    controlled_recovery_blocker_reason = operation_error
+                elif operation is None:
+                    controlled_recovery_blocker_reason = "timeline_operation_evidence_missing"
+                elif recovery_state["status"] == "reserved":
+                    controlled_recovery_blocker_reason = (
+                        "controlled_recovery_reservation_requires_manual_replan"
+                    )
+                elif recovery_state["replans_used"] >= recovery_state["max_replans"]:
+                    controlled_recovery_blocker_reason = "controlled_recovery_budget_exhausted"
+                elif bool(
+                    tool_execution_context.permission_policy.get(
+                        "require_approval_for_file_write"
+                    )
+                ):
+                    controlled_recovery_blocker_reason = "controlled_recovery_requires_approval"
+                else:
+                    try:
+                        decision = ControlledRecoveryCoordinator.decide(
+                            operation=operation,
+                            receipt=ArtifactReceiptState(
+                                execution_status=str(initial_receipt.get("execution_status")),  # type: ignore[arg-type]
+                                retry_disposition=str(initial_receipt.get("retry_disposition")),  # type: ignore[arg-type]
+                            ),
+                        )
+                    except ValueError:
+                        controlled_recovery_blocker_reason = "artifact_recovery_receipt_invalid"
+
+                if decision is not None and decision.action == "blocked_unknown":
+                    controlled_recovery_blocker_reason = decision.reason_code
+                elif decision is not None and decision.action not in {
+                    "new_operation",
+                    "corrective_replan",
+                    "model_replan",
+                }:
+                    controlled_recovery_blocker_reason = decision.reason_code
+
+                if decision is not None and controlled_recovery_blocker_reason is None:
+                    recovery_metadata = {
+                        **recovery_state,
+                        "replans_used": recovery_state["replans_used"] + 1,
+                        "status": "reserved",
+                        "action": decision.action,
+                        "reason_code": decision.reason_code,
+                        "predecessor_operation_id": decision.operation_id,
+                    }
+                    execution_receipt = dict(execution_receipt or {})
+                    execution_receipt["controlled_recovery"] = recovery_metadata
+                    turn_checkpoint, recovery_checkpoint_error = (
+                        await self._transition_turn_checkpoint(
+                            turn_checkpoint,
+                            stage="verifying",
+                            execution_receipt=execution_receipt,
+                            verification_result=initial_receipt,
+                            resume_cursor={
+                                "turn_id": turn_id,
+                                "phase": "controlled_recovery",
+                                "predecessor_operation_id": decision.operation_id,
+                            },
+                        )
+                    )
+                    if recovery_checkpoint_error is not None or turn_checkpoint is None:
+                        controlled_recovery_blocker_reason = (
+                            "controlled_recovery_reservation_persist_failed"
+                        )
+                    else:
+                        recovery_status = StatusEvent(
+                            content="Artifact verification requested one bounded corrective replan.",
+                            metadata={
+                                "reason": "controlled_recovery_reserved",
+                                "controlled_recovery": _checkpoint_json_safe(
+                                    recovery_metadata
+                                ),
+                            },
+                        )
+                        turn_event_seq = await self._record_react_event(
+                            event=recovery_status,
+                            trajectory_id=trajectory_id,
+                            tool_exposure_metadata=tool_exposure_metadata,
+                            turn_id=turn_id,
+                            session_id=session_key,
+                            request=request,
+                            persist_turn_events=persist_turn_events,
+                            events=events,
+                            event_callback=event_callback,
+                            turn_event_seq=turn_event_seq,
+                            controlled_recovery=recovery_metadata,
+                        )
+                        recovery_start = len(events)
+                        recovery_history = [
+                            *prompt_context.history,
+                            Message(role="user", content=request.message),
+                            *react_loop.turn_messages,
+                        ]
+                        try:
+                            corrective_loop, corrective_final_text, turn_event_seq = (
+                                await self._run_controlled_recovery_pass(
+                                    backend=active_backend,
+                                    tool_registry=tool_registry,
+                                    tool_execution_context=tool_execution_context,
+                                    max_iterations=min(2, react_max_iterations),
+                                    system_prompt=system_prompt,
+                                    history=recovery_history,
+                                    recovery_prompt=self._controlled_recovery_prompt(
+                                        decision=decision,
+                                        receipt=initial_receipt,
+                                    ),
+                                    temperature=cast(
+                                        float,
+                                        sanitized.get("temperature", resolved["temperature"]),
+                                    ),
+                                    max_tokens=cast(int, resolved["max_output_tokens"]),
+                                    top_p=cast(float, sanitized.get("top_p", resolved["top_p"])),
+                                    min_p=cast(float, sanitized.get("min_p", resolved["min_p"])),
+                                    top_k=cast(int, sanitized.get("top_k", resolved["top_k"])),
+                                    frequency_penalty=cast(
+                                        float,
+                                        sanitized.get(
+                                            "frequency_penalty",
+                                            resolved["frequency_penalty"],
+                                        ),
+                                    ),
+                                    presence_penalty=cast(
+                                        float,
+                                        sanitized.get(
+                                            "presence_penalty",
+                                            resolved["presence_penalty"],
+                                        ),
+                                    ),
+                                    repeat_penalty=cast(
+                                        float,
+                                        sanitized.get(
+                                            "repeat_penalty",
+                                            resolved["repeat_penalty"],
+                                        ),
+                                    ),
+                                    reasoning_effort=cast(
+                                        ReasoningEffort | None, reasoning_effort
+                                    ),
+                                    trajectory_id=trajectory_id,
+                                    tool_exposure_metadata=tool_exposure_metadata,
+                                    turn_id=turn_id,
+                                    session_id=session_key,
+                                    request=request,
+                                    persist_turn_events=persist_turn_events,
+                                    events=events,
+                                    event_callback=event_callback,
+                                    turn_event_seq=turn_event_seq,
+                                    controlled_recovery=recovery_metadata,
+                                    requires_file_mutation=requires_file_mutation,
+                                )
+                            )
+                        except Exception as exc:
+                            controlled_recovery_blocker_reason = (
+                                "controlled_recovery_pass_failed"
+                            )
+                            recovery_metadata["status"] = "blocked"
+                            recovery_metadata["failure"] = type(exc).__name__
+                            recovery_metadata[
+                                "blocker_reason"
+                            ] = controlled_recovery_blocker_reason
+                            execution_receipt["controlled_recovery"] = recovery_metadata
+                            recovery_error = ErrorEvent(
+                                message="The bounded corrective pass stopped safely.",
+                                code="CONTROLLED_RECOVERY_FAILED",
+                                metadata={
+                                    "reason": controlled_recovery_blocker_reason,
+                                    "controlled_recovery": _checkpoint_json_safe(
+                                        recovery_metadata
+                                    ),
+                                },
+                            )
+                            turn_event_seq = await self._record_react_event(
+                                event=recovery_error,
+                                trajectory_id=trajectory_id,
+                                tool_exposure_metadata=tool_exposure_metadata,
+                                turn_id=turn_id,
+                                session_id=session_key,
+                                request=request,
+                                persist_turn_events=persist_turn_events,
+                                events=events,
+                                event_callback=event_callback,
+                                turn_event_seq=turn_event_seq,
+                                controlled_recovery=recovery_metadata,
+                            )
+                        else:
+                            if corrective_final_text:
+                                final_text = corrective_final_text
+                            corrective_events = events[recovery_start:]
+                            successor, _ = self._recovery_operation_from_events(
+                                corrective_events
+                            )
+                            if successor is not None:
+                                if successor.operation_id == decision.operation_id:
+                                    controlled_recovery_blocker_reason = (
+                                        "controlled_recovery_reused_operation_id"
+                                    )
+                                else:
+                                    recovery_metadata["successor_operation_id"] = (
+                                        successor.operation_id
+                                    )
+                            else:
+                                controlled_recovery_blocker_reason = (
+                                    "controlled_recovery_no_successor_operation"
+                                )
+                            execution_receipt, pending_tool_call, approval_record = (
+                                self._turn_execution_checkpoint_data(events)
+                            )
+                            if approval_record is not None:
+                                controlled_recovery_blocker_reason = (
+                                    "controlled_recovery_requires_approval"
+                                )
+                                execution_receipt[
+                                    "controlled_recovery_approval"
+                                ] = approval_record
+                                approval_record = None
+                            elif controlled_recovery_blocker_reason is None:
+                                completion_persist_error = (
+                                    await self._complete_turn_contract_task_if_satisfied(
+                                        session_id=session_key,
+                                        turn_id=turn_id,
+                                        rollout=turn_contract_rollout,
+                                        events=events,
+                                        persist_session=request.persist_session,
+                                        workspace_dir=effective_workspace_dir,
+                                    )
+                                )
+                                recovery_final_event = next(
+                                    (
+                                        event
+                                        for event in reversed(events)
+                                        if isinstance(event, FinalAnswerEvent)
+                                    ),
+                                    None,
+                                )
+                                if (
+                                    recovery_final_event is None
+                                    or recovery_final_event.metadata.get(
+                                        "artifact_verification_status"
+                                    )
+                                    == "failed"
+                                ):
+                                    controlled_recovery_blocker_reason = (
+                                        "controlled_recovery_budget_exhausted"
+                                    )
+                            if controlled_recovery_blocker_reason is None:
+                                recovery_metadata["status"] = "completed"
+                            else:
+                                recovery_metadata["status"] = "blocked"
+                                recovery_metadata[
+                                    "blocker_reason"
+                                ] = controlled_recovery_blocker_reason
+                            execution_receipt["controlled_recovery"] = recovery_metadata
+                            if request.persist_session:
+                                corrective_transcript = corrective_loop.turn_messages
+                                for replay_message in corrective_transcript:
+                                    context.add_message(replay_message)
+                                if request.timeline_user_message_admitted:
+                                    request.timeline_transcript = [
+                                        *(request.timeline_transcript or []),
+                                        *corrective_transcript,
+                                    ]
+                                else:
+                                    for replay_message in corrective_transcript:
+                                        await self._persist_session_message(
+                                            session_key,
+                                            replay_message,
+                                            turn_id=turn_id,
+                                        )
+
+        if turn_checkpoint is not None and approval_record is None:
+            final_event = next(
+                (event for event in reversed(events) if isinstance(event, FinalAnswerEvent)),
+                None,
+            )
+            verification_result = (
+                _checkpoint_json_safe(final_event.metadata.get("artifact_verification"))
+                if final_event is not None
+                and isinstance(final_event.metadata.get("artifact_verification"), Mapping)
+                else {"verification_status": "not_required"}
+            )
+            artifact_required = bool(
+                turn_contract_rollout is not None
+                and turn_contract_rollout.capability_plan.artifact_obligation.required
+                and turn_contract_rollout.capability_plan.artifact_obligation.ready
+            )
+            verification_status = verification_result.get("verification_status")
+            if completion_persist_error is not None:
+                terminal_stage: Literal["completed", "blocked"] = "blocked"
+                terminal_reason = "turn_contract_completion_persist_failed"
+            elif controlled_recovery_blocker_reason is not None:
+                terminal_stage = "blocked"
+                terminal_reason = controlled_recovery_blocker_reason
+            elif artifact_required and verification_status != "verified":
+                terminal_stage = "blocked"
+                terminal_reason = "artifact_verification_failed"
+            elif final_event is None or not final_event.content.strip():
+                terminal_stage = "blocked"
+                terminal_reason = "turn_finished_without_final_answer"
+            else:
+                terminal_stage = "completed"
+                terminal_reason = (
+                    "artifact_verified" if artifact_required else "turn_completed"
+                )
+            transitioned_checkpoint, terminal_checkpoint_error = (
+                await self._transition_turn_checkpoint(
+                    turn_checkpoint,
+                    stage=terminal_stage,
+                    execution_receipt=execution_receipt,
+                    verification_result=verification_result,
+                    resume_cursor={
+                        "turn_id": turn_id,
+                        "phase": (
+                            "completed" if terminal_stage == "completed" else "blocked"
+                        ),
+                    },
+                    completion_reason=(
+                        terminal_reason if terminal_stage == "completed" else None
+                    ),
+                    blocker_reason=(
+                        terminal_reason if terminal_stage == "blocked" else None
+                    ),
+                )
+            )
+            if terminal_checkpoint_error is not None and final_event is not None:
+                final_event.metadata["turn_checkpoint_persist_error"] = (
+                    terminal_checkpoint_error
+                )
+            else:
+                turn_checkpoint = transitioned_checkpoint
 
         return AgentInvocationResult(
             content=final_text,
@@ -1567,7 +3066,6 @@ class AgentEngine:
             discoverable_tool_names=[],
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
-            intent_route=copy.deepcopy(exposure_plan.intent_route),
             diagnostics=copy.deepcopy(exposure_plan.diagnostics),
         )
 
@@ -1590,7 +3088,6 @@ class AgentEngine:
             discoverable_tool_names=list(exposure_plan.discoverable_tool_names),
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
-            intent_route=copy.deepcopy(exposure_plan.intent_route),
             diagnostics=diagnostics,
         )
 
@@ -1647,7 +3144,6 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
-                intent_route=copy.deepcopy(exposure_plan.intent_route),
                 diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         if execution_profile == "subagent_execution_request":
@@ -1660,7 +3156,6 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
-                intent_route=copy.deepcopy(exposure_plan.intent_route),
                 diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         if execution_profile == "controller_exec":
@@ -1677,7 +3172,6 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
-                intent_route=copy.deepcopy(exposure_plan.intent_route),
                 diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         if execution_profile in {"subagent_research", "judge", "verifier"}:
@@ -1690,7 +3184,6 @@ class AgentEngine:
                 ],
                 workspace_bound=exposure_plan.workspace_bound,
                 attachment_count=exposure_plan.attachment_count,
-                intent_route=copy.deepcopy(exposure_plan.intent_route),
                 diagnostics=copy.deepcopy(exposure_plan.diagnostics),
             )
         return exposure_plan
@@ -1706,21 +3199,48 @@ class AgentEngine:
             return exposure_plan
         if "tool_result_read" not in available_tool_names:
             return exposure_plan
+        if "tool_result_read" not in exposure_plan.discoverable_tool_names:
+            return exposure_plan
+        if exposure_plan.limit <= 0:
+            return exposure_plan
         if not tool_execution_context.tool_result_references:
             return exposure_plan
 
         tool_names = [*exposure_plan.tool_names, "tool_result_read"]
-        discoverable_tool_names = list(exposure_plan.discoverable_tool_names)
-        if "tool_result_read" not in discoverable_tool_names:
-            discoverable_tool_names.append("tool_result_read")
+        while True:
+            deferred_names = set(exposure_plan.discoverable_tool_names) - set(
+                tool_names
+            )
+            expected_runtime_schema_count = len(tool_names) + int(
+                bool(deferred_names)
+            )
+            if expected_runtime_schema_count <= exposure_plan.limit:
+                break
+            eviction_index = next(
+                (
+                    index
+                    for index in range(len(tool_names) - 1, -1, -1)
+                    if tool_names[index]
+                    not in {
+                        "tool_result_read",
+                        "tool_search",
+                        "file_write",
+                        "file_edit",
+                        "apply_patch",
+                    }
+                ),
+                None,
+            )
+            if eviction_index is None:
+                return exposure_plan
+            tool_names.pop(eviction_index)
         return ToolExposurePlan(
             tool_names=tool_names,
             matched_groups=exposure_plan.matched_groups,
-            limit=max(exposure_plan.limit, len(tool_names)),
-            discoverable_tool_names=discoverable_tool_names,
+            limit=exposure_plan.limit,
+            discoverable_tool_names=list(exposure_plan.discoverable_tool_names),
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
-            intent_route=copy.deepcopy(exposure_plan.intent_route),
             diagnostics=copy.deepcopy(exposure_plan.diagnostics),
         )
 
@@ -1762,7 +3282,6 @@ class AgentEngine:
             discoverable_tool_names=discoverable_tool_names,
             workspace_bound=exposure_plan.workspace_bound,
             attachment_count=exposure_plan.attachment_count,
-            intent_route=copy.deepcopy(exposure_plan.intent_route),
             diagnostics=copy.deepcopy(exposure_plan.diagnostics),
         )
 
@@ -2074,6 +3593,9 @@ class AgentEngine:
 
     async def apply_config(self, config: MochiConfig, *, reload_voice: bool = False) -> None:
         """套用新的 runtime 設定，並重建與路徑相關的共享元件。"""
+        # sessions_dir is startup-only. Keep this before every live-state
+        # mutation so a rejected update leaves the existing binding intact.
+        ensure_sessions_dir_unchanged(self._config.sessions_dir, config.sessions_dir)
         previous_voice = self._config.voice
         previous_router_config = (
             self._config.model,
@@ -2090,7 +3612,23 @@ class AgentEngine:
         self._config = config
         self._prompt_builder = PromptBuilder(config.agent.system_prompt)
         self._memory_store = MemoryStore(db_path=config.memory.db_path)
-        self._session_store = SessionStore(sessions_dir=config.sessions_dir)
+        await self._tool_workflow_publication_gate.set_enabled_async(
+            config.agent.tool_observability_v1
+        )
+        self._session_store = self._make_session_store(config)
+        self._tool_workflow_outbox = ToolWorkflowOutboxRepository(
+            self._session_store,
+            enabled=config.agent.tool_observability_v1,
+            publication_gate=self._tool_workflow_publication_gate,
+        )
+        if self._owns_conversation_state_repository:
+            self._conversation_state_repository = ConversationStateRepository(
+                self._session_store
+            )
+        if self._owns_turn_checkpoint_repository:
+            self._turn_checkpoint_repository = TurnCheckpointRepository(
+                self._session_store
+            )
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
         self._skill_loader = self._make_skill_loader()
         self._skill_selector = self._make_skill_selector()
@@ -2793,7 +4331,19 @@ class AgentEngine:
             return
         if len(trajectory.steps) < self._config.learning.min_steps_for_extraction:
             return
-        tool_call_count = sum(1 for step in trajectory.steps if step.step_type == "tool_call")
+        tool_call_keys: set[str] = set()
+        for step in trajectory.steps:
+            if step.step_type not in {
+                "tool_call",
+                "tool_call_created",
+                "tool_call_completed",
+            }:
+                continue
+            call_id = step.metadata.get("call_id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                call_id = json.dumps(step.input_data, sort_keys=True, default=str)
+            tool_call_keys.add(call_id)
+        tool_call_count = len(tool_call_keys)
         if tool_call_count < self._config.learning.min_tool_calls_for_extraction:
             return
         try:
@@ -2904,7 +4454,14 @@ class AgentEngine:
         if context is not None:
             return context
 
-        context = ContextManager(
+        context = self._new_context()
+        await self._restore_session_history(session_id, context)
+        self._contexts[session_id] = context
+        return context
+
+    def _new_context(self) -> ContextManager:
+        """Create an uncached context for a single strict timeline snapshot."""
+        return ContextManager(
             conversation_memory=ConversationMemory(
                 max_messages=max(
                     self._config.memory.max_short_term_messages * 2,
@@ -2923,9 +4480,6 @@ class AgentEngine:
             memory_top_k=self._config.memory.fts_top_k,
             max_short_term_tokens=self._config.memory.max_short_term_tokens,
         )
-        await self._restore_session_history(session_id, context)
-        self._contexts[session_id] = context
-        return context
 
     def _merge_memory_and_summary_context(
         self,
@@ -2978,6 +4532,14 @@ class AgentEngine:
     ) -> None:
         """從 JSONL 還原已持久化的會話歷史。"""
         events = await self._session_store.load_session(session_id)
+        self._restore_session_history_events(events, context)
+
+    def _restore_session_history_events(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        context: ContextManager,
+    ) -> None:
+        """Materialize only supplied durable message events into a context."""
         for event in events:
             if event.get("type") != "message":
                 continue
@@ -3021,29 +4583,46 @@ class AgentEngine:
         selected_skill_ids: list[str] | None = None,
     ) -> None:
         """將 canonical message 持久化到 session store。"""
-        timestamp = datetime.now(UTC).isoformat(timespec="seconds")
         await self._session_store.save_event(
             session_id,
-            {
-                "type": "message",
-                "schema_version": 1,
-                "turn_id": turn_id,
-                "role": message.role,
-                "content": message.content,
-                "thinking": message.thinking,
-                "tool_calls": self._serialize_message_tool_calls(message.tool_calls),
-                "tool_call_id": message.tool_call_id,
-                "name": message.name,
-                "attachments": [attachment.to_dict() for attachment in message.attachments],
-                "selected_skill_ids": list(selected_skill_ids or []),
-                "responses_replay": (
-                    message.responses_replay.to_dict()
-                    if message.responses_replay is not None
-                    else None
-                ),
-                "timestamp": timestamp,
-            },
+            self._session_message_event(
+                message,
+                turn_id=turn_id,
+                session_id=session_id,
+                selected_skill_ids=selected_skill_ids,
+            ),
         )
+
+    def _session_message_event(
+        self,
+        message: Message,
+        *,
+        turn_id: str,
+        session_id: str | None = None,
+        selected_skill_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        event = {
+            "type": "message",
+            "schema_version": 1,
+            "turn_id": turn_id,
+            "role": message.role,
+            "content": message.content,
+            "thinking": message.thinking,
+            "tool_calls": self._serialize_message_tool_calls(message.tool_calls),
+            "tool_call_id": message.tool_call_id,
+            "name": message.name,
+            "attachments": [attachment.to_dict() for attachment in message.attachments],
+            "selected_skill_ids": list(selected_skill_ids or []),
+            "responses_replay": (
+                message.responses_replay.to_dict()
+                if message.responses_replay is not None
+                else None
+            ),
+            "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+        if session_id is not None:
+            event["session_id"] = session_id
+        return event
 
     async def _persist_turn_event(
         self,
@@ -3072,6 +4651,281 @@ class AgentEngine:
                 "payload": payload,
             },
         )
+
+    async def _record_react_event(
+        self,
+        *,
+        event: AgentEvent,
+        trajectory_id: str,
+        tool_exposure_metadata: Mapping[str, Any],
+        turn_id: str,
+        session_id: str,
+        request: AgentInvocationRequest,
+        persist_turn_events: bool,
+        events: list[AgentEvent],
+        event_callback: Callable[[AgentEvent], Any] | None,
+        turn_event_seq: int,
+        controlled_recovery: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Persist and publish one ReAct event through the normal turn path."""
+        self._log_agent_event(trajectory_id, event)
+        event_metadata = getattr(event, "metadata", None)
+        if isinstance(event_metadata, dict):
+            event_metadata.setdefault("tool_exposure", copy.deepcopy(tool_exposure_metadata))
+            if controlled_recovery is not None:
+                event_metadata.setdefault(
+                    "controlled_recovery",
+                    _checkpoint_json_safe(controlled_recovery),
+                )
+        event.turn_id = turn_id  # type: ignore[attr-defined]
+        next_seq = turn_event_seq + 1
+        timeline_operation_id = (
+            str(event.metadata.get("timeline_operation_id") or "").strip()
+            if isinstance(event, ToolCallResultEvent)
+            and isinstance(event.metadata, Mapping)
+            else ""
+        )
+        if (
+            request.timeline_coordinator is not None
+            and isinstance(event, ToolCallResultEvent)
+            and isinstance(event.metadata, Mapping)
+            and (
+                bool(event.metadata.get("timeline_unstarted_blocked"))
+                or bool(event.metadata.get("timeline_pre_effect_failure"))
+                or bool(event.metadata.get("timeline_fail_closed"))
+            )
+        ):
+            request.timeline_pre_effect_failure = True
+        if request.timeline_coordinator is not None and timeline_operation_id:
+            phase, payload = self._turn_event_payload(event)
+            if phase is None:
+                raise RuntimeError("timeline tool result has no durable event payload")
+            if bool(event.metadata.get("timeline_approval_pending")):
+                await request.timeline_coordinator.persist_approval_pending(
+                    operation_id=timeline_operation_id,
+                    event_id=f"{turn_id}:{next_seq}",
+                    sequence=next_seq,
+                    payload=payload,
+                )
+            elif bool(event.metadata.get("timeline_pre_effect_abandoned")):
+                request.timeline_pre_effect_failure = True
+                await request.timeline_coordinator.abandon_pre_effect_operation(
+                    operation_id=timeline_operation_id,
+                    event_id=f"{turn_id}:{next_seq}",
+                    sequence=next_seq,
+                    payload=payload,
+                )
+            else:
+                await request.timeline_coordinator.persist_tool_result(
+                    operation_id=timeline_operation_id,
+                    event_id=f"{turn_id}:{next_seq}",
+                    sequence=next_seq,
+                    payload=payload,
+                    error=event.error,
+                    unknown=bool(event.metadata.get("timeline_result_unknown")),
+                    disposition=(
+                        str(event.metadata.get("timeline_result_disposition"))
+                        if event.metadata.get("timeline_result_disposition")
+                        in {"succeeded", "failed", "unknown"}
+                        else None
+                    ),
+                )
+        elif persist_turn_events:
+            await self._persist_turn_event(
+                session_id,
+                event,
+                turn_id=turn_id,
+                seq=next_seq,
+            )
+        events.append(event)
+        if event_callback is not None:
+            callback_result = event_callback(event)
+            if inspect.isawaitable(callback_result):
+                await cast(Awaitable[None], callback_result)
+        return next_seq
+
+    @staticmethod
+    def _recovery_operation_from_events(
+        events: Sequence[AgentEvent],
+    ) -> tuple[TimelineOperationState | None, str | None]:
+        mutation_results = [
+            event
+            for event in events
+            if isinstance(event, ToolCallResultEvent)
+            and event.tool_name in {"file_write", "file_edit", "file_delete", "apply_patch"}
+        ]
+        if len(mutation_results) != 1:
+            return None, "timeline_operation_evidence_ambiguous"
+        event = mutation_results[0]
+        metadata = event.metadata if isinstance(event.metadata, Mapping) else {}
+        operation_id = str(metadata.get("timeline_operation_id") or "").strip()
+        if not operation_id:
+            return None, "timeline_operation_evidence_missing"
+        disposition = metadata.get("timeline_result_disposition")
+        if disposition not in {"succeeded", "failed", "unknown"}:
+            return None, "timeline_result_disposition_missing"
+        status = str(disposition)
+        if bool(metadata.get("timeline_result_unknown")) and status != "unknown":
+            return None, "timeline_result_disposition_inconsistent"
+        if event.error and status != "failed":
+            return None, "timeline_result_disposition_inconsistent"
+        boundary = "unknown" if status == "unknown" else "started"
+        return (
+            TimelineOperationState(
+                operation_id=operation_id,
+                status=status,  # type: ignore[arg-type]
+                side_effect_boundary=boundary,  # type: ignore[arg-type]
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _is_automatically_correctable_receipt(receipt: Mapping[str, Any]) -> bool:
+        if (
+            receipt.get("verification_status") != "failed"
+            or receipt.get("retry_disposition") != "requires_replan"
+        ):
+            return False
+        failed_codes = {
+            str(check.get("code"))
+            for target in receipt.get("targets", [])
+            if isinstance(target, Mapping)
+            for check in target.get("acceptance_checks", [])
+            if isinstance(check, Mapping) and check.get("passed") is False
+        }
+        return bool(failed_codes) and failed_codes <= _AUTOMATIC_RECOVERY_ACCEPTANCE_CODES
+
+    @staticmethod
+    def _controlled_recovery_state(
+        execution_receipt: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        if execution_receipt is None:
+            return {
+                "schema_version": _CONTROLLED_RECOVERY_SCHEMA_VERSION,
+                "max_replans": _MAX_CONTROLLED_RECOVERY_REPLANS,
+                "replans_used": 0,
+                "status": "not_started",
+            }, None
+        raw = execution_receipt.get("controlled_recovery")
+        if raw is None:
+            return {
+                "schema_version": _CONTROLLED_RECOVERY_SCHEMA_VERSION,
+                "max_replans": _MAX_CONTROLLED_RECOVERY_REPLANS,
+                "replans_used": 0,
+                "status": "not_started",
+            }, None
+        if not isinstance(raw, Mapping):
+            return {}, "controlled_recovery_state_invalid"
+        schema_version = raw.get("schema_version")
+        max_replans = raw.get("max_replans")
+        replans_used = raw.get("replans_used")
+        status = raw.get("status")
+        if (
+            schema_version != _CONTROLLED_RECOVERY_SCHEMA_VERSION
+            or max_replans != _MAX_CONTROLLED_RECOVERY_REPLANS
+            or type(replans_used) is not int
+            or replans_used < 0
+            or replans_used > max_replans
+            or status not in {"not_started", "reserved", "completed", "blocked"}
+        ):
+            return {}, "controlled_recovery_state_invalid"
+        return dict(raw), None
+
+    @staticmethod
+    def _controlled_recovery_prompt(
+        *,
+        decision: ControlledRecoveryDecision,
+        receipt: Mapping[str, Any],
+    ) -> str:
+        predecessor = decision.operation_id or "unknown"
+        targets = receipt.get("resolved_targets")
+        rendered_targets = ", ".join(
+            str(item) for item in targets if isinstance(item, str)
+        ) if isinstance(targets, list) else "the declared artifact targets"
+        return (
+            "The host verifier rejected the prior artifact result. "
+            f"Previous operation: {predecessor}. Reason: {decision.reason_code}. "
+            f"Correct only the failed deliverable targets: {rendered_targets}. "
+            "Do not repeat or assume success for the previous call. If a tool is needed, "
+            "propose a fresh corrective call; normal policy and approval checks still apply. "
+            "If no safe correction is available, explain the blocker."
+        )
+
+    async def _run_controlled_recovery_pass(
+        self,
+        *,
+        backend: BaseLLMBackend,
+        tool_registry: ToolRegistry,
+        tool_execution_context: ToolExecutionContext,
+        max_iterations: int,
+        system_prompt: str,
+        history: list[Message],
+        recovery_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        min_p: float,
+        top_k: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        repeat_penalty: float,
+        reasoning_effort: ReasoningEffort | None,
+        trajectory_id: str,
+        tool_exposure_metadata: Mapping[str, Any],
+        turn_id: str,
+        session_id: str,
+        request: AgentInvocationRequest,
+        persist_turn_events: bool,
+        events: list[AgentEvent],
+        event_callback: Callable[[AgentEvent], Any] | None,
+        turn_event_seq: int,
+        controlled_recovery: Mapping[str, Any],
+        requires_file_mutation: bool,
+    ) -> tuple[AsyncReActLoop, str, int]:
+        """Run one independently budgeted corrective pass in the claimed turn."""
+        loop = AsyncReActLoop(
+            backend=backend,
+            tool_registry=tool_registry,
+            tool_execution_context=tool_execution_context,
+            max_iterations=max_iterations,
+            requires_file_mutation=requires_file_mutation,
+        )
+        final_text = ""
+        await self._router.mark_backend_busy(backend)
+        try:
+            async for event in loop.run(
+                system_prompt=system_prompt,
+                history=history,
+                user_message=recovery_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repeat_penalty=repeat_penalty,
+                reasoning_effort=reasoning_effort,
+            ):
+                if isinstance(event, FinalAnswerEvent):
+                    final_text = event.content
+                    event.trajectory_id = trajectory_id
+                turn_event_seq = await self._record_react_event(
+                    event=event,
+                    trajectory_id=trajectory_id,
+                    tool_exposure_metadata=tool_exposure_metadata,
+                    turn_id=turn_id,
+                    session_id=session_id,
+                    request=request,
+                    persist_turn_events=persist_turn_events,
+                    events=events,
+                    event_callback=event_callback,
+                    turn_event_seq=turn_event_seq,
+                    controlled_recovery=controlled_recovery,
+                )
+        finally:
+            await self._router.mark_backend_idle(backend)
+        return loop, final_text, turn_event_seq
 
     def _turn_event_payload(self, event: AgentEvent) -> tuple[str | None, dict[str, Any]]:
         """將 AgentEvent 轉成 session replay payload。"""
@@ -3143,67 +4997,672 @@ class AgentEngine:
             }
         return None, {}
 
-    async def _route_tool_intent_for_exposure(
+    @staticmethod
+    def _default_conversation_resolver_factory(
+        backend: BaseLLMBackend,
+    ) -> ConversationResolver:
+        return ConversationResolver(
+            interpreter=ModelConversationInterpreter(backend),
+        )
+
+    async def _resolve_turn_contract_rollout(
         self,
         *,
-        message: str,
-        session_bound_workspace: bool,
-        attachment_count: int,
-        workspace_attachment_count: int,
         active_backend: BaseLLMBackend,
+        session_id: str,
+        turn_id: str,
+        message: str,
+        prompt_context: PromptContext,
+        available_tools: list[BaseTool],
+        preferred_tool_names: list[str],
+        policy_eligible_tool_names: set[str],
         execution_profile: str,
         tool_mode: str,
-    ) -> ToolIntentRoute:
-        classifier = (
-            BackendToolIntentClassifier(active_backend)
-            if self._should_enable_tool_intent_classifier(
+        workspace_mutation_eligible: bool,
+        tool_allowlist: list[str] | None,
+        tool_denylist: list[str] | None,
+        load_durable_state: bool,
+        user_message_already_persisted: bool,
+        selected_skill_ids: list[str],
+        attachments: list[AttachmentRef] | None,
+    ) -> TurnContractRolloutResult:
+        user_message_persisted = False
+        state_load = None
+
+        if load_durable_state:
+            # Keep the shared-session critical section short. Conversation
+            # interpretation may invoke a model, so it must use this immutable
+            # durable-state snapshot outside the lock and later CAS its proposed
+            # transition. For ordinary Chat, ``prompt_context`` was prepared
+            # from the durable FIFO claim's linearized history; other invocation
+            # profiles retain their existing bounded-context behavior.
+            lock = self._conversation_state_locks.setdefault(session_id, asyncio.Lock())
+            async with lock:
+                if user_message_already_persisted:
+                    user_message_persisted = True
+                else:
+                    await self._persist_session_message(
+                        session_id,
+                        Message(
+                            role="user",
+                            content=message,
+                            attachments=list(attachments or []),
+                        ),
+                        turn_id=turn_id,
+                        selected_skill_ids=selected_skill_ids,
+                    )
+                    user_message_persisted = True
+                state_load = await self._conversation_state_repository.load(session_id)
+
+        async def resolve_and_optionally_persist() -> TurnContractRolloutResult:
+            state_load_diagnostics = (
+                state_load.diagnostics
+                if state_load is not None
+                else ConversationStateLoadDiagnostics(status="missing")
+            )
+            active_task = state_load.active_task if state_load is not None else None
+            if active_task is not None and active_task.status in {
+                "completed",
+                "cancelled",
+            }:
+                active_task = None
+
+            current_turn, recent_history, summary = (
+                conversation_inputs_from_prompt_context(
+                    turn_id=turn_id,
+                    current_message=message,
+                    prompt_context=prompt_context,
+                )
+            )
+            resolver = self._conversation_resolver_factory(active_backend)
+            if state_load_diagnostics.status in {"invalid", "unsupported_version"}:
+                resolver = ConversationResolver(interpreter=None)
+            resolution = await resolver.resolve(
+                current_turn=current_turn,
+                recent_history=recent_history,
+                summary=summary,
+                active_task=active_task,
+            )
+            capability_plan = build_capability_plan(
+                planner=self._capability_planner,
+                resolution=resolution,
+                available_tools=available_tools,
+                preferred_tool_names=preferred_tool_names,
+                policy_eligible_tool_names=policy_eligible_tool_names,
                 execution_profile=execution_profile,
                 tool_mode=tool_mode,
+                workspace_mutation_eligible=workspace_mutation_eligible,
+                tool_allowlist=tool_allowlist,
+                tool_denylist=tool_denylist,
             )
-            else None
+            persist_error = None
+            state_revision = (
+                state_load.state_revision if state_load is not None else None
+            )
+            if load_durable_state:
+                persist_error, state_revision = await self._persist_turn_contract_rollout_state(
+                    session_id=session_id,
+                    resolution=resolution,
+                    expected_state_revision=state_revision,
+                )
+            return TurnContractRolloutResult(
+                mode="enforce",
+                resolution=resolution,
+                capability_plan=capability_plan,
+                state_load_diagnostics=state_load_diagnostics,
+                state_persist_error=persist_error,
+                state_revision=state_revision,
+            )
+
+        async def guarded_resolve() -> TurnContractRolloutResult:
+            try:
+                return await resolve_and_optionally_persist()
+            except _TurnContractRolloutFailure:
+                raise
+            except Exception as exc:
+                raise _TurnContractRolloutFailure(
+                    exc,
+                    user_message_persisted=user_message_persisted,
+                ) from exc
+
+        return await guarded_resolve()
+
+    async def _persist_turn_contract_rollout_state(
+        self,
+        *,
+        session_id: str,
+        resolution: ConversationResolution,
+        expected_state_revision: int | None,
+    ) -> tuple[str | None, int | None]:
+        try:
+            if resolution.next_active_task is not None:
+                if expected_state_revision is None:
+                    return "missing active-task state revision for durable transition", None
+                lock = self._conversation_state_locks.setdefault(session_id, asyncio.Lock())
+                async with lock:
+                    current = await self._conversation_state_repository.load(session_id)
+                    if current.diagnostics.status in {"invalid", "unsupported_version"}:
+                        return "cannot persist contract over invalid active-task state", None
+                    if current.state_revision != expected_state_revision:
+                        return (
+                            "active-task state revision conflict while persisting turn contract",
+                            None,
+                        )
+                    save_result = await self._conversation_state_repository.save(
+                        session_id,
+                        active_task=resolution.next_active_task,
+                        turn_intent=resolution.contract,
+                        expected_revision=expected_state_revision,
+                    )
+                    if save_result.status != "saved":
+                        return (
+                            save_result.message
+                            or "active-task state CAS failed while persisting turn contract",
+                            None,
+                        )
+                    return None, save_result.saved_revision
+            else:
+                await self._session_store.save_event(
+                    session_id,
+                    {
+                        "type": "session_meta",
+                        "event": "turn_intent_contract_audit",
+                        "schema_version": 1,
+                        "session_id": session_id,
+                        "turn_contract_mode": "enforce",
+                        "turn_intent_contract": resolution.contract.to_dict(),
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                    },
+                )
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}", None
+        return None, expected_state_revision
+
+    def _build_turn_checkpoint(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        rollout: TurnContractRolloutResult,
+        exposure_plan: ToolExposurePlan,
+        tool_execution_context: ToolExecutionContext,
+    ) -> TurnCheckpoint:
+        """Capture all durable turn-scoped inputs before model/tool execution."""
+        policy_snapshot = EffectivePolicyResolver().resolve(
+            self._config.security,
+            session_overrides=dict(tool_execution_context.permission_policy),
+        ).to_dict()
+        inventory_snapshot = {
+            "catalog_scope": "policy_eligible",
+            "policy_eligible_tool_names": sorted(
+                set(exposure_plan.discoverable_tool_names)
+            ),
+            "eligible_tool_names": list(rollout.capability_plan.eligible_tools),
+            "exposed_tool_names": list(exposure_plan.tool_names),
+            "activation_eligible_tool_names": list(
+                tool_execution_context.state
+                .get("tool_activation_policy", {})
+                .get("activation_allowed_tool_names", [])
+            ),
+        }
+        inventory_snapshot["inventory_version"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                inventory_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return TurnCheckpoint(
+            session_id=session_id,
+            turn_id=turn_id,
+            revision=0,
+            stage="contract_resolved",
+            turn_intent_contract=rollout.resolution.contract.to_dict(),
+            capability_plan=rollout.capability_plan.to_dict(),
+            active_goal_id=rollout.resolution.next_active_task.goal_id
+            if rollout.resolution.next_active_task is not None
+            else rollout.resolution.contract.active_goal_id,
+            policy_snapshot=policy_snapshot,
+            inventory_snapshot=inventory_snapshot,
+            activation_state=_checkpoint_json_safe(
+                tool_execution_context.state.get("tool_activation_policy", {})
+            ),
+            resume_cursor={"turn_id": turn_id, "phase": "react"},
         )
-        return await self._tool_intent_router.route(
-            user_message=message,
-            session_bound_workspace=session_bound_workspace,
-            attachment_count=attachment_count,
-            workspace_attachment_count=workspace_attachment_count,
-            classifier=classifier,
+
+    async def _transition_turn_checkpoint(
+        self,
+        checkpoint: TurnCheckpoint,
+        *,
+        stage: Literal[
+            "contract_resolved",
+            "awaiting_approval",
+            "executing",
+            "verifying",
+            "completed",
+            "blocked",
+        ],
+        pending_tool_call: Mapping[str, Any] | None = None,
+        approval_record: Mapping[str, Any] | None = None,
+        execution_receipt: Mapping[str, Any] | None = None,
+        verification_result: Mapping[str, Any] | None = None,
+        resume_cursor: Mapping[str, Any] | None = None,
+        completion_reason: str | None = None,
+        blocker_reason: str | None = None,
+    ) -> tuple[TurnCheckpoint | None, str | None]:
+        candidate = replace(
+            checkpoint,
+            stage=stage,
+            pending_tool_call=(
+                _checkpoint_json_safe(pending_tool_call)
+                if pending_tool_call is not None
+                else checkpoint.pending_tool_call
+            ),
+            approval_record=(
+                _checkpoint_json_safe(approval_record)
+                if approval_record is not None
+                else checkpoint.approval_record
+            ),
+            execution_receipt=(
+                _checkpoint_json_safe(execution_receipt)
+                if execution_receipt is not None
+                else checkpoint.execution_receipt
+            ),
+            verification_result=(
+                _checkpoint_json_safe(verification_result)
+                if verification_result is not None
+                else checkpoint.verification_result
+            ),
+            resume_cursor=(
+                _checkpoint_json_safe(resume_cursor)
+                if resume_cursor is not None
+                else checkpoint.resume_cursor
+            ),
+            completion_reason=completion_reason,
+            blocker_reason=blocker_reason,
+        )
+        try:
+            result = await self._turn_checkpoint_repository.save(
+                candidate,
+                expected_revision=checkpoint.revision,
+            )
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        if result.status != "saved" or result.checkpoint is None:
+            return (
+                None,
+                result.message or "turn checkpoint CAS failed during transition",
+            )
+        return result.checkpoint, None
+
+    @staticmethod
+    def _turn_execution_checkpoint_data(
+        events: list[AgentEvent],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+        requests = [
+            {
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "arguments": _checkpoint_json_safe(event.arguments),
+            }
+            for event in events
+            if isinstance(event, ToolCallRequestEvent)
+        ]
+        results = [
+            {
+                "call_id": event.call_id,
+                "tool_name": event.tool_name,
+                "error": event.error,
+                "metadata": _checkpoint_json_safe(event.metadata),
+            }
+            for event in events
+            if isinstance(event, ToolCallResultEvent)
+        ]
+        pending = requests[-1] if requests else None
+        approval: dict[str, Any] | None = None
+        for event in reversed(events):
+            if not isinstance(event, ToolCallResultEvent):
+                continue
+            metadata = event.metadata
+            approval_id = metadata.get("approval_id")
+            if bool(metadata.get("requires_approval")) and isinstance(approval_id, str):
+                approval = {
+                    "approval_id": approval_id,
+                    "status": "pending",
+                    "tool_name": event.tool_name,
+                    "call_id": event.call_id,
+                }
+                break
+        status = (
+            "awaiting_approval"
+            if approval is not None
+            else "failed"
+            if any(result["error"] for result in results)
+            else "succeeded"
+        )
+        return (
+            {
+                "status": status,
+                "tool_requests": requests,
+                "tool_results": results,
+            },
+            pending,
+            approval,
+        )
+
+    async def _complete_turn_contract_task_if_satisfied(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        rollout: TurnContractRolloutResult | None,
+        events: list[AgentEvent],
+        persist_session: bool,
+        workspace_dir: str,
+    ) -> str | None:
+        if (
+            not persist_session
+            or rollout is None
+            or rollout.mode != "enforce"
+            or rollout.resolution.next_active_task is None
+            or not rollout.capability_plan.artifact_obligation.required
+            or not rollout.capability_plan.artifact_obligation.ready
+        ):
+            return None
+
+        final_event = next(
+            (event for event in reversed(events) if isinstance(event, FinalAnswerEvent)),
+            None,
+        )
+        if final_event is None or not final_event.content.strip():
+            return None
+        mutation_tool_names = {
+            "file_write",
+            "file_edit",
+            "file_delete",
+            "apply_patch",
+        }
+        turn_tool_requests = [
+            event for event in events if isinstance(event, ToolCallRequestEvent)
+        ]
+        turn_tool_results = [
+            event for event in events if isinstance(event, ToolCallResultEvent)
+        ]
+        mutation_requests = [
+            event
+            for event in turn_tool_requests
+            if event.tool_name in mutation_tool_names
+        ]
+        mutation_results = [
+            event
+            for event in turn_tool_results
+            if event.tool_name in mutation_tool_names
+        ]
+        if not mutation_requests or not mutation_results:
+            return None
+        final_error_type = str(final_event.metadata.get("error_type") or "")
+        if final_error_type in {
+            "file_artifact_missing",
+            "file_artifact_not_mutated",
+            "mutation_tool_not_callable",
+            "repeated_unavailable_mutation_tool",
+        }:
+            return None
+
+        active_task = rollout.resolution.next_active_task
+        receipt, completion_error = await self._verify_and_complete_active_task(
+            session_id=session_id,
+            turn_id=turn_id,
+            workspace_dir=workspace_dir,
+            active_task=active_task,
+            state_revision=rollout.state_revision,
+            requests=mutation_requests,
+            results=mutation_results,
+            evidence_requests=turn_tool_requests,
+            evidence_results=turn_tool_results,
+        )
+        final_event.metadata["artifact_verification"] = receipt
+        if receipt.get("verification_status") != "verified":
+            final_event.metadata["artifact_verification_status"] = receipt[
+                "verification_status"
+            ]
+        return completion_error
+
+    async def _verify_and_complete_active_task(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        workspace_dir: str,
+        active_task: Any,
+        state_revision: int | None,
+        requests: list[ToolCallRequestEvent],
+        results: list[ToolCallResultEvent],
+        evidence_requests: Sequence[ToolCallRequestEvent] | None = None,
+        evidence_results: Sequence[ToolCallResultEvent] | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Persist verified evidence before a CAS-protected task completion.
+
+        The contract's deliverable list is authoritative.  Tool metadata can
+        add claims, but cannot omit a required target or silently satisfy a
+        sibling deliverable.
+        """
+        expectations, expectation_error = self._artifact_expectations_for_task(active_task)
+        if expectation_error is not None:
+            return (
+                {
+                    "schema_version": 1,
+                    "verification_status": "failed",
+                    "errors": [expectation_error],
+                    "operation_id": f"unverifiable:{turn_id}",
+                },
+                None,
+            )
+        try:
+            verification = self._artifact_verifier.verify(
+                workspace_root=workspace_dir,
+                turn_id=turn_id,
+                goal_id=active_task.goal_id,
+                requests=requests,
+                results=results,
+                expectations=expectations,
+                evidence_requests=evidence_requests,
+                evidence_results=evidence_results,
+            )
+        except Exception as exc:
+            return (
+                {
+                    "schema_version": 1,
+                    "verification_status": "failed",
+                    "errors": [f"artifact verification failed: {type(exc).__name__}: {exc}"],
+                    "operation_id": f"verification-error:{turn_id}",
+                },
+                None,
+            )
+        receipt = verification.receipt.to_dict()
+        try:
+            await self._session_store.save_event(
+                session_id,
+                {
+                    "type": "session_meta",
+                    "event": "artifact_verification_receipt",
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "artifact_receipt": receipt,
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                },
+            )
+        except Exception as exc:
+            return receipt, f"artifact receipt persistence failed: {type(exc).__name__}: {exc}"
+        if not verification.success:
+            return receipt, None
+        if state_revision is None:
+            return receipt, "missing active-task state revision for completion transition"
+
+        expected_targets = {expectation.path for expectation in expectations}
+        completed_task = replace(
+            active_task,
+            status="completed",
+            deliverables=tuple(
+                replace(deliverable, status="satisfied")
+                if (
+                    deliverable.required
+                    and deliverable.status == "pending"
+                    and deliverable.target_hint in expected_targets
+                )
+                else deliverable
+                for deliverable in active_task.deliverables
+            ),
+            updated_turn_id=turn_id,
+        )
+        lock = self._conversation_state_locks.setdefault(session_id, asyncio.Lock())
+        try:
+            async with lock:
+                current = await self._conversation_state_repository.load(session_id)
+                current_task = current.active_task
+                if (
+                    current_task is None
+                    or current_task.goal_id != active_task.goal_id
+                    or current.state_revision != state_revision
+                ):
+                    return receipt, "active-task state revision conflict while completing turn"
+                save_result = await self._conversation_state_repository.save(
+                    session_id,
+                    active_task=completed_task,
+                    expected_revision=state_revision,
+                )
+                if save_result.status != "saved":
+                    return receipt, (
+                        save_result.message
+                        or "active-task state CAS failed while completing turn"
+                    )
+        except Exception as exc:
+            return receipt, f"{type(exc).__name__}: {exc}"
+        return receipt, None
+
+    @staticmethod
+    def _artifact_expectations_for_task(
+        active_task: Any,
+    ) -> tuple[tuple[ArtifactExpectation, ...], str | None]:
+        expectations: list[ArtifactExpectation] = []
+        for deliverable in active_task.deliverables:
+            if not deliverable.required or deliverable.status != "pending":
+                continue
+            target_hint = deliverable.target_hint
+            if not isinstance(target_hint, str) or not target_hint.strip():
+                return (), "required deliverable has no resolvable artifact target"
+            criteria = tuple(deliverable.acceptance_criteria)
+            if any(
+                (isinstance(item, str) and not item.strip())
+                or not isinstance(item, (str, Mapping))
+                for item in criteria
+            ):
+                return (), "required deliverable contains an invalid acceptance criterion"
+            expectations.append(
+                ArtifactExpectation(
+                    path=target_hint.strip(),
+                    acceptance_criteria=criteria,
+                )
+            )
+        if not expectations:
+            return (), "required artifact task has no pending deliverable targets"
+        return tuple(expectations), None
+
+    @staticmethod
+    def _fork_turn_tool_execution_context(
+        context: ToolExecutionContext,
+    ) -> ToolExecutionContext:
+        """Isolate mutable activation state while retaining shared read caches."""
+
+        return ToolExecutionContext(
+            workspace_dir=context.workspace_dir,
+            session_id=context.session_id,
+            project_workspace=context.project_workspace,
+            task_sandbox_dir=context.task_sandbox_dir,
+            permission_policy=dict(context.permission_policy),
+            read_state_cache=context.read_state_cache,
+            tool_result_store_dir=context.tool_result_store_dir,
+            tool_result_references=context.tool_result_references,
+            transport_diagnostics=context.transport_diagnostics,
+            state=dict(context.state),
+            progress_callback=context.progress_callback,
+            cancellation_requested=context.cancellation_requested,
+            active_tool_controller=context.active_tool_controller,
         )
 
     @staticmethod
-    def _should_enable_tool_intent_classifier(
+    def _turn_contract_enforce_blocker(
         *,
-        execution_profile: str,
-        tool_mode: str,
-    ) -> bool:
-        return execution_profile == "chat" and tool_mode != "disabled"
+        rollout: TurnContractRolloutResult | None,
+        exposure_plan: ToolExposurePlan,
+        callable_tool_names: list[str],
+    ) -> tuple[str, str] | None:
+        if rollout is None or rollout.mode != "enforce":
+            return None
+        if rollout.state_persist_error is not None:
+            return (
+                "turn_contract_state_persist_failed",
+                "I could not safely persist this turn's task state. No tools were run. Please retry.",
+            )
 
-    def _build_tool_planner_message(
-        self,
-        message: str,
-        attachments: list[AttachmentRef] | None,
-    ) -> str:
-        if not attachments:
-            return message
+        clarification = rollout.resolution.contract.clarification
+        if clarification is not None:
+            return "turn_contract_clarification_required", clarification.question
 
-        lines = [message.strip(), "Structured attachments:"]
-        for attachment in attachments:
-            lines.append(f"- {self._attachment_summary_label(attachment)}")
-        return "\n".join(line for line in lines if line)
+        directly_exposed = set(exposure_plan.tool_names)
+        adapter_diagnostics = exposure_plan.diagnostics.get(
+            "capability_exposure_adapter",
+            {},
+        )
+        activation_allowed = set()
+        broker_required = False
+        if isinstance(adapter_diagnostics, dict):
+            raw_activation_allowed = adapter_diagnostics.get(
+                "activation_allowed_tool_names",
+                [],
+            )
+            if isinstance(raw_activation_allowed, list):
+                activation_allowed = {
+                    name for name in raw_activation_allowed if isinstance(name, str)
+                }
+            broker = adapter_diagnostics.get("activation_broker", {})
+            broker_required = isinstance(broker, dict) and bool(
+                broker.get("required")
+            )
+        broker_available = broker_required and "tool_activate" in callable_tool_names
+        artifact_requires_direct_write = (
+            rollout.capability_plan.artifact_obligation.required
+        )
+        covered_capabilities: set[str] = set()
+        for diagnostic in rollout.capability_plan.tool_diagnostics:
+            direct = diagnostic.tool_name in directly_exposed
+            activatable = (
+                broker_available
+                and diagnostic.tool_name in activation_allowed
+                and not (
+                    artifact_requires_direct_write
+                    and "workspace_write" in diagnostic.matched_capabilities
+                )
+            )
+            if direct or activatable:
+                covered_capabilities.update(diagnostic.matched_capabilities)
+        missing_capabilities = set(rollout.capability_plan.unavailable_capabilities) | (
+            set(rollout.capability_plan.required_capabilities) - covered_capabilities
+        )
+        if missing_capabilities:
+            rendered = ", ".join(sorted(missing_capabilities))
+            return (
+                "turn_contract_required_capability_unavailable",
+                "I cannot safely continue because required capabilities are unavailable: "
+                f"{rendered}.",
+            )
+        return None
 
     @staticmethod
     def _attachment_count(attachments: list[AttachmentRef] | None) -> int:
         return len(attachments or [])
-
-    @staticmethod
-    def _workspace_attachment_count(attachments: list[AttachmentRef] | None) -> int:
-        if not attachments:
-            return 0
-        return sum(
-            1
-            for attachment in attachments
-            if (attachment.source or "").strip().lower() in {"workspace_file", "workspace_selection"}
-        )
 
     def _build_attachment_prompt_context(
         self,
@@ -3865,6 +6324,77 @@ def _resolve_agent_run_evidence_permission_policy(
             if filtered:
                 return filtered
     return None
+
+
+def _checkpoint_json_safe(value: Any) -> dict[str, Any]:
+    """Normalize runtime metadata before putting it in a durable checkpoint."""
+    normalized = json.loads(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    )
+    if not isinstance(normalized, dict):
+        raise TypeError("turn checkpoint payload must be an object")
+    return normalized
+
+
+def _ordinary_chat_timeline_operation_identity(
+    approval_payload: Mapping[str, Any],
+) -> dict[str, str] | None:
+    """Return the exact timeline binding carried by an ordinary-Chat approval.
+
+    The timeline descriptor intentionally has only canonical identity values,
+    so this validates both independently persisted copies before an approval
+    service can cross the effect boundary outside the original lane.
+    """
+    checkpoint = approval_payload.get("ordinary_chat_checkpoint")
+    if not isinstance(checkpoint, Mapping) or checkpoint.get("source") != "ordinary_chat":
+        return None
+    resume_cursor = checkpoint.get("resume_cursor")
+    if not isinstance(resume_cursor, Mapping):
+        return None
+
+    def text(value: Any) -> str | None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    session_id = text(checkpoint.get("session_id"))
+    turn_id = text(checkpoint.get("turn_id"))
+    operation_id = text(checkpoint.get("operation_id"))
+    call_id = text(checkpoint.get("timeline_call_id"))
+    arguments_digest = text(checkpoint.get("arguments_digest"))
+    if not all((session_id, turn_id, operation_id, call_id, arguments_digest)):
+        return None
+    if (
+        text(approval_payload.get("session_id")) != session_id
+        or text(approval_payload.get("operation_id")) != operation_id
+        or text(approval_payload.get("timeline_call_id")) != call_id
+        or text(approval_payload.get("arguments_digest")) != arguments_digest
+        or text(resume_cursor.get("tool_call_id")) != call_id
+    ):
+        return None
+    if len(arguments_digest) != 64:
+        return None
+    try:
+        int(arguments_digest, 16)
+    except ValueError:
+        return None
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "operation_id": operation_id,
+        "call_id": call_id,
+        "arguments_digest": arguments_digest,
+    }
+
+
+def _ordinary_chat_timeline_result_digest(value: Mapping[str, Any]) -> str:
+    """Return stable evidence for a known terminal approval outcome."""
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _resolve_agent_run_rag_mcp_servers(

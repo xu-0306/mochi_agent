@@ -807,6 +807,18 @@ def canonical_json(value: object) -> str:
     )
 
 
+def tool_arguments_digest(*, tool_name: str, arguments: Mapping[str, object]) -> str:
+    """Return the canonical bare SHA-256 join key for one tool call."""
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "tool_name": tool_name,
+                "arguments": dict(arguments),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def authorization_request_digest(envelope: AuthorizationEnvelope) -> str:
     if not isinstance(envelope, AuthorizationEnvelope):
         raise TypeError("envelope must be AuthorizationEnvelope")
@@ -878,4 +890,5 @@ __all__ = [
     "capture_file_identity",
     "manifest_digest_projection",
     "preview_idempotency_key",
+    "tool_arguments_digest",
 ]

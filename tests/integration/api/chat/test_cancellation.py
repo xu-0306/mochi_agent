@@ -15,6 +15,7 @@ from ._support import (
     ThinkingEvent,
     ToolCancellationResult,
     _build_app,
+    _build_bare_agent_engine,
     _FakeEngine,
     asyncio,
     cancel_asyncio_task,
@@ -26,8 +27,8 @@ from ._support import (
 )
 
 
-def test_agent_engine_cancel_chat_run_cancels_active_run() -> None:
-    engine = AgentEngine.__new__(AgentEngine)
+def test_agent_engine_cancel_chat_run_cancels_active_run(tmp_path) -> None:
+    engine = _build_bare_agent_engine(sessions_dir=tmp_path / "sessions")
     started = threading.Event()
     cancelled = threading.Event()
 
@@ -77,6 +78,7 @@ def test_agent_engine_cancel_chat_run_cancels_active_run() -> None:
     assert cancel_response["status"] == "cancel_requested"
     assert cancel_response["run_state"] == "cancelled"
     assert cancel_response["cancel_outcome"] == "cancelled"
+    assert cancel_response["cancel_reason"] is None
     assert cancelled.wait(timeout=1.0)
 
 def test_chat_cancel_endpoint_forwards_to_engine() -> None:
@@ -114,8 +116,10 @@ def test_chat_cancel_endpoint_forwards_to_engine() -> None:
         "cancel_reason": None,
     }
 
-def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_race() -> None:
-    engine = AgentEngine.__new__(AgentEngine)
+def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_race(
+    tmp_path,
+) -> None:
+    engine = _build_bare_agent_engine(sessions_dir=tmp_path / "sessions")
     cancelled = threading.Event()
 
     async def _fake_invoke(
@@ -149,7 +153,10 @@ def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_ra
         del self
 
     engine.close = _noop_close.__get__(engine, AgentEngine)  # type: ignore[attr-defined]
-    app, _ = _build_app(engine=engine)  # type: ignore[arg-type]
+    app, _ = _build_app(
+        engine=engine,  # type: ignore[arg-type]
+        sessions_dir=engine._session_store.sessions_dir,  # type: ignore[attr-defined]
+    )
 
     with TestClient(app) as client, client.stream(
         "POST",
@@ -177,9 +184,9 @@ def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_ra
     assert cancel_response.json()["cancel_outcome"] == "completed"
     assert cancelled.is_set() is False
 
-def test_agent_engine_chat_yields_events_before_invocation_finishes() -> None:
+def test_agent_engine_chat_yields_events_before_invocation_finishes(tmp_path) -> None:
     """`AgentEngine.chat()` should surface intermediate events before the invocation fully completes."""
-    engine = AgentEngine.__new__(AgentEngine)
+    engine = _build_bare_agent_engine(sessions_dir=tmp_path / "sessions")
 
     async def _fake_invoke(
         self: AgentEngine,
@@ -231,8 +238,8 @@ def test_agent_engine_chat_yields_events_before_invocation_finishes() -> None:
     assert first_event_elapsed < 0.15
     assert total_elapsed >= 0.25
 
-def test_agent_engine_chat_teardown_cancels_worker() -> None:
-    engine = AgentEngine.__new__(AgentEngine)
+def test_agent_engine_chat_teardown_cancels_worker(tmp_path) -> None:
+    engine = _build_bare_agent_engine(sessions_dir=tmp_path / "sessions")
     cancelled = threading.Event()
 
     async def _fake_invoke(

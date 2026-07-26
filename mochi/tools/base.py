@@ -398,6 +398,49 @@ class BaseTool(ABC):
         return False
 
     @property
+    def supports_timeline_side_effect_boundary(self) -> bool:
+        """Whether this tool records its durable effect boundary before acting.
+
+        Ordinary Chat timeline dispatch relies on this explicit contract instead
+        of treating a tool name as proof that the implementation is safe.
+        """
+        return False
+
+    @property
+    def supports_timeline_approval_revocation(self) -> bool:
+        """Whether post-precommit approvals can be durably revoked."""
+        return False
+
+    @property
+    def timeline_approval_mode(self) -> str:
+        """Declare how a side-effecting tool participates in Chat approvals.
+
+        ``none`` means the tool contract never creates a durable approval.
+        ``continuable`` means an ordinary-Chat pending approval preserves the
+        precommitted operation for the server-owned continuation. ``revocable``
+        is reserved for tools that can prove an unexpected post-precommit
+        approval was superseded before any effect is possible.
+        """
+        return "none"
+
+    def revoke_timeline_approval(self, approval_id: str, *, reason: str) -> bool:
+        """Durably prevent a post-precommit approval from being consumed."""
+        del approval_id, reason
+        return False
+
+    def validates_timeline_approval_binding(
+        self,
+        approval_id: str,
+        *,
+        operation_id: str,
+        arguments_digest: str,
+        call_id: str,
+    ) -> bool:
+        """Confirm a pending approval is durable and bound to one timeline call."""
+        del approval_id, operation_id, arguments_digest, call_id
+        return False
+
+    @property
     def search_hint(self) -> str | None:
         return None
 

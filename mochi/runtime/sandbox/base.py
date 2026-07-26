@@ -227,6 +227,17 @@ class SandboxPlan:
         encoded = canonical_json(self.canonical_payload()).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @property
+    def approval_digest(self) -> str:
+        """Return the stable authorization facts for a later approval replay."""
+        payload = self.canonical_payload()
+        payload.pop("request_nonce")
+        capabilities = payload.get("capabilities")
+        if isinstance(capabilities, dict):
+            capabilities.pop("last_probe_at", None)
+        encoded = canonical_json(payload).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def canonical_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,

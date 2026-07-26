@@ -142,6 +142,7 @@ def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> N
     }
     assert payload["agent"] == {
         "system_prompt": config.agent.system_prompt,
+        "turn_contract_mode": "enforce",
         "temperature": 0.7,
         "max_tokens": None,
         "reserve_output_tokens": None,
@@ -545,7 +546,7 @@ def test_settings_patch_updates_voice_memory_learning_and_paths(tmp_path: Path) 
                 },
                 "paths": {
                     "workspace_dir": str(tmp_path / "workspace-new"),
-                    "sessions_dir": str(tmp_path / "sessions-new"),
+                    "sessions_dir": str(tmp_path / "sessions"),
                     "skills_dir": str(tmp_path / "skills-new"),
                     "plugins_dir": str(tmp_path / "plugins-new"),
                 },
@@ -584,7 +585,7 @@ def test_settings_patch_updates_voice_memory_learning_and_paths(tmp_path: Path) 
     assert followup.status_code == 200
     assert followup.json()["memory"]["db_path"] == str(tmp_path / "memory-new.db")
     assert (tmp_path / "workspace-new").is_dir()
-    assert (tmp_path / "sessions-new").is_dir()
+    assert (tmp_path / "sessions").is_dir()
     assert (tmp_path / "skills-new").is_dir()
     assert (tmp_path / "plugins-new").is_dir()
     assert (tmp_path / "voice-models").is_dir()
@@ -668,6 +669,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
             json={
                 "agent": {
                     "system_prompt": "你是 Mochi inference 測試代理。",
+                    "turn_contract_mode": "enforce",
                     "temperature": 0.25,
                     "max_tokens": 8192,
                     "reserve_output_tokens": 1536,
@@ -738,6 +740,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
         payload = response.json()
         assert payload["agent"] == {
             "system_prompt": "你是 Mochi inference 測試代理。",
+            "turn_contract_mode": "enforce",
             "temperature": 0.25,
             "max_tokens": 8192,
             "reserve_output_tokens": 1536,
@@ -808,6 +811,7 @@ def test_settings_patch_updates_agent_presets_and_security(tmp_path: Path) -> No
     assert followup.status_code == 200
     followup_payload = followup.json()
     assert followup_payload["agent"]["active_preset"] == "focused"
+    assert followup_payload["agent"]["turn_contract_mode"] == "enforce"
     assert followup_payload["agent"]["reasoning_effort"] == "medium"
     assert followup_payload["agent"]["presets"][1]["reasoning_effort"] == "high"
     assert followup_payload["agent"]["show_token_stats"] is True
@@ -888,6 +892,19 @@ def test_settings_rejects_invalid_protected_workspace_modes(patch: dict[str, obj
 
     with TestClient(app) as client:
         response = client.patch("/v1/settings", json={**patch, "persist": False})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "hybrid"])
+def test_settings_rejects_non_enforce_agent_turn_contract_mode(mode: str) -> None:
+    app = _create_test_app(config=MochiConfig())
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/v1/settings",
+            json={"agent": {"turn_contract_mode": mode}, "persist": False},
+        )
 
     assert response.status_code == 422
 

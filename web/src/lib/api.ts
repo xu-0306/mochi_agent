@@ -9,10 +9,20 @@ import type {
   Message,
   MessageEventType,
   ReasoningStep,
-  ToolExposureDiagnostics,
   ToolTransportDiagnostics,
   TokenStats,
 } from '@/lib/chat'
+import {
+  normalizeToolExposureDiagnostics,
+  normalizeToolWorkflowProjection,
+  type ToolWorkflowProjection,
+} from '@/lib/tool-workflow-observability'
+import {
+  parseToolWorkflowAggregateTransport,
+  type ToolWorkflowAggregate,
+  type ToolWorkflowAggregateRangeTransport,
+  type ToolWorkflowAggregateTransport,
+} from '@/lib/tool-workflow-aggregate'
 import {
   extractFileChangeGroupFromToolData,
   extractPatchPreviewResult,
@@ -34,11 +44,18 @@ import {
   deriveSubagentEventStatus,
   deriveSubagentMessageDeliveryStatus,
 } from '@/lib/subagent-protocol-events'
+import { parseSseFrame } from './sse-frame'
 
 const API_BASE = '/v1'
 const LOCAL_DEV_API_ORIGIN = 'http://127.0.0.1:8000'
 
 export type { FileChangeGroupSummary, PatchPreviewResult } from '@/lib/file-change-preview'
+export type { ToolWorkflowProjection } from '@/lib/tool-workflow-observability'
+export type {
+  ToolWorkflowAggregate,
+  ToolWorkflowAggregateRangeTransport,
+  ToolWorkflowAggregateTransport,
+} from '@/lib/tool-workflow-aggregate'
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
@@ -338,6 +355,7 @@ export interface SendMessageOptions {
   presencePenalty?: number
   repeatPenalty?: number
   reasoningEffort?: ReasoningEffort | null
+  expectedPolicyVersion?: string
   signal?: AbortSignal
 }
 
@@ -442,6 +460,8 @@ export interface BackendChatResponse {
   final_answer: string
   trajectory_id: string | null
   events: BackendChatEvent[]
+  tool_workflow?: ToolWorkflowProjection | null
+  tool_workflow_aggregate?: ToolWorkflowAggregateTransport | null
 }
 
 export interface ChatContextSnapshot {
@@ -464,6 +484,7 @@ export interface ChatContextSnapshot {
   compaction_reason?: string | null
   approximate: boolean
   reasoning_effort?: ReasoningEffort | null
+  tool_workflow: ToolWorkflowProjection
 }
 
 export interface PostChatPayload {
@@ -488,6 +509,7 @@ export interface PostChatPayload {
   presence_penalty?: number
   repeat_penalty?: number
   reasoning_effort?: ReasoningEffort | null
+  expected_policy_version?: string | null
 }
 
 export interface SendMessageResult {
@@ -498,12 +520,14 @@ export interface SendMessageResult {
   createdAt: string
   trajectoryId: string | null
   events: BackendChatEvent[]
+  toolWorkflowAggregate?: ToolWorkflowAggregateTransport | null
 }
 
 export type StreamChatEvent =
   | BackendChatEvent
   | TextChunkChatEvent
   | BackendChatResponse
+  | (ToolWorkflowAggregateTransport & { type: 'tool_workflow_aggregate' })
   | {
       type: 'done'
       session_id?: string
@@ -649,41 +673,6 @@ function getPayloadNumber(
   const snakeCaseValue = payload[snakeCaseKey]
   const camelCaseValue = payload[camelCaseKey]
   return getNumber(snakeCaseValue) ?? getNumber(camelCaseValue) ?? undefined
-}
-
-function normalizeToolExposure(
-  metadata?: Record<string, unknown>
-): ToolExposureDiagnostics | undefined {
-  if (!metadata) {
-    return undefined
-  }
-
-  const candidate = getPayloadRecord(metadata, 'tool_exposure', 'toolExposure')
-  if (!candidate) {
-    return undefined
-  }
-
-  const exposedTools = getStringArray(candidate.exposed_tools ?? candidate.exposedTools)
-  const workspaceBound = getOptionalBoolean(
-    candidate.workspace_bound ?? candidate.workspaceBound
-  )
-  const attachmentCount = getOptionalNumber(
-    candidate.attachment_count ?? candidate.attachmentCount
-  )
-
-  if (
-    exposedTools.length === 0 &&
-    workspaceBound === undefined &&
-    attachmentCount === undefined
-  ) {
-    return undefined
-  }
-
-  return {
-    exposedTools,
-    workspaceBound,
-    attachmentCount,
-  }
 }
 
 function normalizeTransportDiagnostics(
@@ -900,7 +889,7 @@ function buildReasoningStep(
   })
   const timestamp = toMessageTimestamp(event.timestamp)
   const source = getReasoningStepSource(event.toolMeta)
-  const toolExposure = normalizeToolExposure(event.toolMeta)
+  const toolExposure = normalizeToolExposureDiagnostics(event.toolMeta)
   const transport = normalizeTransportDiagnostics(event.toolMeta)
 
   switch (event.phase) {
@@ -1346,7 +1335,7 @@ export async function sendMessage(
   text: string,
   options: SendMessageOptions = {}
 ): Promise<SendMessageResult> {
-  const payload = await requestJson<BackendChatResponse>('/chat', {
+  const payload = await requestJson<BackendChatResponse & { tool_workflow_aggregate?: unknown }>('/chat', {
     method: 'POST',
     body: JSON.stringify({
       message: text,
@@ -1367,6 +1356,7 @@ export async function sendMessage(
       presence_penalty: options.presencePenalty,
       repeat_penalty: options.repeatPenalty,
       reasoning_effort: options.reasoningEffort,
+      expected_policy_version: options.expectedPolicyVersion,
     }),
   })
 
@@ -1378,11 +1368,15 @@ export async function sendMessage(
     createdAt: new Date().toISOString(),
     trajectoryId: payload.trajectory_id,
     events: payload.events,
+    toolWorkflowAggregate:
+      payload.tool_workflow_aggregate === undefined || payload.tool_workflow_aggregate === null
+        ? payload.tool_workflow_aggregate ?? null
+        : parseToolWorkflowAggregateTransport(payload.tool_workflow_aggregate),
   }
 }
 
 export async function postChat(payload: PostChatPayload): Promise<BackendChatResponse> {
-  return requestJson<BackendChatResponse>('/chat', {
+  const response = await requestJson<BackendChatResponse & { tool_workflow?: unknown; tool_workflow_aggregate?: unknown }>('/chat', {
     method: 'POST',
     body: JSON.stringify({
       message: payload.message,
@@ -1403,14 +1397,23 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       presence_penalty: payload.presence_penalty,
       repeat_penalty: payload.repeat_penalty,
       reasoning_effort: payload.reasoning_effort,
+      expected_policy_version: payload.expected_policy_version,
     }),
   })
+  return {
+    ...response,
+    tool_workflow: normalizeToolWorkflowProjection(response.tool_workflow),
+    tool_workflow_aggregate:
+      response.tool_workflow_aggregate === undefined || response.tool_workflow_aggregate === null
+        ? response.tool_workflow_aggregate ?? null
+        : parseToolWorkflowAggregateTransport(response.tool_workflow_aggregate),
+  }
 }
 
 export async function fetchChatContextPreview(
   payload: PostChatPayload & { signal?: AbortSignal }
 ): Promise<ChatContextSnapshot> {
-  return requestJson<ChatContextSnapshot>(
+  const response = await requestJson<ChatContextSnapshot & { tool_workflow?: unknown }>(
     '/chat/context',
     {
       method: 'POST',
@@ -1433,11 +1436,17 @@ export async function fetchChatContextPreview(
         presence_penalty: payload.presence_penalty,
         repeat_penalty: payload.repeat_penalty,
         reasoning_effort: payload.reasoning_effort,
+        expected_policy_version: payload.expected_policy_version,
       }),
       signal: payload.signal,
     },
     resolveChatTarget({ model: payload.model })
   )
+  const toolWorkflow = normalizeToolWorkflowProjection(response.tool_workflow)
+  if (!toolWorkflow) {
+    throw new Error('Chat context response is missing the server tool workflow snapshot.')
+  }
+  return { ...response, tool_workflow: toolWorkflow }
 }
 
 function normalizeStreamEvent(value: unknown): StreamChatEvent | null {
@@ -1560,6 +1569,20 @@ async function* readNdjsonStream(
 async function* readSseStream(
   stream: ReadableStream<Uint8Array>
 ): AsyncGenerator<StreamChatEvent, void, unknown> {
+  const parseFrame = (frame: string): StreamChatEvent | null => {
+    const { eventName, data } = parseSseFrame(frame)
+
+    if (!data || data === '[DONE]') {
+      return null
+    }
+
+    const parsed = JSON.parse(data)
+    if (eventName === 'tool_workflow_aggregate' && isRecord(parsed)) {
+      return normalizeStreamEvent({ ...parsed, type: 'tool_workflow_aggregate' })
+    }
+    return normalizeStreamEvent(parsed)
+  }
+
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -1574,18 +1597,7 @@ async function* readSseStream(
     buffer = frames.pop() ?? ''
 
     for (const frame of frames) {
-      const data = frame
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trim())
-        .join('\n')
-        .trim()
-
-      if (!data || data === '[DONE]') {
-        continue
-      }
-
-      const parsed = normalizeStreamEvent(JSON.parse(data))
+      const parsed = parseFrame(frame)
       if (parsed) {
         yield parsed
       }
@@ -1597,18 +1609,7 @@ async function* readSseStream(
     return
   }
 
-  const data = finalFrame
-    .split('\n')
-    .filter((line) => line.startsWith('data:'))
-    .map((line) => line.slice(5).trim())
-    .join('\n')
-    .trim()
-
-  if (!data || data === '[DONE]') {
-    return
-  }
-
-  const parsed = normalizeStreamEvent(JSON.parse(data))
+  const parsed = parseFrame(finalFrame)
   if (parsed) {
     yield parsed
   }
@@ -1647,6 +1648,7 @@ async function requestStreamResponse(
         presence_penalty: options.presencePenalty,
         repeat_penalty: options.repeatPenalty,
         reasoning_effort: options.reasoningEffort,
+        expected_policy_version: options.expectedPolicyVersion,
       }),
       signal: options.signal,
       cache: 'no-store',
@@ -1761,6 +1763,13 @@ export async function* streamChatMessages(
 
     const messages = toStreamMessages(rawEvent)
     if (messages.length === 0) {
+      yield {
+        event: null,
+        rawEvent,
+        sessionId: nextSessionId,
+        model,
+        trajectoryId,
+      }
       continue
     }
 
@@ -2230,6 +2239,99 @@ export async function fetchSession(sessionId: string): Promise<SessionDetail> {
   return normalizeSessionDetail(payload)
 }
 
+export async function fetchToolWorkflowSnapshot(
+  sessionId: string,
+  turnId: string,
+  storageId?: string | null
+): Promise<ToolWorkflowAggregateTransport> {
+  const query = storageId ? `?storage_id=${encodeURIComponent(storageId)}` : ''
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/tool-workflow${query}`
+  )
+  return parseToolWorkflowAggregateTransport(payload)
+}
+
+export async function fetchToolWorkflowRange(
+  sessionId: string,
+  turnId: string,
+  input: { afterSeq: number; limit?: number; storageId?: string | null }
+): Promise<ToolWorkflowAggregateRangeTransport> {
+  const params = new URLSearchParams({
+    after_seq: String(input.afterSeq),
+    limit: String(input.limit ?? 100),
+  })
+  if (input.storageId) params.set('storage_id', input.storageId)
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/tool-workflow/range?${params.toString()}`
+  )
+  if (!isRecord(payload) || !Array.isArray(payload.events)) {
+    throw new Error('Tool workflow aggregate range response is invalid.')
+  }
+  const scope = {
+    storage_id: payload.storage_id,
+    session_id: payload.session_id,
+    turn_id: payload.turn_id,
+    aggregate: null,
+    authoritative: payload.authoritative,
+    publication_enabled: payload.publication_enabled,
+  }
+  const base = parseToolWorkflowAggregateTransport(scope)
+  const events = payload.events.map((aggregate) =>
+    parseToolWorkflowAggregateTransport({ ...base, aggregate }).aggregate as ToolWorkflowAggregate
+  )
+  if (
+    typeof payload.after_seq !== 'number' ||
+    typeof payload.limit !== 'number' ||
+    typeof payload.next_after_seq !== 'number' ||
+    typeof payload.has_more !== 'boolean' ||
+    typeof payload.contiguous !== 'boolean'
+  ) {
+    throw new Error('Tool workflow aggregate range cursor is invalid.')
+  }
+  return {
+    type: typeof payload.type === 'string' ? payload.type : undefined,
+    storage_id: base.storage_id,
+    session_id: base.session_id,
+    turn_id: base.turn_id,
+    after_seq: payload.after_seq,
+    limit: payload.limit,
+    events,
+    next_after_seq: payload.next_after_seq,
+    has_more: payload.has_more,
+    contiguous: payload.contiguous,
+    publication_enabled: base.publication_enabled,
+    authoritative: base.authoritative,
+  }
+}
+
+export async function* streamToolWorkflowAggregates(
+  sessionId: string,
+  turnId: string,
+  input: { afterSeq?: number; storageId?: string | null; lastEventId?: string | null } = {}
+): AsyncGenerator<ToolWorkflowAggregateTransport, void, unknown> {
+  const params = new URLSearchParams({ after_seq: String(input.afterSeq ?? 0) })
+  if (input.storageId) params.set('storage_id', input.storageId)
+  const response = await fetch(
+    resolveApiUrl(`/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/tool-workflow/stream?${params.toString()}`),
+    {
+      headers: {
+        Accept: 'text/event-stream',
+        ...(input.lastEventId ? { 'Last-Event-ID': input.lastEventId } : {}),
+      },
+      cache: 'no-store',
+    }
+  )
+  if (!response.ok) {
+    const payload = await parseResponseBody(response)
+    throw new ApiError(response.status, getApiMessage(payload, response.statusText || 'Request failed'), payload)
+  }
+  if (!response.body) throw new ApiError(0, 'Tool workflow aggregate stream body is unavailable.')
+  for await (const event of readSseStream(response.body)) {
+    if (event.type !== 'tool_workflow_aggregate') continue
+    yield parseToolWorkflowAggregateTransport(event)
+  }
+}
+
 function normalizeSessionDetail(payload: BackendSessionResponse): SessionDetail {
   const events = getRecordArray(payload.events).map(normalizeSessionEvent)
   const updatedAt =
@@ -2282,13 +2384,15 @@ interface ForkSessionInput {
 
 export async function createSession(
   sessionId?: string,
-  projectId?: string | null
+  projectId?: string | null,
+  securityOverride?: SessionSecurityOverride | null
 ): Promise<SessionSummary> {
   const payload = await requestJson<BackendCreateSessionResponse>('/sessions', {
     method: 'POST',
     body: JSON.stringify({
       ...(sessionId ? { session_id: sessionId } : {}),
       ...(projectId !== undefined ? { project_id: projectId } : {}),
+      ...(securityOverride !== undefined ? { security_override: securityOverride } : {}),
     }),
   })
 
@@ -4252,6 +4356,7 @@ export interface InferencePreset {
 
 export interface AgentSettings {
   system_prompt: string
+  turn_contract_mode: 'enforce'
   temperature: number
   max_tokens: number | null
   reserve_output_tokens: number | null
@@ -5176,6 +5281,7 @@ export interface InferencePresetInput {
 
 export interface AgentSettingsUpdate {
   system_prompt?: string
+  turn_contract_mode?: 'enforce'
   temperature?: number
   max_tokens?: number | null
   reserve_output_tokens?: number | null
@@ -5301,9 +5407,9 @@ function normalizeAgentSettings(value: unknown): AgentSettings | undefined {
     .map(normalizeInferencePreset)
     .filter((preset): preset is InferencePreset => preset !== null)
   const reasoningEffort = getString(value.reasoning_effort)
-
   return {
     system_prompt: getString(value.system_prompt) ?? '',
+    turn_contract_mode: 'enforce',
     temperature: getNumber(value.temperature) ?? 0.7,
     max_tokens: getNumber(value.max_tokens) ?? null,
     reserve_output_tokens: getNumber(value.reserve_output_tokens) ?? null,

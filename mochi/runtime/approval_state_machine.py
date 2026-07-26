@@ -293,7 +293,9 @@ def supersede_approval(
 
 
 def can_record_execution_result(state: ApprovalLifecycleState) -> bool:
-    return state.status in _TERMINAL_EXECUTION_STATUSES
+    # Persist the concrete result while the consume lease is still held.  This
+    # closes the crash window between a mutation and its ReAct continuation.
+    return state.status == "consuming" or state.status in _TERMINAL_EXECUTION_STATUSES
 
 
 def recovery_outcome_for_task_status(task_status: str) -> ConsumeRecoveryOutcome:

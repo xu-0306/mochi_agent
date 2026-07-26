@@ -17,5 +17,14 @@ async def sse_stream(events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[str
         SSE 格式字串（data: {...}\\n\\n）。
     """
     async for event in events:
-        data = json.dumps(event, ensure_ascii=False)
-        yield f"data: {data}\n\n"
+        named_event = isinstance(event, dict) and "_sse_data" in event
+        event_name = event.get("_sse_event") if named_event else None
+        event_id = event.get("_sse_id") if named_event else None
+        payload = event.get("_sse_data") if named_event else event
+        data = json.dumps(payload, ensure_ascii=False)
+        prefix = ""
+        if isinstance(event_id, str) and event_id:
+            prefix += f"id: {event_id}\n"
+        if isinstance(event_name, str) and event_name:
+            prefix += f"event: {event_name}\n"
+        yield f"{prefix}data: {data}\n\n"

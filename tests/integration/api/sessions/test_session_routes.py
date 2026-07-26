@@ -31,7 +31,7 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
         assert alpha_projection["change_contract"]["enforcement_active"] is False
         assert alpha_projection["sandbox"]["effective_exec_behavior"] == "host_execution_available"
 
-        alpha_path = sessions_dir / "alpha.jsonl"
+        alpha_path = app.state.session_store._session_path("alpha")  # noqa: SLF001
         old_timestamp = 1_700_000_000
         os.utime(alpha_path, (old_timestamp, old_timestamp))
 
@@ -85,6 +85,90 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
         assert update_response.json()["protected_workspace"] == alpha_projection
 
         assert getattr(app.state, "runtime_service", None) is None
+
+
+def test_sessions_list_uses_logical_special_ids_not_encoded_filenames(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        for session_id in ("a:b", "a?b"):
+            response = client.post("/v1/sessions", json={"session_id": session_id})
+            assert response.status_code == 200
+
+        listed = client.get("/v1/sessions")
+        assert listed.status_code == 200
+        assert {item["session_id"] for item in listed.json()["items"]} == {"a:b", "a?b"}
+
+
+def test_session_create_persists_security_override_before_returning(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    store = SessionStore(sessions_dir)
+    app = _create_test_app(config=config, session_store=store)
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "auto-review-draft",
+                "security_override": {"autonomy_mode": "auto_review"},
+            },
+        )
+
+    assert create_response.status_code == 200
+    assert create_response.json()["security_override"] == {
+        "autonomy_mode": "auto_review"
+    }
+
+    events = asyncio.run(store.load_session("auto-review-draft"))
+    assert [event.get("event") for event in events] == ["created"]
+    assert events[0]["security_override"] == {"autonomy_mode": "auto_review"}
+
+    reloaded_app = _create_test_app(
+        config=config,
+        session_store=SessionStore(sessions_dir),
+    )
+    with TestClient(reloaded_app) as reloaded_client:
+        detail = reloaded_client.get("/v1/sessions/auto-review-draft")
+        summaries = reloaded_client.get("/v1/sessions")
+
+    assert detail.status_code == 200
+    assert detail.json()["security_override"] == {"autonomy_mode": "auto_review"}
+    assert summaries.status_code == 200
+    assert summaries.json()["items"][0]["security_override"] == {
+        "autonomy_mode": "auto_review"
+    }
+
+
+@pytest.mark.parametrize(
+    "security_override",
+    [
+        {},
+        {"autonomy_mode": "unrestricted"},
+        {"autonomy_mode": "auto_review", "unexpected": True},
+    ],
+)
+def test_session_create_rejects_invalid_security_override(
+    tmp_path: Path,
+    security_override: dict[str, object],
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "invalid-security-override",
+                "security_override": security_override,
+            },
+        )
+
+    assert response.status_code == 422
+    assert not (sessions_dir / "invalid-security-override.jsonl").exists()
 
 
 
@@ -314,6 +398,63 @@ def test_sessions_can_fork_from_turn_and_preserve_project(tmp_path: Path) -> Non
             item for item in list_payload["items"] if item["session_id"] == forked_session_id
         )
         assert forked_summary["project_id"] == project["id"]
+
+
+def test_session_fork_uses_explicit_create_override_without_inheriting_metadata(
+    tmp_path: Path,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    store = SessionStore(sessions_dir)
+    app = _create_test_app(config=config, session_store=store)
+
+    with TestClient(app) as client:
+        source = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "source-with-override",
+                "security_override": {"autonomy_mode": "auto_review"},
+            },
+        )
+        assert source.status_code == 200
+        asyncio.run(
+            store.save_event(
+                "source-with-override",
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "fork point",
+                    "turn_id": "turn-1",
+                    "timestamp": "2026-07-23T08:00:00+00:00",
+                },
+            )
+        )
+
+        without_override = client.post(
+            "/v1/sessions",
+            json={
+                "fork_from_session_id": "source-with-override",
+                "fork_until_turn_id": "turn-1",
+            },
+        )
+        with_override = client.post(
+            "/v1/sessions",
+            json={
+                "fork_from_session_id": "source-with-override",
+                "fork_until_turn_id": "turn-1",
+                "security_override": {"autonomy_mode": "strict"},
+            },
+        )
+
+        assert without_override.status_code == 200
+        assert with_override.status_code == 200
+        without_detail = client.get(
+            f"/v1/sessions/{without_override.json()['session_id']}"
+        )
+        with_detail = client.get(f"/v1/sessions/{with_override.json()['session_id']}")
+
+    assert without_detail.json()["security_override"] is None
+    assert with_detail.json()["security_override"] == {"autonomy_mode": "strict"}
 
 
 
@@ -845,3 +986,28 @@ def test_sessions_routes_fall_back_to_config_sessions_dir(tmp_path: Path) -> Non
     events = asyncio.run(SessionStore(sessions_dir).load_session("from-config"))
     assert len(events) == 1
     assert events[0]["type"] == "session_meta"
+
+
+def test_session_event_endpoint_rejects_authoritative_tool_workflow_events(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+
+    with TestClient(app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "reserved"}).status_code == 200
+        response = client.post(
+            "/v1/sessions/reserved/events",
+            json={
+                "events": [
+                    {
+                        "type": "session_meta",
+                        "event": "tool_workflow_aggregate_outbox",
+                        "aggregate": {},
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 403
+    events = asyncio.run(SessionStore(sessions_dir).load_session("reserved"))
+    assert [event.get("event") for event in events] == ["created"]

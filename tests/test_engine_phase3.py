@@ -10,6 +10,7 @@ import mochi.agents.engine as engine_module
 from mochi.agents.engine import AgentEngine
 from mochi.backends.types import GenerationResult, Message, ModelInfo
 from mochi.config.schema import MochiConfig
+from mochi.sessions.turn_timeline import SessionTurnTimelineRepository
 from mochi.tools.base import ToolExecutionContext, ToolResult
 
 
@@ -21,6 +22,72 @@ class _SwitchableBackend:
 
     def get_model_info(self) -> ModelInfo:
         return ModelInfo(name=self.name, backend_type="test")
+
+
+@pytest.mark.asyncio
+async def test_apply_config_rebinds_owned_outbox_sources_and_preserves_injected_repositories(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path / "workspace"),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "agent": {"tool_observability_v1": True},
+        }
+    )
+    engine = AgentEngine(config)
+    original_state = engine._conversation_state_repository  # noqa: SLF001
+    original_checkpoint = engine._turn_checkpoint_repository  # noqa: SLF001
+
+    await engine.apply_config(config.model_copy(deep=True))
+
+    assert engine._session_store.tool_observability_v1 is True  # noqa: SLF001
+    assert engine._tool_workflow_outbox.enabled is True  # noqa: SLF001
+    assert engine._conversation_state_repository is not original_state  # noqa: SLF001
+    assert engine._turn_checkpoint_repository is not original_checkpoint  # noqa: SLF001
+    assert engine._conversation_state_repository._session_store is engine._session_store  # noqa: SLF001
+    assert engine._turn_checkpoint_repository._session_store is engine._session_store  # noqa: SLF001
+
+    timeline = SessionTurnTimelineRepository(engine._session_store)  # noqa: SLF001
+    snapshot = await engine._session_store.load_strict_snapshot("enabled-session")  # noqa: SLF001
+    admitted = await timeline.admit(
+        "enabled-session",
+        turn_id="enabled-turn",
+        expected_history_revision=snapshot.history_revision,
+    )
+    assert admitted.status == "admitted"
+    assert [item["seq"] for item in await engine._tool_workflow_outbox.list(  # noqa: SLF001
+        "enabled-session", turn_id="enabled-turn"
+    )] == [1]
+
+    disabled_agent = config.agent.model_copy(update={"tool_observability_v1": False})
+    disabled = config.model_copy(update={"agent": disabled_agent})
+    await engine.apply_config(disabled)
+    assert engine._session_store.tool_observability_v1 is False  # noqa: SLF001
+    assert engine._tool_workflow_outbox.enabled is False  # noqa: SLF001
+    disabled_timeline = SessionTurnTimelineRepository(engine._session_store)  # noqa: SLF001
+    disabled_snapshot = await engine._session_store.load_strict_snapshot("disabled-session")  # noqa: SLF001
+    assert (
+        await disabled_timeline.admit(
+            "disabled-session",
+            turn_id="disabled-turn",
+            expected_history_revision=disabled_snapshot.history_revision,
+        )
+    ).status == "admitted"
+    assert await engine._tool_workflow_outbox.list("disabled-session") == ()  # noqa: SLF001
+
+    injected_state = object()
+    injected_checkpoint = object()
+    injected_engine = AgentEngine(
+        config,
+        conversation_state_repository=injected_state,  # type: ignore[arg-type]
+        turn_checkpoint_repository=injected_checkpoint,  # type: ignore[arg-type]
+    )
+    await injected_engine.apply_config(disabled)
+    assert injected_engine._conversation_state_repository is injected_state  # noqa: SLF001
+    assert injected_engine._turn_checkpoint_repository is injected_checkpoint  # noqa: SLF001
 
 
 def test_engine_get_model_info_before_initialize_prefers_ollama_model_spec(

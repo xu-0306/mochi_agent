@@ -8,6 +8,11 @@ from pathlib import Path
 import pytest
 
 from mochi.agents import engine as engine_module
+from mochi.agents.conversation_resolver import (
+    BoundedConversationContext,
+    ConversationResolver,
+    IntentInterpretation,
+)
 from mochi.agents.engine import AgentEngine
 from mochi.agents.events import (
     AgentEvent,
@@ -15,7 +20,7 @@ from mochi.agents.events import (
     StatusEvent,
 )
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest
-from mochi.agents.tool_intent_router import ToolIntentRoute
+from mochi.agents.turn_intent_contract import DeliverableContract
 from mochi.backends.types import (
     AttachmentRef,
     ModelInfo,
@@ -25,6 +30,29 @@ from mochi.tools.registry import ToolRegistry
 from tests.unit.engine._support import (
     FakeBackend,
 )
+
+
+class _OperationInterpreter:
+    def __init__(self, *operations: str) -> None:
+        self._operations = frozenset(operations)
+
+    async def interpret(
+        self,
+        context: BoundedConversationContext,
+    ) -> IntentInterpretation:
+        return IntentInterpretation(
+            current_speech_act="request_information",
+            task_relation="standalone",
+            objective=context.current_turn.content,
+            operations=self._operations,  # type: ignore[arg-type]
+            confidence=0.99,
+        )
+
+
+def _resolver_factory(*operations: str):  # type: ignore[no-untyped-def]
+    return lambda backend: ConversationResolver(
+        interpreter=_OperationInterpreter(*operations)
+    )
 
 
 @pytest.mark.asyncio
@@ -41,6 +69,7 @@ async def test_engine_weather_prompt_exposes_only_web_subset_for_local_backend(
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="local.gguf",
         backend_type="gguf",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -52,7 +81,10 @@ async def test_engine_weather_prompt_exposes_only_web_subset_for_local_backend(
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("open_world_lookup"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -63,9 +95,68 @@ async def test_engine_weather_prompt_exposes_only_web_subset_for_local_backend(
     _ = [event async for event in engine.chat("請幫我查詢今天台中天氣", session_id="s1")]
 
     exposed = fake_backend.tool_calls_seen[-1]
-    assert {"web_search", "web_fetch", "get_current_time"} <= set(exposed)
+    assert {"web_search", "tool_search", "tool_activate"} <= set(exposed)
     assert "file_read" not in exposed
     assert len(exposed) <= 6
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_same_contract_with_different_wording_has_identical_tool_plan(
+    tmp_path: Path,
+) -> None:
+    fake_backend = FakeBackend()
+    fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
+        name="remote-model",
+        backend_type="openai_compat",
+        context_length=32768,
+        supports_tool_calling=True,
+    )
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("open_world_lookup"),
+    )
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+
+    first = await engine.invoke(
+        AgentInvocationRequest(
+            message="What is the weather today?",
+            session_id="contract-wording-a",
+            persist_session=False,
+        )
+    )
+    second = await engine.invoke(
+        AgentInvocationRequest(
+            message="Find recent external sources about model evaluation.",
+            session_id="contract-wording-b",
+            persist_session=False,
+        )
+    )
+
+    assert first.diagnostics.exposed_tools == second.diagnostics.exposed_tools
+    assert (
+        first.diagnostics.tool_exposure["diagnostics"][
+            "capability_exposure_adapter"
+        ]["activation_allowed_tool_names"]
+        == second.diagnostics.tool_exposure["diagnostics"][
+            "capability_exposure_adapter"
+        ]["activation_allowed_tool_names"]
+    )
 
     await engine.close()
 
@@ -79,6 +170,7 @@ async def test_engine_coding_prompt_exposes_workspace_subset(
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="remote-model",
         backend_type="openai_compat",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -96,7 +188,10 @@ async def test_engine_coding_prompt_exposes_workspace_subset(
             },
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -107,20 +202,21 @@ async def test_engine_coding_prompt_exposes_workspace_subset(
     _ = [event async for event in engine.chat("請幫我 debug 這個 repo 的 test failure", session_id="s1")]
 
     exposed = fake_backend.tool_calls_seen[-1]
-    assert {"file_read", "glob_search", "grep_search"} <= set(exposed)
+    assert {"repo_map", "tool_search", "tool_activate"} <= set(exposed)
     assert "web_search" not in exposed
 
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_engine_chinese_workspace_prompt_exposes_workspace_read_baseline(
+async def test_engine_chinese_workspace_contract_exposes_minimal_read_and_broker(
     tmp_path: Path,
 ) -> None:
     fake_backend = FakeBackend()
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="remote-model",
         backend_type="openai_compat",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -132,7 +228,10 @@ async def test_engine_chinese_workspace_prompt_exposes_workspace_read_baseline(
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -150,7 +249,8 @@ async def test_engine_chinese_workspace_prompt_exposes_workspace_read_baseline(
     ]
 
     exposed = fake_backend.tool_calls_seen[-1]
-    assert {"file_read", "glob_search", "grep_search"} <= set(exposed)
+    assert {"repo_map", "tool_search", "tool_activate"} <= set(exposed)
+    assert not ({"file_write", "file_edit", "apply_patch"} & set(exposed))
 
     await engine.close()
 
@@ -196,17 +296,10 @@ async def test_engine_attachment_prompt_context_distinguishes_attachment_sources
         ),
     ]
 
-    planner_message = engine._build_tool_planner_message("debug this flow", attachments)  # noqa: SLF001
     prompt_context = engine._build_attachment_prompt_context(  # noqa: SLF001
         attachments=attachments,
         available_tool_names=["file_read", "image_view"],
     )
-
-    assert "[upload]" in planner_message
-    assert "[workspace file]" in planner_message
-    assert "[workspace selection]" in planner_message
-    assert "[image]" in planner_message
-    assert "lines 10-14" in planner_message
 
     assert "uploads, workspace references, selections, or images" in prompt_context
     assert "quote: \"def execute(...):\"" in prompt_context
@@ -225,6 +318,7 @@ async def test_engine_invoke_exposes_tool_exposure_metadata_from_final_plan(
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="remote-model",
         backend_type="openai_compat",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -236,7 +330,10 @@ async def test_engine_invoke_exposes_tool_exposure_metadata_from_final_plan(
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -271,8 +368,9 @@ async def test_engine_invoke_exposes_tool_exposure_metadata_from_final_plan(
     assert tool_exposure["exposed_tools"] == result.diagnostics.exposed_tools
     assert tool_exposure["workspace_bound"] is True
     assert tool_exposure["attachment_count"] == 2
-    assert tool_exposure["intent_route"]["intent"] == "workspace_read"
-    assert tool_exposure["intent_route"]["source"] == "fallback_keyword"
+    assert tool_exposure.get("intent_route") is None
+    adapter = tool_exposure["diagnostics"]["capability_exposure_adapter"]
+    assert adapter["required_capabilities"] == ["workspace_read"]
 
     await engine.close()
 
@@ -312,7 +410,10 @@ async def test_engine_invoke_exposes_diagnostics_and_honors_disabled_tool_mode(
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -351,6 +452,7 @@ async def test_engine_subagent_research_profile_keeps_tools_read_only(
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="remote-model",
         backend_type="openai_compat",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -363,7 +465,10 @@ async def test_engine_subagent_research_profile_keeps_tools_read_only(
             "security": {"autonomy_mode": "auto_review"},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -394,7 +499,9 @@ async def test_engine_subagent_research_profile_keeps_tools_read_only(
     }
     assert not (set(result.diagnostics.exposed_tools) & risky)
     assert not (set(fake_backend.tool_calls_seen[-1]) & risky)
-    assert {"grep_search", "csv_read"} & set(result.diagnostics.exposed_tools)
+    assert {"repo_map", "grep_search", "csv_read"} & set(
+        result.diagnostics.exposed_tools
+    )
 
     await engine.close()
 
@@ -419,7 +526,10 @@ async def test_engine_controlled_execution_profiles_gate_risky_tools(
             "security": {"autonomy_mode": "auto_review"},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -466,6 +576,7 @@ async def test_engine_restricted_profiles_use_hard_readonly_allowlists(
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="remote-model",
         backend_type="openai_compat",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -478,7 +589,10 @@ async def test_engine_restricted_profiles_use_hard_readonly_allowlists(
             "security": {"autonomy_mode": "auto_review"},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -508,7 +622,7 @@ async def test_engine_restricted_profiles_use_hard_readonly_allowlists(
             )
         )
         exposed = set(result.diagnostics.exposed_tools)
-        assert "memory_search" in exposed
+        assert "repo_map" in exposed
         assert "tool_result_read" in exposed
         assert not (exposed & blocked_memory_tools)
 
@@ -523,6 +637,7 @@ async def test_engine_followup_open_world_turn_preserves_tool_result_read_only_w
     fake_backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="remote-model",
         backend_type="openai_compat",
+        context_length=32768,
         supports_tool_calling=True,
     )
 
@@ -535,7 +650,10 @@ async def test_engine_followup_open_world_turn_preserves_tool_result_read_only_w
             "security": {"autonomy_mode": "auto_review"},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("open_world_lookup"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -673,11 +791,11 @@ async def test_engine_invocation_tool_overrides_are_limited_by_profile(
 
 
 @pytest.mark.asyncio
-async def test_engine_passes_workspace_write_route_as_file_mutation_obligation(
+async def test_engine_blocks_unavailable_contract_write_before_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_backend = FakeBackend()
+    fake_backend = FakeBackend(metadata={"effective_context_length": 32768})
     seen_requires_file_mutation: list[bool] = []
     seen_tool_names: list[list[str]] = []
 
@@ -709,26 +827,46 @@ async def test_engine_passes_workspace_write_route_as_file_mutation_obligation(
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
+    class _Interpreter:
+        async def interpret(
+            self,
+            context: BoundedConversationContext,
+        ) -> IntentInterpretation:
+            if "weather" in context.current_turn.content.lower():
+                return IntentInterpretation(
+                    current_speech_act="request_information",
+                    task_relation="standalone",
+                    operations=frozenset({"open_world_lookup"}),
+                    confidence=0.99,
+                )
+            return IntentInterpretation(
+                current_speech_act="request_execution",
+                task_relation="standalone",
+                operations=frozenset({"workspace_write"}),
+                deliverables=(
+                    DeliverableContract(
+                        kind="workspace_file",
+                        target_hint="report.md",
+                        source_turn_ids=(context.current_turn.turn_id,),
+                    ),
+                ),
+                mutation_requirement="required",
+                confidence=0.99,
+            )
+
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=lambda backend: ConversationResolver(
+            interpreter=_Interpreter()
+        ),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         del model_spec
         engine._router._active = fake_backend  # noqa: SLF001
         return fake_backend
 
-    routed_intent = "workspace_write"
-
-    async def fake_route_tool_intent_for_exposure(**kwargs: object) -> ToolIntentRoute:
-        del kwargs
-        return ToolIntentRoute(
-            intent=routed_intent,
-            confidence=0.99,
-            source="classifier" if routed_intent == "workspace_write" else "fallback_keyword",
-            rationale="The user is asking to create or save a workspace file.",
-        )
-
     engine._router.load = fake_load  # type: ignore[method-assign]
-    engine._route_tool_intent_for_exposure = fake_route_tool_intent_for_exposure  # type: ignore[method-assign]
     monkeypatch.setattr(engine_module, "AsyncReActLoop", SpyReActLoop)
 
     result = await engine.invoke(
@@ -742,11 +880,12 @@ async def test_engine_passes_workspace_write_route_as_file_mutation_obligation(
         )
     )
 
-    assert result.content == "spy reply"
-    assert seen_requires_file_mutation == [True]
-    assert not any(tool_name in {"file_write", "file_edit", "apply_patch"} for tool_name in seen_tool_names[0])
+    assert "required capabilities are unavailable" in result.content
+    assert result.diagnostics.fallback_reason == (
+        "turn_contract_required_capability_unavailable"
+    )
+    assert seen_requires_file_mutation == []
 
-    routed_intent = "ambiguous"
     fallback_result = await engine.invoke(
         AgentInvocationRequest(
             message="save report.md",
@@ -758,14 +897,9 @@ async def test_engine_passes_workspace_write_route_as_file_mutation_obligation(
         )
     )
 
-    assert fallback_result.content == "spy reply"
-    assert seen_requires_file_mutation == [True, True]
-    assert all(
-        not ({"file_write", "file_edit", "apply_patch"} & set(tool_names))
-        for tool_names in seen_tool_names
-    )
+    assert "required capabilities are unavailable" in fallback_result.content
+    assert seen_requires_file_mutation == []
 
-    routed_intent = "open_world_lookup"
     non_write_result = await engine.invoke(
         AgentInvocationRequest(
             message="Update me on the latest weather in Taipei",
@@ -778,7 +912,7 @@ async def test_engine_passes_workspace_write_route_as_file_mutation_obligation(
     )
 
     assert non_write_result.content == "spy reply"
-    assert seen_requires_file_mutation == [True, True, False]
+    assert seen_requires_file_mutation == [False]
 
     await engine.close()
 

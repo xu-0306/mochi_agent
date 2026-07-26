@@ -83,8 +83,11 @@ async def test_engine_persists_and_restores_session_history(tmp_path: Path) -> N
 
     assert any(isinstance(event, FinalAnswerEvent) for event in restored_events)
     assert restored_backend.probe_calls == 1
-    assert len(restored_backend.calls) == 2
-    restored_messages = restored_backend.calls[-1]
+    restored_messages = next(
+        call
+        for call in reversed(restored_backend.calls)
+        if any(message.role == "user" and message.content == "second turn" for message in call)
+    )
     assert [message.content for message in restored_messages[1:3]] == [
         "first turn",
         "fake reply",

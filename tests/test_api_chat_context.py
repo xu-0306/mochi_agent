@@ -36,6 +36,7 @@ class _ContextPreviewEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        permission_policy: dict[str, Any] | None = None,
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
     ) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class _ContextPreviewEngine:
                 "inference_overrides": inference_overrides,
                 "project_id": project_id,
                 "workspace_dir": workspace_dir,
+                "permission_policy": permission_policy,
                 "selected_skill_ids": selected_skill_ids,
                 "attachments": attachments,
             }
@@ -123,6 +125,11 @@ def test_chat_context_preview_returns_budget_and_compaction_snapshot(tmp_path) -
     assert payload["remaining_tokens"] == 2384
     assert payload["compaction_triggered"] is True
     assert payload["reasoning_effort"] == "high"
+    workflow = payload["tool_workflow"]
+    assert workflow["tool_inventory"]["catalog_scope"] == "policy_eligible"
+    assert workflow["effective_policy"]["policy_snapshot_id"].startswith("policy-")
+    assert workflow["effective_policy"]["review_semantics"] == "concrete_call_only"
+    assert workflow["activation"]["status"] == "not_observed"
     assert engine.preview_calls[0]["inference_overrides"]["reserve_output_tokens"] == 768
     assert engine.preview_calls[0]["selected_skill_ids"] == ["skill-a"]
     assert engine.preview_calls[0]["attachments"] == [
@@ -165,6 +172,53 @@ def test_chat_context_preview_preserves_explicit_auto_token_overrides(tmp_path) 
     assert response.status_code == 200
     assert engine.preview_calls[0]["inference_overrides"]["max_tokens"] is None
     assert engine.preview_calls[0]["inference_overrides"]["reserve_output_tokens"] is None
+
+
+def test_chat_context_preview_receives_persisted_session_policy(tmp_path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate(
+        {
+            "model": "gpt-test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(sessions_dir),
+            "security": {"autonomy_mode": "strict"},
+        }
+    )
+    app = _create_test_app(config=config, session_store=SessionStore(sessions_dir))
+    engine = _ContextPreviewEngine()
+    app.state.engine = engine
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "session-context-policy",
+                "security_override": {"autonomy_mode": "auto_review"},
+            },
+        )
+        assert create_response.status_code == 200
+        response = client.post(
+            "/v1/chat/context",
+            json={
+                "message": "preview with the persisted policy",
+                "session_id": "session-context-policy",
+            },
+        )
+
+    assert response.status_code == 200
+    policy = engine.preview_calls[-1]["permission_policy"]
+    assert policy["autonomy_mode"] == "auto_review"
+    assert policy["require_approval_for_file_write"] is False
+    assert policy["require_approval_for_exec"] is False
+    assert policy["source_chain"] == ["security_config", "session_override"]
+    assert str(policy["policy_snapshot_id"]).startswith("policy-")
+    workflow = response.json()["tool_workflow"]
+    assert workflow["effective_policy"]["autonomy_mode"] == "auto_review"
+    assert workflow["effective_policy"]["source_chain"] == [
+        "security_config",
+        "session_override",
+    ]
+    assert workflow["effective_policy"]["expectation_status"] == "not_provided"
 
 
 def test_chat_context_preview_rejects_invalid_reasoning_effort(tmp_path) -> None:

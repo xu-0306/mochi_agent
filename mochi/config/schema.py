@@ -967,6 +967,13 @@ class AgentConfig(BaseModel):
     max_context_tokens: int = 3000
     """傳入 LLM 的最大 context token 數（不含輸出）。"""
 
+    turn_contract_mode: Literal["enforce"] = "enforce"
+    """Turn contract execution mode. Contract enforcement is always authoritative."""
+
+    # P2.3 durable aggregate publication.  Disabling this stops new cache
+    # entries but keeps existing outbox records inspectable for rollback.
+    tool_observability_v1: bool = False
+
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     """採樣溫度（0.0–2.0）。"""
 
@@ -1003,6 +1010,13 @@ class AgentConfig(BaseModel):
 
     active_preset: str = "default"
     """目前啟用的 preset 名稱。"""
+
+    @field_validator("turn_contract_mode", mode="before")
+    @classmethod
+    def _migrate_turn_contract_mode(cls, value: Any) -> Any:
+        if value in {None, "legacy", "shadow", "enforce"}:
+            return "enforce"
+        return value
 
     @model_validator(mode="before")
     @classmethod

@@ -117,6 +117,7 @@ import { useSessionStore, type Session } from '@/lib/stores/session-store'
 import { useTaskStore } from '@/lib/stores/task-store'
 import { useUIStore } from '@/lib/stores/ui-store'
 import { useWorkspaceStore } from '@/lib/stores/workspace-store'
+import { toolWorkflowAggregateStore } from '@/lib/tool-workflow-aggregate'
 import { cn } from '@/lib/utils'
 import { resolveVoiceOverlayPhase, resolveVoicePhaseFromRuntime } from '@/lib/voice-phase'
 import {
@@ -235,6 +236,7 @@ interface BackendChatResponse {
   content?: string
   model?: string
   events?: api.BackendChatEvent[]
+  tool_workflow_aggregate?: api.ToolWorkflowAggregateTransport | null
 }
 
 interface ModelsResponse {
@@ -265,6 +267,7 @@ interface ApiCompat {
       presencePenalty?: number
       repeatPenalty?: number
       reasoningEffort?: api.ReasoningEffort | null
+      expectedPolicyVersion?: string
     }
   ) => Promise<unknown>
   postChat?: (payload: {
@@ -289,6 +292,7 @@ interface ApiCompat {
     presence_penalty?: number
     repeat_penalty?: number
     reasoning_effort?: api.ReasoningEffort | null
+    expected_policy_version?: string | null
   }) => Promise<unknown>
 }
 
@@ -723,6 +727,7 @@ interface DirectChatTurnInput {
   normalizedWorkflow: api.SessionWorkflowState
   sessionScope: SendSessionScope
   systemPromptOverride?: string | null
+  expectedPolicyVersion?: string
 }
 
 interface ActiveGoalDirectTurnDecisionInput {
@@ -735,6 +740,7 @@ interface ActiveGoalDirectTurnDecisionInput {
   selectedSkillIds: string[]
   sessionScope: SendSessionScope
   systemPromptOverride?: string | null
+  expectedPolicyVersion?: string
 }
 
 function normalizeGoalSessionSummary(value: unknown): GoalSessionSummary | null {
@@ -1415,6 +1421,7 @@ async function requestChat(
   selectedSkillIds: string[],
   attachments: ChatAttachment[],
   toolMode: 'disabled' | 'auto' | 'required' | undefined,
+  expectedPolicyVersion: string | undefined,
   inference: {
     systemPrompt: string
     temperature: number
@@ -1454,6 +1461,7 @@ async function requestChat(
       presence_penalty: inference.presencePenalty,
       repeat_penalty: inference.repeatPenalty,
       reasoning_effort: inference.reasoningEffort,
+      expected_policy_version: expectedPolicyVersion,
     })
     return response as BackendChatResponse
   }
@@ -1477,6 +1485,7 @@ async function requestChat(
       presencePenalty: inference.presencePenalty,
       repeatPenalty: inference.repeatPenalty,
       reasoningEffort: inference.reasoningEffort,
+      expectedPolicyVersion,
     })
     return response as BackendChatResponse
   }
@@ -2922,15 +2931,78 @@ export default function ChatPage() {
     [setSessionMessages, t, updateLastMessage]
   )
 
+  const repairToolWorkflowAggregate = React.useCallback(async (sessionId: string, turnId: string) => {
+    const cursor = toolWorkflowAggregateStore.getCursor(sessionId, turnId)
+    try {
+      if (cursor) {
+        const range = await api.fetchToolWorkflowRange(sessionId, turnId, {
+          afterSeq: cursor.lastSeq,
+          storageId: cursor.storageId,
+        })
+        const rangeResult = toolWorkflowAggregateStore.applyRange(range)
+        if (
+          rangeResult.kind === 'applied' ||
+          (rangeResult.kind === 'duplicate' && rangeResult.entry.status !== 'repair_required')
+        ) {
+          return
+        }
+      }
+
+      const snapshot = await api.fetchToolWorkflowSnapshot(sessionId, turnId)
+      toolWorkflowAggregateStore.applySnapshot(snapshot)
+    } catch (error) {
+      if (error instanceof api.ApiError && error.status === 404) {
+        return
+      }
+      try {
+        const snapshot = await api.fetchToolWorkflowSnapshot(sessionId, turnId)
+        toolWorkflowAggregateStore.applySnapshot(snapshot)
+      } catch {
+        // Keep the last-known-good aggregate and its repair diagnostic.
+      }
+    }
+  }, [])
+
+  const hydrateToolWorkflowAggregates = React.useCallback(async (detail: api.SessionDetail) => {
+    const turnIds = new Set<string>()
+    for (const event of detail.events) {
+      const candidate = event as unknown as Record<string, unknown>
+      const turnId = candidate.turn_id ?? candidate.turnId
+      if (typeof turnId === 'string' && turnId.trim()) {
+        turnIds.add(turnId.trim())
+      } else if (typeof turnId === 'number' && Number.isSafeInteger(turnId)) {
+        turnIds.add(String(turnId))
+      }
+    }
+    await Promise.all([...turnIds].map(async (turnId) => {
+      try {
+        const snapshot = await api.fetchToolWorkflowSnapshot(detail.id, turnId)
+        toolWorkflowAggregateStore.applySnapshot(snapshot)
+      } catch (error) {
+        if (!(error instanceof api.ApiError && error.status === 404)) {
+          // Legacy turns may not have an aggregate; transcript materialization remains available.
+        }
+      }
+    }))
+  }, [])
+
+  React.useEffect(() => {
+    if (currentSessionDetail?.id !== currentSessionId) {
+      return
+    }
+    void hydrateToolWorkflowAggregates(currentSessionDetail)
+  }, [currentSessionDetail, currentSessionId, hydrateToolWorkflowAggregates])
+
   const syncSessionFromServer = React.useCallback(async (sessionId: string) => {
     try {
       const detail = await api.fetchSession(sessionId)
       hydrateSessionFromDetail(detail)
       upsertSessionDetail(detail)
+      await hydrateToolWorkflowAggregates(detail)
     } catch {
       // Keep the optimistic transcript if canonical session refresh fails.
     }
-  }, [hydrateSessionFromDetail, upsertSessionDetail])
+  }, [hydrateSessionFromDetail, hydrateToolWorkflowAggregates, upsertSessionDetail])
 
   const appendVoiceMessages = React.useCallback(
     (result: VoiceTurnResult) => {
@@ -3826,6 +3898,7 @@ export default function ChatPage() {
       normalizedWorkflow,
       sessionScope,
       systemPromptOverride,
+      expectedPolicyVersion,
     }: DirectChatTurnInput) => {
       let sessionId = sessionScope.getSessionId()
       let sessionContext = sessionScope.getContext()
@@ -4121,6 +4194,7 @@ export default function ChatPage() {
             presencePenalty: effectiveInference.presencePenalty,
             repeatPenalty: effectiveInference.repeatPenalty,
             reasoningEffort: effectiveInference.reasoningEffort,
+            expectedPolicyVersion,
             signal: abortController.signal,
             onSessionId: (nextSessionId) => {
               if (nextSessionId && nextSessionId !== targetSessionId) {
@@ -4136,6 +4210,16 @@ export default function ChatPage() {
             },
           })) {
             streamed = true
+
+            if (chunk.rawEvent?.type === 'tool_workflow_aggregate') {
+              const aggregateResult = toolWorkflowAggregateStore.applyTransport(chunk.rawEvent)
+              if (aggregateResult.kind === 'repair_required' || aggregateResult.kind === 'unsupported') {
+                void repairToolWorkflowAggregate(
+                  aggregateResult.entry.cursor.sessionId,
+                  aggregateResult.entry.cursor.turnId
+                )
+              }
+            }
 
             const subagentEvent = normalizeStreamSubagentEvent(chunk.rawEvent)
             if (subagentEvent) {
@@ -4188,6 +4272,7 @@ export default function ChatPage() {
             selectedSkillIds,
             attachments,
             toolMode,
+            expectedPolicyVersion,
             {
               ...effectiveInference,
               systemPrompt: systemPromptOverride ?? effectiveInference.systemPrompt,
@@ -4213,6 +4298,10 @@ export default function ChatPage() {
             ...resolveMessagesForSession(sessionId).filter((message) => message.turnKey !== turnKey),
             ...eventMessages,
           ])
+
+          if (response.tool_workflow_aggregate) {
+            toolWorkflowAggregateStore.applySnapshot(response.tool_workflow_aggregate)
+          }
 
           const finalAssistantMessage = [...eventMessages]
             .reverse()
@@ -4284,6 +4373,7 @@ export default function ChatPage() {
       selectSession,
       setSessionMessages,
       startStreaming,
+      repairToolWorkflowAggregate,
       syncSessionFromServer,
       syncWorkflowRunEventsToSession,
       t,
@@ -4293,6 +4383,10 @@ export default function ChatPage() {
     ]
   )
 
+  const activeGoalDirectTurnDecisionRef = React.useRef<
+    ((input: ActiveGoalDirectTurnDecisionInput) => Promise<boolean>) | null
+  >(null)
+
   const handleSend = React.useCallback(
     async (
       text: string,
@@ -4300,6 +4394,7 @@ export default function ChatPage() {
         forceSessionId?: string
         selectedSkillIds?: string[]
         attachments?: ChatAttachment[]
+        expectedPolicyVersion?: string
       }
     ) => {
       if (hasActiveStream) {
@@ -4309,6 +4404,7 @@ export default function ChatPage() {
       const targetSessionId = options?.forceSessionId ?? currentSessionId
       const selectedSkillIds = options?.selectedSkillIds ?? []
       const attachments = options?.attachments ?? []
+      const expectedPolicyVersion = options?.expectedPolicyVersion
       const initialSessionId = targetSessionId ?? createDraftSession(activeProjectId)
       const targetSession = sessions.find((session) => session.id === initialSessionId)
       const sessionScope = createSendSessionScope(initialSessionId, targetSession)
@@ -4440,6 +4536,7 @@ export default function ChatPage() {
           toolMode: 'auto',
           normalizedWorkflow,
           sessionScope,
+          expectedPolicyVersion,
           systemPromptOverride: buildAutonomousGoalSystemPrompt(
             effectiveInference.systemPrompt,
             route.content
@@ -4497,16 +4594,19 @@ export default function ChatPage() {
         sessionContext.baseGoalState.pending_proposal === null &&
         requestText.trim().length > 0
       ) {
-        const handledActiveGoalDecision = await handleActiveGoalDirectTurnDecision({
-          sessionId,
-          requestText,
-          attachments,
-          activeGoalId,
-          baseWorkflow: sessionContext.baseWorkflow,
-          latestGoalSummary: sessionContext.baseGoalState.last_goal_summary,
-          selectedSkillIds,
-          sessionScope,
-        })
+        const handledActiveGoalDecision = activeGoalDirectTurnDecisionRef.current
+          ? await activeGoalDirectTurnDecisionRef.current({
+              sessionId,
+              requestText,
+              attachments,
+              activeGoalId,
+              baseWorkflow: sessionContext.baseWorkflow,
+              latestGoalSummary: sessionContext.baseGoalState.last_goal_summary,
+              selectedSkillIds,
+              sessionScope,
+              expectedPolicyVersion,
+            })
+          : false
         if (handledActiveGoalDecision) {
           return
         }
@@ -4520,6 +4620,7 @@ export default function ChatPage() {
         toolMode: undefined,
         normalizedWorkflow,
         sessionScope,
+        expectedPolicyVersion,
       })
     },
     [
@@ -4822,6 +4923,7 @@ export default function ChatPage() {
     options?: {
       selectedSkillIds?: string[]
       attachments?: ChatAttachment[]
+      expectedPolicyVersion?: string
     }
   ) => {
     const attachments = options?.attachments ?? []
@@ -4829,7 +4931,11 @@ export default function ChatPage() {
 
     if (!editState?.turnId || !currentSessionId) {
       setEditState(null)
-      await handleSend(nextContent, { attachments, selectedSkillIds })
+      await handleSend(nextContent, {
+        attachments,
+        selectedSkillIds,
+        expectedPolicyVersion: options?.expectedPolicyVersion,
+      })
       return
     }
 
@@ -4849,6 +4955,7 @@ export default function ChatPage() {
       forceSessionId: currentSessionId,
       attachments,
       selectedSkillIds,
+      expectedPolicyVersion: options?.expectedPolicyVersion,
     })
   }, [
     currentSessionId,
@@ -5815,6 +5922,7 @@ export default function ChatPage() {
       selectedSkillIds,
       sessionScope,
       systemPromptOverride,
+      expectedPolicyVersion,
     }: ActiveGoalDirectTurnDecisionInput): Promise<boolean> => {
       let decision: api.ActiveGoalTurnDecision
       try {
@@ -5829,6 +5937,7 @@ export default function ChatPage() {
           normalizedWorkflow: baseWorkflow,
           sessionScope,
           systemPromptOverride,
+          expectedPolicyVersion,
         })
         return true
       }
@@ -5844,6 +5953,7 @@ export default function ChatPage() {
           toolMode: undefined,
           normalizedWorkflow: baseWorkflow,
           sessionScope,
+          expectedPolicyVersion,
           systemPromptOverride:
             systemPromptOverride ??
             `${effectiveInference.systemPrompt ?? ''}\n\nActive goal decision metadata: ${JSON.stringify(decisionMetadata)}`
@@ -6098,8 +6208,17 @@ export default function ChatPage() {
       persistSessionGoalState,
       submitDirectChatTurn,
       syncWorkflowStateForGoal,
+      t,
+      updateSessionMessages,
     ]
   )
+
+  React.useEffect(() => {
+    activeGoalDirectTurnDecisionRef.current = handleActiveGoalDirectTurnDecision
+    return () => {
+      activeGoalDirectTurnDecisionRef.current = null
+    }
+  }, [handleActiveGoalDirectTurnDecision])
 
   const footerRuntimeNotice =
     !headerGoal && pendingApprovalCount > 0

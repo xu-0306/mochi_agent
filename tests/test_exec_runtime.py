@@ -112,6 +112,29 @@ async def test_exec_runtime_background_incremental_read_and_write_stdin() -> Non
 
 
 @pytest.mark.asyncio
+async def test_exec_runtime_inspection_does_not_consume_incremental_output() -> None:
+    runtime = ExecRuntime(
+        providers={"test": _PythonDirectProvider()},
+        default_shell="test",
+    )
+    started = await runtime.start_command(
+        command="import time; print('ready', flush=True); time.sleep(10)",
+        background=True,
+    )
+
+    inspected = await runtime.inspect_session(started.session_id)
+    assert inspected is not None
+    assert inspected.status == ExecSessionStatus.RUNNING
+    assert inspected.stdout == ""
+    assert inspected.stderr == ""
+
+    read = await runtime.read_session(started.session_id, yield_time_ms=120)
+    assert read is not None
+    assert "ready" in read.stdout
+    await runtime.kill_session(started.session_id)
+
+
+@pytest.mark.asyncio
 async def test_exec_runtime_kill_session() -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},

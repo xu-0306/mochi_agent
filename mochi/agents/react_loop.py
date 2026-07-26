@@ -7,8 +7,9 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Mapping, cast
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 try:
     from loguru import logger
@@ -170,6 +171,145 @@ class AsyncReActLoop:
             presence_penalty=presence_penalty,
             repeat_penalty=repeat_penalty,
             reasoning_effort=reasoning_effort,
+            start_iteration=0,
+            initial_file_mutation_satisfied=None,
+        ):
+            yield event
+
+    async def resume_from_ordinary_chat_approval(
+        self,
+        *,
+        checkpoint: Mapping[str, Any],
+        tool_result: ToolResult,
+    ) -> AsyncIterator[AgentEvent]:
+        """Continue the interrupted ReAct turn after its exact tool result is available."""
+        continuation = checkpoint.get("react_continuation")
+        if not isinstance(continuation, Mapping):
+            raise ValueError("Ordinary-Chat approval is missing its ReAct continuation checkpoint.")
+        messages = self._messages_from_ordinary_chat_checkpoint(continuation)
+        cursor = checkpoint.get("resume_cursor")
+        if not isinstance(cursor, Mapping):
+            raise ValueError("Ordinary-Chat approval is missing its ReAct resume cursor.")
+        tool_call_id = str(cursor.get("tool_call_id") or "").strip()
+        tool_name = str(cursor.get("tool_name") or checkpoint.get("tool_name") or "").strip()
+        if not tool_call_id or not tool_name:
+            raise ValueError("Ordinary-Chat approval resume cursor is invalid.")
+
+        tool_call = next(
+            (
+                candidate
+                for message in reversed(messages)
+                if message.role == "assistant"
+                for candidate in message.tool_calls
+                if candidate.id == tool_call_id and candidate.name == tool_name
+            ),
+            None,
+        )
+        if tool_call is None:
+            raise ValueError("Ordinary-Chat approval cursor does not match its original tool call.")
+
+        expected_tool_names = continuation.get("callable_tool_names")
+        if not isinstance(expected_tool_names, list) or tool_name not in expected_tool_names:
+            raise ValueError("Ordinary-Chat approval checkpoint does not authorize its original tool.")
+        tools = self._collect_tool_schemas()
+        available_tool_names = {tool.name for tool in tools}
+        missing_tools = {
+            str(name)
+            for name in expected_tool_names
+            if isinstance(name, str) and name and name not in available_tool_names
+        }
+        if missing_tools:
+            raise ValueError("Ordinary-Chat approval continuation tools are no longer available.")
+
+        if self._tool_registry is None:
+            raise ValueError("Ordinary-Chat approval continuation has no tool registry.")
+        tool_definition = self._tool_registry.get(tool_name)
+        formatted_content = (
+            tool_definition.format_result_for_model(
+                tool_result,
+                max_chars=self._max_tool_message_chars,
+            )
+            if tool_definition is not None
+            else self._tool_registry.format_result_for_model(
+                tool_name,
+                tool_result,
+                max_chars=self._max_tool_message_chars,
+            )
+        )
+        tool_content, transport_diagnostics = self._guard_tool_message(
+            tool_name=tool_name,
+            result=tool_result,
+            formatted_content=formatted_content,
+        )
+        metadata = (
+            dict(tool_result.metadata)
+            if isinstance(tool_result.metadata, dict)
+            else {}
+        )
+        metadata.update(
+            {
+                "approval_continuation": True,
+                "approval_continuation_source": "ordinary_chat",
+                "transport": transport_diagnostics,
+            }
+        )
+        self._turn_messages = []
+        yield ToolCallResultEvent(
+            call_id=tool_call.id,
+            tool_name=tool_call.name,
+            result=tool_result.output,
+            error=tool_result.error,
+            metadata=metadata,
+        )
+        yield ToolCallCompletedEvent(
+            call_id=tool_call.id,
+            tool_name=tool_call.name,
+            arguments=tool_call.arguments,
+            result=tool_result.output,
+            error=tool_result.error,
+            metadata={**metadata, "compat_event_type": "tool_call_result"},
+        )
+        tool_message = Message(
+            role="tool",
+            content=tool_content,
+            tool_call_id=tool_call.id,
+            name=tool_call.name,
+        )
+        messages.append(tool_message)
+        self._remember_turn_message(tool_message)
+
+        generation = continuation.get("generation")
+        if not isinstance(generation, Mapping):
+            raise ValueError("Ordinary-Chat approval checkpoint is missing generation settings.")
+        async for event in self._run_nonstream(
+            messages,
+            tools,
+            temperature=float(generation.get("temperature", 0.7)),
+            max_tokens=int(generation.get("max_tokens", 4096)),
+            top_p=float(generation.get("top_p", 1.0)),
+            min_p=float(generation.get("min_p", 0.0)),
+            top_k=int(generation.get("top_k", 0)),
+            frequency_penalty=float(generation.get("frequency_penalty", 0.0)),
+            presence_penalty=float(generation.get("presence_penalty", 0.0)),
+            repeat_penalty=float(generation.get("repeat_penalty", 1.0)),
+            reasoning_effort=(
+                str(generation["reasoning_effort"])
+                if isinstance(generation.get("reasoning_effort"), str)
+                else None
+            ),
+            start_iteration=(
+                int(continuation["next_iteration"])
+                if isinstance(continuation.get("next_iteration"), int)
+                and int(continuation["next_iteration"]) > 0
+                else 0
+            ),
+            initial_file_mutation_satisfied=(
+                bool(continuation.get("file_mutation_satisfied"))
+                or (
+                    self._is_file_mutation_tool(tool_name)
+                    and tool_result.error is None
+                )
+            ),
         ):
             yield event
 
@@ -205,6 +345,8 @@ class AsyncReActLoop:
         presence_penalty: float,
         repeat_penalty: float,
         reasoning_effort: str | None,
+        start_iteration: int = 0,
+        initial_file_mutation_satisfied: bool | None = None,
     ) -> AsyncIterator[AgentEvent]:
         from mochi.backends.types import GenerationResult
 
@@ -252,7 +394,11 @@ class AsyncReActLoop:
             "last_low_info_lines": None,
         }
         file_artifact_guard_state: dict[str, Any] = {
-            "satisfied": not self._requires_file_mutation,
+            "satisfied": (
+                initial_file_mutation_satisfied
+                if initial_file_mutation_satisfied is not None
+                else not self._requires_file_mutation
+            ),
             "nudge_count": 0,
             "last_error": None,
             "last_tool_name": None,
@@ -262,7 +408,7 @@ class AsyncReActLoop:
         allowed_tool_names = {tool.name for tool in tools}
 
         try:
-            for iteration in range(self._max_iterations):
+            for iteration in range(max(0, start_iteration), self._max_iterations):
                 logger.debug(f"ReAct iteration {iteration + 1}/{self._max_iterations}")
                 progress_event = self._build_iteration_progress_event(iteration=iteration + 1)
                 if progress_event is not None:
@@ -550,6 +696,7 @@ class AsyncReActLoop:
                         tool_error: str | None = None
                         tool_metadata: dict[str, Any] = {}
                         tool_result_payload = ToolResult(output=None, error=None)
+                        observed_operation_id: str | None = None
                         self._mark_literature_research_mode(tool_call, literature_state)
                         followup_retrieval_attempt = self._is_followup_retrieval_attempt(
                             tool_call=tool_call,
@@ -679,7 +826,37 @@ class AsyncReActLoop:
                                             getattr(tool_definition, "is_cancellable", False)
                                         ),
                                     )
+                                self._bind_ordinary_chat_approval_cursor(tool_call)
+                                self._capture_ordinary_chat_react_continuation(
+                                    messages=messages,
+                                    tools=tools,
+                                    iteration=iteration,
+                                    file_mutation_satisfied=bool(
+                                        file_artifact_guard_state.get("satisfied")
+                                    ),
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    top_p=top_p,
+                                    min_p=min_p,
+                                    top_k=top_k,
+                                    frequency_penalty=frequency_penalty,
+                                    presence_penalty=presence_penalty,
+                                    repeat_penalty=repeat_penalty,
+                                    reasoning_effort=reasoning_effort,
+                                )
                                 try:
+                                    if self._tool_execution_context is not None:
+                                        self._tool_execution_context.state[
+                                            "timeline_tool_call_id"
+                                        ] = tool_call.id
+                                        if not self._tool_execution_context.state.get(
+                                            "timeline_tool_lifecycle"
+                                        ):
+                                            observed_operation_id = (
+                                                f"tool-execution-{uuid4().hex}"
+                                            )
+                                    else:
+                                        observed_operation_id = f"tool-execution-{uuid4().hex}"
                                     tool_result = await self._tool_registry.execute(
                                         tool_call.name,
                                         tool_call.arguments,
@@ -693,11 +870,25 @@ class AsyncReActLoop:
                                         else {}
                                     )
                                     tool_result_payload = tool_result
-                                    formatted_content = self._tool_registry.format_result_for_model(
-                                        tool_call.name,
-                                        tool_result,
-                                        max_chars=self._max_tool_message_chars,
-                                    )
+                                    if tool_definition is not None:
+                                        formatted_content = tool_definition.format_result_for_model(
+                                            tool_result,
+                                            max_chars=self._max_tool_message_chars,
+                                        )
+                                    else:
+                                        formatted_content = self._tool_registry.format_result_for_model(
+                                            tool_call.name,
+                                            tool_result,
+                                            max_chars=self._max_tool_message_chars,
+                                        )
+                                    if (
+                                        tool_call.name == "tool_activate"
+                                        and tool_result.error is None
+                                        and tool_result.metadata.get("status")
+                                        in {"tool_activated", "tool_already_callable"}
+                                    ):
+                                        tools = self._collect_tool_schemas()
+                                        allowed_tool_names = {tool.name for tool in tools}
                                 except Exception as exc:
                                     tool_error = str(exc)
                                     tool_result_payload = ToolResult(output=tool_output, error=tool_error)
@@ -763,6 +954,9 @@ class AsyncReActLoop:
                             **tool_metadata,
                             "transport": transport_diagnostics,
                         }
+                        if observed_operation_id is not None:
+                            tool_metadata.setdefault("operation_id", observed_operation_id)
+                            tool_metadata["execution_observed"] = True
                         if evidence_diagnostics:
                             tool_metadata["evidence_quality"] = evidence_diagnostics
                             if evidence_diagnostics.get("reason") == "low_information_web_fetch":
@@ -788,6 +982,13 @@ class AsyncReActLoop:
                                 },
                             )
 
+                        yield ToolCallResultEvent(
+                            call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            result=tool_output,
+                            error=tool_error,
+                            metadata=tool_metadata,
+                        )
                         yield ToolCallCompletedEvent(
                             call_id=tool_call.id,
                             tool_name=tool_call.name,
@@ -796,13 +997,32 @@ class AsyncReActLoop:
                             error=tool_error,
                             metadata={**tool_metadata, "compat_event_type": "tool_call_result"},
                         )
-                        yield ToolCallResultEvent(
-                            call_id=tool_call.id,
-                            tool_name=tool_call.name,
-                            result=tool_output,
-                            error=tool_error,
-                            metadata=tool_metadata,
-                        )
+                        if tool_metadata.get("timeline_fail_closed") is True:
+                            return
+                        if self._is_durable_approval_interrupt(tool_metadata):
+                            approval_id = str(tool_metadata.get("approval_id") or "").strip()
+                            approval_metadata = {
+                                "status": "approval_pending",
+                                "approval_id": approval_id,
+                                "tool_name": tool_call.name,
+                                "operation_id": tool_metadata.get("operation_id"),
+                                "arguments_digest": tool_metadata.get("arguments_digest"),
+                                "resume_cursor": tool_metadata.get("resume_cursor"),
+                                "requires_approval": True,
+                            }
+                            yield StatusEvent(
+                                content="Tool execution is paused until the requested approval is resolved.",
+                                metadata=approval_metadata,
+                            )
+                            yield FinalAnswerEvent(
+                                content=(
+                                    "The requested tool call is waiting for your approval. "
+                                    "After it is resolved, Mochi will execute this exact call once."
+                                ),
+                                finish_reason="approval_required",
+                                metadata=approval_metadata,
+                            )
+                            return
 
                         tool_message = Message(
                             role="tool",
@@ -1041,6 +1261,167 @@ class AsyncReActLoop:
             "Your previous answer was cut off because the response length limit was reached. "
             "Continue exactly where it stopped. Do not restart, do not repeat completed text, "
             "and include only the missing continuation."
+        )
+
+    def _bind_ordinary_chat_approval_cursor(self, tool_call: ToolCall) -> None:
+        """Attach the exact ReAct cursor before a tool can create an approval."""
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return
+        approval_context = context.state.get("ordinary_chat_approval_context")
+        if not isinstance(approval_context, dict) or approval_context.get("source") != "ordinary_chat":
+            return
+        cursor = approval_context.get("resume_cursor")
+        next_cursor = dict(cursor) if isinstance(cursor, dict) else {}
+        next_cursor.update(
+            {
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+            }
+        )
+        approval_context["resume_cursor"] = next_cursor
+
+    def _capture_ordinary_chat_react_continuation(
+        self,
+        *,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        iteration: int,
+        file_mutation_satisfied: bool,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        min_p: float,
+        top_k: int,
+        frequency_penalty: float,
+        presence_penalty: float,
+        repeat_penalty: float,
+        reasoning_effort: str | None,
+    ) -> None:
+        """Capture the pre-call transcript before a tool can persist an approval."""
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return
+        approval_context = context.state.get("ordinary_chat_approval_context")
+        if not isinstance(approval_context, dict) or approval_context.get("source") != "ordinary_chat":
+            return
+        approval_context["react_continuation"] = {
+            "schema_version": 1,
+            "messages": [self._serialize_ordinary_chat_message(message) for message in messages],
+            "callable_tool_names": [tool.name for tool in tools],
+            "max_iterations": self._max_iterations,
+            "requires_file_mutation": self._requires_file_mutation,
+            "next_iteration": iteration + 1,
+            "file_mutation_satisfied": file_mutation_satisfied,
+            "tool_activation_policy": (
+                dict(context.state["tool_activation_policy"])
+                if isinstance(context.state.get("tool_activation_policy"), Mapping)
+                else None
+            ),
+            "generation": {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "min_p": min_p,
+                "top_k": top_k,
+                "frequency_penalty": frequency_penalty,
+                "presence_penalty": presence_penalty,
+                "repeat_penalty": repeat_penalty,
+                "reasoning_effort": reasoning_effort,
+            },
+        }
+
+    @staticmethod
+    def _serialize_ordinary_chat_message(message: Message) -> dict[str, Any]:
+        return {
+            "role": message.role,
+            "content": message.content,
+            "thinking": message.thinking,
+            "tool_calls": [
+                {
+                    "id": tool_call.id,
+                    "name": tool_call.name,
+                    "arguments": dict(tool_call.arguments),
+                    "index": tool_call.index,
+                }
+                for tool_call in message.tool_calls
+            ],
+            "tool_call_id": message.tool_call_id,
+            "name": message.name,
+            "attachments": [attachment.to_dict() for attachment in message.attachments],
+            "responses_replay": (
+                message.responses_replay.to_dict()
+                if message.responses_replay is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _messages_from_ordinary_chat_checkpoint(
+        checkpoint: Mapping[str, Any],
+    ) -> list[Message]:
+        raw_messages = checkpoint.get("messages")
+        if not isinstance(raw_messages, list) or not raw_messages:
+            raise ValueError("Ordinary-Chat approval continuation transcript is missing.")
+        messages: list[Message] = []
+        for raw in raw_messages:
+            if not isinstance(raw, Mapping):
+                raise ValueError("Ordinary-Chat approval continuation transcript is invalid.")
+            role = raw.get("role")
+            content = raw.get("content")
+            if role not in {"system", "user", "assistant", "tool"} or not isinstance(content, str):
+                raise ValueError("Ordinary-Chat approval continuation message is invalid.")
+            raw_tool_calls = raw.get("tool_calls")
+            tool_calls: list[ToolCall] = []
+            if isinstance(raw_tool_calls, list):
+                for raw_call in raw_tool_calls:
+                    if not isinstance(raw_call, Mapping):
+                        continue
+                    call_id = raw_call.get("id")
+                    name = raw_call.get("name")
+                    arguments = raw_call.get("arguments")
+                    if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                        tool_calls.append(
+                            ToolCall(
+                                id=call_id,
+                                name=name,
+                                arguments=dict(arguments) if isinstance(arguments, Mapping) else {},
+                                index=(raw_call.get("index") if isinstance(raw_call.get("index"), int) else None),
+                            )
+                        )
+            from mochi.backends.types import AttachmentRef, ResponsesReplayState
+
+            raw_attachments = raw.get("attachments")
+            attachments = (
+                [
+                    attachment
+                    for item in raw_attachments
+                    if (attachment := AttachmentRef.from_dict(item)) is not None
+                ]
+                if isinstance(raw_attachments, list)
+                else []
+            )
+            messages.append(
+                Message(
+                    role=role,
+                    content=content,
+                    thinking=raw.get("thinking") if isinstance(raw.get("thinking"), str) else "",
+                    tool_calls=tool_calls,
+                    tool_call_id=(raw.get("tool_call_id") if isinstance(raw.get("tool_call_id"), str) else None),
+                    name=raw.get("name") if isinstance(raw.get("name"), str) else None,
+                    attachments=attachments,
+                    responses_replay=ResponsesReplayState.from_dict(raw.get("responses_replay")),
+                )
+            )
+        return messages
+
+    @staticmethod
+    def _is_durable_approval_interrupt(metadata: dict[str, Any]) -> bool:
+        """Only persisted approval requests may suspend an ordinary ReAct turn."""
+        return (
+            metadata.get("status") == "approval_pending"
+            and isinstance(metadata.get("approval_id"), str)
+            and bool(str(metadata.get("approval_id")).strip())
         )
 
     @staticmethod

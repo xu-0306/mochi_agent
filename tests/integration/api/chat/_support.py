@@ -65,10 +65,18 @@ from mochi.tools.base import (
 )
 
 
+def _build_bare_agent_engine(*, sessions_dir: Path) -> AgentEngine:
+    """Build the smallest real engine surface needed by chat lifecycle tests."""
+    engine = AgentEngine.__new__(AgentEngine)
+    engine._session_store = SessionStore(sessions_dir)  # type: ignore[attr-defined]
+    return engine
+
+
 class _FakeEngine:
     def __init__(self) -> None:
         self.chat_calls: list[tuple[str, str | None]] = []
         self.chat_attachment_calls: list[list[AttachmentRef] | None] = []
+        self.chat_permission_policy_calls: list[dict[str, Any] | None] = []
         self.switch_calls: list[str] = []
         self.ollama_switch_calls: list[tuple[str, str | None]] = []
         self.openai_switch_calls: list[tuple[str, str, str, str]] = []
@@ -92,12 +100,14 @@ class _FakeEngine:
         inference_overrides: dict[str, Any] | None = None,
         project_id: str | None = None,
         workspace_dir: str | None = None,
+        permission_policy: dict[str, Any] | None = None,
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
     ) -> AsyncIterator[object]:
         _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids)
         self.chat_calls.append((message, session_id))
         self.chat_attachment_calls.append(attachments)
+        self.chat_permission_policy_calls.append(permission_policy)
         yield ThinkingEvent(content="分析中")
         yield ToolCallRequestEvent(
             call_id="call-1",
@@ -252,6 +262,7 @@ def _build_app(
     config_path: Path | None = None,
     vllm_runtime_manager: Any | None = None,
     workspace_dir: Path | None = None,
+    sessions_dir: Path | None = None,
 ) -> tuple[object, _FakeEngine]:
     app = create_app()
     fake_engine = engine or _FakeEngine()
@@ -260,6 +271,9 @@ def _build_app(
         {
             "model": "ollama:configured",
             "workspace_dir": str(workspace_dir) if workspace_dir is not None else ".mochi",
+            "sessions_dir": (
+                str(sessions_dir) if sessions_dir is not None else ".mochi/sessions"
+            ),
             "local_models": {
                 "roots": [],
                 "scan_max_depth": 3,

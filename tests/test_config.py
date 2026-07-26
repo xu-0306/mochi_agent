@@ -56,6 +56,7 @@ def test_default_config_is_valid() -> None:
     assert cfg.log_level == "INFO"
     assert cfg.agent.max_react_iterations == 10
     assert cfg.agent.system_prompt
+    assert cfg.agent.turn_contract_mode == "enforce"
     assert cfg.agent.temperature == 0.7
     assert cfg.agent.max_tokens is None
     assert cfg.agent.reserve_output_tokens is None
@@ -287,6 +288,22 @@ def test_legacy_config_without_protected_workspace_axes_uses_safe_rollout_defaul
 
     assert cfg.security.change_contract_mode == "observe"
     assert cfg.sandbox.mode == "off"
+
+
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "enforce"])
+def test_agent_turn_contract_mode_migrates_to_enforce(mode: str) -> None:
+    cfg = MochiConfig.model_validate({"agent": {"turn_contract_mode": mode}})
+
+    assert cfg.agent.turn_contract_mode == "enforce"
+    assert (
+        MochiConfig.model_validate(cfg.model_dump()).agent.turn_contract_mode
+        == "enforce"
+    )
+
+
+def test_agent_turn_contract_mode_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError, match="hybrid"):
+        MochiConfig.model_validate({"agent": {"turn_contract_mode": "hybrid"}})
 
 
 def test_legacy_file_scope_migrates_one_way_to_independent_scopes() -> None:

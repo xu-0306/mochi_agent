@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from mochi.agents.events import AgentEvent
 from mochi.backends.base import BaseLLMBackend
@@ -50,6 +50,13 @@ class AgentInvocationRequest:
     turn_id: str | None = None
     active_tool_controller: ActiveToolController | None = None
     cancellation_context: RunCancellationContext | None = None
+    # Ordinary Chat injects these only after a durable FIFO lane claim.  They
+    # are intentionally absent from callers outside the Chat stream path.
+    timeline_history_events: list[Mapping[str, Any]] | None = None
+    timeline_user_message_admitted: bool = False
+    timeline_transcript: list[Message] | None = None
+    timeline_coordinator: Any | None = None
+    timeline_pre_effect_failure: bool = False
 
 
 @dataclass

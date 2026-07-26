@@ -13,6 +13,88 @@ from mochi.tools.mcp_client import MCPCallTool
 from mochi.tools.process_service import ProcessService
 
 
+def _effective_exec_policy(
+    *,
+    require_approval: bool,
+    hard_denies: list[str] | None = None,
+    suffix: str,
+) -> dict[str, object]:
+    return {
+        "policy_snapshot_id": f"policy-{suffix}",
+        "policy_version": f"effective-policy-v1:{suffix}",
+        "source_chain": ["security_config", "session_override"],
+        "autonomy_mode": "strict" if require_approval else "auto_review",
+        "require_approval_for_file_write": True,
+        "require_approval_for_exec": require_approval,
+        "file_read_scope": "workspace",
+        "file_write_scope": "workspace",
+        "hard_denies": list(hard_denies or []),
+    }
+
+
+def test_cached_execute_code_tool_uses_each_call_policy_snapshot(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(
+        code: str,
+        cwd: Path,
+        timeout_sec: int,
+        python_executable: str,
+    ) -> tuple[int, str, str]:
+        del cwd, timeout_sec, python_executable
+        calls.append(code)
+        return 0, "ok", ""
+
+    tool = ExecuteCodeTool(
+        workspace_dir=tmp_path,
+        require_approval=True,
+        runner=fake_runner,
+    )
+    allowed = asyncio.run(
+        tool.execute(
+            code="print('allowed')",
+            context=ToolExecutionContext(
+                permission_policy=_effective_exec_policy(
+                    require_approval=False,
+                    suffix="allow",
+                )
+            ),
+        )
+    )
+    pending = asyncio.run(
+        tool.execute(
+            code="print('pending')",
+            context=ToolExecutionContext(
+                permission_policy=_effective_exec_policy(
+                    require_approval=True,
+                    suffix="approval",
+                )
+            ),
+        )
+    )
+    denied = asyncio.run(
+        tool.execute(
+            code="print('denied')",
+            approved=True,
+            context=ToolExecutionContext(
+                permission_policy=_effective_exec_policy(
+                    require_approval=False,
+                    hard_denies=["tool:execute_code"],
+                    suffix="deny",
+                )
+            ),
+        )
+    )
+
+    assert allowed.error is None
+    assert allowed.metadata["policy_snapshot_id"] == "policy-allow"
+    assert pending.metadata["requires_approval"] is True
+    assert pending.metadata["policy_snapshot_id"] == "policy-approval"
+    assert denied.metadata["security_decision"] == "deny"
+    assert denied.metadata["hard_deny"] == "tool:execute_code"
+    assert calls == ["print('allowed')"]
+
+
 def test_execute_code_requires_approval_by_default(tmp_path: Path) -> None:
     """execute_code 預設應要求審批。"""
     tool = ExecuteCodeTool(workspace_dir=tmp_path)
@@ -149,7 +231,13 @@ def test_execute_code_foreground_cancellation_reports_cancelled_status(tmp_path:
     async def _run() -> None:
         tool = ExecuteCodeTool(workspace_dir=tmp_path, require_approval=False)
         controller = ActiveToolController()
-        context = ToolExecutionContext(active_tool_controller=controller)
+        context = ToolExecutionContext(
+            active_tool_controller=controller,
+            permission_policy=_effective_exec_policy(
+                require_approval=False,
+                suffix="cancel",
+            ),
+        )
         await controller.activate_tool(
             tool_call_id="tool-call-execute-code-cancel",
             tool_name="execute_code",
@@ -181,6 +269,8 @@ def test_execute_code_foreground_cancellation_reports_cancelled_status(tmp_path:
         assert result.error is None
         assert result.metadata["status"] == "cancelled"
         assert result.metadata["cancelled"] is True
+        assert result.metadata["policy_snapshot_id"] == "policy-cancel"
+        assert result.metadata["effective_policy_version"] == "effective-policy-v1:cancel"
         assert isinstance(result.output, str)
 
     asyncio.run(_run())
@@ -195,11 +285,84 @@ def test_execute_code_v2_requires_approval_by_default(tmp_path: Path) -> None:
     assert "approval" in result.error.lower()
 
 
+def test_cached_execute_code_v2_tool_uses_each_call_policy_snapshot(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(
+        code: str,
+        cwd: Path,
+        timeout_sec: int,
+        python_executable: str,
+        workspace_dir: Path,
+        allowed_tools: list[str],
+    ) -> dict[str, Any]:
+        del cwd, timeout_sec, python_executable, workspace_dir, allowed_tools
+        calls.append(code)
+        return {"stdout": "ok", "result": None, "tool_calls": []}
+
+    tool = ExecuteCodeV2Tool(
+        workspace_dir=tmp_path,
+        require_approval=True,
+        runner=fake_runner,
+    )
+
+    allowed = asyncio.run(
+        tool.execute(
+            code="result = 'allowed'",
+            context=ToolExecutionContext(
+                permission_policy=_effective_exec_policy(
+                    require_approval=False,
+                    suffix="v2-allow",
+                )
+            ),
+        )
+    )
+    pending = asyncio.run(
+        tool.execute(
+            code="result = 'pending'",
+            context=ToolExecutionContext(
+                permission_policy=_effective_exec_policy(
+                    require_approval=True,
+                    suffix="v2-approval",
+                )
+            ),
+        )
+    )
+    denied = asyncio.run(
+        tool.execute(
+            code="result = 'denied'",
+            approved=True,
+            context=ToolExecutionContext(
+                permission_policy=_effective_exec_policy(
+                    require_approval=False,
+                    hard_denies=["tool:execute_code_v2"],
+                    suffix="v2-deny",
+                )
+            ),
+        )
+    )
+
+    assert allowed.error is None
+    assert allowed.metadata["policy_snapshot_id"] == "policy-v2-allow"
+    assert pending.metadata["requires_approval"] is True
+    assert pending.metadata["policy_snapshot_id"] == "policy-v2-approval"
+    assert denied.metadata["security_decision"] == "deny"
+    assert denied.metadata["hard_deny"] == "tool:execute_code_v2"
+    assert denied.metadata["policy_snapshot_id"] == "policy-v2-deny"
+    assert calls == ["result = 'allowed'"]
+
+
 def test_execute_code_v2_foreground_cancellation_reports_cancelled_status(tmp_path: Path) -> None:
     async def _run() -> None:
         tool = ExecuteCodeV2Tool(workspace_dir=tmp_path, require_approval=False)
         controller = ActiveToolController()
-        context = ToolExecutionContext(active_tool_controller=controller)
+        context = ToolExecutionContext(
+            active_tool_controller=controller,
+            permission_policy=_effective_exec_policy(
+                require_approval=False,
+                suffix="v2-cancel",
+            ),
+        )
         await controller.activate_tool(
             tool_call_id="tool-call-execute-code-v2-cancel",
             tool_name="execute_code_v2",
@@ -231,6 +394,8 @@ def test_execute_code_v2_foreground_cancellation_reports_cancelled_status(tmp_pa
         assert result.error is None
         assert result.metadata["status"] == "cancelled"
         assert result.metadata["cancelled"] is True
+        assert result.metadata["policy_snapshot_id"] == "policy-v2-cancel"
+        assert result.metadata["effective_policy_version"] == "effective-policy-v1:v2-cancel"
         assert result.output["result"] is None
         assert result.output["tool_calls"] == []
 
@@ -279,7 +444,7 @@ def test_execute_code_v2_supports_injected_runner(tmp_path: Path) -> None:
 
 def test_execute_code_v2_default_runner_can_call_tool_helpers(tmp_path: Path) -> None:
     target = tmp_path / "note.txt"
-    target.write_text("hello from helper\n", encoding="utf-8")
+    target.write_bytes(b"hello from helper\n")
     tool = ExecuteCodeV2Tool(workspace_dir=tmp_path, require_approval=False)
 
     result = asyncio.run(

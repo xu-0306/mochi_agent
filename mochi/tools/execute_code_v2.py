@@ -6,12 +6,17 @@ import asyncio
 import json
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from mochi.config import defaults
-from mochi.security import require_approval_decision
+from mochi.security import deny_security_decision, require_approval_decision
+from mochi.security.policy import (
+    effective_policy_snapshot_from_mapping,
+    matching_tool_hard_deny,
+)
+from mochi.sessions.timeline_coordinator import mark_context_side_effect_started
 from mochi.tools.base import BaseTool, ToolCancellationResult, ToolExecutionContext, ToolResult
 from mochi.utils.security import normalize_workspace_dir, resolve_path_in_workspace
 
@@ -207,6 +212,10 @@ class ExecuteCodeV2Tool(BaseTool):
     def is_cancellable(self) -> bool:
         return True
 
+    @property
+    def supports_timeline_side_effect_boundary(self) -> bool:
+        return True
+
     async def execute(
         self,
         *,
@@ -220,7 +229,49 @@ class ExecuteCodeV2Tool(BaseTool):
         if not code.strip():
             return ToolResult(error="`code` must not be empty.")
 
-        if self._require_approval and not approved:
+        permission_policy = (
+            context.permission_policy
+            if context is not None and isinstance(context.permission_policy, Mapping)
+            else {}
+        )
+        effective_snapshot = effective_policy_snapshot_from_mapping(permission_policy)
+        effective_require_approval = self._require_approval
+        if isinstance(permission_policy.get("require_approval_for_exec"), bool):
+            effective_require_approval = bool(permission_policy["require_approval_for_exec"])
+        policy_metadata = {
+            "policy_snapshot_id": (
+                effective_snapshot.policy_snapshot_id if effective_snapshot is not None else None
+            ),
+            "effective_policy_version": (
+                effective_snapshot.policy_version if effective_snapshot is not None else None
+            ),
+            "effective_policy_source": (
+                "effective_policy_snapshot"
+                if effective_snapshot is not None
+                else "execute_code_v2_policy"
+            ),
+        }
+        hard_deny = matching_tool_hard_deny(
+            effective_snapshot or permission_policy,
+            tool_name=self.name,
+            capability="exec",
+        )
+        if hard_deny is not None:
+            reason = f"Code execution is prohibited by hard policy selector: {hard_deny}."
+            decision = deny_security_decision(
+                reason=reason,
+                approval_kind="other",
+                approval_scope="dangerous_command",
+                replay_safe=False,
+                policy_source="effective_policy_hard_deny",
+            )
+            return ToolResult(
+                error=reason,
+                metadata={"hard_deny": hard_deny, **policy_metadata, **decision.to_metadata()},
+                retryable=False,
+            )
+
+        if effective_require_approval and not approved:
             decision = require_approval_decision(
                 reason="Code execution requires explicit approval.",
                 approval_kind="other",
@@ -230,7 +281,7 @@ class ExecuteCodeV2Tool(BaseTool):
             )
             return ToolResult(
                 error="Code execution requires approval.",
-                metadata=decision.to_metadata(),
+                metadata={**policy_metadata, **decision.to_metadata()},
             )
 
         workspace_root = self._resolve_workspace_root(context)
@@ -259,6 +310,7 @@ class ExecuteCodeV2Tool(BaseTool):
             )
 
         try:
+            await mark_context_side_effect_started(context)
             if self._uses_default_runner:
                 runner_result = await self._execute_default_runner(
                     code=code,
@@ -270,6 +322,11 @@ class ExecuteCodeV2Tool(BaseTool):
                     context=context,
                 )
                 if isinstance(runner_result, ToolResult):
+                    runner_result.metadata.update(policy_metadata)
+                    runner_result.metadata.setdefault(
+                        "timeline_result_disposition",
+                        "failed" if runner_result.error is not None else "succeeded",
+                    )
                     return runner_result
                 payload = runner_result
             else:
@@ -284,7 +341,11 @@ class ExecuteCodeV2Tool(BaseTool):
         except Exception as exc:  # pragma: no cover
             return ToolResult(
                 error=f"Code execution failed: {exc}",
-                metadata={"cwd": str(working_dir)},
+                metadata={
+                    "cwd": str(working_dir),
+                    **policy_metadata,
+                    "timeline_result_disposition": "unknown",
+                },
             )
 
         output = {
@@ -296,6 +357,8 @@ class ExecuteCodeV2Tool(BaseTool):
             "cwd": str(working_dir),
             "allowed_tools": effective_allowed_tools,
             "tool_call_count": len(output["tool_calls"]) if isinstance(output["tool_calls"], list) else 0,
+            **policy_metadata,
+            "timeline_result_disposition": "failed" if isinstance(payload.get("error"), str) and payload.get("error") else "succeeded",
         }
         traceback_text = payload.get("traceback")
         if isinstance(traceback_text, str) and traceback_text:
@@ -472,6 +535,7 @@ class ExecuteCodeV2Tool(BaseTool):
                     "status": "cancelled",
                     "cancelled": True,
                     "returncode": process.returncode,
+                    "timeline_result_disposition": "failed",
                 },
             )
 

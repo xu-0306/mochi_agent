@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
+import logging
 import stat
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,8 @@ from uuid import uuid4
 
 from mochi.config import defaults
 from mochi.config.schema import SecurityConfig
+from mochi.runtime.approval_state_machine import derive_approval_binding
+from mochi.runtime.approvals import APPROVAL_OWNER_TASK_ID_KEY, ApprovalStore
 from mochi.runtime.change_sets import ChangeSetStore
 from mochi.runtime.store import RuntimeStore
 from mochi.security import require_approval_decision, with_task_isolation_scope
@@ -36,8 +41,13 @@ from mochi.security.file_contract import (
     canonical_json,
     capture_file_identity,
     detect_content_fidelity,
+    tool_arguments_digest,
 )
 from mochi.security.policy import policy_projection_version
+from mochi.sessions.timeline_coordinator import (
+    mark_context_side_effect_started,
+    timeline_pending_operation_binding,
+)
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
 from mochi.tools.file_mutations import (
     PatchValidationError,
@@ -57,6 +67,357 @@ from mochi.utils.security import (
 FileReader = Callable[[Path, str], Awaitable[str]]
 FileWriter = Callable[[Path, str, bool, str], Awaitable[int]]
 _TOOL_RESULT_PATH_PREFIX = "tool-result://"
+_logger = logging.getLogger(__name__)
+
+
+async def _observe_ordinary_chat_approval(
+    context: ToolExecutionContext | None,
+    approval: Any,
+) -> None:
+    """Publish only the approval identity/revision handoff when the Engine wired it."""
+
+    if context is None or not isinstance(context.state, Mapping):
+        return
+    observer = context.state.get("tool_workflow_approval_observer")
+    if not callable(observer):
+        return
+    try:
+        result = observer(approval)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        # The approval transaction is already durable.  This cross-store
+        # publication is repairable at startup and must never turn a pending
+        # approval into a failed mutation result.
+        _logger.warning(
+            "ordinary-chat approval observation handoff requires repair: %s (%s)",
+            getattr(approval, "approval_id", ""),
+            type(exc).__name__,
+        )
+
+
+def file_mutation_tool_inventory_version(tool: BaseTool) -> str:
+    """Return the replay contract version for one concrete mutation tool."""
+    return policy_projection_version(
+        "file-mutation-tool",
+        {
+            "tool_name": tool.name,
+            "parameters_schema": tool.parameters_schema,
+        },
+    )
+
+
+def file_mutation_arguments_digest(
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> str:
+    """Digest normalized mutation arguments without lossy string projection."""
+    return tool_arguments_digest(tool_name=tool_name, arguments=arguments)
+
+
+def _file_base_state(
+    *,
+    target: Path,
+    workspace_root: Path,
+    before: bytes | None,
+) -> dict[str, Any]:
+    return {
+        "relative_path": target.relative_to(workspace_root).as_posix(),
+        "exists": before is not None,
+        "sha256": _content_digest(before),
+    }
+
+
+@dataclass(frozen=True)
+class _FileMutationCallPolicy:
+    require_approval: bool
+    path_scope: str
+    autonomy_mode: str
+    source: str
+    policy_snapshot_id: str | None
+    policy_version: str | None
+
+    def metadata(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "path_scope": self.path_scope,
+            "require_approval_for_file_write": self.require_approval,
+            "file_permission_policy_source": self.source,
+        }
+        if self.policy_snapshot_id is not None:
+            payload["policy_snapshot_id"] = self.policy_snapshot_id
+        if self.policy_version is not None:
+            payload["effective_policy_version"] = self.policy_version
+        return payload
+
+
+def _resolve_file_mutation_call_policy(
+    *,
+    context: ToolExecutionContext | None,
+    legacy_require_approval: bool,
+    legacy_path_scope: str,
+) -> _FileMutationCallPolicy:
+    """Resolve mutable file policy per call, with constructor values as fallback.
+
+    A task sandbox is an immutable containment ceiling.  Even if a malformed or
+    stale execution policy requests ``any``, a sandboxed call remains confined
+    to its task workspace.  Protected-path checks are enforced separately for
+    every call by ``check_file_tool_path`` / ``prepare_apply_patch``.
+    """
+    permission_policy: Mapping[str, Any] = {}
+    if context is not None and isinstance(context.permission_policy, Mapping):
+        permission_policy = context.permission_policy
+
+    approval_value = permission_policy.get("require_approval_for_file_write")
+    require_approval = (
+        approval_value if isinstance(approval_value, bool) else legacy_require_approval
+    )
+    scope_value = permission_policy.get("file_write_scope")
+    path_scope = (
+        scope_value if scope_value in {"workspace", "any"} else legacy_path_scope
+    )
+    has_context_policy = isinstance(approval_value, bool) or scope_value in {
+        "workspace",
+        "any",
+    }
+    source = "execution_context" if has_context_policy else "constructor_fallback"
+    if context is not None and context.task_sandbox_dir:
+        path_scope = "workspace"
+        source = f"{source}+task_sandbox_ceiling"
+
+    autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
+    snapshot_value = permission_policy.get("policy_snapshot_id")
+    version_value = permission_policy.get("policy_version")
+    return _FileMutationCallPolicy(
+        require_approval=bool(require_approval),
+        path_scope=path_scope,
+        autonomy_mode=autonomy_mode,
+        source=source,
+        policy_snapshot_id=(
+            snapshot_value.strip()
+            if isinstance(snapshot_value, str) and snapshot_value.strip()
+            else None
+        ),
+        policy_version=(
+            version_value.strip()
+            if isinstance(version_value, str) and version_value.strip()
+            else None
+        ),
+    )
+
+
+def _create_file_mutation_approval(
+    *,
+    tool: BaseTool,
+    approval_store: ApprovalStore,
+    arguments: Mapping[str, Any],
+    workspace_root: Path,
+    base_states: list[dict[str, Any]],
+    preview_metadata: Mapping[str, Any],
+    reason: str,
+    call_policy: _FileMutationCallPolicy,
+    context: ToolExecutionContext | None,
+) -> Any:
+    timeline_binding = timeline_pending_operation_binding(
+        context,
+        tool_name=tool.name,
+    )
+    arguments_payload = (
+        dict(timeline_binding["arguments"])
+        if timeline_binding is not None
+        else dict(arguments)
+    )
+    arguments_digest = (
+        timeline_binding["arguments_digest"]
+        if timeline_binding is not None
+        else file_mutation_arguments_digest(
+            tool_name=tool.name,
+            arguments=arguments_payload,
+        )
+    )
+    cache_key = ":".join(
+        (
+            tool.name,
+            arguments_digest,
+            call_policy.policy_snapshot_id or "",
+            timeline_binding["operation_id"] if timeline_binding is not None else "",
+        )
+    )
+    if context is not None:
+        cached = context.state.setdefault("durable_file_approval_ids", {})
+        if isinstance(cached, dict):
+            approval_id = cached.get(cache_key)
+            if isinstance(approval_id, str):
+                existing = approval_store.get(approval_id)
+                if existing is not None:
+                    return existing
+
+    operation_id = (
+        timeline_binding["operation_id"]
+        if timeline_binding is not None
+        else f"file-operation-{uuid4().hex}"
+    )
+    approval_id = f"tool-approval-{uuid4().hex[:20]}"
+    inventory_version = file_mutation_tool_inventory_version(tool)
+    permission_policy = (
+        dict(context.permission_policy)
+        if context is not None and isinstance(context.permission_policy, Mapping)
+        else {}
+    )
+    ordinary_chat_context = _ordinary_chat_approval_context(context)
+    resume_cursor = (
+        dict(ordinary_chat_context.get("resume_cursor") or {})
+        if isinstance(ordinary_chat_context, Mapping)
+        and isinstance(ordinary_chat_context.get("resume_cursor"), Mapping)
+        else {}
+    )
+    if timeline_binding is not None:
+        if ordinary_chat_context is None:
+            raise ValueError(
+                "timeline-bound file approval requires an ordinary-Chat continuation context"
+            )
+        cursor_call_id = str(resume_cursor.get("tool_call_id") or "").strip()
+        cursor_tool_name = str(resume_cursor.get("tool_name") or "").strip()
+        if cursor_call_id != timeline_binding["call_id"] or (
+            cursor_tool_name and cursor_tool_name != tool.name
+        ):
+            raise ValueError(
+                "ordinary-Chat approval cursor does not match the timeline-bound call"
+            )
+    owner_task_id = str(permission_policy.get(APPROVAL_OWNER_TASK_ID_KEY) or "").strip() or None
+    requester_id, request_digest, context_digest = derive_approval_binding(
+        requester_id=(
+            f"runtime-task:{owner_task_id}"
+            if owner_task_id
+            else f"runtime-session:{context.session_id}"
+            if context is not None and context.session_id
+            else "runtime-service"
+        ),
+        request={
+            "tool_name": tool.name,
+            "arguments": arguments_payload,
+            "arguments_digest": arguments_digest,
+            "operation_id": operation_id,
+            **(
+                {"timeline_call_id": timeline_binding["call_id"]}
+                if timeline_binding is not None
+                else {}
+            ),
+        },
+        authorization_context={
+            "workspace_root": str(workspace_root),
+            "session_id": context.session_id if context is not None else None,
+            "policy_snapshot_id": call_policy.policy_snapshot_id,
+            "policy_version": call_policy.policy_version,
+            "tool_inventory_version": inventory_version,
+        },
+    )
+    replay_payload = {
+        "schema_version": 1,
+        "tool_name": tool.name,
+        "arguments": arguments_payload,
+        "arguments_digest": arguments_digest,
+        "operation_id": operation_id,
+        **(
+            {"timeline_call_id": timeline_binding["call_id"]}
+            if timeline_binding is not None
+            else {}
+        ),
+        "workspace_dir": str(workspace_root),
+        "session_id": context.session_id if context is not None else None,
+        "permission_policy": permission_policy,
+        "policy_snapshot_id": call_policy.policy_snapshot_id,
+        "effective_policy_version": call_policy.policy_version,
+        "tool_inventory_version": inventory_version,
+        "base_states": [dict(item) for item in base_states],
+    }
+    if ordinary_chat_context is not None:
+        # A Chat approval is a durable interrupt, not an invitation for the
+        # model to recreate a similar call on a later turn.  Keep the exact
+        # normalized call plus the identity needed to safely resume it.
+        replay_payload["ordinary_chat_checkpoint"] = {
+            "schema_version": 1,
+            "source": "ordinary_chat",
+            "session_id": ordinary_chat_context.get("session_id"),
+            "turn_id": ordinary_chat_context.get("turn_id"),
+            "resume_cursor": resume_cursor,
+            "resolved_workspace_dir": str(workspace_root),
+            "resolved_targets": [dict(item) for item in base_states],
+            "operation_id": operation_id,
+            **(
+                {"timeline_call_id": timeline_binding["call_id"]}
+                if timeline_binding is not None
+                else {}
+            ),
+            "tool_name": tool.name,
+            "normalized_arguments": arguments_payload,
+            "arguments_digest": arguments_digest,
+            "policy_snapshot_id": call_policy.policy_snapshot_id,
+            "policy_version": call_policy.policy_version,
+            "inventory_version": inventory_version,
+            "react_continuation": (
+                dict(ordinary_chat_context["react_continuation"])
+                if isinstance(ordinary_chat_context.get("react_continuation"), Mapping)
+                else None
+            ),
+        }
+    stored = approval_store.create(
+        approval_id=approval_id,
+        command=tool.name,
+        shell="tool",
+        scope="workspace",
+        reason=reason,
+        metadata={
+            **dict(preview_metadata),
+            "tool_name": tool.name,
+            "arguments_digest": arguments_digest,
+            "operation_id": operation_id,
+            **(
+                {"timeline_call_id": timeline_binding["call_id"]}
+                if timeline_binding is not None
+                else {}
+            ),
+            "policy_snapshot_id": call_policy.policy_snapshot_id,
+            "effective_policy_version": call_policy.policy_version,
+            "tool_inventory_version": inventory_version,
+            **(
+                {
+                    "approval_source": "ordinary_chat",
+                    "resume_cursor": resume_cursor,
+                    "resolved_workspace_dir": str(workspace_root),
+                    "resolved_targets": [dict(item) for item in base_states],
+                }
+                if ordinary_chat_context is not None
+                else {}
+            ),
+            **(
+                {APPROVAL_OWNER_TASK_ID_KEY: owner_task_id}
+                if owner_task_id
+                else {}
+            ),
+        },
+        command_payload=replay_payload,
+        requester_id=requester_id,
+        request_digest=request_digest,
+        context_digest=context_digest,
+    )
+    if context is not None:
+        cached = context.state.setdefault("durable_file_approval_ids", {})
+        if isinstance(cached, dict):
+            cached[cache_key] = stored.approval_id
+    return stored
+
+
+def _ordinary_chat_approval_context(
+    context: ToolExecutionContext | None,
+) -> dict[str, Any] | None:
+    """Return the engine-owned ordinary-Chat checkpoint context, if present."""
+    if context is None or not isinstance(context.state, Mapping):
+        return None
+    raw = context.state.get("ordinary_chat_approval_context")
+    if not isinstance(raw, Mapping) or raw.get("source") != "ordinary_chat":
+        return None
+    return dict(raw)
 
 
 def _build_path_denial_metadata(
@@ -122,13 +483,13 @@ async def _prepare_file_auto_review(
     *,
     workspace_root: Path,
     tool_name: str,
-    path_scope: str,
+    call_policy: _FileMutationCallPolicy,
     changes: list[tuple[Path, str, bytes | None, bytes | None]],
     patch_sha256: str | None,
     context: ToolExecutionContext | None,
 ) -> tuple[AutoReviewDecision, AuthorizationEnvelope] | None:
     permission_policy = context.permission_policy if context is not None else {}
-    autonomy_mode = str(permission_policy.get("autonomy_mode") or "").strip().lower()
+    autonomy_mode = call_policy.autonomy_mode
     if autonomy_mode not in {"auto_review", "high_autonomy"}:
         return None
 
@@ -196,10 +557,10 @@ async def _prepare_file_auto_review(
         "file-auto-review-policy",
         {
             "autonomy_mode": autonomy_mode,
-            "file_write_scope": path_scope,
-            "require_approval_for_file_write": bool(
-                permission_policy.get("require_approval_for_file_write")
-            ),
+            "file_write_scope": call_policy.path_scope,
+            "require_approval_for_file_write": call_policy.require_approval,
+            "effective_policy_version": call_policy.policy_version,
+            "policy_source": call_policy.source,
             "tool_name": tool_name,
         },
     )
@@ -259,7 +620,7 @@ async def _enforce_file_auto_review(
     *,
     workspace_root: Path,
     tool_name: str,
-    path_scope: str,
+    call_policy: _FileMutationCallPolicy,
     changes: list[tuple[Path, str, bytes | None, bytes | None]],
     patch_sha256: str | None,
     context: ToolExecutionContext | None,
@@ -272,7 +633,7 @@ async def _enforce_file_auto_review(
         reviewed = await _prepare_file_auto_review(
             workspace_root=workspace_root,
             tool_name=tool_name,
-            path_scope=path_scope,
+            call_policy=call_policy,
             changes=changes,
             patch_sha256=patch_sha256,
             context=context,
@@ -901,6 +1262,7 @@ class FileWriteTool(BaseTool):
         undo_max_size_mb: float = 2.0,
         default_encoding: str = "utf-8",
         writer: FileWriter | None = None,
+        approval_store: ApprovalStore | None = None,
     ) -> None:
         self._workspace_dir = normalize_workspace_dir(workspace_dir or defaults.default_workspace_dir())
         self._path_scope = path_scope
@@ -909,6 +1271,7 @@ class FileWriteTool(BaseTool):
         self._undo_max_size_mb = undo_max_size_mb
         self._default_encoding = default_encoding
         self._writer = writer or self._default_writer
+        self._approval_store = approval_store
 
     @property
     def name(self) -> str:
@@ -945,6 +1308,57 @@ class FileWriteTool(BaseTool):
     def requires_approval(self) -> bool:
         return self._require_approval
 
+    @property
+    def supports_timeline_side_effect_boundary(self) -> bool:
+        return True
+
+    @property
+    def supports_timeline_approval_revocation(self) -> bool:
+        return True
+
+    @property
+    def timeline_approval_mode(self) -> str:
+        return "continuable"
+
+    def revoke_timeline_approval(self, approval_id: str, *, reason: str) -> bool:
+        if self._approval_store is None:
+            return False
+        return self._approval_store.supersede(approval_id, reason=reason).status == "superseded"
+
+    def validates_timeline_approval_binding(
+        self,
+        approval_id: str,
+        *,
+        operation_id: str,
+        arguments_digest: str,
+        call_id: str,
+    ) -> bool:
+        if self._approval_store is None:
+            return False
+        approval = self._approval_store.get(approval_id)
+        if approval is None or approval.status != "pending":
+            return False
+        payload = approval.command_payload
+        checkpoint = (
+            payload.get("ordinary_chat_checkpoint")
+            if isinstance(payload, Mapping)
+            else None
+        )
+        return bool(
+            approval.metadata.get("operation_id") == operation_id
+            and approval.metadata.get("arguments_digest") == arguments_digest
+            and approval.metadata.get("timeline_call_id") == call_id
+            and isinstance(payload, Mapping)
+            and payload.get("operation_id") == operation_id
+            and payload.get("arguments_digest") == arguments_digest
+            and payload.get("timeline_call_id") == call_id
+            and isinstance(checkpoint, Mapping)
+            and checkpoint.get("source") == "ordinary_chat"
+            and checkpoint.get("operation_id") == operation_id
+            and checkpoint.get("arguments_digest") == arguments_digest
+            and checkpoint.get("timeline_call_id") == call_id
+        )
+
     def _resolve_workspace_root(self, context: ToolExecutionContext | None) -> Path:
         if context is not None:
             for candidate in (
@@ -970,6 +1384,11 @@ class FileWriteTool(BaseTool):
             return ToolResult(error="`path` must not be empty.")
 
         workspace_root = self._resolve_workspace_root(context)
+        call_policy = _resolve_file_mutation_call_policy(
+            context=context,
+            legacy_require_approval=self._require_approval,
+            legacy_path_scope=self._path_scope,
+        )
         active_encoding = encoding or self._default_encoding
         if not is_within_write_size_limit(
             content=content,
@@ -988,17 +1407,18 @@ class FileWriteTool(BaseTool):
         target, security_decision = check_file_tool_path(
             path,
             workspace_dir=workspace_root,
-            scope=self._path_scope,
+            scope=call_policy.path_scope,
         )
         if security_decision is not None or target is None:
             metadata = _build_path_denial_metadata(
                 path=path,
                 workspace_root=workspace_root,
-                path_scope=self._path_scope,
+                path_scope=call_policy.path_scope,
                 security_metadata=(
                     security_decision.to_metadata() if security_decision is not None else {}
                 ),
             )
+            metadata.update(call_policy.metadata())
             if security_decision is not None:
                 metadata.update(
                     {
@@ -1041,16 +1461,18 @@ class FileWriteTool(BaseTool):
         metadata = build_file_change_payload([file_change])
         metadata.update(
             {
-                'workspace_dir': str(workspace_root),
-                'resolved_path': str(target),
-                'path_scope': self._path_scope,
+                "workspace_dir": str(workspace_root),
+                "resolved_path": str(target),
+                **call_policy.metadata(),
             }
         )
-        policy_requires_approval = (
-            context is not None
-            and bool(context.permission_policy.get("require_approval_for_file_write"))
+        approval_replay = bool(
+            context is not None and context.state.get("approval_replay") is True
         )
-        if (self._require_approval or policy_requires_approval) and not approved:
+        trusted_approved = bool(
+            approved and (self._approval_store is None or approval_replay)
+        )
+        if call_policy.require_approval and not trusted_approved:
             decision = require_approval_decision(
                 reason="File writes require explicit approval in the current autonomy mode.",
                 approval_kind="file_write",
@@ -1063,6 +1485,46 @@ class FileWriteTool(BaseTool):
                 task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
             )
             metadata.update(decision.to_metadata())
+            if self._approval_store is not None:
+                before = (
+                    await asyncio.to_thread(target.read_bytes)
+                    if existed_before
+                    else None
+                )
+                approval = _create_file_mutation_approval(
+                    tool=self,
+                    approval_store=self._approval_store,
+                    arguments={
+                        "path": target.relative_to(workspace_root).as_posix(),
+                        "content": content,
+                        "append": append,
+                        "encoding": active_encoding,
+                    },
+                    workspace_root=workspace_root,
+                    base_states=[
+                        _file_base_state(
+                            target=target,
+                            workspace_root=workspace_root,
+                            before=before,
+                        )
+                    ],
+                    preview_metadata=metadata,
+                    reason=decision.reason,
+                    call_policy=call_policy,
+                    context=context,
+                )
+                await _observe_ordinary_chat_approval(context, approval)
+                metadata.update(
+                    {
+                        "status": "approval_pending",
+                        "approval_id": approval.approval_id,
+                        "operation_id": approval.metadata.get("operation_id"),
+                        "arguments_digest": approval.metadata.get("arguments_digest"),
+                        "tool_inventory_version": approval.metadata.get(
+                            "tool_inventory_version"
+                        ),
+                    }
+                )
             return ToolResult(
                 error="File write requires approval.",
                 metadata=metadata,
@@ -1071,7 +1533,7 @@ class FileWriteTool(BaseTool):
         review_error = await _enforce_file_auto_review(
             workspace_root=workspace_root,
             tool_name=self.name,
-            path_scope=self._path_scope,
+            call_policy=call_policy,
             changes=[
                 (
                     target,
@@ -1083,11 +1545,12 @@ class FileWriteTool(BaseTool):
             patch_sha256=None,
             context=context,
             metadata=metadata,
-            approved=approved,
+            approved=trusted_approved,
         )
         if review_error is not None:
             return review_error
 
+        await mark_context_side_effect_started(context)
         bytes_written = await self._writer(target, content if append else merged_content, append, active_encoding)
 
         await _refresh_read_state_cache(
@@ -1098,6 +1561,7 @@ class FileWriteTool(BaseTool):
         )
         metadata["bytes_written"] = bytes_written
         metadata["append"] = append
+        metadata["timeline_result_disposition"] = "succeeded"
         return ToolResult(output=str(target), metadata=metadata)
 
     @staticmethod
@@ -1165,21 +1629,27 @@ class FileEditTool(FileWriteTool):
             return ToolResult(error="`old_string` must not be empty.")
 
         workspace_root = self._resolve_workspace_root(context)
+        call_policy = _resolve_file_mutation_call_policy(
+            context=context,
+            legacy_require_approval=self._require_approval,
+            legacy_path_scope=self._path_scope,
+        )
         active_encoding = encoding or self._default_encoding
         target, security_decision = check_file_tool_path(
             path,
             workspace_dir=workspace_root,
-            scope=self._path_scope,
+            scope=call_policy.path_scope,
         )
         if security_decision is not None or target is None:
             metadata = _build_path_denial_metadata(
                 path=path,
                 workspace_root=workspace_root,
-                path_scope=self._path_scope,
+                path_scope=call_policy.path_scope,
                 security_metadata=(
                     security_decision.to_metadata() if security_decision is not None else {}
                 ),
             )
+            metadata.update(call_policy.metadata())
             if security_decision is not None:
                 metadata.update(
                     {
@@ -1232,16 +1702,18 @@ class FileEditTool(FileWriteTool):
         metadata = build_file_change_payload([file_change])
         metadata.update(
             {
-                'workspace_dir': str(workspace_root),
-                'resolved_path': str(target),
-                'path_scope': self._path_scope,
+                "workspace_dir": str(workspace_root),
+                "resolved_path": str(target),
+                **call_policy.metadata(),
             }
         )
-        policy_requires_approval = (
-            context is not None
-            and bool(context.permission_policy.get("require_approval_for_file_write"))
+        approval_replay = bool(
+            context is not None and context.state.get("approval_replay") is True
         )
-        if (self._require_approval or policy_requires_approval) and not approved:
+        trusted_approved = bool(
+            approved and (self._approval_store is None or approval_replay)
+        )
+        if call_policy.require_approval and not trusted_approved:
             decision = require_approval_decision(
                 reason="File edits require explicit approval in the current autonomy mode.",
                 approval_kind="file_edit",
@@ -1254,6 +1726,43 @@ class FileEditTool(FileWriteTool):
                 task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
             )
             metadata.update(decision.to_metadata())
+            if self._approval_store is not None:
+                before = await asyncio.to_thread(target.read_bytes)
+                approval = _create_file_mutation_approval(
+                    tool=self,
+                    approval_store=self._approval_store,
+                    arguments={
+                        "path": target.relative_to(workspace_root).as_posix(),
+                        "old_string": old_string,
+                        "new_string": new_string,
+                        "replace_all": replace_all,
+                        "encoding": active_encoding,
+                    },
+                    workspace_root=workspace_root,
+                    base_states=[
+                        _file_base_state(
+                            target=target,
+                            workspace_root=workspace_root,
+                            before=before,
+                        )
+                    ],
+                    preview_metadata=metadata,
+                    reason=decision.reason,
+                    call_policy=call_policy,
+                    context=context,
+                )
+                await _observe_ordinary_chat_approval(context, approval)
+                metadata.update(
+                    {
+                        "status": "approval_pending",
+                        "approval_id": approval.approval_id,
+                        "operation_id": approval.metadata.get("operation_id"),
+                        "arguments_digest": approval.metadata.get("arguments_digest"),
+                        "tool_inventory_version": approval.metadata.get(
+                            "tool_inventory_version"
+                        ),
+                    }
+                )
             return ToolResult(
                 error="File edit requires approval.",
                 metadata=metadata,
@@ -1262,7 +1771,7 @@ class FileEditTool(FileWriteTool):
         review_error = await _enforce_file_auto_review(
             workspace_root=workspace_root,
             tool_name=self.name,
-            path_scope=self._path_scope,
+            call_policy=call_policy,
             changes=[
                 (
                     target,
@@ -1274,11 +1783,12 @@ class FileEditTool(FileWriteTool):
             patch_sha256=None,
             context=context,
             metadata=metadata,
-            approved=approved,
+            approved=trusted_approved,
         )
         if review_error is not None:
             return review_error
 
+        await mark_context_side_effect_started(context)
         bytes_written = await self._writer(target, new_content, False, active_encoding)
         await _refresh_read_state_cache(
             context=context,
@@ -1287,6 +1797,7 @@ class FileEditTool(FileWriteTool):
             encoding=active_encoding,
         )
         metadata["bytes_written"] = bytes_written
+        metadata["timeline_result_disposition"] = "succeeded"
         return ToolResult(output=str(target), metadata=metadata)
 
 
@@ -1330,21 +1841,30 @@ class ApplyPatchTool(FileWriteTool):
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
         workspace_root = self._resolve_workspace_root(context)
+        call_policy = _resolve_file_mutation_call_policy(
+            context=context,
+            legacy_require_approval=self._require_approval,
+            legacy_path_scope=self._path_scope,
+        )
         active_encoding = encoding or self._default_encoding
         try:
             prepared, metadata = await prepare_apply_patch(
                 patch=patch,
                 workspace_dir=workspace_root,
-                path_scope=self._path_scope,
+                path_scope=call_policy.path_scope,
                 encoding=active_encoding,
                 undo_max_size_mb=self._undo_max_size_mb,
                 tool_name=self.name,
             )
         except PatchValidationError as exc:
+            error_metadata = dict(getattr(exc, "metadata", {}) or {})
+            error_metadata.update(call_policy.metadata())
             return ToolResult(
                 error=str(exc),
-                metadata=dict(getattr(exc, "metadata", {}) or {}),
+                metadata=error_metadata,
             )
+
+        metadata.update(call_policy.metadata())
 
         for item in prepared:
             if item.new_content is not None and not is_within_write_size_limit(
@@ -1371,11 +1891,13 @@ class ApplyPatchTool(FileWriteTool):
                 if guard_error is not None:
                     return guard_error
 
-        policy_requires_approval = (
-            context is not None
-            and bool(context.permission_policy.get("require_approval_for_file_write"))
+        approval_replay = bool(
+            context is not None and context.state.get("approval_replay") is True
         )
-        if (self._require_approval or policy_requires_approval) and not approved:
+        trusted_approved = bool(
+            approved and (self._approval_store is None or approval_replay)
+        )
+        if call_policy.require_approval and not trusted_approved:
             decision = require_approval_decision(
                 reason="Patch application requires explicit approval in the current autonomy mode.",
                 approval_kind="apply_patch",
@@ -1388,6 +1910,44 @@ class ApplyPatchTool(FileWriteTool):
                 task_sandbox_dir=context.task_sandbox_dir if context is not None else None,
             )
             metadata.update(decision.to_metadata())
+            if self._approval_store is not None:
+                base_states: list[dict[str, Any]] = []
+                for item in prepared:
+                    before = (
+                        await asyncio.to_thread(item.target.read_bytes)
+                        if await asyncio.to_thread(item.target.exists)
+                        else None
+                    )
+                    base_states.append(
+                        _file_base_state(
+                            target=item.target,
+                            workspace_root=workspace_root,
+                            before=before,
+                        )
+                    )
+                approval = _create_file_mutation_approval(
+                    tool=self,
+                    approval_store=self._approval_store,
+                    arguments={"patch": patch, "encoding": active_encoding},
+                    workspace_root=workspace_root,
+                    base_states=base_states,
+                    preview_metadata=metadata,
+                    reason=decision.reason,
+                    call_policy=call_policy,
+                    context=context,
+                )
+                await _observe_ordinary_chat_approval(context, approval)
+                metadata.update(
+                    {
+                        "status": "approval_pending",
+                        "approval_id": approval.approval_id,
+                        "operation_id": approval.metadata.get("operation_id"),
+                        "arguments_digest": approval.metadata.get("arguments_digest"),
+                        "tool_inventory_version": approval.metadata.get(
+                            "tool_inventory_version"
+                        ),
+                    }
+                )
             return ToolResult(
                 error="Patch application requires approval.",
                 metadata=metadata,
@@ -1409,16 +1969,17 @@ class ApplyPatchTool(FileWriteTool):
         review_error = await _enforce_file_auto_review(
             workspace_root=workspace_root,
             tool_name=self.name,
-            path_scope=self._path_scope,
+            call_policy=call_policy,
             changes=review_changes,
             patch_sha256=hashlib.sha256(patch.encode("utf-8")).hexdigest(),
             context=context,
             metadata=metadata,
-            approved=approved,
+            approved=trusted_approved,
         )
         if review_error is not None:
             return review_error
 
+        await mark_context_side_effect_started(context)
         total_bytes_written = 0
         for item in prepared:
             if item.operation.kind == "delete":
@@ -1438,6 +1999,7 @@ class ApplyPatchTool(FileWriteTool):
             )
 
         metadata["bytes_written"] = total_bytes_written
+        metadata["timeline_result_disposition"] = "succeeded"
         return ToolResult(
             output={"paths": metadata.get("paths", []), "change_count": metadata.get("change_count", 0)},
             metadata=metadata,

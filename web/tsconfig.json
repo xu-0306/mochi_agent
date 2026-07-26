@@ -37,7 +37,13 @@
     "**/*.ts",
     "**/*.tsx",
     ".next/types/**/*.ts",
-    ".next/dev/types/**/*.ts"
+    ".next/dev/types/**/*.ts",
+    ".next-fixture-goal-live/types/**/*.ts",
+    ".next-fixture-goal-live/dev/types/**/*.ts",
+    ".next-fixture-subagent/types/**/*.ts",
+    ".next-fixture-subagent/dev/types/**/*.ts",
+    ".next-fixture-reload/types/**/*.ts",
+    ".next-fixture-reload/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

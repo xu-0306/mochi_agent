@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
-from mochi.sessions.store import SessionStore
+import pytest
+
+from mochi.sessions.store import SessionIdentityConflictError, SessionStore
 
 
 def test_save_and_load_session_round_trip(tmp_path) -> None:
@@ -39,14 +42,15 @@ def test_load_session_tolerates_bad_jsonl_lines(tmp_path) -> None:
     """load_session() 應跳過壞行與非 dict JSON。"""
     store = SessionStore(tmp_path / "sessions")
     session_id = "broken-data"
+    valid_first = {"type": "user", "content": "ok-1"}
+    asyncio.run(store.save_event(session_id, valid_first))
     path = store._session_path(session_id)  # noqa: SLF001
-    path.parent.mkdir(parents=True, exist_ok=True)
 
-    valid_1 = json.dumps({"type": "user", "content": "ok-1"}, ensure_ascii=False)
     invalid = '{"type": "assistant", bad-json'
     non_dict = json.dumps(["not", "object"], ensure_ascii=False)
     valid_2 = json.dumps({"type": "assistant", "content": "ok-2"}, ensure_ascii=False)
-    path.write_text(f"{valid_1}\n{invalid}\n{non_dict}\n{valid_2}\n", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{invalid}\n{non_dict}\n{valid_2}\n")
 
     events = asyncio.run(store.load_session(session_id))
     assert events == [
@@ -72,3 +76,134 @@ def test_session_exists_and_delete_session(tmp_path) -> None:
     assert asyncio.run(store.session_exists("delete-me")) is False
     assert asyncio.run(store.load_session("delete-me")) == []
     assert asyncio.run(store.delete_session("delete-me")) is False
+
+
+def test_special_session_ids_coexist_without_lossy_filename_collisions(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    first_id = "a:b"
+    second_id = "a?b"
+
+    asyncio.run(store.save_event(first_id, {"type": "message", "content": "first"}))
+    asyncio.run(store.save_event(second_id, {"type": "message", "content": "second"}))
+
+    assert store._session_path(first_id) != store._session_path(second_id)  # noqa: SLF001
+    assert asyncio.run(store.load_session(first_id)) == [{"type": "message", "content": "first"}]
+    assert asyncio.run(store.load_session(second_id)) == [{"type": "message", "content": "second"}]
+    assert set(asyncio.run(store.list_session_ids())) == {first_id, second_id}
+
+
+def test_v2_filename_is_safe_on_case_insensitive_windows_volumes(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    # These were ``YcOA`` and ``YcOa`` in the rejected Base64 scheme, which
+    # collide after Windows case-folding.  V2 filenames are lowercase hashes
+    # and are verified by exact-ID sidecars.
+    first_id = "a\u00c0"
+    second_id = "a\u00da"
+
+    first_path = store._session_path(first_id)  # noqa: SLF001
+    second_path = store._session_path(second_id)  # noqa: SLF001
+    assert first_path.name.casefold() != second_path.name.casefold()
+
+    asyncio.run(store.save_event(first_id, {"type": "message", "content": "first"}))
+    asyncio.run(store.save_event(second_id, {"type": "message", "content": "second"}))
+
+    assert asyncio.run(store.load_session(first_id))[0]["content"] == "first"
+    assert asyncio.run(store.load_session(second_id))[0]["content"] == "second"
+
+
+def test_long_session_id_uses_fixed_length_filename_and_round_trips(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = "long:" + ("\U0001f642" * 1024)
+    path = store._session_path(session_id)  # noqa: SLF001
+
+    assert len(path.name) < 255
+    asyncio.run(store.save_event(session_id, {"type": "message", "content": "long"}))
+
+    assert path.exists()
+    assert asyncio.run(store.load_session(session_id)) == [{"type": "message", "content": "long"}]
+    assert session_id in asyncio.run(store.list_session_ids())
+
+
+def test_identity_sidecar_probes_hash_collisions_without_data_aliasing(tmp_path, monkeypatch) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    monkeypatch.setattr(
+        SessionStore,
+        "_session_id_digest",
+        staticmethod(lambda _session_id: "f" * 64),
+    )
+    first_id = "collision:first"
+    second_id = "collision:second"
+
+    asyncio.run(store.save_event(first_id, {"type": "message", "content": "first"}))
+    asyncio.run(store.save_event(second_id, {"type": "message", "content": "second"}))
+
+    assert store._find_v2_path(first_id) != store._find_v2_path(second_id)  # noqa: SLF001
+    assert asyncio.run(store.load_session(first_id))[0]["content"] == "first"
+    assert asyncio.run(store.load_session(second_id))[0]["content"] == "second"
+
+    assert asyncio.run(store.delete_session(first_id)) is True
+    # The first slot's identity tombstone keeps the second colliding slot
+    # addressable after deletion instead of aliasing it back to slot zero.
+    assert asyncio.run(store.load_session(second_id))[0]["content"] == "second"
+
+
+def test_verified_legacy_special_session_is_read_listed_and_migrated_on_replace(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = "legacy:session"
+    legacy_path = store._legacy_session_path(session_id)  # noqa: SLF001
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({"type": "session_meta", "session_id": session_id, "event": "created"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(store.load_session(session_id))[0]["session_id"] == session_id
+    assert session_id in asyncio.run(store.list_session_ids())
+
+    replacement = [{"type": "message", "content": "preserve opaque identity in filename"}]
+    asyncio.run(store.replace_session(session_id, replacement))
+
+    assert not legacy_path.exists()
+    assert store._session_path(session_id).exists()  # noqa: SLF001
+    assert asyncio.run(store.load_session(session_id)) == replacement
+
+
+def test_verified_legacy_special_session_can_be_deleted(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = "delete:legacy"
+    legacy_path = store._legacy_session_path(session_id)  # noqa: SLF001
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps({"session_id": session_id, "type": "message"}) + "\n", encoding="utf-8")
+
+    assert asyncio.run(store.delete_session(session_id)) is True
+    assert not legacy_path.exists()
+
+
+def test_conflicting_legacy_sanitized_identity_fails_closed(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    claimed_id = "a?b"
+    conflicting_request_id = "a:b"
+    legacy_path = store._legacy_session_path(claimed_id)  # noqa: SLF001
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({"type": "message", "session_id": claimed_id, "content": "claimed"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert asyncio.run(store.load_session(claimed_id))[0]["content"] == "claimed"
+    with pytest.raises(SessionIdentityConflictError):
+        asyncio.run(store.load_session(conflicting_request_id))
+    with pytest.raises(SessionIdentityConflictError):
+        asyncio.run(store.replace_session(conflicting_request_id, [{"type": "message"}]))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive filename lookup")
+def test_identity_free_legacy_filename_requires_exact_preserved_case(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    legacy_path = store._legacy_session_path("alpha")  # noqa: SLF001
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps({"type": "message", "content": "lower"}) + "\n", encoding="utf-8")
+
+    assert asyncio.run(store.load_session("alpha"))[0]["content"] == "lower"
+    with pytest.raises(SessionIdentityConflictError):
+        asyncio.run(store.load_session("ALPHA"))

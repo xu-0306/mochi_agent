@@ -24,6 +24,7 @@ from mochi.runtime.change_sets import (
 )
 from mochi.runtime.security_audit import SecurityAuditEvent, file_content_observation
 from mochi.runtime.store import RuntimeStore
+from mochi.api.session_store_binding import resolve_route_session_store
 from mochi.security.file_contract import (
     AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
     AuthorizationContext,
@@ -459,11 +460,5 @@ async def _resolve_workspace_dir_for_session(request: Request, session_id: str) 
 
 
 async def _get_session_store(request: Request) -> SessionStore:
-    existing = getattr(request.app.state, "session_store", None)
-    if isinstance(existing, SessionStore):
-        return existing
-
     config = await _get_config(request.app)
-    store = SessionStore(config.sessions_dir)
-    request.app.state.session_store = store
-    return store
+    return resolve_route_session_store(request.app, config)

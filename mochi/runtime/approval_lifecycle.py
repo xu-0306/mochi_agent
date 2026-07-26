@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Protocol, cast
+from typing import Any, Mapping, Protocol, cast
 from uuid import uuid4
 
 from mochi.runtime.approval_state_machine import (
@@ -92,6 +92,25 @@ class ExecApprovalRequest:
     consume_lease_token: str | None = None
     consume_lease_expires_at: str | None = None
     consumed_at: str | None = None
+    # Source revision for projections.  This is deliberately independent from
+    # updated_at so equal timestamps cannot collapse two lifecycle transitions.
+    approval_revision: int | None = 1
+
+
+@dataclass(frozen=True)
+class ContinuationReconciliationClaim:
+    approval_id: str
+    lease_token: str
+    lease_expires_at: str
+
+
+@dataclass(frozen=True)
+class ContinuationReconciliationCandidate:
+    """One durably applied ordinary-Chat continuation eligible for recovery."""
+
+    approval: ExecApprovalRequest
+    status: str
+    schema_version: int
 
 
 class ApprovalStore(Protocol):
@@ -167,6 +186,20 @@ class ApprovalStore(Protocol):
         execution_result: dict[str, Any],
     ) -> ExecApprovalRequest | None: ...
 
+    def claim_continuation_reconciliation(
+        self, approval_id: str, *, lease_owner: str, lease_seconds: int = DEFAULT_CONSUME_LEASE_SECONDS,
+    ) -> ContinuationReconciliationClaim: ...
+    def complete_continuation_reconciliation(
+        self, approval_id: str, *, lease_token: str, execution_result: dict[str, Any],
+    ) -> ExecApprovalRequest: ...
+    def fail_continuation_reconciliation(
+        self, approval_id: str, *, lease_token: str, reason: str,
+    ) -> ExecApprovalRequest: ...
+
+    def list_continuation_reconciliation_candidates(
+        self, *, limit: int,
+    ) -> list[ContinuationReconciliationCandidate]: ...
+
     def supersede(
         self,
         approval_id: str,
@@ -210,7 +243,16 @@ def _new_request(
         request_digest=digest,
         context_digest=context_digest or digest,
         expires_at=expires_at or _future_iso(ttl_seconds),
+        # New rows always carry an explicit revision.  ``None`` is reserved
+        # for rows that genuinely predate this column.
+        approval_revision=1,
     )
+
+
+def _next_approval_revision(value: int | None) -> int:
+    """Advance a durable source revision without inventing a legacy value."""
+
+    return (value if type(value) is int and value > 0 else 0) + 1
 
 
 def _lifecycle_state(request: ExecApprovalRequest) -> ApprovalLifecycleState:
@@ -348,7 +390,11 @@ class InMemoryApprovalStore:
                     context_digest=context_digest,
                 )
             except ApprovalExpired:
-                self._items[approval_id] = replace(current, status="expired")
+                self._items[approval_id] = replace(
+                    current,
+                    status="expired",
+                    approval_revision=_next_approval_revision(current.approval_revision),
+                )
                 raise
             if effect is not None:
                 self._effects.setdefault(approval_id, []).append(effect)
@@ -365,6 +411,7 @@ class InMemoryApprovalStore:
                 ),
                 resolved_at=transition.resolved_at,
                 resolution_kind=transition.resolution_kind,
+                approval_revision=_next_approval_revision(current.approval_revision),
             )
             self._items[approval_id] = deepcopy(resolved)
             return deepcopy(resolved)
@@ -395,7 +442,11 @@ class InMemoryApprovalStore:
                     lease_seconds=lease_seconds,
                 )
             except ApprovalExpired:
-                self._items[approval_id] = replace(current, status="expired")
+                self._items[approval_id] = replace(
+                    current,
+                    status="expired",
+                    approval_revision=_next_approval_revision(current.approval_revision),
+                )
                 raise
             if (
                 execution_idempotency_key in self._execution_keys
@@ -410,6 +461,7 @@ class InMemoryApprovalStore:
                 consume_lease_owner=transition.consume_lease_owner,
                 consume_lease_token=transition.consume_lease_token,
                 consume_lease_expires_at=transition.consume_lease_expires_at,
+                approval_revision=_next_approval_revision(current.approval_revision),
             )
             self._items[approval_id] = deepcopy(claimed)
             return deepcopy(claimed)
@@ -443,6 +495,7 @@ class InMemoryApprovalStore:
                 consume_lease_token=transition.consume_lease_token,
                 consume_lease_expires_at=transition.consume_lease_expires_at,
                 consumed_at=transition.consumed_at,
+                approval_revision=_next_approval_revision(current.approval_revision),
             )
             self._items[approval_id] = deepcopy(completed)
             return deepcopy(completed)
@@ -474,6 +527,7 @@ class InMemoryApprovalStore:
                 consume_lease_token=transition.consume_lease_token,
                 consume_lease_expires_at=transition.consume_lease_expires_at,
                 consumed_at=transition.consumed_at,
+                approval_revision=_next_approval_revision(current.approval_revision),
             )
             self._items[approval_id] = deepcopy(recovered)
             return deepcopy(recovered)
@@ -490,7 +544,11 @@ class InMemoryApprovalStore:
                 _lifecycle_state(current)
             ):
                 return None
-            updated = replace(current, execution_result=audit_details(execution_result))
+            updated = replace(
+                current,
+                execution_result=audit_details(execution_result),
+                approval_revision=_next_approval_revision(current.approval_revision),
+            )
             self._items[approval_id] = deepcopy(updated)
             return deepcopy(updated)
 
@@ -507,13 +565,18 @@ class InMemoryApprovalStore:
             try:
                 transition = supersede_approval(_lifecycle_state(current))
             except ApprovalExpired:
-                self._items[approval_id] = replace(current, status="expired")
+                self._items[approval_id] = replace(
+                    current,
+                    status="expired",
+                    approval_revision=_next_approval_revision(current.approval_revision),
+                )
                 raise
             updated = replace(
                 current,
                 status=transition.status,
                 reason=reason if reason is not None else current.reason,
                 resolved_at=transition.resolved_at,
+                approval_revision=_next_approval_revision(current.approval_revision),
             )
             self._items[approval_id] = deepcopy(updated)
             return deepcopy(updated)
@@ -529,7 +592,21 @@ class InMemoryApprovalStore:
                     or _is_expired(item.consume_lease_expires_at)
                 )
             ]
-        return [self.recover_consumption(item_id, outcome='unknown') for item_id in stale_ids]
+        recovered: list[ExecApprovalRequest] = []
+        for item_id in stale_ids:
+            result = self._items[item_id].execution_result
+            recovered.append(
+                self.recover_consumption(
+                    item_id,
+                    outcome=(
+                        'applied'
+                        if isinstance(result, dict)
+                        and result.get('status') in {'succeeded', 'completed'}
+                        else 'unknown'
+                    ),
+                )
+            )
+        return recovered
 
     def list_side_effects(self, approval_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -586,7 +663,8 @@ class PersistentApprovalStore:
                         resolved_at,updated_at,requester_id,request_digest,context_digest,
                         expires_at,resolution_kind,execution_idempotency_key,
                         consume_lease_owner,consume_lease_token,consume_lease_expires_at,consumed_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ,approval_revision
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     _row_values(item, updated_at=item.created_at),
                 )
@@ -655,7 +733,7 @@ class PersistentApprovalStore:
                 )
             except ApprovalExpired:
                 conn.execute(
-                    "UPDATE exec_approval_requests SET status='expired',updated_at=? WHERE approval_id=? AND status IN ('pending','approved_once')",
+                    "UPDATE exec_approval_requests SET status='expired',updated_at=?,approval_revision=COALESCE(approval_revision,0)+1 WHERE approval_id=? AND status IN ('pending','approved_once')",
                     (utc_now_iso(), approval_id),
                 )
                 conn.commit()
@@ -666,7 +744,7 @@ class PersistentApprovalStore:
                 """
                 UPDATE exec_approval_requests
                 SET status=?,reason=?,metadata_json=?,execution_result_json=?,
-                    resolved_at=?,resolution_kind=?,updated_at=?
+                    resolved_at=?,resolution_kind=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1
                 WHERE approval_id=? AND status='pending' AND expires_at>?
                 """,
                 (
@@ -739,7 +817,7 @@ class PersistentApprovalStore:
                 )
             except ApprovalExpired:
                 conn.execute(
-                    "UPDATE exec_approval_requests SET status='expired',updated_at=? WHERE approval_id=? AND status='approved_once'",
+                    "UPDATE exec_approval_requests SET status='expired',updated_at=?,approval_revision=COALESCE(approval_revision,0)+1 WHERE approval_id=? AND status='approved_once'",
                     (utc_now_iso(), approval_id),
                 )
                 conn.commit()
@@ -750,7 +828,7 @@ class PersistentApprovalStore:
                     """
                     UPDATE exec_approval_requests
                     SET status='consuming',execution_idempotency_key=?,consume_lease_owner=?,
-                        consume_lease_token=?,consume_lease_expires_at=?,updated_at=?
+                        consume_lease_token=?,consume_lease_expires_at=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1
                     WHERE approval_id=? AND status='approved_once' AND expires_at>?
                     """,
                     (
@@ -803,9 +881,9 @@ class PersistentApprovalStore:
             cursor = conn.execute(
                 """
                 UPDATE exec_approval_requests
-                SET status=?,execution_result_json=?,consume_lease_owner=NULL,
+                    SET status=?,execution_result_json=?,consume_lease_owner=NULL,
                     consume_lease_token=NULL,consume_lease_expires_at=NULL,
-                    consumed_at=?,updated_at=?
+                    consumed_at=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1
                 WHERE approval_id=? AND status='consuming'
                   AND execution_idempotency_key=? AND consume_lease_owner=?
                   AND consume_lease_token=?
@@ -853,9 +931,9 @@ class PersistentApprovalStore:
             cursor = conn.execute(
                 """
                 UPDATE exec_approval_requests
-                SET status=?,execution_result_json=?,consume_lease_owner=NULL,
+                    SET status=?,execution_result_json=?,consume_lease_owner=NULL,
                     consume_lease_token=NULL,consume_lease_expires_at=NULL,
-                    consumed_at=?,updated_at=?
+                    consumed_at=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1
                 WHERE approval_id=? AND status='consuming'
                   AND (consume_lease_expires_at IS NULL OR consume_lease_expires_at<=?)
                 """,
@@ -886,8 +964,8 @@ class PersistentApprovalStore:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
-                UPDATE exec_approval_requests SET execution_result_json=?,updated_at=?
-                WHERE approval_id=? AND status IN ('consumed','execution_failed')
+                UPDATE exec_approval_requests SET execution_result_json=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1
+                WHERE approval_id=? AND status IN ('consuming','consumed','execution_failed')
                 """,
                 (
                     json.dumps(audit_details(execution_result), ensure_ascii=False),
@@ -897,6 +975,223 @@ class PersistentApprovalStore:
             )
             conn.commit()
         return self.get(approval_id) if cursor.rowcount == 1 else None
+
+    def list_continuation_reconciliation_candidates(
+        self,
+        *,
+        limit: int,
+    ) -> list[ContinuationReconciliationCandidate]:
+        """Materialize and enumerate a bounded set of safe continuation work.
+
+        ``execution_result.recovery_required`` predates the durable
+        continuation table.  Treat it as a reader migration signal: the first
+        dispatcher pass records a v1 ``pending`` row atomically.  Records with
+        untrusted execution evidence are terminalized as ``unknown`` rather
+        than becoming a possible replay path.
+        """
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer.")
+        candidates: list[ContinuationReconciliationCandidate] = []
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT approval.*
+                FROM exec_approval_requests AS approval
+                LEFT JOIN approval_continuation_reconciliations AS continuation
+                  ON continuation.approval_id=approval.approval_id
+                WHERE approval.status='consumed'
+                  AND json_valid(approval.execution_result_json)=1
+                  AND json_extract(
+                      approval.execution_result_json,
+                      '$.recovery_required'
+                  )=?
+                  AND (
+                      continuation.status IS NULL
+                      OR continuation.status='pending'
+                      OR (
+                          continuation.status='reconciling'
+                          AND (
+                              continuation.lease_expires_at IS NULL
+                              OR continuation.lease_expires_at<=?
+                          )
+                      )
+                  )
+                ORDER BY datetime(approval.updated_at) ASC, approval.approval_id ASC
+                LIMIT ?
+                """,
+                ("ordinary_chat_continuation", utc_now_iso(), limit),
+            ).fetchall()
+            now = utc_now_iso()
+            for row in rows:
+                approval = _from_row(row)
+                result = approval.execution_result or {}
+                if result.get("recovery_required") != "ordinary_chat_continuation":
+                    continue
+                current = conn.execute(
+                    "SELECT status,schema_version FROM approval_continuation_reconciliations WHERE approval_id=?",
+                    (approval.approval_id,),
+                ).fetchone()
+                if not _is_trusted_ordinary_chat_continuation(approval):
+                    if current is None:
+                        conn.execute(
+                            """
+                            INSERT INTO approval_continuation_reconciliations(
+                                approval_id,status,schema_version,lease_owner,lease_token,
+                                lease_expires_at,reason,created_at,updated_at
+                            ) VALUES (?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                approval.approval_id, "unknown", 1, None, None,
+                                None, "applied_execution_evidence_missing", now, now,
+                            ),
+                        )
+                    continue
+                if current is None:
+                    conn.execute(
+                        """
+                        INSERT INTO approval_continuation_reconciliations(
+                            approval_id,status,schema_version,lease_owner,lease_token,
+                            lease_expires_at,reason,created_at,updated_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?)
+                        """,
+                        (approval.approval_id, "pending", 1, None, None, None, None, now, now),
+                    )
+                    status, schema_version = "pending", 1
+                else:
+                    status = str(current["status"])
+                    schema_version = int(current["schema_version"] or 1)
+                if status in {"pending", "reconciling"}:
+                    candidates.append(
+                        ContinuationReconciliationCandidate(
+                            approval=approval,
+                            status=status,
+                            schema_version=schema_version,
+                        )
+                    )
+            conn.commit()
+        return candidates
+
+    def claim_continuation_reconciliation(
+        self,
+        approval_id: str,
+        *,
+        lease_owner: str,
+        lease_seconds: int = DEFAULT_CONSUME_LEASE_SECONDS,
+    ) -> ContinuationReconciliationClaim:
+        """Claim the one-shot post-crash ReAct continuation in SQLite."""
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            approval = conn.execute(
+                "SELECT status,execution_result_json FROM exec_approval_requests WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["status"] != "consumed":
+                conn.rollback()
+                raise ApprovalConflict("Applied approval evidence is unavailable for reconciliation.")
+            result = _json_object(approval["execution_result_json"])
+            if result.get("recovery_required") != "ordinary_chat_continuation":
+                conn.rollback()
+                raise ApprovalConflict("Approval is not awaiting continuation reconciliation.")
+            current = conn.execute(
+                "SELECT status,lease_expires_at FROM approval_continuation_reconciliations WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+            if current is not None:
+                status = str(current["status"])
+                if status == "pending":
+                    token = f"continuation-{uuid4().hex}"
+                    expires_at = _future_iso(lease_seconds)
+                    now = utc_now_iso()
+                    cursor = conn.execute(
+                        """
+                        UPDATE approval_continuation_reconciliations
+                        SET status='reconciling',lease_owner=?,lease_token=?,
+                            lease_expires_at=?,reason=NULL,updated_at=?
+                        WHERE approval_id=? AND status='pending'
+                        """,
+                        (lease_owner, token, expires_at, now, approval_id),
+                    )
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        raise ApprovalConflict("Continuation reconciliation lost its compare-and-swap race.")
+                    conn.commit()
+                    return ContinuationReconciliationClaim(approval_id, token, expires_at)
+                if status == "reconciling":
+                    expiry = str(current["lease_expires_at"] or "")
+                    if not expiry or _is_expired(expiry):
+                        conn.execute(
+                            "UPDATE approval_continuation_reconciliations SET status='unknown',updated_at=? WHERE approval_id=? AND status='reconciling'",
+                            (utc_now_iso(), approval_id),
+                        )
+                        conn.commit()
+                        raise ApprovalConflict("Continuation lease expired with unknown outcome; manual recovery is required.")
+                    conn.rollback()
+                    raise ApprovalConflict("Continuation reconciliation is already in progress.")
+                conn.rollback()
+                raise ApprovalConflict(f"Continuation reconciliation is terminal: {status}.")
+            token = f"continuation-{uuid4().hex}"
+            expires_at = _future_iso(lease_seconds)
+            now = utc_now_iso()
+            conn.execute(
+                """
+                INSERT INTO approval_continuation_reconciliations(
+                    approval_id,status,schema_version,lease_owner,lease_token,
+                    lease_expires_at,reason,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (approval_id, "reconciling", 1, lease_owner, token, expires_at, None, now, now),
+            )
+            conn.commit()
+        return ContinuationReconciliationClaim(approval_id, token, expires_at)
+
+    def complete_continuation_reconciliation(
+        self,
+        approval_id: str,
+        *,
+        lease_token: str,
+        execution_result: dict[str, Any],
+    ) -> ExecApprovalRequest:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_now_iso()
+            cursor = conn.execute(
+                "UPDATE approval_continuation_reconciliations SET status='continued',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE approval_id=? AND status='reconciling' AND lease_token=?",
+                (now, approval_id, lease_token),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise ApprovalConflict("Continuation completion lost its lease compare-and-swap race.")
+            result_cursor = conn.execute(
+                "UPDATE exec_approval_requests SET execution_result_json=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1 WHERE approval_id=? AND status='consumed'",
+                (json.dumps(audit_details(execution_result), ensure_ascii=False), now, approval_id),
+            )
+            if result_cursor.rowcount != 1:
+                conn.rollback()
+                raise ApprovalConflict("Approval disappeared before continuation completion.")
+            conn.commit()
+        return self._required(approval_id)
+
+    def fail_continuation_reconciliation(
+        self,
+        approval_id: str,
+        *,
+        lease_token: str,
+        reason: str,
+    ) -> ExecApprovalRequest:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE approval_continuation_reconciliations SET status='unknown',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,reason=?,updated_at=? WHERE approval_id=? AND status='reconciling' AND lease_token=?",
+                (reason, utc_now_iso(), approval_id, lease_token),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise ApprovalConflict("Continuation failure lost its lease compare-and-swap race.")
+            conn.commit()
+        return self._required(approval_id)
 
     def supersede(
         self,
@@ -919,14 +1214,14 @@ class PersistentApprovalStore:
                 transition = supersede_approval(_lifecycle_state(current))
             except ApprovalExpired:
                 conn.execute(
-                    "UPDATE exec_approval_requests SET status='expired',updated_at=? WHERE approval_id=? AND status='pending'",
+                    "UPDATE exec_approval_requests SET status='expired',updated_at=?,approval_revision=COALESCE(approval_revision,0)+1 WHERE approval_id=? AND status='pending'",
                     (utc_now_iso(), approval_id),
                 )
                 conn.commit()
                 raise
             now = transition.resolved_at or utc_now_iso()
             cursor = conn.execute(
-                "UPDATE exec_approval_requests SET status=?,reason=?,resolved_at=?,updated_at=? WHERE approval_id=? AND status='pending' AND expires_at>?",
+                "UPDATE exec_approval_requests SET status=?,reason=?,resolved_at=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1 WHERE approval_id=? AND status='pending' AND expires_at>?",
                 (
                     transition.status,
                     reason,
@@ -943,15 +1238,74 @@ class PersistentApprovalStore:
         return self._required(approval_id)
 
     def recover_stale_consumptions(self) -> list[ExecApprovalRequest]:
+        """Atomically recover stale exact calls and mark Chat continuation work.
+
+        A previous implementation changed ``consuming`` to ``consumed`` and
+        then let RuntimeService add ``recovery_required`` in a separate write.
+        A crash in that gap made an applied Chat mutation undiscoverable.
+        """
+        recovered: list[ExecApprovalRequest] = []
         with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                'SELECT approval_id FROM exec_approval_requests WHERE status=? AND (consume_lease_expires_at IS NULL OR consume_lease_expires_at<=?)',
-                ('consuming', utc_now_iso()),
+                "SELECT approval_id FROM exec_approval_requests WHERE status='consuming' AND (consume_lease_expires_at IS NULL OR consume_lease_expires_at<=?)",
+                (utc_now_iso(),),
             ).fetchall()
-        return [
-            self.recover_consumption(str(row[0]), outcome='unknown')
-            for row in rows
-        ]
+        for row in rows:
+            approval_id = str(row["approval_id"])
+            with self._lock, self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                current_row = conn.execute(
+                    "SELECT * FROM exec_approval_requests WHERE approval_id=?",
+                    (approval_id,),
+                ).fetchone()
+                if current_row is None:
+                    conn.rollback()
+                    continue
+                current = _from_row(current_row)
+                if (
+                    current.status != "consuming"
+                    or (
+                        current.consume_lease_expires_at is not None
+                        and not _is_expired(current.consume_lease_expires_at)
+                    )
+                ):
+                    # Another process completed recovery or renewed the lease.
+                    conn.rollback()
+                    continue
+                result = dict(current.execution_result or {})
+                applied = result.get("status") in {"succeeded", "completed"}
+                status = (
+                    "expired"
+                    if _is_expired(current.expires_at)
+                    else "consumed" if applied else "execution_failed"
+                )
+                if status == "consumed" and _has_ordinary_chat_checkpoint(current.command_payload):
+                    continuation = result.get("react_continuation")
+                    if result.get("continuation_started") is True and not isinstance(continuation, Mapping):
+                        result["continuation_outcome"] = "unknown"
+                        result.pop("recovery_required", None)
+                    elif not isinstance(continuation, Mapping):
+                        result["recovery_required"] = "ordinary_chat_continuation"
+                now = utc_now_iso()
+                cursor = conn.execute(
+                    "UPDATE exec_approval_requests SET status=?,execution_result_json=?,consume_lease_owner=NULL,consume_lease_token=NULL,consume_lease_expires_at=NULL,consumed_at=?,updated_at=?,approval_revision=COALESCE(approval_revision,0)+1 WHERE approval_id=? AND status='consuming' AND (consume_lease_expires_at IS NULL OR consume_lease_expires_at<=?)",
+                    (
+                        status,
+                        json.dumps(audit_details(result), ensure_ascii=False) if result else None,
+                        now,
+                        now,
+                        approval_id,
+                        now,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    continue
+                conn.commit()
+            recovered.append(self._required(approval_id))
+        return recovered
 
     def list_side_effects(self, approval_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
@@ -998,6 +1352,7 @@ class PersistentApprovalStore:
                     expires_at TEXT NOT NULL DEFAULT '',resolution_kind TEXT,
                     execution_idempotency_key TEXT,consume_lease_owner TEXT,
                     consume_lease_token TEXT,consume_lease_expires_at TEXT,consumed_at TEXT
+                    ,approval_revision INTEGER
                 )
                 """
             )
@@ -1012,6 +1367,10 @@ class PersistentApprovalStore:
                 ("consume_lease_token", "TEXT"),
                 ("consume_lease_expires_at", "TEXT"),
                 ("consumed_at", "TEXT"),
+                # Keep pre-column rows distinguishable from new source rows.
+                # ``create`` explicitly writes revision 1; a migration must
+                # not fabricate that monotonic proof for existing data.
+                ("approval_revision", "INTEGER"),
             ):
                 _ensure_column(conn, "exec_approval_requests", column, definition)
             conn.execute(
@@ -1037,6 +1396,27 @@ class PersistentApprovalStore:
                     UNIQUE(approval_id,kind,payload_digest)
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approval_continuation_reconciliations(
+                    approval_id TEXT PRIMARY KEY,status TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    lease_owner TEXT,lease_token TEXT,lease_expires_at TEXT,
+                    reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+                    FOREIGN KEY(approval_id) REFERENCES exec_approval_requests(approval_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            _ensure_column(
+                conn,
+                "approval_continuation_reconciliations",
+                "schema_version",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            conn.execute(
+                "UPDATE approval_continuation_reconciliations SET schema_version=1 WHERE schema_version IS NULL OR schema_version<1"
             )
             conn.commit()
 
@@ -1068,6 +1448,56 @@ def _optional_json_object(value: object) -> dict[str, Any] | None:
     return loaded or None
 
 
+def _has_ordinary_chat_checkpoint(payload: Mapping[str, Any] | None) -> bool:
+    checkpoint = payload.get("ordinary_chat_checkpoint") if isinstance(payload, Mapping) else None
+    return isinstance(checkpoint, Mapping) and checkpoint.get("source") == "ordinary_chat"
+
+
+def _is_trusted_ordinary_chat_continuation(approval: ExecApprovalRequest) -> bool:
+    """Only a durable, successfully applied ordinary-Chat result can resume."""
+    result = approval.execution_result
+    if (
+        approval.status != "consumed"
+        or not isinstance(result, Mapping)
+        or result.get("recovery_required") != "ordinary_chat_continuation"
+        or result.get("status") not in {"succeeded", "completed"}
+        or result.get("continuation_started") is True
+    ):
+        return False
+    metadata = approval.metadata
+    payload = approval.command_payload
+    checkpoint = (
+        payload.get("ordinary_chat_checkpoint")
+        if isinstance(payload, Mapping)
+        else None
+    )
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("approval_source") != "ordinary_chat"
+        or not isinstance(payload, Mapping)
+        or not isinstance(checkpoint, Mapping)
+        or checkpoint.get("source") != "ordinary_chat"
+        or not isinstance(checkpoint.get("react_continuation"), Mapping)
+    ):
+        return False
+    tool_name = payload.get("tool_name")
+    operation_id = payload.get("operation_id")
+    arguments_digest = payload.get("arguments_digest")
+    return (
+        isinstance(tool_name, str)
+        and bool(tool_name)
+        and isinstance(operation_id, str)
+        and bool(operation_id)
+        and isinstance(arguments_digest, str)
+        and bool(arguments_digest)
+        and checkpoint.get("tool_name") == tool_name
+        and checkpoint.get("operation_id") == operation_id
+        and checkpoint.get("arguments_digest") == arguments_digest
+        and metadata.get("operation_id") == operation_id
+        and metadata.get("arguments_digest") == arguments_digest
+    )
+
+
 def _from_row(row: sqlite3.Row) -> ExecApprovalRequest:
     value = dict(row)
     return ExecApprovalRequest(
@@ -1092,6 +1522,12 @@ def _from_row(row: sqlite3.Row) -> ExecApprovalRequest:
         consume_lease_token=_optional_string(value.get("consume_lease_token")),
         consume_lease_expires_at=_optional_string(value.get("consume_lease_expires_at")),
         consumed_at=_optional_string(value.get("consumed_at")),
+        approval_revision=(
+            raw_revision
+            if type(raw_revision := value.get("approval_revision")) is int
+            and raw_revision > 0
+            else None
+        ),
     )
 
 
@@ -1123,6 +1559,7 @@ def _row_values(item: ExecApprovalRequest, *, updated_at: str) -> tuple[Any, ...
         item.consume_lease_token,
         item.consume_lease_expires_at,
         item.consumed_at,
+        item.approval_revision,
     )
 
 
@@ -1136,6 +1573,7 @@ __all__ = [
     "ApprovalStatus",
     "ConsumeRecoveryOutcome",
     "ApprovalStore",
+    "ContinuationReconciliationCandidate",
     "ExecApprovalRequest",
     "InMemoryApprovalStore",
     "PersistentApprovalStore",

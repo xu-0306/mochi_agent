@@ -43,6 +43,10 @@ from mochi.config.schema import (
 from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.security.policy import autonomy_mode_defaults
 from mochi.security.rollout import project_sandbox_rollout
+from mochi.sessions.store import (
+    SessionsDirectoryRestartRequired,
+    ensure_sessions_dir_unchanged,
+)
 from mochi.tools.web_search_providers import build_web_search_provider_status_payload
 from mochi.voice.model_manager import (
     ensure_model_available,
@@ -215,6 +219,7 @@ class AgentSettingsPatch(BaseModel):
     """可由 WebGUI 更新的 agent 推理設定。"""
 
     system_prompt: str | None = None
+    turn_contract_mode: Literal["enforce"] | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=131072)
     reserve_output_tokens: int | None = Field(default=None, ge=0, le=131072)
@@ -406,7 +411,9 @@ async def get_settings(request: Request, response: Response) -> dict[str, Any]:
     config = await _get_config(app)
     revision = _app_config_revision(request)
     response.headers["ETag"] = _quoted_etag(revision)
-    return _settings_payload(config, revision=revision)
+    response_payload = _settings_payload(config, revision=revision)
+    response_payload["config_reload"] = _config_reload_payload(request.app)
+    return response_payload
 
 
 @router.patch("/settings")
@@ -418,6 +425,7 @@ async def update_settings(
     """更新 WebGUI 可編輯的非敏感 runtime 設定。"""
     config = await _get_config(request.app)
     updated = _apply_settings_patch(config, payload)
+    _preflight_sessions_dir(config, updated)
     _ensure_config_directories(updated)
     download_result = await _maybe_prepare_voice_models(
         updated.voice,
@@ -443,6 +451,7 @@ async def update_settings(
         ) from exc
 
     request.app.state.config = updated
+    request.app.state.config_reload_status = {"status": "applied"}
     engine = getattr(request.app.state, "engine", None)
     if engine is not None:
         apply_config = getattr(engine, "apply_config", None)
@@ -454,6 +463,7 @@ async def update_settings(
     revision = _app_config_revision(request)
     response.headers["ETag"] = _quoted_etag(revision)
     response_payload = _settings_payload(updated, revision=revision)
+    response_payload["config_reload"] = _config_reload_payload(request.app)
     response_payload["update"] = {
         "type": "settings_update",
         "download": download_result,
@@ -475,6 +485,7 @@ async def setup_discord(
         updated = _apply_discord_setup(config, payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _preflight_sessions_dir(config, updated)
     _ensure_config_directories(updated)
 
     expected_revision = _required_if_match(request) if _persistence_enabled(request, payload.persist) else None
@@ -495,6 +506,7 @@ async def setup_discord(
         ) from exc
 
     request.app.state.config = updated
+    request.app.state.config_reload_status = {"status": "applied"}
     engine = getattr(request.app.state, "engine", None)
     if engine is not None:
         apply_config = getattr(engine, "apply_config", None)
@@ -509,6 +521,7 @@ async def setup_discord(
     revision = _app_config_revision(request)
     response.headers["ETag"] = _quoted_etag(revision)
     response_payload = _settings_payload(updated, revision=revision)
+    response_payload["config_reload"] = _config_reload_payload(request.app)
     response_payload["update"] = {
         "type": "discord_setup",
         "persisted": persisted_path is not None,
@@ -521,6 +534,34 @@ async def setup_discord(
         },
     }
     return response_payload
+
+
+def _config_reload_payload(app: Any) -> dict[str, Any]:
+    status = getattr(app.state, "config_reload_status", None)
+    if isinstance(status, dict):
+        return dict(status)
+    return {"status": "applied"}
+
+
+def _preflight_sessions_dir(
+    current: MochiConfig,
+    updated: MochiConfig,
+) -> None:
+    """Reject a sessions-root switch before filesystem or config side effects."""
+
+    try:
+        ensure_sessions_dir_unchanged(current.sessions_dir, updated.sessions_dir)
+    except SessionsDirectoryRestartRequired as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "requires_restart": True,
+                "current_root": exc.current_root,
+                "requested_root": exc.requested_root,
+            },
+        ) from exc
 
 
 def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> dict[str, Any]:
@@ -583,6 +624,7 @@ def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> di
         },
         "agent": {
             "system_prompt": config.agent.system_prompt,
+            "turn_contract_mode": config.agent.turn_contract_mode,
             "temperature": config.agent.temperature,
             "max_tokens": config.agent.max_tokens,
             "reserve_output_tokens": config.agent.reserve_output_tokens,

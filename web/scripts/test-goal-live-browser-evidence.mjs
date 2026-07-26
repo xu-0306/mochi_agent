@@ -6,12 +6,33 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 const WEB_DIR = process.cwd()
-const PORT = Number(process.env.MOCHI_GOAL_LIVE_FIXTURE_PORT ?? 3220)
-const BASE_URL = `http://127.0.0.1:${PORT}`
-const APP_URL = `${BASE_URL}/`
+const configuredPort = Number(process.env.MOCHI_GOAL_LIVE_FIXTURE_PORT ?? 0)
+let PORT = Number.isInteger(configuredPort) && configuredPort > 0 ? configuredPort : 0
+let BASE_URL = ''
+let APP_URL = ''
+const NEXT_DIST_DIR = process.env.MOCHI_NEXT_DIST_DIR ?? '.next-fixture-goal-live'
 const require = createRequire(import.meta.url)
 const SSE_CHUNK_DELAY_MS = 80
 let stoppingDevServer = false
+
+function reportPhase(phase) {
+  console.error(`[goal-live-browser-fixture] phase=${phase}`)
+}
+
+async function configurePort() {
+  if (PORT === 0) {
+    const probe = createServer()
+    await new Promise((resolve, reject) => {
+      probe.once('error', reject)
+      probe.listen(0, '127.0.0.1', resolve)
+    })
+    const address = probe.address()
+    PORT = typeof address === 'object' && address ? address.port : 0
+    await new Promise((resolve) => probe.close(resolve))
+  }
+  BASE_URL = `http://127.0.0.1:${PORT}`
+  APP_URL = `${BASE_URL}/`
+}
 
 const sessionId = 'session-goal-live-evidence'
 const goalId = 'goal-live-evidence'
@@ -46,15 +67,17 @@ function findChromiumExecutable() {
 }
 
 function startDevServer(directApiBaseUrl) {
-  const command = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  const child = spawn(command, ['run', 'dev', '--', '--hostname', '127.0.0.1', '--port', String(PORT)], {
+  const nextCli = require.resolve('next/dist/bin/next')
+  const child = spawn(process.execPath, [nextCli, 'dev', '--hostname', '127.0.0.1', '--port', String(PORT)], {
     cwd: WEB_DIR,
     env: {
       ...process.env,
       NEXT_TELEMETRY_DISABLED: '1',
       NEXT_PUBLIC_MOCHI_API_BASE_URL: directApiBaseUrl,
+      MOCHI_NEXT_DIST_DIR: NEXT_DIST_DIR,
     },
-    shell: process.platform === 'win32',
+    shell: false,
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   child.on('exit', (code, signal) => {
@@ -71,7 +94,7 @@ function startDevServer(directApiBaseUrl) {
 }
 
 async function stopDevServer(child) {
-  if (!child || child.killed) {
+  if (!child || child.exitCode !== null) {
     return
   }
   stoppingDevServer = true
@@ -79,11 +102,40 @@ async function stopDevServer(child) {
   child.stderr?.destroy()
   if (process.platform === 'win32') {
     await new Promise((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) {
+          return
+        }
+        settled = true
+        clearTimeout(timeout)
+        resolve()
+      }
       const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
         stdio: 'ignore',
       })
-      killer.on('exit', resolve)
-      killer.on('error', resolve)
+      const timeout = setTimeout(() => {
+        killer.kill()
+        if (!child.killed) {
+          child.kill()
+        }
+        finish()
+      }, 5_000)
+      timeout.unref?.()
+      killer.on('exit', finish)
+      killer.on('error', finish)
+    })
+    await new Promise((resolve) => {
+      if (child.exitCode !== null) {
+        resolve()
+        return
+      }
+      const timeout = setTimeout(resolve, 3_000)
+      timeout.unref?.()
+      child.once('exit', () => {
+        clearTimeout(timeout)
+        resolve()
+      })
     })
     return
   }
@@ -92,16 +144,27 @@ async function stopDevServer(child) {
   child.kill('SIGKILL')
 }
 
+async function cleanupNextDistDir() {
+  if (process.env.MOCHI_NEXT_DIST_DIR) {
+    return
+  }
+  await fs.promises.rm(path.join(WEB_DIR, NEXT_DIST_DIR), { recursive: true, force: true })
+}
+
 async function waitForServer(url, timeoutMs = 45_000) {
   const startedAt = Date.now()
   while (Date.now() - startedAt < timeoutMs) {
+    const controller = new AbortController()
+    const probeTimeout = setTimeout(() => controller.abort(), 2_000)
     try {
-      const response = await fetch(url)
+      const response = await fetch(url, { signal: controller.signal })
       if (response.ok) {
         return
       }
     } catch {
       // Server is not ready yet.
+    } finally {
+      clearTimeout(probeTimeout)
     }
     await sleep(500)
   }
@@ -476,7 +539,21 @@ async function stopMockApiServer(server) {
   if (!server || !server.listening) {
     return
   }
-  await new Promise((resolve) => server.close(resolve))
+  await new Promise((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timeout)
+      resolve()
+    }
+    const timeout = setTimeout(finish, 5_000)
+    timeout.unref?.()
+    server.close(finish)
+    server.closeAllConnections?.()
+  })
 }
 
 async function installRoutes(page, requestLog, fixtureState) {
@@ -668,15 +745,21 @@ async function assertNoConsoleNoise(page, badMessages) {
 
 async function main() {
   const requestLog = []
+  reportPhase('configure-port')
+  await configurePort()
+  reportPhase('start-mock-api')
   const mockApi = await startMockApiServer(requestLog)
+  reportPhase('start-next-dev-server')
   const server = startDevServer(mockApi.directApiBaseUrl)
   try {
     await waitForServer(APP_URL)
+    reportPhase('next-dev-server-ready')
     const { chromium } = requireLocalPlaywright()
     const browser = await chromium.launch({
       headless: true,
       executablePath: findChromiumExecutable(),
     })
+    reportPhase('browser-launched')
     try {
       const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
       const badMessages = []
@@ -731,6 +814,7 @@ async function main() {
       )
       await assertNoConsoleNoise(page, badMessages)
       await page.close()
+      reportPhase('assertions-complete')
 
       console.log(JSON.stringify({
         ok: true,
@@ -749,11 +833,15 @@ async function main() {
         requests: requestLog,
       }, null, 2))
     } finally {
+      reportPhase('close-browser')
       await browser.close()
     }
   } finally {
+    reportPhase('cleanup-runtime')
     await stopDevServer(server)
     await stopMockApiServer(mockApi.server)
+    await cleanupNextDistDir()
+    reportPhase('cleanup-complete')
   }
 }
 

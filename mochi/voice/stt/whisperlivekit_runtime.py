@@ -351,7 +351,7 @@ class WhisperLiveKitRealtimeSession:
         now = time.monotonic()
         if self._first_audio_ts is None:
             self._first_audio_ts = now
-        self._last_audio_ts = now
+        self._last_audio_ts = max(now, self._last_audio_ts + 1e-9)
 
         result = await _maybe_await(_call_with_supported_kwargs(
             process_audio,
@@ -380,7 +380,7 @@ class WhisperLiveKitRealtimeSession:
         now = time.monotonic()
         if self._first_audio_ts is None:
             self._first_audio_ts = now
-        self._last_audio_ts = now
+        self._last_audio_ts = max(now, self._last_audio_ts + 1e-9)
 
         result = await _maybe_await(_call_with_supported_kwargs(
             process_audio,

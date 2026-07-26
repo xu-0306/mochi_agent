@@ -187,31 +187,62 @@ def normalize_goal_session_state(value: Any) -> dict[str, Any]:
         return empty_goal_session_state()
     pending = normalize_goal_session_proposal(value.get("pending_proposal"))
     last_summary = normalize_goal_session_summary(value.get("last_goal_summary"))
+    protocol_selection = (
+        _string_or_none(value.get("protocol_selection"))
+        or _string_or_none(value.get("protocol_id"))
+        or _string_or_none((pending or {}).get("protocol_selection"))
+        or _string_or_none((last_summary or {}).get("protocol_selection"))
+    )
     execution_mode = normalize_goal_execution_mode(value.get("execution_mode"))
     if execution_mode is None and pending is not None:
         execution_mode = pending["execution_mode"]
     if execution_mode is None and last_summary is not None:
         execution_mode = last_summary["execution_mode"]
+    if execution_mode is None and protocol_selection is not None:
+        execution_mode = (
+            "single_agent"
+            if protocol_selection == "autonomous_single_agent"
+            else "workflow"
+        )
     default_route = _string_or_none(value.get("default_route"))
+    inferred_interaction_mode = (
+        "workflow" if execution_mode == "workflow" else "goal" if execution_mode == "single_agent" else None
+    )
+    inferred_execution_topology = (
+        "multi_agent" if execution_mode == "workflow" else "single_agent" if execution_mode == "single_agent" else None
+    )
+    interaction_mode = (
+        normalize_goal_interaction_mode(value.get("interaction_mode"))
+        or (pending or {}).get("interaction_mode")
+        or (last_summary or {}).get("interaction_mode")
+        or inferred_interaction_mode
+    )
+    execution_topology = (
+        normalize_goal_execution_topology(value.get("execution_topology"))
+        or (pending or {}).get("execution_topology")
+        or (last_summary or {}).get("execution_topology")
+        or inferred_execution_topology
+    )
+    if default_route == "continue":
+        default_route = "goal"
     return {
         "active_goal_id": _string_or_none(value.get("active_goal_id")) or _string_or_none(value.get("goal_id")),
         "active_goal_status": _string_or_none(value.get("active_goal_status")) or _string_or_none(value.get("status")),
         "execution_mode": execution_mode,
-        "interaction_mode": normalize_goal_interaction_mode(value.get("interaction_mode"))
-        or (pending or {}).get("interaction_mode")
-        or (last_summary or {}).get("interaction_mode"),
-        "execution_topology": normalize_goal_execution_topology(value.get("execution_topology"))
-        or (pending or {}).get("execution_topology")
-        or (last_summary or {}).get("execution_topology"),
+        "interaction_mode": interaction_mode,
+        "execution_topology": execution_topology,
         "bound_run_id": _string_or_none(value.get("bound_run_id"))
         or _string_or_none((pending or {}).get("bound_run_id"))
         or _string_or_none((last_summary or {}).get("bound_run_id")),
-        "protocol_selection": _string_or_none(value.get("protocol_selection"))
-        or _string_or_none((pending or {}).get("protocol_selection"))
-        or _string_or_none((last_summary or {}).get("protocol_selection")),
+        "protocol_selection": protocol_selection,
         "selection_rationale": _string_or_none(value.get("selection_rationale"))
         or _string_or_none((pending or {}).get("selection_rationale"))
-        or _string_or_none((last_summary or {}).get("selection_rationale")),
+        or _string_or_none((last_summary or {}).get("selection_rationale"))
+        or (
+            _describe_goal_protocol_selection(protocol_selection, interaction_mode)
+            if protocol_selection is not None and interaction_mode is not None
+            else None
+        ),
         "default_route": default_route if default_route in {"chat", "goal", "workflow"} else "chat",
         "last_goal_summary": last_summary,
         "pending_proposal": pending,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -10,8 +11,10 @@ from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
+from mochi.runtime.ordinary_chat_session_gate import OrdinaryChatSessionGateError
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
+from mochi.sessions.store import SessionStore
 from tests.support.exec_providers import PythonDirectProvider as _ApiRuntimePythonDirectProvider
 
 from ._support import (
@@ -21,6 +24,356 @@ from ._support import (
     _RuntimeFakeEngine,
     _wait_until,
 )
+
+
+class _ReconcileRouteService:
+    def __init__(
+        self,
+        *,
+        session_id: str | None = "reconcile-session",
+        outcome: dict[str, object] | None = None,
+        ordinary_chat: bool = True,
+        gate_error: str | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.outcome = outcome or {"status": "continued"}
+        self.ordinary_chat = ordinary_chat
+        self.gate_error = gate_error
+        self.policy: dict[str, object] | None = None
+        self.approval_status = "pending"
+        self.engine_calls = 0
+        self.resolve_calls = 0
+
+    def update_security_config(self, *_: object) -> None:
+        pass
+
+    def update_sandbox_config(self, *_: object) -> None:
+        pass
+
+    def bind_app_config(self, **_: object) -> None:
+        pass
+
+    async def start(self) -> None:
+        pass
+
+    def ordinary_chat_approval_session_id(self, _: str) -> str | None:
+        return self.session_id
+
+    def ordinary_chat_approval_owner(self, _: str) -> tuple[bool, str | None]:
+        return self.ordinary_chat, self.session_id
+
+    async def resolve_approval(
+        self,
+        _: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.resolve_calls += 1
+        policy = kwargs.get("current_permission_policy")
+        self.policy = dict(policy) if isinstance(policy, dict) else None
+        self.approval_status = "consumed"
+        self.engine_calls += 1
+        return {"status": "consumed"}
+
+    async def reconcile_recovered_ordinary_chat_approval(
+        self,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if self.gate_error is not None:
+            raise OrdinaryChatSessionGateError(self.gate_error)
+        self.policy = None
+        return self.outcome
+
+
+class _CountingSessionStore(SessionStore):
+    def __init__(self, sessions_dir: Path) -> None:
+        super().__init__(sessions_dir)
+        self.load_calls = 0
+
+    async def load_strict_snapshot(self, session_id: str):  # type: ignore[no-untyped-def]
+        self.load_calls += 1
+        return await super().load_strict_snapshot(session_id)
+
+
+def _reconcile_app(
+    tmp_path: Path,
+    service: _ReconcileRouteService,
+    *,
+    session_store: SessionStore | None = None,
+) -> TestClient:
+    app = create_app()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {"sessions_dir": str(tmp_path / "sessions")}
+    )
+    app.state.runtime_service = service
+    if session_store is not None:
+        app.state.session_store = session_store
+    return TestClient(app)
+
+
+def _created_session_event(
+    session_id: str,
+    *,
+    security_override: dict[str, object] | None = None,
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "type": "session_meta",
+        "event": "created",
+        "session_id": session_id,
+        "timestamp": "2026-07-25T00:00:00+00:00",
+    }
+    if security_override is not None:
+        event["security_override"] = security_override
+    return event
+
+
+def test_ordinary_chat_reconcile_route_derives_policy_server_side(tmp_path: Path) -> None:
+    service = _ReconcileRouteService()
+    sessions = SessionStore(tmp_path / "sessions")
+    asyncio.run(
+        sessions.save_event(
+            "reconcile-session",
+            _created_session_event(
+                "reconcile-session",
+                security_override={"autonomy_mode": "high_autonomy"},
+            ),
+        )
+    )
+    with _reconcile_app(tmp_path, service) as client:
+        response = client.post(
+            "/v1/approvals/a/reconcile",
+            json={"current_permission_policy": {"autonomy_mode": "strict"}},
+        )
+    assert response.status_code == 200
+    assert service.policy is None
+
+
+def test_ordinary_chat_resolve_route_derives_policy_from_one_session_snapshot(
+    tmp_path: Path,
+) -> None:
+    service = _ReconcileRouteService()
+    sessions = _CountingSessionStore(tmp_path / "sessions")
+    asyncio.run(
+        sessions.save_event(
+            "reconcile-session",
+            _created_session_event(
+                "reconcile-session",
+                security_override={"autonomy_mode": "high_autonomy"},
+            ),
+        )
+    )
+
+    with _reconcile_app(tmp_path, service, session_store=sessions) as client:
+        response = client.post(
+            "/v1/approvals/a/resolve",
+            json={
+                "decision": "approve_once",
+                "current_permission_policy": {"autonomy_mode": "strict"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert sessions.load_calls == 1
+    assert service.policy is not None
+    assert service.policy.get("autonomy_mode") == "high_autonomy"
+
+
+def test_ordinary_chat_reconcile_route_reads_verified_session_once(tmp_path: Path) -> None:
+    service = _ReconcileRouteService()
+    sessions = _CountingSessionStore(tmp_path / "sessions")
+    asyncio.run(
+        sessions.save_event(
+            "reconcile-session",
+            _created_session_event("reconcile-session"),
+        )
+    )
+
+    with _reconcile_app(tmp_path, service, session_store=sessions) as client:
+        response = client.post("/v1/approvals/a/reconcile")
+
+    assert response.status_code == 200
+    assert sessions.load_calls == 0
+
+
+def test_ordinary_chat_resolve_route_rejects_invalid_session_before_side_effect(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        ("missing", "missing", None, None, "ordinary_chat_resolve_session_missing"),
+        ("empty", "empty", [], None, "ordinary_chat_resolve_session_invalid"),
+        (
+            "wrong",
+            "wrong",
+            [_created_session_event("other")],
+            None,
+            "ordinary_chat_resolve_session_invalid",
+        ),
+        (
+            "corrupt-log",
+            "corrupt-log",
+            None,
+            "{not-valid-json}\n",
+            "ordinary_chat_resolve_session_invalid",
+        ),
+        ("corrupt-checkpoint", None, None, None, "ordinary_chat_resolve_session_invalid"),
+    )
+    for name, session_id, events, raw_session, code in cases:
+        service = _ReconcileRouteService(session_id=session_id)
+        sessions = SessionStore(tmp_path / name / "sessions")
+        if events is not None:
+            if not events:
+                sessions._session_path(name).parent.mkdir(parents=True, exist_ok=True)  # noqa: SLF001
+                sessions._session_path(name).touch()  # noqa: SLF001
+            for event in events:
+                asyncio.run(sessions.save_event(name, event))
+        if raw_session is not None:
+            path = sessions._session_path(session_id or name)  # noqa: SLF001
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw_session, encoding="utf-8")
+
+        with _reconcile_app(tmp_path / name, service) as client:
+            response = client.post(
+                "/v1/approvals/a/resolve",
+                json={"decision": "approve_once"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == code
+        assert service.approval_status == "pending"
+        assert service.resolve_calls == 0
+        assert service.engine_calls == 0
+
+
+def test_ordinary_chat_resolve_route_rejects_malformed_durable_override(
+    tmp_path: Path,
+) -> None:
+    service = _ReconcileRouteService()
+    sessions = SessionStore(tmp_path / "sessions")
+    asyncio.run(
+        sessions.save_event(
+            "reconcile-session",
+            _created_session_event(
+                "reconcile-session",
+                security_override={"autonomy_mode": "not-a-valid-mode"},
+            ),
+        )
+    )
+    with _reconcile_app(tmp_path, service) as client:
+        response = client.post(
+            "/v1/approvals/a/resolve",
+            json={"decision": "approve_once"},
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ordinary_chat_resolve_session_invalid"
+    assert service.resolve_calls == 0
+    assert service.engine_calls == 0
+
+
+def test_nonordinary_resolve_route_skips_session_validation(tmp_path: Path) -> None:
+    service = _ReconcileRouteService(session_id=None, ordinary_chat=False)
+
+    with _reconcile_app(tmp_path, service) as client:
+        response = client.post(
+            "/v1/approvals/a/resolve",
+            json={"decision": "approve_once"},
+        )
+
+    assert response.status_code == 200
+    assert service.resolve_calls == 1
+    assert service.policy is None
+
+
+def test_ordinary_chat_reconcile_route_rejects_invalid_session_logs(tmp_path: Path) -> None:
+    for name, events, code in (
+        ("missing", None, "ordinary_chat_reconciliation_session_missing"),
+        ("empty", [], "ordinary_chat_reconciliation_session_invalid"),
+        (
+            "wrong",
+            [_created_session_event("other")],
+            "ordinary_chat_reconciliation_session_invalid",
+        ),
+        ("corrupt", None, "ordinary_chat_reconciliation_session_invalid"),
+    ):
+        service = _ReconcileRouteService(
+            session_id=name,
+            gate_error="missing" if name == "missing" else "invalid",
+        )
+        sessions = SessionStore(tmp_path / name / "sessions")
+        if events is not None:
+            if not events:
+                sessions._session_path(name).parent.mkdir(parents=True, exist_ok=True)  # noqa: SLF001
+                sessions._session_path(name).touch()  # noqa: SLF001
+            for event in events:
+                asyncio.run(sessions.save_event(name, event))
+        if name == "corrupt":
+            path = sessions._session_path(name)  # noqa: SLF001
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{not-valid-json}\n", encoding="utf-8")
+        with _reconcile_app(tmp_path / name, service) as client:
+            response = client.post("/v1/approvals/a/reconcile")
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == code
+
+
+def test_ordinary_chat_reconcile_route_rejects_corrupt_checkpoint(tmp_path: Path) -> None:
+    service = _ReconcileRouteService(session_id=None, gate_error="invalid")
+
+    with _reconcile_app(tmp_path, service) as client:
+        response = client.post("/v1/approvals/a/reconcile")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ordinary_chat_reconciliation_session_invalid"
+
+
+def test_ordinary_chat_reconcile_route_maps_unavailable_states(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions")
+    asyncio.run(
+        sessions.save_event(
+            "reconcile-session",
+            _created_session_event("reconcile-session"),
+        )
+    )
+    cases = [
+        (
+            _ReconcileRouteService(session_id=None, ordinary_chat=False),
+            404,
+            "ordinary_chat_reconciliation_not_found",
+        ),
+        (
+            _ReconcileRouteService(
+                outcome={
+                    "status": "not_available",
+                    "reason": "reconciliation_not_required",
+                }
+            ),
+            409,
+            "ordinary_chat_reconciliation_not_required",
+        ),
+        (
+            _ReconcileRouteService(
+                outcome={
+                    "status": "not_available",
+                    "reason": "continuation_unknown_outcome",
+                }
+            ),
+            409,
+            "ordinary_chat_continuation_unknown_outcome",
+        ),
+        (
+            _ReconcileRouteService(
+                outcome={
+                    "status": "not_available",
+                    "reason": "reconciliation_claim_rejected",
+                }
+            ),
+            409,
+            "ordinary_chat_reconciliation_claim_rejected",
+        ),
+    ]
+    for service, status, code in cases:
+        with _reconcile_app(tmp_path, service) as client:
+            response = client.post("/v1/approvals/a/reconcile")
+        assert response.status_code == status
+        assert response.json()["detail"]["code"] == code
 
 
 def test_approvals_api_includes_and_resolves_standalone_exec_approvals(tmp_path: Path) -> None:

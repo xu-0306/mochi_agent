@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from mochi.api.routes.approvals import _get_runtime_service
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
+from mochi.api.session_store_binding import resolve_route_session_store
+from mochi.agents.conversation_state_store import TURN_CHECKPOINT_EVENT
+from mochi.api.tool_workflow_outbox import (
+    TOOL_WORKFLOW_APPROVAL_OBSERVATION_EVENT,
+    TOOL_WORKFLOW_OUTBOX_EVENT,
+    ToolWorkflowOutboxError,
+    ToolWorkflowOutboxRepository,
+)
 from mochi.config.schema import MochiConfig
 from mochi.runtime.models import (
     AgentRunMessageRequest,
@@ -23,9 +31,35 @@ from mochi.runtime.models import (
 )
 from mochi.security.rollout import project_protected_workspace_rollout
 from mochi.sessions.store import SessionStore
+from mochi.sessions.turn_timeline import SESSION_TURN_TIMELINE_EVENT
 from mochi.terminal_goal_helpers import normalize_goal_session_state
+from mochi.utils.streaming import sse_stream
 
 router = APIRouter(prefix="/v1", tags=["sessions"])
+
+
+_RESERVED_AUTHORITATIVE_SESSION_EVENTS = frozenset(
+    {
+        SESSION_TURN_TIMELINE_EVENT,
+        TURN_CHECKPOINT_EVENT,
+        "artifact_verification_receipt",
+        TOOL_WORKFLOW_APPROVAL_OBSERVATION_EVENT,
+        TOOL_WORKFLOW_OUTBOX_EVENT,
+    }
+)
+
+
+class SessionSecurityOverrideRequest(BaseModel):
+    """Validated session-scoped security override metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    autonomy_mode: Literal[
+        "strict",
+        "trusted_workspace",
+        "auto_review",
+        "high_autonomy",
+    ]
 
 
 class CreateSessionRequest(BaseModel):
@@ -35,6 +69,7 @@ class CreateSessionRequest(BaseModel):
     project_id: str | None = None
     fork_from_session_id: str | None = None
     fork_until_turn_id: str | None = None
+    security_override: SessionSecurityOverrideRequest | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -151,16 +186,71 @@ def _subagent_message_response_with_delivery(
 
 def _get_session_store(app: object, *, config: object | None = None) -> SessionStore:
     """從 app state 或 config 取得 SessionStore。"""
-    existing = getattr(app.state, "session_store", None)
-    if isinstance(existing, SessionStore):
-        return existing
-
     if config is None:
+        engine_store = getattr(getattr(app.state, "engine", None), "_session_store", None)
+        if isinstance(engine_store, SessionStore):
+            app.state.session_store = engine_store
+            return engine_store
+        existing = getattr(app.state, "session_store", None)
+        if isinstance(existing, SessionStore):
+            return existing
         raise RuntimeError("config is required when app.state.session_store is not set.")
+    return resolve_route_session_store(app, config)
 
-    store = SessionStore(cast(object, config).sessions_dir)
-    app.state.session_store = store
-    return store
+
+async def _get_tool_workflow_outbox(
+    app: object,
+    config: MochiConfig,
+    store: SessionStore,
+) -> ToolWorkflowOutboxRepository:
+    engine = getattr(app.state, "engine", None)
+    engine_outbox = getattr(engine, "_tool_workflow_outbox", None)
+    if (
+        isinstance(engine_outbox, ToolWorkflowOutboxRepository)
+        and getattr(engine_outbox, "_session_store", None) is store
+    ):
+        return engine_outbox
+    gate = getattr(engine, "tool_workflow_publication_gate", None)
+    return ToolWorkflowOutboxRepository(
+        store,
+        enabled=bool(config.agent.tool_observability_v1),
+        publication_gate=gate,
+    )
+
+
+def _check_tool_workflow_storage_scope(
+    requested_storage_id: str | None,
+    store: SessionStore,
+) -> None:
+    if requested_storage_id is None or requested_storage_id == store.storage_id:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "tool_workflow_storage_scope_mismatch",
+            "storage_id": store.storage_id,
+            "requested_storage_id": requested_storage_id,
+            "requires_snapshot": True,
+        },
+    )
+
+
+async def _load_tool_workflow_records(
+    outbox: ToolWorkflowOutboxRepository,
+    session_id: str,
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    try:
+        records = list(await outbox.list(session_id, turn_id=turn_id))
+    except ToolWorkflowOutboxError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "tool_workflow_aggregate_unavailable",
+                "message": str(exc),
+            },
+        ) from exc
+    return sorted(records, key=lambda record: int(record["seq"]))
 
 
 def _protected_workspace_projection(
@@ -175,19 +265,21 @@ def _protected_workspace_projection(
 
 
 async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]]:
-    """掃描 sessions 目錄，回傳摘要列表。"""
-    sessions_dir = Path(store._sessions_dir).expanduser()  # noqa: SLF001
-    if not sessions_dir.exists():
-        return []
+    """Return summaries from SessionStore logical IDs, not JSONL stems."""
 
     summaries: list[dict[str, object]] = []
-    for path in await asyncio.to_thread(lambda: sorted(sessions_dir.glob("*.jsonl"))):
-        events = await store.load_session(path.stem)
-        updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
-        title = _session_title(path.stem, events)
+    for session_id in await store.list_session_ids():
+        events = await store.load_session(session_id)
+        modified_at = await store.session_last_modified(session_id)
+        # An inventory item may be deleted immediately after the scan.  Keep
+        # the listing race harmless while never deriving an ID from its path.
+        if modified_at is None:
+            continue
+        updated_at = datetime.fromtimestamp(modified_at, tz=UTC).isoformat()
+        title = _session_title(session_id, events)
         summaries.append(
             {
-                "session_id": path.stem,
+                "session_id": session_id,
                 "title": title,
                 "event_count": len(events),
                 "updated_at": updated_at,
@@ -293,7 +385,7 @@ def _session_security_override(events: list[dict]) -> dict[str, object] | None:
     for event in reversed(events):
         if event.get("type") != "session_meta":
             continue
-        if event.get("event") != "security_override_updated":
+        if event.get("event") not in {"created", "security_override_updated"}:
             continue
         override = event.get("security_override")
         if isinstance(override, dict):
@@ -377,14 +469,10 @@ async def _clear_project_from_sessions(
     config: object | None = None,
 ) -> None:
     store = _get_session_store(app, config=config)
-    sessions_dir = Path(store._sessions_dir).expanduser()  # noqa: SLF001
-    if not sessions_dir.exists():
-        return
-
-    for path in await asyncio.to_thread(lambda: sorted(sessions_dir.glob("*.jsonl"))):
-        events = await store.load_session(path.stem)
+    for session_id in await store.list_session_ids():
+        events = await store.load_session(session_id)
         if _session_project_id(events) == project_id:
-            await _append_project_assignment_event(store, path.stem, None)
+            await _append_project_assignment_event(store, session_id, None)
 
 
 @router.post("/sessions")
@@ -399,6 +487,19 @@ async def create_session(
     store = _get_session_store(app, config=config)
     session_id = (request.session_id if request is not None else None) or str(uuid4())
     now = datetime.now(tz=UTC).isoformat()
+    security_override = (
+        _normalize_session_security_override(request.security_override.model_dump())
+        if request is not None and request.security_override is not None
+        else None
+    )
+    created_event: dict[str, object] = {
+        "type": "session_meta",
+        "event": "created",
+        "session_id": session_id,
+        "timestamp": now,
+    }
+    if security_override is not None:
+        created_event["security_override"] = security_override
 
     if request is not None and request.fork_from_session_id is not None:
         source_session_id = request.fork_from_session_id.strip()
@@ -426,26 +527,21 @@ async def create_session(
             if project is None:
                 raise HTTPException(status_code=404, detail="Project not found")
 
-        await store.save_event(
-            session_id,
-            {
-                "type": "session_meta",
-                "event": "created",
-                "session_id": session_id,
-                "timestamp": now,
-            },
-        )
+        await store.save_event(session_id, created_event)
         if effective_project_id is not None:
             await _append_project_assignment_event(store, session_id, effective_project_id)
 
         for event in _cloneable_session_events(source_events, until_turn_id=fork_until_turn_id):
             await store.save_event(session_id, event)
 
-        return {
+        response: dict[str, object] = {
             "type": "session",
             "session_id": session_id,
             "protected_workspace": _protected_workspace_projection(config, session_id),
         }
+        if security_override is not None:
+            response["security_override"] = security_override
+        return response
 
     if request is not None and request.project_id is not None:
         project_store = _get_project_store(app, config=config)
@@ -453,22 +549,17 @@ async def create_session(
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-    await store.save_event(
-        session_id,
-        {
-            "type": "session_meta",
-            "event": "created",
-            "session_id": session_id,
-            "timestamp": now,
-        },
-    )
+    await store.save_event(session_id, created_event)
     if request is not None and request.project_id is not None:
         await _append_project_assignment_event(store, session_id, request.project_id)
-    return {
+    response = {
         "type": "session",
         "session_id": session_id,
         "protected_workspace": _protected_workspace_projection(config, session_id),
     }
+    if security_override is not None:
+        response["security_override"] = security_override
+    return response
 
 
 @router.get("/sessions")
@@ -484,6 +575,143 @@ async def list_sessions(http_request: Request) -> dict[str, object]:
             config, session_id
         )
     return {"type": "sessions", "items": items}
+
+
+@router.get("/sessions/{session_id}/turns/{turn_id}/tool-workflow")
+async def get_tool_workflow_snapshot(
+    session_id: str,
+    turn_id: str,
+    http_request: Request,
+    storage_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Return the latest validated aggregate for one session turn."""
+
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    _check_tool_workflow_storage_scope(storage_id, store)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    outbox = await _get_tool_workflow_outbox(http_request.app, config, store)
+    records = await _load_tool_workflow_records(outbox, session_id, turn_id)
+    aggregate = records[-1] if records else None
+    return {
+        "type": "tool_workflow_aggregate_snapshot",
+        "schema_version": 1,
+        "storage_id": store.storage_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "aggregate": aggregate,
+        "publication_enabled": outbox.enabled,
+        "authoritative": outbox.enabled,
+    }
+
+
+@router.get("/sessions/{session_id}/turns/{turn_id}/tool-workflow/range")
+async def get_tool_workflow_range(
+    session_id: str,
+    turn_id: str,
+    http_request: Request,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
+    storage_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Return a bounded durable outbox range for one session turn."""
+
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    _check_tool_workflow_storage_scope(storage_id, store)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    outbox = await _get_tool_workflow_outbox(http_request.app, config, store)
+    records = await _load_tool_workflow_records(outbox, session_id, turn_id)
+    available = [record for record in records if int(record["seq"]) > after_seq]
+    selected = available[:limit]
+    expected = after_seq + 1
+    contiguous = not selected or int(selected[0]["seq"]) == expected
+    if contiguous:
+        for previous, current in zip(selected, selected[1:]):
+            if int(current["seq"]) != int(previous["seq"]) + 1:
+                contiguous = False
+                break
+    next_after_seq = int(selected[-1]["seq"]) if selected else after_seq
+    return {
+        "type": "tool_workflow_aggregate_range",
+        "schema_version": 1,
+        "storage_id": store.storage_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "after_seq": after_seq,
+        "limit": limit,
+        "events": selected,
+        "next_after_seq": next_after_seq,
+        "has_more": len(available) > len(selected),
+        "contiguous": contiguous,
+        "publication_enabled": outbox.enabled,
+        "authoritative": outbox.enabled,
+    }
+
+
+@router.get("/sessions/{session_id}/turns/{turn_id}/tool-workflow/stream")
+async def stream_tool_workflow_aggregates(
+    session_id: str,
+    turn_id: str,
+    http_request: Request,
+    after_seq: int = Query(default=0, ge=0),
+    storage_id: str | None = Query(default=None),
+) -> StreamingResponse:
+    """Replay durable aggregate events as named SSE records."""
+
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    _check_tool_workflow_storage_scope(storage_id, store)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    outbox = await _get_tool_workflow_outbox(http_request.app, config, store)
+    records = await _load_tool_workflow_records(outbox, session_id, turn_id)
+    last_event_id = http_request.headers.get("last-event-id")
+    if last_event_id:
+        matched = next(
+            (record for record in records if record.get("event_id") == last_event_id),
+            None,
+        )
+        if matched is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "tool_workflow_cursor_not_found",
+                    "requires_snapshot": True,
+                    "storage_id": store.storage_id,
+                },
+            )
+        after_seq = int(matched["seq"])
+    records = [record for record in records if int(record["seq"]) > after_seq]
+
+    async def events() -> Any:
+        for aggregate in records:
+            yield {
+                "_sse_event": "tool_workflow_aggregate",
+                "_sse_id": aggregate["event_id"],
+                "_sse_data": {
+                    "type": "tool_workflow_aggregate",
+                    "schema_version": 1,
+                    "storage_id": store.storage_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "aggregate": aggregate,
+                    "publication_enabled": outbox.enabled,
+                    "authoritative": outbox.enabled,
+                },
+            }
+
+    return StreamingResponse(
+        sse_stream(events()),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Mochi-Storage-ID": store.storage_id,
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/sessions/{session_id}")
@@ -760,6 +988,11 @@ async def append_session_events(
         raise HTTPException(status_code=404, detail="Session not found")
 
     for event in payload.events:
+        if event.get("event") in _RESERVED_AUTHORITATIVE_SESSION_EVENTS:
+            raise HTTPException(
+                status_code=403,
+                detail="Authoritative tool-workflow events may only be written by runtime services.",
+            )
         await store.save_event(session_id, dict(event))
 
     events = await store.load_session(session_id)

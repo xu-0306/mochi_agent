@@ -15,6 +15,7 @@ import {
   type SessionDetail,
   type SessionSummary,
 } from '@/lib/api'
+import { resolveMaterializedSecurityOverride } from '@/lib/session-materialization'
 
 const DEFAULT_SESSION_TITLE = 'New chat'
 
@@ -312,8 +313,19 @@ const sessionStore = create<SessionStore>((set, get) => ({
       return draft.id
     }
 
-    const created = await createSessionApi(undefined, draft.projectId)
+    const created = await createSessionApi(
+      undefined,
+      draft.projectId,
+      draft.securityOverride
+    )
     const detail = await fetchSession(created.id)
+    const materializedDetail: SessionDetail = {
+      ...detail,
+      security_override: resolveMaterializedSecurityOverride(
+        detail.security_override,
+        created.security_override
+      ),
+    }
 
     set((state) => ({
       sessions: state.sessions.map((session) =>
@@ -331,7 +343,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
                   goal: session.goal,
                   isDraft: false,
                 },
-                detail
+                materializedDetail
               ),
               id: created.id,
               lastMessage: session.lastMessage,
@@ -343,8 +355,8 @@ const sessionStore = create<SessionStore>((set, get) => ({
       currentSessionDetail:
         state.currentSessionId === draftId
           ? {
-              ...detail,
-              title: sessionTitleForMaterialized(detail.title, draft.title),
+              ...materializedDetail,
+              title: sessionTitleForMaterialized(materializedDetail.title, draft.title),
             }
           : state.currentSessionDetail,
       error: null,

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from mochi.config.schema import SecurityConfig
 from mochi.security import (
+    EffectivePolicyResolver,
     SecurityDecision,
     deny_security_decision,
     require_approval_decision,
@@ -23,6 +24,101 @@ def test_runtime_policy_defaults_follow_autonomy_mode() -> None:
     assert policy.autonomy_mode == "auto_review"
     assert policy.require_approval_for_file_write is False
     assert policy.require_approval_for_exec is False
+
+
+def test_session_auto_review_expands_over_global_strict_preset() -> None:
+    snapshot = EffectivePolicyResolver().resolve(
+        SecurityConfig(autonomy_mode="strict"),
+        session_overrides={"autonomy_mode": "auto_review"},
+    )
+
+    assert snapshot.autonomy_mode == "auto_review"
+    assert snapshot.require_approval_for_file_write is False
+    assert snapshot.require_approval_for_exec is False
+    assert snapshot.file_read_scope == "workspace"
+    assert snapshot.file_write_scope == "workspace"
+    assert snapshot.source_chain == ("security_config", "session_override")
+
+
+def test_legacy_runtime_resolver_also_expands_session_mode_preset() -> None:
+    policy = resolve_runtime_permission_policy(
+        SecurityConfig(autonomy_mode="strict"),
+        overrides={"autonomy_mode": "auto_review"},
+    )
+
+    assert policy.autonomy_mode == "auto_review"
+    assert policy.require_approval_for_file_write is False
+    assert policy.require_approval_for_exec is False
+
+
+def test_session_strict_expands_over_global_permissive_policy() -> None:
+    snapshot = EffectivePolicyResolver().resolve(
+        SecurityConfig(
+            autonomy_mode="high_autonomy",
+            file_read_scope="any",
+            file_write_scope="any",
+        ),
+        session_overrides={"autonomy_mode": "strict"},
+    )
+
+    assert snapshot.autonomy_mode == "strict"
+    assert snapshot.require_approval_for_file_write is True
+    assert snapshot.require_approval_for_exec is True
+    assert snapshot.file_read_scope == "workspace"
+    assert snapshot.file_write_scope == "workspace"
+
+
+def test_effective_policy_snapshot_is_deterministic() -> None:
+    resolver = EffectivePolicyResolver()
+    security = SecurityConfig(autonomy_mode="strict")
+
+    first = resolver.resolve(
+        security,
+        session_overrides={"autonomy_mode": "auto_review"},
+        hard_constraints={"hard_denies": ["network_write", "protected_path"]},
+    )
+    second = resolver.resolve(
+        security,
+        session_overrides={"autonomy_mode": "auto_review"},
+        hard_constraints={"hard_denies": ["protected_path", "network_write"]},
+    )
+
+    assert first == second
+    assert first.policy_snapshot_id == second.policy_snapshot_id
+    assert first.policy_version == second.policy_version
+    assert first.source_chain == (
+        "security_config",
+        "session_override",
+        "hard_constraint",
+    )
+
+
+def test_hard_constraints_cannot_be_relaxed_by_session_or_run_policy() -> None:
+    snapshot = EffectivePolicyResolver().resolve(
+        SecurityConfig(
+            autonomy_mode="high_autonomy",
+            file_read_scope="any",
+            file_write_scope="any",
+        ),
+        session_overrides={
+            "autonomy_mode": "high_autonomy",
+            "file_read_scope": "any",
+            "file_write_scope": "any",
+        },
+        run_restrictions={"autonomy_mode": "auto_review"},
+        hard_constraints={
+            "require_approval_for_exec": True,
+            "file_read_scope": "workspace",
+            "file_write_scope": "workspace",
+            "hard_denies": ["protected_path", "exec:shutdown"],
+        },
+    )
+
+    assert snapshot.require_approval_for_exec is True
+    assert snapshot.file_read_scope == "workspace"
+    assert snapshot.file_write_scope == "workspace"
+    assert snapshot.hard_denies == ("exec:shutdown", "protected_path")
+    assert snapshot.source_chain[-2:] == ("run_restriction", "hard_constraint")
 
 
 def test_runtime_policy_preserves_legacy_explicit_booleans() -> None:

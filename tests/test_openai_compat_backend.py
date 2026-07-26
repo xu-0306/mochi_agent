@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -442,7 +441,7 @@ async def test_simulated_fallback_thinking_only_marks_backend_unavailable() -> N
     mock_resp = _mock_response(response_data)
 
     try:
-        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp):  # noqa: SIM117
             with pytest.raises(BackendRequestError, match="invalid tool-eligible turn") as exc_info:
                 await backend.generate(
                     messages=[Message(role="user", content="hi")],
@@ -521,7 +520,8 @@ async def test_simulated_fallback_post_tool_thinking_only_stays_recoverable() ->
     assert metadata["fallback_validation_status"] == "not_attempted"
 
 
-def test_blocked_simulated_retry_overwrites_stale_supported_probe_status() -> None:
+@pytest.mark.asyncio
+async def test_blocked_simulated_retry_overwrites_stale_supported_probe_status() -> None:
     backend = OpenAICompatBackend(
         base_url="https://api.example.com/v1",
         model="gpt-5.4",
@@ -537,7 +537,7 @@ def test_blocked_simulated_retry_overwrites_stale_supported_probe_status() -> No
         backend._record_tool_calling_blocked_from_retry(exc)  # noqa: SLF001
         metadata = backend.get_model_info().metadata
     finally:
-        asyncio.run(backend.close())
+        await backend.close()
 
     assert metadata["tool_call_mode"] == "unavailable"
     assert metadata["tool_calling_blocked"] is True
@@ -1031,9 +1031,8 @@ async def test_http_status_errors_are_wrapped_with_backend_metadata() -> None:
             "post",
             new_callable=AsyncMock,
             side_effect=httpx.HTTPStatusError("bad request", request=request, response=response),
-        ):
-            with pytest.raises(BackendRequestError) as exc_info:
-                await backend.generate(messages=[Message(role="user", content="hi")], stream=False)
+        ), pytest.raises(BackendRequestError) as exc_info:
+            await backend.generate(messages=[Message(role="user", content="hi")], stream=False)
     finally:
         await backend.close()
 

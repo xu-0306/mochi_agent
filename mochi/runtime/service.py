@@ -11,8 +11,9 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
-from hashlib import sha1
+from hashlib import sha1, sha256
 from pathlib import Path
+from time import monotonic
 from typing import Any, Awaitable, Callable, Mapping, cast
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -24,6 +25,10 @@ from mochi.agents.multi_agent.execution_policy import (
     parse_subagent_execution_policy,
 )
 from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunRequest
+from mochi.api.tool_workflow_outbox import (
+    ToolWorkflowOutboxRepository,
+    ToolWorkflowOutboxVerifierDiagnostics,
+)
 from mochi.api.routes.chat import _serialize_event
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config.manager import load_config_snapshot, save_config
@@ -45,6 +50,7 @@ from mochi.runtime.agent_run_packages import (
 from mochi.runtime.approval_side_effect_worker import ApprovalSideEffectWorker
 from mochi.runtime.approval_side_effects import public_side_effect_projection
 from mochi.runtime.approval_state_machine import derive_approval_binding
+from mochi.runtime.approval_state_machine import ApprovalExpired
 from mochi.runtime.approvals import (
     APPROVAL_OWNER_TASK_ID_KEY,
     ApprovalConflict,
@@ -106,22 +112,40 @@ from mochi.runtime.store import RuntimeStore
 from mochi.security import SecurityDecision
 from mochi.security.file_contract import AppliedChangeRecord
 from mochi.security.policy import (
+    EffectivePolicyResolver,
     build_runtime_permission_policy_dict,
+    effective_policy_snapshot_from_mapping,
     resolve_runtime_permission_policy,
 )
+from mochi.runtime.ordinary_chat_session_gate import (
+    OrdinaryChatSessionGate,
+    OrdinaryChatSessionGateError,
+)
 from mochi.security.rollout import project_protected_workspace_rollout
+from mochi.sessions.store import (
+    SessionStore,
+    ToolWorkflowPublicationGate,
+    ensure_sessions_dir_unchanged,
+)
 from mochi.tools.base import ToolExecutionContext, ToolResult
-from mochi.tools.exec_command import get_shared_exec_approval_store, get_shared_exec_runtime
+from mochi.tools.exec_command import (
+    ExecCommandTool,
+    get_shared_exec_approval_store,
+    get_shared_exec_runtime,
+)
 from mochi.tools.file_mutations import PatchValidationError, summarize_file_change_payload
 from mochi.tools.file_ops import (
     ApplyPatchTool,
     FileChangeContractConflict,
     FileEditTool,
     FileWriteTool,
+    file_mutation_arguments_digest,
+    file_mutation_tool_inventory_version,
     prepare_patch_change_contract,
     revalidate_patch_change_contract,
 )
 from mochi.tools.file_transaction import observe_undo_target
+from mochi.utils.command_security import CommandSecurityPolicy
 
 _security_audit_logger = logging.getLogger(__name__)
 
@@ -512,6 +536,9 @@ class RuntimeService:
 
     _DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS = 30.0
     _DEFAULT_GOAL_LEASE_TTL_SECONDS = 120.0
+    _ORDINARY_CHAT_RECOVERY_BATCH_LIMIT = 16
+    _ORDINARY_CHAT_RECOVERY_RETRY_BACKOFF_SECONDS = 5.0
+    _TOOL_WORKFLOW_OUTBOX_AUDIT_PAGE_SIZE = 16
 
     def __init__(
         self,
@@ -522,6 +549,7 @@ class RuntimeService:
         exec_runtime: ExecRuntime | None = None,
         active_goal_turn_selector: ActiveGoalTurnSelector | None = None,
         file_transaction_recovery: Callable[[], Awaitable[object]] | None = None,
+        ordinary_chat_session_store: SessionStore | None = None,
     ) -> None:
         self._engine = engine
         self._store = store
@@ -529,6 +557,25 @@ class RuntimeService:
         self._exec_runtime = exec_runtime or get_shared_exec_runtime()
         self._active_goal_turn_selector = active_goal_turn_selector
         self._file_transaction_recovery = file_transaction_recovery
+        self._ordinary_chat_session_store = ordinary_chat_session_store
+        self._tool_workflow_outbox: ToolWorkflowOutboxRepository | None = None
+        self._tool_workflow_observability_enabled: bool | None = None
+        engine_gate = getattr(engine, "tool_workflow_publication_gate", None)
+        self._owns_tool_workflow_publication_gate = not isinstance(
+            engine_gate,
+            ToolWorkflowPublicationGate,
+        )
+        self._tool_workflow_publication_gate = (
+            engine_gate
+            if isinstance(engine_gate, ToolWorkflowPublicationGate)
+            else ToolWorkflowPublicationGate()
+        )
+        engine_diagnostics = getattr(engine, "_tool_workflow_verifier_diagnostics", None)
+        self._tool_workflow_verifier_diagnostics = (
+            engine_diagnostics
+            if isinstance(engine_diagnostics, ToolWorkflowOutboxVerifierDiagnostics)
+            else ToolWorkflowOutboxVerifierDiagnostics()
+        )
         self._runtime_tasks_root = Path("sessions") / "runtime-tasks"
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._active_agent_run_jobs: dict[str, asyncio.Task[None]] = {}
@@ -542,6 +589,10 @@ class RuntimeService:
         self._scheduler_task: asyncio.Task[None] | None = None
         self._side_effect_stop_event = asyncio.Event()
         self._side_effect_task: asyncio.Task[None] | None = None
+        self._ordinary_chat_recovery_task: asyncio.Task[None] | None = None
+        self._tool_workflow_outbox_audit_task: asyncio.Task[None] | None = None
+        self._tool_workflow_outbox_audit_binding: tuple[int, bool] | None = None
+        self._ordinary_chat_recovery_backoff: dict[str, float] = {}
         approval_db_path = getattr(self._exec_approval_store, "database_path", None)
         side_effect_paths = [self._store.database_path]
         if isinstance(approval_db_path, Path):
@@ -556,6 +607,11 @@ class RuntimeService:
     def set_runtime_tasks_root(self, root_dir: Path) -> None:
         self._runtime_tasks_root = Path(root_dir)
 
+    def tool_workflow_outbox_verifier_counters_snapshot(self) -> dict[str, int]:
+        """Return a process-local copy of read-only outbox verifier counters."""
+
+        return self._tool_workflow_verifier_diagnostics.snapshot()
+
     def update_security_config(self, security: SecurityConfig) -> None:
         self._security_config = security
 
@@ -568,10 +624,66 @@ class RuntimeService:
         config: MochiConfig,
         config_path: str | Path | None,
     ) -> None:
+        previous_config = self._bound_config
+        if previous_config is not None:
+            ensure_sessions_dir_unchanged(
+                previous_config.sessions_dir,
+                config.sessions_dir,
+            )
+        observability_enabled = bool(
+            getattr(getattr(config, "agent", None), "tool_observability_v1", False)
+        )
+        engine_store = getattr(self._engine, "_session_store", None)
+        injected_store = self._ordinary_chat_session_store
+        if isinstance(injected_store, SessionStore):
+            ensure_sessions_dir_unchanged(config.sessions_dir, injected_store.sessions_dir)
+            session_store = injected_store
+        elif isinstance(engine_store, SessionStore):
+            ensure_sessions_dir_unchanged(config.sessions_dir, engine_store.sessions_dir)
+            session_store = engine_store
+        else:
+            session_store = SessionStore(
+                config.sessions_dir,
+                tool_observability_v1=observability_enabled,
+                tool_workflow_publication_gate=self._tool_workflow_publication_gate,
+            )
         self._bound_config = config
         self._bound_config_path = config_path
         self.update_security_config(config.security)
         self.update_sandbox_config(config.sandbox)
+        if self._owns_tool_workflow_publication_gate:
+            # A RuntimeService with no AgentEngine-owned gate still needs the
+            # live policy to track config changes.  Set it before attaching an
+            # injected store so every later strict mutation shares the same
+            # rollback barrier.
+            self._tool_workflow_publication_gate.set_enabled(observability_enabled)
+        session_store.bind_tool_workflow_publication_gate(
+            self._tool_workflow_publication_gate,
+        )
+        prior_outbox = self._tool_workflow_outbox
+        binding_changed = (
+            prior_outbox is None
+            or getattr(prior_outbox, "_session_store", None) is not session_store
+            or self._tool_workflow_observability_enabled != observability_enabled
+        )
+        if binding_changed:
+            prior_audit = getattr(self, "_tool_workflow_outbox_audit_task", None)
+            if prior_audit is not None and not prior_audit.done():
+                prior_audit.cancel()
+            self._tool_workflow_outbox_audit_task = None
+            self._tool_workflow_outbox_audit_binding = None
+            self._tool_workflow_outbox = ToolWorkflowOutboxRepository(
+                session_store,
+                enabled=observability_enabled,
+                publication_gate=self._tool_workflow_publication_gate,
+            )
+            self._tool_workflow_observability_enabled = observability_enabled
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._ensure_tool_workflow_outbox_audit_task()
 
     def protected_workspace_session_projection(
         self,
@@ -616,6 +728,7 @@ class RuntimeService:
     async def start(self) -> None:
         active = self._scheduler_task
         if active is not None and not active.done():
+            self._ensure_tool_workflow_outbox_audit_task()
             return
         if self._file_transaction_recovery is not None:
             await self._file_transaction_recovery()
@@ -623,6 +736,7 @@ class RuntimeService:
         if callable(recover_detached):
             await recover_detached()
         await self._recover_stale_approval_consumptions()
+        await self.reconcile_tool_workflow_approval_observations()
         await self._recover_goals_on_startup()
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task = asyncio.create_task(
@@ -634,6 +748,30 @@ class RuntimeService:
             self._approval_side_effect_loop(),
             name="runtime-approval-side-effect-worker",
         )
+        self._ordinary_chat_recovery_task = asyncio.create_task(
+            self._run_ordinary_chat_approval_recovery_once(),
+            name="runtime-ordinary-chat-approval-recovery",
+        )
+        self._ensure_tool_workflow_outbox_audit_task()
+
+    def _ensure_tool_workflow_outbox_audit_task(self) -> None:
+        """Start one restart audit whenever a live binding enables publication."""
+
+        outbox = self._tool_workflow_outbox
+        current = getattr(self, "_tool_workflow_outbox_audit_task", None)
+        if outbox is None or not outbox.enabled:
+            return
+        binding = (id(getattr(outbox, "_session_store", None)), True)
+        if (
+            current is not None
+            and self._tool_workflow_outbox_audit_binding == binding
+        ):
+            return
+        self._tool_workflow_outbox_audit_task = asyncio.create_task(
+            self._audit_tool_workflow_outbox_sessions(),
+            name="runtime-tool-workflow-outbox-audit",
+        )
+        self._tool_workflow_outbox_audit_binding = binding
 
     async def _recover_stale_approval_consumptions(self) -> None:
         await self._store.recover_stale_approval_consumptions()
@@ -643,7 +781,451 @@ class RuntimeService:
             None,
         )
         if callable(recover_exec_approvals):
-            await asyncio.to_thread(recover_exec_approvals)
+            # PersistentApprovalStore atomically records recovery_required in
+            # the same transition that turns an expired consuming lease into
+            # consumed.  Do not add a second write here: it would recreate the
+            # crash window this recovery path is meant to close.
+            recovered = await asyncio.to_thread(recover_exec_approvals)
+            for approval in recovered:
+                await self._observe_ordinary_chat_approval(approval)
+                if (
+                    _is_ordinary_chat_approval(approval)
+                    and _ordinary_chat_timeline_binding_is_present(approval)
+                    and getattr(approval, "status", None) == "execution_failed"
+                ):
+                    # The consume lease crossed process ownership without a
+                    # trustworthy result. Re-establish the boundary if needed
+                    # and quarantine it rather than replaying its mutation.
+                    await self._record_stale_ordinary_chat_operation_unknown(
+                        approval_id=approval.approval_id,
+                        approval=approval,
+                    )
+
+    async def reconcile_tool_workflow_approval_observations(self) -> list[dict[str, Any]]:
+        """Repair ordinary-Chat observation/outbox gaps without tool execution.
+
+        Task-runtime linked approvals deliberately remain outside the ordinary
+        Chat aggregate stream.  Their RuntimeStore lifecycle is not a reducer
+        source and is therefore reported as excluded rather than projected.
+        """
+
+        outbox = self._tool_workflow_outbox
+        if outbox is None or not outbox.enabled:
+            return []
+        approvals = await asyncio.to_thread(self._exec_approval_store.list)
+        outcomes: list[dict[str, Any]] = []
+        reconciled_sessions: set[str] = set()
+        for approval in approvals:
+            if not _is_ordinary_chat_approval(approval):
+                continue
+            outcome = await self._observe_ordinary_chat_approval(approval)
+            if outcome is not None:
+                outcomes.append(outcome)
+                session_id = outcome.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    reconciled_sessions.add(session_id)
+        # Checkpoint enumeration catches an approval transition committed to
+        # SQLite before the first observation was written.  This path performs
+        # only SessionStore writes and never calls the mutation executor.
+        for session_id in sorted(reconciled_sessions):
+            try:
+                repaired = await outbox.reconcile_checkpoint_approvals(
+                    session_id,
+                    self._exec_approval_store,
+                )
+            except Exception as exc:
+                _security_audit_logger.warning(
+                    "tool-workflow approval observation reconciliation failed for %s: %s",
+                    session_id,
+                    type(exc).__name__,
+                )
+                continue
+            outcomes.extend(
+                {
+                    "approval_id": item.approval_id,
+                    "session_id": item.session_id,
+                    "turn_id": item.turn_id,
+                    "status": item.status,
+                    "message": item.message,
+                }
+                for item in repaired
+            )
+        return outcomes
+
+    async def _audit_tool_workflow_outbox_sessions(self) -> None:
+        """Audit every session in small pages without delaying runtime startup."""
+
+        outbox = self._tool_workflow_outbox
+        if outbox is None or not outbox.enabled:
+            return
+        session_store = getattr(outbox, "_session_store", None)
+        if not isinstance(session_store, SessionStore):
+            return
+        after: str | None = None
+        seen_session_ids: set[str] = set()
+        while outbox.enabled:
+            try:
+                page = await session_store.list_session_ids_page(
+                    limit=self._TOOL_WORKFLOW_OUTBOX_AUDIT_PAGE_SIZE,
+                    after=after,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _security_audit_logger.warning(
+                    "tool-workflow outbox session inventory failed: %s",
+                    type(exc).__name__,
+                )
+                return
+            for session_id in page.session_ids:
+                if session_id not in seen_session_ids:
+                    seen_session_ids.add(session_id)
+                    await self._verify_tool_workflow_outbox_session(session_id)
+            if page.next_cursor is None:
+                return
+            after = page.next_cursor
+            # A large legacy directory is scanned progressively: each page is
+            # bounded and yields before taking the next inventory snapshot.
+            await asyncio.sleep(0)
+
+    async def _observe_ordinary_chat_approval(self, approval: Any) -> dict[str, Any] | None:
+        """Best-effort cross-store handoff after an approval DB transition.
+
+        A failure here never replays a tool.  Startup reconciliation retries
+        the idempotent observation/outbox write from the committed DB row.
+        """
+
+        outbox = self._tool_workflow_outbox
+        if outbox is None or not outbox.enabled or not _is_ordinary_chat_approval(approval):
+            return None
+        try:
+            result = await outbox.observe_approval(approval)
+        except Exception as exc:
+            _security_audit_logger.warning(
+                "tool-workflow approval observation handoff failed for %s: %s",
+                getattr(approval, "approval_id", ""),
+                type(exc).__name__,
+            )
+            return {
+                "approval_id": getattr(approval, "approval_id", ""),
+                "status": "repair_required",
+                "message": type(exc).__name__,
+            }
+        outcome = {
+            "approval_id": result.approval_id,
+            "session_id": result.session_id,
+            "turn_id": result.turn_id,
+            "status": result.status,
+            "message": result.message,
+        }
+        return outcome
+
+    async def _verify_tool_workflow_outbox_session(self, session_id: str) -> None:
+        """Accumulate diagnostics without affecting publication or execution."""
+
+        outbox = self._tool_workflow_outbox
+        if outbox is None:
+            return
+        try:
+            verification = await outbox.verify_session(session_id)
+        except Exception as exc:
+            _security_audit_logger.warning(
+                "tool-workflow outbox verifier failed for %s: %s",
+                session_id,
+                type(exc).__name__,
+            )
+            return
+        self._tool_workflow_verifier_diagnostics.record(verification)
+
+    async def reconcile_recovered_ordinary_chat_approval(
+        self,
+        *,
+        approval_id: str,
+    ) -> dict[str, Any]:
+        """Continue only with policy derived from the durable Chat session."""
+        is_ordinary_chat, session_id = await self._ordinary_chat_approval_owner_async(
+            approval_id
+        )
+        if not is_ordinary_chat:
+            return {"status": "not_available", "reason": "ordinary_chat_approval_missing"}
+        policy = await self._ordinary_chat_recovery_policy(session_id)
+        return await self._reconcile_recovered_ordinary_chat_approval_with_policy(
+            approval_id=approval_id,
+            current_permission_policy=policy,
+            enforce_checkpoint_preflight=True,
+        )
+
+    async def _reconcile_recovered_ordinary_chat_approval_with_policy(
+        self,
+        *,
+        approval_id: str,
+        current_permission_policy: Mapping[str, Any],
+        enforce_checkpoint_preflight: bool,
+    ) -> dict[str, Any]:
+        """Private continuation primitive for already-verified server policy."""
+        approval = await asyncio.to_thread(self._exec_approval_store.get, approval_id)
+        if approval is None or not _is_ordinary_chat_approval(approval):
+            return {"status": "not_available", "reason": "ordinary_chat_approval_missing"}
+        result = approval.execution_result
+        if approval.status != "consumed" or not isinstance(result, Mapping):
+            return {"status": "not_available", "reason": "applied_execution_evidence_missing"}
+        if result.get("recovery_required") != "ordinary_chat_continuation":
+            return {"status": "not_available", "reason": "reconciliation_not_required"}
+        if enforce_checkpoint_preflight:
+            checkpoint_error = self._preflight_ordinary_chat_approval(
+                approval,
+                current_permission_policy=current_permission_policy,
+            )
+            if checkpoint_error is not None:
+                reason = str(checkpoint_error.get("error_code") or "checkpoint_invalid")
+                await self._terminalize_ordinary_chat_recovery(
+                    approval_id=approval_id,
+                    reason=reason,
+                )
+                return {"status": "not_available", "reason": reason}
+        claim_continuation = getattr(
+            self._exec_approval_store,
+            "claim_continuation_reconciliation",
+            None,
+        )
+        complete_continuation = getattr(
+            self._exec_approval_store,
+            "complete_continuation_reconciliation",
+            None,
+        )
+        fail_continuation = getattr(
+            self._exec_approval_store,
+            "fail_continuation_reconciliation",
+            None,
+        )
+        if not all(callable(item) for item in (claim_continuation, complete_continuation, fail_continuation)):
+            return {"status": "not_available", "reason": "durable_reconciliation_lease_unavailable"}
+        try:
+            claim = await asyncio.to_thread(
+                claim_continuation,
+                approval_id,
+                lease_owner=f"runtime-service:{id(self)}",
+            )
+        except ApprovalConflict as exc:
+            return {"status": "not_available", "reason": "reconciliation_claim_rejected", "error": str(exc)}
+        try:
+            resumed = await self._resume_ordinary_chat_approval_react_loop(
+                approval_id=approval_id,
+                approval=approval,
+                execution_result=result,
+                current_permission_policy=current_permission_policy,
+            )
+            if resumed.get("status") != "continued":
+                try:
+                    await asyncio.to_thread(
+                        fail_continuation,
+                        approval_id,
+                        lease_token=claim.lease_token,
+                        reason=str(
+                            resumed.get("reason") or "continuation_unknown_outcome"
+                        ),
+                    )
+                except Exception:
+                    # A failed terminal write leaves the continuation outcome
+                    # uncertain. Never expose it as a retryable failure.
+                    pass
+                return {"status": "not_available", "reason": "continuation_unknown_outcome"}
+        except asyncio.CancelledError:
+            try:
+                await asyncio.to_thread(
+                    fail_continuation,
+                    approval_id,
+                    lease_token=claim.lease_token,
+                    reason="continuation_cancelled",
+                )
+            except Exception:
+                # Cancellation must keep propagating even when its durable
+                # terminal write loses a race or the store is unavailable.
+                pass
+            raise
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(
+                    fail_continuation,
+                    approval_id,
+                    lease_token=claim.lease_token,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+            return {"status": "not_available", "reason": "continuation_unknown_outcome"}
+        persisted = dict(result)
+        persisted.pop("recovery_required", None)
+        persisted["react_continuation"] = resumed
+        try:
+            completed_approval = await asyncio.to_thread(
+                complete_continuation,
+                approval_id,
+                lease_token=claim.lease_token,
+                execution_result=persisted,
+            )
+        except ApprovalConflict:
+            return {"status": "not_available", "reason": "continuation_unknown_outcome"}
+        await self._observe_ordinary_chat_approval(completed_approval)
+        return resumed
+
+    async def _run_ordinary_chat_approval_recovery_once(self) -> None:
+        """Dispatch a bounded recovery batch without ever replaying mutations."""
+        try:
+            await self.dispatch_ordinary_chat_approval_recovery_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Scheduler passes are best-effort.  Candidate-specific failures
+            # are terminalized below; infrastructure failures retry later.
+            return
+
+    async def dispatch_ordinary_chat_approval_recovery_once(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Continue applied ordinary-Chat results exactly once per durable lease.
+
+        The store only yields consumed rows with trustworthy applied evidence.
+        This method does not call the approved tool or its mutation executor;
+        it only supplies a server-derived policy to the existing continuation
+        path after strict session validation.
+        """
+        enumerate_candidates = getattr(
+            self._exec_approval_store,
+            "list_continuation_reconciliation_candidates",
+            None,
+        )
+        if not callable(enumerate_candidates):
+            return []
+        batch_limit = self._ORDINARY_CHAT_RECOVERY_BATCH_LIMIT if limit is None else limit
+        if not isinstance(batch_limit, int) or batch_limit <= 0:
+            raise ValueError("limit must be a positive integer.")
+        candidates = await asyncio.to_thread(
+            enumerate_candidates,
+            limit=batch_limit,
+        )
+        outcomes: list[dict[str, Any]] = []
+        for candidate in candidates:
+            approval = getattr(candidate, "approval", None)
+            approval_id = str(getattr(approval, "approval_id", "") or "")
+            if not approval_id:
+                continue
+            now = monotonic()
+            retry_after = self._ordinary_chat_recovery_backoff.get(approval_id)
+            if retry_after is not None and retry_after > now:
+                continue
+            try:
+                outcome = await self._dispatch_one_ordinary_chat_approval_recovery(
+                    approval_id=approval_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                outcome = {
+                    "status": "not_available",
+                    "reason": "dispatcher_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            outcomes.append({"approval_id": approval_id, **outcome})
+            if outcome.get("status") == "continued":
+                self._ordinary_chat_recovery_backoff.pop(approval_id, None)
+            elif outcome.get("reason") in {
+                "reconciliation_claim_rejected",
+                "dispatcher_error",
+            }:
+                self._ordinary_chat_recovery_backoff[approval_id] = (
+                    monotonic() + self._ORDINARY_CHAT_RECOVERY_RETRY_BACKOFF_SECONDS
+                )
+            else:
+                # Terminal outcomes are normally absent from the next durable
+                # enumeration.  Retain a short local guard if a store adapter
+                # returns a stale view.
+                self._ordinary_chat_recovery_backoff[approval_id] = (
+                    monotonic() + self._ORDINARY_CHAT_RECOVERY_RETRY_BACKOFF_SECONDS
+                )
+        return outcomes
+
+    async def _dispatch_one_ordinary_chat_approval_recovery(
+        self,
+        *,
+        approval_id: str,
+    ) -> dict[str, Any]:
+        try:
+            return await self.reconcile_recovered_ordinary_chat_approval(
+                approval_id=approval_id,
+            )
+        except OrdinaryChatSessionGateError as exc:
+            await self._terminalize_ordinary_chat_recovery(
+                approval_id=approval_id,
+                reason=f"session_{exc.reason}",
+            )
+            return {"status": "not_available", "reason": f"session_{exc.reason}"}
+
+    async def _ordinary_chat_recovery_policy(self, session_id: str | None) -> dict[str, Any]:
+        config = self._bound_config
+        if config is None:
+            raise OrdinaryChatSessionGateError("runtime_configuration_unavailable")
+        gate = OrdinaryChatSessionGate(
+            session_store=(
+                self._ordinary_chat_session_store
+                or SessionStore(config.sessions_dir)
+            ),
+            security=self._security_config,
+        )
+        return await gate.effective_policy(session_id)
+
+    async def _terminalize_ordinary_chat_recovery(
+        self,
+        *,
+        approval_id: str,
+        reason: str,
+    ) -> None:
+        claim_continuation = getattr(
+            self._exec_approval_store,
+            "claim_continuation_reconciliation",
+            None,
+        )
+        fail_continuation = getattr(
+            self._exec_approval_store,
+            "fail_continuation_reconciliation",
+            None,
+        )
+        if not callable(claim_continuation) or not callable(fail_continuation):
+            return
+        try:
+            claim = await asyncio.to_thread(
+                claim_continuation,
+                approval_id,
+                lease_owner=f"runtime-service:{id(self)}",
+            )
+        except ApprovalConflict:
+            return
+        try:
+            await asyncio.to_thread(
+                fail_continuation,
+                approval_id,
+                lease_token=claim.lease_token,
+                reason=reason,
+            )
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        fail_continuation,
+                        approval_id,
+                        lease_token=claim.lease_token,
+                        reason="continuation_cancelled",
+                    )
+                )
+            except Exception:
+                pass
+            raise
+        except Exception:
+            # A lost terminal CAS is intentionally not retryable.  The stale
+            # reconciliation lease will transition to unknown in the store.
+            return
 
     async def _approval_side_effect_loop(self) -> None:
         while not self._side_effect_stop_event.is_set():
@@ -712,6 +1294,25 @@ class RuntimeService:
 
         self._scheduler_stop_event.set()
         self._side_effect_stop_event.set()
+        audit_task = self._tool_workflow_outbox_audit_task
+        if audit_task is not None and not audit_task.done():
+            audit_task.cancel()
+            if _awaitable_in_current_loop(audit_task):
+                try:
+                    await audit_task
+                except asyncio.CancelledError:
+                    pass
+        self._tool_workflow_outbox_audit_task = None
+        self._tool_workflow_outbox_audit_binding = None
+        recovery_task = self._ordinary_chat_recovery_task
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+            if _awaitable_in_current_loop(recovery_task):
+                try:
+                    await recovery_task
+                except asyncio.CancelledError:
+                    pass
+        self._ordinary_chat_recovery_task = None
         scheduler_task = self._scheduler_task
         if scheduler_task is not None and not scheduler_task.done():
             scheduler_task.cancel()
@@ -5461,6 +6062,7 @@ class RuntimeService:
         while True:
             try:
                 await self._recover_stale_approval_consumptions()
+                await self.dispatch_ordinary_chat_approval_recovery_once()
                 await self._process_goal_supervision()
                 await self._process_due_agent_runs()
                 await asyncio.wait_for(
@@ -7038,6 +7640,7 @@ class RuntimeService:
         rule: dict[str, Any] | None = None,
         replay_override: dict[str, Any] | None = None,
         auto_resume_linked_run: bool = True,
+        current_permission_policy: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         current = await self._store.get_approval_request(approval_id)
         if current is None:
@@ -7075,6 +7678,33 @@ class RuntimeService:
                 raise ValueError(
                     'replay_override is only supported for task file-mutation approvals.'
                 )
+            if decision != "reject" and _is_ordinary_chat_approval(existing_exec):
+                checkpoint_error = self._preflight_ordinary_chat_approval(
+                    existing_exec,
+                    current_permission_policy=current_permission_policy,
+                )
+                if checkpoint_error is not None:
+                    superseded = self._exec_approval_store.supersede(
+                        approval_id,
+                        reason=checkpoint_error["error"],
+                    )
+                    await self._observe_ordinary_chat_approval(superseded)
+                    await self._abandon_ordinary_chat_timeline_operation(
+                        approval_id=approval_id,
+                        approval=existing_exec,
+                        reason=checkpoint_error["error_code"],
+                    )
+                    await self._record_approval_resolution_audit(
+                        approval_id=approval_id,
+                        approval=superseded,
+                        decision="reject",
+                        reason=checkpoint_error["error"],
+                        rule_side_effect=None,
+                    )
+                    summary = _exec_approval_summary(superseded)
+                    summary["checkpoint_status"] = "drift"
+                    summary["checkpoint_error_code"] = checkpoint_error["error_code"]
+                    return summary
             effective_decision, saved_rule = (
                 await self._resolve_approval_decision_and_saved_rule(
                     decision=decision,
@@ -7082,20 +7712,32 @@ class RuntimeService:
                     suggested_rules=[existing_exec.metadata.get('suggested_rule')],
                 )
             )
-            resolved_exec = self._exec_approval_store.resolve(
-                approval_id,
-                decision=effective_decision,
-                reason=reason,
-                **_exec_approval_binding_kwargs(existing_exec),
-                metadata={'saved_rule': saved_rule} if isinstance(saved_rule, dict) else None,
-                rule_side_effect=(
-                    self._approval_rule_side_effect(saved_rule)
-                    if effective_decision == 'approve_and_save_rule'
-                    else None
-                ),
-            )
+            try:
+                resolved_exec = self._exec_approval_store.resolve(
+                    approval_id,
+                    decision=effective_decision,
+                    reason=reason,
+                    **_exec_approval_binding_kwargs(existing_exec),
+                    metadata={'saved_rule': saved_rule} if isinstance(saved_rule, dict) else None,
+                    rule_side_effect=(
+                        self._approval_rule_side_effect(saved_rule)
+                        if effective_decision == 'approve_and_save_rule'
+                        else None
+                    ),
+                )
+            except ApprovalExpired:
+                await self._observe_ordinary_chat_approval(
+                    self._exec_approval_store.get(approval_id)
+                )
+                await self._abandon_ordinary_chat_timeline_operation(
+                    approval_id=approval_id,
+                    approval=existing_exec,
+                    reason="approval_expired",
+                )
+                raise
             if resolved_exec is None:
                 return None
+            await self._observe_ordinary_chat_approval(resolved_exec)
             await self._record_approval_resolution_audit(
                 approval_id=approval_id,
                 approval=resolved_exec,
@@ -7107,24 +7749,161 @@ class RuntimeService:
                 ),
             )
             execution_result: dict[str, Any] | None = None
+            execution_disposition: str | None = None
+            if effective_decision == 'reject':
+                await self._abandon_ordinary_chat_timeline_operation(
+                    approval_id=approval_id,
+                    approval=existing_exec,
+                    reason=reason or "approval_rejected",
+                )
             if effective_decision != 'reject':
                 lease_owner = f'runtime-service:{id(self)}'
-                claim = self._exec_approval_store.consume(
-                    approval_id,
-                    execution_idempotency_key=f'approval-execution:{approval_id}',
-                    lease_owner=lease_owner,
-                    **_exec_approval_binding_kwargs(existing_exec),
+                operation_id = existing_exec.metadata.get('operation_id')
+                if _is_ordinary_chat_approval(existing_exec) and (
+                    not isinstance(operation_id, str) or not operation_id
+                ):
+                    raise ApprovalConflict('Approved call is missing its operation idempotency binding.')
+                execution_idempotency_key = (
+                    f'approval-execution:{approval_id}:{operation_id}'
+                    if isinstance(operation_id, str) and operation_id
+                    else f'approval-execution:{approval_id}'
                 )
-                execution_result = await self._execute_approved_exec_request(claim)
-                succeeded = is_successful_exec_approval_result(execution_result)
+                try:
+                    claim = self._exec_approval_store.consume(
+                        approval_id,
+                        execution_idempotency_key=execution_idempotency_key,
+                        lease_owner=lease_owner,
+                        **_exec_approval_binding_kwargs(existing_exec),
+                    )
+                except ApprovalExpired:
+                    await self._observe_ordinary_chat_approval(
+                        self._exec_approval_store.get(approval_id)
+                    )
+                    await self._abandon_ordinary_chat_timeline_operation(
+                        approval_id=approval_id,
+                        approval=existing_exec,
+                        reason="approval_expired",
+                    )
+                    raise
+                await self._observe_ordinary_chat_approval(claim)
+                timeline_bound = _ordinary_chat_timeline_binding_is_present(existing_exec)
+                if timeline_bound:
+                    try:
+                        await self._begin_ordinary_chat_timeline_operation(
+                            approval_id=approval_id,
+                            approval=claim,
+                        )
+                    except Exception:
+                        # No tool has been dispatched on this path. Complete
+                        # the lease as a no-effect failure, then make the
+                        # original Chat turn eligible for a fresh plan.
+                        pre_effect_failure = {
+                            "status": "execution_failed",
+                            "error": "ordinary_chat_timeline_start_failed",
+                            "error_code": "timeline_start_failed",
+                        }
+                        recorded = self._exec_approval_store.record_execution_result(
+                            approval_id,
+                            execution_result=pre_effect_failure,
+                        )
+                        await self._observe_ordinary_chat_approval(recorded)
+                        completed = self._exec_approval_store.complete_consumption(
+                            approval_id,
+                            execution_idempotency_key=execution_idempotency_key,
+                            lease_owner=lease_owner,
+                            lease_token=claim.consume_lease_token or '',
+                            execution_result=pre_effect_failure,
+                            succeeded=False,
+                        )
+                        await self._observe_ordinary_chat_approval(completed)
+                        await self._abandon_ordinary_chat_timeline_operation(
+                            approval_id=approval_id,
+                            approval=claim,
+                            reason="timeline_start_failed",
+                        )
+                        raise
+                try:
+                    execution_result = await self._execute_approved_standalone_request(
+                        claim,
+                        current_permission_policy=current_permission_policy,
+                    )
+                except asyncio.CancelledError:
+                    if timeline_bound:
+                        await asyncio.shield(
+                            self._record_ordinary_chat_timeline_operation_result(
+                                approval_id=approval_id,
+                                approval=claim,
+                                execution_result={
+                                    "status": "unknown",
+                                    "reason": "approval_execution_cancelled",
+                                },
+                                status="unknown",
+                            )
+                        )
+                    raise
+                except Exception as exc:
+                    if timeline_bound:
+                        await self._record_ordinary_chat_timeline_operation_result(
+                            approval_id=approval_id,
+                            approval=claim,
+                            execution_result={
+                                "status": "unknown",
+                                "reason": f"approval_execution_error:{type(exc).__name__}",
+                            },
+                            status="unknown",
+                        )
+                    raise
+                execution_disposition = _ordinary_chat_timeline_result_disposition(
+                    execution_result
+                )
+                if timeline_bound:
+                    await self._record_ordinary_chat_timeline_operation_result(
+                        approval_id=approval_id,
+                        approval=claim,
+                        execution_result=execution_result,
+                        status=execution_disposition,
+                    )
+                if (
+                    execution_disposition == "succeeded"
+                    and _is_ordinary_chat_approval(existing_exec)
+                ):
+                    execution_result = dict(execution_result)
+                    # Persist this barrier before handing control to ReAct.
+                    # A crash after downstream continuation starts is unknown,
+                    # never an invitation to replay the continuation.
+                    execution_result["continuation_started"] = True
+                    recorded = self._exec_approval_store.record_execution_result(
+                        approval_id,
+                        execution_result=execution_result,
+                    )
+                    await self._observe_ordinary_chat_approval(recorded)
+                    execution_result["react_continuation"] = (
+                        await self._resume_ordinary_chat_approval_react_loop(
+                            approval_id=approval_id,
+                            approval=claim,
+                            execution_result=execution_result,
+                            current_permission_policy=current_permission_policy,
+                        )
+                    )
+                    execution_result.pop("continuation_started", None)
+                else:
+                    # This durable checkpoint is written before consumption
+                    # completion.  Recovery never replays the exact mutation.
+                    recorded = self._exec_approval_store.record_execution_result(
+                        approval_id,
+                        execution_result=execution_result,
+                    )
+                    await self._observe_ordinary_chat_approval(recorded)
+                succeeded = execution_disposition == "succeeded"
                 resolved_exec = self._exec_approval_store.complete_consumption(
                     approval_id,
-                    execution_idempotency_key=f'approval-execution:{approval_id}',
+                    execution_idempotency_key=execution_idempotency_key,
                     lease_owner=lease_owner,
                     lease_token=claim.consume_lease_token or '',
                     execution_result=execution_result,
                     succeeded=succeeded,
                 )
+                await self._observe_ordinary_chat_approval(resolved_exec)
             if linked_run_context is not None:
                 linked_run, pending_entry = linked_run_context
                 await self._append_goal_operator_approval_audit_log(
@@ -7344,6 +8123,441 @@ class RuntimeService:
             succeeded=True,
         )
         return self._task_approval_summary(completed)
+
+    def ordinary_chat_approval_owner(self, approval_id: str) -> tuple[bool, str | None]:
+        """Return whether an approval is ordinary Chat and its durable session."""
+        return self._ordinary_chat_approval_owner_from(
+            self._exec_approval_store.get(approval_id)
+        )
+
+    @staticmethod
+    def _ordinary_chat_approval_owner_from(approval: Any) -> tuple[bool, str | None]:
+        if approval is None or not _is_ordinary_chat_approval(approval):
+            return False, None
+        payload = approval.command_payload
+        if not isinstance(payload, Mapping):
+            return True, None
+        checkpoint = payload.get("ordinary_chat_checkpoint")
+        if not isinstance(checkpoint, Mapping):
+            return True, None
+        session_id = checkpoint.get("session_id") or payload.get("session_id")
+        normalized_session_id = (
+            str(session_id).strip()
+            if isinstance(session_id, str) and session_id.strip()
+            else None
+        )
+        return True, normalized_session_id
+
+    async def _ordinary_chat_approval_owner_async(
+        self,
+        approval_id: str,
+    ) -> tuple[bool, str | None]:
+        approval = await asyncio.to_thread(self._exec_approval_store.get, approval_id)
+        return self._ordinary_chat_approval_owner_from(approval)
+
+    def ordinary_chat_approval_session_id(self, approval_id: str) -> str | None:
+        """Return the durable Chat owner for a standalone approval, if any."""
+        _, session_id = self.ordinary_chat_approval_owner(approval_id)
+        return session_id
+
+    async def _resume_ordinary_chat_approval_react_loop(
+        self,
+        *,
+        approval_id: str,
+        approval: Any,
+        execution_result: Mapping[str, Any],
+        current_permission_policy: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Feed an approved exact-call result back into its original Chat ReAct turn."""
+        payload = getattr(approval, "command_payload", None)
+        checkpoint = (
+            payload.get("ordinary_chat_checkpoint")
+            if isinstance(payload, Mapping)
+            else None
+        )
+        if not isinstance(checkpoint, Mapping) or not isinstance(
+            checkpoint.get("react_continuation"), Mapping
+        ):
+            return {"status": "not_available", "reason": "checkpoint_missing"}
+        resume = getattr(self._engine, "resume_ordinary_chat_approval", None)
+        if not callable(resume):
+            return {"status": "not_available", "reason": "engine_resume_unavailable"}
+        if not isinstance(current_permission_policy, Mapping):
+            return {"status": "failed", "reason": "policy_revalidation_unavailable"}
+        try:
+            result = resume(
+                approval_id=approval_id,
+                approval_payload=payload,
+                execution_result=execution_result,
+                current_permission_policy=current_permission_policy,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # Preserve the completed exact call; never replay it.
+            return {
+                "status": "failed",
+                "reason": "engine_resume_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if not isinstance(result, Mapping):
+            return {"status": "failed", "reason": "engine_resume_invalid_result"}
+        return dict(result)
+
+    async def _begin_ordinary_chat_timeline_operation(
+        self,
+        *,
+        approval_id: str,
+        approval: Any,
+    ) -> bool:
+        """Cross the durable effect boundary for a timeline-bound approval."""
+        if not _ordinary_chat_timeline_binding_is_present(approval):
+            return False
+        payload = getattr(approval, "command_payload", None)
+        if not isinstance(payload, Mapping):
+            raise ApprovalConflict("Ordinary-Chat approval payload is unavailable.")
+        begin = getattr(self._engine, "begin_ordinary_chat_approval_operation", None)
+        if not callable(begin):
+            raise ApprovalConflict(
+                "Ordinary-Chat timeline approval cannot record its effect boundary."
+            )
+        result = begin(approval_id=approval_id, approval_payload=payload)
+        if inspect.isawaitable(result):
+            await result
+        return True
+
+    async def _record_ordinary_chat_timeline_operation_result(
+        self,
+        *,
+        approval_id: str,
+        approval: Any,
+        execution_result: Mapping[str, Any],
+        status: str,
+    ) -> None:
+        """Persist an exact post-boundary outcome before any ReAct callback."""
+        if not _ordinary_chat_timeline_binding_is_present(approval):
+            return
+        payload = getattr(approval, "command_payload", None)
+        if not isinstance(payload, Mapping):
+            raise ApprovalConflict("Ordinary-Chat approval payload is unavailable.")
+        record = getattr(self._engine, "record_ordinary_chat_approval_operation_result", None)
+        if not callable(record):
+            raise ApprovalConflict(
+                "Ordinary-Chat timeline approval cannot persist its operation result."
+            )
+        result = record(
+            approval_id=approval_id,
+            approval_payload=payload,
+            execution_result=execution_result,
+            status=status,
+        )
+        if inspect.isawaitable(result):
+            await result
+
+    async def _abandon_ordinary_chat_timeline_operation(
+        self,
+        *,
+        approval_id: str,
+        approval: Any,
+        reason: str,
+    ) -> None:
+        """Release a pre-effect approval disposition for a future replan."""
+        if not _ordinary_chat_timeline_binding_is_present(approval):
+            return
+        payload = getattr(approval, "command_payload", None)
+        if not isinstance(payload, Mapping):
+            raise ApprovalConflict("Ordinary-Chat approval payload is unavailable.")
+        abandon = getattr(self._engine, "abandon_ordinary_chat_approval_operation", None)
+        if not callable(abandon):
+            raise ApprovalConflict(
+                "Ordinary-Chat timeline approval cannot record a pre-effect disposition."
+            )
+        result = abandon(
+            approval_id=approval_id,
+            approval_payload=payload,
+            reason=reason,
+        )
+        if inspect.isawaitable(result):
+            await result
+
+    async def _record_stale_ordinary_chat_operation_unknown(
+        self,
+        *,
+        approval_id: str,
+        approval: Any,
+    ) -> None:
+        """Quarantine a stale consuming lease without replaying its tool call."""
+        try:
+            await self._begin_ordinary_chat_timeline_operation(
+                approval_id=approval_id,
+                approval=approval,
+            )
+        except ValueError:
+            # A prior worker may have crossed the boundary immediately before
+            # it died. The result transition below proves whether it remained
+            # unresolved; never treat this duplicate start as permission to run.
+            pass
+        await self._record_ordinary_chat_timeline_operation_result(
+            approval_id=approval_id,
+            approval=approval,
+            execution_result={
+                "status": "unknown",
+                "reason": "stale_approval_consume_lease",
+            },
+            status="unknown",
+        )
+
+    def _preflight_ordinary_chat_approval(
+        self,
+        approval: Any,
+        *,
+        current_permission_policy: Mapping[str, Any] | None,
+    ) -> dict[str, str] | None:
+        """Reject a stale Chat checkpoint before it receives a consume lease."""
+        payload = getattr(approval, "command_payload", None)
+        metadata = getattr(approval, "metadata", None)
+        if not isinstance(payload, Mapping) or not isinstance(metadata, Mapping):
+            return {
+                "error": "Ordinary-Chat approval checkpoint is missing its replay payload.",
+                "error_code": "checkpoint_missing",
+            }
+        checkpoint = payload.get("ordinary_chat_checkpoint")
+        if not isinstance(checkpoint, Mapping) or checkpoint.get("source") != "ordinary_chat":
+            return {
+                "error": "Ordinary-Chat approval checkpoint is invalid.",
+                "error_code": "checkpoint_invalid",
+            }
+        tool_name = str(payload.get("tool_name") or "")
+        operation_id = str(payload.get("operation_id") or "")
+        arguments_digest = str(payload.get("arguments_digest") or "")
+        if (
+            not tool_name
+            or not operation_id
+            or not arguments_digest
+            or checkpoint.get("tool_name") != tool_name
+            or checkpoint.get("operation_id") != operation_id
+            or checkpoint.get("arguments_digest") != arguments_digest
+            or metadata.get("operation_id") != operation_id
+            or metadata.get("arguments_digest") != arguments_digest
+        ):
+            return {
+                "error": "Approved tool call no longer matches its durable checkpoint.",
+                "error_code": "arguments_digest_drift",
+            }
+
+        stored_policy = payload.get("permission_policy")
+        stored_snapshot = effective_policy_snapshot_from_mapping(
+            stored_policy if isinstance(stored_policy, Mapping) else None
+        )
+        current_snapshot = effective_policy_snapshot_from_mapping(
+            current_permission_policy
+        )
+        if stored_snapshot is None or current_snapshot is None:
+            return {
+                "error": "Current ordinary-Chat policy could not be revalidated.",
+                "error_code": "policy_revalidation_unavailable",
+            }
+        if (
+            checkpoint.get("policy_snapshot_id") != stored_snapshot.policy_snapshot_id
+            or checkpoint.get("policy_version") != stored_snapshot.policy_version
+            or current_snapshot.policy_snapshot_id != stored_snapshot.policy_snapshot_id
+            or current_snapshot.policy_version != stored_snapshot.policy_version
+        ):
+            return {
+                "error": "Effective policy changed while approval was pending.",
+                "error_code": "policy_drift",
+            }
+
+        workspace_value = payload.get("workspace_dir")
+        checkpoint_workspace = checkpoint.get("resolved_workspace_dir")
+        if not isinstance(workspace_value, str) or not isinstance(checkpoint_workspace, str):
+            return {
+                "error": "Ordinary-Chat approval is missing its resolved workspace identity.",
+                "error_code": "workspace_checkpoint_invalid",
+            }
+        workspace_root = Path(workspace_value).expanduser().resolve(strict=False)
+        if workspace_root != Path(checkpoint_workspace).expanduser().resolve(strict=False):
+            return {
+                "error": "Workspace changed while approval was pending.",
+                "error_code": "workspace_drift",
+            }
+        if (
+            tool_name in _FILE_MUTATION_TOOLS
+            and _ordinary_chat_timeline_binding_is_present(approval)
+        ):
+            return self._preflight_ordinary_chat_file_mutation(
+                payload=payload,
+                workspace_root=workspace_root,
+            )
+        if tool_name == "exec_command":
+            target = payload.get("workdir")
+            if not isinstance(target, str) or not target.strip():
+                return {
+                    "error": "Exec approval is missing its resolved target.",
+                    "error_code": "target_checkpoint_invalid",
+                }
+            try:
+                Path(target).expanduser().resolve(strict=False).relative_to(workspace_root)
+            except ValueError:
+                return {
+                    "error": "Exec target escaped the approved workspace.",
+                    "error_code": "workspace_drift",
+                }
+            command = payload.get("command")
+            if not isinstance(command, str) or not command.strip():
+                return {
+                    "error": "Exec approval is missing its normalized command.",
+                    "error_code": "arguments_digest_drift",
+                }
+            shell = payload.get("shell")
+            normalized_shell = (
+                str(shell).strip()
+                if isinstance(shell, str) and shell.strip() and shell.strip().lower() != "auto"
+                else None
+            )
+            environment = payload.get("env") if isinstance(payload.get("env"), dict) else None
+            try:
+                timeout_sec = float(payload.get("timeout_sec"))
+                current_sandbox_plan = self._exec_runtime.build_sandbox_plan(
+                    command=command,
+                    mode=self._sandbox_config.mode,
+                    shell=normalized_shell,
+                    cwd=Path(target).expanduser().resolve(strict=False),
+                    env=environment,
+                    timeout_sec=timeout_sec,
+                    requested_escalation=str(payload.get("sandbox_permissions") or "use_default"),
+                    workspace_root=workspace_root,
+                    background=bool(payload.get("background", False)),
+                    tty=bool(payload.get("tty", False)),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return {
+                    "error": "Current sandbox plan could not be revalidated.",
+                    "error_code": "sandbox_revalidation_failed",
+                }
+            expected_plan_digest = checkpoint.get("sandbox_authorization_digest")
+            if (
+                not isinstance(expected_plan_digest, str)
+                or current_sandbox_plan.approval_digest != expected_plan_digest
+            ):
+                return {
+                    "error": "Sandbox plan changed while approval was pending.",
+                    "error_code": "sandbox_drift",
+                }
+            command_policy = CommandSecurityPolicy(
+                command_rules=[rule.model_dump() for rule in self._security_config.command_rules],
+                workspace_dir=Path(target).expanduser().resolve(strict=False),
+                allowed_env_vars=self._security_config.exec_allowed_env_vars,
+                allow_dangerous_interpreters=True,
+            )
+            command_decision = command_policy.classify(
+                command,
+                shell=normalized_shell,
+                env=environment,
+            )
+            if command_decision.action == "deny":
+                return {
+                    "error": "Current command policy denies the approved command.",
+                    "error_code": "command_policy_drift",
+                }
+            current_inventory_version = sha256(
+                json.dumps(
+                    {
+                        "tool_name": "exec_command",
+                        "parameters_schema": ExecCommandTool().parameters_schema,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if current_inventory_version != payload.get("tool_inventory_version"):
+                return {
+                    "error": "Exec tool contract changed while approval was pending.",
+                    "error_code": "tool_inventory_drift",
+                }
+        return None
+
+    def _preflight_ordinary_chat_file_mutation(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        workspace_root: Path,
+    ) -> dict[str, str] | None:
+        """Reject known file replay drift before the timeline effect boundary."""
+        tool_name = str(payload.get("tool_name") or "")
+        arguments = payload.get("arguments")
+        expected_digest = str(payload.get("arguments_digest") or "")
+        if tool_name not in _FILE_MUTATION_TOOLS or not isinstance(arguments, Mapping):
+            return {
+                "error": "Approved file mutation replay payload is invalid.",
+                "error_code": "approval_payload_invalid",
+            }
+        if (
+            not expected_digest
+            or file_mutation_arguments_digest(
+                tool_name=tool_name,
+                arguments=dict(arguments),
+            )
+            != expected_digest
+        ):
+            return {
+                "error": "Approved file mutation arguments no longer match their checkpoint.",
+                "error_code": "arguments_digest_drift",
+            }
+        tool = self._build_standalone_file_mutation_tool(
+            tool_name=tool_name,
+            workspace_dir=str(workspace_root),
+        )
+        if tool is None:
+            return {
+                "error": f"Unsupported file-mutation tool: {tool_name}",
+                "error_code": "tool_unavailable",
+            }
+        if file_mutation_tool_inventory_version(tool) != payload.get("tool_inventory_version"):
+            return {
+                "error": "File mutation tool contract changed while approval was pending.",
+                "error_code": "tool_inventory_drift",
+            }
+        base_states = payload.get("base_states")
+        if not isinstance(base_states, list) or not base_states:
+            return {
+                "error": "File mutation approval is missing target base checkpoints.",
+                "error_code": "base_checkpoint_missing",
+            }
+        for item in base_states:
+            if not isinstance(item, Mapping):
+                return {
+                    "error": "File mutation base checkpoint is invalid.",
+                    "error_code": "base_checkpoint_invalid",
+                }
+            relative_path = item.get("relative_path")
+            if not isinstance(relative_path, str) or not relative_path:
+                return {
+                    "error": "File mutation base checkpoint path is invalid.",
+                    "error_code": "base_checkpoint_invalid",
+                }
+            target = (workspace_root / Path(relative_path)).resolve(strict=False)
+            try:
+                target.relative_to(workspace_root)
+            except ValueError:
+                return {
+                    "error": "File mutation base checkpoint escaped the workspace.",
+                    "error_code": "workspace_drift",
+                }
+            try:
+                exists = target.is_file()
+                current_digest = sha256(target.read_bytes()).hexdigest() if exists else None
+            except OSError:
+                return {
+                    "error": "File mutation base checkpoint could not be read.",
+                    "error_code": "file_base_drift",
+                }
+            if exists != bool(item.get("exists")) or current_digest != item.get("sha256"):
+                return {
+                    "error": "File target changed while approval was pending.",
+                    "error_code": "file_base_drift",
+                }
+        return None
 
     async def _record_approval_resolution_audit(
         self,
@@ -7666,7 +8880,230 @@ class RuntimeService:
             return ApplyPatchTool(**common)
         return None
 
-    async def _execute_approved_exec_request(self, approval: Any) -> dict[str, Any]:
+    async def _execute_approved_standalone_request(
+        self,
+        approval: Any,
+        *,
+        current_permission_policy: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = getattr(approval, "command_payload", None)
+        tool_name = (
+            str(payload.get("tool_name") or "")
+            if isinstance(payload, dict)
+            else ""
+        )
+        if tool_name in _FILE_MUTATION_TOOLS:
+            return await self._execute_approved_standalone_file_mutation(
+                approval,
+                current_permission_policy=current_permission_policy,
+            )
+        return await self._execute_approved_exec_request(
+            approval,
+            current_permission_policy=current_permission_policy,
+        )
+
+    async def _execute_approved_standalone_file_mutation(
+        self,
+        approval: Any,
+        *,
+        current_permission_policy: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = getattr(approval, "command_payload", None)
+        if not isinstance(payload, dict):
+            return {
+                "status": "execution_failed",
+                "error": "Approved file mutation did not include a replay payload.",
+                "error_code": "approval_payload_missing",
+            }
+        tool_name = str(payload.get("tool_name") or "")
+        arguments = payload.get("arguments")
+        workspace_dir = payload.get("workspace_dir")
+        if (
+            tool_name not in _FILE_MUTATION_TOOLS
+            or not isinstance(arguments, dict)
+            or not isinstance(workspace_dir, str)
+            or not workspace_dir.strip()
+        ):
+            return {
+                "status": "execution_failed",
+                "error": "Approved file mutation replay payload is invalid.",
+                "error_code": "approval_payload_invalid",
+            }
+
+        expected_arguments_digest = str(payload.get("arguments_digest") or "")
+        current_arguments_digest = file_mutation_arguments_digest(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        if not expected_arguments_digest or current_arguments_digest != expected_arguments_digest:
+            return {
+                "status": "execution_failed",
+                "error": "Approved file mutation arguments no longer match their checkpoint.",
+                "error_code": "arguments_digest_drift",
+            }
+
+        tool = self._build_standalone_file_mutation_tool(
+            tool_name=tool_name,
+            workspace_dir=workspace_dir,
+        )
+        if tool is None:
+            return {
+                "status": "execution_failed",
+                "error": f"Unsupported file-mutation tool: {tool_name}",
+                "error_code": "tool_unavailable",
+            }
+        inventory_version = file_mutation_tool_inventory_version(tool)
+        if inventory_version != payload.get("tool_inventory_version"):
+            return {
+                "status": "execution_failed",
+                "error": "File mutation tool contract changed while approval was pending.",
+                "error_code": "tool_inventory_drift",
+            }
+
+        stored_permission_policy = (
+            dict(payload.get("permission_policy"))
+            if isinstance(payload.get("permission_policy"), dict)
+            else {}
+        )
+        permission_policy = stored_permission_policy
+        stored_snapshot = effective_policy_snapshot_from_mapping(stored_permission_policy)
+        if stored_snapshot is not None:
+            if (
+                stored_snapshot.policy_snapshot_id != payload.get("policy_snapshot_id")
+                or stored_snapshot.policy_version
+                != payload.get("effective_policy_version")
+            ):
+                return {
+                    "status": "execution_failed",
+                    "error": "Effective policy checkpoint is internally inconsistent.",
+                    "error_code": "policy_checkpoint_invalid",
+                }
+            if _is_ordinary_chat_approval(approval):
+                current_snapshot = effective_policy_snapshot_from_mapping(
+                    current_permission_policy
+                )
+                if current_snapshot is None:
+                    return {
+                        "status": "execution_failed",
+                        "error": "Current ordinary-Chat policy could not be revalidated.",
+                        "error_code": "policy_revalidation_unavailable",
+                    }
+                if (
+                    current_snapshot.policy_snapshot_id != stored_snapshot.policy_snapshot_id
+                    or current_snapshot.policy_version != stored_snapshot.policy_version
+                ):
+                    return {
+                        "status": "execution_failed",
+                        "error": "Effective policy changed while approval was pending.",
+                        "error_code": "policy_drift",
+                    }
+                permission_policy = dict(current_permission_policy)
+            elif stored_snapshot.source_chain == ("security_config",):
+                current_snapshot = EffectivePolicyResolver().resolve(self._security_config)
+                if current_snapshot.policy_version != stored_snapshot.policy_version:
+                    return {
+                        "status": "execution_failed",
+                        "error": "Effective policy changed while approval was pending.",
+                        "error_code": "policy_drift",
+                    }
+
+        workspace_root = Path(workspace_dir).expanduser().resolve(strict=False)
+        base_states = payload.get("base_states")
+        if not isinstance(base_states, list) or not base_states:
+            return {
+                "status": "execution_failed",
+                "error": "File mutation approval is missing target base checkpoints.",
+                "error_code": "base_checkpoint_missing",
+            }
+        for item in base_states:
+            if not isinstance(item, dict):
+                return {
+                    "status": "execution_failed",
+                    "error": "File mutation base checkpoint is invalid.",
+                    "error_code": "base_checkpoint_invalid",
+                }
+            relative_path = item.get("relative_path")
+            if not isinstance(relative_path, str) or not relative_path:
+                return {
+                    "status": "execution_failed",
+                    "error": "File mutation base checkpoint path is invalid.",
+                    "error_code": "base_checkpoint_invalid",
+                }
+            target = (workspace_root / Path(relative_path)).resolve(strict=False)
+            try:
+                target.relative_to(workspace_root)
+            except ValueError:
+                return {
+                    "status": "execution_failed",
+                    "error": "File mutation base checkpoint escaped the workspace.",
+                    "error_code": "workspace_drift",
+                }
+            exists = await asyncio.to_thread(target.is_file)
+            expected_exists = bool(item.get("exists"))
+            current_digest = (
+                sha256(await asyncio.to_thread(target.read_bytes)).hexdigest()
+                if exists
+                else None
+            )
+            if exists != expected_exists or current_digest != item.get("sha256"):
+                return {
+                    "status": "execution_failed",
+                    "error": "File target changed while approval was pending.",
+                    "error_code": "file_base_drift",
+                    "relative_path": relative_path,
+                }
+
+        context = ToolExecutionContext(
+            workspace_dir=str(workspace_root),
+            project_workspace=str(workspace_root),
+            session_id=(
+                str(payload.get("session_id"))
+                if isinstance(payload.get("session_id"), str)
+                else None
+            ),
+            permission_policy=permission_policy,
+        )
+        context.state["approval_replay"] = True
+        result = await tool.execute(**dict(arguments), approved=True, context=context)
+        return {
+            "status": "completed" if result.error is None else "execution_failed",
+            "tool_name": tool_name,
+            "operation_id": payload.get("operation_id"),
+            "arguments_digest": expected_arguments_digest,
+            "tool_inventory_version": inventory_version,
+            "output": result.output,
+            "error": result.error,
+            "metadata": result.metadata,
+        }
+
+    def _build_standalone_file_mutation_tool(
+        self,
+        *,
+        tool_name: str,
+        workspace_dir: str,
+    ) -> FileWriteTool | FileEditTool | ApplyPatchTool | None:
+        runtime_policy = resolve_runtime_permission_policy(self._security_config)
+        common: dict[str, Any] = {
+            "workspace_dir": workspace_dir,
+            "path_scope": runtime_policy.file_write_scope,
+            "require_approval": False,
+            "max_write_size_mb": self._security_config.max_file_write_size_mb,
+            "undo_max_size_mb": self._security_config.file_undo_max_size_mb,
+        }
+        if tool_name == "file_write":
+            return FileWriteTool(**common)
+        if tool_name == "file_edit":
+            return FileEditTool(**common)
+        if tool_name == "apply_patch":
+            return ApplyPatchTool(**common)
+        return None
+
+    async def _execute_approved_exec_request(
+        self,
+        approval: Any,
+        *,
+        current_permission_policy: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = getattr(approval, "command_payload", None)
         if not isinstance(payload, dict):
             return {
@@ -7709,6 +9146,7 @@ class RuntimeService:
             return {
                 "status": "execution_failed",
                 "error": str(exc),
+                "error_code": "exec_dispatch_exception",
             }
 
         return {
@@ -13771,6 +15209,17 @@ def _exec_approval_summary(
     reason_text = reason if isinstance(reason, str) else None
     metadata = getattr(approval, "metadata", None)
     metadata_dict = metadata if isinstance(metadata, dict) else {}
+    command_payload = getattr(approval, "command_payload", None)
+    command_payload_dict = command_payload if isinstance(command_payload, dict) else {}
+    stored_tool_name = str(command_payload_dict.get("tool_name") or "exec_command")
+    stored_arguments = command_payload_dict.get("arguments")
+    public_arguments = (
+        _public_approval_arguments(stored_tool_name, stored_arguments)
+        if isinstance(stored_arguments, Mapping)
+        else {"command": command, "shell": shell}
+    )
+    is_file_mutation = stored_tool_name in _FILE_MUTATION_TOOLS
+    is_ordinary_chat = metadata_dict.get("approval_source") == "ordinary_chat"
     auto_review = _auto_review_summary(metadata_dict)
 
     rule_projection = public_side_effect_projection(rule_side_effect)
@@ -13778,8 +15227,8 @@ def _exec_approval_summary(
         "approval_id": str(getattr(approval, "approval_id", "")),
         "task_id": None,
         "status": status,
-        "tool_name": "exec_command",
-        "arguments": {"command": command, "shell": shell},
+        "tool_name": stored_tool_name,
+        "arguments": public_arguments,
         "command": command,
         "shell": shell,
         "workdir": (
@@ -13800,18 +15249,40 @@ def _exec_approval_summary(
         "reason": reason_text,
         "requires_approval": True,
         "policy_reason": reason_text,
-        "approval_kind": "exec",
+        "approval_kind": stored_tool_name if is_file_mutation else "exec",
         "approval_scope": scope,
-        "replay_safe": False,
+        "replay_safe": is_file_mutation,
         "security_decision": "require_approval",
-        "policy_source": "exec_runtime",
+        "policy_source": (
+            "ordinary_chat_durable_checkpoint"
+            if is_ordinary_chat
+            else "durable_file_mutation" if is_file_mutation else "exec_runtime"
+        ),
         "suggested_rule": metadata_dict.get("suggested_rule"),
-        "allowed_decisions": ["approve_once", "approve_and_save_rule", "reject"],
-        "source": "exec_runtime",
-        "exec_approval_id": str(getattr(approval, "approval_id", "")),
+        "allowed_decisions": (
+            ["approve_once", "reject"]
+            if is_file_mutation
+            else ["approve_once", "approve_and_save_rule", "reject"]
+        ),
+        "source": (
+            "ordinary_chat" if is_ordinary_chat
+            else "durable_file_mutation" if is_file_mutation else "exec_runtime"
+        ),
+        "exec_approval_id": (
+            None if is_file_mutation else str(getattr(approval, "approval_id", ""))
+        ),
         "exec_session_id": _exec_result_field(getattr(approval, "execution_result", None), "session_id"),
         "exec_status": status,
         "execution_result": getattr(approval, "execution_result", None),
+        "operation_id": metadata_dict.get("operation_id"),
+        "arguments_digest": metadata_dict.get("arguments_digest"),
+        "policy_snapshot_id": metadata_dict.get("policy_snapshot_id"),
+        "effective_policy_version": metadata_dict.get("effective_policy_version"),
+        "tool_inventory_version": metadata_dict.get("tool_inventory_version"),
+        "resume_cursor": metadata_dict.get("resume_cursor") if is_ordinary_chat else None,
+        "checkpoint_status": (
+            "pending" if status == "pending" else status
+        ) if is_ordinary_chat else None,
         **auto_review,
     }
     return _redact_public_approval_summary(summary)
@@ -14067,6 +15538,57 @@ def _is_file_mutation_approval(approval: dict[str, Any]) -> bool:
     )
 
 
+def _is_ordinary_chat_approval(approval: Any) -> bool:
+    metadata = (
+        approval.get("metadata")
+        if isinstance(approval, Mapping)
+        else getattr(approval, "metadata", None)
+    )
+    return isinstance(metadata, Mapping) and metadata.get("approval_source") == "ordinary_chat"
+
+
+def _ordinary_chat_timeline_binding_is_present(approval: Any) -> bool:
+    """Return whether an approval carries the exact terminal-turn binding."""
+    payload = (
+        approval.get("command_payload")
+        if isinstance(approval, Mapping)
+        else getattr(approval, "command_payload", None)
+    )
+    if not isinstance(payload, Mapping):
+        return False
+    checkpoint = payload.get("ordinary_chat_checkpoint")
+    if not isinstance(checkpoint, Mapping) or checkpoint.get("source") != "ordinary_chat":
+        return False
+    resume_cursor = checkpoint.get("resume_cursor")
+    if not isinstance(resume_cursor, Mapping):
+        return False
+
+    def text(value: Any) -> str | None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    session_id = text(checkpoint.get("session_id"))
+    turn_id = text(checkpoint.get("turn_id"))
+    operation_id = text(checkpoint.get("operation_id"))
+    call_id = text(checkpoint.get("timeline_call_id"))
+    arguments_digest = text(checkpoint.get("arguments_digest"))
+    if not all((session_id, turn_id, operation_id, call_id, arguments_digest)):
+        return False
+    if (
+        text(payload.get("session_id")) != session_id
+        or text(payload.get("operation_id")) != operation_id
+        or text(payload.get("timeline_call_id")) != call_id
+        or text(payload.get("arguments_digest")) != arguments_digest
+        or text(resume_cursor.get("tool_call_id")) != call_id
+        or len(arguments_digest) != 64
+    ):
+        return False
+    try:
+        int(arguments_digest, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def _approved_tool_call(
     approval: dict[str, Any],
     *,
@@ -14146,15 +15668,70 @@ def _build_approval_exec_session_payload(
 
 
 def is_successful_exec_approval_result(result: Mapping[str, Any]) -> bool:
-    status = str(result.get("status") or "")
+    """Return whether an approved exec result is durably successful.
+
+    This deliberately shares the result classification used by ordinary-Chat
+    timeline persistence, so linked approvals cannot mark a known terminal
+    failure as consumed merely because its transport status is ``completed``.
+    """
+    return _exec_approval_result_disposition(result) == "succeeded"
+
+
+def _exec_approval_result_disposition(
+    result: Mapping[str, Any],
+) -> str:
+    """Classify an approved-operation result without discarding known failures.
+
+    Approval consumers must only use ``unknown`` when the effect or its result
+    cannot be trusted. A terminal process status and a tool-level known error
+    are still evidence, even though they do not represent success.
+    """
+    status = str(result.get("status") or "").strip().lower()
     if status == "completed":
-        return True
-    return (
+        exit_code = result.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+            return "failed"
+        if bool(result.get("timed_out")):
+            return "failed"
+        return "succeeded"
+    if (
         status == "running"
         and bool(result.get("background"))
         and isinstance(result.get("session_id"), str)
         and bool(str(result.get("session_id")).strip())
-    )
+    ):
+        return "succeeded"
+    if status in {"failed", "timed_out", "killed", "cancelled", "canceled", "terminated"}:
+        return "failed"
+    if status == "execution_failed":
+        error_code = str(result.get("error_code") or "").strip().lower()
+        if error_code in {
+            "exec_dispatch_exception",
+            "exec_transport_error",
+            "transport_error",
+            "dispatch_uncertain",
+        }:
+            return "unknown"
+        metadata = result.get("metadata")
+        explicit_disposition = (
+            str(metadata.get("timeline_result_disposition") or "").strip().lower()
+            if isinstance(metadata, Mapping)
+            else ""
+        )
+        if explicit_disposition == "failed":
+            return "failed"
+        if explicit_disposition == "unknown":
+            return "unknown"
+        if str(result.get("tool_name") or "") in _FILE_MUTATION_TOOLS and result.get("error"):
+            return "failed"
+    return "unknown"
+
+
+def _ordinary_chat_timeline_result_disposition(
+    result: Mapping[str, Any],
+) -> str:
+    """Classify an ordinary-Chat result using approval-wide semantics."""
+    return _exec_approval_result_disposition(result)
 
 def _approval_binding_kwargs(
     requester_id: str,
@@ -14209,6 +15786,16 @@ def _exec_approval_binding_from_values(
 def _exec_approval_binding_kwargs(approval: Any | None) -> dict[str, str]:
     if approval is None or str(getattr(approval, "requester_id", "legacy")) == "legacy":
         return {}
+    if _is_ordinary_chat_approval(approval):
+        # The ordinary-Chat checkpoint already binds an exact call to its
+        # session, policy and workspace.  Re-deriving it as an exec-only
+        # request would discard those fields and incorrectly reject a valid
+        # restart-safe replay.
+        return {
+            "requester_id": str(getattr(approval, "requester_id", "")),
+            "request_digest": str(getattr(approval, "request_digest", "")),
+            "context_digest": str(getattr(approval, "context_digest", "")),
+        }
     metadata = getattr(approval, "metadata", None)
     metadata = metadata if isinstance(metadata, Mapping) else {}
     return _exec_approval_binding_from_values(

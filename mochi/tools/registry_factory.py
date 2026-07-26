@@ -390,6 +390,7 @@ class ToolRegistryFactory:
             require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
+            approval_store=self._exec_approval_store,
         )
 
     def _build_file_edit(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -401,6 +402,7 @@ class ToolRegistryFactory:
             require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
+            approval_store=self._exec_approval_store,
         )
 
     def _build_apply_patch(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
@@ -412,6 +414,7 @@ class ToolRegistryFactory:
             require_approval=runtime_policy.require_approval_for_file_write,
             max_write_size_mb=config.security.max_file_write_size_mb,
             undo_max_size_mb=config.security.file_undo_max_size_mb,
+            approval_store=self._exec_approval_store,
         )
 
     def _build_execute_code(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:

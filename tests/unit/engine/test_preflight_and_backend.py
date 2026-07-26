@@ -6,10 +6,14 @@ from pathlib import Path
 
 import pytest
 
+from mochi.agents.conversation_resolver import (
+    BoundedConversationContext,
+    ConversationResolver,
+    IntentInterpretation,
+)
 from mochi.agents.engine import AgentEngine
 from mochi.agents.invocation import AgentInvocationRequest
 from mochi.agents.tool_exposure import ToolExposurePlan
-from mochi.agents.tool_intent_router import ToolIntentRoute
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.types import (
     Message,
@@ -344,7 +348,7 @@ async def test_engine_preflight_probe_skips_terminal_non_ollama_state_without_re
 
 
 @pytest.mark.asyncio
-async def test_engine_preview_and_chat_invoke_share_classifier_first_tool_intent_contract(
+async def test_engine_preview_and_chat_invoke_share_turn_contract_resolver(
     tmp_path: Path,
 ) -> None:
     config = MochiConfig.model_validate(
@@ -355,35 +359,42 @@ async def test_engine_preview_and_chat_invoke_share_classifier_first_tool_intent
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
-    backend = FakeBackend(backend_type="openai_compat")
+    class _Interpreter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def interpret(
+            self,
+            context: BoundedConversationContext,
+        ) -> IntentInterpretation:
+            self.calls += 1
+            return IntentInterpretation(
+                current_speech_act="request_information",
+                task_relation="standalone",
+                objective=context.current_turn.content,
+                operations=frozenset({"workspace_read"}),
+                confidence=0.99,
+            )
+
+    interpreter = _Interpreter()
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=lambda backend: ConversationResolver(
+            interpreter=interpreter
+        ),
+    )
+    backend = FakeBackend(
+        backend_type="openai_compat",
+        metadata={"effective_context_length": 32768},
+    )
     scoped_workspace = tmp_path / "scoped-workspace"
     scoped_workspace.mkdir()
-    route_calls: list[bool] = []
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = backend  # noqa: SLF001
         return backend
 
-    async def fake_route(
-        *,
-        user_message: str,
-        session_bound_workspace: bool,
-        attachment_count: int = 0,
-        workspace_attachment_count: int = 0,
-        classifier=None,
-    ) -> ToolIntentRoute:
-        del user_message, session_bound_workspace, attachment_count, workspace_attachment_count
-        route_calls.append(classifier is not None)
-        return ToolIntentRoute(
-            intent="ambiguous",
-            confidence=0.0,
-            source="fallback_keyword",
-            rationale="test route",
-        )
-
     engine._router.load = fake_load  # type: ignore[method-assign]
-    engine._tool_intent_router.route = fake_route  # type: ignore[method-assign]
 
     await engine.preview_chat_context(
         "Summarize foo.py",
@@ -401,7 +412,7 @@ async def test_engine_preview_and_chat_invoke_share_classifier_first_tool_intent
         )
     )
 
-    assert route_calls == [True, True]
+    assert interpreter.calls == 2
     await engine.close()
 
 
@@ -540,7 +551,24 @@ async def test_engine_preview_runtime_and_backend_payload_keep_output_cap_and_re
             },
         }
     )
-    engine = AgentEngine(config)
+    class _Interpreter:
+        async def interpret(
+            self,
+            context: BoundedConversationContext,
+        ) -> IntentInterpretation:
+            return IntentInterpretation(
+                current_speech_act="request_information",
+                task_relation="standalone",
+                objective=context.current_turn.content,
+                confidence=0.99,
+            )
+
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=lambda backend: ConversationResolver(
+            interpreter=_Interpreter()
+        ),
+    )
     backend = FakeBackend(backend_type="openai_compat", metadata={"api_mode": "responses"})
     backend.get_model_info = lambda: ModelInfo(  # type: ignore[method-assign]
         name="gpt-5.2",

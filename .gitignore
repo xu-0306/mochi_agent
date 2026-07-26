@@ -78,6 +78,9 @@ logs/
 mochi/config.yaml
 mochi/workspace/
 mochi/sessions/
+!mochi/sessions/
+mochi/sessions/*
+!mochi/sessions/*.py
 mochi/skills/
 mochi/plugins/
 mochi/memory/

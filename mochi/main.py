@@ -2870,7 +2870,14 @@ async def _voice_async(
                 await _maybe_start_next_turn()
 
                 while turn_tasks:
-                    await asyncio.gather(*list(turn_tasks.values()), return_exceptions=True)
+                    tasks_to_wait = list(turn_tasks.items())
+                    await asyncio.gather(
+                        *(task for _, task in tasks_to_wait),
+                        return_exceptions=True,
+                    )
+                    for completed_turn_id, task in tasks_to_wait:
+                        if task.done():
+                            turn_tasks.pop(completed_turn_id, None)
                 completed_normally = True
             finally:
                 for task in list(turn_tasks.values()):

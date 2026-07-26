@@ -19,6 +19,8 @@ import {
 
 interface ReasoningPanelProps {
   steps: ReasoningStep[]
+  sessionId?: string | null
+  turnId?: string | null
   isStreaming?: boolean
   tokenStats?: TokenStats
   onUndoFileChange?: (change: FileChangeSummary) => Promise<void> | void
@@ -66,6 +68,9 @@ function hasToolExposure(step: ReasoningStep): boolean {
     step.toolExposure &&
       (
         step.toolExposure.exposedTools.length > 0 ||
+        step.toolExposure.policyCatalog.length > 0 ||
+        step.toolExposure.eligibleTools.length > 0 ||
+        step.toolExposure.activationAllowedTools.length > 0 ||
         step.toolExposure.workspaceBound !== undefined ||
         step.toolExposure.attachmentCount !== undefined
       )
@@ -99,6 +104,12 @@ function diagnosticsSignature(step: ReasoningStep): string | null {
   const parts: string[] = []
 
   if (step.toolExposure) {
+    if (step.toolExposure.policyCatalog.length > 0) {
+      parts.push(`catalog:${step.toolExposure.policyCatalog.join(',')}`)
+    }
+    if (step.toolExposure.eligibleTools.length > 0) {
+      parts.push(`eligible:${step.toolExposure.eligibleTools.join(',')}`)
+    }
     if (step.toolExposure.exposedTools.length > 0) {
       parts.push(`tools:${step.toolExposure.exposedTools.join(',')}`)
     }
@@ -157,7 +168,7 @@ function StepDiagnostics({
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-              Workspace tools
+              Tool workflow
             </p>
             {typeof exposure.workspaceBound === 'boolean' ? (
               <span className="rounded-full border border-border/80 bg-canvas/80 px-2 py-0.5 text-[10px] text-muted-foreground">
@@ -170,16 +181,33 @@ function StepDiagnostics({
               </span>
             ) : null}
           </div>
-          {exposure.exposedTools.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5">
-              {exposure.exposedTools.map((toolName) => (
-                <span
-                  key={toolName}
-                  className="rounded-full border border-primary-500/20 bg-primary-500/10 px-2 py-0.5 text-[11px] text-primary-200"
-                >
-                  {toolName}
-                </span>
-              ))}
+          <div className="grid gap-2 sm:grid-cols-3">
+            {[
+              ['Policy-bounded catalog', exposure.policyCatalog],
+              ['Eligible for this task', exposure.eligibleTools],
+              ['Exposed this iteration', exposure.exposedTools],
+            ].map(([label, tools]) => (
+              <div key={label as string} className="min-w-0 rounded-lg border border-border/70 bg-black/10 p-2">
+                <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+                  {label as string}
+                </p>
+                <p className="mt-1 break-words text-xs text-foreground/90">
+                  {(tools as string[]).length > 0 ? (tools as string[]).join(', ') : 'None observed'}
+                </p>
+              </div>
+            ))}
+          </div>
+          {exposure.activationAllowedTools.length > 0 ? (
+            <div className="rounded-lg border border-border/70 bg-black/10 p-2">
+              <p className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+                Activation allowed
+              </p>
+              <p className="mt-1 break-words text-xs text-foreground/90">
+                {exposure.activationAllowedTools.join(', ')}
+              </p>
+              <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                Activation only makes a schema callable for this turn. Concrete calls still pass runtime policy review.
+              </p>
             </div>
           ) : null}
         </div>
@@ -252,6 +280,8 @@ function StepDiagnostics({
 
 export function ReasoningPanel({
   steps,
+  sessionId,
+  turnId,
   isStreaming = false,
   tokenStats,
   onUndoFileChange,
@@ -374,6 +404,8 @@ export function ReasoningPanel({
                     <div className="mt-2">
                       <ToolCallCard
                         toolName={step.toolName ?? 'tool'}
+                        sessionId={sessionId}
+                        turnId={turnId}
                         args={step.toolArgs}
                         result={step.toolResult}
                         metadata={step.toolMeta}

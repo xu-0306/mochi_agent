@@ -19,7 +19,19 @@ export type MessageEventType =
 export type ReasoningStepType = 'thinking' | 'status' | 'tool_call' | 'tool_result' | 'error'
 
 export interface ToolExposureDiagnostics {
+  catalogScope: 'policy_eligible'
+  policyCatalog: string[]
+  eligibleTools: string[]
   exposedTools: string[]
+  activationAllowedTools: string[]
+  deferredTools: string[]
+  planVersion?: string
+  toolDiagnostics: Array<{
+    toolName: string
+    status: string
+    includeReasons: string[]
+    excludeReasons: string[]
+  }>
   workspaceBound?: boolean
   attachmentCount?: number
 }

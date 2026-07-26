@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from mochi.api.routes.filesystem import _preview_docx, _preview_pdf, _preview_text_file
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
+from mochi.api.session_store_binding import resolve_route_session_store
 from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.runtime.approvals import ApprovalConflict
 from mochi.runtime.store import RuntimeStore
@@ -478,14 +479,8 @@ async def resolve_workspace_scope(
 
 
 async def _get_session_store(request: Request) -> SessionStore:
-    existing = getattr(request.app.state, "session_store", None)
-    if isinstance(existing, SessionStore):
-        return existing
-
     config = await _get_config(request.app)
-    store = SessionStore(config.sessions_dir)
-    request.app.state.session_store = store
-    return store
+    return resolve_route_session_store(request.app, config)
 
 
 async def _get_runtime_store(request: Request) -> RuntimeStore:
