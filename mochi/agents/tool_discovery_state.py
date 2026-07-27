@@ -320,7 +320,7 @@ class ToolDiscoveryState:
         catalog_fingerprint: str,
     ) -> ToolDiscoveryState:
         current = _clean_non_negative_int(current_turn_index, field_name="current_turn_index")
-        limit = _clean_positive_int(max_entries, field_name="max_entries")
+        limit = _clean_non_negative_int(max_entries, field_name="max_entries")
         ttl = _clean_positive_int(ttl_turns, field_name="ttl_turns")
         current_generation = _clean_non_negative_int(
             catalog_generation,

@@ -84,6 +84,22 @@ def test_multilingual_metadata_match_scores_positive() -> None:
     assert matches[0].score > 0.0
 
 
+def test_bounded_inflection_normalization_finds_saving_files() -> None:
+    index = ToolCatalogIndex.from_tools(
+        [
+            _FakeTool("file_read", "Read a workspace file."),
+            _FakeTool("file_write", "Write text into a workspace file."),
+        ]
+    )
+
+    matches = index.search("saving files")
+
+    assert matches
+    file_write = next(match for match in matches if match.name == "file_write")
+    assert file_write.score > 0.0
+    assert index.search("astronomy nebula") == []
+
+
 def test_zero_score_tools_are_filtered_and_ties_are_deterministic() -> None:
     index = ToolCatalogIndex.from_tools(
         [

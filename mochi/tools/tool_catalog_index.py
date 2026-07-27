@@ -375,10 +375,36 @@ def _compact_text(value: str) -> str:
 
 
 def _query_tokens(normalized_text: str, compact_text: str) -> tuple[str, ...]:
-    tokens = [token for token in _TOKEN_RE.findall(normalized_text) if token]
+    tokens: list[str] = []
+    for token in _TOKEN_RE.findall(normalized_text):
+        if token:
+            tokens.extend(_bounded_lexical_variants(token))
     if compact_text and compact_text not in tokens:
         tokens.append(compact_text)
-    return tuple(tokens)
+    return tuple(dict.fromkeys(tokens))
+
+
+def _bounded_lexical_variants(token: str) -> tuple[str, ...]:
+    """Return conservative English inflection variants for lexical retrieval."""
+
+    variants = [token]
+    if not token.isascii() or not token.isalpha() or len(token) < 4:
+        return tuple(variants)
+    if token.endswith("ies") and len(token) > 4:
+        variants.append(token[:-3] + "y")
+    elif token.endswith("es") and len(token) > 4:
+        variants.extend((token[:-2], token[:-1]))
+    elif token.endswith("s") and not token.endswith("ss"):
+        variants.append(token[:-1])
+    if token.endswith("ing") and len(token) > 5:
+        stem = token[:-3]
+        variants.extend((stem, stem + "e"))
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            variants.append(stem[:-1])
+    elif token.endswith("ed") and len(token) > 4:
+        stem = token[:-2]
+        variants.extend((stem, stem + "e"))
+    return tuple(dict.fromkeys(value for value in variants if len(value) >= 3))
 
 
 def _string_fragments(value: Any) -> list[str]:

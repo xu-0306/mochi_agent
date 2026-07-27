@@ -137,6 +137,48 @@ def test_record_observations_prunes_by_ttl_lru_and_catalog_invalidation() -> Non
     assert state.entries[0].catalog_fingerprint == "e" * 64
 
 
+def test_zero_cache_size_returns_an_explicit_empty_bounded_state() -> None:
+    state = ToolDiscoveryState.empty(
+        "session-no-cache",
+        catalog_generation=1,
+        catalog_fingerprint="f" * 64,
+    ).record_observations(
+        [_observation()],
+        current_turn_index=1,
+        max_entries=0,
+        ttl_turns=20,
+        catalog_generation=1,
+        catalog_fingerprint="f" * 64,
+    )
+
+    assert state.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_repository_persists_zero_cache_as_empty_state(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    repository = ToolDiscoveryStateRepository(store)
+
+    result = await repository.record_observations(
+        session_id="session-no-cache",
+        turn_id="turn-1",
+        current_turn_index=1,
+        catalog_generation=1,
+        catalog_fingerprint="f" * 64,
+        observations=[_observation()],
+        idempotency_key="tool-discovery:no-cache",
+        max_entries=0,
+    )
+
+    assert result.status == "saved"
+    assert result.state is not None
+    assert result.state.entries == ()
+    reloaded = await repository.load("session-no-cache")
+    assert reloaded.status == "loaded"
+    assert reloaded.state is not None
+    assert reloaded.state.entries == ()
+
+
 @pytest.mark.asyncio
 async def test_repository_idempotent_replay_does_not_append_twice(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions")

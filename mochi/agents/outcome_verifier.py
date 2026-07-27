@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
 
@@ -29,6 +30,8 @@ CriterionKind = Literal[
 CriterionVerdict = Literal["verified", "failed", "unverified", "not_applicable"]
 
 VERIFICATION_RECEIPT_VERSION = "verification-receipt-v1"
+VERIFICATION_RECEIPT_EVENT = "ordinary_chat_verification_receipt_recorded"
+VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION = 1
 
 _CRITERION_KINDS = frozenset(
     {"artifact", "tool_execution", "state", "response_shape", "semantic", "manual"}
@@ -176,18 +179,41 @@ def _retry_disposition_max(values: Sequence[str]) -> str:
     return max(values, key=lambda item: _RETRY_PRECEDENCE[item])
 
 
-def _criterion_identity(prefix: str, source_turn_ids: tuple[str, ...], index: int) -> str:
+def _criterion_identity(
+    prefix: str,
+    source_turn_ids: tuple[str, ...],
+    index: int,
+    *,
+    owner_identity: Mapping[str, Any] | None = None,
+    target_hint: str | None = None,
+) -> str:
     seed = json.dumps(
         {
             "prefix": prefix,
             "source_turn_ids": list(source_turn_ids),
             "index": index,
+            "owner_identity": dict(owner_identity or {}),
+            "target_hint": target_hint,
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
     return f"{prefix}:{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _normalized_artifact_target(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _artifact_target_evidence_ref(receipt_id: str, requested_path: str) -> str:
+    target_digest = hashlib.sha256(
+        _normalized_artifact_target(requested_path).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{receipt_id}:target:{target_digest}"
 
 
 def _legacy_artifact_payload(value: str) -> Mapping[str, Any] | None:
@@ -475,6 +501,289 @@ class VerificationReceipt:
         )
 
 
+VerificationReceiptLoadStatus = Literal[
+    "missing",
+    "loaded",
+    "invalid",
+    "unsupported_version",
+]
+VerificationReceiptSaveStatus = Literal["saved", "conflict", "invalid"]
+
+
+class VerificationReceiptSessionStore(Protocol):
+    async def load_session(self, session_id: str) -> list[dict[str, Any]]: ...
+
+    async def append_event_if(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+        predicate: Any,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class VerificationReceiptLoadResult:
+    status: VerificationReceiptLoadStatus
+    receipt: VerificationReceipt | None = None
+    revision: int = 0
+    event_index: int | None = None
+    message: str | None = None
+
+
+@dataclass(frozen=True)
+class VerificationReceiptSaveResult:
+    status: VerificationReceiptSaveStatus
+    expected_revision: int
+    current_revision: int
+    receipt: VerificationReceipt | None = None
+    message: str | None = None
+    idempotent_replay: bool = False
+
+
+class VerificationReceiptRepository:
+    """Strict, idempotent aggregate verification receipt persistence."""
+
+    _EVENT_FIELDS = frozenset(
+        {
+            "type",
+            "event",
+            "schema_version",
+            "session_id",
+            "turn_id",
+            "receipt_revision",
+            "idempotency_key",
+            "verification_receipt",
+            "timestamp",
+        }
+    )
+
+    def __init__(self, session_store: VerificationReceiptSessionStore) -> None:
+        self._session_store = session_store
+
+    async def load(self, session_id: str, turn_id: str) -> VerificationReceiptLoadResult:
+        normalized_session_id = _clean_text(
+            session_id,
+            field_name="session_id",
+            max_chars=256,
+        )
+        normalized_turn_id = _clean_text(turn_id, field_name="turn_id", max_chars=128)
+        events = await self._session_store.load_session(normalized_session_id)
+        return self._load_from_events(
+            session_id=normalized_session_id,
+            turn_id=normalized_turn_id,
+            events=events,
+        )
+
+    async def save(
+        self,
+        session_id: str,
+        receipt: VerificationReceipt,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+        timestamp: str | None = None,
+    ) -> VerificationReceiptSaveResult:
+        normalized_session_id = _clean_text(
+            session_id,
+            field_name="session_id",
+            max_chars=256,
+        )
+        if not isinstance(receipt, VerificationReceipt):
+            raise TypeError("receipt must be a VerificationReceipt")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected_revision must be a non-negative integer")
+        normalized_idempotency_key = _clean_text(
+            idempotency_key,
+            field_name="idempotency_key",
+            max_chars=256,
+        )
+        current = await self.load(normalized_session_id, receipt.turn_id)
+        if current.status in {"invalid", "unsupported_version"}:
+            return VerificationReceiptSaveResult(
+                status="invalid",
+                expected_revision=expected_revision,
+                current_revision=current.revision,
+                message=current.message or "cannot append after invalid verification receipt state",
+            )
+        next_revision = expected_revision + 1
+        event = {
+            "type": "session_meta",
+            "event": VERIFICATION_RECEIPT_EVENT,
+            "schema_version": VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION,
+            "session_id": normalized_session_id,
+            "turn_id": receipt.turn_id,
+            "receipt_revision": next_revision,
+            "idempotency_key": normalized_idempotency_key,
+            "verification_receipt": receipt.to_dict(),
+            "timestamp": timestamp or datetime.now(tz=UTC).isoformat(),
+        }
+        outcome: VerificationReceiptSaveResult | None = None
+
+        def predicate(events: list[dict[str, Any]]) -> bool:
+            nonlocal outcome
+            loaded = self._load_from_events(
+                session_id=normalized_session_id,
+                turn_id=receipt.turn_id,
+                events=events,
+            )
+            if loaded.status in {"invalid", "unsupported_version"}:
+                outcome = VerificationReceiptSaveResult(
+                    status="invalid",
+                    expected_revision=expected_revision,
+                    current_revision=loaded.revision,
+                    message=loaded.message,
+                )
+                return False
+            duplicate = self._find_idempotent_event(
+                events,
+                session_id=normalized_session_id,
+                turn_id=receipt.turn_id,
+                idempotency_key=normalized_idempotency_key,
+            )
+            if duplicate is not None:
+                if duplicate.get("verification_receipt") == receipt.to_dict():
+                    outcome = VerificationReceiptSaveResult(
+                        status="saved",
+                        expected_revision=expected_revision,
+                        current_revision=int(duplicate["receipt_revision"]),
+                        receipt=receipt,
+                        message="idempotent replay",
+                        idempotent_replay=True,
+                    )
+                    return False
+                outcome = VerificationReceiptSaveResult(
+                    status="invalid",
+                    expected_revision=expected_revision,
+                    current_revision=loaded.revision,
+                    message="idempotency key was reused for a different verification receipt",
+                )
+                return False
+            if loaded.revision != expected_revision:
+                outcome = VerificationReceiptSaveResult(
+                    status="conflict",
+                    expected_revision=expected_revision,
+                    current_revision=loaded.revision,
+                    receipt=loaded.receipt,
+                    message="verification receipt revision changed before append",
+                )
+                return False
+            return True
+
+        appended = await self._session_store.append_event_if(
+            normalized_session_id,
+            event,
+            predicate,
+        )
+        if appended:
+            return VerificationReceiptSaveResult(
+                status="saved",
+                expected_revision=expected_revision,
+                current_revision=next_revision,
+                receipt=receipt,
+            )
+        if outcome is not None:
+            return outcome
+        reloaded = await self.load(normalized_session_id, receipt.turn_id)
+        return VerificationReceiptSaveResult(
+            status="conflict" if reloaded.status == "loaded" else "invalid",
+            expected_revision=expected_revision,
+            current_revision=reloaded.revision,
+            receipt=reloaded.receipt,
+            message=reloaded.message or "verification receipt append lost the SessionStore CAS",
+        )
+
+    @staticmethod
+    def _find_idempotent_event(
+        events: Sequence[Mapping[str, Any]],
+        *,
+        session_id: str,
+        turn_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        for event in reversed(events):
+            if (
+                event.get("event") == VERIFICATION_RECEIPT_EVENT
+                and event.get("session_id") == session_id
+                and event.get("turn_id") == turn_id
+                and event.get("idempotency_key") == idempotency_key
+            ):
+                return event
+        return None
+
+    @classmethod
+    def _load_from_events(
+        cls,
+        *,
+        session_id: str,
+        turn_id: str,
+        events: Sequence[Mapping[str, Any]],
+    ) -> VerificationReceiptLoadResult:
+        for reverse_index, event in enumerate(reversed(events)):
+            if (
+                event.get("event") != VERIFICATION_RECEIPT_EVENT
+                or event.get("turn_id") != turn_id
+            ):
+                continue
+            event_index = len(events) - 1 - reverse_index
+            version = event.get("schema_version")
+            if type(version) is not int:
+                return VerificationReceiptLoadResult(
+                    status="invalid",
+                    event_index=event_index,
+                    message="verification receipt event schema_version must be an integer",
+                )
+            if version != VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION:
+                return VerificationReceiptLoadResult(
+                    status=(
+                        "unsupported_version"
+                        if version > VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION
+                        else "invalid"
+                    ),
+                    event_index=event_index,
+                    message=f"unsupported verification receipt event schema version: {version}",
+                )
+            try:
+                _require_exact_keys(
+                    event,
+                    expected=cls._EVENT_FIELDS,
+                    field_name="verification receipt event",
+                )
+                if event.get("type") != "session_meta":
+                    raise ValueError("verification receipt event type must be session_meta")
+                if event.get("session_id") != session_id:
+                    raise ValueError(
+                        "verification receipt event session_id does not match request"
+                    )
+                revision = event.get("receipt_revision")
+                if type(revision) is not int or revision <= 0:
+                    raise ValueError("receipt_revision must be a positive integer")
+                _clean_text(
+                    event.get("idempotency_key"),
+                    field_name="idempotency_key",
+                    max_chars=256,
+                )
+                _clean_text(event.get("timestamp"), field_name="timestamp", max_chars=128)
+                payload = event.get("verification_receipt")
+                if not isinstance(payload, Mapping):
+                    raise TypeError("verification_receipt must be an object")
+                receipt = VerificationReceipt.from_dict(payload)
+                if receipt.turn_id != turn_id:
+                    raise ValueError("verification receipt payload turn_id does not match envelope")
+            except Exception as exc:
+                return VerificationReceiptLoadResult(
+                    status="invalid",
+                    event_index=event_index,
+                    message=f"invalid verification receipt event: {exc}",
+                )
+            return VerificationReceiptLoadResult(
+                status="loaded",
+                receipt=receipt,
+                revision=revision,
+                event_index=event_index,
+            )
+        return VerificationReceiptLoadResult(status="missing")
+
+
 @dataclass(frozen=True)
 class VerificationEvidence:
     artifact_receipts: Mapping[str, ArtifactReceipt] = field(default_factory=dict)
@@ -515,6 +824,21 @@ class VerificationEvidence:
                     max_chars=12_000,
                 ),
             )
+
+    def recognized_evidence_refs(self) -> frozenset[str]:
+        refs = set(self.artifact_receipts)
+        for receipt_id, receipt in self.artifact_receipts.items():
+            refs.update(
+                _artifact_target_evidence_ref(receipt_id, target.requested_path)
+                for target in receipt.targets
+            )
+        for item in self.tool_execution_evidence:
+            refs.add(item.call_id)
+            if item.operation_id:
+                refs.add(item.operation_id)
+        if self.response_text is not None or self.response_json is not None:
+            refs.add("response")
+        return frozenset(refs)
 
 
 class SemanticJudge(Protocol):
@@ -571,19 +895,57 @@ class ArtifactVerifierAdapter:
                 reason_code="artifact_receipt_missing",
                 retry_disposition="requires_replan",
             )
+
+        target_hint = criterion.payload.get("target_hint")
+        target = None
+        if isinstance(target_hint, str) and target_hint.strip():
+            normalized_hint = _normalized_artifact_target(target_hint)
+            matches = [
+                candidate
+                for candidate in receipt.targets
+                if _normalized_artifact_target(candidate.requested_path)
+                == normalized_hint
+            ]
+            if len(matches) != 1:
+                return CriterionReceipt(
+                    criterion_id=criterion.criterion_id,
+                    verdict="unverified",
+                    verifier_id=self.verifier_id,
+                    evidence_refs=(receipt_id,),
+                    reason_code=(
+                        "artifact_target_missing"
+                        if not matches
+                        else "artifact_target_ambiguous"
+                    ),
+                    retry_disposition="requires_replan",
+                )
+            target = matches[0]
+
+        verification_status = (
+            target.verification_status
+            if target is not None
+            else receipt.verification_status
+        )
         verdict: CriterionVerdict = (
-            "verified" if receipt.verification_status == "verified" else "failed"
+            "verified" if verification_status == "verified" else "failed"
+        )
+        evidence_ref = (
+            _artifact_target_evidence_ref(receipt_id, target.requested_path)
+            if target is not None
+            else receipt_id
+        )
+        reason_scope = "artifact_target" if target is not None else "artifact"
+        reason_code = (
+            f"{reason_scope}_verified"
+            if verdict == "verified"
+            else f"{reason_scope}_{verification_status}"
         )
         return CriterionReceipt(
             criterion_id=criterion.criterion_id,
             verdict=verdict,
             verifier_id=self.verifier_id,
-            evidence_refs=(receipt_id,),
-            reason_code=(
-                "artifact_verified"
-                if verdict == "verified"
-                else f"artifact_{receipt.verification_status}"
-            ),
+            evidence_refs=(evidence_ref,),
+            reason_code=reason_code,
             retry_disposition=receipt.retry_disposition,
         )
 
@@ -818,9 +1180,16 @@ class SemanticJudgeVerifier:
         *,
         judge: SemanticJudge,
         timeout_seconds: float = 20.0,
+        max_criteria: int = 6,
     ) -> None:
+        if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if type(max_criteria) is not int or max_criteria < 0:
+            raise ValueError("max_criteria must be a non-negative integer")
         self._judge = judge
         self._timeout_seconds = timeout_seconds
+        self._max_criteria = max_criteria
+        self._criteria_used = 0
 
     def supports(self, criterion: VerificationCriterion) -> bool:
         return criterion.kind == "semantic"
@@ -830,6 +1199,16 @@ class SemanticJudgeVerifier:
         criterion: VerificationCriterion,
         evidence: VerificationEvidence,
     ) -> CriterionReceipt:
+        if self._criteria_used >= self._max_criteria:
+            return CriterionReceipt(
+                criterion_id=criterion.criterion_id,
+                verdict="unverified",
+                verifier_id=self.verifier_id,
+                evidence_refs=(),
+                reason_code="semantic_judge_budget_exhausted",
+                retry_disposition="requires_replan",
+            )
+        self._criteria_used += 1
         try:
             raw = await asyncio.wait_for(
                 self._judge.judge(criterion, evidence),
@@ -869,6 +1248,11 @@ class SemanticJudgeVerifier:
                 retry_disposition=raw.get("retry_disposition"),
                 confidence=raw.get("confidence"),
             )
+            recognized_refs = evidence.recognized_evidence_refs()
+            if any(ref not in recognized_refs for ref in receipt.evidence_refs):
+                raise ValueError("semantic judge referenced evidence not recognized by the host")
+            if receipt.verdict == "verified" and not receipt.evidence_refs:
+                raise ValueError("verified semantic verdict requires host evidence")
         except Exception:
             return CriterionReceipt(
                 criterion_id=criterion.criterion_id,
@@ -947,7 +1331,12 @@ class DeterministicVerifierRegistry:
                     required_verified_count += 1
                 elif receipt.verdict == "failed" and criterion.kind != "semantic":
                     hard_failure = True
-        verdict = self._aggregate_verdict(criteria, tuple(receipts), required_count, required_verified_count)
+        verdict = self._aggregate_verdict(
+            criteria,
+            tuple(receipts),
+            required_count,
+            required_verified_count,
+        )
         retry_disposition = _retry_disposition_max(
             [receipt.retry_disposition for receipt in receipts]
         )
@@ -973,7 +1362,10 @@ class DeterministicVerifierRegistry:
     ) -> CriterionReceipt:
         for verifier in self._verifiers:
             if verifier.supports(criterion):
-                if criterion.verifier_id is not None and verifier.verifier_id != criterion.verifier_id:
+                if (
+                    criterion.verifier_id is not None
+                    and verifier.verifier_id != criterion.verifier_id
+                ):
                     continue
                 return await verifier.verify(criterion, evidence)
         return CriterionReceipt(
@@ -1033,7 +1425,13 @@ class VerificationPlanCompiler:
         response_shape: Mapping[str, Any] | None = None,
     ) -> tuple[VerificationCriterion, ...]:
         criteria: list[VerificationCriterion] = []
-        for deliverable in deliverables:
+        for deliverable_index, deliverable in enumerate(deliverables):
+            deliverable_identity = {
+                "scope": "deliverable",
+                "ordinal": deliverable_index,
+                "kind": deliverable.kind,
+                "target_hint": deliverable.target_hint,
+            }
             for index, acceptance in enumerate(deliverable.acceptance_criteria):
                 criteria.append(
                     self._compile_acceptance_criterion(
@@ -1042,6 +1440,8 @@ class VerificationPlanCompiler:
                         required=deliverable.required,
                         source_turn_ids=deliverable.source_turn_ids,
                         ordinal=index,
+                        owner_identity=deliverable_identity,
+                        target_hint=deliverable.target_hint,
                     )
                 )
         for obligation_index, obligation in enumerate(artifact_obligations):
@@ -1049,7 +1449,19 @@ class VerificationPlanCompiler:
             source_turn_ids = tuple(payload.get("source_turn_ids", ()))
             criteria.append(
                 VerificationCriterion(
-                    criterion_id=_criterion_identity("artifact", source_turn_ids or ("artifact",), obligation_index),
+                    criterion_id=_criterion_identity(
+                        "artifact",
+                        source_turn_ids or ("artifact",),
+                        obligation_index,
+                        owner_identity={
+                            "scope": "artifact_obligation",
+                            "ordinal": obligation_index,
+                        },
+                        target_hint=str(
+                            payload.get("target_hint") or payload.get("path") or ""
+                        )
+                        or None,
+                    ),
                     kind="artifact",
                     required=bool(payload.get("required", True)),
                     description=_clean_text(
@@ -1078,7 +1490,13 @@ class VerificationPlanCompiler:
                         description=f"{item.title} success criterion {criterion_index + 1}",
                         required=True,
                         source_turn_ids=item.source_turn_ids,
-                        ordinal=item_index + criterion_index,
+                        ordinal=criterion_index,
+                        owner_identity={
+                            "scope": "plan_item",
+                            "ordinal": item_index,
+                            "item_id": item.item_id,
+                        },
+                        target_hint=None,
                     )
                 )
         if response_shape is not None:
@@ -1108,18 +1526,29 @@ class VerificationPlanCompiler:
         required: bool,
         source_turn_ids: tuple[str, ...],
         ordinal: int,
+        owner_identity: Mapping[str, Any],
+        target_hint: str | None,
     ) -> VerificationCriterion:
         if isinstance(acceptance, str):
             legacy_artifact = _legacy_artifact_payload(acceptance)
             if legacy_artifact is not None:
+                artifact_payload = dict(legacy_artifact)
+                if target_hint is not None:
+                    artifact_payload["target_hint"] = target_hint
                 return VerificationCriterion(
-                    criterion_id=_criterion_identity("artifact", source_turn_ids, ordinal),
+                    criterion_id=_criterion_identity(
+                        "artifact",
+                        source_turn_ids,
+                        ordinal,
+                        owner_identity=owner_identity,
+                        target_hint=target_hint,
+                    ),
                     kind="artifact",
                     required=required,
                     description=description,
                     source_turn_ids=source_turn_ids,
                     verifier_id="artifact",
-                    payload=legacy_artifact,
+                    payload=artifact_payload,
                 )
             criterion_kind: CriterionKind = (
                 "semantic" if self._semantic_fallback_enabled else "manual"
@@ -1128,29 +1557,50 @@ class VerificationPlanCompiler:
                 _SEMANTIC_VERIFIER_ID if criterion_kind == "semantic" else _MANUAL_VERIFIER_ID
             )
             return VerificationCriterion(
-                criterion_id=_criterion_identity(criterion_kind, source_turn_ids, ordinal),
+                criterion_id=_criterion_identity(
+                    criterion_kind,
+                    source_turn_ids,
+                    ordinal,
+                    owner_identity=owner_identity,
+                    target_hint=target_hint,
+                ),
                 kind=criterion_kind,
                 required=required,
                 description=description,
                 source_turn_ids=source_turn_ids,
                 verifier_id=verifier_id,
-                payload={"rubric": acceptance},
+                payload={"rubric": acceptance, "target_hint": target_hint},
             )
         if isinstance(acceptance, Mapping):
             kind = acceptance.get("kind")
             if kind == "file":
+                artifact_payload = dict(acceptance)
+                if target_hint is not None and "target_hint" not in artifact_payload:
+                    artifact_payload["target_hint"] = target_hint
                 return VerificationCriterion(
-                    criterion_id=_criterion_identity("artifact", source_turn_ids, ordinal),
+                    criterion_id=_criterion_identity(
+                        "artifact",
+                        source_turn_ids,
+                        ordinal,
+                        owner_identity=owner_identity,
+                        target_hint=target_hint,
+                    ),
                     kind="artifact",
                     required=required,
                     description=description,
                     source_turn_ids=source_turn_ids,
                     verifier_id="artifact",
-                    payload=acceptance,
+                    payload=artifact_payload,
                 )
             if kind == "tool_execution":
                 return VerificationCriterion(
-                    criterion_id=_criterion_identity("tool_execution", source_turn_ids, ordinal),
+                    criterion_id=_criterion_identity(
+                        "tool_execution",
+                        source_turn_ids,
+                        ordinal,
+                        owner_identity=owner_identity,
+                        target_hint=target_hint,
+                    ),
                     kind="tool_execution",
                     required=required,
                     description=description,
@@ -1160,7 +1610,13 @@ class VerificationPlanCompiler:
                 )
         criterion_kind = "manual"
         return VerificationCriterion(
-            criterion_id=_criterion_identity(criterion_kind, source_turn_ids, ordinal),
+            criterion_id=_criterion_identity(
+                criterion_kind,
+                source_turn_ids,
+                ordinal,
+                owner_identity=owner_identity,
+                target_hint=target_hint,
+            ),
             kind=criterion_kind,
             required=required,
             description=description,
@@ -1192,9 +1648,14 @@ __all__ = [
     "SemanticJudgeVerifier",
     "StateVerifier",
     "ToolExecutionVerifier",
+    "VERIFICATION_RECEIPT_EVENT",
+    "VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION",
     "VERIFICATION_RECEIPT_VERSION",
     "VerificationCriterion",
     "VerificationEvidence",
     "VerificationPlanCompiler",
     "VerificationReceipt",
+    "VerificationReceiptLoadResult",
+    "VerificationReceiptRepository",
+    "VerificationReceiptSaveResult",
 ]

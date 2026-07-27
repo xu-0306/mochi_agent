@@ -5,7 +5,11 @@ from types import MappingProxyType
 
 import pytest
 
-from mochi.agents.artifact_verifier import ArtifactReceipt, ToolExecutionEvidence
+from mochi.agents.artifact_verifier import (
+    ArtifactReceipt,
+    ArtifactTargetReceipt,
+    ToolExecutionEvidence,
+)
 from mochi.agents.outcome_verifier import (
     ArtifactVerifierAdapter,
     CriterionReceipt,
@@ -14,17 +18,25 @@ from mochi.agents.outcome_verifier import (
     SemanticJudgeVerifier,
     StateVerifier,
     ToolExecutionVerifier,
+    VERIFICATION_RECEIPT_EVENT,
+    VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION,
     VERIFICATION_RECEIPT_VERSION,
     VerificationCriterion,
     VerificationEvidence,
     VerificationPlanCompiler,
     VerificationReceipt,
+    VerificationReceiptRepository,
 )
 from mochi.agents.plan_ledger import PlanItem
 from mochi.agents.turn_intent_contract import DeliverableContract
+from mochi.sessions.store import SessionStore
 
 
-def _artifact_receipt(*, verification_status: str, retry_disposition: str = "none") -> ArtifactReceipt:
+def _artifact_receipt(
+    *,
+    verification_status: str,
+    retry_disposition: str = "none",
+) -> ArtifactReceipt:
     return ArtifactReceipt(
         operation_id="op-1",
         turn_id="turn-1",
@@ -39,6 +51,26 @@ def _artifact_receipt(*, verification_status: str, retry_disposition: str = "non
         verification_status=verification_status,
         retry_disposition=retry_disposition,
         targets=(),
+    )
+
+
+def _artifact_target(
+    requested_path: str,
+    *,
+    verification_status: str,
+) -> ArtifactTargetReceipt:
+    return ArtifactTargetReceipt(
+        requested_path=requested_path,
+        resolved_path=requested_path,
+        expected_exists=True,
+        exists=verification_status == "verified",
+        in_workspace=True,
+        size_bytes=1 if verification_status == "verified" else None,
+        before_sha256=None,
+        expected_after_sha256=None,
+        actual_after_sha256=("a" * 64 if verification_status == "verified" else None),
+        changed=True if verification_status == "verified" else None,
+        verification_status=verification_status,  # type: ignore[arg-type]
     )
 
 
@@ -83,6 +115,56 @@ def test_verification_receipt_round_trip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_artifact_verifier_binds_each_criterion_to_its_target_evidence() -> None:
+    receipt = ArtifactReceipt(
+        operation_id="op-multi",
+        turn_id="turn-1",
+        goal_id="goal-1",
+        tool_call_ids=("call-1",),
+        resolved_targets=("first.txt", "second.txt"),
+        changed_paths=("first.txt",),
+        before_hashes={"first.txt": None, "second.txt": None},
+        after_hashes={"first.txt": "a" * 64, "second.txt": None},
+        expected_after_hashes={"first.txt": None, "second.txt": None},
+        execution_status="succeeded",
+        verification_status="failed",
+        retry_disposition="requires_replan",
+        targets=(
+            _artifact_target("first.txt", verification_status="verified"),
+            _artifact_target("second.txt", verification_status="failed"),
+        ),
+    )
+    criteria = tuple(
+        VerificationCriterion(
+            criterion_id=f"artifact-{index}",
+            kind="artifact",
+            required=True,
+            description=f"verify {target}",
+            source_turn_ids=("turn-1",),
+            verifier_id="artifact",
+            payload={
+                "receipt_id": "artifact:multi",
+                "check": "exists",
+                "target_hint": target,
+            },
+        )
+        for index, target in enumerate(("first.txt", "second.txt"), start=1)
+    )
+
+    aggregate = await DeterministicVerifierRegistry().verify_all(
+        criteria,
+        VerificationEvidence(artifact_receipts={"artifact:multi": receipt}),
+        receipt_id="verification:turn-1",
+        turn_id="turn-1",
+        goal_id="goal-1",
+    )
+
+    assert [item.verdict for item in aggregate.criteria] == ["verified", "failed"]
+    assert aggregate.criteria[0].evidence_refs != aggregate.criteria[1].evidence_refs
+    assert aggregate.verdict == "failed"
+
+
+@pytest.mark.asyncio
 async def test_registry_fails_when_required_deterministic_criterion_fails() -> None:
     criteria = (
         VerificationCriterion(
@@ -106,11 +188,15 @@ async def test_registry_fails_when_required_deterministic_criterion_fails() -> N
     )
 
     class Judge:
-        async def judge(self, criterion: VerificationCriterion, evidence: VerificationEvidence) -> dict[str, object]:
+        async def judge(
+            self,
+            criterion: VerificationCriterion,
+            evidence: VerificationEvidence,
+        ) -> dict[str, object]:
             del criterion, evidence
             return {
                 "verdict": "verified",
-                "evidence_refs": ["semantic:1"],
+                "evidence_refs": ["response"],
                 "reason_code": "semantic_ok",
                 "retry_disposition": "none",
                 "confidence": 0.8,
@@ -123,7 +209,13 @@ async def test_registry_fails_when_required_deterministic_criterion_fails() -> N
         )
     )
     evidence = VerificationEvidence(
-        artifact_receipts={"artifact:1": _artifact_receipt(verification_status="failed", retry_disposition="requires_replan")}
+        artifact_receipts={
+            "artifact:1": _artifact_receipt(
+                verification_status="failed",
+                retry_disposition="requires_replan",
+            )
+        },
+        response_text="The response is available as host evidence.",
     )
     receipt = await registry.verify_all(
         criteria,
@@ -163,7 +255,8 @@ async def test_registry_marks_missing_required_support_unverified() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_required_semantic_failure_blocks_verification_without_hard_failure() -> None:
+async def test_registry_required_semantic_failure_blocks_verification_without_hard_failure(
+) -> None:
     criterion = VerificationCriterion(
         criterion_id="semantic-1",
         kind="semantic",
@@ -183,7 +276,7 @@ async def test_registry_required_semantic_failure_blocks_verification_without_ha
             del criterion, evidence
             return {
                 "verdict": "failed",
-                "evidence_refs": ["semantic:1"],
+                "evidence_refs": ["response"],
                 "reason_code": "semantic_mismatch",
                 "retry_disposition": "requires_replan",
                 "confidence": 0.4,
@@ -193,7 +286,7 @@ async def test_registry_required_semantic_failure_blocks_verification_without_ha
         (SemanticJudgeVerifier(judge=Judge()),)
     ).verify_all(
         (criterion,),
-        VerificationEvidence(),
+        VerificationEvidence(response_text="A response that does not satisfy the rubric."),
         receipt_id="receipt-1",
         turn_id="turn-1",
         goal_id="goal-1",
@@ -246,6 +339,50 @@ def test_compiler_maps_legacy_and_structured_acceptance_criteria() -> None:
         "artifact",
         "response_shape",
     ]
+
+
+def test_compiler_assigns_unique_target_bound_ids_for_multiple_deliverables() -> None:
+    compiler = VerificationPlanCompiler(semantic_fallback_enabled=True)
+    criteria = compiler.compile(
+        deliverables=(
+            DeliverableContract(
+                kind="file",
+                target_hint="first.txt",
+                source_turn_ids=("turn-1",),
+                acceptance_criteria=("exists", "explain first"),
+            ),
+            DeliverableContract(
+                kind="file",
+                target_hint="second.txt",
+                source_turn_ids=("turn-1",),
+                acceptance_criteria=("exists", "explain second"),
+            ),
+        )
+    )
+
+    assert len({criterion.criterion_id for criterion in criteria}) == len(criteria)
+    assert [criterion.payload.get("target_hint") for criterion in criteria] == [
+        "first.txt",
+        "first.txt",
+        "second.txt",
+        "second.txt",
+    ]
+    assert compiler.compile(
+        deliverables=(
+            DeliverableContract(
+                kind="file",
+                target_hint="first.txt",
+                source_turn_ids=("turn-1",),
+                acceptance_criteria=("exists", "explain first"),
+            ),
+            DeliverableContract(
+                kind="file",
+                target_hint="second.txt",
+                source_turn_ids=("turn-1",),
+                acceptance_criteria=("exists", "explain second"),
+            ),
+        )
+    ) == criteria
 
 
 @pytest.mark.asyncio
@@ -305,7 +442,11 @@ async def test_semantic_judge_fails_closed_on_timeout_and_malformed_payload() ->
     )
 
     class SlowJudge:
-        async def judge(self, criterion: VerificationCriterion, evidence: VerificationEvidence) -> dict[str, object]:
+        async def judge(
+            self,
+            criterion: VerificationCriterion,
+            evidence: VerificationEvidence,
+        ) -> dict[str, object]:
             del criterion, evidence
             await asyncio.sleep(0.05)
             return {
@@ -317,7 +458,11 @@ async def test_semantic_judge_fails_closed_on_timeout_and_malformed_payload() ->
             }
 
     class BadJudge:
-        async def judge(self, criterion: VerificationCriterion, evidence: VerificationEvidence) -> dict[str, object]:
+        async def judge(
+            self,
+            criterion: VerificationCriterion,
+            evidence: VerificationEvidence,
+        ) -> dict[str, object]:
             del criterion, evidence
             return {"bad": True}
 
@@ -333,3 +478,133 @@ async def test_semantic_judge_fails_closed_on_timeout_and_malformed_payload() ->
     assert timeout_receipt.reason_code == "semantic_judge_timeout"
     assert malformed_receipt.verdict == "unverified"
     assert malformed_receipt.reason_code == "semantic_judge_malformed"
+
+
+@pytest.mark.asyncio
+async def test_semantic_judge_rejects_model_invented_evidence_refs() -> None:
+    criterion = VerificationCriterion(
+        criterion_id="semantic-1",
+        kind="semantic",
+        required=True,
+        description="judge text",
+        source_turn_ids=("turn-1",),
+        verifier_id="semantic_judge",
+        payload={"rubric": "be correct"},
+    )
+
+    class InventingJudge:
+        async def judge(self, criterion, evidence):  # type: ignore[no-untyped-def]
+            del criterion, evidence
+            return {
+                "verdict": "verified",
+                "evidence_refs": ["model-invented-proof"],
+                "reason_code": "looks_good",
+                "retry_disposition": "none",
+                "confidence": 0.99,
+            }
+
+    receipt = await SemanticJudgeVerifier(judge=InventingJudge()).verify(
+        criterion,
+        VerificationEvidence(response_text="Host-owned response evidence."),
+    )
+
+    assert receipt.verdict == "unverified"
+    assert receipt.evidence_refs == ()
+    assert receipt.reason_code == "semantic_judge_malformed"
+
+
+def _aggregate_receipt(*, verdict: str = "verified") -> VerificationReceipt:
+    return VerificationReceipt(
+        receipt_version=VERIFICATION_RECEIPT_VERSION,
+        receipt_id="verification:turn-1",
+        turn_id="turn-1",
+        goal_id="goal-1",
+        verdict=verdict,  # type: ignore[arg-type]
+        criteria=(
+            CriterionReceipt(
+                criterion_id="criterion-1",
+                verdict=verdict,  # type: ignore[arg-type]
+                verifier_id="artifact",
+                evidence_refs=("artifact:1",),
+                reason_code="artifact_verified",
+                retry_disposition="none",
+            ),
+        ),
+        hard_failure=False,
+        retry_disposition="none",
+    )
+
+
+@pytest.mark.asyncio
+async def test_verification_receipt_repository_is_idempotent_and_restart_safe(tmp_path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    first = VerificationReceiptRepository(SessionStore(sessions_dir))
+    receipt = _aggregate_receipt()
+
+    saved = await first.save(
+        "session-1",
+        receipt,
+        expected_revision=0,
+        idempotency_key="verification:turn-1:verified",
+    )
+    replay = await first.save(
+        "session-1",
+        receipt,
+        expected_revision=0,
+        idempotency_key="verification:turn-1:verified",
+        timestamp="2026-07-27T01:00:00+00:00",
+    )
+    restarted = await VerificationReceiptRepository(
+        SessionStore(sessions_dir)
+    ).load("session-1", "turn-1")
+
+    assert saved.status == "saved"
+    assert replay.status == "saved"
+    assert replay.idempotent_replay is True
+    assert restarted.status == "loaded"
+    assert restarted.receipt == receipt
+    events = await SessionStore(sessions_dir).load_session("session-1")
+    assert [event.get("event") for event in events].count(VERIFICATION_RECEIPT_EVENT) == 1
+
+
+@pytest.mark.asyncio
+async def test_verification_receipt_repository_latest_malformed_and_future_fail_closed(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    repository = VerificationReceiptRepository(store)
+    receipt = _aggregate_receipt()
+    await repository.save(
+        "session-1",
+        receipt,
+        expected_revision=0,
+        idempotency_key="verification:valid",
+    )
+    malformed = {
+        "type": "session_meta",
+        "event": VERIFICATION_RECEIPT_EVENT,
+        "schema_version": VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION,
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "receipt_revision": 2,
+        "idempotency_key": "verification:malformed",
+        "verification_receipt": {"receipt_version": "verification-receipt-v99"},
+        "timestamp": "2026-07-27T02:00:00+00:00",
+    }
+    await store.save_event("session-1", malformed)
+    assert (await repository.load("session-1", "turn-1")).status == "invalid"
+
+    future_store = SessionStore(tmp_path / "future-sessions")
+    await future_store.save_event(
+        "session-2",
+        {
+            **malformed,
+            "session_id": "session-2",
+            "schema_version": VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION + 1,
+        },
+    )
+    future = await VerificationReceiptRepository(future_store).load(
+        "session-2",
+        "turn-1",
+    )
+    assert future.status == "unsupported_version"
