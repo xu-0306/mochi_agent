@@ -55,6 +55,7 @@
     "test:tool-workflow-aggregate": "node --experimental-strip-types ./src/lib/tool-workflow-aggregate.test.ts",
     "test:tool-workflow-aggregate-sse": "node --experimental-strip-types ./src/lib/tool-workflow-aggregate-sse.test.ts",
     "test:tool-workflow-observability": "node --experimental-strip-types ./src/lib/tool-workflow-observability.test.ts",
+    "test:ordinary-chat-plan": "node --experimental-strip-types ./src/lib/ordinary-chat-plan.test.ts",
     "test:dialog-animation": "node ./scripts/test-dialog-animation.mjs",
     "test:sidebar-bulk-delete": "node ./scripts/test-sidebar-bulk-delete.mjs",
     "test:workflows-labeling": "node ./scripts/test-workflows-labeling.mjs",

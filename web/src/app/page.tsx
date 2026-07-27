@@ -29,6 +29,7 @@ import { ExecutionTimeline } from '@/components/chat/ExecutionTimeline'
 import { SubagentDrawer } from '@/components/chat/SubagentDrawer'
 import { SubagentTimelineCard } from '@/components/chat/SubagentTimelineCard'
 import { ChatMessage } from '@/components/chat/ChatMessage'
+import { OrdinaryChatPlanCard } from '@/components/chat/OrdinaryChatPlanCard'
 import { EmptyState } from '@/components/chat/EmptyState'
 import { ExportDialog } from '@/components/chat/ExportDialog'
 import { InferencePanel } from '@/components/chat/InferencePanel'
@@ -98,6 +99,10 @@ import {
   classifyActiveGoalTurnDecision,
 } from '@/lib/goal-turn-controller'
 import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
+import {
+  hydrateOrdinaryChatPlanProjection,
+  markProvisionalOrdinaryChatFinals,
+} from '@/lib/ordinary-chat-plan'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
   findRegeneratePrompt,
@@ -2113,9 +2118,13 @@ export default function ChatPage() {
     () => buildWorkflowProgressCardView(projectedWorkflowRun),
     [projectedWorkflowRun]
   )
+  const ordinaryChatPlanState = React.useMemo(
+    () => hydrateOrdinaryChatPlanProjection(currentSessionDetail?.adaptiveRuntime),
+    [currentSessionDetail?.adaptiveRuntime]
+  )
   const displayMessages = React.useMemo<Message[]>(() => {
     return buildProjectedDisplayMessages({
-      messages,
+      messages: markProvisionalOrdinaryChatFinals(messages, ordinaryChatPlanState),
       runtimeTasks: contextualRuntimeTasks,
       workflowProgressCard,
       workflowRun: projectedWorkflowRun,
@@ -2125,6 +2134,7 @@ export default function ChatPage() {
     contextualRuntimeTasks,
     currentSessionGoalState.execution_mode,
     messages,
+    ordinaryChatPlanState,
     projectedWorkflowRun,
     workflowProgressCard,
   ])
@@ -6525,29 +6535,36 @@ export default function ChatPage() {
                     onSettings={() => router.push('/settings')}
                   />
                 ) : (
-                  displayMessages.map((message) => (
-                    <ChatMessage
-                      key={message.id}
-                      message={
-                        message.type === 'assistant' && !effectiveInference.showTokenStats
-                          ? { ...message, tokenStats: undefined }
-                          : message
-                      }
-                      sessionId={currentSessionId}
-                      projectId={effectiveProjectId}
-                      onRegenerate={
-                        message.type === 'assistant' &&
-                        !message.workflowCard &&
-                        !message.workflowCompletion &&
-                        !message.subagentTaskCard
-                          ? handleRegenerate
-                          : undefined
-                      }
-                      onEditAndResend={message.type === 'user' ? (message) => handleEditAndResend(message) : undefined}
-                      onUndoFileChange={handleUndoFileChange}
-                      onOpenTask={handleOpenRuntimeTask}
-                    />
-                  ))
+                  <>
+                    {!currentSessionGoalState.active_goal_id &&
+                    !currentSessionGoalState.pending_proposal &&
+                    !workflowProgressCard ? (
+                      <OrdinaryChatPlanCard state={ordinaryChatPlanState} />
+                    ) : null}
+                    {displayMessages.map((message) => (
+                      <ChatMessage
+                        key={message.id}
+                        message={
+                          message.type === 'assistant' && !effectiveInference.showTokenStats
+                            ? { ...message, tokenStats: undefined }
+                            : message
+                        }
+                        sessionId={currentSessionId}
+                        projectId={effectiveProjectId}
+                        onRegenerate={
+                          message.type === 'assistant' &&
+                          !message.workflowCard &&
+                          !message.workflowCompletion &&
+                          !message.subagentTaskCard
+                            ? handleRegenerate
+                            : undefined
+                        }
+                        onEditAndResend={message.type === 'user' ? (message) => handleEditAndResend(message) : undefined}
+                        onUndoFileChange={handleUndoFileChange}
+                        onOpenTask={handleOpenRuntimeTask}
+                      />
+                    ))}
+                  </>
                 )}
               </div>
             </div>

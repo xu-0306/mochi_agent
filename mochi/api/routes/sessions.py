@@ -16,6 +16,7 @@ from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
 from mochi.api.session_store_binding import resolve_route_session_store
 from mochi.agents.conversation_state_store import TURN_CHECKPOINT_EVENT
+from mochi.api.adaptive_runtime_projection import project_adaptive_runtime
 from mochi.api.tool_workflow_outbox import (
     TOOL_WORKFLOW_APPROVAL_OBSERVATION_EVENT,
     TOOL_WORKFLOW_OUTBOX_EVENT,
@@ -715,13 +716,17 @@ async def stream_tool_workflow_aggregates(
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str, http_request: Request) -> dict[str, object]:
+async def get_session(
+    session_id: str,
+    http_request: Request,
+    include_adaptive_runtime: bool = Query(default=False),
+) -> dict[str, object]:
     """讀取單一 session 的事件列表。"""
     app = http_request.app
     config = await _get_config(app)
     store = _get_session_store(app, config=config)
     events = await store.load_session(session_id)
-    return {
+    response: dict[str, object] = {
         "type": "session",
         "session_id": session_id,
         "title": _session_title(session_id, events),
@@ -732,6 +737,122 @@ async def get_session(session_id: str, http_request: Request) -> dict[str, objec
         "protected_workspace": _protected_workspace_projection(config, session_id),
         "events": events,
     }
+    if include_adaptive_runtime:
+        response["adaptive_runtime"] = project_adaptive_runtime(session_id, events)
+    return response
+
+
+@router.get("/sessions/{session_id}/adaptive-runtime")
+async def get_adaptive_runtime_projection(
+    session_id: str,
+    http_request: Request,
+    max_turns: int = Query(default=12, ge=1, le=100),
+    max_events: int = Query(default=128, ge=1, le=500),
+) -> dict[str, Any]:
+    """Return the bounded replay-safe ordinary Chat runtime projection."""
+
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    events = await store.load_session(session_id)
+    return project_adaptive_runtime(
+        session_id,
+        events,
+        max_turns=max_turns,
+        max_events=max_events,
+    )
+
+
+@router.get("/sessions/{session_id}/adaptive-runtime/range")
+async def get_adaptive_runtime_range(
+    session_id: str,
+    http_request: Request,
+    after_sequence: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    """Return a bounded range of projected durable adaptive events."""
+
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    projection = project_adaptive_runtime(session_id, await store.load_session(session_id))
+    available = [
+        event
+        for event in projection["events"]
+        if int(event["sequence"]) > after_sequence
+    ]
+    selected = available[:limit]
+    return {
+        "type": "ordinary_chat_adaptive_runtime_range",
+        "schema_version": 1,
+        "session_id": session_id,
+        "after_sequence": after_sequence,
+        "limit": limit,
+        "events": selected,
+        "next_after_sequence": int(selected[-1]["sequence"]) if selected else after_sequence,
+        "has_more": len(available) > len(selected),
+        "projection": {
+            "projection_version": projection["projection_version"],
+            "revision": projection["revision"],
+            "latest_sequence": projection["latest_sequence"],
+        },
+    }
+
+
+@router.get("/sessions/{session_id}/adaptive-runtime/stream")
+async def stream_adaptive_runtime_projection(
+    session_id: str,
+    http_request: Request,
+    after_sequence: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    """Replay projected adaptive events as named SSE records."""
+
+    config = await _get_config(http_request.app)
+    store = _get_session_store(http_request.app, config=config)
+    if not await store.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    projection = project_adaptive_runtime(session_id, await store.load_session(session_id))
+    records = list(projection["events"])
+    last_event_id = http_request.headers.get("last-event-id")
+    if last_event_id:
+        matched = next(
+            (event for event in records if event.get("event_id") == last_event_id),
+            None,
+        )
+        if matched is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "adaptive_runtime_cursor_not_found",
+                    "requires_snapshot": True,
+                },
+            )
+        after_sequence = int(matched["sequence"])
+    records = [event for event in records if int(event["sequence"]) > after_sequence]
+
+    async def events() -> Any:
+        for event in records:
+            yield {
+                "_sse_event": "ordinary_chat_adaptive_runtime",
+                "_sse_id": event["event_id"],
+                "_sse_data": {
+                    "type": "ordinary_chat_adaptive_runtime_event",
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "event": event,
+                },
+            }
+
+    return StreamingResponse(
+        sse_stream(events()),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/sessions/{session_id}/subagents", response_model=list[SubagentTranscriptSummary])

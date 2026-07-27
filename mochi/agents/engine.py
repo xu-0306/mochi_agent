@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import inspect
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -107,6 +108,7 @@ from mochi.agents.outcome_verifier import (
 )
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
+from mochi.agents.recovery_policy import RecoveryBudget, RecoveryPolicy
 from mochi.agents.turn_intent_contract import DeliverableContract
 from mochi.agents.turn_contract_rollout import (
     TurnContractRolloutResult,
@@ -144,6 +146,10 @@ from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.learning.evaluator import OutcomeEvaluator
 from mochi.learning.extractor import SkillExtractor
 from mochi.learning.improver import SkillImprover
+from mochi.learning.failure_episode import FailureEpisode
+from mochi.learning.failure_outbox import FailureOutboxRepository
+from mochi.learning.failure_store import FailureStore
+from mochi.learning.runtime import LearningRuntime
 from mochi.learning.skill_library import SkillLibrary
 from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.learning.skill_loader import SkillLoader, default_system_skills_dir
@@ -662,6 +668,7 @@ class AgentEngine:
         turn_checkpoint_repository: TurnCheckpointRepository | None = None,
         tool_discovery_state_repository: ToolDiscoveryStateRepository | None = None,
         validation_profile_registry: ValidationProfileRegistry | None = None,
+        learning_runtime: LearningRuntime | None = None,
     ) -> None:
         """初始化 AgentEngine（同步部分）。
 
@@ -704,6 +711,12 @@ class AgentEngine:
         )
         self._tool_workflow_verifier_diagnostics = ToolWorkflowOutboxVerifierDiagnostics()
         self._session_store = self._make_session_store(config)
+        self._owns_learning_runtime = learning_runtime is None
+        self._learning_runtime = learning_runtime or LearningRuntime(
+            FailureOutboxRepository(self._session_store),
+            FailureStore(self._session_store),
+            enabled=config.agent.ordinary_chat_adaptive_runtime.failure_learning.enabled,
+        )
         self._verification_receipt_repository = VerificationReceiptRepository(
             self._session_store
         )
@@ -821,6 +834,12 @@ class AgentEngine:
     def tool_workflow_outbox_verifier_counters_snapshot(self) -> dict[str, int]:
         return self._tool_workflow_verifier_diagnostics.snapshot()
 
+    @property
+    def learning_runtime(self) -> LearningRuntime:
+        """Return the durable failure-learning runtime bound to this engine."""
+
+        return self._learning_runtime
+
     async def _observe_tool_workflow_approval(self, approval: Any) -> Any:
         """Stable context dispatcher; publication policy is read live."""
 
@@ -913,6 +932,145 @@ class AgentEngine:
                 session_id,
                 turn_id,
                 result.message or result.status,
+            )
+
+    async def _record_failure_learning_candidate(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        verification_result: Mapping[str, Any],
+        execution_receipt: Mapping[str, Any] | None,
+        final_event: FinalAnswerEvent | None,
+        turn_contract_rollout: Any,
+        events: Sequence[AgentEvent],
+        blocker_reason: str | None,
+    ) -> None:
+        """Append a redacted learning candidate after turn finalization.
+
+        This producer is deliberately synchronous only with the durable outbox
+        append.  It never calls a model and the worker remains optional, so a
+        standalone AgentEngine is still correct when no application lifecycle
+        has started the learning worker.
+        """
+
+        learning_config = self._config.agent.ordinary_chat_adaptive_runtime.failure_learning
+        if not learning_config.enabled:
+            return
+        aggregate_verdict = str(
+            verification_result.get("aggregate_verdict") or ""
+        ).strip()
+        verification_status = str(
+            verification_result.get("verification_status") or ""
+        ).strip()
+        controlled_recovery = (
+            execution_receipt.get("controlled_recovery")
+            if isinstance(execution_receipt, Mapping)
+            else None
+        )
+        correction_attempted = isinstance(controlled_recovery, Mapping) and bool(
+            controlled_recovery.get("replans_used")
+        )
+        needs_candidate = (
+            aggregate_verdict in {"failed", "unverified"}
+            or verification_status in {"failed", "unverified"}
+            or correction_attempted
+            or bool(blocker_reason)
+        )
+        if not needs_candidate:
+            return
+
+        reason_codes: list[str] = []
+
+        def add_reason(value: object) -> None:
+            if isinstance(value, str) and value.strip() and value.strip() not in reason_codes:
+                reason_codes.append(value.strip()[:128])
+
+        add_reason(
+            f"verification_{aggregate_verdict or verification_status}"
+            if aggregate_verdict or verification_status
+            else None
+        )
+        add_reason(blocker_reason)
+        if isinstance(final_event, FinalAnswerEvent):
+            metadata = final_event.metadata
+            if isinstance(metadata, Mapping):
+                add_reason(metadata.get("error_type"))
+        if isinstance(controlled_recovery, Mapping):
+            add_reason(controlled_recovery.get("reason_code"))
+        raw_errors = verification_result.get("errors")
+        feedback_values = (
+            tuple(item for item in raw_errors if isinstance(item, str))
+            if isinstance(raw_errors, Sequence)
+            and not isinstance(raw_errors, (str, bytes))
+            else ()
+        )
+        if isinstance(raw_errors, Sequence) and not isinstance(raw_errors, (str, bytes)):
+            for error in raw_errors:
+                if isinstance(error, Mapping):
+                    add_reason(error.get("reason_code") or error.get("code"))
+                elif isinstance(error, str):
+                    add_reason("verification_error")
+        if not reason_codes:
+            reason_codes.append("ordinary_chat_failure")
+
+        capability_tags = ["ordinary_chat", "verification"]
+        artifact_obligation = getattr(
+            getattr(turn_contract_rollout, "capability_plan", None),
+            "artifact_obligation",
+            None,
+        )
+        if getattr(artifact_obligation, "required", False):
+            capability_tags.append("artifact")
+        if correction_attempted:
+            capability_tags.append("controlled_recovery")
+        mutation_tool_name = next(
+            (
+                event.tool_name
+                for event in reversed(events)
+                if isinstance(event, ToolCallResultEvent) and event.tool_name
+            ),
+            None,
+        )
+        receipt_id = str(
+            verification_result.get("receipt_id")
+            or (
+                verification_result.get("aggregate_verification_receipt", {}).get(
+                    "receipt_id"
+                )
+                if isinstance(
+                    verification_result.get("aggregate_verification_receipt"),
+                    Mapping,
+                )
+                else ""
+            )
+            or verification_status
+            or aggregate_verdict
+        )
+        identity = hashlib.sha256(
+            f"{turn_id}|{receipt_id}|{';'.join(reason_codes)}".encode()
+        ).hexdigest()[:32]
+        try:
+            episode = FailureEpisode.candidate(
+                session_id=session_id,
+                turn_id=turn_id,
+                capability_tags=capability_tags,
+                tool_name=mutation_tool_name,
+                failure_signature=";".join(reason_codes),
+                reason_codes=reason_codes,
+                verifier_feedback=tuple(error[:400] for error in feedback_values),
+                correction_attempted=correction_attempted,
+                correction_verified=correction_attempted
+                and aggregate_verdict == "verified",
+                episode_id=f"failure-episode:{identity}",
+                idempotency_key=f"failure-learning:{identity}",
+            )
+            await self._learning_runtime.submit(episode)
+        except Exception as exc:
+            logger.warning(
+                "ordinary-chat failure-learning candidate append failed for turn={}: {}",
+                turn_id,
+                type(exc).__name__,
             )
 
     async def _session_user_turn_index(
@@ -3247,6 +3405,7 @@ class AgentEngine:
                             )
 
         controlled_recovery_blocker_reason: str | None = None
+        recovery_budget_runtime: dict[str, Any] | None = None
         if turn_checkpoint is not None and approval_record is None:
             initial_final_event = next(
                 (event for event in reversed(events) if isinstance(event, FinalAnswerEvent)),
@@ -3263,11 +3422,37 @@ class AgentEngine:
                 and turn_contract_rollout.capability_plan.artifact_obligation.required
                 and turn_contract_rollout.capability_plan.artifact_obligation.ready
             )
+            aggregate_verification_payload = (
+                initial_receipt.get("aggregate_verification_receipt")
+                if isinstance(initial_receipt, Mapping)
+                else None
+            )
+            aggregate_recovery_requested = False
+            aggregate_policy_receipt: VerificationReceipt | None = None
+            aggregate_policy_receipt_error: str | None = None
+            if isinstance(aggregate_verification_payload, Mapping):
+                aggregate_recovery_requested = aggregate_verification_payload.get(
+                    "verdict"
+                ) in {"failed", "unverified"}
+                if aggregate_recovery_requested:
+                    try:
+                        aggregate_policy_receipt = VerificationReceipt.from_dict(
+                            aggregate_verification_payload
+                        )
+                    except (TypeError, ValueError):
+                        aggregate_policy_receipt_error = (
+                            "aggregate_verification_receipt_invalid"
+                        )
             if (
                 artifact_required
                 and initial_receipt is not None
-                and initial_receipt.get("verification_status") == "failed"
+                and (
+                    initial_receipt.get("verification_status") == "failed"
+                    or aggregate_recovery_requested
+                )
                 and request.timeline_coordinator is not None
+                and self._config.agent.ordinary_chat_adaptive_runtime.enabled
+                and self._config.agent.ordinary_chat_adaptive_runtime.recovery.enabled
             ):
                 recovery_state, recovery_state_error = self._controlled_recovery_state(
                     execution_receipt
@@ -3277,27 +3462,33 @@ class AgentEngine:
                 )
                 operation, operation_error = self._recovery_operation_from_events(events)
                 decision: ControlledRecoveryDecision | None = None
+                policy_decision: Any | None = None
+                corrective_context: Mapping[str, Any] | None = None
                 if recovery_state_error is not None:
                     controlled_recovery_blocker_reason = recovery_state_error
                 elif recovery_budget_error is not None:
                     controlled_recovery_blocker_reason = recovery_budget_error
+                elif aggregate_policy_receipt_error is not None:
+                    controlled_recovery_blocker_reason = aggregate_policy_receipt_error
                 elif request.timeline_pre_effect_failure:
                     controlled_recovery_blocker_reason = "timeline_pre_effect_failure"
-                elif not self._is_automatically_correctable_receipt(initial_receipt):
+                elif (
+                    not aggregate_recovery_requested
+                    and not self._is_automatically_correctable_receipt(initial_receipt)
+                ):
                     controlled_recovery_blocker_reason = "artifact_recovery_not_automatable"
                 elif operation_error is not None:
                     controlled_recovery_blocker_reason = operation_error
-                elif operation is None:
+                elif operation is None and aggregate_policy_receipt is None:
                     controlled_recovery_blocker_reason = "timeline_operation_evidence_missing"
                 elif recovery_state["status"] == "reserved":
                     controlled_recovery_blocker_reason = (
                         "controlled_recovery_reservation_requires_manual_replan"
                     )
-                elif recovery_budget["remaining_attempts"] < 1:
-                    controlled_recovery_blocker_reason = (
-                        "controlled_recovery_budget_exhausted"
-                    )
-                elif recovery_state["replans_used"] >= recovery_state["max_replans"]:
+                elif (
+                    recovery_budget["remaining_attempts"] < 1
+                    or recovery_state["replans_used"] >= recovery_state["max_replans"]
+                ):
                     controlled_recovery_blocker_reason = "controlled_recovery_budget_exhausted"
                 elif bool(
                     tool_execution_context.permission_policy.get(
@@ -3307,19 +3498,88 @@ class AgentEngine:
                     controlled_recovery_blocker_reason = "controlled_recovery_requires_approval"
                 else:
                     try:
-                        decision = ControlledRecoveryCoordinator.decide(
-                            operation=operation,
-                            receipt=ArtifactReceiptState(
-                                execution_status=str(initial_receipt.get("execution_status")),  # type: ignore[arg-type]
-                                retry_disposition=str(initial_receipt.get("retry_disposition")),  # type: ignore[arg-type]
-                            ),
-                        )
+                        if aggregate_policy_receipt is not None:
+                            policy_decision = RecoveryPolicy.decide(
+                                receipt=aggregate_policy_receipt,
+                                operation=operation,
+                                plan_ledger=cast(
+                                    Mapping[str, Any] | None,
+                                    tool_execution_context.state.get(
+                                        "plan_ledger_snapshot"
+                                    ),
+                                ),
+                                budget=RecoveryBudget.from_dict(recovery_budget),
+                                fresh_operation_id=(
+                                    f"recovery:{turn_id}:{recovery_state['replans_used'] + 1}"
+                                ),
+                            )
+                            if policy_decision.action in {
+                                "model_replan",
+                                "new_operation",
+                                "corrective_replan",
+                            }:
+                                decision = ControlledRecoveryDecision(
+                                    action=policy_decision.action,
+                                    reason_code=policy_decision.reason_code,
+                                    operation_id=(
+                                        operation.operation_id if operation is not None else None
+                                    ),
+                                    supersedes_operation_id=(
+                                        operation.operation_id
+                                        if policy_decision.action
+                                        in {"new_operation", "corrective_replan"}
+                                        and operation is not None
+                                        else None
+                                    ),
+                                )
+                            else:
+                                controlled_recovery_blocker_reason = (
+                                    policy_decision.reason_code
+                                )
+                        else:
+                            decision = ControlledRecoveryCoordinator.decide(
+                                operation=operation,
+                                receipt=ArtifactReceiptState(
+                                    execution_status=str(initial_receipt.get("execution_status")),  # type: ignore[arg-type]
+                                    retry_disposition=str(initial_receipt.get("retry_disposition")),  # type: ignore[arg-type]
+                                ),
+                            )
                     except ValueError:
                         controlled_recovery_blocker_reason = "artifact_recovery_receipt_invalid"
 
-                if decision is not None and decision.action == "blocked_unknown":
-                    controlled_recovery_blocker_reason = decision.reason_code
-                elif decision is not None and decision.action not in {
+                if (
+                    policy_decision is not None
+                    and decision is not None
+                    and aggregate_policy_receipt is not None
+                    and controlled_recovery_blocker_reason is None
+                ):
+                    try:
+                        corrective_context = cast(
+                            Mapping[str, Any],
+                            RecoveryPolicy.build_corrective_context(
+                                receipt=aggregate_policy_receipt,
+                                decision=policy_decision,
+                                plan_ledger=cast(
+                                    Mapping[str, Any] | None,
+                                    tool_execution_context.state.get(
+                                        "plan_ledger_snapshot"
+                                    ),
+                                ),
+                                allowed_targets=tuple(
+                                    value
+                                    for value in initial_receipt.get(
+                                        "resolved_targets", ()
+                                    )
+                                    if isinstance(value, str)
+                                ),
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        controlled_recovery_blocker_reason = (
+                            "controlled_recovery_context_invalid"
+                        )
+
+                if decision is not None and decision.action not in {
                     "new_operation",
                     "corrective_replan",
                     "model_replan",
@@ -3327,6 +3587,26 @@ class AgentEngine:
                     controlled_recovery_blocker_reason = decision.reason_code
 
                 reserved_recovery_budget: dict[str, Any] | None = None
+                if decision is not None and controlled_recovery_blocker_reason is None:
+                    attempted_plan_ledger, plan_attempt_error = (
+                        await self._record_recovery_plan_attempt(
+                            session_id=session_key,
+                            turn_id=turn_id,
+                            plan_ledger_snapshot=cast(
+                                Mapping[str, Any] | None,
+                                tool_execution_context.state.get(
+                                    "plan_ledger_snapshot"
+                                ),
+                            ),
+                            attempt_number=recovery_state["replans_used"] + 1,
+                        )
+                    )
+                    if plan_attempt_error is not None:
+                        controlled_recovery_blocker_reason = plan_attempt_error
+                    elif attempted_plan_ledger is not None:
+                        tool_execution_context.state["plan_ledger_snapshot"] = (
+                            attempted_plan_ledger
+                        )
                 if decision is not None and controlled_recovery_blocker_reason is None:
                     reserved_recovery_budget, budget_error = (
                         self._reserve_controlled_recovery_budget(turn_checkpoint)
@@ -3343,6 +3623,12 @@ class AgentEngine:
                         "reason_code": decision.reason_code,
                         "predecessor_operation_id": decision.operation_id,
                     }
+                    if policy_decision is not None:
+                        recovery_metadata["policy_decision"] = policy_decision.to_dict()
+                    if corrective_context is not None:
+                        recovery_metadata["corrective_context"] = _checkpoint_json_safe(
+                            dict(corrective_context)
+                        )
                     execution_receipt = dict(execution_receipt or {})
                     execution_receipt["controlled_recovery"] = recovery_metadata
                     turn_checkpoint, recovery_checkpoint_error = (
@@ -3390,6 +3676,20 @@ class AgentEngine:
                             turn_event_seq=turn_event_seq,
                             controlled_recovery=recovery_metadata,
                         )
+                        reserved_budget = RecoveryBudget.from_dict(reserved_recovery_budget)
+                        recovery_budget_runtime = {
+                            "started_at": time.perf_counter(),
+                            "model_calls_limit": 1
+                            + reserved_budget.remaining_extra_model_calls,
+                            "model_calls_used": 0,
+                            "tool_calls_limit": reserved_budget.remaining_extra_tool_calls,
+                            "tool_calls_used": 0,
+                            "wall_seconds_limit": reserved_budget.remaining_extra_wall_seconds,
+                            "exhausted_reason": None,
+                        }
+                        tool_execution_context.state[
+                            "controlled_recovery_budget_runtime"
+                        ] = recovery_budget_runtime
                         recovery_start = len(events)
                         recovery_history = [
                             *prompt_context.history,
@@ -3408,6 +3708,7 @@ class AgentEngine:
                                     recovery_prompt=self._controlled_recovery_prompt(
                                         decision=decision,
                                         receipt=initial_receipt,
+                                        corrective_context=corrective_context,
                                     ),
                                     temperature=cast(
                                         float,
@@ -3544,11 +3845,102 @@ class AgentEngine:
                                     or recovery_final_event.metadata.get(
                                         "artifact_verification_status"
                                     )
-                                    == "failed"
+                                    in {"failed", "unverified"}
                                 ):
-                                    controlled_recovery_blocker_reason = (
-                                        "controlled_recovery_budget_exhausted"
+                                    recovery_verification = (
+                                        recovery_final_event.metadata.get(
+                                            "artifact_verification"
+                                        )
+                                        if recovery_final_event is not None
+                                        else None
                                     )
+                                    recovery_aggregate_verdict = (
+                                        str(
+                                            recovery_verification.get(
+                                                "aggregate_verdict"
+                                            )
+                                            or ""
+                                        ).strip()
+                                        if isinstance(recovery_verification, Mapping)
+                                        else ""
+                                    )
+                                    controlled_recovery_blocker_reason = (
+                                        "controlled_recovery_verification_failed"
+                                        if recovery_aggregate_verdict
+                                        in {"failed", "unverified"}
+                                        else "controlled_recovery_budget_exhausted"
+                                    )
+                                    if recovery_final_event is not None and recovery_aggregate_verdict in {
+                                        "failed",
+                                        "unverified",
+                                    }:
+                                        verification_failed = (
+                                            recovery_aggregate_verdict == "failed"
+                                        )
+                                        blocked_text = (
+                                            "The bounded corrective operation ran, but "
+                                            "independent verification still found that "
+                                            "a required acceptance criterion failed. "
+                                            "The task remains open."
+                                            if verification_failed
+                                            else "The bounded corrective operation ran, "
+                                            "but independent semantic verification "
+                                            "still could not confirm every required "
+                                            "acceptance criterion. The task remains "
+                                            "open."
+                                        )
+                                        blocked_event = FinalAnswerEvent(
+                                            content=blocked_text,
+                                            finish_reason="verification_blocked",
+                                            metadata={
+                                                "runtime_category": "verification",
+                                                "error_type": (
+                                                    "required_verification_failed"
+                                                    if verification_failed
+                                                    else "semantic_verification_unverified"
+                                                ),
+                                                "recoverability": "requires_replan",
+                                                "artifact_verification": _checkpoint_json_safe(
+                                                    recovery_verification
+                                                ),
+                                                "controlled_recovery": _checkpoint_json_safe(
+                                                    {
+                                                        "reason": controlled_recovery_blocker_reason,
+                                                    }
+                                                ),
+                                            },
+                                        )
+                                        final_text = blocked_text
+                                        turn_event_seq = await self._record_react_event(
+                                            event=blocked_event,
+                                            trajectory_id=trajectory_id,
+                                            tool_exposure_metadata=tool_exposure_metadata,
+                                            turn_id=turn_id,
+                                            session_id=session_key,
+                                            request=request,
+                                            persist_turn_events=persist_turn_events,
+                                            events=events,
+                                            event_callback=event_callback,
+                                            turn_event_seq=turn_event_seq,
+                                            controlled_recovery=recovery_metadata,
+                                        )
+                                        if request.persist_session:
+                                            blocked_message = Message(
+                                                role="assistant",
+                                                content=blocked_text,
+                                            )
+                                            context.add_message(blocked_message)
+                                            if request.timeline_user_message_admitted:
+                                                request.timeline_transcript = [
+                                                    *(request.timeline_transcript or []),
+                                                    blocked_message,
+                                                ]
+                                            else:
+                                                await self._persist_session_message(
+                                                    session_key,
+                                                    blocked_message,
+                                                    turn_id=turn_id,
+                                                )
                             if controlled_recovery_blocker_reason is None:
                                 recovery_metadata["status"] = "completed"
                             else:
@@ -3573,6 +3965,49 @@ class AgentEngine:
                                             replay_message,
                                             turn_id=turn_id,
                                         )
+
+        if recovery_budget_runtime is not None and turn_checkpoint is not None:
+            runtime = recovery_budget_runtime
+            try:
+                reserved_budget = RecoveryBudget.from_dict(
+                    turn_checkpoint.recovery_budget
+                )
+                model_calls_used = max(0, int(runtime.get("model_calls_used") or 0))
+                extra_model_calls = min(
+                    max(0, model_calls_used - 1),
+                    reserved_budget.remaining_extra_model_calls,
+                )
+                tool_calls_used = min(
+                    max(0, int(runtime.get("tool_calls_used") or 0)),
+                    reserved_budget.remaining_extra_tool_calls,
+                )
+                started_at = runtime.get("started_at")
+                elapsed = (
+                    max(0.0, time.perf_counter() - float(started_at))
+                    if isinstance(started_at, (int, float))
+                    else 0.0
+                )
+                wall_seconds = min(
+                    elapsed,
+                    reserved_budget.remaining_extra_wall_seconds,
+                )
+                updated_budget = reserved_budget.consume(
+                    model_calls=extra_model_calls,
+                    tool_calls=tool_calls_used,
+                    wall_seconds=wall_seconds,
+                )
+                if (
+                    model_calls_used - 1 > extra_model_calls
+                    or int(runtime.get("tool_calls_used") or 0) > tool_calls_used
+                    or elapsed > wall_seconds
+                ) and not runtime.get("exhausted_reason"):
+                    runtime["exhausted_reason"] = "controlled_recovery_budget_exhausted"
+                turn_checkpoint = replace(
+                    turn_checkpoint,
+                    recovery_budget=updated_budget.to_dict(),
+                )
+            except (TypeError, ValueError):
+                runtime["exhausted_reason"] = "controlled_recovery_budget_invalid"
 
         if turn_checkpoint is not None and approval_record is None:
             final_event = next(
@@ -3645,6 +4080,18 @@ class AgentEngine:
                 )
             else:
                 turn_checkpoint = transitioned_checkpoint
+            await self._record_failure_learning_candidate(
+                session_id=session_key,
+                turn_id=turn_id,
+                verification_result=verification_result,
+                execution_receipt=execution_receipt,
+                final_event=final_event,
+                turn_contract_rollout=turn_contract_rollout,
+                events=events,
+                blocker_reason=(
+                    terminal_reason if terminal_stage == "blocked" else None
+                ),
+            )
 
         return AgentInvocationResult(
             content=final_text,
@@ -4901,6 +5348,59 @@ class AgentEngine:
             )
         return saved_payload, None
 
+    async def _record_recovery_plan_attempt(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        plan_ledger_snapshot: Mapping[str, Any] | None,
+        attempt_number: int,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Persist one recovery attempt before crossing the recovery boundary."""
+
+        if not isinstance(plan_ledger_snapshot, Mapping):
+            return None, None
+        try:
+            ledger = PlanLedger.from_dict(plan_ledger_snapshot)
+            if ledger.session_id != session_id:
+                return None, "controlled_recovery_plan_session_mismatch"
+            current_item = next(
+                (item for item in ledger.items if item.status == "in_progress"),
+                None,
+            )
+            if current_item is None:
+                return ledger.to_dict(), "controlled_recovery_plan_item_missing"
+            proposed = replace(
+                ledger,
+                items=tuple(
+                    replace(item, attempts=item.attempts + 1)
+                    if item.item_id == current_item.item_id
+                    else item
+                    for item in ledger.items
+                ),
+                updated_turn_id=turn_id,
+            )
+            saved = await self._plan_ledger_repository.save(
+                proposed,
+                expected_revision=ledger.revision,
+                turn_id=turn_id,
+                idempotency_key=(
+                    f"plan-recovery-attempt:{ledger.ledger_id}:{turn_id}:{attempt_number}"
+                ),
+            )
+            if saved.status != "saved" or saved.ledger is None:
+                return (
+                    None,
+                    saved.message or "controlled_recovery_plan_attempt_persist_failed",
+                )
+            return saved.ledger.to_dict(), None
+        except (TypeError, ValueError) as exc:
+            return (
+                None,
+                "controlled_recovery_plan_attempt_invalid: "
+                f"{type(exc).__name__}",
+            )
+
     async def _cancel_prior_active_plan_ledger(
         self,
         *,
@@ -5327,6 +5827,16 @@ class AgentEngine:
             config.agent.tool_observability_v1
         )
         self._session_store = self._make_session_store(config)
+        if self._owns_learning_runtime:
+            learning_worker_was_running = self._learning_runtime.worker.running
+            await self._learning_runtime.stop()
+            self._learning_runtime = LearningRuntime(
+                FailureOutboxRepository(self._session_store),
+                FailureStore(self._session_store),
+                enabled=config.agent.ordinary_chat_adaptive_runtime.failure_learning.enabled,
+            )
+            if learning_worker_was_running:
+                await self._learning_runtime.start()
         self._verification_receipt_repository = VerificationReceiptRepository(
             self._session_store
         )
@@ -5520,6 +6030,7 @@ class AgentEngine:
         """釋放所有資源。"""
         self._clear_preinitialized_model_info_cache()
         await self._close_tool_registries(self._tool_registry_factory.list_cached_registries())
+        await self._learning_runtime.stop()
         await self._router.close()
         if self._initialized:
             logger.info("AgentEngine closed.")
@@ -6555,28 +7066,15 @@ class AgentEngine:
         checkpoint: TurnCheckpoint,
     ) -> tuple[dict[str, Any], str | None]:
         raw_budget = checkpoint.recovery_budget
-        remaining_attempts = raw_budget.get("remaining_attempts")
-        remaining_extra_model_calls = raw_budget.get("remaining_extra_model_calls")
-        remaining_extra_tool_calls = raw_budget.get("remaining_extra_tool_calls")
-        remaining_extra_wall_seconds = raw_budget.get("remaining_extra_wall_seconds")
-        if (
-            type(remaining_attempts) is not int
-            or remaining_attempts < 0
-            or type(remaining_extra_model_calls) is not int
-            or remaining_extra_model_calls < 0
-            or type(remaining_extra_tool_calls) is not int
-            or remaining_extra_tool_calls < 0
-            or isinstance(remaining_extra_wall_seconds, bool)
-            or not isinstance(remaining_extra_wall_seconds, (int, float))
-            or remaining_extra_wall_seconds < 0
-        ):
+        try:
+            budget = (
+                RecoveryBudget.from_dict(raw_budget)
+                if "budget_version" in raw_budget
+                else RecoveryBudget.from_legacy_checkpoint(raw_budget)
+            )
+        except (TypeError, ValueError):
             return {}, "controlled_recovery_budget_invalid"
-        return {
-            "remaining_attempts": remaining_attempts,
-            "remaining_extra_model_calls": remaining_extra_model_calls,
-            "remaining_extra_tool_calls": remaining_extra_tool_calls,
-            "remaining_extra_wall_seconds": float(remaining_extra_wall_seconds),
-        }, None
+        return budget.to_dict(), None
 
     @classmethod
     def _reserve_controlled_recovery_budget(
@@ -6586,26 +7084,44 @@ class AgentEngine:
         budget, error = cls._controlled_recovery_budget(checkpoint)
         if error is not None:
             return {}, error
-        if budget["remaining_attempts"] < 1:
+        try:
+            reserved = RecoveryBudget.from_dict(budget).reserve_recovery()
+        except ValueError:
             return budget, "controlled_recovery_budget_exhausted"
-        budget["remaining_attempts"] -= 1
-        return budget, None
+        return reserved.to_dict(), None
 
     @staticmethod
     def _controlled_recovery_prompt(
         *,
         decision: ControlledRecoveryDecision,
         receipt: Mapping[str, Any],
+        corrective_context: Mapping[str, Any] | None = None,
     ) -> str:
         predecessor = decision.operation_id or "unknown"
-        targets = receipt.get("resolved_targets")
+        context_targets = (
+            corrective_context.get("allowed_targets")
+            if isinstance(corrective_context, Mapping)
+            else None
+        )
+        targets = context_targets or receipt.get("resolved_targets")
         rendered_targets = ", ".join(
             str(item) for item in targets if isinstance(item, str)
         ) if isinstance(targets, list) else "the declared artifact targets"
+        failed_criteria = (
+            corrective_context.get("failed_criteria")
+            if isinstance(corrective_context, Mapping)
+            else None
+        )
+        rendered_criteria = ", ".join(
+            str(item.get("criterion_id"))
+            for item in failed_criteria
+            if isinstance(item, Mapping) and isinstance(item.get("criterion_id"), str)
+        ) if isinstance(failed_criteria, list) else "the failed acceptance criteria"
         return (
             "The host verifier rejected the prior artifact result. "
             f"Previous operation: {predecessor}. Reason: {decision.reason_code}. "
-            f"Correct only the failed deliverable targets: {rendered_targets}. "
+            f"Correct only failed criteria ({rendered_criteria}) within targets: "
+            f"{rendered_targets}. "
             "Do not repeat or assume success for the previous call. If a tool is needed, "
             "propose a fresh corrective call; normal policy and approval checks still apply. "
             "If no safe correction is available, explain the blocker."
@@ -7137,6 +7653,7 @@ class AgentEngine:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        recovery_config = self._config.agent.ordinary_chat_adaptive_runtime.recovery
         return TurnCheckpoint(
             session_id=session_id,
             turn_id=turn_id,
@@ -7169,6 +7686,12 @@ class AgentEngine:
                 if tool_execution_context.state.get("verification_plan") is not None
                 else None
             ),
+            recovery_budget=RecoveryBudget.initial(
+                max_attempts=recovery_config.max_attempts,
+                max_extra_model_calls=recovery_config.max_extra_model_calls,
+                max_extra_tool_calls=recovery_config.max_extra_tool_calls,
+                max_extra_wall_seconds=recovery_config.max_extra_wall_seconds,
+            ).to_dict(),
             resume_cursor={"turn_id": turn_id, "phase": "react"},
         )
 
@@ -7414,10 +7937,16 @@ class AgentEngine:
                 plan_runtime.update(_plan_runtime_progress_fields(normalized_plan_ledger))
                 if plan_runtime.get("ledger_status") in {"completed", "cancelled"}:
                     plan_runtime["state"] = "terminal"
-        if receipt.get("verification_status") != "verified":
+        aggregate_verdict = str(receipt.get("aggregate_verdict") or "").strip()
+        if receipt.get("verification_status") != "verified" or aggregate_verdict in {
+            "failed",
+            "unverified",
+        }:
             final_event.metadata["artifact_verification_status"] = receipt[
                 "verification_status"
             ]
+            if aggregate_verdict in {"failed", "unverified"}:
+                final_event.metadata["artifact_verification_status"] = aggregate_verdict
         return completion_error
 
     async def _verify_and_complete_active_task(

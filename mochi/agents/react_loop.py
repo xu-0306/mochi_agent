@@ -331,6 +331,79 @@ class AsyncReActLoop:
             for schema in self._tool_registry.get_schemas()
         ]
 
+    def _recovery_budget_runtime(self) -> dict[str, Any] | None:
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return None
+        runtime = context.state.get("controlled_recovery_budget_runtime")
+        return runtime if isinstance(runtime, dict) else None
+
+    def _recovery_budget_blocker(self) -> str | None:
+        runtime = self._recovery_budget_runtime()
+        if runtime is None:
+            return None
+        started_at = runtime.get("started_at")
+        wall_limit = runtime.get("wall_seconds_limit")
+        if (
+            isinstance(started_at, (int, float))
+            and isinstance(wall_limit, (int, float))
+            and time.perf_counter() - float(started_at) >= float(wall_limit)
+        ):
+            runtime["exhausted_reason"] = "controlled_recovery_wall_budget_exhausted"
+            return "controlled_recovery_wall_budget_exhausted"
+        return None
+
+    def _consume_recovery_model_call(self) -> str | None:
+        runtime = self._recovery_budget_runtime()
+        if runtime is None:
+            return None
+        wall_error = self._recovery_budget_blocker()
+        if wall_error is not None:
+            return wall_error
+        used = max(0, int(runtime.get("model_calls_used") or 0))
+        limit = max(0, int(runtime.get("model_calls_limit") or 0))
+        if used >= limit:
+            runtime["exhausted_reason"] = "controlled_recovery_model_budget_exhausted"
+            return "controlled_recovery_model_budget_exhausted"
+        runtime["model_calls_used"] = used + 1
+        return None
+
+    def _consume_recovery_tool_call(self, tool_call: ToolCall) -> ToolResult | None:
+        runtime = self._recovery_budget_runtime()
+        if runtime is None:
+            return None
+        wall_error = self._recovery_budget_blocker()
+        if wall_error is not None:
+            return self._recovery_budget_tool_result(tool_call, wall_error)
+        used = max(0, int(runtime.get("tool_calls_used") or 0))
+        limit = max(0, int(runtime.get("tool_calls_limit") or 0))
+        if used >= limit:
+            runtime["exhausted_reason"] = "controlled_recovery_tool_budget_exhausted"
+            return self._recovery_budget_tool_result(
+                tool_call,
+                "controlled_recovery_tool_budget_exhausted",
+            )
+        runtime["tool_calls_used"] = used + 1
+        return None
+
+    @staticmethod
+    def _recovery_budget_tool_result(tool_call: ToolCall, reason: str) -> ToolResult:
+        return ToolResult(
+            error=(
+                "The bounded corrective pass cannot execute this tool call because "
+                "its recovery budget is exhausted."
+            ),
+            metadata={
+                "runtime_category": "controlled_recovery",
+                "error_type": reason,
+                "recoverability": "blocked",
+                "reason": reason,
+                "tool_name": tool_call.name,
+            },
+            retryable=False,
+            suggestion="Stop the corrective pass and report the bounded recovery blocker.",
+        )
+
     async def _run_nonstream(
         self,
         messages: list[Message],
@@ -411,6 +484,19 @@ class AsyncReActLoop:
         try:
             for iteration in range(max(0, start_iteration), self._max_iterations):
                 logger.debug(f"ReAct iteration {iteration + 1}/{self._max_iterations}")
+                recovery_budget_error = self._consume_recovery_model_call()
+                if recovery_budget_error is not None:
+                    yield ErrorEvent(
+                        message="The bounded corrective pass reached its model-call budget.",
+                        code="CONTROLLED_RECOVERY_BUDGET_EXHAUSTED",
+                        metadata={
+                            "runtime_category": "controlled_recovery",
+                            "error_type": recovery_budget_error,
+                            "recoverability": "blocked",
+                            "reason": recovery_budget_error,
+                        },
+                    )
+                    return
                 progress_event = self._build_iteration_progress_event(iteration=iteration + 1)
                 if progress_event is not None:
                     yield progress_event
@@ -824,7 +910,21 @@ class AsyncReActLoop:
                             formatted_content = self._format_tool_message_content(
                                 output=tool_output,
                                 error=tool_error,
-                        )
+                            )
+                        if unavailable_tool_result is None and guarded_tool_result is None:
+                            recovery_tool_budget_result = self._consume_recovery_tool_call(
+                                tool_call
+                            )
+                            if recovery_tool_budget_result is not None:
+                                unavailable_tool_result = recovery_tool_budget_result
+                                tool_output = recovery_tool_budget_result.output
+                                tool_error = recovery_tool_budget_result.error
+                                tool_metadata = dict(recovery_tool_budget_result.metadata)
+                                tool_result_payload = recovery_tool_budget_result
+                                formatted_content = self._format_tool_message_content(
+                                    output=tool_output,
+                                    error=tool_error,
+                                )
                         if self._tool_registry is not None:
                             if unavailable_tool_result is None and guarded_tool_result is None:
                                 self._record_preplan_read_attempt(tool_call)

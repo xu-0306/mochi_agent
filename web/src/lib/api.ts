@@ -44,6 +44,12 @@ import {
   deriveSubagentEventStatus,
   deriveSubagentMessageDeliveryStatus,
 } from '@/lib/subagent-protocol-events'
+import {
+  normalizeOrdinaryChatRuntimeEvent,
+  normalizeOrdinaryChatRuntimeProjection,
+  type OrdinaryChatRuntimeEvent,
+  type OrdinaryChatRuntimeProjection,
+} from '@/lib/ordinary-chat-plan'
 import { parseSseFrame } from './sse-frame'
 
 const API_BASE = '/v1'
@@ -56,6 +62,7 @@ export type {
   ToolWorkflowAggregateRangeTransport,
   ToolWorkflowAggregateTransport,
 } from '@/lib/tool-workflow-aggregate'
+export type { OrdinaryChatRuntimeProjection } from '@/lib/ordinary-chat-plan'
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
@@ -1939,11 +1946,13 @@ interface BackendSessionResponse {
   workflow?: SessionWorkflowState | null
   goal?: SessionGoalState | null
   security_override?: SessionSecurityOverride | null
+  adaptive_runtime?: unknown
   events: Record<string, unknown>[]
 }
 
 export interface SessionDetail extends SessionSummary {
   events: SessionEvent[]
+  adaptiveRuntime: OrdinaryChatRuntimeProjection | null
 }
 
 export interface SessionSecurityOverride {
@@ -2233,10 +2242,62 @@ export async function fetchSessions(): Promise<SessionSummary[]> {
 
 export async function fetchSession(sessionId: string): Promise<SessionDetail> {
   const payload = await requestJson<BackendSessionResponse>(
-    `/sessions/${encodeURIComponent(sessionId)}`
+    `/sessions/${encodeURIComponent(sessionId)}?include_adaptive_runtime=true`
   )
 
   return normalizeSessionDetail(payload)
+}
+
+export async function fetchOrdinaryChatRuntimeProjection(
+  sessionId: string,
+  input: { maxTurns?: number; maxEvents?: number } = {}
+): Promise<OrdinaryChatRuntimeProjection> {
+  const params = new URLSearchParams({
+    max_turns: String(input.maxTurns ?? 12),
+    max_events: String(input.maxEvents ?? 128),
+  })
+  const payload = await requestJson<unknown>(
+    `/sessions/${encodeURIComponent(sessionId)}/adaptive-runtime?${params.toString()}`
+  )
+  const projection = normalizeOrdinaryChatRuntimeProjection(payload)
+  if (!projection) throw new Error('Ordinary Chat adaptive runtime projection is invalid.')
+  return projection
+}
+
+export async function* streamOrdinaryChatRuntime(
+  sessionId: string,
+  input: { afterSequence?: number; lastEventId?: string | null } = {}
+): AsyncGenerator<OrdinaryChatRuntimeEvent, void, unknown> {
+  const params = new URLSearchParams({
+    after_sequence: String(input.afterSequence ?? 0),
+  })
+  const response = await fetch(
+    resolveApiUrl(
+      `/sessions/${encodeURIComponent(sessionId)}/adaptive-runtime/stream?${params.toString()}`
+    ),
+    {
+      headers: {
+        Accept: 'text/event-stream',
+        ...(input.lastEventId ? { 'Last-Event-ID': input.lastEventId } : {}),
+      },
+      cache: 'no-store',
+    }
+  )
+  if (!response.ok) {
+    const payload = await parseResponseBody(response)
+    throw new ApiError(
+      response.status,
+      getApiMessage(payload, response.statusText || 'Request failed'),
+      payload
+    )
+  }
+  if (!response.body) throw new ApiError(0, 'Adaptive runtime stream body is unavailable.')
+  for await (const rawFrame of readSseStream(response.body)) {
+    const frame = rawFrame as unknown as Record<string, unknown>
+    if (frame.type !== 'ordinary_chat_adaptive_runtime') continue
+    const event = normalizeOrdinaryChatRuntimeEvent(frame.event)
+    if (event) yield event
+  }
 }
 
 export async function fetchToolWorkflowSnapshot(
@@ -2350,6 +2411,7 @@ function normalizeSessionDetail(payload: BackendSessionResponse): SessionDetail 
     workflow: normalizeSessionWorkflowState(payload.workflow),
     goal: normalizeSessionGoalState(payload.goal),
     security_override: normalizeSessionSecurityOverride(payload.security_override),
+    adaptiveRuntime: normalizeOrdinaryChatRuntimeProjection(payload.adaptive_runtime),
     events,
   }
 }

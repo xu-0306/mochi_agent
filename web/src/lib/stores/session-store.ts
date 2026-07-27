@@ -241,6 +241,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
               workflow: target.workflow,
               goal: target.goal,
               security_override: target.securityOverride,
+              adaptiveRuntime: null,
               events: [],
             }
           : get().currentSessionDetail,
@@ -295,6 +296,7 @@ const sessionStore = create<SessionStore>((set, get) => ({
         workflow: draft.workflow,
         goal: draft.goal,
         security_override: draft.securityOverride,
+        adaptiveRuntime: null,
         events: [],
       },
       error: null,
