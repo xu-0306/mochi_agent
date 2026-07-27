@@ -212,16 +212,16 @@ class OpenAICodexConfig(BaseModel):
 
 
 class VLLMConfig(BaseModel):
-    """Managed vLLM runtime 閮剖?"""
+    """Managed vLLM runtime 設定。"""
 
     enabled: bool = False
-    """?臬? managed vLLM runtime。"""
+    """是否啟用 managed vLLM runtime。"""
 
     host: str = "127.0.0.1"
     """vLLM API host。"""
 
     port: int | None = None
-    """vLLM API port；`None` 甇?? route/runtime 層分配。"""
+    """vLLM API port；`None` 表示由 route/runtime 層分配。"""
 
     api_key: SecretStr | None = None
     """vLLM API key。"""
@@ -233,13 +233,13 @@ class VLLMConfig(BaseModel):
     """vLLM dtype。"""
 
     gpu_memory_utilization: float = Field(default=0.9, ge=0.0, le=1.0)
-    """GPU 憭扳? ratio嚗?.0~1.0嚗?"""
+    """GPU 記憶體使用比例（0.0–1.0）。"""
 
     max_model_len: int | None = None
     """vLLM max model length。"""
 
     trust_remote_code: bool = False
-    """?臬 trust remote code。"""
+    """是否信任遠端程式碼。"""
 
     quantization: str | None = None
     """vLLM quantization preset。"""
@@ -305,7 +305,7 @@ class ConfiguredModelConfig(BaseModel):
     """UI 顯示名稱。"""
 
     backend_type: str | None = None
-    """摨惜 backend family??"""
+    """後端類型 metadata。"""
 
     launch_mode: Literal["external", "managed"] | None = None
     """底層 backend family。"""
@@ -769,7 +769,7 @@ class SecurityConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _infer_legacy_autonomy_mode(cls, value: Any) -> Any:
-        """??舐?蝚砍??怠?autonomy mode??"""
+        """相容舊設定欄位並推導對應的 autonomy mode。"""
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
@@ -952,6 +952,87 @@ class ToolsConfig(BaseModel):
         return normalized
 
 
+class ComplexityGateConfig(BaseModel):
+    mode: Literal["off", "shadow", "enforce"] = "shadow"
+    no_plan_max_score: int = Field(default=2, ge=0, le=100)
+    plan_required_min_score: int = Field(default=6, ge=0, le=100)
+    model_advisor_enabled: bool = True
+    advisor_max_tokens: int = Field(default=500, ge=128, le=2_000)
+    advisor_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+
+    @model_validator(mode="after")
+    def _validate_thresholds(self) -> "ComplexityGateConfig":
+        if self.plan_required_min_score <= self.no_plan_max_score:
+            raise ValueError(
+                "plan_required_min_score must be greater than no_plan_max_score"
+            )
+        return self
+
+
+class PlanRuntimeConfig(BaseModel):
+    enabled: bool = True
+    max_items: int = Field(default=12, ge=1, le=50)
+    max_dependencies_per_item: int = Field(default=8, ge=0, le=50)
+    max_preplan_read_calls: int = Field(default=2, ge=0, le=10)
+    max_plan_prompt_corrections: int = Field(default=1, ge=0, le=2)
+    max_prompt_chars: int = Field(default=4_000, ge=500, le=20_000)
+
+
+class ToolRetrievalConfig(BaseModel):
+    enabled: bool = True
+    default_top_k: int = Field(default=5, ge=1, le=10)
+    max_top_k: int = Field(default=10, ge=1, le=20)
+    discovered_cache_size: int = Field(default=20, ge=0, le=200)
+    discovered_ttl_turns: int = Field(default=20, ge=1, le=1_000)
+    embedding_rerank_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _validate_top_k(self) -> "ToolRetrievalConfig":
+        if self.max_top_k < self.default_top_k:
+            raise ValueError("max_top_k must be greater than or equal to default_top_k")
+        return self
+
+
+class VerificationRuntimeConfig(BaseModel):
+    enabled: bool = True
+    semantic_judge_mode: Literal["off", "fallback"] = "fallback"
+    max_semantic_criteria: int = Field(default=6, ge=0, le=20)
+    max_evidence_chars: int = Field(default=12_000, ge=1_000, le=100_000)
+    judge_max_tokens: int = Field(default=800, ge=128, le=4_000)
+    judge_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+
+
+class RecoveryRuntimeConfig(BaseModel):
+    enabled: bool = True
+    max_attempts: int = Field(default=1, ge=0, le=2)
+    max_extra_model_calls: int = Field(default=1, ge=0, le=2)
+    max_extra_tool_calls: int = Field(default=4, ge=0, le=20)
+    max_extra_wall_seconds: float = Field(default=120.0, gt=0, le=600)
+
+
+class FailureLearningConfig(BaseModel):
+    enabled: bool = True
+    retention_days: int = Field(default=30, ge=1, le=3650)
+    min_occurrences_for_hint: int = Field(default=2, ge=1, le=100)
+    max_injected_hints: int = Field(default=2, ge=0, le=10)
+    max_hint_chars: int = Field(default=800, ge=0, le=5_000)
+    automatic_skill_promotion: bool = False
+
+
+class OrdinaryChatAdaptiveRuntimeConfig(BaseModel):
+    enabled: bool = True
+    complexity: ComplexityGateConfig = Field(default_factory=ComplexityGateConfig)
+    plan: PlanRuntimeConfig = Field(default_factory=PlanRuntimeConfig)
+    retrieval: ToolRetrievalConfig = Field(default_factory=ToolRetrievalConfig)
+    verification: VerificationRuntimeConfig = Field(
+        default_factory=VerificationRuntimeConfig
+    )
+    recovery: RecoveryRuntimeConfig = Field(default_factory=RecoveryRuntimeConfig)
+    failure_learning: FailureLearningConfig = Field(
+        default_factory=FailureLearningConfig
+    )
+
+
 class AgentConfig(BaseModel):
     """Agent 核心設定。"""
 
@@ -973,6 +1054,9 @@ class AgentConfig(BaseModel):
     # P2.3 durable aggregate publication.  Disabling this stops new cache
     # entries but keeps existing outbox records inspectable for rollback.
     tool_observability_v1: bool = False
+    ordinary_chat_adaptive_runtime: OrdinaryChatAdaptiveRuntimeConfig = Field(
+        default_factory=OrdinaryChatAdaptiveRuntimeConfig
+    )
 
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     """採樣溫度（0.0–2.0）。"""

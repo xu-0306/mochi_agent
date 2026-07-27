@@ -405,6 +405,7 @@ class AsyncReActLoop:
             "mutation_paths": [],
         }
         final_file_artifact_blocker_metadata: dict[str, Any] | None = None
+        final_plan_blocker_metadata: dict[str, Any] | None = None
         allowed_tool_names = {tool.name for tool in tools}
 
         try:
@@ -679,6 +680,10 @@ class AsyncReActLoop:
                     messages.append(assistant_message)
                     self._remember_turn_message(assistant_message)
 
+                    batch_plan_guard_state: dict[str, Any] = {
+                        "stale_effect_boundary": False,
+                        "successful_update_plan": False,
+                    }
                     for tool_call in result.tool_calls:
                         yield ToolCallCreatedEvent(
                             call_id=tool_call.id,
@@ -702,6 +707,15 @@ class AsyncReActLoop:
                             tool_call=tool_call,
                             evidence_guard_state=evidence_guard_state,
                         )
+                        tool_definition = (
+                            self._tool_registry.get(tool_call.name)
+                            if self._tool_registry is not None
+                            else None
+                        )
+                        plan_guarded_tool_result = self._build_plan_guarded_tool_result(
+                            tool_call=tool_call,
+                            batch_plan_guard_state=batch_plan_guard_state,
+                        )
                         activation_tool_result = self._request_tool_activation_if_needed(
                             tool_call=tool_call,
                             allowed_tool_names=allowed_tool_names,
@@ -716,7 +730,8 @@ class AsyncReActLoop:
                             tools = self._collect_tool_schemas()
                             allowed_tool_names = {tool.name for tool in tools}
                         unavailable_tool_result = (
-                            activation_tool_result
+                            plan_guarded_tool_result
+                            or activation_tool_result
                             or self._build_unavailable_tool_result(
                                 tool_call=tool_call,
                                 allowed_tool_names=allowed_tool_names,
@@ -809,15 +824,15 @@ class AsyncReActLoop:
                             formatted_content = self._format_tool_message_content(
                                 output=tool_output,
                                 error=tool_error,
-                            )
+                        )
                         if self._tool_registry is not None:
                             if unavailable_tool_result is None and guarded_tool_result is None:
+                                self._record_preplan_read_attempt(tool_call)
                                 active_tool_controller = (
                                     self._tool_execution_context.active_tool_controller
                                     if self._tool_execution_context is not None
                                     else None
                                 )
-                                tool_definition = self._tool_registry.get(tool_call.name)
                                 if active_tool_controller is not None:
                                     await active_tool_controller.activate_tool(
                                         tool_call_id=tool_call.id,
@@ -902,6 +917,29 @@ class AsyncReActLoop:
                         elif unavailable_tool_result is None and guarded_tool_result is None:
                             tool_error = "No tool registry configured."
                             tool_result_payload = ToolResult(output=tool_output, error=tool_error)
+                            formatted_content = self._format_tool_message_content(
+                                output=tool_output,
+                                error=tool_error,
+                            )
+
+                        tool_result_payload = self._postprocess_plan_runtime_tool_result(
+                            tool_call=tool_call,
+                            tool_result=tool_result_payload,
+                            batch_plan_guard_state=batch_plan_guard_state,
+                        )
+                        tool_output = tool_result_payload.output
+                        tool_error = tool_result_payload.error
+                        tool_metadata = (
+                            dict(tool_result_payload.metadata)
+                            if isinstance(tool_result_payload.metadata, dict)
+                            else {}
+                        )
+                        if tool_definition is not None and unavailable_tool_result is None and guarded_tool_result is None:
+                            formatted_content = tool_definition.format_result_for_model(
+                                tool_result_payload,
+                                max_chars=self._max_tool_message_chars,
+                            )
+                        else:
                             formatted_content = self._format_tool_message_content(
                                 output=tool_output,
                                 error=tool_error,
@@ -1058,6 +1096,34 @@ class AsyncReActLoop:
                     )
                     evidence_guard_state["nudge_count"] = int(evidence_guard_state.get("nudge_count") or 0) + 1
                     continue
+                if self._should_force_plan_finalization_followup():
+                    messages.append(
+                        Message(
+                            role="user",
+                            content=self._build_plan_finalization_followup_prompt(),
+                        )
+                    )
+                    self._increment_plan_runtime_counter("finalization_nudges_used")
+                    finalization_nudges_used = self._plan_runtime_counter("finalization_nudges_used")
+                    yield StatusEvent(
+                        content=(
+                            "A durable task plan is required for this turn; requesting a final plan update "
+                            "before completing the answer."
+                        ),
+                        metadata={
+                            **self._runtime_error_taxonomy(
+                                error_type="plan_finalization_required",
+                                recoverability="retrying",
+                                runtime_category="task_planning",
+                            ),
+                            "reason": "plan_finalization_required",
+                            "finalization_nudges_used": finalization_nudges_used,
+                            "max_finalization_nudges": self._plan_runtime_counter(
+                                "max_finalization_nudges"
+                            ),
+                        },
+                    )
+                    continue
                 if self._should_force_file_artifact_followup(file_artifact_guard_state):
                     messages.append(
                         Message(
@@ -1090,6 +1156,9 @@ class AsyncReActLoop:
                         },
                     )
                     continue
+                if self._should_block_unsatisfied_plan_final(final_text):
+                    final_text = self._build_plan_blocker_final()
+                    final_plan_blocker_metadata = self._build_plan_blocker_metadata()
                 if self._should_block_unsatisfied_file_artifact_final(file_artifact_guard_state, final_text):
                     final_text = self._build_file_artifact_blocker_final(
                         file_artifact_guard_state=file_artifact_guard_state,
@@ -1233,6 +1302,8 @@ class AsyncReActLoop:
             )
             final_metadata["truncated"] = True
             final_metadata["recovery_attempts"] = truncated_final_recovery_attempts
+        if final_plan_blocker_metadata:
+            final_metadata.update(final_plan_blocker_metadata)
         if final_file_artifact_blocker_metadata:
             final_metadata.update(final_file_artifact_blocker_metadata)
         yield FinalAnswerEvent(
@@ -1423,6 +1494,429 @@ class AsyncReActLoop:
             and isinstance(metadata.get("approval_id"), str)
             and bool(str(metadata.get("approval_id")).strip())
         )
+
+    @staticmethod
+    def _runtime_control_tool_names() -> frozenset[str]:
+        return frozenset({"update_plan", "tool_activate"})
+
+    def _plan_runtime_state(self) -> dict[str, Any] | None:
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return None
+        plan_runtime = context.state.get("plan_runtime")
+        if not isinstance(plan_runtime, dict):
+            return None
+        return plan_runtime
+
+    def _plan_ledger_snapshot(self) -> Mapping[str, Any] | None:
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return None
+        snapshot = context.state.get("plan_ledger_snapshot")
+        if not isinstance(snapshot, Mapping):
+            return None
+        return snapshot
+
+    def _is_runtime_control_tool(self, tool_name: str) -> bool:
+        return tool_name in self._runtime_control_tool_names()
+
+    def _tool_is_read_only(self, tool_name: str) -> bool:
+        if self._tool_registry is None:
+            return False
+        tool = self._tool_registry.get(tool_name)
+        return bool(tool is not None and tool.is_read_only)
+
+    def _plan_runtime_counter(self, key: str) -> int:
+        plan_runtime = self._plan_runtime_state()
+        if plan_runtime is None:
+            return 0
+        return max(0, int(plan_runtime.get(key) or 0))
+
+    def _increment_plan_runtime_counter(self, key: str) -> int:
+        plan_runtime = self._plan_runtime_state()
+        if plan_runtime is None:
+            return 0
+        next_value = max(0, int(plan_runtime.get(key) or 0)) + 1
+        plan_runtime[key] = next_value
+        return next_value
+
+    def _build_plan_guarded_tool_result(
+        self,
+        *,
+        tool_call: ToolCall,
+        batch_plan_guard_state: dict[str, Any],
+    ) -> ToolResult | None:
+        plan_runtime = self._plan_runtime_state()
+        if plan_runtime is None:
+            return None
+        if not bool(plan_runtime.get("enabled")) or not bool(plan_runtime.get("required")):
+            return None
+        if plan_runtime.get("state") == "unavailable":
+            return None
+        if self._is_runtime_control_tool(tool_call.name):
+            return None
+
+        if batch_plan_guard_state.get("stale_effect_boundary") and not self._tool_is_read_only(tool_call.name):
+            return ToolResult(
+                error=(
+                    "A previous update_plan call did not commit because its plan revision was stale. "
+                    "Refresh the durable plan state before executing effectful tools."
+                ),
+                metadata={
+                    **self._runtime_error_taxonomy(
+                        error_type="plan_stale_before_effect",
+                        recoverability="retrying",
+                        runtime_category="task_planning",
+                    ),
+                    "guard": "plan_effect_boundary",
+                    "reason": "plan_stale_before_effect",
+                    "plan_corrections_used": self._plan_runtime_counter("plan_corrections_used"),
+                    "max_plan_corrections": self._plan_runtime_counter("max_plan_prompt_corrections"),
+                },
+                retryable=True,
+                suggestion="Call update_plan view or retry update_plan with the latest revision before continuing.",
+            )
+
+        if self._tool_is_read_only(tool_call.name):
+            if self._plan_requires_creation_before_effect():
+                used = self._plan_runtime_counter("preplan_read_calls_used")
+                max_reads = self._plan_runtime_counter("max_preplan_read_calls")
+                if used >= max_reads:
+                    return ToolResult(
+                        error=(
+                            "The pre-plan read budget is exhausted. Create or repair the durable task plan "
+                            "with update_plan before making more inspection calls."
+                        ),
+                        metadata={
+                            **self._runtime_error_taxonomy(
+                                error_type="preplan_read_budget_exhausted",
+                                recoverability="retrying",
+                                runtime_category="task_planning",
+                            ),
+                            "guard": "preplan_read_budget",
+                            "preplan_read_calls_used": used,
+                            "max_preplan_read_calls": max_reads,
+                        },
+                        retryable=True,
+                        suggestion="Use update_plan now, then continue with any remaining reads if still needed.",
+                    )
+            return None
+
+        plan_issue = self._plan_effect_boundary_issue()
+        if plan_issue is None:
+            return None
+        corrections_used = self._plan_runtime_counter("plan_corrections_used")
+        max_corrections = self._plan_runtime_counter("max_plan_prompt_corrections")
+        retryable = corrections_used < max_corrections
+        if retryable:
+            corrections_used = self._increment_plan_runtime_counter("plan_corrections_used")
+        return ToolResult(
+            error=str(plan_issue.get("error") or "A durable task plan is required before effectful tool execution."),
+            metadata={
+                **self._runtime_error_taxonomy(
+                    error_type=str(plan_issue.get("error_type") or "plan_required_before_effect"),
+                    recoverability="retrying" if retryable else "requires_replanning_or_activation",
+                    runtime_category="task_planning",
+                ),
+                "guard": "plan_effect_boundary",
+                "reason": str(plan_issue.get("reason") or "plan_required_before_effect"),
+                "plan_corrections_used": corrections_used,
+                "max_plan_corrections": max_corrections,
+                **{
+                    key: value
+                    for key, value in plan_issue.items()
+                    if key not in {"error", "error_type", "reason"}
+                },
+            },
+            retryable=retryable,
+            suggestion=(
+                "Use update_plan to create or correct the durable plan, ensure exactly one in_progress item "
+                "with satisfied dependencies, and only then call effectful tools."
+            ),
+        )
+
+    def _plan_requires_creation_before_effect(self) -> bool:
+        plan_runtime = self._plan_runtime_state()
+        if plan_runtime is None:
+            return False
+        if not bool(plan_runtime.get("required")):
+            return False
+        if plan_runtime.get("state") == "required":
+            return True
+        return self._plan_ledger_snapshot() is None
+
+    def _plan_effect_boundary_issue(self) -> dict[str, Any] | None:
+        plan_runtime = self._plan_runtime_state()
+        snapshot = self._plan_ledger_snapshot()
+        if plan_runtime is None:
+            return None
+        if self._plan_requires_creation_before_effect():
+            return {
+                "error": "A durable task plan is required before effectful tool execution.",
+                "error_type": "plan_required_before_effect",
+                "reason": "plan_required_before_effect",
+            }
+        if not isinstance(snapshot, Mapping):
+            return {
+                "error": "The durable task plan snapshot is unavailable. Refresh the plan with update_plan before proceeding.",
+                "error_type": "plan_stale_before_effect",
+                "reason": "plan_stale_before_effect",
+            }
+        items = snapshot.get("items")
+        if not isinstance(items, list):
+            return {
+                "error": "The durable task plan snapshot is malformed. Rebuild it with update_plan before proceeding.",
+                "error_type": "plan_stale_before_effect",
+                "reason": "plan_snapshot_invalid",
+            }
+        in_progress_items = [
+            item
+            for item in items
+            if isinstance(item, Mapping) and str(item.get("status") or "") == "in_progress"
+        ]
+        if len(in_progress_items) != 1:
+            return {
+                "error": (
+                    "Effectful tools require exactly one in_progress plan item. "
+                    f"Current in_progress count: {len(in_progress_items)}."
+                ),
+                "error_type": "plan_stale_before_effect",
+                "reason": "plan_in_progress_item_invalid",
+                "in_progress_count": len(in_progress_items),
+            }
+        current_item = in_progress_items[0]
+        current_item_id = str(current_item.get("item_id") or "").strip()
+        item_by_id = {
+            str(item.get("item_id") or ""): item
+            for item in items
+            if isinstance(item, Mapping) and str(item.get("item_id") or "").strip()
+        }
+        dependencies = current_item.get("dependencies")
+        unmet_dependencies = [
+            dependency
+            for dependency in dependencies
+            if isinstance(dependency, str)
+            and str(item_by_id.get(dependency, {}).get("status") or "") != "completed"
+        ] if isinstance(dependencies, list) else []
+        if unmet_dependencies:
+            return {
+                "error": (
+                    "Effectful tools require the current in_progress item to have all dependencies completed. "
+                    f"Unmet dependencies for {current_item_id or 'current item'}: {', '.join(unmet_dependencies)}."
+                ),
+                "error_type": "plan_stale_before_effect",
+                "reason": "plan_dependencies_incomplete",
+                "current_item_id": current_item_id or None,
+                "unmet_dependencies": unmet_dependencies,
+            }
+        return None
+
+    def _record_preplan_read_attempt(self, tool_call: ToolCall) -> None:
+        if not self._tool_is_read_only(tool_call.name):
+            return
+        if not self._plan_requires_creation_before_effect():
+            return
+        self._increment_plan_runtime_counter("preplan_read_calls_used")
+
+    def _postprocess_plan_runtime_tool_result(
+        self,
+        *,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        batch_plan_guard_state: dict[str, Any],
+    ) -> ToolResult:
+        if tool_call.name == "update_plan":
+            return self._postprocess_update_plan_result(
+                tool_result=tool_result,
+                batch_plan_guard_state=batch_plan_guard_state,
+            )
+        if tool_result.error is None:
+            self._record_successful_plan_evidence_ref(tool_call, tool_result)
+        return tool_result
+
+    def _postprocess_update_plan_result(
+        self,
+        *,
+        tool_result: ToolResult,
+        batch_plan_guard_state: dict[str, Any],
+    ) -> ToolResult:
+        metadata = dict(tool_result.metadata) if isinstance(tool_result.metadata, dict) else {}
+        output = tool_result.output if isinstance(tool_result.output, Mapping) else None
+        if tool_result.error is None:
+            save_status = str(metadata.get("save_status") or output.get("status") or "").strip()
+            if save_status == "saved":
+                batch_plan_guard_state["successful_update_plan"] = True
+                batch_plan_guard_state["stale_effect_boundary"] = False
+            return tool_result
+
+        error_type = str(metadata.get("error_type") or "").strip()
+        if error_type == "stale_plan_revision":
+            batch_plan_guard_state["stale_effect_boundary"] = True
+            plan_runtime = self._plan_runtime_state()
+            if plan_runtime is not None and isinstance(metadata.get("current_revision"), int):
+                plan_runtime["current_revision"] = int(metadata["current_revision"])
+            return ToolResult(
+                output=tool_result.output,
+                error=tool_result.error,
+                metadata={
+                    **metadata,
+                    **self._runtime_error_taxonomy(
+                        error_type="stale_plan_revision",
+                        recoverability="retrying",
+                        runtime_category="task_planning",
+                    ),
+                },
+                retryable=True,
+                suggestion="Refresh the latest ledger revision with update_plan view, then retry the plan update.",
+            )
+
+        if error_type not in {"plan_tool_invalid_request", "plan_transition_invalid", "plan_mutation_invalid"}:
+            return tool_result
+        used = self._plan_runtime_counter("plan_corrections_used")
+        max_corrections = self._plan_runtime_counter("max_plan_prompt_corrections")
+        retryable = used < max_corrections
+        if retryable:
+            used = self._increment_plan_runtime_counter("plan_corrections_used")
+            error_message = (
+                f"{tool_result.error or 'The plan update was malformed.'} "
+                "Fix the update_plan arguments or transition and retry once."
+            )
+        else:
+            error_message = (
+                f"{tool_result.error or 'The plan update was malformed.'} "
+                "The plan correction budget is exhausted; do not execute effectful tools until the plan is repaired."
+            )
+        return ToolResult(
+            output=tool_result.output,
+            error=error_message,
+            metadata={
+                **metadata,
+                **self._runtime_error_taxonomy(
+                    error_type="plan_update_malformed",
+                    recoverability="retrying" if retryable else "requires_replanning_or_activation",
+                    runtime_category="task_planning",
+                ),
+                "plan_corrections_used": used,
+                "max_plan_corrections": max_corrections,
+            },
+            retryable=retryable,
+            suggestion=(
+                "Call update_plan again with a valid revision and valid item transition."
+                if retryable
+                else "Repair the durable plan state before attempting more effectful work."
+            ),
+        )
+
+    def _record_successful_plan_evidence_ref(self, tool_call: ToolCall, tool_result: ToolResult) -> None:
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return
+        raw_refs = context.state.get("recognized_plan_evidence_refs")
+        recognized = (
+            {str(item) for item in raw_refs if isinstance(item, str)}
+            if isinstance(raw_refs, (set, frozenset, list, tuple))
+            else set()
+        )
+        recognized.add(tool_call.id)
+        metadata = tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        explicit_refs = metadata.get("evidence_refs")
+        if isinstance(explicit_refs, (list, tuple, set, frozenset)):
+            recognized.update(str(item) for item in explicit_refs if isinstance(item, str) and item)
+        context.state["recognized_plan_evidence_refs"] = sorted(recognized)
+
+    def _plan_finalization_issue(self) -> dict[str, Any] | None:
+        plan_runtime = self._plan_runtime_state()
+        if plan_runtime is None:
+            return None
+        if not bool(plan_runtime.get("enabled")) or not bool(plan_runtime.get("required")):
+            return None
+        if plan_runtime.get("state") == "unavailable":
+            return None
+        if self._plan_requires_creation_before_effect():
+            return {
+                "reason": "plan_missing_at_finalization",
+                "error": "A durable task plan is still required before the turn can finalize.",
+            }
+        ledger_status = str(plan_runtime.get("ledger_status") or "").strip()
+        if ledger_status in {"completed", "cancelled"} or plan_runtime.get("state") == "terminal":
+            return None
+        return {
+            "reason": "plan_incomplete_at_finalization",
+            "error": "The durable task plan is still active or incomplete and needs a final update before the answer can finalize.",
+            "current_item_id": plan_runtime.get("current_item_id"),
+        }
+
+    def _should_force_plan_finalization_followup(self) -> bool:
+        if self._plan_finalization_issue() is None:
+            return False
+        return self._plan_runtime_counter("finalization_nudges_used") < self._plan_runtime_counter(
+            "max_finalization_nudges"
+        )
+
+    def _should_block_unsatisfied_plan_final(self, final_text: str) -> bool:
+        if self._plan_finalization_issue() is None:
+            return False
+        return not self._looks_like_plan_blocker_final(final_text)
+
+    @staticmethod
+    def _looks_like_plan_blocker_final(final_text: str) -> bool:
+        normalized = final_text.strip().lower()
+        if not normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "blocked",
+                "plan",
+                "in_progress",
+                "could not complete",
+                "needs update_plan",
+                "task plan",
+            )
+        )
+
+    def _build_plan_finalization_followup_prompt(self) -> str:
+        issue = self._plan_finalization_issue() or {}
+        current_item_id = str(issue.get("current_item_id") or "").strip()
+        if issue.get("reason") == "plan_missing_at_finalization":
+            return (
+                "A durable task plan is required for this turn before you can finalize. "
+                "Use update_plan to create the plan, set exactly one item to in_progress, and then continue."
+            )
+        item_hint = f" Current in-progress item: {current_item_id}." if current_item_id else ""
+        return (
+            "The durable task plan is still incomplete and must be updated before you finalize."
+            f"{item_hint} Use update_plan to reflect the latest task state. "
+            "Only mark items completed with host-recognized evidence_refs from successful current-turn tool calls."
+        )
+
+    def _build_plan_blocker_final(self) -> str:
+        issue = self._plan_finalization_issue() or {}
+        if issue.get("reason") == "plan_missing_at_finalization":
+            return "I could not finalize this turn because a durable task plan was required but was never created."
+        current_item_id = str(issue.get("current_item_id") or "").strip()
+        if current_item_id:
+            return (
+                "I could not finalize this turn because the durable task plan is still incomplete: "
+                f"item {current_item_id} remains in progress."
+            )
+        return "I could not finalize this turn because the durable task plan is still incomplete."
+
+    def _build_plan_blocker_metadata(self) -> dict[str, Any]:
+        issue = self._plan_finalization_issue() or {}
+        return {
+            **self._runtime_error_taxonomy(
+                error_type="plan_finalization_required",
+                recoverability="partial",
+                runtime_category="task_planning",
+            ),
+            "reason": issue.get("reason") or "plan_finalization_required",
+            "plan_corrections_used": self._plan_runtime_counter("plan_corrections_used"),
+            "max_plan_corrections": self._plan_runtime_counter("max_plan_prompt_corrections"),
+            "finalization_nudges_used": self._plan_runtime_counter("finalization_nudges_used"),
+            "max_finalization_nudges": self._plan_runtime_counter("max_finalization_nudges"),
+            "current_item_id": issue.get("current_item_id"),
+        }
 
     @staticmethod
     def _available_file_mutation_tools(allowed_tool_names: set[str]) -> list[str]:

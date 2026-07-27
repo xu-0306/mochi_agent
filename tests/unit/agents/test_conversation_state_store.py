@@ -7,6 +7,7 @@ import pytest
 
 from mochi.agents.conversation_state_store import (
     ACTIVE_TASK_STATE_EVENT_VERSION,
+    TURN_CHECKPOINT_VERSION,
     ConversationStateRepository,
     TurnCheckpoint,
     TurnCheckpointRepository,
@@ -146,6 +147,10 @@ def _checkpoint(
         },
         inventory_snapshot={"inventory_version": "inventory-test"},
         activation_state={"allowed_tool_names": [allowed_tool]},
+        complexity_decision={"kind": "no_plan", "score": 1},
+        plan_ledger_snapshot={"ledger_id": "plan-1", "status": "active"},
+        verification_plan={"criteria": [{"kind": "artifact"}]},
+        recovery_budget={"remaining_attempts": 1, "remaining_extra_tool_calls": 4},
         resume_cursor={"turn_id": turn_id, "phase": "contract"},
         completion_reason=("verified" if stage == "completed" else None),
         blocker_reason=("blocked_for_test" if stage == "blocked" else None),
@@ -418,6 +423,36 @@ async def test_turn_checkpoint_cas_reconstructs_latest_state_after_restart(tmp_p
     )
     assert reloaded.diagnostics.status == "loaded"
     assert reloaded.checkpoint == saved_executing.checkpoint
+
+
+def test_turn_checkpoint_v1_payload_migrates_to_v2_defaults() -> None:
+    payload = _checkpoint().to_dict()
+    payload["checkpoint_version"] = "turn-checkpoint-v1"
+    payload.pop("complexity_decision")
+    payload.pop("plan_ledger_snapshot")
+    payload.pop("verification_plan")
+    payload.pop("recovery_budget")
+
+    migrated = TurnCheckpoint.from_dict(payload)
+
+    assert migrated.checkpoint_version == TURN_CHECKPOINT_VERSION
+    assert migrated.complexity_decision == {}
+    assert migrated.plan_ledger_snapshot is None
+    assert migrated.verification_plan is None
+    assert migrated.recovery_budget == {
+        "remaining_attempts": 1,
+        "remaining_extra_model_calls": 1,
+        "remaining_extra_tool_calls": 4,
+        "remaining_extra_wall_seconds": 120.0,
+    }
+
+
+def test_turn_checkpoint_future_version_fails_closed() -> None:
+    payload = _checkpoint().to_dict()
+    payload["checkpoint_version"] = "turn-checkpoint-v999"
+
+    with pytest.raises(ValueError, match="unsupported checkpoint version"):
+        TurnCheckpoint.from_dict(payload)
 
 
 @pytest.mark.asyncio

@@ -69,6 +69,7 @@ class AgentInvocationDiagnostics:
     matched_tool_groups: list[str] = field(default_factory=list)
     fallback_reason: str | None = None
     tool_exposure: dict[str, Any] | None = None
+    adaptive_runtime: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-safe dict."""
@@ -81,6 +82,8 @@ class AgentInvocationDiagnostics:
         }
         if self.tool_exposure is not None:
             payload["tool_exposure"] = dict(self.tool_exposure)
+        if self.adaptive_runtime is not None:
+            payload["adaptive_runtime"] = dict(self.adaptive_runtime)
         return payload
 
 

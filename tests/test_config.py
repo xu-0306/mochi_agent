@@ -57,6 +57,19 @@ def test_default_config_is_valid() -> None:
     assert cfg.agent.max_react_iterations == 10
     assert cfg.agent.system_prompt
     assert cfg.agent.turn_contract_mode == "enforce"
+    assert cfg.agent.ordinary_chat_adaptive_runtime.enabled is True
+    assert cfg.agent.ordinary_chat_adaptive_runtime.complexity.mode == "shadow"
+    assert cfg.agent.ordinary_chat_adaptive_runtime.plan.max_items == 12
+    assert cfg.agent.ordinary_chat_adaptive_runtime.retrieval.default_top_k == 5
+    assert (
+        cfg.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
+        == "fallback"
+    )
+    assert cfg.agent.ordinary_chat_adaptive_runtime.recovery.max_attempts == 1
+    assert (
+        cfg.agent.ordinary_chat_adaptive_runtime.failure_learning.retention_days
+        == 30
+    )
     assert cfg.agent.temperature == 0.7
     assert cfg.agent.max_tokens is None
     assert cfg.agent.reserve_output_tokens is None
@@ -179,6 +192,10 @@ def test_default_yaml_parseable() -> None:
 
     assert cfg.model == "ollama:llama3.2"
     assert cfg.agent.temperature == 0.7
+    assert cfg.agent.ordinary_chat_adaptive_runtime.enabled is True
+    assert cfg.agent.ordinary_chat_adaptive_runtime.complexity.mode == "shadow"
+    assert cfg.agent.ordinary_chat_adaptive_runtime.plan.max_items == 12
+    assert cfg.agent.ordinary_chat_adaptive_runtime.retrieval.default_top_k == 5
     assert cfg.agent.max_tokens is None
     assert cfg.agent.reserve_output_tokens is None
     assert cfg.agent.top_p == 1.0
@@ -304,6 +321,52 @@ def test_agent_turn_contract_mode_migrates_to_enforce(mode: str) -> None:
 def test_agent_turn_contract_mode_rejects_invalid_value() -> None:
     with pytest.raises(ValueError, match="hybrid"):
         MochiConfig.model_validate({"agent": {"turn_contract_mode": "hybrid"}})
+
+
+def test_ordinary_chat_adaptive_runtime_rejects_invalid_thresholds() -> None:
+    with pytest.raises(ValueError, match="plan_required_min_score"):
+        MochiConfig.model_validate(
+            {
+                "agent": {
+                    "ordinary_chat_adaptive_runtime": {
+                        "complexity": {
+                            "no_plan_max_score": 6,
+                            "plan_required_min_score": 6,
+                        }
+                    }
+                }
+            }
+        )
+
+
+def test_ordinary_chat_adaptive_runtime_round_trips_nested_values() -> None:
+    cfg = MochiConfig.model_validate(
+        {
+            "agent": {
+                "ordinary_chat_adaptive_runtime": {
+                    "complexity": {"mode": "enforce"},
+                    "plan": {"max_items": 9},
+                    "retrieval": {"default_top_k": 4, "max_top_k": 8},
+                    "verification": {"semantic_judge_mode": "off"},
+                    "recovery": {"max_attempts": 2},
+                    "failure_learning": {"automatic_skill_promotion": False},
+                }
+            }
+        }
+    )
+
+    dumped = cfg.model_dump()
+    round_tripped = MochiConfig.model_validate(dumped)
+
+    assert round_tripped.agent.ordinary_chat_adaptive_runtime.complexity.mode == "enforce"
+    assert round_tripped.agent.ordinary_chat_adaptive_runtime.plan.max_items == 9
+    assert round_tripped.agent.ordinary_chat_adaptive_runtime.retrieval.default_top_k == 4
+    assert round_tripped.agent.ordinary_chat_adaptive_runtime.retrieval.max_top_k == 8
+    assert (
+        round_tripped.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
+        == "off"
+    )
+    assert round_tripped.agent.ordinary_chat_adaptive_runtime.recovery.max_attempts == 2
 
 
 def test_legacy_file_scope_migrates_one_way_to_independent_scopes() -> None:

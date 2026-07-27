@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,14 +21,20 @@ from mochi.agents.events import (
     StatusEvent,
 )
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest
+from mochi.agents.plan_ledger import PLAN_LEDGER_VERSION, PlanItem, PlanLedger
+from mochi.agents.tool_exposure import ToolExposurePlan
 from mochi.agents.turn_intent_contract import DeliverableContract
 from mochi.backends.types import (
     AttachmentRef,
+    Message,
     ModelInfo,
 )
 from mochi.config.schema import MochiConfig
+from mochi.tools.base import ToolExecutionContext
 from mochi.tools.registry import ToolRegistry
+from mochi.tools.update_plan import UpdatePlanTool
 from tests.unit.engine._support import (
+    EchoTool,
     FakeBackend,
 )
 
@@ -52,6 +59,43 @@ class _OperationInterpreter:
 def _resolver_factory(*operations: str):  # type: ignore[no-untyped-def]
     return lambda backend: ConversationResolver(
         interpreter=_OperationInterpreter(*operations)
+    )
+
+
+def _plan_item(
+    *,
+    item_id: str,
+    status: str,
+    dependencies: tuple[str, ...] = (),
+    evidence_refs: tuple[str, ...] = (),
+) -> PlanItem:
+    return PlanItem(
+        item_id=item_id,
+        title=f"Title for {item_id}",
+        status=status,  # type: ignore[arg-type]
+        dependencies=dependencies,
+        success_criteria=("done",),
+        source_turn_ids=("turn-1",),
+        evidence_refs=evidence_refs,
+    )
+
+
+def _rollout(goal_id: str) -> object:
+    contract = SimpleNamespace(
+        objective="Build the selected artifact",
+        active_goal_id=goal_id,
+        cancels_active_goal=False,
+        supersedes_previous_goal=False,
+        modifies_active_task=True,
+    )
+    return SimpleNamespace(
+        resolution=SimpleNamespace(
+            contract=contract,
+            context=SimpleNamespace(
+                active_task=SimpleNamespace(goal_id=goal_id),
+            ),
+            next_active_task=SimpleNamespace(goal_id=goal_id),
+        )
     )
 
 
@@ -386,9 +430,197 @@ def test_agent_invocation_diagnostics_to_dict_serializes_tool_exposure() -> None
             "workspace_bound": True,
             "attachment_count": 2,
         },
+        adaptive_runtime={
+            "complexity": {},
+            "plan": {},
+            "retrieval": {},
+            "verification": {},
+            "recovery": {},
+            "failure_learning": {},
+        },
     )
 
     assert diagnostics.to_dict()["tool_exposure"] == diagnostics.tool_exposure
+    assert diagnostics.to_dict()["adaptive_runtime"] == diagnostics.adaptive_runtime
+
+
+@pytest.mark.asyncio
+async def test_configure_plan_runtime_exposes_update_plan_for_active_chat_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+            "agent": {
+                "ordinary_chat_adaptive_runtime": {
+                    "complexity": {"mode": "enforce"},
+                }
+            },
+        }
+    )
+    engine = AgentEngine(config)
+    ledger = PlanLedger(
+        ledger_version=PLAN_LEDGER_VERSION,
+        ledger_id="plan-goal-plan",
+        session_id="plan-session",
+        goal_id="goal-plan",
+        revision=0,
+        status="active",
+        objective="Build the selected artifact",
+        reason_codes=("multiple_deliverables",),
+        items=(
+            _plan_item(
+                item_id="item-1",
+                status="completed",
+                evidence_refs=("receipt-1",),
+            ),
+            _plan_item(
+                item_id="item-2",
+                status="in_progress",
+                dependencies=("item-1",),
+            ),
+        ),
+        created_turn_id="turn-0",
+        updated_turn_id="turn-0",
+    )
+    saved = await engine._plan_ledger_repository.save(  # noqa: SLF001
+        ledger,
+        expected_revision=0,
+        turn_id="turn-0",
+        idempotency_key="plan-update:seed",
+    )
+    assert saved.status == "saved"
+    monkeypatch.setattr(
+        engine,
+        "_resolve_complexity_decision",
+        lambda **kwargs: {  # noqa: ARG005
+            "kind": "continue_existing_plan",
+            "hard_reason_codes": ["multiple_deliverables"],
+        },
+    )
+    tool_execution_context = ToolExecutionContext(session_id="plan-session")
+    exposure_plan = ToolExposurePlan(
+        tool_names=["file_read"],
+        matched_groups=["workspace"],
+        limit=4,
+        discoverable_tool_names=["file_read", "update_plan"],
+    )
+
+    updated_plan, complexity_decision, task_plan_context = await engine._configure_plan_runtime(  # noqa: SLF001
+        session_id="plan-session",
+        turn_id="turn-1",
+        request=AgentInvocationRequest(
+            message="Continue the existing plan",
+            session_id="plan-session",
+            tool_mode="auto",
+            execution_profile="chat",
+            persist_session=True,
+        ),
+        rollout=_rollout("goal-plan"),  # type: ignore[arg-type]
+        available_tools=[EchoTool(), UpdatePlanTool()],
+        exposure_plan=exposure_plan,
+        tool_execution_context=tool_execution_context,
+    )
+
+    plan_runtime = tool_execution_context.state["plan_runtime"]
+    assert complexity_decision["kind"] == "continue_existing_plan"
+    assert "update_plan" in updated_plan.tool_names
+    assert plan_runtime["enabled"] is True
+    assert plan_runtime["state"] == "active"
+    assert plan_runtime["required"] is True
+    assert plan_runtime["exposed"] is True
+    assert plan_runtime["mutable"] is True
+    assert plan_runtime["ledger_status"] == "active"
+    assert plan_runtime["current_revision"] == 1
+    assert plan_runtime["current_item_id"] == "item-2"
+    assert plan_runtime["completed_item_ids"] == ["item-1"]
+    assert tool_execution_context.state["plan_ledger_snapshot"]["ledger_id"] == "plan-goal-plan"
+    assert tool_execution_context.state["recognized_plan_evidence_refs"] == {"receipt-1"}
+    assert "update_plan_controller" in tool_execution_context.state
+    assert task_plan_context is not None
+    assert "Use `update_plan` to create or update the durable task plan." in task_plan_context
+    assert "Current in-progress item: item-2" in task_plan_context
+
+    view = await UpdatePlanTool().execute(
+        action="view",
+        expected_revision=0,
+        items=[],
+        item_id=None,
+        status=None,
+        evidence_refs=[],
+        blocker_reason=None,
+        context=tool_execution_context,
+    )
+    assert view.error is None
+    assert view.output["status"] == "loaded"
+    assert view.output["ledger"]["ledger_id"] == "plan-goal-plan"
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_configure_plan_runtime_keeps_update_plan_hidden_when_chat_plan_runtime_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+            "agent": {
+                "ordinary_chat_adaptive_runtime": {
+                    "complexity": {"mode": "enforce"},
+                }
+            },
+        }
+    )
+    engine = AgentEngine(config)
+    monkeypatch.setattr(
+        engine,
+        "_resolve_complexity_decision",
+        lambda **kwargs: {  # noqa: ARG005
+            "kind": "plan_required",
+            "hard_reason_codes": ["multiple_deliverables"],
+        },
+    )
+    tool_execution_context = ToolExecutionContext(session_id="plan-session")
+    exposure_plan = ToolExposurePlan(
+        tool_names=["file_read"],
+        matched_groups=["workspace"],
+        limit=4,
+        discoverable_tool_names=["file_read", "update_plan"],
+    )
+
+    updated_plan, _, task_plan_context = await engine._configure_plan_runtime(  # noqa: SLF001
+        session_id="plan-session",
+        turn_id="turn-1",
+        request=AgentInvocationRequest(
+            message="Plan this task",
+            session_id="plan-session",
+            tool_mode="disabled",
+            execution_profile="chat",
+            persist_session=True,
+        ),
+        rollout=_rollout("goal-plan"),  # type: ignore[arg-type]
+        available_tools=[EchoTool(), UpdatePlanTool()],
+        exposure_plan=exposure_plan,
+        tool_execution_context=tool_execution_context,
+    )
+
+    plan_runtime = tool_execution_context.state["plan_runtime"]
+    assert updated_plan.tool_names == ["file_read"]
+    assert plan_runtime["enabled"] is False
+    assert plan_runtime["state"] == "unavailable"
+    assert plan_runtime["unavailable_reason"] == "planning_unavailable_tool_mode"
+    assert "update_plan_controller" not in tool_execution_context.state
+    assert "update_plan_runtime" not in tool_execution_context.state
+    assert task_plan_context is None
+    await engine.close()
 
 
 @pytest.mark.asyncio
@@ -438,6 +670,9 @@ async def test_engine_invoke_exposes_diagnostics_and_honors_disabled_tool_mode(
     assert result.diagnostics.execution_profile == "subagent_readonly"
     assert result.diagnostics.tool_mode == "disabled"
     assert result.diagnostics.exposed_tools == []
+    assert result.diagnostics.adaptive_runtime is not None
+    assert "complexity" in result.diagnostics.adaptive_runtime
+    assert "verification" in result.diagnostics.adaptive_runtime
     assert fake_backend.tool_calls_seen[-1] == []
     assert started_trajectories == []
 
@@ -963,6 +1198,117 @@ async def test_engine_invocation_max_iterations_override_reaches_react_loop(
 
     assert result.content == "spy reply"
     assert seen_iterations == [2]
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_chat_binds_turn_id_into_tool_execution_context_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_backend = FakeBackend()
+    seen_turn_ids: list[str | None] = []
+
+    class SpyReActLoop:
+        def __init__(
+            self,
+            *args: object,
+            tool_execution_context: object | None = None,
+            **kwargs: object,
+        ) -> None:
+            del args, kwargs
+            state = getattr(tool_execution_context, "state", None)
+            seen_turn_ids.append(state.get("turn_id") if isinstance(state, dict) else None)
+
+        async def run(self, *args: object, **kwargs: object) -> AsyncIterator[AgentEvent]:
+            del args, kwargs
+            yield FinalAnswerEvent(content="spy reply")
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    monkeypatch.setattr(engine_module, "AsyncReActLoop", SpyReActLoop)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message="inspect repo files",
+            session_id="turn-id-worker",
+            tool_mode="auto",
+            execution_profile="chat",
+            persist_session=False,
+        )
+    )
+
+    assert result.content == "spy reply"
+    assert len(seen_turn_ids) == 1
+    assert isinstance(seen_turn_ids[0], str) and seen_turn_ids[0]
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_tool_search_hook_persists_discovery_state(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(config)
+    session_id = "tool-discovery-session"
+    turn_id = "turn-1"
+
+    await engine._persist_session_message(  # noqa: SLF001
+        session_id,
+        Message(role="user", content="find the file read tool"),
+        turn_id=turn_id,
+    )
+    context = engine._get_tool_execution_context(  # noqa: SLF001
+        session_id=session_id,
+        workspace_dir=str(tmp_path),
+    )
+    context.state["turn_id"] = turn_id
+    registry = engine._tool_registry_factory.create_registry(str(tmp_path))  # noqa: SLF001
+
+    result = await registry.execute(
+        "tool_search",
+        {"query": "file_read"},
+        context=context,
+    )
+    loaded = await engine._tool_discovery_state_repository.load(session_id)  # noqa: SLF001
+
+    assert result.error is None
+    assert loaded.status == "loaded"
+    assert loaded.state is not None
+    assert loaded.state.catalog_generation == 0
+    file_read_entry = next(
+        entry for entry in loaded.state.entries if entry.tool_name == "file_read"
+    )
+    assert file_read_entry.discovered_turn_id == turn_id
+    assert file_read_entry.last_used_turn_id == turn_id
+    assert file_read_entry.discovered_turn_index == 1
+    assert len(file_read_entry.source_query_hash) == 64
+    assert file_read_entry.capability_risk_class == "read_only"
 
     await engine.close()
 

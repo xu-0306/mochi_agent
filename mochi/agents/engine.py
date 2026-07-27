@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,16 +29,26 @@ from mochi.agents.capability_exposure_adapter import (
     ExposurePolicyCeilings,
     adapt_capability_plan_to_exposure,
 )
-from mochi.agents.capability_planner import CapabilityPlanner
+from mochi.agents.capability_planner import CapabilityPlanner, CatalogToolDescriptor
+from mochi.agents.complexity_gate import (
+    ComplexityActivePlanSummary,
+    ComplexityCapabilitySummary,
+    ComplexityGate,
+    ComplexityGateConfig as RuntimeComplexityGateConfig,
+    ComplexityGateRequest,
+)
 from mochi.agents.controlled_recovery import (
     ArtifactReceiptState,
     ControlledRecoveryCoordinator,
     ControlledRecoveryDecision,
     TimelineOperationState,
 )
+from mochi.agents.plan_ledger import PlanLedger, PlanLedgerRepository
 from mochi.agents.artifact_verifier import (
+    ArtifactReceipt,
     ArtifactExpectation,
     ArtifactVerifier,
+    ToolExecutionEvidence,
     ValidationProfileRegistry,
 )
 from mochi.agents.context import ContextManager, PromptContext
@@ -77,8 +87,15 @@ from mochi.agents.conversation_state_store import (
     TurnCheckpointRepository,
 )
 from mochi.agents.model_conversation_interpreter import ModelConversationInterpreter
+from mochi.agents.outcome_verifier import (
+    DeterministicVerifierRegistry,
+    VerificationCriterion,
+    VerificationEvidence,
+    VerificationPlanCompiler,
+)
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
+from mochi.agents.turn_intent_contract import DeliverableContract
 from mochi.agents.turn_contract_rollout import (
     TurnContractRolloutResult,
     build_capability_plan,
@@ -145,6 +162,10 @@ from mochi.sessions.timeline_coordinator import (
 )
 from mochi.sessions.turn_timeline import SessionTurnTimelineRepository
 from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
+from mochi.agents.tool_discovery_state import (
+    ToolDiscoveryObservation,
+    ToolDiscoveryStateRepository,
+)
 from mochi.tools.base import (
     ActiveToolController,
     BaseTool,
@@ -156,6 +177,7 @@ from mochi.tools.base import (
 from mochi.tools.mcp_client import McpRuntimeManager
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.registry_factory import ToolRegistryFactory
+from mochi.tools.update_plan import ScopedPlanController, UpdatePlanRuntimeContext
 from mochi.voice.events import VoiceEvent
 from mochi.voice.router import SUPPORTED_STT_BACKENDS, SUPPORTED_TTS_BACKENDS, VoiceRouter
 from mochi.voice.session_manager import VoiceSessionManager
@@ -189,6 +211,120 @@ class _TurnContractRolloutFailure(RuntimeError):
     def __init__(self, cause: Exception, *, user_message_persisted: bool) -> None:
         super().__init__(f"{type(cause).__name__}: {cause}")
         self.user_message_persisted = user_message_persisted
+
+
+def _plan_runtime_progress_fields(
+    ledger_payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(ledger_payload, Mapping):
+        return {
+            "current_item_id": None,
+            "ready_item_ids": [],
+            "blocked_item_ids": [],
+            "completed_item_ids": [],
+            "ledger_status": None,
+            "current_revision": 0,
+        }
+    try:
+        ledger = PlanLedger.from_dict(ledger_payload)
+    except Exception:
+        return {
+            "current_item_id": None,
+            "ready_item_ids": [],
+            "blocked_item_ids": [],
+            "completed_item_ids": [],
+            "ledger_status": None,
+            "current_revision": 0,
+        }
+
+    item_map = {item.item_id: item for item in ledger.items}
+    current_item = next(
+        (item.item_id for item in ledger.items if item.status == "in_progress"),
+        None,
+    )
+    ready_items = [
+        item.item_id
+        for item in ledger.items
+        if item.status == "pending"
+        and all(item_map[dependency].status == "completed" for dependency in item.dependencies)
+    ]
+    blocked_items = [item.item_id for item in ledger.items if item.status == "blocked"]
+    completed_items = [
+        item.item_id for item in ledger.items if item.status == "completed"
+    ]
+    return {
+        "current_item_id": current_item,
+        "ready_item_ids": ready_items,
+        "blocked_item_ids": blocked_items,
+        "completed_item_ids": completed_items[-3:],
+        "ledger_status": ledger.status,
+        "current_revision": ledger.revision,
+    }
+
+
+class _RuntimePlanController:
+    """Bind update_plan to mutable turn-scoped runtime state."""
+
+    def __init__(
+        self,
+        *,
+        repository: PlanLedgerRepository,
+        tool_execution_context: ToolExecutionContext,
+    ) -> None:
+        self._repository = repository
+        self._tool_execution_context = tool_execution_context
+
+    async def apply(self, request: Any) -> ToolResult:
+        controller = ScopedPlanController(
+            repository=self._repository,
+            runtime_context=self._runtime_context(),
+        )
+        result = await controller.apply(request)
+        self._sync_runtime_state(result)
+        return result
+
+    def _runtime_context(self) -> UpdatePlanRuntimeContext:
+        state = self._tool_execution_context.state
+        runtime_data = state.get("update_plan_runtime")
+        if not isinstance(runtime_data, Mapping):
+            raise RuntimeError("update_plan runtime state is unavailable")
+        raw_refs = state.get("recognized_plan_evidence_refs")
+        recognized = (
+            frozenset(str(item) for item in raw_refs if isinstance(item, str))
+            if isinstance(raw_refs, (set, frozenset, list, tuple))
+            else frozenset()
+        )
+        return UpdatePlanRuntimeContext(
+            session_id=str(runtime_data.get("session_id") or ""),
+            goal_id=str(runtime_data.get("goal_id") or ""),
+            ledger_id=str(runtime_data.get("ledger_id") or ""),
+            turn_id=str(runtime_data.get("turn_id") or ""),
+            objective=str(runtime_data.get("objective") or ""),
+            reason_codes=tuple(runtime_data.get("reason_codes") or ()),
+            recognized_evidence_refs=recognized,
+        )
+
+    def _sync_runtime_state(self, result: ToolResult) -> None:
+        state = self._tool_execution_context.state
+        plan_runtime = state.get("plan_runtime")
+        if not isinstance(plan_runtime, dict):
+            return
+        output = result.output if isinstance(result.output, Mapping) else None
+        ledger_payload = output.get("ledger") if isinstance(output, Mapping) else None
+        if isinstance(ledger_payload, Mapping):
+            normalized_ledger = json.loads(
+                json.dumps(ledger_payload, ensure_ascii=False, sort_keys=True)
+            )
+            state["plan_ledger_snapshot"] = normalized_ledger
+            plan_runtime.update(_plan_runtime_progress_fields(normalized_ledger))
+            if plan_runtime.get("ledger_status") == "active":
+                plan_runtime["state"] = "active"
+                plan_runtime["required"] = True
+            elif plan_runtime.get("ledger_status") in {"completed", "cancelled"}:
+                plan_runtime["state"] = "terminal"
+        elif output is not None and output.get("status") == "missing":
+            state["plan_ledger_snapshot"] = None
+            plan_runtime.update(_plan_runtime_progress_fields(None))
 
 
 ConversationResolverFactory = Callable[[BaseLLMBackend], ConversationResolver]
@@ -343,6 +479,7 @@ class AgentEngine:
         capability_planner: CapabilityPlanner | None = None,
         conversation_state_repository: ConversationStateRepository | None = None,
         turn_checkpoint_repository: TurnCheckpointRepository | None = None,
+        tool_discovery_state_repository: ToolDiscoveryStateRepository | None = None,
         validation_profile_registry: ValidationProfileRegistry | None = None,
     ) -> None:
         """初始化 AgentEngine（同步部分）。
@@ -386,6 +523,13 @@ class AgentEngine:
         )
         self._tool_workflow_verifier_diagnostics = ToolWorkflowOutboxVerifierDiagnostics()
         self._session_store = self._make_session_store(config)
+        self._owns_tool_discovery_state_repository = (
+            tool_discovery_state_repository is None
+        )
+        self._tool_discovery_state_repository = (
+            tool_discovery_state_repository
+            or ToolDiscoveryStateRepository(self._session_store)
+        )
         self._tool_workflow_outbox = ToolWorkflowOutboxRepository(
             self._session_store,
             enabled=config.agent.tool_observability_v1,
@@ -401,6 +545,7 @@ class AgentEngine:
             turn_checkpoint_repository
             or TurnCheckpointRepository(self._session_store)
         )
+        self._plan_ledger_repository = PlanLedgerRepository(self._session_store)
         self._conversation_resolver_factory = (
             conversation_resolver_factory or self._default_conversation_resolver_factory
         )
@@ -439,6 +584,7 @@ class AgentEngine:
             config,
             memory_store=self._memory_store,
             mcp_runtime_manager=self._mcp_runtime_manager,
+            tool_search_discovery_hook=self._record_tool_search_discovery,
         )
         self._tool_registry = self._tool_registry_factory.create_registry(config.workspace_dir)
         self._tool_exposure_planner = ToolExposurePlanner(
@@ -498,6 +644,162 @@ class AgentEngine:
         if not outbox.enabled:
             return None
         return await outbox.observe_approval(approval)
+
+    async def _record_tool_search_discovery(self, payload: dict[str, Any]) -> None:
+        retrieval = self._config.agent.ordinary_chat_adaptive_runtime.retrieval
+        if not retrieval.enabled:
+            return
+        if not isinstance(payload, Mapping):
+            return
+
+        session_id = str(payload.get("session_id") or "").strip()
+        turn_id = str(payload.get("turn_id") or "").strip()
+        source_query_hash = str(payload.get("source_query_hash") or "").strip()
+        catalog_fingerprint = str(payload.get("catalog_fingerprint") or "").strip()
+        raw_catalog_generation = payload.get("catalog_generation")
+        raw_matches = payload.get("matches")
+        if (
+            not session_id
+            or not turn_id
+            or not source_query_hash
+            or not catalog_fingerprint
+            or type(raw_catalog_generation) is not int
+            or raw_catalog_generation < 0
+            or not isinstance(raw_matches, list)
+            or not raw_matches
+        ):
+            return
+
+        current_turn_index = await self._session_user_turn_index(
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+        if current_turn_index is None:
+            return
+
+        observations: list[ToolDiscoveryObservation] = []
+        for item in raw_matches:
+            if not isinstance(item, Mapping):
+                continue
+            tool_name = str(item.get("tool_name") or "").strip()
+            capability_risk_class = str(item.get("capability_risk_class") or "").strip()
+            if not tool_name or not capability_risk_class:
+                continue
+            try:
+                observations.append(
+                    ToolDiscoveryObservation(
+                        tool_name=tool_name,
+                        source_query_hash=source_query_hash,
+                        turn_id=turn_id,
+                        turn_index=current_turn_index,
+                        catalog_fingerprint=catalog_fingerprint,
+                        catalog_generation=raw_catalog_generation,
+                        capability_risk_class=capability_risk_class,
+                    )
+                )
+            except Exception:
+                continue
+        if not observations:
+            return
+
+        result = await self._tool_discovery_state_repository.record_observations(
+            session_id=session_id,
+            turn_id=turn_id,
+            current_turn_index=current_turn_index,
+            catalog_generation=raw_catalog_generation,
+            catalog_fingerprint=catalog_fingerprint,
+            observations=observations,
+            idempotency_key=self._tool_discovery_idempotency_key(
+                session_id=session_id,
+                turn_id=turn_id,
+                source_query_hash=source_query_hash,
+                catalog_generation=raw_catalog_generation,
+                catalog_fingerprint=catalog_fingerprint,
+                matches=tuple(
+                    item for item in raw_matches if isinstance(item, Mapping)
+                ),
+            ),
+            max_entries=retrieval.discovered_cache_size,
+            ttl_turns=retrieval.discovered_ttl_turns,
+        )
+        if result.status not in {"saved", "conflict"}:
+            logger.warning(
+                "tool discovery persistence failed for session={} turn={}: {}",
+                session_id,
+                turn_id,
+                result.message or result.status,
+            )
+
+    async def _session_user_turn_index(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> int | None:
+        if not session_id or not turn_id:
+            return None
+        try:
+            events = await self._session_store.load_session(session_id)
+        except Exception as exc:
+            logger.warning(
+                "tool discovery turn index load failed for session={} turn={}: {}",
+                session_id,
+                turn_id,
+                exc,
+            )
+            return None
+
+        seen_turn_ids: set[str] = set()
+        current_index = 0
+        for event in events:
+            if event.get("type") != "message" or event.get("role") != "user":
+                continue
+            candidate_turn_id = str(event.get("turn_id") or "").strip()
+            if not candidate_turn_id or candidate_turn_id in seen_turn_ids:
+                continue
+            seen_turn_ids.add(candidate_turn_id)
+            current_index += 1
+            if candidate_turn_id == turn_id:
+                return current_index
+        return None
+
+    @staticmethod
+    def _tool_discovery_idempotency_key(
+        *,
+        session_id: str,
+        turn_id: str,
+        source_query_hash: str,
+        catalog_generation: int,
+        catalog_fingerprint: str,
+        matches: Sequence[Mapping[str, Any]],
+    ) -> str:
+        payload = {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "source_query_hash": source_query_hash,
+            "catalog_generation": catalog_generation,
+            "catalog_fingerprint": catalog_fingerprint,
+            "matches": [
+                {
+                    "tool_name": str(item.get("tool_name") or "").strip(),
+                    "rank": item.get("rank"),
+                    "score": item.get("score"),
+                    "capability_risk_class": str(
+                        item.get("capability_risk_class") or ""
+                    ).strip(),
+                }
+                for item in matches
+            ],
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"tool-discovery:{digest}"
 
     def _ensure_chat_run_registry(self) -> None:
         if not hasattr(self, "_active_chat_runs"):
@@ -853,6 +1155,9 @@ class AgentEngine:
         )
         tool_execution_context = self._fork_turn_tool_execution_context(base_context)
         tool_execution_context.permission_policy = dict(current_permission_policy)
+        checkpoint_turn_id = str(checkpoint.get("turn_id") or "").strip()
+        if checkpoint_turn_id:
+            tool_execution_context.state["turn_id"] = checkpoint_turn_id
         tool_execution_context.state["ordinary_chat_approval_context"] = {
             "schema_version": 1,
             "source": "ordinary_chat",
@@ -869,6 +1174,12 @@ class AgentEngine:
         activation_policy = continuation.get("tool_activation_policy")
         if isinstance(activation_policy, Mapping):
             tool_execution_context.state["tool_activation_policy"] = dict(activation_policy)
+        if original_turn_checkpoint is not None:
+            self._restore_plan_runtime_from_checkpoint(
+                checkpoint=original_turn_checkpoint,
+                turn_id=checkpoint_turn_id or original_turn_id,
+                tool_execution_context=tool_execution_context,
+            )
 
         raw_max_iterations = continuation.get("max_iterations")
         max_iterations = (
@@ -966,6 +1277,10 @@ class AgentEngine:
                     pending_tool_call=pending_tool_call,
                     approval_record=approval_record,
                     execution_receipt=execution_receipt,
+                    plan_ledger_snapshot=cast(
+                        Mapping[str, Any] | None,
+                        tool_execution_context.state.get("plan_ledger_snapshot"),
+                    ),
                     resume_cursor={
                         "turn_id": original_turn_id,
                         "phase": "approval_verification",
@@ -1048,11 +1363,51 @@ class AgentEngine:
                                 state_revision=state.state_revision,
                                 requests=[approved_request],
                                 results=[approved_result],
+                                verification_plan=original_turn_checkpoint.verification_plan,
+                                final_response_text=(
+                                    final_event.content if final_event is not None else None
+                                ),
+                                plan_ledger_snapshot=cast(
+                                    Mapping[str, Any] | None,
+                                    tool_execution_context.state.get("plan_ledger_snapshot"),
+                                ),
+                                recognized_evidence_refs=cast(
+                                    Collection[str],
+                                    tool_execution_context.state.get("recognized_plan_evidence_refs")
+                                    or (),
+                                ),
                             )
                         )
+                        updated_plan_ledger = verification_result.get("plan_ledger")
+                        if isinstance(updated_plan_ledger, Mapping):
+                            normalized_plan_ledger = _checkpoint_json_safe(
+                                updated_plan_ledger
+                            )
+                            tool_execution_context.state["plan_ledger_snapshot"] = (
+                                normalized_plan_ledger
+                            )
+                            plan_runtime = tool_execution_context.state.get("plan_runtime")
+                            if isinstance(plan_runtime, dict):
+                                plan_runtime.update(
+                                    _plan_runtime_progress_fields(
+                                        normalized_plan_ledger
+                                    )
+                                )
+                                if plan_runtime.get("ledger_status") in {
+                                    "completed",
+                                    "cancelled",
+                                }:
+                                    plan_runtime["state"] = "terminal"
                 if final_event is not None:
                     final_event.metadata["artifact_verification"] = verification_result
-            verification_status = verification_result.get("verification_status")
+            aggregate_verdict = str(
+                verification_result.get("aggregate_verdict") or ""
+            ).strip()
+            verification_status = (
+                self._aggregate_verdict_to_status(aggregate_verdict)
+                if aggregate_verdict
+                else verification_result.get("verification_status")
+            )
             if final_event is None or not final_event.content.strip():
                 terminal_stage: Literal["completed", "blocked"] = "blocked"
                 terminal_reason = "approval_continuation_missing_final_answer"
@@ -1075,6 +1430,10 @@ class AgentEngine:
                     stage=terminal_stage,
                     execution_receipt=execution_receipt,
                     verification_result=verification_result,
+                    plan_ledger_snapshot=cast(
+                        Mapping[str, Any] | None,
+                        tool_execution_context.state.get("plan_ledger_snapshot"),
+                    ),
                     resume_cursor={
                         "turn_id": original_turn_id,
                         "phase": (
@@ -1864,27 +2223,12 @@ class AgentEngine:
                 "cleared_tools": before_preflight_count > 0 and not exposure_plan.tool_names,
             },
         )
-        attachment_context = self._build_attachment_prompt_context(
-            attachments=request.attachments,
-            available_tool_names=exposure_plan.tool_names,
-        )
         system_prompt_addendum = _merge_prompt_addenda(
             _build_response_language_prompt_addendum(
                 self._config.locale_defaults.response_language,
                 request.message,
             ),
             request.system_prompt_addendum,
-        )
-        system_prompt = self._prompt_builder.build_system_prompt(
-            skills_context=skills_context,
-            memory_context=self._merge_memory_and_summary_context(
-                memory_context=prompt_context.memory_context,
-                summary=prompt_context.summary,
-            ),
-            attachment_context=attachment_context,
-            base_prompt=str(sanitized.get("system_prompt") or resolved["system_prompt"]),
-            task_workspace_dir=request.task_workspace_dir,
-            system_prompt_addendum=system_prompt_addendum,
         )
         persist_turn_events = (
             request.persist_session
@@ -1929,6 +2273,7 @@ class AgentEngine:
             tool_execution_context = self._fork_turn_tool_execution_context(
                 tool_execution_context
             )
+        tool_execution_context.state["turn_id"] = turn_id
         if request.execution_profile == "chat":
             # File/exec tools use this only when a concrete call requires
             # human review.  It makes that result a durable Chat interrupt and
@@ -1954,27 +2299,6 @@ class AgentEngine:
             await request.cancellation_context.bind_active_tool_controller(
                 request.active_tool_controller
             )
-        before_continuation_count = len(exposure_plan.tool_names)
-        exposure_plan = self._preserve_tool_result_read_for_continuation(
-            exposure_plan,
-            available_tool_names=[tool.name for tool in available_tools],
-            tool_execution_context=tool_execution_context,
-        )
-        exposure_plan = self._with_tool_exposure_diagnostic(
-            exposure_plan,
-            "after_continuation_preservation",
-            {
-                "before_tool_count": before_continuation_count,
-                "after_tool_count": len(exposure_plan.tool_names),
-                "preserved_tool_result_read": len(exposure_plan.tool_names) > before_continuation_count,
-                "reference_count": len(tool_execution_context.tool_result_references),
-            },
-        )
-        tool_registry = workspace_registry.create_view(
-            exposure_plan.tool_names,
-            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
-            schema_limit=exposure_plan.limit,
-        )
         if turn_contract_rollout is None:
             tool_execution_context.state["tool_activation_policy"] = {
                 "turn_contract_mode": "enforce",
@@ -1989,6 +2313,9 @@ class AgentEngine:
                 "tool_allowlist": [],
                 "tool_denylist": list(request.tool_denylist or ()),
             }
+            complexity_decision = {}
+            verification_plan = None
+            task_plan_context = None
         else:
             contract = turn_contract_rollout.resolution.contract
             capability_plan = turn_contract_rollout.capability_plan
@@ -2025,6 +2352,87 @@ class AgentEngine:
                     else None
                 ),
             }
+            verification_plan = self._build_verification_plan(
+                turn_contract_rollout,
+                semantic_fallback_enabled=(
+                    self._config.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
+                    == "fallback"
+                ),
+            )
+            if verification_plan is not None:
+                tool_execution_context.state["verification_plan"] = verification_plan
+            if request.persist_session:
+                prior_plan_error = await self._cancel_prior_active_plan_ledger(
+                    session_id=session_key,
+                    turn_id=turn_id,
+                    rollout=turn_contract_rollout,
+                )
+                if prior_plan_error is not None:
+                    existing_error = turn_contract_rollout.state_persist_error
+                    turn_contract_rollout = replace(
+                        turn_contract_rollout,
+                        state_persist_error="; ".join(
+                            part
+                            for part in (
+                                existing_error,
+                                "prior plan ledger persistence failed: "
+                                + prior_plan_error,
+                            )
+                            if part
+                        ),
+                    )
+            (
+                exposure_plan,
+                complexity_decision,
+                task_plan_context,
+            ) = await self._configure_plan_runtime(
+                session_id=session_key,
+                turn_id=turn_id,
+                request=request,
+                rollout=turn_contract_rollout,
+                available_tools=available_tools,
+                exposure_plan=exposure_plan,
+                tool_execution_context=tool_execution_context,
+            )
+
+        before_continuation_count = len(exposure_plan.tool_names)
+        exposure_plan = self._preserve_tool_result_read_for_continuation(
+            exposure_plan,
+            available_tool_names=[tool.name for tool in available_tools],
+            tool_execution_context=tool_execution_context,
+        )
+        exposure_plan = self._with_tool_exposure_diagnostic(
+            exposure_plan,
+            "after_continuation_preservation",
+            {
+                "before_tool_count": before_continuation_count,
+                "after_tool_count": len(exposure_plan.tool_names),
+                "preserved_tool_result_read": len(exposure_plan.tool_names)
+                > before_continuation_count,
+                "reference_count": len(tool_execution_context.tool_result_references),
+            },
+        )
+        attachment_context = self._build_attachment_prompt_context(
+            attachments=request.attachments,
+            available_tool_names=exposure_plan.tool_names,
+        )
+        system_prompt = self._prompt_builder.build_system_prompt(
+            skills_context=skills_context,
+            memory_context=self._merge_memory_and_summary_context(
+                memory_context=prompt_context.memory_context,
+                summary=prompt_context.summary,
+            ),
+            attachment_context=attachment_context,
+            base_prompt=str(sanitized.get("system_prompt") or resolved["system_prompt"]),
+            task_workspace_dir=request.task_workspace_dir,
+            system_prompt_addendum=system_prompt_addendum,
+            task_plan_context=task_plan_context,
+        )
+        tool_registry = workspace_registry.create_view(
+            exposure_plan.tool_names,
+            tool_search_catalog_names=exposure_plan.discoverable_tool_names,
+            schema_limit=exposure_plan.limit,
+        )
         turn_checkpoint: TurnCheckpoint | None = None
         turn_checkpoint_error: str | None = None
         controlled_recovery_reentry_blocker: str | None = None
@@ -2104,6 +2512,38 @@ class AgentEngine:
             exposed_tools=list(exposure_plan.tool_names),
             matched_tool_groups=list(exposure_plan.matched_groups),
             tool_exposure=exposure_plan.exposure_metadata(),
+            adaptive_runtime={
+                "complexity": {
+                    "mode": (
+                        self._config.agent.ordinary_chat_adaptive_runtime.complexity.mode
+                        if turn_contract_rollout is not None
+                        else "off"
+                    ),
+                    "decision": copy.deepcopy(complexity_decision),
+                },
+                "plan": (
+                    copy.deepcopy(tool_execution_context.state.get("plan_runtime"))
+                    if isinstance(
+                        tool_execution_context.state.get("plan_runtime"),
+                        Mapping,
+                    )
+                    else {}
+                ),
+                "retrieval": {},
+                "verification": {
+                    "plan_compiled": verification_plan is not None,
+                    "criteria_count": len(
+                        verification_plan.get("criteria", [])
+                    )
+                    if verification_plan is not None
+                    else 0,
+                    "semantic_judge_mode": (
+                        self._config.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
+                    ),
+                },
+                "recovery": {},
+                "failure_learning": {},
+            },
         )
         tool_exposure_metadata = diagnostics.tool_exposure or exposure_plan.exposure_metadata()
         logger.debug(
@@ -2465,6 +2905,10 @@ class AgentEngine:
                     pending_tool_call=pending_tool_call,
                     approval_record=approval_record,
                     execution_receipt=execution_receipt,
+                    plan_ledger_snapshot=cast(
+                        Mapping[str, Any] | None,
+                        tool_execution_context.state.get("plan_ledger_snapshot"),
+                    ),
                     resume_cursor=next_cursor,
                 )
             )
@@ -2485,10 +2929,11 @@ class AgentEngine:
                 events=events,
                 persist_session=request.persist_session,
                 workspace_dir=effective_workspace_dir,
+                tool_execution_context=tool_execution_context,
             )
         if completion_persist_error is not None:
             logger.error(
-                "Unable to persist completed turn-contract task state: {}",
+                "Unable to persist completed turn-contract task state: %s",
                 completion_persist_error,
             )
             for event in reversed(events):
@@ -2524,10 +2969,15 @@ class AgentEngine:
                 recovery_state, recovery_state_error = self._controlled_recovery_state(
                     execution_receipt
                 )
+                recovery_budget, recovery_budget_error = (
+                    self._controlled_recovery_budget(turn_checkpoint)
+                )
                 operation, operation_error = self._recovery_operation_from_events(events)
                 decision: ControlledRecoveryDecision | None = None
                 if recovery_state_error is not None:
                     controlled_recovery_blocker_reason = recovery_state_error
+                elif recovery_budget_error is not None:
+                    controlled_recovery_blocker_reason = recovery_budget_error
                 elif request.timeline_pre_effect_failure:
                     controlled_recovery_blocker_reason = "timeline_pre_effect_failure"
                 elif not self._is_automatically_correctable_receipt(initial_receipt):
@@ -2539,6 +2989,10 @@ class AgentEngine:
                 elif recovery_state["status"] == "reserved":
                     controlled_recovery_blocker_reason = (
                         "controlled_recovery_reservation_requires_manual_replan"
+                    )
+                elif recovery_budget["remaining_attempts"] < 1:
+                    controlled_recovery_blocker_reason = (
+                        "controlled_recovery_budget_exhausted"
                     )
                 elif recovery_state["replans_used"] >= recovery_state["max_replans"]:
                     controlled_recovery_blocker_reason = "controlled_recovery_budget_exhausted"
@@ -2569,6 +3023,14 @@ class AgentEngine:
                 }:
                     controlled_recovery_blocker_reason = decision.reason_code
 
+                reserved_recovery_budget: dict[str, Any] | None = None
+                if decision is not None and controlled_recovery_blocker_reason is None:
+                    reserved_recovery_budget, budget_error = (
+                        self._reserve_controlled_recovery_budget(turn_checkpoint)
+                    )
+                    if budget_error is not None:
+                        controlled_recovery_blocker_reason = budget_error
+
                 if decision is not None and controlled_recovery_blocker_reason is None:
                     recovery_metadata = {
                         **recovery_state,
@@ -2586,6 +3048,11 @@ class AgentEngine:
                             stage="verifying",
                             execution_receipt=execution_receipt,
                             verification_result=initial_receipt,
+                            plan_ledger_snapshot=cast(
+                                Mapping[str, Any] | None,
+                                tool_execution_context.state.get("plan_ledger_snapshot"),
+                            ),
+                            recovery_budget=reserved_recovery_budget,
                             resume_cursor={
                                 "turn_id": turn_id,
                                 "phase": "controlled_recovery",
@@ -2757,6 +3224,7 @@ class AgentEngine:
                                         events=events,
                                         persist_session=request.persist_session,
                                         workspace_dir=effective_workspace_dir,
+                                        tool_execution_context=tool_execution_context,
                                     )
                                 )
                                 recovery_final_event = next(
@@ -2818,7 +3286,14 @@ class AgentEngine:
                 and turn_contract_rollout.capability_plan.artifact_obligation.required
                 and turn_contract_rollout.capability_plan.artifact_obligation.ready
             )
-            verification_status = verification_result.get("verification_status")
+            aggregate_verdict = str(
+                verification_result.get("aggregate_verdict") or ""
+            ).strip()
+            verification_status = (
+                self._aggregate_verdict_to_status(aggregate_verdict)
+                if aggregate_verdict
+                else verification_result.get("verification_status")
+            )
             if completion_persist_error is not None:
                 terminal_stage: Literal["completed", "blocked"] = "blocked"
                 terminal_reason = "turn_contract_completion_persist_failed"
@@ -2842,6 +3317,10 @@ class AgentEngine:
                     stage=terminal_stage,
                     execution_receipt=execution_receipt,
                     verification_result=verification_result,
+                    plan_ledger_snapshot=cast(
+                        Mapping[str, Any] | None,
+                        tool_execution_context.state.get("plan_ledger_snapshot"),
+                    ),
                     resume_cursor={
                         "turn_id": turn_id,
                         "phase": (
@@ -3245,6 +3724,814 @@ class AgentEngine:
         )
 
     @staticmethod
+    def _recognized_plan_evidence_refs(
+        ledger: PlanLedger | None,
+    ) -> set[str]:
+        if ledger is None:
+            return set()
+        refs: set[str] = set()
+        for item in ledger.items:
+            refs.update(item.evidence_refs)
+        return refs
+
+    async def _load_active_plan_ledger(
+        self,
+        *,
+        session_id: str,
+        goal_id: str | None,
+    ) -> PlanLedger | None:
+        if not goal_id:
+            return None
+        try:
+            loaded = await self._plan_ledger_repository.load_active(
+                session_id,
+                goal_id,
+            )
+        except Exception:
+            return None
+        if loaded.status != "loaded" or loaded.ledger is None:
+            return None
+        return loaded.ledger
+
+    def _preserve_update_plan_for_plan_runtime(
+        self,
+        exposure_plan: ToolExposurePlan,
+        *,
+        available_tool_names: list[str],
+        plan_runtime: Mapping[str, Any] | None,
+    ) -> ToolExposurePlan:
+        if "update_plan" in exposure_plan.tool_names:
+            return exposure_plan
+        if "update_plan" not in available_tool_names:
+            return exposure_plan
+        if not isinstance(plan_runtime, Mapping):
+            return exposure_plan
+        if not bool(plan_runtime.get("exposed")):
+            return exposure_plan
+        if exposure_plan.limit <= 0:
+            return exposure_plan
+
+        tool_names = [*exposure_plan.tool_names, "update_plan"]
+        while True:
+            deferred_names = set(exposure_plan.discoverable_tool_names) - set(
+                tool_names
+            )
+            expected_runtime_schema_count = len(tool_names) + int(
+                bool(deferred_names)
+            )
+            if expected_runtime_schema_count <= exposure_plan.limit:
+                break
+            eviction_index = next(
+                (
+                    index
+                    for index in range(len(tool_names) - 1, -1, -1)
+                    if tool_names[index]
+                    not in {
+                        "update_plan",
+                        "tool_search",
+                        "file_write",
+                        "file_edit",
+                        "apply_patch",
+                    }
+                ),
+                None,
+            )
+            if eviction_index is None:
+                return exposure_plan
+            tool_names.pop(eviction_index)
+        return ToolExposurePlan(
+            tool_names=tool_names,
+            matched_groups=exposure_plan.matched_groups,
+            limit=exposure_plan.limit,
+            discoverable_tool_names=[
+                name
+                for name in exposure_plan.discoverable_tool_names
+                if name != "update_plan"
+            ],
+            workspace_bound=exposure_plan.workspace_bound,
+            attachment_count=exposure_plan.attachment_count,
+            diagnostics=copy.deepcopy(exposure_plan.diagnostics),
+        )
+
+    async def _configure_plan_runtime(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        request: AgentInvocationRequest,
+        rollout: TurnContractRolloutResult | None,
+        available_tools: Sequence[BaseTool],
+        exposure_plan: ToolExposurePlan,
+        tool_execution_context: ToolExecutionContext,
+    ) -> tuple[ToolExposurePlan, dict[str, Any], str | None]:
+        if rollout is None:
+            return exposure_plan, {}, None
+
+        active_goal_id = (
+            rollout.resolution.next_active_task.goal_id
+            if rollout.resolution.next_active_task is not None
+            else rollout.resolution.contract.active_goal_id
+        )
+        active_ledger = await self._load_active_plan_ledger(
+            session_id=session_id,
+            goal_id=active_goal_id,
+        )
+        active_plan_summary = (
+            ComplexityActivePlanSummary(
+                ledger_id=active_ledger.ledger_id,
+                status=active_ledger.status,
+                revision=active_ledger.revision,
+            )
+            if active_ledger is not None
+            else None
+        )
+        complexity_decision = self._resolve_complexity_decision(
+            rollout=rollout,
+            available_tools=available_tools,
+            exposure_plan=exposure_plan,
+            active_plan_summary=active_plan_summary,
+        )
+        if complexity_decision:
+            tool_execution_context.state["complexity_decision"] = complexity_decision
+
+        plan_config = self._config.agent.ordinary_chat_adaptive_runtime.plan
+        relation = self._resolve_complexity_task_relation(rollout)
+        decision_kind = str(complexity_decision.get("kind") or "no_plan")
+        reason_codes = list(
+            dict.fromkeys(
+                [
+                    *(
+                        complexity_decision.get("hard_reason_codes", [])
+                        if isinstance(
+                            complexity_decision.get("hard_reason_codes"),
+                            list,
+                        )
+                        else []
+                    ),
+                    *(
+                        complexity_decision.get("soft_reason_codes", [])
+                        if isinstance(
+                            complexity_decision.get("soft_reason_codes"),
+                            list,
+                        )
+                        else []
+                    ),
+                ]
+            )
+        )
+        if not reason_codes and active_ledger is not None:
+            reason_codes = list(active_ledger.reason_codes)
+
+        plan_runtime: dict[str, Any] = {
+            "enabled": False,
+            "state": "inactive",
+            "required": False,
+            "exposed": False,
+            "mutable": False,
+            "decision_kind": decision_kind,
+            "task_relation": relation,
+            "unavailable_reason": None,
+            "session_id": session_id,
+            "goal_id": active_goal_id,
+            "ledger_id": active_ledger.ledger_id if active_ledger is not None else None,
+            "objective": rollout.resolution.contract.objective,
+            "reason_codes": reason_codes,
+            "max_preplan_read_calls": plan_config.max_preplan_read_calls,
+            "preplan_read_calls_used": 0,
+            "max_plan_prompt_corrections": plan_config.max_plan_prompt_corrections,
+            "plan_corrections_used": 0,
+            "max_finalization_nudges": 1,
+            "finalization_nudges_used": 0,
+            **_plan_runtime_progress_fields(
+                active_ledger.to_dict() if active_ledger is not None else None
+            ),
+        }
+        adaptive_runtime = self._config.agent.ordinary_chat_adaptive_runtime
+        if not adaptive_runtime.enabled or not plan_config.enabled:
+            pass
+        elif adaptive_runtime.complexity.mode != "enforce":
+            plan_runtime["unavailable_reason"] = "planning_shadow_mode"
+        elif request.execution_profile != "chat":
+            plan_runtime["state"] = "unavailable"
+            plan_runtime["unavailable_reason"] = "planning_requires_chat_profile"
+        elif request.tool_mode == "disabled":
+            plan_runtime["state"] = "unavailable"
+            plan_runtime["unavailable_reason"] = "planning_unavailable_tool_mode"
+        elif not request.persist_session:
+            plan_runtime["state"] = "unavailable"
+            plan_runtime["unavailable_reason"] = "planning_unavailable_persistence"
+        elif decision_kind == "continue_existing_plan" and active_ledger is not None:
+            plan_runtime["enabled"] = True
+            plan_runtime["state"] = "active"
+            plan_runtime["required"] = True
+            plan_runtime["exposed"] = True
+            plan_runtime["mutable"] = True
+        elif decision_kind == "preserve_existing_plan" and active_ledger is not None:
+            plan_runtime["enabled"] = True
+            plan_runtime["state"] = "preserved"
+            plan_runtime["required"] = False
+            plan_runtime["exposed"] = False
+            plan_runtime["mutable"] = False
+        elif decision_kind == "plan_required" and active_goal_id:
+            plan_runtime["enabled"] = True
+            plan_runtime["required"] = True
+            plan_runtime["exposed"] = True
+            plan_runtime["mutable"] = True
+            if active_ledger is not None:
+                plan_runtime["state"] = "active"
+            else:
+                plan_runtime["state"] = "required"
+                plan_runtime["ledger_id"] = f"plan:{active_goal_id}"
+
+        tool_execution_context.state["plan_runtime"] = plan_runtime
+        tool_execution_context.state["plan_ledger_snapshot"] = (
+            active_ledger.to_dict() if active_ledger is not None else None
+        )
+        tool_execution_context.state["recognized_plan_evidence_refs"] = (
+            self._recognized_plan_evidence_refs(active_ledger)
+        )
+        if bool(plan_runtime.get("enabled")) and bool(plan_runtime.get("mutable")):
+            tool_execution_context.state["update_plan_runtime"] = {
+                "session_id": session_id,
+                "goal_id": active_goal_id,
+                "ledger_id": plan_runtime.get("ledger_id"),
+                "turn_id": turn_id,
+                "objective": rollout.resolution.contract.objective,
+                "reason_codes": list(reason_codes),
+            }
+            tool_execution_context.state["update_plan_controller"] = _RuntimePlanController(
+                repository=self._plan_ledger_repository,
+                tool_execution_context=tool_execution_context,
+            )
+
+        exposure_plan = self._preserve_update_plan_for_plan_runtime(
+            exposure_plan,
+            available_tool_names=[tool.name for tool in available_tools],
+            plan_runtime=plan_runtime,
+        )
+        return (
+            exposure_plan,
+            complexity_decision,
+            self._build_task_plan_context(tool_execution_context),
+        )
+
+    def _build_task_plan_context(
+        self,
+        tool_execution_context: ToolExecutionContext,
+    ) -> str | None:
+        plan_runtime = tool_execution_context.state.get("plan_runtime")
+        if not isinstance(plan_runtime, Mapping):
+            return None
+        if not bool(plan_runtime.get("enabled")):
+            return None
+        if plan_runtime.get("state") == "unavailable":
+            return None
+        if not bool(plan_runtime.get("required")) and plan_runtime.get("state") != "active":
+            return None
+
+        lines: list[str] = []
+        objective = str(plan_runtime.get("objective") or "").strip()
+        if objective:
+            lines.append(f"Objective: {objective}")
+        lines.append(
+            f"Decision: {plan_runtime.get('decision_kind') or 'no_plan'}; state: {plan_runtime.get('state') or 'inactive'}."
+        )
+        ledger_id = str(plan_runtime.get("ledger_id") or "").strip()
+        if ledger_id:
+            lines.append(f"Ledger: {ledger_id}")
+        revision = int(plan_runtime.get("current_revision") or 0)
+        ledger_status = str(plan_runtime.get("ledger_status") or "").strip()
+        if ledger_status:
+            lines.append(f"Revision: {revision}; status: {ledger_status}.")
+        current_item_id = str(plan_runtime.get("current_item_id") or "").strip()
+        if current_item_id:
+            lines.append(f"Current in-progress item: {current_item_id}")
+        ready_item_ids = plan_runtime.get("ready_item_ids")
+        if isinstance(ready_item_ids, list) and ready_item_ids:
+            lines.append("Ready next items: " + ", ".join(str(item) for item in ready_item_ids[:4]))
+        blocked_item_ids = plan_runtime.get("blocked_item_ids")
+        if isinstance(blocked_item_ids, list) and blocked_item_ids:
+            lines.append("Blocked items: " + ", ".join(str(item) for item in blocked_item_ids[:4]))
+        completed_item_ids = plan_runtime.get("completed_item_ids")
+        if isinstance(completed_item_ids, list) and completed_item_ids:
+            lines.append("Recent completed items: " + ", ".join(str(item) for item in completed_item_ids[:3]))
+
+        preplan_budget = max(
+            0,
+            int(plan_runtime.get("max_preplan_read_calls") or 0)
+            - int(plan_runtime.get("preplan_read_calls_used") or 0),
+        )
+        correction_budget = max(
+            0,
+            int(plan_runtime.get("max_plan_prompt_corrections") or 0)
+            - int(plan_runtime.get("plan_corrections_used") or 0),
+        )
+        lines.append(
+            f"Remaining pre-plan read budget: {preplan_budget}; remaining plan corrections: {correction_budget}."
+        )
+        lines.append(
+            "Use `update_plan` to create or update the durable task plan. "
+            "Before any effectful tool call, ensure there is exactly one `in_progress` item. "
+            "Only mark an item `completed` with host-recognized `evidence_refs` from successful current-turn work."
+        )
+        rendered = "\n".join(lines).strip()
+        max_chars = self._config.agent.ordinary_chat_adaptive_runtime.plan.max_prompt_chars
+        if len(rendered) <= max_chars:
+            return rendered
+        return rendered[: max_chars - 14] + "...[truncated]"
+
+    def _restore_plan_runtime_from_checkpoint(
+        self,
+        *,
+        checkpoint: TurnCheckpoint,
+        turn_id: str,
+        tool_execution_context: ToolExecutionContext,
+    ) -> None:
+        ledger: PlanLedger | None = None
+        if checkpoint.plan_ledger_snapshot is not None:
+            try:
+                ledger = PlanLedger.from_dict(checkpoint.plan_ledger_snapshot)
+            except Exception:
+                ledger = None
+        complexity_decision = (
+            _checkpoint_json_safe(checkpoint.complexity_decision)
+            if checkpoint.complexity_decision
+            else {}
+        )
+        if complexity_decision:
+            tool_execution_context.state["complexity_decision"] = complexity_decision
+        if checkpoint.verification_plan is not None:
+            tool_execution_context.state["verification_plan"] = _checkpoint_json_safe(
+                checkpoint.verification_plan
+            )
+        reason_codes = list(
+            dict.fromkeys(
+                [
+                    *(
+                        complexity_decision.get("hard_reason_codes", [])
+                        if isinstance(
+                            complexity_decision.get("hard_reason_codes"),
+                            list,
+                        )
+                        else []
+                    ),
+                    *(
+                        complexity_decision.get("soft_reason_codes", [])
+                        if isinstance(
+                            complexity_decision.get("soft_reason_codes"),
+                            list,
+                        )
+                        else []
+                    ),
+                ]
+            )
+        )
+        if not reason_codes and ledger is not None:
+            reason_codes = list(ledger.reason_codes)
+        contract = checkpoint.turn_intent_contract
+        objective = (
+            str(contract.get("objective") or "").strip()
+            if isinstance(contract, Mapping)
+            else ""
+        )
+        decision_kind = str(complexity_decision.get("kind") or "no_plan")
+        enabled = bool(
+            checkpoint.plan_ledger_snapshot is not None
+            or decision_kind
+            in {"plan_required", "continue_existing_plan", "preserve_existing_plan"}
+        )
+        mutable = (
+            enabled
+            and checkpoint.stage not in {"completed", "blocked"}
+            and decision_kind != "preserve_existing_plan"
+            and (ledger is None or ledger.status == "active")
+        )
+        required = decision_kind in {"plan_required", "continue_existing_plan"}
+        state = "inactive"
+        if checkpoint.stage in {"completed", "blocked"}:
+            state = "terminal"
+        elif ledger is not None and ledger.status == "active":
+            state = "active" if required else "preserved"
+        elif required:
+            state = "required"
+        elif enabled:
+            state = "preserved"
+        plan_runtime: dict[str, Any] = {
+            "enabled": enabled,
+            "state": state,
+            "required": required,
+            "exposed": mutable,
+            "mutable": mutable,
+            "decision_kind": decision_kind,
+            "task_relation": "restored",
+            "unavailable_reason": None,
+            "session_id": checkpoint.session_id,
+            "goal_id": checkpoint.active_goal_id,
+            "ledger_id": ledger.ledger_id if ledger is not None else None,
+            "objective": objective,
+            "reason_codes": reason_codes,
+            "max_preplan_read_calls": self._config.agent.ordinary_chat_adaptive_runtime.plan.max_preplan_read_calls,
+            "preplan_read_calls_used": 0,
+            "max_plan_prompt_corrections": self._config.agent.ordinary_chat_adaptive_runtime.plan.max_plan_prompt_corrections,
+            "plan_corrections_used": 0,
+            "max_finalization_nudges": 1,
+            "finalization_nudges_used": 0,
+            **_plan_runtime_progress_fields(
+                ledger.to_dict() if ledger is not None else checkpoint.plan_ledger_snapshot
+            ),
+        }
+        tool_execution_context.state["plan_runtime"] = plan_runtime
+        tool_execution_context.state["plan_ledger_snapshot"] = (
+            ledger.to_dict() if ledger is not None else checkpoint.plan_ledger_snapshot
+        )
+        tool_execution_context.state["recognized_plan_evidence_refs"] = (
+            self._recognized_plan_evidence_refs(ledger)
+        )
+        if mutable and checkpoint.active_goal_id:
+            tool_execution_context.state["update_plan_runtime"] = {
+                "session_id": checkpoint.session_id,
+                "goal_id": checkpoint.active_goal_id,
+                "ledger_id": plan_runtime.get("ledger_id"),
+                "turn_id": turn_id,
+                "objective": objective,
+                "reason_codes": list(reason_codes),
+            }
+            tool_execution_context.state["update_plan_controller"] = _RuntimePlanController(
+                repository=self._plan_ledger_repository,
+                tool_execution_context=tool_execution_context,
+            )
+
+    @staticmethod
+    def _tool_call_arguments_digest(arguments: Mapping[str, Any]) -> str:
+        canonical = json.dumps(
+            _checkpoint_json_safe(arguments),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _tool_execution_evidence_from_events(
+        cls,
+        *,
+        requests: Sequence[ToolCallRequestEvent],
+        results: Sequence[ToolCallResultEvent],
+        default_turn_id: str,
+    ) -> tuple[ToolExecutionEvidence, ...]:
+        requests_by_call_id = {event.call_id: event for event in requests}
+        evidence: list[ToolExecutionEvidence] = []
+        for result in results:
+            request = requests_by_call_id.get(result.call_id)
+            arguments = (
+                dict(request.arguments)
+                if request is not None
+                else {}
+            )
+            metadata = (
+                dict(result.metadata)
+                if isinstance(result.metadata, Mapping)
+                else {}
+            )
+            raw_exit_code = metadata.get("exit_code")
+            exit_code = (
+                raw_exit_code
+                if type(raw_exit_code) is int
+                else 0 if result.error is None else 1
+            )
+            evidence.append(
+                ToolExecutionEvidence(
+                    call_id=result.call_id,
+                    tool_name=result.tool_name,
+                    arguments_digest=str(
+                        metadata.get("arguments_digest")
+                        or cls._tool_call_arguments_digest(arguments)
+                    ),
+                    operation_id=str(
+                        metadata.get("operation_id")
+                        or f"tool-execution:{result.call_id}"
+                    ),
+                    turn_id=str(
+                        metadata.get("turn_id")
+                        or default_turn_id
+                    ),
+                    exit_code=exit_code,
+                    status=str(
+                        metadata.get("status")
+                        or ("failed" if result.error else "completed")
+                    ),
+                    approval_pending=bool(
+                        metadata.get("requires_approval")
+                        or metadata.get("approval_id")
+                    ),
+                    error=result.error,
+                    arguments=arguments,
+                )
+            )
+        return tuple(evidence)
+
+    @staticmethod
+    def _recognized_evidence_refs_from_results(
+        *,
+        existing_refs: Collection[str],
+        results: Sequence[ToolCallResultEvent],
+    ) -> tuple[str, ...]:
+        recognized = [
+            str(value).strip()
+            for value in existing_refs
+            if isinstance(value, str) and str(value).strip()
+        ]
+        seen = set(recognized)
+        for result in results:
+            if result.error:
+                continue
+            if result.call_id and result.call_id not in seen:
+                recognized.append(result.call_id)
+                seen.add(result.call_id)
+            metadata = result.metadata if isinstance(result.metadata, Mapping) else {}
+            explicit_refs = metadata.get("evidence_refs")
+            if not isinstance(explicit_refs, (list, tuple, set, frozenset)):
+                continue
+            for item in explicit_refs:
+                if not isinstance(item, str):
+                    continue
+                normalized = item.strip()
+                if not normalized or normalized in seen:
+                    continue
+                recognized.append(normalized)
+                seen.add(normalized)
+        return tuple(recognized)
+
+    @staticmethod
+    def _verification_plan_criteria(
+        verification_plan: Mapping[str, Any] | None,
+    ) -> tuple[VerificationCriterion, ...]:
+        if not isinstance(verification_plan, Mapping):
+            return ()
+        raw_criteria = verification_plan.get("criteria")
+        if not isinstance(raw_criteria, list):
+            return ()
+        return tuple(
+            VerificationCriterion.from_dict(item)
+            for item in raw_criteria
+            if isinstance(item, Mapping)
+        )
+
+    @staticmethod
+    def _bind_artifact_receipt_to_criteria(
+        criteria: Sequence[VerificationCriterion],
+        *,
+        artifact_receipt_id: str | None,
+    ) -> tuple[VerificationCriterion, ...]:
+        if not artifact_receipt_id:
+            return tuple(criteria)
+        bound: list[VerificationCriterion] = []
+        for criterion in criteria:
+            if criterion.kind != "artifact" or "receipt_id" in criterion.payload:
+                bound.append(criterion)
+                continue
+            payload = dict(criterion.payload)
+            payload["receipt_id"] = artifact_receipt_id
+            bound.append(
+                VerificationCriterion(
+                    criterion_id=criterion.criterion_id,
+                    kind=criterion.kind,
+                    required=criterion.required,
+                    description=criterion.description,
+                    source_turn_ids=criterion.source_turn_ids,
+                    verifier_id=criterion.verifier_id,
+                    payload=payload,
+                )
+            )
+        return tuple(bound)
+
+    @staticmethod
+    def _aggregate_verdict_to_status(verdict: str) -> str:
+        if verdict == "not_applicable":
+            return "not_required"
+        return verdict
+
+    async def _build_aggregate_verification_receipt(
+        self,
+        *,
+        turn_id: str,
+        goal_id: str | None,
+        active_task: Any,
+        verification_plan: Mapping[str, Any] | None,
+        artifact_verification: Mapping[str, Any] | None,
+        requests: Sequence[ToolCallRequestEvent],
+        results: Sequence[ToolCallResultEvent],
+        final_response_text: str | None,
+    ) -> dict[str, Any] | None:
+        criteria = self._verification_plan_criteria(verification_plan)
+        if not criteria:
+            return None
+        artifact_receipts: dict[str, ArtifactReceipt] = {}
+        artifact_receipt_id: str | None = None
+        if isinstance(artifact_verification, Mapping):
+            try:
+                artifact_receipt = ArtifactReceipt.from_dict(artifact_verification)
+            except Exception:
+                artifact_receipt = None
+            if artifact_receipt is not None:
+                artifact_receipt_id = str(
+                    artifact_verification.get("receipt_id")
+                    or f"artifact:{artifact_receipt.operation_id}"
+                )
+                artifact_receipts[artifact_receipt_id] = artifact_receipt
+        criteria = self._bind_artifact_receipt_to_criteria(
+            criteria,
+            artifact_receipt_id=artifact_receipt_id,
+        )
+        state = {
+            "active_task": (
+                active_task.to_dict()
+                if hasattr(active_task, "to_dict")
+                else _checkpoint_json_safe({"active_task": active_task}).get("active_task")
+            )
+        }
+        registry = DeterministicVerifierRegistry()
+        receipt = await registry.verify_all(
+            criteria,
+            VerificationEvidence(
+                artifact_receipts=artifact_receipts,
+                tool_execution_evidence=self._tool_execution_evidence_from_events(
+                    requests=requests,
+                    results=results,
+                    default_turn_id=turn_id,
+                ),
+                state=state,
+                response_text=final_response_text,
+            ),
+            receipt_id=f"verification:{turn_id}",
+            turn_id=turn_id,
+            goal_id=goal_id,
+        )
+        return receipt.to_dict()
+
+    async def _persist_aggregate_verification_receipt(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        verification_receipt: Mapping[str, Any],
+    ) -> str | None:
+        try:
+            await self._session_store.save_event(
+                session_id,
+                {
+                    "type": "session_meta",
+                    "event": "verification_receipt",
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "verification_receipt": _checkpoint_json_safe(
+                        verification_receipt
+                    ),
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                },
+            )
+        except Exception as exc:
+            return (
+                "aggregate verification receipt persistence failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        return None
+
+    async def _complete_verified_plan_ledger(
+        self,
+        *,
+        turn_id: str,
+        plan_ledger_snapshot: Mapping[str, Any] | None,
+        recognized_evidence_refs: Collection[str],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(plan_ledger_snapshot, Mapping):
+            return None, None
+        try:
+            ledger = PlanLedger.from_dict(plan_ledger_snapshot)
+        except Exception as exc:
+            return None, f"plan ledger snapshot is invalid: {type(exc).__name__}: {exc}"
+        if ledger.status in {"completed", "cancelled"}:
+            return ledger.to_dict(), None
+        recognized = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in recognized_evidence_refs
+                if isinstance(value, str) and str(value).strip()
+            )
+        )
+        if not recognized:
+            return None, "verified plan completion requires recognized evidence refs"
+        current_item = next(
+            (item for item in ledger.items if item.status == "in_progress"),
+            None,
+        )
+        proposed = ledger
+        try:
+            validator = PlanLedgerTransitionValidator(
+                recognized_evidence_refs=recognized,
+            )
+            if current_item is not None:
+                proposed = validator.set_item_status(
+                    proposed,
+                    item_id=current_item.item_id,
+                    status="completed",
+                    updated_turn_id=turn_id,
+                    evidence_refs=recognized,
+                )
+            if (
+                proposed.status == "active"
+                and all(item.status in {"completed", "cancelled"} for item in proposed.items)
+            ):
+                proposed = replace(
+                    proposed,
+                    status="completed",
+                    updated_turn_id=turn_id,
+                )
+        except Exception as exc:
+            return None, f"verified plan completion failed: {type(exc).__name__}: {exc}"
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "ledger_id": proposed.ledger_id,
+                    "turn_id": turn_id,
+                    "recognized_evidence_refs": list(recognized),
+                    "current_item_id": current_item.item_id if current_item is not None else None,
+                    "status": proposed.status,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        saved = await self._plan_ledger_repository.save(
+            proposed,
+            expected_revision=ledger.revision,
+            turn_id=turn_id,
+            idempotency_key=f"plan-host-finalize:{digest}",
+        )
+        if saved.status != "saved" or saved.ledger is None:
+            return (
+                saved.ledger.to_dict() if saved.ledger is not None else None,
+                saved.message or "plan ledger completion persistence failed",
+            )
+        return saved.ledger.to_dict(), None
+
+    async def _cancel_prior_active_plan_ledger(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        rollout: TurnContractRolloutResult,
+    ) -> str | None:
+        relation = self._resolve_complexity_task_relation(rollout)
+        if relation not in {"cancel", "supersede"}:
+            return None
+        prior_active_task = rollout.resolution.context.active_task
+        if prior_active_task is None:
+            return None
+        next_active_task = rollout.resolution.next_active_task
+        if (
+            relation == "supersede"
+            and next_active_task is not None
+            and next_active_task.goal_id == prior_active_task.goal_id
+        ):
+            return None
+        loaded = await self._plan_ledger_repository.load_active(
+            session_id,
+            prior_active_task.goal_id,
+        )
+        if loaded.status != "loaded" or loaded.ledger is None:
+            return None
+        proposed = replace(
+            loaded.ledger,
+            status="cancelled",
+            updated_turn_id=turn_id,
+        )
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "ledger_id": proposed.ledger_id,
+                    "goal_id": proposed.goal_id,
+                    "turn_id": turn_id,
+                    "relation": relation,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        saved = await self._plan_ledger_repository.save(
+            proposed,
+            expected_revision=loaded.ledger.revision,
+            turn_id=turn_id,
+            idempotency_key=f"plan-host-cancel:{digest}",
+        )
+        if saved.status != "saved":
+            return saved.message or "prior plan ledger cancellation failed"
+        return None
+
+    @staticmethod
     def _apply_invocation_tool_overrides(
         exposure_plan: ToolExposurePlan,
         *,
@@ -3629,6 +4916,10 @@ class AgentEngine:
             self._turn_checkpoint_repository = TurnCheckpointRepository(
                 self._session_store
             )
+        if self._owns_tool_discovery_state_repository:
+            self._tool_discovery_state_repository = ToolDiscoveryStateRepository(
+                self._session_store
+            )
         self._skill_library = SkillLibrary(db_path=self._skills_db_path())
         self._skill_loader = self._make_skill_loader()
         self._skill_selector = self._make_skill_selector()
@@ -3645,6 +4936,7 @@ class AgentEngine:
             config,
             memory_store=self._memory_store,
             mcp_runtime_manager=self._mcp_runtime_manager,
+            tool_search_discovery_hook=self._record_tool_search_discovery,
         )
         self._tool_registry = self._tool_registry_factory.create_registry(config.workspace_dir)
         self._tool_exposure_planner = ToolExposurePlanner(
@@ -4832,6 +6124,47 @@ class AgentEngine:
         return dict(raw), None
 
     @staticmethod
+    def _controlled_recovery_budget(
+        checkpoint: TurnCheckpoint,
+    ) -> tuple[dict[str, Any], str | None]:
+        raw_budget = checkpoint.recovery_budget
+        remaining_attempts = raw_budget.get("remaining_attempts")
+        remaining_extra_model_calls = raw_budget.get("remaining_extra_model_calls")
+        remaining_extra_tool_calls = raw_budget.get("remaining_extra_tool_calls")
+        remaining_extra_wall_seconds = raw_budget.get("remaining_extra_wall_seconds")
+        if (
+            type(remaining_attempts) is not int
+            or remaining_attempts < 0
+            or type(remaining_extra_model_calls) is not int
+            or remaining_extra_model_calls < 0
+            or type(remaining_extra_tool_calls) is not int
+            or remaining_extra_tool_calls < 0
+            or isinstance(remaining_extra_wall_seconds, bool)
+            or not isinstance(remaining_extra_wall_seconds, (int, float))
+            or remaining_extra_wall_seconds < 0
+        ):
+            return {}, "controlled_recovery_budget_invalid"
+        return {
+            "remaining_attempts": remaining_attempts,
+            "remaining_extra_model_calls": remaining_extra_model_calls,
+            "remaining_extra_tool_calls": remaining_extra_tool_calls,
+            "remaining_extra_wall_seconds": float(remaining_extra_wall_seconds),
+        }, None
+
+    @classmethod
+    def _reserve_controlled_recovery_budget(
+        cls,
+        checkpoint: TurnCheckpoint,
+    ) -> tuple[dict[str, Any], str | None]:
+        budget, error = cls._controlled_recovery_budget(checkpoint)
+        if error is not None:
+            return {}, error
+        if budget["remaining_attempts"] < 1:
+            return budget, "controlled_recovery_budget_exhausted"
+        budget["remaining_attempts"] -= 1
+        return budget, None
+
+    @staticmethod
     def _controlled_recovery_prompt(
         *,
         decision: ControlledRecoveryDecision,
@@ -5178,6 +6511,149 @@ class AgentEngine:
             return f"{type(exc).__name__}: {exc}", None
         return None, expected_state_revision
 
+    def _resolve_complexity_decision(
+        self,
+        *,
+        rollout: TurnContractRolloutResult,
+        available_tools: Sequence[BaseTool],
+        exposure_plan: ToolExposurePlan,
+        active_plan_summary: ComplexityActivePlanSummary | None = None,
+    ) -> dict[str, Any]:
+        adaptive_runtime = self._config.agent.ordinary_chat_adaptive_runtime
+        complexity_config = adaptive_runtime.complexity
+        if not adaptive_runtime.enabled or complexity_config.mode == "off":
+            return {}
+
+        candidate_tool_names = set(rollout.capability_plan.eligible_tools)
+        candidate_tool_names.update(exposure_plan.tool_names)
+        descriptors = [
+            CatalogToolDescriptor.from_capability_metadata(
+                name=tool.name,
+                metadata=tool.tool_capabilities,
+                requires_approval=tool.requires_approval,
+                risk=(
+                    "high"
+                    if tool.is_destructive
+                    else "elevated" if tool.requires_approval else "low"
+                ),
+            )
+            for tool in available_tools
+            if tool.name in candidate_tool_names
+        ]
+        capability_summary = ComplexityCapabilitySummary(
+            requires_user_approval=any(
+                descriptor.requires_approval for descriptor in descriptors
+            ),
+            destructive_tool_available=any(
+                descriptor.destructive for descriptor in descriptors
+            ),
+            effectful_tool_count=sum(
+                1
+                for descriptor in descriptors
+                if descriptor.mutating or "execution" in descriptor.capabilities
+            ),
+        )
+        gate = ComplexityGate(
+            config=RuntimeComplexityGateConfig(
+                no_plan_max_score=complexity_config.no_plan_max_score,
+                plan_required_min_score=complexity_config.plan_required_min_score,
+                advisor_enabled=complexity_config.model_advisor_enabled,
+                advisor_timeout_seconds=complexity_config.advisor_timeout_seconds,
+            )
+        )
+        decision = gate.evaluate_deterministic(
+            ComplexityGateRequest(
+                turn_intent=rollout.resolution.contract,
+                task_relation=self._resolve_complexity_task_relation(rollout),
+                capability_summary=capability_summary,
+                active_plan=active_plan_summary,
+            )
+        )
+        return decision.to_dict()
+
+    @staticmethod
+    def _build_verification_plan(
+        rollout: TurnContractRolloutResult,
+        *,
+        semantic_fallback_enabled: bool,
+    ) -> dict[str, Any] | None:
+        compiler = VerificationPlanCompiler(
+            semantic_fallback_enabled=semantic_fallback_enabled
+        )
+        criteria = compiler.compile(
+            deliverables=tuple(
+                AgentEngine._normalize_verification_deliverable(deliverable)
+                for deliverable in rollout.resolution.contract.deliverables
+            )
+        )
+        if not criteria:
+            return None
+        return {
+            "criteria": [criterion.to_dict() for criterion in criteria],
+        }
+
+    @staticmethod
+    def _normalize_verification_deliverable(
+        deliverable: DeliverableContract,
+    ) -> DeliverableContract:
+        if deliverable.target_hint is None:
+            return deliverable
+        criteria = tuple(deliverable.acceptance_criteria)
+        if AgentEngine._deliverable_has_exists_acceptance(criteria):
+            return deliverable
+        return replace(
+            deliverable,
+            acceptance_criteria=("exists", *criteria),
+        )
+
+    @staticmethod
+    def _deliverable_has_exists_acceptance(criteria: Sequence[Any]) -> bool:
+        for criterion in criteria:
+            if isinstance(criterion, str) and criterion.strip().lower() in {
+                "exists",
+                "target exists",
+                "target_exists",
+            }:
+                return True
+            if (
+                isinstance(criterion, Mapping)
+                and criterion.get("kind") == "file"
+                and str(criterion.get("check") or "").strip().lower() == "exists"
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _resolve_complexity_task_relation(
+        rollout: TurnContractRolloutResult,
+    ) -> Literal[
+        "continue",
+        "side_question",
+        "start",
+        "supersede",
+        "cancel",
+        "standalone",
+    ]:
+        contract = rollout.resolution.contract
+        prior_active_task = rollout.resolution.context.active_task
+        next_active_task = rollout.resolution.next_active_task
+        if contract.cancels_active_goal:
+            return "cancel"
+        if contract.supersedes_previous_goal:
+            return "supersede"
+        if prior_active_task is not None and not contract.modifies_active_task:
+            return "side_question"
+        if prior_active_task is not None and contract.modifies_active_task:
+            if (
+                next_active_task is not None
+                and next_active_task.goal_id != prior_active_task.goal_id
+            ):
+                return "supersede"
+            return "continue"
+        if next_active_task is not None and contract.modifies_active_task:
+            return "start"
+        return "standalone"
+
     def _build_turn_checkpoint(
         self,
         *,
@@ -5228,6 +6704,23 @@ class AgentEngine:
             activation_state=_checkpoint_json_safe(
                 tool_execution_context.state.get("tool_activation_policy", {})
             ),
+            complexity_decision=_checkpoint_json_safe(
+                tool_execution_context.state.get("complexity_decision", {})
+            ),
+            plan_ledger_snapshot=(
+                _checkpoint_json_safe(
+                    tool_execution_context.state.get("plan_ledger_snapshot", {})
+                )
+                if tool_execution_context.state.get("plan_ledger_snapshot") is not None
+                else None
+            ),
+            verification_plan=(
+                _checkpoint_json_safe(
+                    tool_execution_context.state.get("verification_plan", {})
+                )
+                if tool_execution_context.state.get("verification_plan") is not None
+                else None
+            ),
             resume_cursor={"turn_id": turn_id, "phase": "react"},
         )
 
@@ -5247,6 +6740,8 @@ class AgentEngine:
         approval_record: Mapping[str, Any] | None = None,
         execution_receipt: Mapping[str, Any] | None = None,
         verification_result: Mapping[str, Any] | None = None,
+        plan_ledger_snapshot: Mapping[str, Any] | None = None,
+        recovery_budget: Mapping[str, Any] | None = None,
         resume_cursor: Mapping[str, Any] | None = None,
         completion_reason: str | None = None,
         blocker_reason: str | None = None,
@@ -5273,6 +6768,16 @@ class AgentEngine:
                 _checkpoint_json_safe(verification_result)
                 if verification_result is not None
                 else checkpoint.verification_result
+            ),
+            plan_ledger_snapshot=(
+                _checkpoint_json_safe(plan_ledger_snapshot)
+                if plan_ledger_snapshot is not None
+                else checkpoint.plan_ledger_snapshot
+            ),
+            recovery_budget=(
+                _checkpoint_json_safe(recovery_budget)
+                if recovery_budget is not None
+                else checkpoint.recovery_budget
             ),
             resume_cursor=(
                 _checkpoint_json_safe(resume_cursor)
@@ -5360,6 +6865,7 @@ class AgentEngine:
         events: list[AgentEvent],
         persist_session: bool,
         workspace_dir: str,
+        tool_execution_context: ToolExecutionContext,
     ) -> str | None:
         if (
             not persist_session
@@ -5421,8 +6927,33 @@ class AgentEngine:
             results=mutation_results,
             evidence_requests=turn_tool_requests,
             evidence_results=turn_tool_results,
+            verification_plan=self._build_verification_plan(
+                rollout,
+                semantic_fallback_enabled=(
+                    self._config.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
+                    == "fallback"
+                ),
+            ),
+            final_response_text=final_event.content,
+            plan_ledger_snapshot=cast(
+                Mapping[str, Any] | None,
+                tool_execution_context.state.get("plan_ledger_snapshot"),
+            ),
+            recognized_evidence_refs=cast(
+                Collection[str],
+                tool_execution_context.state.get("recognized_plan_evidence_refs") or (),
+            ),
         )
         final_event.metadata["artifact_verification"] = receipt
+        updated_plan_ledger = receipt.get("plan_ledger")
+        if isinstance(updated_plan_ledger, Mapping):
+            normalized_plan_ledger = _checkpoint_json_safe(updated_plan_ledger)
+            tool_execution_context.state["plan_ledger_snapshot"] = normalized_plan_ledger
+            plan_runtime = tool_execution_context.state.get("plan_runtime")
+            if isinstance(plan_runtime, dict):
+                plan_runtime.update(_plan_runtime_progress_fields(normalized_plan_ledger))
+                if plan_runtime.get("ledger_status") in {"completed", "cancelled"}:
+                    plan_runtime["state"] = "terminal"
         if receipt.get("verification_status") != "verified":
             final_event.metadata["artifact_verification_status"] = receipt[
                 "verification_status"
@@ -5441,6 +6972,10 @@ class AgentEngine:
         results: list[ToolCallResultEvent],
         evidence_requests: Sequence[ToolCallRequestEvent] | None = None,
         evidence_results: Sequence[ToolCallResultEvent] | None = None,
+        verification_plan: Mapping[str, Any] | None = None,
+        final_response_text: str | None = None,
+        plan_ledger_snapshot: Mapping[str, Any] | None = None,
+        recognized_evidence_refs: Collection[str] = (),
     ) -> tuple[dict[str, Any], str | None]:
         """Persist verified evidence before a CAS-protected task completion.
 
@@ -5498,6 +7033,58 @@ class AgentEngine:
             return receipt, f"artifact receipt persistence failed: {type(exc).__name__}: {exc}"
         if not verification.success:
             return receipt, None
+        aggregate_receipt: dict[str, Any] | None = None
+        if verification_plan is not None:
+            try:
+                aggregate_receipt = await self._build_aggregate_verification_receipt(
+                    turn_id=turn_id,
+                    goal_id=active_task.goal_id,
+                    active_task=active_task,
+                    verification_plan=verification_plan,
+                    artifact_verification=receipt,
+                    requests=evidence_requests or requests,
+                    results=evidence_results or results,
+                    final_response_text=final_response_text,
+                )
+            except Exception as exc:
+                receipt["aggregate_verification_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return (
+                    receipt,
+                    "aggregate verification receipt build failed: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+            if aggregate_receipt is not None:
+                persist_error = await self._persist_aggregate_verification_receipt(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    verification_receipt=aggregate_receipt,
+                )
+                if persist_error is not None:
+                    receipt["aggregate_verification_receipt"] = aggregate_receipt
+                    receipt["aggregate_verdict"] = aggregate_receipt.get("verdict")
+                    return receipt, persist_error
+                receipt["aggregate_verification_receipt"] = aggregate_receipt
+                receipt["aggregate_verdict"] = aggregate_receipt.get("verdict")
+                receipt["aggregate_retry_disposition"] = aggregate_receipt.get(
+                    "retry_disposition"
+                )
+                if aggregate_receipt.get("verdict") != "verified":
+                    return receipt, None
+        effective_recognized_evidence_refs = self._recognized_evidence_refs_from_results(
+            existing_refs=recognized_evidence_refs,
+            results=evidence_results or results,
+        )
+        plan_ledger_result, plan_ledger_error = await self._complete_verified_plan_ledger(
+            turn_id=turn_id,
+            plan_ledger_snapshot=plan_ledger_snapshot,
+            recognized_evidence_refs=effective_recognized_evidence_refs,
+        )
+        if plan_ledger_result is not None:
+            receipt["plan_ledger"] = plan_ledger_result
+        if plan_ledger_error is not None:
+            return receipt, plan_ledger_error
         if state_revision is None:
             return receipt, "missing active-task state revision for completion transition"
 

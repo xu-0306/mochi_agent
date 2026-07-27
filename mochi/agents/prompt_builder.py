@@ -55,6 +55,7 @@ class PromptBuilder:
         self,
         skills_context: str | None = None,
         memory_context: str | None = None,
+        task_plan_context: str | None = None,
         attachment_context: str | None = None,
         base_prompt: str | None = None,
         task_workspace_dir: str | None = None,
@@ -82,6 +83,13 @@ class PromptBuilder:
                 "## Relevant Memory\n"
                 "The following prior information may be relevant to the current task:\n"
                 f"{memory_context}"
+            )
+
+        if task_plan_context:
+            parts.append(
+                "## Task Plan\n"
+                "The following host-managed task plan state is authoritative for this turn:\n"
+                f"{task_plan_context}"
             )
 
         if attachment_context:

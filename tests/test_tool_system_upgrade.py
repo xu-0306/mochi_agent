@@ -681,6 +681,56 @@ def test_registry_factory_registers_tool_search(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_registry_factory_wires_tool_search_runtime_metadata(tmp_path: Path) -> None:
+    seen: list[dict[str, Any]] = []
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+            "agent": {
+                "ordinary_chat_adaptive_runtime": {
+                    "retrieval": {
+                        "default_top_k": 2,
+                        "max_top_k": 4,
+                    }
+                }
+            },
+        }
+    )
+    factory = ToolRegistryFactory(
+        config,
+        memory_store=MemoryStore(db_path=tmp_path / "memory.db"),
+        tool_search_discovery_hook=lambda payload: seen.append(payload),
+    )
+
+    registry = factory.create_registry(str(tmp_path))
+    tool = registry.get("tool_search")
+
+    assert isinstance(tool, ToolSearchTool)
+    assert tool.parameters_schema["properties"]["top_k"]["maximum"] == 4
+
+    result = await registry.execute(
+        "tool_search",
+        {"query": "file_read"},
+        context=ToolExecutionContext(
+            workspace_dir=str(tmp_path),
+            session_id="session-1",
+            state={"turn_id": "turn-1"},
+        ),
+    )
+
+    assert result.error is None
+    assert result.metadata["top_k"] == 2
+    assert result.metadata["catalog_generation"] == 0
+    assert len(seen) == 1
+    assert seen[0]["session_id"] == "session-1"
+    assert seen[0]["turn_id"] == "turn-1"
+    assert seen[0]["catalog_generation"] == 0
+    assert seen[0]["matches"][0]["tool_name"] == "file_read"
+
+
+@pytest.mark.asyncio
 async def test_registry_factory_propagates_independent_file_scopes(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -757,6 +807,77 @@ def test_registry_factory_caches_registries_per_workspace(tmp_path: Path) -> Non
     assert primary is primary_again
     assert secondary is not primary
     assert factory.list_cached_registries() == [primary, secondary]
+
+
+@pytest.mark.asyncio
+async def test_registry_factory_rebuilds_registry_after_mcp_catalog_refresh(tmp_path: Path) -> None:
+    class _MutableMcpAdapter:
+        def __init__(self) -> None:
+            self.tools: list[McpToolDefinition] = [
+                McpToolDefinition(
+                    name="search_docs",
+                    description="Search docs from MCP.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                    annotations={"readOnlyHint": True},
+                )
+            ]
+
+        async def list_tools(self) -> list[McpToolDefinition]:
+            return list(self.tools)
+
+        async def list_resources(self) -> list[dict[str, Any]]:
+            return [{"uri": "memo://welcome", "name": "welcome"}]
+
+    adapter = _MutableMcpAdapter()
+    runtime = McpRuntimeManager(
+        servers={"demo": McpServerConfig(name="demo", transport="in_memory")},
+        adapters={"demo": adapter},
+    )
+    await runtime.refresh_server("demo")
+    config = MochiConfig.model_validate(
+        {
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    factory = ToolRegistryFactory(
+        config,
+        memory_store=MemoryStore(db_path=tmp_path / "memory.db"),
+        mcp_runtime_manager=runtime,
+    )
+
+    first = factory.create_registry(str(tmp_path))
+    first_result = await first.execute("tool_search", {"query": "search_docs"})
+
+    assert first.get("mcp__demo__search_docs") is not None
+    assert first_result.error is None
+    assert first_result.metadata["catalog_generation"] == 1
+
+    adapter.tools = [
+        McpToolDefinition(
+            name="read_docs",
+            description="Read docs from MCP.",
+            input_schema={
+                "type": "object",
+                "properties": {"uri": {"type": "string"}},
+            },
+            annotations={"readOnlyHint": True},
+        )
+    ]
+    await runtime.refresh_server("demo")
+
+    second = factory.create_registry(str(tmp_path))
+    second_result = await second.execute("tool_search", {"query": "read_docs"})
+
+    assert second is not first
+    assert second.get("mcp__demo__read_docs") is not None
+    assert second.get("mcp__demo__search_docs") is None
+    assert second_result.error is None
+    assert second_result.metadata["catalog_generation"] == 2
 
 
 def test_registry_get_schemas_for_names_returns_requested_schemas_only() -> None:

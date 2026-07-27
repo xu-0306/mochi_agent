@@ -17,7 +17,8 @@ _LEGACY_ACTIVE_TASK_STATE_EVENT_VERSION = 1
 
 TURN_CHECKPOINT_EVENT = "turn_execution_checkpoint"
 TURN_CHECKPOINT_EVENT_VERSION = 1
-TURN_CHECKPOINT_VERSION = "turn-checkpoint-v1"
+TURN_CHECKPOINT_VERSION = "turn-checkpoint-v2"
+_LEGACY_TURN_CHECKPOINT_VERSION = "turn-checkpoint-v1"
 
 ConversationStateLoadStatus = Literal[
     "loaded",
@@ -72,6 +73,15 @@ _CHECKPOINT_TRANSITIONS: dict[str | None, frozenset[TurnCheckpointStage]] = {
 }
 
 
+def _default_recovery_budget() -> dict[str, Any]:
+    return {
+        "remaining_attempts": 1,
+        "remaining_extra_model_calls": 1,
+        "remaining_extra_tool_calls": 4,
+        "remaining_extra_wall_seconds": 120.0,
+    }
+
+
 @dataclass(frozen=True)
 class ConversationStateLoadDiagnostics:
     """Non-authoritative diagnostics for one reverse event scan."""
@@ -117,6 +127,10 @@ class TurnCheckpoint:
     policy_snapshot: Mapping[str, Any] = field(default_factory=dict)
     inventory_snapshot: Mapping[str, Any] = field(default_factory=dict)
     activation_state: Mapping[str, Any] = field(default_factory=dict)
+    complexity_decision: Mapping[str, Any] = field(default_factory=dict)
+    plan_ledger_snapshot: Mapping[str, Any] | None = None
+    verification_plan: Mapping[str, Any] | None = None
+    recovery_budget: Mapping[str, Any] = field(default_factory=_default_recovery_budget)
     pending_tool_call: Mapping[str, Any] | None = None
     approval_record: Mapping[str, Any] | None = None
     execution_receipt: Mapping[str, Any] | None = None
@@ -141,6 +155,8 @@ class TurnCheckpoint:
             "policy_snapshot",
             "inventory_snapshot",
             "activation_state",
+            "complexity_decision",
+            "recovery_budget",
         ):
             object.__setattr__(
                 self,
@@ -152,6 +168,8 @@ class TurnCheckpoint:
             "approval_record",
             "execution_receipt",
             "verification_result",
+            "plan_ledger_snapshot",
+            "verification_plan",
             "resume_cursor",
         ):
             value = getattr(self, field_name)
@@ -186,6 +204,10 @@ class TurnCheckpoint:
             "policy_snapshot": _json_clone(self.policy_snapshot),
             "inventory_snapshot": _json_clone(self.inventory_snapshot),
             "activation_state": _json_clone(self.activation_state),
+            "complexity_decision": _json_clone(self.complexity_decision),
+            "plan_ledger_snapshot": _json_clone_or_none(self.plan_ledger_snapshot),
+            "verification_plan": _json_clone_or_none(self.verification_plan),
+            "recovery_budget": _json_clone(self.recovery_budget),
             "pending_tool_call": _json_clone_or_none(self.pending_tool_call),
             "approval_record": _json_clone_or_none(self.approval_record),
             "execution_receipt": _json_clone_or_none(self.execution_receipt),
@@ -197,6 +219,10 @@ class TurnCheckpoint:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TurnCheckpoint:
+        raw_version = value.get("checkpoint_version")
+        if raw_version == _LEGACY_TURN_CHECKPOINT_VERSION:
+            value = _migrate_turn_checkpoint_v1(value)
+            raw_version = value.get("checkpoint_version")
         expected = {
             "checkpoint_version",
             "session_id",
@@ -209,6 +235,10 @@ class TurnCheckpoint:
             "policy_snapshot",
             "inventory_snapshot",
             "activation_state",
+            "complexity_decision",
+            "plan_ledger_snapshot",
+            "verification_plan",
+            "recovery_budget",
             "pending_tool_call",
             "approval_record",
             "execution_receipt",
@@ -226,9 +256,9 @@ class TurnCheckpoint:
             if unexpected:
                 details.append(f"unexpected fields: {unexpected}")
             raise ValueError("turn checkpoint " + "; ".join(details))
-        if value.get("checkpoint_version") != TURN_CHECKPOINT_VERSION:
+        if raw_version != TURN_CHECKPOINT_VERSION:
             raise ValueError(
-                f"unsupported checkpoint version: {value.get('checkpoint_version')!r}"
+                f"unsupported checkpoint version: {raw_version!r}"
             )
         raw_stage = value.get("stage")
         if not isinstance(raw_stage, str) or raw_stage not in _CHECKPOINT_TRANSITIONS:
@@ -255,6 +285,19 @@ class TurnCheckpoint:
             activation_state=_require_mapping(
                 value.get("activation_state"), field_name="activation_state"
             ),
+            complexity_decision=_require_mapping(
+                value.get("complexity_decision"), field_name="complexity_decision"
+            ),
+            plan_ledger_snapshot=_optional_mapping(
+                value.get("plan_ledger_snapshot"),
+                field_name="plan_ledger_snapshot",
+            ),
+            verification_plan=_optional_mapping(
+                value.get("verification_plan"), field_name="verification_plan"
+            ),
+            recovery_budget=_require_mapping(
+                value.get("recovery_budget"), field_name="recovery_budget"
+            ),
             pending_tool_call=_optional_mapping(
                 value.get("pending_tool_call"), field_name="pending_tool_call"
             ),
@@ -277,6 +320,45 @@ class TurnCheckpoint:
                 value.get("blocker_reason"), field_name="blocker_reason"
             ),
         )
+
+
+def _migrate_turn_checkpoint_v1(value: Mapping[str, Any]) -> dict[str, Any]:
+    expected_v1 = {
+        "checkpoint_version",
+        "session_id",
+        "turn_id",
+        "revision",
+        "stage",
+        "turn_intent_contract",
+        "capability_plan",
+        "active_goal_id",
+        "policy_snapshot",
+        "inventory_snapshot",
+        "activation_state",
+        "pending_tool_call",
+        "approval_record",
+        "execution_receipt",
+        "verification_result",
+        "resume_cursor",
+        "completion_reason",
+        "blocker_reason",
+    }
+    missing = sorted(expected_v1 - set(value))
+    unexpected = sorted(set(value) - expected_v1)
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing fields: {missing}")
+        if unexpected:
+            details.append(f"unexpected fields: {unexpected}")
+        raise ValueError("turn checkpoint " + "; ".join(details))
+    migrated = dict(value)
+    migrated["checkpoint_version"] = TURN_CHECKPOINT_VERSION
+    migrated["complexity_decision"] = {}
+    migrated["plan_ledger_snapshot"] = None
+    migrated["verification_plan"] = None
+    migrated["recovery_budget"] = _default_recovery_budget()
+    return migrated
 
 
 @dataclass(frozen=True)

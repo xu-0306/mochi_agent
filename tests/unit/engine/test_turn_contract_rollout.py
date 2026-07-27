@@ -22,6 +22,7 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.agents.plan_ledger import PLAN_LEDGER_VERSION, PlanItem, PlanLedger
 from mochi.agents.conversation_state_store import TurnCheckpoint
 from mochi.agents.invocation import AgentInvocationRequest
 from mochi.agents.tool_exposure import ToolExposurePlan
@@ -156,6 +157,9 @@ async def test_enforce_contract_write_uses_default_workspace_and_required_tools(
             captured["tools"] = [
                 schema["function"]["name"] for schema in tool_registry.get_schemas()
             ]
+            captured["complexity_decision"] = dict(
+                tool_execution_context.state.get("complexity_decision", {})
+            )
             captured["policy"] = dict(
                 tool_execution_context.state["tool_activation_policy"]
             )
@@ -190,6 +194,8 @@ async def test_enforce_contract_write_uses_default_workspace_and_required_tools(
     assert result.content == "spy reply"
     assert interpreter.calls == 1
     assert {"file_write", "file_edit", "apply_patch"} & set(captured["tools"])
+    assert captured["complexity_decision"]["decision_version"] == "complexity-decision-v1"
+    assert captured["complexity_decision"]["turn_id"]
     assert captured["requires_file_mutation"] is True
     assert captured["policy"]["capability_enforcement_mode"] == "enforce"
     assert captured["policy"]["mutation_requirement"] == "required"
@@ -464,6 +470,10 @@ async def test_successful_enforce_artifact_turn_persists_completed_task(
     ]
     assert [checkpoint["revision"] for checkpoint in checkpoints] == [1, 2, 3, 4]
     assert checkpoints[0]["turn_intent_contract"]["turn_id"] == result.events[-1].turn_id
+    assert checkpoints[0]["complexity_decision"]["decision_version"] == "complexity-decision-v1"
+    assert checkpoints[0]["complexity_decision"]["turn_id"] == result.events[-1].turn_id
+    assert checkpoints[0]["verification_plan"]["criteria"][0]["kind"] == "artifact"
+    assert checkpoints[0]["verification_plan"]["criteria"][0]["payload"]["check"] == "exists"
     assert checkpoints[-1]["verification_result"]["verification_status"] == "verified"
     await engine.close()
 
@@ -672,6 +682,14 @@ async def test_timeline_artifact_failure_runs_one_durable_corrective_pass(
         ).get("status")
         == "reserved"
     )
+    reserved_checkpoint = next(
+        item
+        for item in checkpoints
+        if (item["execution_receipt"] or {}).get("controlled_recovery", {}).get(
+            "status"
+        )
+        == "reserved"
+    )
     assert receipt_indexes[0] < reserved_index < receipt_indexes[1]
     assert [item["stage"] for item in checkpoints] == [
         "contract_resolved",
@@ -680,7 +698,9 @@ async def test_timeline_artifact_failure_runs_one_durable_corrective_pass(
         "verifying",
         "completed",
     ]
+    assert reserved_checkpoint["recovery_budget"]["remaining_attempts"] == 0
     recovery = checkpoints[-1]["execution_receipt"]["controlled_recovery"]
+    assert checkpoints[-1]["recovery_budget"]["remaining_attempts"] == 0
     assert recovery["status"] == "completed"
     assert recovery["predecessor_operation_id"] == "operation-first"
     assert recovery["successor_operation_id"] == "operation-corrective"
@@ -750,6 +770,7 @@ async def test_controlled_recovery_budget_exhaustion_blocks_a_second_model_pass(
     assert loaded.checkpoint is not None
     assert loaded.checkpoint.stage == "blocked"
     assert loaded.checkpoint.blocker_reason == "controlled_recovery_budget_exhausted"
+    assert loaded.checkpoint.recovery_budget["remaining_attempts"] == 0
     recovery = loaded.checkpoint.execution_receipt["controlled_recovery"]
     assert recovery["status"] == "blocked"
     assert recovery["replans_used"] == 1
@@ -817,6 +838,71 @@ async def test_reserved_controlled_recovery_reentry_blocks_without_model_or_tool
     loaded = await engine._turn_checkpoint_repository.load("recovery-reentry", "reserved-turn")  # noqa: SLF001
     assert loaded.checkpoint is not None
     assert loaded.checkpoint.stage == "blocked"
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_checkpoint_round_trips_plan_ledger_snapshot_from_public_repository(
+    tmp_path: Path,
+) -> None:
+    engine = AgentEngine(_config(tmp_path, mode="enforce"))
+    ledger = PlanLedger(
+        ledger_version=PLAN_LEDGER_VERSION,
+        ledger_id="plan-goal-1",
+        session_id="checkpoint-plan-session",
+        goal_id="goal-1",
+        revision=1,
+        status="active",
+        objective="Build the selected artifact",
+        reason_codes=("multiple_deliverables",),
+        items=(
+            PlanItem(
+                item_id="item-1",
+                title="Inspect inputs",
+                status="completed",
+                dependencies=(),
+                success_criteria=("done",),
+                source_turn_ids=("turn-1",),
+                evidence_refs=("receipt-1",),
+            ),
+            PlanItem(
+                item_id="item-2",
+                title="Apply the fix",
+                status="in_progress",
+                dependencies=("item-1",),
+                success_criteria=("done",),
+                source_turn_ids=("turn-1",),
+            ),
+        ),
+        created_turn_id="turn-1",
+        updated_turn_id="turn-2",
+    )
+    checkpoint = TurnCheckpoint(
+        session_id="checkpoint-plan-session",
+        turn_id="turn-2",
+        revision=0,
+        stage="contract_resolved",
+        turn_intent_contract={"turn_id": "turn-2"},
+        capability_plan={"plan_version": "capability-plan-v1"},
+        plan_ledger_snapshot=ledger.to_dict(),
+        verification_plan={"criteria": [{"kind": "artifact"}]},
+    )
+
+    saved = await engine._turn_checkpoint_repository.save(  # noqa: SLF001
+        checkpoint,
+        expected_revision=0,
+    )
+
+    assert saved.status == "saved"
+    loaded = await engine._turn_checkpoint_repository.load(  # noqa: SLF001
+        "checkpoint-plan-session",
+        "turn-2",
+    )
+    assert loaded.diagnostics.status == "loaded"
+    assert loaded.checkpoint is not None
+    assert loaded.checkpoint.plan_ledger_snapshot == ledger.to_dict()
+    assert loaded.checkpoint.plan_ledger_snapshot["items"][1]["status"] == "in_progress"
+    assert loaded.checkpoint.plan_ledger_snapshot["reason_codes"] == ["multiple_deliverables"]
     await engine.close()
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -49,7 +50,8 @@ from mochi.tools.process_service import ProcessService
 from mochi.tools.read_session import ReadSessionTool
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.tool_result_read import ToolResultReadTool
-from mochi.tools.tool_search import ToolSearchTool
+from mochi.tools.tool_search import ToolDiscoveryHook, ToolSearchTool
+from mochi.tools.update_plan import UpdatePlanTool
 from mochi.tools.web_crawl import WebCrawlTool
 from mochi.tools.web_fetch import WebFetchTool
 from mochi.tools.web_search import WebSearchTool
@@ -82,10 +84,12 @@ class ToolRegistryFactory:
         *,
         memory_store: MemoryStore,
         mcp_runtime_manager: McpRuntimeManager | None = None,
+        tool_search_discovery_hook: ToolDiscoveryHook | None = None,
     ) -> None:
         self._config = config
         self._memory_store = memory_store
         self._mcp_runtime_manager = mcp_runtime_manager
+        self._tool_search_discovery_hook = tool_search_discovery_hook
         self._process_service = ProcessService()
         self._exec_runtime = ExecRuntime(
             default_shell=self._resolve_exec_default_shell(),
@@ -94,6 +98,7 @@ class ToolRegistryFactory:
         self._exec_approval_store = PersistentApprovalStore(Path(config.sessions_dir) / "exec-approvals.db")
         self._builtins = self._build_specs()
         self._registry_cache: dict[str, ToolRegistry] = {}
+        self._registry_catalog_signatures: dict[str, str | None] = {}
 
     @property
     def tool_groups(self) -> dict[str, list[str]]:
@@ -109,8 +114,9 @@ class ToolRegistryFactory:
     def create_registry(self, workspace_dir: str) -> ToolRegistry:
         """Create a registry bound to one effective workspace."""
         cache_key = self._registry_cache_key(workspace_dir)
+        catalog_signature = self._mcp_catalog_signature()
         cached = self._registry_cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and self._registry_catalog_signatures.get(cache_key) == catalog_signature:
             return cached
 
         registry = ToolRegistry(
@@ -130,8 +136,9 @@ class ToolRegistryFactory:
         if self._mcp_runtime_manager is not None:
             for tool in self._mcp_runtime_manager.materialize_tools():
                 registry.register(tool)
-        registry.register(ToolSearchTool(catalog_provider=registry.list_tools))
+        registry.register(self._build_tool_search(registry))
         self._registry_cache[cache_key] = registry
+        self._registry_catalog_signatures[cache_key] = catalog_signature
         return registry
 
     def list_cached_registries(self) -> list[ToolRegistry]:
@@ -153,6 +160,47 @@ class ToolRegistryFactory:
             "process_service": self._process_service,
         }
 
+    def _build_tool_search(self, registry: ToolRegistry) -> ToolSearchTool:
+        retrieval = self._config.agent.ordinary_chat_adaptive_runtime.retrieval
+        catalog_generation = self._tool_catalog_generation_snapshot()
+        return ToolSearchTool(
+            catalog_provider=registry.list_tools,
+            catalog_generation_provider=lambda: catalog_generation,
+            discovery_hook=self._tool_search_discovery_hook,
+            default_top_k=retrieval.default_top_k,
+            max_top_k=retrieval.max_top_k,
+        )
+
+    def _tool_catalog_generation_snapshot(self) -> int:
+        if self._mcp_runtime_manager is None:
+            return 0
+        return sum(
+            self._mcp_runtime_manager.get_catalog_generation(server_name)
+            for server_name in self._mcp_runtime_manager.list_server_names()
+        )
+
+    def _mcp_catalog_signature(self) -> str | None:
+        if self._mcp_runtime_manager is None:
+            return None
+        states = []
+        for server_name in sorted(self._mcp_runtime_manager.list_server_names()):
+            state = self._mcp_runtime_manager.get_catalog_state(server_name)
+            states.append(
+                {
+                    "server": state.server,
+                    "generation": state.generation,
+                    "fingerprint": state.fingerprint,
+                    "status": state.status,
+                    "error": state.error,
+                }
+            )
+        return json.dumps(
+            states,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     @staticmethod
     def _registry_cache_key(workspace_dir: str) -> str:
         return str(Path(workspace_dir).expanduser().resolve())
@@ -173,6 +221,7 @@ class ToolRegistryFactory:
             BuiltInToolSpec("list_sessions", "workspace", "workspace", self._build_list_sessions),
             BuiltInToolSpec("file_read", "workspace", "workspace", self._build_file_read),
             BuiltInToolSpec("tool_result_read", "workspace", "workspace", self._build_tool_result_read),
+            BuiltInToolSpec("update_plan", "workspace", "workspace", self._build_update_plan),
             BuiltInToolSpec("glob_search", "workspace", "workspace", self._build_glob_search),
             BuiltInToolSpec("grep_search", "workspace", "workspace", self._build_grep_search),
             BuiltInToolSpec("repo_map", "workspace", "workspace", self._build_repo_map),
@@ -302,6 +351,10 @@ class ToolRegistryFactory:
             workspace_dir=workspace_dir,
             path_scope=runtime_policy.file_read_scope,
         )
+
+    def _build_update_plan(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
+        del config, workspace_dir, services
+        return UpdatePlanTool()
 
     def _build_glob_search(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
         del config, services
