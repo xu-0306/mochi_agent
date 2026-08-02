@@ -1,5 +1,0 @@
-Gate: GATE-002-NATIVE
-Command: rtk pytest -q tests/test_openai_codex_backend.py -k "continuity or response_id"
-Exit code: 0
-Observed: Pytest: 1 passed
-Oracle: OpenAICodexBackend explicitly opts into previous_response_id continuity and retains incremental post-anchor serialization.

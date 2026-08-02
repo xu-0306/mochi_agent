@@ -15,11 +15,8 @@ The current product model is intentionally chat-first:
 - `Subagent transcript` is the shared execution-visibility model for normal chat turns and Goal/AgentRun work.
 - `TaskPanel` and `/goals` or `/agent-runs` pages act as operator or inspection surfaces.
 
-This matches the direction in:
-
-- `docs/superpowers/plans/2026-06-25-chat-first-goal-unification-plan.md`
-- `docs/superpowers/plans/2026-06-21-goal-supervisor-and-long-running-autonomy-implementation-plan.md`
-- `docs/architecture/chat-and-goal-subagent-transcript-contract.md`
+The detailed transcript contract is documented in
+`docs/architecture/chat-and-goal-subagent-transcript-contract.md`.
 
 ## 2. Core backend layers
 
@@ -172,9 +169,8 @@ flowchart TD
 - projected workflow and delegated-subagent cards are display-only
 - they are intentionally not canonical assistant chat history
 - subagent transcript events are runtime display records, not assistant-visible replay content
-- accepted rationale is documented in:
-  - `docs/superpowers/plans/2026-06-21-workflow-subagent-projection-persistence-decision.md`
-  - `docs/architecture/chat-and-goal-subagent-transcript-contract.md`
+- accepted rationale is documented in
+  `docs/architecture/chat-and-goal-subagent-transcript-contract.md`
 
 ## 5. Main execution flows
 
@@ -392,9 +388,4 @@ Frontend integration:
 - `web/src/components/chat/SubagentTimelineCard.tsx`
 - `web/src/components/chat/SubagentDrawer.tsx`
 
-Decision context:
-
-- `docs/superpowers/plans/2026-06-25-chat-first-goal-unification-plan.md`
-- `docs/superpowers/plans/2026-06-21-goal-supervisor-and-long-running-autonomy-implementation-plan.md`
-- `docs/superpowers/plans/2026-06-21-workflow-subagent-projection-persistence-decision.md`
-- `docs/architecture/chat-and-goal-subagent-transcript-contract.md`
+Decision context: `docs/architecture/chat-and-goal-subagent-transcript-contract.md`.

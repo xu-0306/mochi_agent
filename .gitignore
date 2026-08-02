@@ -95,6 +95,17 @@ mochi/memory/
 PLAN.md
 .playwright-cli/
 .tokensave/
+output/
+screenshots_ascii/
+截圖/
+範例1/
+範例2/
+/Untitled-*.excalidraw
+/rise5_dual_head_notebooklm_brief_*.md
+/goal-*-handoff-*.md
+/docs/analysis/
+/docs/superpowers/handoffs/
+/docs/superpowers/plans/
 docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/dispatch-manifest.json
 docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-manifest.json
 _YesCode.bat
@@ -116,6 +127,7 @@ docs/
 !docs/testing/test-suite-baseline.md
 !docs/testing/test-inventory.txt
 documents/
+/native/mochi-sandbox-windows/
 implementation_plan.md
 scripts/
 web/scripts/

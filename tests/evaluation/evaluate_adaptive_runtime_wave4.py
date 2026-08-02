@@ -321,7 +321,7 @@ def evaluate(fixtures_path: Path) -> dict[str, Any]:
         "reproduction_command": (
             "rtk proxy python tests/evaluation/evaluate_adaptive_runtime_wave4.py "
             "--fixtures tests/fixtures/adaptive_runtime/wave4_rollout_fixtures.json "
-            "--output docs/superpowers/handoffs/2026-07-29-ordinary-chat-adaptive-runtime-wave4-measurement.json"
+            "--output .tmp/adaptive-runtime-wave4-measurement.json"
         ),
         "acceptance_thresholds": acceptance_thresholds,
         "environment": {
