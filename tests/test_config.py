@@ -58,7 +58,7 @@ def test_default_config_is_valid() -> None:
     assert cfg.agent.system_prompt
     assert cfg.agent.turn_contract_mode == "enforce"
     assert cfg.agent.ordinary_chat_adaptive_runtime.enabled is True
-    assert cfg.agent.ordinary_chat_adaptive_runtime.complexity.mode == "shadow"
+    assert cfg.agent.ordinary_chat_adaptive_runtime.complexity.mode == "enforce"
     assert cfg.agent.ordinary_chat_adaptive_runtime.plan.max_items == 12
     assert cfg.agent.ordinary_chat_adaptive_runtime.retrieval.default_top_k == 5
     assert (
@@ -193,7 +193,7 @@ def test_default_yaml_parseable() -> None:
     assert cfg.model == "ollama:llama3.2"
     assert cfg.agent.temperature == 0.7
     assert cfg.agent.ordinary_chat_adaptive_runtime.enabled is True
-    assert cfg.agent.ordinary_chat_adaptive_runtime.complexity.mode == "shadow"
+    assert cfg.agent.ordinary_chat_adaptive_runtime.complexity.mode == "enforce"
     assert cfg.agent.ordinary_chat_adaptive_runtime.plan.max_items == 12
     assert cfg.agent.ordinary_chat_adaptive_runtime.retrieval.default_top_k == 5
     assert cfg.agent.max_tokens is None
@@ -367,6 +367,35 @@ def test_ordinary_chat_adaptive_runtime_round_trips_nested_values() -> None:
         == "off"
     )
     assert round_tripped.agent.ordinary_chat_adaptive_runtime.recovery.max_attempts == 2
+
+
+def test_legacy_persisted_complexity_mode_is_marked_and_preserved_on_save_reload(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "legacy-shadow.yaml"
+    config_path.write_text(
+        "agent:\n  ordinary_chat_adaptive_runtime:\n    complexity:\n      mode: shadow\n",
+        encoding="utf-8",
+    )
+
+    snapshot = load_config_snapshot(config_path)
+    complexity = snapshot.config.agent.ordinary_chat_adaptive_runtime.complexity
+    assert complexity.mode == "shadow"
+    assert complexity.rollout_version == "legacy-v1"
+    save_config(snapshot.config, config_path, expected_revision=snapshot.revision)
+
+    reloaded = load_config(config_path)
+    assert reloaded.agent.ordinary_chat_adaptive_runtime.complexity.mode == "shadow"
+    assert (
+        reloaded.agent.ordinary_chat_adaptive_runtime.complexity.rollout_version
+        == "legacy-v1"
+    )
+
+
+def test_new_adaptive_runtime_default_records_enforce_v2_rollout() -> None:
+    complexity = MochiConfig().agent.ordinary_chat_adaptive_runtime.complexity
+    assert complexity.mode == "enforce"
+    assert complexity.rollout_version == "enforce-v2"
 
 
 def test_legacy_file_scope_migrates_one_way_to_independent_scopes() -> None:

@@ -69,6 +69,10 @@ async def test_react_loop_stops_at_a_durable_approval_interrupt() -> None:
             "ordinary_chat_approval_context": {
                 "source": "ordinary_chat",
                 "resume_cursor": {"turn_id": "turn-1"},
+                "tool_registry_view": {
+                    "tool_search_catalog_names": ["file_write"],
+                    "schema_limit": 4,
+                },
             }
         },
     )
@@ -97,11 +101,16 @@ async def test_react_loop_stops_at_a_durable_approval_interrupt() -> None:
     }
     continuation = context.state["ordinary_chat_approval_context"]["react_continuation"]
     assert continuation["callable_tool_names"] == ["file_write"]
+    assert continuation["tool_registry_view"] == {
+        "tool_search_catalog_names": ["file_write"],
+        "schema_limit": 4,
+    }
     assert [message["role"] for message in continuation["messages"]] == [
         "system",
         "user",
         "assistant",
     ]
+    assert continuation["messages"][1]["native_tool_protocol_active"] is True
 
 
 @pytest.mark.asyncio
@@ -143,6 +152,10 @@ async def test_react_loop_continues_from_the_original_approval_transcript() -> N
             assert messages[-1].role == "tool"
             assert messages[-1].tool_call_id == "call-1"
             assert messages[-1].name == "file_write"
+            assert any(
+                message.role == "user" and message.native_tool_protocol_active
+                for message in messages
+            )
             assert any(
                 message.role == "assistant" and message.tool_calls[0].id == "call-1"
                 for message in messages
@@ -386,10 +399,27 @@ async def test_engine_binds_normal_turn_validation_evidence_before_completion(
         "expected_verification_status",
         "acceptance_criteria",
         "profile_registry",
+        "runtime_broker",
     ),
     [
-        (["report.md"], "completed", "completed", "verified", ("contains:Report",), None),
-        (["report.md", "sibling.md"], "blocked", "active", "failed", ("contains:Report",), None),
+        (
+            ["report.md"],
+            "completed",
+            "completed",
+            "verified",
+            ("contains:Report",),
+            None,
+            False,
+        ),
+        (
+            ["report.md", "sibling.md"],
+            "blocked",
+            "active",
+            "failed",
+            ("contains:Report",),
+            None,
+            False,
+        ),
         (
             ["report.md"],
             "completed",
@@ -406,9 +436,24 @@ async def test_engine_binds_normal_turn_validation_evidence_before_completion(
                 },
             ),
             "approved-file-write",
+            False,
+        ),
+        (
+            ["report.md"],
+            "completed",
+            "completed",
+            "verified",
+            ("contains:Report",),
+            None,
+            True,
         ),
     ],
-    ids=["authorized-target", "unexpected-sibling", "approval-exact-evidence"],
+    ids=[
+        "authorized-target",
+        "unexpected-sibling",
+        "approval-exact-evidence",
+        "runtime-activation-broker",
+    ],
 )
 async def test_engine_resumes_an_ordinary_chat_approval_without_a_new_user_turn(
     tmp_path,
@@ -418,6 +463,7 @@ async def test_engine_resumes_an_ordinary_chat_approval_without_a_new_user_turn(
     expected_verification_status,
     acceptance_criteria,
     profile_registry,
+    runtime_broker,
 ) -> None:  # type: ignore[no-untyped-def]
     from dataclasses import replace
 
@@ -558,9 +604,35 @@ async def test_engine_resumes_an_ordinary_chat_approval_without_a_new_user_turn(
                         ],
                     },
                 ],
-                "callable_tool_names": ["file_write"],
+                "callable_tool_names": (
+                    ["file_write", "tool_activate"]
+                    if runtime_broker
+                    else ["file_write"]
+                ),
+                "tool_registry_view": (
+                    {
+                        "tool_search_catalog_names": [
+                            "file_write",
+                            "exec_command",
+                        ],
+                        "schema_limit": 8,
+                    }
+                    if runtime_broker
+                    else None
+                ),
                 "max_iterations": 3,
                 "requires_file_mutation": True,
+                "tool_activation_policy": (
+                    {
+                        "activation_allowed_tool_names": ["exec_command"],
+                        "discoverable_tool_names": [
+                            "file_write",
+                            "exec_command",
+                        ],
+                    }
+                    if runtime_broker
+                    else None
+                ),
                 "generation": {"temperature": 0.7, "max_tokens": 128},
             },
         }

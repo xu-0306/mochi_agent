@@ -22,7 +22,7 @@ from mochi.agents.turn_intent_contract import (
     DeliverableContract,
     TurnIntentContract,
 )
-from mochi.backends.base import BaseLLMBackend
+from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.types import (
     GenerationResult,
     Message,
@@ -33,8 +33,18 @@ from mochi.backends.types import (
 
 
 class _FakeBackend(BaseLLMBackend):
-    def __init__(self, content: str) -> None:
+    def __init__(
+        self,
+        content: str,
+        *,
+        backend_type: str = "test",
+        model: str = "fake",
+        provider: str | None = None,
+    ) -> None:
         self.content = content
+        self.backend_type = backend_type
+        self.model = model
+        self.provider = provider
         self.calls: list[list[Message]] = []
         self.tools_seen: list[list[ToolSchema] | None] = []
         self.kwargs: list[dict[str, Any]] = []
@@ -76,7 +86,11 @@ class _FakeBackend(BaseLLMBackend):
         return False
 
     def get_model_info(self) -> ModelInfo:
-        return ModelInfo(name="fake", backend_type="test")
+        return ModelInfo(
+            name=self.model,
+            backend_type=self.backend_type,
+            provider=self.provider,
+        )
 
     async def health_check(self) -> bool:
         return True
@@ -200,7 +214,68 @@ async def test_model_interpreter_uses_bounded_history_summary_and_active_task() 
     assert "advisories" not in messages[1].content
     assert backend.tools_seen == [None]
     assert backend.kwargs[0]["temperature"] == 0.0
+    assert backend.kwargs[0]["reasoning_effort"] is None
     assert backend.kwargs[0]["stream"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_type", "model", "provider", "expected_effort"),
+    [
+        ("ollama", "qwen3.5:4b", "ollama", "none"),
+        ("openai_compat", "gpt-5.4", "openai_compat", "low"),
+        ("openai_compat", "gpt-5.2", "openai_compat", "low"),
+        ("openai_compat", "gpt-5.6-luna", "openai_compat", "low"),
+    ],
+)
+async def test_model_interpreter_uses_lowest_supported_reasoning_effort(
+    backend_type: str,
+    model: str,
+    provider: str,
+    expected_effort: str,
+) -> None:
+    backend = _FakeBackend(
+        _response(),
+        backend_type=backend_type,
+        model=model,
+        provider=provider,
+    )
+
+    await ModelConversationInterpreter(backend).interpret(_context())
+
+    assert backend.kwargs[0]["reasoning_effort"] == expected_effort
+
+
+@pytest.mark.asyncio
+async def test_model_interpreter_accepts_typed_temporal_lookup_operation() -> None:
+    backend = _FakeBackend(
+        _response(
+            current_speech_act="request_information",
+            objective="Report the current time in the requested timezone",
+            operations=["temporal_lookup"],
+            mutation_requirement="forbidden",
+        )
+    )
+    resolver = ConversationResolver(interpreter=ModelConversationInterpreter(backend))
+
+    resolution = await resolver.resolve(
+        current_turn=ConversationTurn(
+            "turn-now",
+            "user",
+            "Report the current time in the requested timezone.",
+        )
+    )
+
+    assert resolution.contract.operations == frozenset({"temporal_lookup"})
+    assert (
+        TurnIntentContract.from_dict(resolution.contract.to_dict())
+        == resolution.contract
+    )
+    operation_schema = INTERPRETATION_JSON_SCHEMA["properties"]["operations"]["items"]
+    assert "temporal_lookup" in operation_schema["enum"]
+    system_prompt = backend.calls[0][0].content
+    assert "Use temporal_lookup for read-only current date/time lookup" in system_prompt
+    assert "Reserve execution for running" in system_prompt
 
 
 @pytest.mark.asyncio
@@ -275,11 +350,84 @@ async def test_model_interpreter_carries_structured_validation_to_turn_contract(
     assert resolution.diagnostics["interpreter_status"] == "accepted"
     actual = resolution.contract.deliverables[0].acceptance_criteria[0]
     assert dict(actual) == criterion
-    assert TurnIntentContract.from_dict(resolution.contract.to_dict()) == resolution.contract
+    assert (
+        TurnIntentContract.from_dict(resolution.contract.to_dict())
+        == resolution.contract
+    )
     schema_items = INTERPRETATION_JSON_SCHEMA["properties"]["deliverables"]["items"][
         "properties"
     ]["acceptance_criteria"]["items"]
     assert len(schema_items["oneOf"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_model_interpreter_strips_runtime_owned_tool_evidence_pins() -> None:
+    criterion = {
+        "schema_version": 1,
+        "kind": "tool_execution",
+        "check": "test",
+        "tool_name": "exec_command",
+        "profile_id": "readonly-command",
+        "call_id": "future-call",
+        "arguments_digest": "not-a-sha256-digest",
+        "operation_id": "future-operation",
+        "turn_id": "future-turn",
+        "expected_exit_code": 0,
+    }
+    backend = _FakeBackend(
+        _response(
+            current_speech_act="request_execution",
+            task_relation="standalone",
+            objective="Run the requested read-only command and report its output",
+            operations=["execution"],
+            mutation_requirement="forbidden",
+            deliverables=[
+                {
+                    "kind": "command_output",
+                    "target_hint": None,
+                    "required": True,
+                    "acceptance_criteria": [criterion],
+                    "status": "pending",
+                    "source_turn_ids": ["turn-now"],
+                }
+            ],
+        )
+    )
+    resolver = ConversationResolver(interpreter=ModelConversationInterpreter(backend))
+
+    resolution = await resolver.resolve(
+        current_turn=ConversationTurn(
+            "turn-now",
+            "user",
+            "Run the requested read-only command and report its output.",
+        )
+    )
+
+    assert resolution.diagnostics["interpreter_status"] == "accepted"
+    assert resolution.contract.objective == (
+        "Run the requested read-only command and report its output"
+    )
+    assert resolution.contract.operations == frozenset({"execution"})
+    assert resolution.contract.mutation_requirement == "forbidden"
+    assert resolution.contract.clarification_needed is False
+    actual = resolution.contract.deliverables[0].acceptance_criteria[0]
+    assert dict(actual) == {
+        "schema_version": 1,
+        "kind": "tool_execution",
+        "check": "test",
+        "tool_name": "exec_command",
+        "profile_id": "readonly-command",
+        "expected_exit_code": 0,
+    }
+    assert TurnIntentContract.from_dict(resolution.contract.to_dict()) == resolution.contract
+
+    schema_properties = INTERPRETATION_JSON_SCHEMA["$defs"][
+        "tool_execution_acceptance_criterion_v1"
+    ]["properties"]
+    assert not (
+        {"call_id", "arguments_digest", "operation_id", "turn_id"}
+        & schema_properties.keys()
+    )
 
 
 @pytest.mark.asyncio
@@ -492,6 +640,30 @@ async def test_invalid_json_reaches_resolver_fail_closed_path() -> None:
         == "semantic_interpretation_unavailable"
     )
     assert resolution.next_active_task == active
+
+
+@pytest.mark.asyncio
+async def test_backend_outage_is_not_rewritten_as_user_clarification() -> None:
+    class _UnavailableBackend(_FakeBackend):
+        async def generate(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+            del args, kwargs
+            raise BackendRequestError(
+                "provider unavailable",
+                metadata={
+                    "backend_name": "openai_compat",
+                    "status_code": 503,
+                    "model": "gpt-5.6-luna",
+                },
+            )
+
+    resolver = ConversationResolver(
+        interpreter=ModelConversationInterpreter(_UnavailableBackend("{}"))
+    )
+
+    with pytest.raises(BackendRequestError, match="provider unavailable"):
+        await resolver.resolve(
+            current_turn=ConversationTurn("turn-now", "user", "HI"),
+        )
 
 
 @pytest.mark.asyncio

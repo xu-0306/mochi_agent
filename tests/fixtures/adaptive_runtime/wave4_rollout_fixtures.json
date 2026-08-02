@@ -1,0 +1,52 @@
+{
+  "schema_version": "ordinary-chat-adaptive-wave4-fixtures-v1",
+  "samples_per_fixture": 31,
+  "fixtures": [
+    {
+      "id": "simple-information-en",
+      "objective": "Explain why an expired JWT is rejected.",
+      "operations": ["conversation"],
+      "deliverable_count": 0,
+      "acceptance_criteria_per_deliverable": 0,
+      "effectful_tool_count": 0,
+      "label": "no_plan"
+    },
+    {
+      "id": "single-safe-edit",
+      "objective": "Update README.md with one setup sentence.",
+      "operations": ["workspace_write"],
+      "deliverable_count": 1,
+      "acceptance_criteria_per_deliverable": 1,
+      "effectful_tool_count": 1,
+      "label": "no_plan"
+    },
+    {
+      "id": "complex-effectful",
+      "objective": "Fix the migration, update its schema, and run validation.",
+      "operations": ["workspace_write", "execution"],
+      "deliverable_count": 2,
+      "acceptance_criteria_per_deliverable": 2,
+      "effectful_tool_count": 2,
+      "label": "plan_required"
+    },
+    {
+      "id": "dynamic-escalation",
+      "objective": "Update README.md after inspecting the current guidance.",
+      "operations": ["workspace_write"],
+      "deliverable_count": 1,
+      "acceptance_criteria_per_deliverable": 1,
+      "effectful_tool_count": 1,
+      "label": "no_plan",
+      "dynamic_label": "plan_required"
+    },
+    {
+      "id": "simple-information-zh",
+      "objective": "說明 JWT 過期後為何會被拒絕。",
+      "operations": ["conversation"],
+      "deliverable_count": 0,
+      "acceptance_criteria_per_deliverable": 0,
+      "effectful_tool_count": 0,
+      "label": "no_plan"
+    }
+  ]
+}

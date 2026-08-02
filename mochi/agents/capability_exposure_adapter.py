@@ -78,6 +78,13 @@ def adapt_capability_plan_to_exposure(
         final_names=candidate_names,
         discoverable_tool_names=discoverable_tool_names,
     )
+    activation_allowed = _activation_allowed_tool_names(
+        capability_plan=capability_plan,
+        contract=contract,
+        ceilings=ceilings,
+    )
+    if not set(deferred_names).issubset(activation_allowed):
+        raise RuntimeError("deferred tools must be activation-authorized")
     broker_required = bool(deferred_names)
     if broker_required:
         candidate_names = _reconcile_schema_budget(
@@ -96,6 +103,8 @@ def adapt_capability_plan_to_exposure(
             final_names=candidate_names,
             discoverable_tool_names=discoverable_tool_names,
         )
+        if not set(deferred_names).issubset(activation_allowed):
+            raise RuntimeError("deferred tools must be activation-authorized")
         broker_required = bool(deferred_names)
 
     if baseline_plan.limit <= 0:
@@ -127,11 +136,13 @@ def adapt_capability_plan_to_exposure(
         "reasons": reasons,
         "artifact_obligation": capability_plan.artifact_obligation.to_dict(),
         "required_capabilities": sorted(capability_plan.required_capabilities),
-        "activation_allowed_tool_names": _activation_allowed_tool_names(
-            capability_plan=capability_plan,
-            contract=contract,
-            ceilings=ceilings,
-        ),
+        "activation_allowed_tool_names": activation_allowed,
+        "continuation_candidate_tool_names": [
+            name
+            for name in baseline_plan.discoverable_tool_names
+            if name == "tool_result_read"
+            and _within_hard_ceilings(name, ceilings=ceilings)
+        ],
         "activation_broker": {
             "required": broker_required,
             "reserved_schema_slots": int(broker_required),
@@ -318,12 +329,6 @@ def _enforced_discoverable_tool_names(
             contract=contract,
             ceilings=ceilings,
         )
-    )
-    allowed.update(
-        name
-        for name in (*baseline_plan.discoverable_tool_names, *final_names)
-        if name in _NEUTRAL_INFRASTRUCTURE_TOOLS
-        and _within_hard_ceilings(name, ceilings=ceilings)
     )
     ordered_candidates = [
         *baseline_plan.discoverable_tool_names,

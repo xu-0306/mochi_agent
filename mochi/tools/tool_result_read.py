@@ -23,6 +23,13 @@ class ToolResultReadTool(FileReadTool):
         )
 
     @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            **super().tool_capabilities,
+            "activation_requirements": ["tool_result_reference"],
+        }
+
+    @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
@@ -58,7 +65,7 @@ class ToolResultReadTool(FileReadTool):
             "additionalProperties": False,
         }
 
-    async def execute(
+    async def execute(  # type: ignore[override]
         self,
         *,
         reference_id: str,

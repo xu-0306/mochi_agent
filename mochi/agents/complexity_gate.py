@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, cast
 
@@ -24,6 +24,13 @@ ComplexityTaskRelation = Literal[
     "cancel",
     "standalone",
 ]
+ComplexityRecheckSignal = Literal[
+    "iteration_threshold",
+    "third_distinct_tool",
+    "read_to_effectful",
+    "verifier_failed",
+    "active_plan_invalidated",
+]
 AdvisorOutcomeStatus = Literal["accepted", "timeout", "malformed", "skipped"]
 
 COMPLEXITY_DECISION_VERSION = "complexity-decision-v1"
@@ -43,9 +50,24 @@ _TASK_RELATIONS = frozenset(
     {"continue", "side_question", "start", "supersede", "cancel", "standalone"}
 )
 _ADVISOR_STATUSES = frozenset({"accepted", "timeout", "malformed", "skipped"})
+_DYNAMIC_RECHECK_SIGNALS = frozenset(
+    {
+        "iteration_threshold",
+        "third_distinct_tool",
+        "read_to_effectful",
+        "verifier_failed",
+        "active_plan_invalidated",
+    }
+)
 _EFFECTFUL_OPERATIONS = frozenset({"workspace_write", "execution"})
 _READ_ONLY_COMPLEXITY_OPERATIONS = frozenset(
-    {"conversation", "open_world_lookup", "literature_research", "workspace_read"}
+    {
+        "conversation",
+        "temporal_lookup",
+        "open_world_lookup",
+        "literature_research",
+        "workspace_read",
+    }
 )
 _MAX_REASON_CODES = 16
 _MAX_REASON_CODE_CHARS = 64
@@ -873,11 +895,50 @@ class ComplexityGate:
         *,
         prior_decision: ComplexityDecision,
         completed_iterations: int,
+        signals: Iterable[ComplexityRecheckSignal] = (),
     ) -> ComplexityDecision | None:
-        if not self.should_recheck(prior_decision, completed_iterations=completed_iterations):
+        normalized_signals = tuple(dict.fromkeys(str(signal) for signal in signals))
+        unknown_signals = set(normalized_signals) - _DYNAMIC_RECHECK_SIGNALS
+        if unknown_signals:
+            raise ValueError(
+                "unsupported dynamic complexity recheck signal(s): "
+                + ", ".join(sorted(unknown_signals))
+            )
+        threshold_reached = self.should_recheck(
+            prior_decision,
+            completed_iterations=completed_iterations,
+        )
+        if not threshold_reached and not normalized_signals:
             return None
         next_request = replace(request, completed_iterations=completed_iterations)
-        return await self.evaluate(next_request)
+        if next_request.task_relation in {"cancel", "side_question"}:
+            return None
+        # Dynamic re-gating is a host-side safety boundary. It must not turn a
+        # single grey-zone advisor request into an advisor loop after tool
+        # observations change the task shape.
+        deterministic = self.evaluate_deterministic(next_request)
+        trigger_reasons = list(normalized_signals)
+        if threshold_reached:
+            trigger_reasons.append("iteration_threshold")
+        trigger_reasons = list(dict.fromkeys(trigger_reasons))
+        if (
+            prior_decision.kind == "no_plan"
+            and prior_decision.effectful_action_requires_plan
+        ):
+            return replace(
+                deterministic,
+                kind="plan_required",
+                advisor_used=False,
+                advisor_confidence=None,
+                soft_reason_codes=tuple(
+                    dict.fromkeys(
+                        deterministic.soft_reason_codes
+                        + tuple(f"dynamic_{reason}" for reason in trigger_reasons)
+                    )
+                ),
+                dynamic_recheck_after_iterations=0,
+            )
+        return deterministic
 
     def _should_consult_advisor(
         self,

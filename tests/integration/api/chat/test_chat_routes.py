@@ -70,6 +70,34 @@ def test_chat_route_returns_bounded_response_with_serialized_events() -> None:
         ],
     }
 
+def test_chat_routes_forward_each_request_timezone_without_cross_request_leakage() -> None:
+    app, engine = _build_app()
+
+    with TestClient(app) as client:
+        regular_response = client.post(
+            "/v1/chat",
+            json={
+                "message": "time in Nairobi",
+                "session_id": "timezone-regular",
+                "client_timezone": "Africa/Nairobi",
+            },
+        )
+        with client.stream(
+            "POST",
+            "/v1/chat/stream",
+            json={
+                "message": "time in Taipei",
+                "session_id": "timezone-stream",
+                "client_timezone": "Asia/Taipei",
+            },
+        ) as stream_response:
+            list(stream_response.iter_lines())
+
+    assert regular_response.status_code == 200
+    assert stream_response.status_code == 200
+    assert engine.chat_client_timezone_calls == ["Africa/Nairobi", "Asia/Taipei"]
+
+
 def test_chat_route_applies_selected_available_model_before_chat() -> None:
     """`POST /v1/chat` 帶模型 id 時應先切換到該模型再執行對話。"""
     config = MochiConfig.model_validate(

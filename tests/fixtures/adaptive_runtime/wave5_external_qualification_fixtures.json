@@ -1,0 +1,29 @@
+{
+  "schema_version": "ordinary-chat-adaptive-wave5-fixture-v1",
+  "fixtures": [
+    {
+      "fixture_version": "ordinary-chat-adaptive-wave5-fixture-v1",
+      "fixture_id": "simple-information-en",
+      "message": "Explain why an expired JWT is rejected.",
+      "expected_complexity": "no_plan",
+      "max_backend_calls": 2,
+      "require_visible_response": true
+    },
+    {
+      "fixture_version": "ordinary-chat-adaptive-wave5-fixture-v1",
+      "fixture_id": "simple-information-zh",
+      "message": "說明 JWT 過期後為何會被拒絕。",
+      "expected_complexity": "no_plan",
+      "max_backend_calls": 2,
+      "require_visible_response": true
+    },
+    {
+      "fixture_version": "ordinary-chat-adaptive-wave5-fixture-v1",
+      "fixture_id": "complex-effectful",
+      "message": "Fix the migration, update its schema, and run validation.",
+      "expected_complexity": "plan_required",
+      "max_backend_calls": 2,
+      "require_visible_response": true
+    }
+  ]
+}

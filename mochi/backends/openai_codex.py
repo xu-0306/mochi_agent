@@ -31,6 +31,7 @@ class OpenAICodexBackend(OpenAICompatBackend):
             api_key=access_token,
             timeout=timeout,
             provider="openai_codex",
+            responses_continuity_policy="previous_response_id",
         )
         self._auth_profile_id = auth_profile_id
         self._workspace_dir = workspace_dir

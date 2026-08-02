@@ -7,8 +7,8 @@ read persisted audit contracts as authorization inputs.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -17,8 +17,10 @@ from mochi.agents.capability_planner import (
     CapabilityPlanner,
     CatalogToolDescriptor,
     EnvironmentEligibility,
-    ExecutionProfile as CapabilityExecutionProfile,
     PlannerCapability,
+)
+from mochi.agents.capability_planner import (
+    ExecutionProfile as CapabilityExecutionProfile,
 )
 from mochi.agents.context import PromptContext
 from mochi.agents.conversation_resolver import (
@@ -29,7 +31,6 @@ from mochi.agents.conversation_resolver import (
 from mochi.agents.conversation_state_store import ConversationStateLoadDiagnostics
 from mochi.backends.types import Message
 from mochi.tools.base import BaseTool
-
 
 # Stable catalog preference for tools that cover the same planner capability.
 # This is deliberately independent of user text; explicit skill preferences
@@ -67,6 +68,7 @@ TurnContractMode = Literal["enforce"]
 
 _ALL_CAPABILITIES: frozenset[PlannerCapability] = frozenset(
     {
+        "temporal_lookup",
         "open_world_lookup",
         "literature_research",
         "workspace_read",
@@ -78,9 +80,12 @@ _ALL_CAPABILITIES: frozenset[PlannerCapability] = frozenset(
 _PROFILE_CAPABILITIES: dict[str, frozenset[PlannerCapability]] = {
     "chat": _ALL_CAPABILITIES,
     "task": _ALL_CAPABILITIES,
-    "subagent_readonly": frozenset({"workspace_read", "tool_discovery"}),
+    "subagent_readonly": frozenset(
+        {"temporal_lookup", "workspace_read", "tool_discovery"}
+    ),
     "subagent_research": frozenset(
         {
+            "temporal_lookup",
             "open_world_lookup",
             "literature_research",
             "workspace_read",
@@ -89,6 +94,7 @@ _PROFILE_CAPABILITIES: dict[str, frozenset[PlannerCapability]] = {
     ),
     "subagent_execution_request": frozenset(
         {
+            "temporal_lookup",
             "open_world_lookup",
             "literature_research",
             "workspace_read",
@@ -97,6 +103,7 @@ _PROFILE_CAPABILITIES: dict[str, frozenset[PlannerCapability]] = {
     ),
     "controller_exec": frozenset(
         {
+            "temporal_lookup",
             "open_world_lookup",
             "literature_research",
             "workspace_read",
@@ -218,7 +225,9 @@ def build_capability_plan(
         execution_profile,
         frozenset(),
     )
-    session_capabilities = frozenset() if tool_mode == "disabled" else _ALL_CAPABILITIES
+    session_capabilities: frozenset[PlannerCapability] = (
+        frozenset() if tool_mode == "disabled" else _ALL_CAPABILITIES
+    )
     environment_capabilities = set(_ALL_CAPABILITIES)
     if not workspace_mutation_eligible:
         environment_capabilities.discard("workspace_write")
@@ -236,6 +245,7 @@ def build_capability_plan(
             frozenset(tool_allowlist) if tool_allowlist is not None else None
         ),
         denied_tools=frozenset(tool_denylist or ()),
+        semantic_fallback=resolution.resolution_source == "fallback",
     )
 
 

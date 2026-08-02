@@ -19,6 +19,9 @@ env/
 
 # Testing
 .pytest_cache/
+.pytest-tmp/
+.phase*-tmp/
+.tmp-*/
 .coverage
 htmlcov/
 .tox/
@@ -52,6 +55,8 @@ Thumbs.db
 # Node (WebGUI)
 web/node_modules/
 web/.next/
+web/.next-*/
+web/.playwright-cli/
 web/out/
 
 # Logs
@@ -88,8 +93,14 @@ mochi/memory/
 # Local scratch files
 1.txt
 PLAN.md
+.playwright-cli/
+.tokensave/
+docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/dispatch-manifest.json
+docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-manifest.json
 _YesCode.bat
 _YesCode - C.bat
+_coderelay.bat
+_coderelay- C.bat
 交接.md
 
 # Non-release project docs / helpers

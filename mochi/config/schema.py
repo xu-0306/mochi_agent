@@ -953,12 +953,27 @@ class ToolsConfig(BaseModel):
 
 
 class ComplexityGateConfig(BaseModel):
-    mode: Literal["off", "shadow", "enforce"] = "shadow"
+    mode: Literal["off", "shadow", "enforce"] = "enforce"
+    # `legacy-v1` records a full config written before enforce became the
+    # product default.  It intentionally preserves a persisted shadow/off
+    # choice instead of guessing whether an operator meant it as rollback.
+    rollout_version: Literal["legacy-v1", "enforce-v2", "operator-v2"] = "enforce-v2"
     no_plan_max_score: int = Field(default=2, ge=0, le=100)
     plan_required_min_score: int = Field(default=6, ge=0, le=100)
     model_advisor_enabled: bool = True
     advisor_max_tokens: int = Field(default=500, ge=128, le=2_000)
     advisor_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    dynamic_recheck_after_iterations: int = Field(default=1, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mark_legacy_persisted_mode(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "rollout_version" in value:
+            return value
+        mode = value.get("mode")
+        if mode in {"shadow", "off"}:
+            return {**value, "rollout_version": "legacy-v1"}
+        return value
 
     @model_validator(mode="after")
     def _validate_thresholds(self) -> "ComplexityGateConfig":
@@ -1017,6 +1032,9 @@ class FailureLearningConfig(BaseModel):
     max_injected_hints: int = Field(default=2, ge=0, le=10)
     max_hint_chars: int = Field(default=800, ge=0, le=5_000)
     automatic_skill_promotion: bool = False
+    # Advisory failure hints are a separately controlled rollout; they never
+    # grant capability exposure, authorization, or SkillLibrary writes.
+    hint_injection_enabled: bool = False
 
 
 class OrdinaryChatAdaptiveRuntimeConfig(BaseModel):

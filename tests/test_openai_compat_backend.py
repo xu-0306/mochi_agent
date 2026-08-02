@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -131,9 +132,39 @@ async def test_base_v1_url_completes_chat_completions_endpoint(backend: OpenAICo
 
 
 @pytest.mark.asyncio
-async def test_base_v1_gpt5_prefers_responses_transport() -> None:
+async def test_third_party_base_v1_gpt5_defaults_to_chat_completions_transport() -> None:
     backend = OpenAICompatBackend(
         base_url="https://api.example.com/v1",
+        model="gpt-5",
+        api_key="test-key",
+        provider="openai_compat",
+    )
+    response_data = {
+        "model": "gpt-5",
+        "choices": [{"message": {"content": "chat ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+    }
+    mock_resp = _mock_response(response_data)
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp) as post:
+            result = await backend.generate(messages=[Message(role="user", content="hi")], stream=False)
+    finally:
+        await backend.close()
+
+    assert result.content == "chat ok"
+    assert post.await_args.args[0] == "https://api.example.com/v1/chat/completions"
+    assert "messages" in post.await_args.kwargs["json"]
+    assert backend.get_model_info().metadata["request_shape"] == "chat_completions"
+    assert backend.get_model_info().metadata["reasoning_transport_preference"] == (
+        "chat_completions_default"
+    )
+
+
+@pytest.mark.asyncio
+async def test_official_openai_base_v1_gpt5_prefers_responses_transport() -> None:
+    backend = OpenAICompatBackend(
+        base_url="https://api.openai.com/v1",
         model="gpt-5",
         api_key="test-key",
         provider="openai_compat",
@@ -160,10 +191,38 @@ async def test_base_v1_gpt5_prefers_responses_transport() -> None:
         await backend.close()
 
     assert result.content == "responses ok"
-    assert post.await_args.args[0] == "https://api.example.com/v1/responses"
+    assert post.await_args.args[0] == "https://api.openai.com/v1/responses"
     assert "input" in post.await_args.kwargs["json"]
     assert backend.get_model_info().metadata["request_shape"] == "responses"
     assert backend.get_model_info().metadata["reasoning_transport_preference"] == "responses_preferred"
+
+
+@pytest.mark.asyncio
+async def test_explicit_chat_completions_url_keeps_gpt5_on_chat_transport() -> None:
+    backend = OpenAICompatBackend(
+        base_url="https://api.example.com/v1/chat/completions",
+        model="gpt-5",
+        api_key="test-key",
+        provider="openai_compat",
+    )
+    mock_resp = _mock_response(
+        {
+            "model": "gpt-5",
+            "choices": [{"message": {"content": "explicit chat ok"}, "finish_reason": "stop"}],
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=mock_resp) as post:
+            result = await backend.generate(messages=[Message(role="user", content="hi")], stream=False)
+    finally:
+        await backend.close()
+
+    assert result.content == "explicit chat ok"
+    assert post.await_args.args[0] == "https://api.example.com/v1/chat/completions"
+    assert backend.get_model_info().metadata["reasoning_transport_preference"] == (
+        "chat_completions_explicit"
+    )
 
 
 @pytest.mark.asyncio
@@ -577,6 +636,310 @@ def test_chat_completions_payload_serializes_tool_call_arguments_as_json(
     assert raw_arguments == '{"query": "台中 南區 天氣", "top_k": 5}'
 
 
+def test_chat_completions_payload_projects_completed_historical_tool_turn(
+    backend: OpenAICompatBackend,
+) -> None:
+    """Completed tool protocol is evidence, not a native follow-up replay."""
+    payload = backend._build_chat_completions_payload(  # noqa: SLF001
+        messages=[
+            Message(role="user", content="Find Mochi"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-old",
+                        name="web_search",
+                        arguments={"query": "Mochi"},
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content='{"ok": true, "result": "Mochi is an agent"}',
+                tool_call_id="call-old",
+                name="web_search",
+            ),
+            Message(role="assistant", content="Mochi is an agent."),
+            Message(role="user", content="Summarize that for me."),
+        ],
+        tools=None,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        reasoning_effort=None,
+        stream=False,
+    )
+
+    messages = payload["messages"]
+
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "user",
+    ]
+    assert all("tool_calls" not in message for message in messages)
+    assert all("tool_call_id" not in message for message in messages)
+    assert "Historical tool evidence" in messages[1]["content"]
+    assert "web_search" in messages[1]["content"]
+    assert '"result": "Mochi is an agent"' in messages[1]["content"]
+    assert "call-old" not in json.dumps(messages)
+
+
+def test_chat_completions_payload_keeps_current_turn_native_tool_protocol(
+    backend: OpenAICompatBackend,
+) -> None:
+    """A current ReAct continuation still requires native call/result messages."""
+    payload = backend._build_chat_completions_payload(  # noqa: SLF001
+        messages=[
+            Message(role="user", content="Find Mochi"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-old",
+                        name="web_search",
+                        arguments={"query": "Mochi"},
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content='{"ok": true, "result": "old evidence"}',
+                tool_call_id="call-old",
+                name="web_search",
+            ),
+            Message(role="assistant", content="Mochi is an agent."),
+            Message(
+                role="user",
+                content="Find its repository.",
+                native_tool_protocol_active=True,
+            ),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-current",
+                        name="web_search",
+                        arguments={"query": "Mochi repository"},
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content='{"ok": true, "result": "https://example.test"}',
+                tool_call_id="call-current",
+                name="web_search",
+            ),
+        ],
+        tools=None,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        reasoning_effort=None,
+        stream=False,
+    )
+
+    messages = payload["messages"]
+
+    assert all(message.get("tool_call_id") != "call-old" for message in messages)
+    assert all(
+        tool_call["id"] != "call-old"
+        for message in messages
+        for tool_call in message.get("tool_calls", [])
+    )
+    assert messages[-2]["tool_calls"][0]["id"] == "call-current"
+    assert messages[-1] == {
+        "role": "tool",
+        "content": '{"ok": true, "result": "https://example.test"}',
+        "tool_call_id": "call-current",
+        "name": "web_search",
+    }
+
+
+def test_chat_completions_payload_keeps_unmarked_active_tool_tail_native(
+    backend: OpenAICompatBackend,
+) -> None:
+    """The latest user boundary also protects direct backend continuations."""
+    payload = backend._build_chat_completions_payload(  # noqa: SLF001
+        messages=[
+            Message(role="user", content="Find Mochi"),
+            Message(role="assistant", content="Mochi is an agent."),
+            Message(role="user", content="Find its repository."),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-current",
+                        name="web_search",
+                        arguments={"query": "Mochi repository"},
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content="repository result",
+                tool_call_id="call-current",
+                name="web_search",
+            ),
+        ],
+        tools=None,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        reasoning_effort=None,
+        stream=False,
+    )
+
+    assert payload["messages"][-2]["tool_calls"][0]["id"] == "call-current"
+    assert payload["messages"][-1]["tool_call_id"] == "call-current"
+
+
+def test_chat_completions_payload_projects_multi_missing_and_orphan_historical_tools(
+    backend: OpenAICompatBackend,
+) -> None:
+    """Malformed historical blocks must never leave orphan native tool messages."""
+    payload = backend._build_chat_completions_payload(  # noqa: SLF001
+        messages=[
+            Message(role="user", content="Research Mochi"),
+            Message(
+                role="assistant",
+                content="I will check two sources.",
+                tool_calls=[
+                    ToolCall(id="call-first", name="web_search", arguments={"query": "Mochi"}),
+                    ToolCall(id="call-missing", name="arxiv_search", arguments={"query": "Mochi agents"}),
+                ],
+            ),
+            Message(role="tool", content="first result", tool_call_id="call-first", name="web_search"),
+            Message(role="tool", content="unpaired result", tool_call_id="call-orphan", name="tool_result_read"),
+            Message(role="assistant", content="I found one source."),
+            Message(role="user", content="What did you find?"),
+        ],
+        tools=None,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        reasoning_effort=None,
+        stream=False,
+    )
+
+    messages = payload["messages"]
+    evidence = "\n".join(message["content"] for message in messages if message["role"] == "assistant")
+
+    assert all(message["role"] != "tool" for message in messages)
+    assert all("tool_calls" not in message and "tool_call_id" not in message for message in messages)
+    assert "web_search" in evidence
+    assert "arxiv_search" in evidence
+    assert "No recorded result." in evidence
+    assert "unpaired result" in evidence
+
+
+def test_chat_completions_payload_bounds_historical_tool_evidence(
+    backend: OpenAICompatBackend,
+) -> None:
+    """Large historical arguments and results cannot expand a follow-up indefinitely."""
+    payload = backend._build_chat_completions_payload(  # noqa: SLF001
+        messages=[
+            Message(role="user", content="Research Mochi"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-large",
+                        name="web_search",
+                        arguments={"query": "x" * 20_000},
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                content="y" * 20_000,
+                tool_call_id="call-large",
+                name="web_search",
+            ),
+            Message(role="assistant", content="Research complete."),
+            Message(role="user", content="Summarize it."),
+        ],
+        tools=None,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        reasoning_effort=None,
+        stream=False,
+    )
+
+    evidence = payload["messages"][1]["content"]
+
+    assert "Tool: web_search" in evidence
+    assert "Historical tool arguments truncated for provider context." in evidence
+    assert "Historical tool result truncated for provider context." in evidence
+    assert len(evidence) <= 8_100
+
+
+def test_chat_completions_payload_does_not_pair_tool_results_across_user_boundary(
+    backend: OpenAICompatBackend,
+) -> None:
+    """A later turn cannot satisfy an earlier native call merely by reusing an ID."""
+    payload = backend._build_chat_completions_payload(  # noqa: SLF001
+        messages=[
+            Message(role="user", content="First request"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="call-reused", name="web_search", arguments={})],
+            ),
+            Message(role="user", content="A different historical request"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="call-reused", name="web_search", arguments={})],
+            ),
+            Message(
+                role="tool",
+                content="later result only",
+                tool_call_id="call-reused",
+                name="web_search",
+            ),
+            Message(role="assistant", content="Second request complete."),
+            Message(role="user", content="Current request"),
+        ],
+        tools=None,
+        temperature=0.7,
+        max_tokens=256,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        reasoning_effort=None,
+        stream=False,
+    )
+
+    evidence_messages = [
+        message["content"]
+        for message in payload["messages"]
+        if message["role"] == "assistant" and "Historical tool evidence" in message["content"]
+    ]
+
+    assert len(evidence_messages) == 2
+    assert "No recorded result." in evidence_messages[0]
+    assert "later result only" not in evidence_messages[0]
+    assert "later result only" in evidence_messages[1]
+
+
 @pytest.mark.asyncio
 async def test_responses_payload_includes_function_call_output_items() -> None:
     """Responses API tool result 應用 function_call_output 回送，不應降級成一般 user 文字。"""
@@ -839,10 +1202,10 @@ async def test_responses_retry_strips_rejected_summary_and_include_fields() -> N
 
 
 @pytest.mark.asyncio
-async def test_responses_input_uses_previous_response_id_for_incremental_continuity() -> None:
+async def test_responses_input_generically_replays_complete_local_history() -> None:
     backend = OpenAICompatBackend(
-        base_url="https://api.example.com/v1/responses",
-        model="gpt-5",
+        base_url="https://unrelated-gateway.invalid/v1/responses",
+        model="vendor-custom-reasoner",
         api_key="test-key",
     )
 
@@ -872,12 +1235,87 @@ async def test_responses_input_uses_previous_response_id_for_incremental_continu
     finally:
         await backend.close()
 
-    assert input_state.previous_response_id == "resp_prev"
-    assert input_state.continuity_mode == "previous_response_id"
+    assert input_state.previous_response_id is None
+    assert input_state.continuity_mode == "manual_items"
     assert input_state.input_items == [
+        {"role": "user", "content": "Find Mochi"},
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "web_search",
+            "arguments": '{"query":"Mochi"}',
+        },
         {"type": "function_call_output", "call_id": "call-1", "output": '{"ok": true}'},
         {"role": "user", "content": "Summarize it"},
     ]
+
+
+def test_responses_continuity_policy_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError, match="responses_continuity_policy"):
+        OpenAICompatBackend(
+            base_url="https://arbitrary.example/v1/responses",
+            model="arbitrary-model",
+            responses_continuity_policy="server_managed",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_responses_input_replays_local_history_without_explicit_native_opt_in() -> None:
+    backend = OpenAICompatBackend(
+        base_url="https://api.openai.com/v1/responses",
+        model="gpt-5.9",
+        api_key="test-key",
+    )
+
+    try:
+        input_state = backend._build_responses_input(  # noqa: SLF001
+            [
+                Message(role="user", content="Find Mochi"),
+                Message(
+                    role="assistant",
+                    content="",
+                    responses_replay=ResponsesReplayState(
+                        response_id="resp_generic",
+                        assistant_output_items=[
+                            {
+                                "type": "function_call",
+                                "call_id": "call-generic",
+                                "name": "web_search",
+                                "arguments": '{"query":"Mochi"}',
+                            }
+                        ],
+                    ),
+                ),
+                Message(
+                    role="tool",
+                    content='{"ok": true}',
+                    tool_call_id="call-generic",
+                    name="web_search",
+                ),
+                Message(role="user", content="Summarize it"),
+            ]
+        )
+        metadata = backend.get_model_info().metadata
+    finally:
+        await backend.close()
+
+    assert input_state.previous_response_id is None
+    assert input_state.input_items == [
+        {"role": "user", "content": "Find Mochi"},
+        {
+            "type": "function_call",
+            "call_id": "call-generic",
+            "name": "web_search",
+            "arguments": '{"query":"Mochi"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-generic",
+            "output": '{"ok": true}',
+        },
+        {"role": "user", "content": "Summarize it"},
+    ]
+    assert metadata["responses_continuity_policy"] == "local_replay"
 
 
 @pytest.mark.asyncio

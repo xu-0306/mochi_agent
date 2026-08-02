@@ -442,7 +442,7 @@ class OllamaBackend(BaseLLMBackend):
         tools: list[ToolSchema] | None,
         options: dict[str, Any],
         stream: bool,
-        think_value: str | None,
+        think_value: str | bool | None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -1144,7 +1144,11 @@ class OllamaBackend(BaseLLMBackend):
 
         return datetime.now(UTC).isoformat()
 
-    def _reasoning_effort_to_think_value(self, effort: str | None) -> str | None:
+    def _reasoning_effort_to_think_value(
+        self, effort: str | None
+    ) -> str | bool | None:
+        if effort == "none":
+            return False
         if effort not in {"low", "medium", "high"}:
             return None
         if not self._supports_reasoning_effort_model(self.model):

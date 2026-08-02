@@ -18,8 +18,11 @@ def test_discord_setup_persists_secret_without_exposing_it(tmp_path: Path) -> No
     app.state.config_path = config_path
 
     with TestClient(app) as client:
+        settings = client.get("/v1/settings")
+        assert settings.status_code == 200
         response = client.post(
             "/v1/setup/discord",
+            headers={"If-Match": settings.headers["etag"]},
             json={
                 "bot_token": "discord-super-secret-token",
                 "enabled": True,

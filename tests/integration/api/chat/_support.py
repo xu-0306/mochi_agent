@@ -41,7 +41,7 @@ from mochi.agents.multi_agent.orchestrator import (
     MultiAgentRunEvent,
     MultiAgentRunResult,
 )
-from mochi.api.routes.chat import _stream_chat_events
+from mochi.api.routes.chat import _event_phase, _serialize_event, _stream_chat_events
 from mochi.api.server import create_app
 from mochi.auth.models import OpenAICodexAuthProfile
 from mochi.auth.openai_codex import (
@@ -77,6 +77,7 @@ class _FakeEngine:
         self.chat_calls: list[tuple[str, str | None]] = []
         self.chat_attachment_calls: list[list[AttachmentRef] | None] = []
         self.chat_permission_policy_calls: list[dict[str, Any] | None] = []
+        self.chat_client_timezone_calls: list[str | None] = []
         self.switch_calls: list[str] = []
         self.ollama_switch_calls: list[tuple[str, str | None]] = []
         self.openai_switch_calls: list[tuple[str, str, str, str]] = []
@@ -103,11 +104,13 @@ class _FakeEngine:
         permission_policy: dict[str, Any] | None = None,
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
+        client_timezone: str | None = None,
     ) -> AsyncIterator[object]:
         _ = (inference_overrides, project_id, workspace_dir, selected_skill_ids)
         self.chat_calls.append((message, session_id))
         self.chat_attachment_calls.append(attachments)
         self.chat_permission_policy_calls.append(permission_policy)
+        self.chat_client_timezone_calls.append(client_timezone)
         yield ThinkingEvent(content="分析中")
         yield ToolCallRequestEvent(
             call_id="call-1",

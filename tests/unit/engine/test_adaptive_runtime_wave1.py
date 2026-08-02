@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 
 from mochi.agents import engine as engine_module
+from mochi.agents.adaptive_diagnostics import AdaptiveDiagnosticsAccumulator
+from mochi.agents.complexity_gate import COMPLEXITY_ADVISOR_RESPONSE_VERSION
 from mochi.agents.conversation_resolver import (
     BoundedConversationContext,
     ConversationResolver,
@@ -60,18 +62,22 @@ def _contract(
     *,
     turn_id: str = "turn-1",
     deliverables: tuple[DeliverableContract, ...] = (),
+    operations: frozenset[str] | None = None,
 ) -> TurnIntentContract:
+    resolved_operations = operations or frozenset({"workspace_write"})
     return TurnIntentContract(
         turn_id=turn_id,
         active_goal_id=None,
         objective="Write one requested artifact",
         current_speech_act="request_execution",
-        operations=frozenset({"workspace_write"}),
+        operations=resolved_operations,
         deliverables=deliverables,
         resolved_references=(),
         positive_constraints=(),
         negative_constraints=(),
-        mutation_requirement="required",
+        mutation_requirement=(
+            "required" if "workspace_write" in resolved_operations else "forbidden"
+        ),
         clarification=None,
         supersedes_previous_goal=False,
         cancels_active_goal=False,
@@ -350,6 +356,65 @@ async def test_plan_runtime_kill_switch_is_noop_before_ledger_load(
     await engine.close()
 
 
+@pytest.mark.asyncio
+async def test_shadow_mode_observes_complexity_without_exposing_or_enforcing_plan(
+    tmp_path: Path,
+) -> None:
+    engine = AgentEngine(
+        _config(tmp_path, adaptive_runtime={"complexity": {"mode": "shadow"}})
+    )
+    exposure = ToolExposurePlan(
+        tool_names=["echo_tool"],
+        matched_groups=[],
+        limit=4,
+        discoverable_tool_names=["echo_tool"],
+    )
+    context = ToolExecutionContext(session_id="session-shadow")
+    deliverables = (
+        DeliverableContract(
+            kind="workspace_file",
+            target_hint="report.md",
+            acceptance_criteria=("report exists",),
+            source_turn_ids=("turn-shadow",),
+        ),
+        DeliverableContract(
+            kind="workspace_file",
+            target_hint="tests.txt",
+            acceptance_criteria=("tests summarized",),
+            source_turn_ids=("turn-shadow",),
+        ),
+    )
+
+    configured_exposure, decision, task_plan_context = await engine._configure_plan_runtime(  # noqa: SLF001
+        session_id="session-shadow",
+        turn_id="turn-shadow",
+        request=AgentInvocationRequest(message="write", persist_session=True),
+        rollout=_rollout(
+            _contract(
+                turn_id="turn-shadow",
+                deliverables=deliverables,
+                operations=frozenset({"workspace_write", "execution"}),
+            )
+        ),
+        available_tools=[EchoTool()],
+        exposure_plan=exposure,
+        tool_execution_context=context,
+    )
+
+    assert decision["kind"] == "plan_required"
+    assert configured_exposure == exposure
+    assert task_plan_context is None
+    plan_runtime = context.state["plan_runtime"]
+    assert plan_runtime["enabled"] is False
+    assert plan_runtime["required"] is False
+    assert plan_runtime["exposed"] is False
+    assert plan_runtime["mutable"] is False
+    assert plan_runtime["state"] == "inactive"
+    assert plan_runtime["unavailable_reason"] == "planning_shadow_mode"
+    assert "update_plan_runtime" not in context.state
+    await engine.close()
+
+
 def test_verification_compile_and_run_respect_parent_and_component_switches(
     tmp_path: Path,
 ) -> None:
@@ -373,7 +438,10 @@ def test_verification_compile_and_run_respect_parent_and_component_switches(
         )
 
 
-def test_single_routine_file_write_approval_does_not_force_plan(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_single_routine_file_write_approval_does_not_force_plan(
+    tmp_path: Path,
+) -> None:
     engine = AgentEngine(
         _config(
             tmp_path,
@@ -386,7 +454,7 @@ def test_single_routine_file_write_approval_does_not_force_plan(tmp_path: Path) 
         target_hint="report.md",
         source_turn_ids=("turn-1",),
     )
-    decision = engine._resolve_complexity_decision(  # noqa: SLF001
+    decision = await engine._resolve_complexity_decision(  # noqa: SLF001
         rollout=_rollout(
             _contract(deliverables=(deliverable,)),
             eligible_tools=(tool.name,),
@@ -420,7 +488,8 @@ def test_single_routine_file_write_approval_does_not_force_plan(tmp_path: Path) 
     ],
     ids=["destructive", "multiple-approvals", "unknown-boundary"],
 )
-def test_complexity_gate_fails_closed_for_risky_approval_shapes(
+@pytest.mark.asyncio
+async def test_complexity_gate_fails_closed_for_risky_approval_shapes(
     tmp_path: Path,
     tools: list[BaseTool],
     expected_reason: str,
@@ -431,7 +500,7 @@ def test_complexity_gate_fails_closed_for_risky_approval_shapes(
             adaptive_runtime={"complexity": {"mode": "enforce"}},
         )
     )
-    decision = engine._resolve_complexity_decision(  # noqa: SLF001
+    decision = await engine._resolve_complexity_decision(  # noqa: SLF001
         rollout=_rollout(
             _contract(),
             eligible_tools=tuple(tool.name for tool in tools),
@@ -445,6 +514,99 @@ def test_complexity_gate_fails_closed_for_risky_approval_shapes(
     )
     assert decision["kind"] == "plan_required"
     assert expected_reason in decision["hard_reason_codes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "delay", "enabled", "expected_reason", "expected_calls"),
+    [
+        (
+            {
+                "response_version": COMPLEXITY_ADVISOR_RESPONSE_VERSION,
+                "plan_recommended": True,
+                "estimated_distinct_actions": 4,
+                "dependency_count": 2,
+                "reason_codes": ["cross_tool_dependency"],
+                "confidence": 0.8,
+            },
+            0.0,
+            True,
+            "cross_tool_dependency",
+            1,
+        ),
+        ({"unexpected": True}, 0.0, True, "advisor_malformed", 1),
+        ({}, 0.05, True, "advisor_timeout", 1),
+        ({}, 0.0, False, None, 0),
+    ],
+    ids=["success", "malformed", "timeout", "disabled"],
+)
+async def test_engine_complexity_advisor_producer_and_diagnostics(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    delay: float,
+    enabled: bool,
+    expected_reason: str | None,
+    expected_calls: int,
+) -> None:
+    class AdvisorBackend(FakeBackend):
+        async def generate(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            assert tools is None
+            assert kwargs["temperature"] == 0.0
+            if delay:
+                await asyncio.sleep(delay)
+            return GenerationResult(
+                content=json.dumps(payload),
+                input_tokens=11,
+                output_tokens=7,
+            )
+
+    engine = AgentEngine(
+        _config(
+            tmp_path,
+            adaptive_runtime={
+                "complexity": {
+                    "mode": "enforce",
+                    "model_advisor_enabled": enabled,
+                    "advisor_timeout_seconds": 0.01,
+                }
+            },
+        )
+    )
+    backend = AdvisorBackend()
+    diagnostics = AdaptiveDiagnosticsAccumulator()
+    deliverables = (
+        DeliverableContract(
+            kind="workspace_file",
+            target_hint="one.md",
+            source_turn_ids=("turn-1",),
+        ),
+        DeliverableContract(
+            kind="workspace_file",
+            target_hint="two.md",
+            source_turn_ids=("turn-1",),
+        ),
+    )
+
+    decision = await engine._resolve_complexity_decision(  # noqa: SLF001
+        active_backend=backend,
+        rollout=_rollout(_contract(deliverables=deliverables)),
+        available_tools=[],
+        exposure_plan=ToolExposurePlan(tool_names=[], matched_groups=[], limit=4),
+        diagnostics=diagnostics,
+    )
+
+    assert len(backend.calls) == expected_calls
+    assert decision["advisor_used"] is enabled
+    if expected_reason is not None:
+        assert expected_reason in decision["soft_reason_codes"]
+    snapshot = diagnostics.snapshot()
+    assert snapshot["model_calls"] == expected_calls
+    assert snapshot["model_wall_observed_calls"] == expected_calls
+    assert snapshot["model_usage_observed_calls"] == (
+        1 if expected_calls and delay == 0 else 0
+    )
+    await engine.close()
 
 
 @pytest.mark.asyncio
@@ -677,6 +839,7 @@ async def test_semantic_judge_timeout_and_malformed_schema_fail_unverified(
             adaptive_runtime={"verification": {"judge_timeout_seconds": 0.01}},
         )
     )
+    timeout_diagnostics = AdaptiveDiagnosticsAccumulator()
     timeout_receipt = await engine._build_aggregate_verification_receipt(  # noqa: SLF001
         turn_id="turn-timeout",
         goal_id="goal-1",
@@ -687,7 +850,9 @@ async def test_semantic_judge_timeout_and_malformed_schema_fail_unverified(
         results=(),
         final_response_text="The report is complete.",
         semantic_judge_backend=SlowJudge({}),
+        diagnostics=timeout_diagnostics,
     )
+    malformed_diagnostics = AdaptiveDiagnosticsAccumulator()
     malformed_receipt = await engine._build_aggregate_verification_receipt(  # noqa: SLF001
         turn_id="turn-malformed",
         goal_id="goal-1",
@@ -698,6 +863,7 @@ async def test_semantic_judge_timeout_and_malformed_schema_fail_unverified(
         results=(),
         final_response_text="The report is complete.",
         semantic_judge_backend=_JudgeBackend({"verdict": "verified"}),
+        diagnostics=malformed_diagnostics,
     )
     assert timeout_receipt is not None
     assert timeout_receipt["verdict"] == "unverified"
@@ -705,6 +871,67 @@ async def test_semantic_judge_timeout_and_malformed_schema_fail_unverified(
     assert malformed_receipt is not None
     assert malformed_receipt["verdict"] == "unverified"
     assert malformed_receipt["criteria"][0]["reason_code"] == "semantic_judge_malformed"
+    assert (
+        timeout_diagnostics.snapshot()["model_calls"],
+        timeout_diagnostics.snapshot()["model_wall_observed_calls"],
+        timeout_diagnostics.snapshot()["model_usage_observed_calls"],
+        timeout_diagnostics.snapshot()["recovery_model_calls"],
+    ) == (1, 1, 0, 0)
+    assert (
+        malformed_diagnostics.snapshot()["model_calls"],
+        malformed_diagnostics.snapshot()["model_wall_observed_calls"],
+        malformed_diagnostics.snapshot()["model_usage_observed_calls"],
+        malformed_diagnostics.snapshot()["recovery_model_calls"],
+    ) == (1, 1, 0, 0)
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_judge_cancellation_records_direct_model_attempt(
+    tmp_path: Path,
+) -> None:
+    class BlockingJudge(_JudgeBackend):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.started = asyncio.Event()
+
+        async def generate(self, messages, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(messages)
+            self.raw_tools.append(tools)
+            self.generation_kwargs.append(dict(kwargs))
+            self.started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+    engine = AgentEngine(_config(tmp_path))
+    backend = BlockingJudge()
+    diagnostics = AdaptiveDiagnosticsAccumulator()
+    task = asyncio.create_task(
+        engine._build_aggregate_verification_receipt(  # noqa: SLF001
+            turn_id="turn-cancelled",
+            goal_id="goal-1",
+            active_task={"status": "active"},
+            verification_plan=_semantic_plan(),
+            artifact_verification=None,
+            requests=(),
+            results=(),
+            final_response_text="The report is complete.",
+            semantic_judge_backend=backend,
+            diagnostics=diagnostics,
+        )
+    )
+    await asyncio.wait_for(backend.started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    snapshot = diagnostics.snapshot()
+    assert (
+        snapshot["model_calls"],
+        snapshot["model_wall_observed_calls"],
+        snapshot["model_usage_observed_calls"],
+        snapshot["recovery_model_calls"],
+    ) == (1, 1, 0, 0)
     await engine.close()
 
 

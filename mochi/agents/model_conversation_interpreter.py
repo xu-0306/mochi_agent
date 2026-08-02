@@ -34,6 +34,10 @@ from mochi.agents.turn_intent_contract import (
     TurnOperation,
 )
 from mochi.backends.base import BaseLLMBackend
+from mochi.backends.inference_capabilities import (
+    resolve_model_inference_capabilities,
+    select_lowest_reasoning_effort,
+)
 from mochi.backends.types import GenerationResult, Message
 
 _T = TypeVar("_T", bound=str)
@@ -56,6 +60,7 @@ _TASK_RELATIONS = frozenset(
 _OPERATIONS = frozenset(
     {
         "conversation",
+        "temporal_lookup",
         "open_world_lookup",
         "literature_research",
         "workspace_read",
@@ -297,13 +302,6 @@ INTERPRETATION_JSON_SCHEMA: dict[str, Any] = {
                 "check": {"enum": ["test", "lint"]},
                 "tool_name": {"type": "string", "minLength": 1},
                 "profile_id": {"type": "string", "minLength": 1},
-                "call_id": {"type": "string", "minLength": 1},
-                "arguments_digest": {
-                    "type": "string",
-                    "pattern": "^[0-9a-f]{64}$",
-                },
-                "operation_id": {"type": "string", "minLength": 1},
-                "turn_id": {"type": "string", "minLength": 1},
                 "expected_exit_code": {"type": "integer"},
             },
         },
@@ -323,6 +321,10 @@ Rules:
 - task_relation describes how the current turn relates to the durable active task:
   continue, side_question, start, supersede, cancel, or standalone.
 - operations is a set and may contain multiple independent operations.
+- Use temporal_lookup for read-only current date/time lookup, timezone
+  conversion, or calendar/date arithmetic. Reserve execution for running
+  commands, code, or processes; naming a read-only temporal tool does not make
+  the operation execution.
 - mutation_requirement is required only for an intended persistent workspace
   change, forbidden when mutation is explicitly ruled out, and unknown otherwise.
 - A required deliverable for a persistent workspace change requested by the
@@ -334,6 +336,8 @@ Rules:
   a host-owned profile and already-observed tool evidence; it must never contain
   a command, shell, executable, or environment. Natural language such as
   "tests pass" is only a description and never instructs command execution.
+  Never invent call_id, arguments_digest, operation_id, or turn_id: those
+  evidence pins are runtime-owned and are not part of interpreter output.
 - A side question must describe only the side question's current operations and
   deliverables; do not silently continue the active task in the same turn.
 - Preserve positive and negative constraints separately.
@@ -366,6 +370,9 @@ _CLARIFICATION_KEYS = frozenset(
     {"question", "missing_fields", "source_turn_ids", "reason_code"}
 )
 _EVIDENCE_KEYS = frozenset({"statement", "source", "source_turn_ids"})
+_RUNTIME_OWNED_ACCEPTANCE_FIELDS = frozenset(
+    {"call_id", "arguments_digest", "operation_id", "turn_id"}
+)
 
 
 class ModelConversationInterpreter:
@@ -381,6 +388,7 @@ class ModelConversationInterpreter:
         self, context: BoundedConversationContext
     ) -> IntentInterpretation:
         payload = conversation_context_payload(context)
+        reasoning_effort = self._preferred_reasoning_effort()
         result = await self._backend.generate(
             [
                 Message(role="system", content=_SYSTEM_PROMPT),
@@ -393,6 +401,7 @@ class ModelConversationInterpreter:
             temperature=0.0,
             max_tokens=self._max_tokens,
             top_p=1.0,
+            reasoning_effort=reasoning_effort,
             stream=False,
         )
         if not isinstance(result, GenerationResult):
@@ -404,6 +413,15 @@ class ModelConversationInterpreter:
             interpretation,
             current_turn_id=context.current_turn.turn_id,
         )
+
+    def _preferred_reasoning_effort(self) -> str | None:
+        model_info = self._backend.get_model_info()
+        if model_info.backend_type.strip().lower() == "ollama":
+            # Ollama accepts the provider-native boolean ``think: false`` even
+            # for models that do not expose adjustable reasoning levels.
+            return "none"
+        capabilities = resolve_model_inference_capabilities(model_info)
+        return select_lowest_reasoning_effort(capabilities)
 
 
 def conversation_context_payload(
@@ -575,9 +593,16 @@ def _acceptance_criteria(value: Any, *, label: str) -> tuple[Any, ...]:
             not isinstance(key, str) for key in item
         ):
             raise ValueError(f"{item_label} must be a string or object")
+        criterion = dict(item)
+        if criterion.get("kind") == "tool_execution":
+            # These evidence pins identify an observed runtime call. A semantic
+            # interpreter cannot know them yet, so discard model-invented pins
+            # before the durable contract performs its strict validation.
+            for field in _RUNTIME_OWNED_ACCEPTANCE_FIELDS:
+                criterion.pop(field, None)
         # DeliverableContract owns the shared strict v1 criterion validation
         # used by both persisted state and downstream artifact verification.
-        criteria.append(dict(item))
+        criteria.append(criterion)
     return tuple(criteria)
 
 

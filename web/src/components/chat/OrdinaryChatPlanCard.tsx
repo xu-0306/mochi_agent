@@ -1,17 +1,31 @@
 'use client'
 
 import type { OrdinaryChatPlanState, OrdinaryChatTurn } from '@/lib/ordinary-chat-plan'
-import { sortOrdinaryChatTurns } from '@/lib/ordinary-chat-plan'
+import {
+  failureLearningDisplayItems,
+  sortOrdinaryChatTurns,
+} from '@/lib/ordinary-chat-plan'
 
 interface OrdinaryChatPlanCardProps {
   state: OrdinaryChatPlanState
 }
 
 function latestVisibleTurn(state: OrdinaryChatPlanState): OrdinaryChatTurn | null {
-  const turns = sortOrdinaryChatTurns(state).filter(
-    (turn) => turn.plan || turn.evidence.receipts.length > 0 || turn.blockers.length > 0
+  const allTurns = sortOrdinaryChatTurns(state)
+  const turns = allTurns.filter(
+    (turn) =>
+      turn.plan ||
+      turn.evidence.receipts.length > 0 ||
+      turn.blockers.length > 0 ||
+      Object.values(turn.failure_learning).some((count) => count > 0)
   )
-  return turns.at(-1) ?? null
+  if (turns.length > 0) return turns.at(-1) ?? null
+  const hasSessionLearning = failureLearningDisplayItems(state).some(
+    (item) => item.value > 0
+  )
+  return hasSessionLearning || state.costCoverage.expected_turns > 0
+    ? (allTurns.at(-1) ?? null)
+    : null
 }
 
 export function OrdinaryChatPlanCard({ state }: OrdinaryChatPlanCardProps) {
@@ -24,6 +38,8 @@ export function OrdinaryChatPlanCard({ state }: OrdinaryChatPlanCardProps) {
     0
   )
   const title = turn.plan?.objective || 'Adaptive task progress'
+  const learningItems = failureLearningDisplayItems(state)
+  const hasFailureLearning = learningItems.some((item) => item.value > 0)
 
   return (
     <section
@@ -64,6 +80,35 @@ export function OrdinaryChatPlanCard({ state }: OrdinaryChatPlanCardProps) {
 
       {evidenceCount > 0 ? (
         <p className="mt-2 text-xs text-success">Verified evidence: {evidenceCount}</p>
+      ) : null}
+
+      {state.costCoverage.expected_turns > 0 ? (
+        <p
+          aria-label="Adaptive runtime cost coverage"
+          className="mt-2 text-[11px] text-muted-foreground"
+        >
+          Cost coverage · {state.costCoverage.coverage} · tokens{' '}
+          {state.costCoverage.token_coverage} · wall {state.costCoverage.wall_coverage}
+        </p>
+      ) : null}
+
+      {hasFailureLearning ? (
+        <div
+          aria-label="Failure learning diagnostics"
+          className="mt-2 rounded-lg border border-border/60 bg-background/40 px-2.5 py-2"
+        >
+          <p className="text-[11px] font-medium text-muted-foreground">
+            Failure learning · {state.failureLearning.coverage}
+          </p>
+          <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-muted-foreground sm:grid-cols-4">
+            {learningItems.map((item) => (
+              <div key={item.label} className="flex items-center justify-between gap-2 sm:block">
+                <dt>{item.label}</dt>
+                <dd className="font-medium tabular-nums text-foreground">{item.value}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
       ) : null}
 
       {turn.blockers.length > 0 ? (

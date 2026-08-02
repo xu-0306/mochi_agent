@@ -14,6 +14,17 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from mochi.agents.adaptive_diagnostics import (
+    DIAGNOSTICS_EVENT,
+    AdaptiveDiagnosticsError,
+    AdaptiveDiagnosticsRecord,
+)
+from mochi.learning.failure_attribution import (
+    FAILURE_ATTRIBUTION_EVENT,
+    FailureAttributionError,
+    FailureAttributionRecord,
+)
+
 ADAPTIVE_RUNTIME_PROJECTION_VERSION = "ordinary-chat-adaptive-runtime-v1"
 ADAPTIVE_RUNTIME_SCHEMA_VERSION = 1
 
@@ -21,15 +32,21 @@ _KNOWN_EVENTS = frozenset(
     {
         "ordinary_chat_plan_ledger_updated",
         "ordinary_chat_verification_receipt_recorded",
-        "failure_learning_candidate",
-        "failure_learning_processed",
+        DIAGNOSTICS_EVENT,
+        FAILURE_ATTRIBUTION_EVENT,
         "turn_execution_checkpoint",
         "session_turn_timeline",
+        "turn_event",
         "message",
     }
 )
 _REDACTION_PATTERNS = (
-    (re.compile(r"(?i)\b(?:api[_ -]?key|access[_ -]?token|authorization|secret|token)\s*[:=]\s*[^\s,;]+"), "[REDACTED_SECRET]"),
+    (
+        re.compile(
+            r"(?i)\b(?:api[_ -]?key|access[_ -]?token|authorization|secret|token)\s*[:=]\s*[^\s,;]+"
+        ),
+        "[REDACTED_SECRET]",
+    ),
     (re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+"), "Bearer [REDACTED_SECRET]"),
     (re.compile(r"\b[0-9]{13,19}\b"), "[REDACTED_PAYMENT]"),
     (re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_CONTACT]"),
@@ -60,6 +77,7 @@ def project_adaptive_runtime(
 
     candidates: list[dict[str, Any]] = []
     ignored_event_count = 0
+    ignored_failure_attribution_count = 0
     for source_position, raw in enumerate(events, start=1):
         if not isinstance(raw, Mapping):
             ignored_event_count += 1
@@ -90,17 +108,25 @@ def project_adaptive_runtime(
         )
         if candidate is not None:
             candidates.append(candidate)
+        elif event_name == DIAGNOSTICS_EVENT:
+            ignored_event_count += 1
+        elif event_name == FAILURE_ATTRIBUTION_EVENT:
+            ignored_event_count += 1
+            ignored_failure_attribution_count += 1
 
     candidate_count = len(candidates)
     candidates = _deduplicate_candidates(candidates)
     duplicate_event_count = max(0, candidate_count - len(candidates))
-    candidates.sort(key=lambda item: (item["order"], item["source_position"], item["identity"]))
+    candidates.sort(
+        key=lambda item: (item["order"], item["source_position"], item["identity"])
+    )
     public_events: list[dict[str, Any]] = []
     for candidate in candidates:
         public_events.extend(_public_events_for_candidate(candidate))
     if len(public_events) > max_events:
+        discarded_public_events = len(public_events) - max_events
         public_events = public_events[-max_events:]
-        ignored_event_count += len(candidates) - max_events
+        ignored_event_count += discarded_public_events
 
     turns: dict[str, dict[str, Any]] = {}
     turn_first_order: dict[str, tuple[int, int]] = {}
@@ -109,6 +135,7 @@ def project_adaptive_runtime(
         "ignored_event_count": ignored_event_count,
         "duplicate_event_count": duplicate_event_count,
         "gate": {
+            "coverage": "partial",
             "decisions": 0,
             "by_kind": {},
             "by_reason": {},
@@ -118,47 +145,82 @@ def project_adaptive_runtime(
         },
         "complexity_decisions": {"total": 0, "by_kind": {}, "by_reason": {}},
         "plan": {
+            "coverage": "partial",
+            "diagnostics_coverage": "partial",
+            "diagnostics_observed_turns": 0,
+            "diagnostics_expected_turns": 0,
             "created": 0,
             "updated": 0,
             "cas_conflicts": 0,
-            "effectful_call_guard_blocks": 0,
+            "effectful_guard_blocks": 0,
         },
         "plan_updates": 0,
         "plan_cas_conflicts": 0,
         "retrieval": {
+            "coverage": "partial",
+            "diagnostics_coverage": "partial",
+            "diagnostics_observed_turns": 0,
+            "diagnostics_expected_turns": 0,
             "turns_with_inventory": 0,
             "eligible_tools": 0,
             "exposed_tools": 0,
             "search_queries": 0,
-            "zero_matches": 0,
+            "zero_match_queries": 0,
             "candidates": 0,
             "activations": 0,
+            "schema_count_before_total": 0,
+            "schema_count_after_total": 0,
+            "schema_token_estimate_before_total": 0,
+            "schema_token_estimate_after_total": 0,
         },
         "verification": {
+            "coverage": "partial",
             "receipts": 0,
             "by_verdict": {},
+            "by_verifier": {},
+            "by_reason": {},
             "semantic_judge_calls": 0,
             "semantic_judge_timeouts": 0,
             "semantic_judge_malformed": 0,
         },
         "recovery": {
+            "coverage": "partial",
+            "diagnostics_coverage": "partial",
+            "diagnostics_observed_turns": 0,
+            "diagnostics_expected_turns": 0,
             "decisions": 0,
             "attempts": 0,
-            "blocked_reasons": {},
+            "blocked": 0,
             "budget_exhausted": 0,
+            "blocked_reasons": {},
+            "extra_model_calls": 0,
+            "extra_tool_calls": 0,
+            "extra_input_tokens": 0,
+            "extra_output_tokens": 0,
+            "extra_model_wall_ms": 0,
+            "extra_tool_wall_ms": 0,
+        },
+        "cost": {
+            "coverage": "partial",
+            "token_coverage": "partial",
+            "wall_coverage": "partial",
+            "observed_turns": 0,
+            "expected_turns": 0,
+            "by_classification": {},
+        },
+        "diagnostics": {
+            "coverage": "partial",
+            "observed_turns": 0,
+            "expected_turns": 0,
         },
         "failure_learning": {
+            "coverage": "partial",
+            "valid_transition_count": 0,
+            "ignored_transition_count": ignored_failure_attribution_count,
             "candidates": 0,
             "processed": 0,
             "rejected": 0,
             "hints_selected": 0,
-        },
-        "cost": {
-            "simple_turns": 0,
-            "complex_turns": 0,
-            "extra_model_calls": 0,
-            "extra_tool_calls": 0,
-            "extra_wall_seconds": 0.0,
         },
     }
 
@@ -169,8 +231,84 @@ def project_adaptive_runtime(
         turn = turns.setdefault(turn_id, _new_turn(turn_id))
         order_key = (int(candidate["order"]), int(candidate["source_position"]))
         turn_first_order.setdefault(turn_id, order_key)
-        turn["updated_sequence"] = max(int(turn["updated_sequence"]), int(candidate["order"]))
+        turn["updated_sequence"] = max(
+            int(turn["updated_sequence"]), int(candidate["order"])
+        )
         _apply_candidate(turn, candidate, metrics, max_items=max_items)
+
+    runtime_turn_ids = {
+        str(candidate["turn_id"])
+        for candidate in candidates
+        if isinstance(candidate.get("turn_id"), str)
+        and candidate["kind"] != "message"
+    }
+    observed_diagnostics_turn_ids = {
+        str(candidate["turn_id"])
+        for candidate in candidates
+        if candidate["kind"] == DIAGNOSTICS_EVENT
+        and isinstance(candidate.get("turn_id"), str)
+    }
+    expected_turns = len(runtime_turn_ids)
+    observed_turns = len(observed_diagnostics_turn_ids & runtime_turn_ids)
+    diagnostics_coverage = (
+        "complete"
+        if expected_turns > 0 and observed_turns == expected_turns
+        else "partial"
+    )
+    metrics["diagnostics"]["coverage"] = diagnostics_coverage
+    metrics["diagnostics"]["observed_turns"] = observed_turns
+    metrics["diagnostics"]["expected_turns"] = expected_turns
+    metrics["cost"]["observed_turns"] = observed_turns
+    metrics["cost"]["expected_turns"] = expected_turns
+    cost_model_calls = sum(
+        int(bucket.get("model_calls", 0))
+        for bucket in metrics["cost"]["by_classification"].values()
+    )
+    cost_usage_observed = sum(
+        int(bucket.get("model_usage_observed_calls", 0))
+        for bucket in metrics["cost"]["by_classification"].values()
+    )
+    cost_wall_observed = sum(
+        int(bucket.get("model_wall_observed_calls", 0))
+        for bucket in metrics["cost"]["by_classification"].values()
+    )
+    metrics["cost"]["token_coverage"] = (
+        "complete"
+        if cost_model_calls > 0 and cost_usage_observed == cost_model_calls
+        else "partial"
+    )
+    metrics["cost"]["wall_coverage"] = (
+        "complete"
+        if cost_model_calls > 0 and cost_wall_observed == cost_model_calls
+        else "partial"
+    )
+    metrics["cost"]["coverage"] = (
+        "complete"
+        if diagnostics_coverage == "complete"
+        and metrics["cost"]["token_coverage"] == "complete"
+        and metrics["cost"]["wall_coverage"] == "complete"
+        else "partial"
+    )
+    for namespace in ("plan", "retrieval", "recovery"):
+        # Diagnostics prove coverage only for the counters emitted by that
+        # producer.  These sections also contain ledger/checkpoint/inventory
+        # projections, so their aggregate coverage cannot be promoted without
+        # independent provenance for those producers.
+        metrics[namespace]["diagnostics_coverage"] = diagnostics_coverage
+        metrics[namespace]["diagnostics_observed_turns"] = observed_turns
+        metrics[namespace]["diagnostics_expected_turns"] = expected_turns
+    valid_failure_attributions = sum(
+        candidate["kind"] == FAILURE_ATTRIBUTION_EVENT
+        for candidate in candidates
+    )
+    metrics["failure_learning"]["valid_transition_count"] = (
+        valid_failure_attributions
+    )
+    if (
+        valid_failure_attributions > 0
+        and ignored_failure_attribution_count == 0
+    ):
+        metrics["failure_learning"]["coverage"] = "complete"
 
     # Authoritative checkpoint/receipt/timeline state wins over a provisional
     # assistant final that may have streamed immediately before verification.
@@ -183,11 +321,29 @@ def project_adaptive_runtime(
         turn.pop("_latest_timeline_order", None)
         turn.pop("_latest_plan_order", None)
         turn.pop("_latest_plan_revision", None)
+        turn.pop("_terminal_outcome", None)
+        turn.pop("_runtime_status_hint", None)
+        turn.pop("_activation_outcome", None)
+        turn.pop("_latest_activation_order", None)
 
     ordered_turn_ids = sorted(turns, key=lambda key: turn_first_order[key])
     if len(ordered_turn_ids) > max_turns:
         ordered_turn_ids = ordered_turn_ids[-max_turns:]
     projected_turns = [turns[turn_id] for turn_id in ordered_turn_ids]
+    for namespace, field_name in (
+        ("gate", "by_kind"),
+        ("gate", "by_reason"),
+        ("complexity_decisions", "by_kind"),
+        ("complexity_decisions", "by_reason"),
+        ("verification", "by_verdict"),
+        ("verification", "by_verifier"),
+        ("verification", "by_reason"),
+        ("recovery", "blocked_reasons"),
+    ):
+        metrics[namespace][field_name] = _bounded_counter_map(
+            metrics[namespace][field_name],
+            max_items=max_items,
+        )
 
     return {
         "projection_version": ADAPTIVE_RUNTIME_PROJECTION_VERSION,
@@ -234,7 +390,8 @@ def _candidate_from_event(
     turn_id = _text_or_none(raw.get("turn_id"))
     revision = _positive_or_zero_int(
         raw.get("sequence")
-        if isinstance(raw.get("sequence"), int) and not isinstance(raw.get("sequence"), bool)
+        if isinstance(raw.get("sequence"), int)
+        and not isinstance(raw.get("sequence"), bool)
         else raw.get("seq")
     )
 
@@ -245,31 +402,64 @@ def _candidate_from_event(
         payload = checkpoint
         turn_id = turn_id or _text_or_none(checkpoint.get("turn_id"))
         revision = _positive_or_zero_int(checkpoint.get("revision"))
-    elif kind in {"ordinary_chat_plan_ledger_updated", "ordinary_chat_verification_receipt_recorded"}:
-        nested_name = "plan_ledger" if kind.startswith("ordinary_chat_plan") else "verification_receipt"
+    elif kind in {
+        "ordinary_chat_plan_ledger_updated",
+        "ordinary_chat_verification_receipt_recorded",
+    }:
+        nested_name = (
+            "plan_ledger"
+            if kind.startswith("ordinary_chat_plan")
+            else "verification_receipt"
+        )
         nested = raw.get(nested_name)
         if not isinstance(nested, Mapping):
             return None
         payload = nested
         turn_id = turn_id or _text_or_none(nested.get("turn_id"))
         revision = revision or _positive_or_zero_int(
-            raw.get("ledger_revision") if kind.startswith("ordinary_chat_plan") else raw.get("receipt_revision")
+            raw.get("ledger_revision")
+            if kind.startswith("ordinary_chat_plan")
+            else raw.get("receipt_revision")
         )
-    elif kind in {"failure_learning_candidate", "failure_learning_processed"}:
-        nested = raw.get("failure_episode")
-        if kind == "failure_learning_processed" and not isinstance(nested, Mapping):
-            nested = raw.get("candidate")
-        if isinstance(nested, Mapping):
-            payload = nested
-            turn_id = turn_id or _text_or_none(nested.get("turn_id"))
-        revision = revision or _positive_or_zero_int(raw.get("attempts"))
+    elif kind == DIAGNOSTICS_EVENT:
+        try:
+            diagnostics = AdaptiveDiagnosticsRecord.from_event(raw)
+        except AdaptiveDiagnosticsError:
+            return None
+        payload = {
+            "classification": diagnostics.classification,
+            "counters": dict(diagnostics.counters),
+        }
+        turn_id = diagnostics.turn_id
+    elif kind == FAILURE_ATTRIBUTION_EVENT:
+        try:
+            attribution = FailureAttributionRecord.from_event(raw)
+        except FailureAttributionError:
+            return None
+        payload = {
+            "candidate_id": attribution.candidate_id,
+            "transition": attribution.transition,
+            "status": attribution.status,
+            "reason_code": attribution.reason_code,
+        }
+        turn_id = attribution.turn_id
     elif kind == "session_turn_timeline":
         timeline = raw.get("timeline")
         if not isinstance(timeline, Mapping):
             return None
         payload = timeline
         turn_id = turn_id or _timeline_turn_id(timeline)
-        revision = revision or _positive_or_zero_int(timeline.get("history_current_revision"))
+        revision = revision or _positive_or_zero_int(
+            timeline.get("history_current_revision")
+        )
+    elif kind == "turn_event":
+        nested = raw.get("payload")
+        if not isinstance(nested, Mapping):
+            return None
+        payload = _turn_event_status_hint(raw, nested)
+        if payload is None:
+            return None
+        turn_id = turn_id or _text_or_none(nested.get("turn_id"))
     elif kind == "message":
         turn_id = turn_id or _text_or_none(raw.get("turn_id"))
         if turn_id is None:
@@ -284,9 +474,11 @@ def _candidate_from_event(
             "metadata": raw.get("metadata"),
         }
 
-    if turn_id is None and kind not in {"failure_learning_candidate", "failure_learning_processed"}:
+    if turn_id is None:
         return None
-    explicit_order = _first_int(raw, "sequence", "event_sequence", "source_sequence", "seq")
+    explicit_order = _first_int(
+        raw, "sequence", "event_sequence", "source_sequence", "seq"
+    )
     order = explicit_order or source_position
     identity_material = {
         "event": kind,
@@ -299,7 +491,9 @@ def _candidate_from_event(
         "source_position": source_position,
     }
     identity = hashlib.sha256(
-        json.dumps(identity_material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(
+            identity_material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
     ).hexdigest()
     return {
         "kind": kind,
@@ -313,6 +507,45 @@ def _candidate_from_event(
     }
 
 
+def _turn_event_status_hint(
+    raw: Mapping[str, Any], payload: Mapping[str, Any]
+) -> dict[str, str] | None:
+    """Extract only allowlisted terminal/recovery state from a turn event.
+
+    Turn events may contain assistant content, hidden reasoning, tool
+    arguments, and tool results.  None of those fields cross this boundary.
+    """
+
+    event_type = _text_or_none(payload.get("type")) or _text_or_none(
+        raw.get("phase")
+    )
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    error_type = _text_or_none(metadata.get("error_type"))
+
+    if (
+        event_type == "final_answer"
+        and error_type == "plan_finalization_required"
+        and metadata.get("recoverability") == "partial"
+    ):
+        return {
+            "status": "partial",
+            "blocker_code": "plan_finalization_required",
+        }
+
+    if event_type != "tool_call_result" or payload.get("tool_name") != "tool_activate":
+        return None
+    if error_type == "tool_activation_denied":
+        return {
+            "activation_outcome": "denied",
+            "blocker_code": "tool_activation_denied",
+        }
+    if metadata.get("status") == "tool_activated":
+        return {"activation_outcome": "activated"}
+    return None
+
+
 def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
@@ -320,23 +553,58 @@ def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, 
         kind = candidate["kind"]
         stable_key: tuple[Any, ...]
         if kind == "ordinary_chat_plan_ledger_updated":
-            stable_key = (kind, _text_or_none(raw.get("ledger_id")), candidate["revision"])
+            stable_key = (
+                kind,
+                _text_or_none(raw.get("ledger_id")),
+                candidate["revision"],
+            )
         elif kind == "ordinary_chat_verification_receipt_recorded":
-            stable_key = (kind, _text_or_none(raw.get("idempotency_key")) or _text_or_none(candidate["payload"].get("receipt_id")))
-        elif kind == "turn_execution_checkpoint":
+            stable_key = (
+                kind,
+                _text_or_none(raw.get("idempotency_key"))
+                or _text_or_none(candidate["payload"].get("receipt_id")),
+            )
+        elif kind in {"turn_execution_checkpoint", "session_turn_timeline"}:
             stable_key = (kind, candidate["turn_id"], candidate["revision"])
-        elif kind == "session_turn_timeline":
-            stable_key = (kind, candidate["turn_id"], candidate["revision"])
-        elif kind in {"failure_learning_candidate", "failure_learning_processed"}:
-            stable_key = (kind, _text_or_none(raw.get("candidate_id")), candidate["revision"])
+        elif kind == "turn_event":
+            stable_key = (
+                kind,
+                candidate["turn_id"],
+                (
+                    candidate["revision"]
+                    if candidate["revision"] > 0
+                    else candidate["source_position"]
+                ),
+                json.dumps(
+                    candidate["payload"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        elif kind in {DIAGNOSTICS_EVENT, FAILURE_ATTRIBUTION_EVENT}:
+            stable_key = (
+                kind,
+                _text_or_none(raw.get("idempotency_key")),
+            )
         else:
-            stable_key = (kind, candidate["turn_id"], candidate["order"], candidate["source_position"])
-        key = json.dumps(stable_key, ensure_ascii=False, separators=(",", ":"), default=str)
+            stable_key = (
+                kind,
+                candidate["turn_id"],
+                candidate["order"],
+                candidate["source_position"],
+            )
+        key = json.dumps(
+            stable_key, ensure_ascii=False, separators=(",", ":"), default=str
+        )
         prior = selected.get(key)
         if prior is not None:
             # Keep the candidate with the strongest explicit ordering and use
             # source position only as a deterministic tie breaker.
-            if (candidate["order"], candidate["source_position"]) > (prior["order"], prior["source_position"]):
+            if (candidate["order"], candidate["source_position"]) > (
+                prior["order"],
+                prior["source_position"],
+            ):
                 selected[key] = candidate
         else:
             selected[key] = candidate
@@ -352,16 +620,26 @@ def _new_turn(turn_id: str) -> dict[str, Any]:
         "complexity": {},
         "plan": None,
         "retrieval": {},
+        "diagnostics": {},
         "evidence": {"status": "not_observed", "receipts": []},
         "recovery": {},
-        "failure_learning": {"candidate_count": 0, "processed_count": 0},
+        "failure_learning": {
+            "candidate_count": 0,
+            "processed_count": 0,
+            "rejected_count": 0,
+            "hints_selected_count": 0,
+        },
         "blockers": [],
         "_status_hints": [],
     }
 
 
 def _apply_candidate(
-    turn: dict[str, Any], candidate: Mapping[str, Any], metrics: dict[str, Any], *, max_items: int
+    turn: dict[str, Any],
+    candidate: Mapping[str, Any],
+    metrics: dict[str, Any],
+    *,
+    max_items: int,
 ) -> None:
     kind = candidate["kind"]
     raw = candidate["raw"]
@@ -372,7 +650,9 @@ def _apply_candidate(
     if kind == "ordinary_chat_plan_ledger_updated":
         latest_revision = int(turn.get("_latest_plan_revision", -1))
         latest_order = int(turn.get("_latest_plan_order", -1))
-        if revision < latest_revision or (revision == latest_revision and order < latest_order):
+        if revision < latest_revision or (
+            revision == latest_revision and order < latest_order
+        ):
             return
         turn["_latest_plan_revision"] = revision
         turn["_latest_plan_order"] = order
@@ -381,24 +661,108 @@ def _apply_candidate(
         metrics["plan"]["updated"] += 1
         if turn["plan"].get("revision") == 1:
             metrics["plan"]["created"] += 1
-        if str(raw.get("idempotency_key") or "").startswith("plan-update:"):
-            conflict = int("conflict" in str(raw.get("idempotency_key")))
+        if raw.get("cas_status") in {"conflict", "rejected"}:
+            conflict = 1
             metrics["plan_cas_conflicts"] += conflict
             metrics["plan"]["cas_conflicts"] += conflict
+        return
+
+    if kind == DIAGNOSTICS_EVENT:
+        counters = payload.get("counters")
+        if isinstance(counters, Mapping):
+            turn["diagnostics"] = {
+                "classification": payload.get("classification"),
+                "counters": {
+                    key: int(value)
+                    for key, value in counters.items()
+                    if isinstance(key, str) and type(value) is int and value >= 0
+                },
+            }
+            _count_diagnostics(metrics, turn["diagnostics"])
+        return
+
+    if kind == FAILURE_ATTRIBUTION_EVENT:
+        transition = payload.get("transition")
+        turn_learning = turn["failure_learning"]
+        session_learning = metrics["failure_learning"]
+        if transition == "candidate":
+            turn_learning["candidate_count"] += 1
+            session_learning["candidates"] += 1
+        elif transition == "processed":
+            turn_learning["processed_count"] += 1
+            session_learning["processed"] += 1
+        elif transition == "rejected":
+            turn_learning["rejected_count"] += 1
+            session_learning["rejected"] += 1
+        elif transition == "hint_selected":
+            turn_learning["hints_selected_count"] += 1
+            session_learning["hints_selected"] += 1
+        return
+
+    if kind == "turn_event":
+        status_hint = payload.get("status")
+        blocker_code = _text_or_none(payload.get("blocker_code"))
+        if status_hint == "partial":
+            turn["_runtime_status_hint"] = "partial"
+            _add_blocker(turn, blocker_code)
+        activation_outcome = payload.get("activation_outcome")
+        if activation_outcome in {"denied", "activated"}:
+            latest_activation_order = int(turn.get("_latest_activation_order", -1))
+            if order >= latest_activation_order:
+                turn["_latest_activation_order"] = order
+                turn["_activation_outcome"] = activation_outcome
+                if activation_outcome == "denied":
+                    _add_blocker(turn, blocker_code)
+                else:
+                    turn["blockers"] = [
+                        item
+                        for item in turn["blockers"]
+                        if item != "tool_activation_denied"
+                    ]
         return
 
     if kind == "ordinary_chat_verification_receipt_recorded":
         receipt = _public_receipt(payload)
         evidence = turn["evidence"]
-        receipts = [item for item in evidence.get("receipts", []) if item.get("receipt_id") != receipt.get("receipt_id")]
+        receipts = [
+            item
+            for item in evidence.get("receipts", [])
+            if item.get("receipt_id") != receipt.get("receipt_id")
+        ]
         receipts.append(receipt)
         evidence["receipts"] = receipts[-8:]
         evidence["status"] = receipt["verdict"]
-        turn["_latest_receipt_order"] = max(order, int(turn.get("_latest_receipt_order", -1)))
-        _add_blocker(turn, receipt["verdict"] if receipt["verdict"] in {"failed", "unverified"} else None)
+        turn["_latest_receipt_order"] = max(
+            order, int(turn.get("_latest_receipt_order", -1))
+        )
+        _add_blocker(
+            turn,
+            (
+                receipt["verdict"]
+                if receipt["verdict"] in {"failed", "unverified"}
+                else None
+            ),
+        )
         metrics["verification"]["receipts"] += 1
         verdicts = metrics["verification"]["by_verdict"]
         verdicts[receipt["verdict"]] = int(verdicts.get(receipt["verdict"], 0)) + 1
+        for criterion in receipt.get("criteria", []):
+            if not isinstance(criterion, Mapping):
+                continue
+            verifier = _text_or_none(criterion.get("verifier_id"))
+            reason = _text_or_none(criterion.get("reason_code"))
+            if verifier:
+                bucket = metrics["verification"]["by_verifier"]
+                bucket[verifier] = int(bucket.get(verifier, 0)) + 1
+                if verifier == "semantic_judge":
+                    metrics["verification"]["semantic_judge_calls"] += 1
+            if reason:
+                bucket = metrics["verification"]["by_reason"]
+                bucket[reason] = int(bucket.get(reason, 0)) + 1
+                if reason == "semantic_judge_timeout":
+                    metrics["verification"]["semantic_judge_timeouts"] += 1
+                if reason == "semantic_judge_malformed":
+                    metrics["verification"]["semantic_judge_malformed"] += 1
         return
 
     if kind == "turn_execution_checkpoint":
@@ -406,7 +770,17 @@ def _apply_candidate(
             return
         turn["_latest_checkpoint_order"] = revision
         checkpoint = payload
-        stage = _safe_enum(checkpoint.get("stage"), {"contract_resolved", "awaiting_approval", "executing", "verifying", "completed", "blocked"})
+        stage = _safe_enum(
+            checkpoint.get("stage"),
+            {
+                "contract_resolved",
+                "awaiting_approval",
+                "executing",
+                "verifying",
+                "completed",
+                "blocked",
+            },
+        )
         if stage:
             turn["_status_hints"] = [stage]
         complexity = checkpoint.get("complexity_decision")
@@ -419,19 +793,25 @@ def _apply_candidate(
         turn["retrieval"] = _public_retrieval(checkpoint.get("inventory_snapshot"))
         if turn["retrieval"]:
             metrics["retrieval"]["turns_with_inventory"] += 1
-            metrics["retrieval"]["eligible_tools"] += int(turn["retrieval"].get("eligible_count", 0))
-            metrics["retrieval"]["exposed_tools"] += int(turn["retrieval"].get("exposed_count", 0))
+            metrics["retrieval"]["eligible_tools"] += int(
+                turn["retrieval"].get("eligible_count", 0)
+            )
+            metrics["retrieval"]["exposed_tools"] += int(
+                turn["retrieval"].get("exposed_count", 0)
+            )
         turn["recovery"] = _public_recovery(checkpoint)
         if turn["recovery"]:
             attempts_used = int(turn["recovery"].get("attempts_used") or 0)
             metrics["recovery"]["decisions"] += int(attempts_used > 0)
-            metrics["recovery"]["attempts"] += attempts_used
-            metrics["recovery"]["budget_exhausted"] += int(bool(turn["recovery"].get("exhausted_reason")))
         verification = checkpoint.get("verification_result")
         if isinstance(verification, Mapping):
             _apply_checkpoint_verification(turn, verification)
         if stage == "blocked":
             _add_blocker(turn, checkpoint.get("blocker_reason"))
+            reason = _text_or_none(checkpoint.get("blocker_reason"))
+            if reason:
+                bucket = metrics["recovery"]["blocked_reasons"]
+                bucket[reason] = int(bucket.get(reason, 0)) + 1
         if stage == "awaiting_approval":
             _add_blocker(turn, "awaiting_approval")
         return
@@ -441,31 +821,33 @@ def _apply_candidate(
         if timeline_turn is None:
             return
         timeline_order = int(turn.get("_latest_timeline_order", -1))
-        current_revision = _positive_or_zero_int(payload.get("history_current_revision"))
+        current_revision = _positive_or_zero_int(
+            payload.get("history_current_revision")
+        )
         if current_revision < timeline_order:
             return
         turn["_latest_timeline_order"] = current_revision
-        status = _safe_enum(timeline_turn.get("status"), {"queued", "running", "terminal", "cancelled"})
+        status = _safe_enum(
+            timeline_turn.get("status"), {"queued", "running", "terminal", "cancelled"}
+        )
         terminal_outcome = _text_or_none(timeline_turn.get("terminal_outcome"))
         cancellation_outcome = _text_or_none(timeline_turn.get("cancellation_outcome"))
-        if status == "cancelled" or terminal_outcome == "cancelled" or cancellation_outcome:
+        if (
+            status == "cancelled"
+            or terminal_outcome == "cancelled"
+            or cancellation_outcome
+        ):
             turn["_status_hints"] = ["cancelled"]
+            turn["_terminal_outcome"] = "cancelled"
             _add_blocker(turn, cancellation_outcome or "cancelled")
-        return
-
-    if kind == "failure_learning_candidate":
-        turn["failure_learning"]["candidate_count"] += 1
-        metrics["failure_learning"]["candidates"] += 1
-        for code in _safe_string_list(payload.get("reason_codes"), max_items=8, max_chars=120):
-            _add_blocker(turn, code)
-        return
-
-    if kind == "failure_learning_processed":
-        turn["failure_learning"]["processed_count"] += 1
-        metrics["failure_learning"]["processed"] += 1
-        status = _text_or_none(raw.get("status")) or _text_or_none(payload.get("status"))
-        if status == "hint_selected":
-            metrics["failure_learning"]["hints_selected"] += 1
+        elif status == "terminal":
+            turn["_terminal_outcome"] = (
+                terminal_outcome
+                if terminal_outcome in {"completed", "blocked", "unknown"}
+                else "unknown"
+            )
+            if terminal_outcome == "blocked":
+                _add_blocker(turn, "blocked")
         return
 
     if kind == "message":
@@ -483,16 +865,27 @@ def _apply_candidate(
         return
 
 
-def _apply_checkpoint_verification(turn: dict[str, Any], verification: Mapping[str, Any]) -> None:
+def _apply_checkpoint_verification(
+    turn: dict[str, Any], verification: Mapping[str, Any]
+) -> None:
     receipt = verification.get("aggregate_verification_receipt")
     if isinstance(receipt, Mapping):
         public_receipt = _public_receipt(receipt)
-        receipts = [item for item in turn["evidence"].get("receipts", []) if item.get("receipt_id") != public_receipt.get("receipt_id")]
+        receipts = [
+            item
+            for item in turn["evidence"].get("receipts", [])
+            if item.get("receipt_id") != public_receipt.get("receipt_id")
+        ]
         receipts.append(public_receipt)
-        turn["evidence"] = {"status": public_receipt["verdict"], "receipts": receipts[-8:]}
+        turn["evidence"] = {
+            "status": public_receipt["verdict"],
+            "receipts": receipts[-8:],
+        }
         if public_receipt["verdict"] in {"failed", "unverified"}:
             _add_blocker(turn, public_receipt["verdict"])
-    verdict = _text_or_none(verification.get("aggregate_verdict")) or _text_or_none(verification.get("verification_status"))
+    verdict = _text_or_none(verification.get("aggregate_verdict")) or _text_or_none(
+        verification.get("verification_status")
+    )
     if verdict in {"failed", "unverified", "blocked"}:
         turn["evidence"]["status"] = verdict
         _add_blocker(turn, verdict)
@@ -510,15 +903,40 @@ def _finalize_turn_status(turn: dict[str, Any]) -> None:
     if "blocked" in hints:
         turn["status"] = "blocked"
         return
+    plan_status = (
+        turn.get("plan", {}).get("status")
+        if isinstance(turn.get("plan"), Mapping)
+        else None
+    )
+    if plan_status == "cancelled":
+        turn["status"] = "cancelled"
+        return
+    if plan_status == "blocked":
+        turn["status"] = "blocked"
+        return
+    if turn.get("_runtime_status_hint") == "partial":
+        turn["status"] = "partial"
+        return
+    terminal_outcome = turn.get("_terminal_outcome")
+    if terminal_outcome == "blocked":
+        turn["status"] = "blocked"
+        return
+    if (
+        terminal_outcome in {"completed", "unknown"}
+        and turn.get("_activation_outcome") == "denied"
+    ):
+        turn["status"] = "blocked"
+        return
     if evidence_status == "unverified":
         turn["status"] = "partial"
         return
-    plan_status = turn.get("plan", {}).get("status") if isinstance(turn.get("plan"), Mapping) else None
-    if plan_status == "cancelled":
-        turn["status"] = "cancelled"
-    elif plan_status == "blocked":
-        turn["status"] = "blocked"
-    elif plan_status == "completed" or "completed" in hints:
+    if terminal_outcome == "unknown":
+        turn["status"] = "partial"
+    elif (
+        plan_status == "completed"
+        or "completed" in hints
+        or terminal_outcome == "completed"
+    ):
         turn["status"] = "completed"
     elif "awaiting_approval" in hints:
         turn["status"] = "awaiting_approval"
@@ -528,10 +946,52 @@ def _finalize_turn_status(turn: dict[str, Any]) -> None:
 
 def _public_event(candidate: Mapping[str, Any]) -> dict[str, Any]:
     kind = str(candidate["kind"])
+    public_kind = "turn_status_hint" if kind == "turn_event" else kind
     payload = candidate["payload"]
     public_payload: dict[str, Any]
     if kind == "ordinary_chat_plan_ledger_updated":
         public_payload = {"plan": _public_plan(payload, max_items=12)}
+    elif kind == DIAGNOSTICS_EVENT:
+        counters = payload.get("counters")
+        public_payload = {
+            "classification": _safe_enum(
+                payload.get("classification"),
+                {"simple", "complex", "unknown"},
+            ),
+            "counters": (
+                {
+                    key: int(value)
+                    for key, value in counters.items()
+                    if isinstance(key, str) and type(value) is int and value >= 0
+                }
+                if isinstance(counters, Mapping)
+                else {}
+            ),
+        }
+    elif kind == FAILURE_ATTRIBUTION_EVENT:
+        public_payload = {
+            "candidate_id": _safe_text(
+                payload.get("candidate_id"),
+                max_chars=128,
+            ),
+            "transition": _safe_enum(
+                payload.get("transition"),
+                {"candidate", "processed", "rejected", "hint_selected"},
+            ),
+            "status": _safe_enum(
+                payload.get("status"),
+                {"pending", "processed", "rejected", "selected"},
+            ),
+            "reason_code": _safe_enum(
+                payload.get("reason_code"),
+                {
+                    "candidate_enqueued",
+                    "worker_acked",
+                    "worker_rejected",
+                    "verified_hint_injected",
+                },
+            ),
+        }
     elif kind == "complexity_decision":
         public_payload = {"decision": _public_complexity(payload)}
     elif kind == "tool_retrieval_result":
@@ -541,32 +1001,78 @@ def _public_event(candidate: Mapping[str, Any]) -> dict[str, Any]:
     elif kind == "turn_cancelled":
         public_payload = {
             "status": "cancelled",
-            "cancellation_outcome": _safe_text(payload.get("cancellation_outcome"), max_chars=120),
+            "cancellation_outcome": _safe_text(
+                payload.get("cancellation_outcome"), max_chars=120
+            ),
         }
     elif kind == "ordinary_chat_verification_receipt_recorded":
         public_payload = {"receipt": _public_receipt(payload)}
     elif kind == "turn_execution_checkpoint":
         checkpoint = payload
         public_payload = {
-            "stage": _safe_enum(checkpoint.get("stage"), {"contract_resolved", "awaiting_approval", "executing", "verifying", "completed", "blocked"}),
+            "stage": _safe_enum(
+                checkpoint.get("stage"),
+                {
+                    "contract_resolved",
+                    "awaiting_approval",
+                    "executing",
+                    "verifying",
+                    "completed",
+                    "blocked",
+                },
+            ),
             "complexity": _public_complexity(checkpoint.get("complexity_decision")),
             "retrieval": _public_retrieval(checkpoint.get("inventory_snapshot")),
             "recovery": _public_recovery(checkpoint),
-            "verification_status": _text_or_none((checkpoint.get("verification_result") or {}).get("verification_status")) if isinstance(checkpoint.get("verification_result"), Mapping) else None,
-            "blocker_reason": _safe_text(checkpoint.get("blocker_reason"), max_chars=160),
+            "verification_status": (
+                _text_or_none(
+                    (checkpoint.get("verification_result") or {}).get(
+                        "verification_status"
+                    )
+                )
+                if isinstance(checkpoint.get("verification_result"), Mapping)
+                else None
+            ),
+            "blocker_reason": _safe_text(
+                checkpoint.get("blocker_reason"), max_chars=160
+            ),
         }
     elif kind == "session_turn_timeline":
         timeline_turn = _timeline_turn(payload, candidate.get("turn_id"))
         public_payload = {
-            "status": _safe_enum(timeline_turn.get("status"), {"queued", "running", "terminal", "cancelled"}) if timeline_turn else None,
-            "terminal_outcome": _safe_text(timeline_turn.get("terminal_outcome"), max_chars=80) if timeline_turn else None,
-            "cancellation_outcome": _safe_text(timeline_turn.get("cancellation_outcome"), max_chars=120) if timeline_turn else None,
+            "status": (
+                _safe_enum(
+                    timeline_turn.get("status"),
+                    {"queued", "running", "terminal", "cancelled"},
+                )
+                if timeline_turn
+                else None
+            ),
+            "terminal_outcome": (
+                _safe_text(timeline_turn.get("terminal_outcome"), max_chars=80)
+                if timeline_turn
+                else None
+            ),
+            "cancellation_outcome": (
+                _safe_text(timeline_turn.get("cancellation_outcome"), max_chars=120)
+                if timeline_turn
+                else None
+            ),
         }
-    elif kind in {"failure_learning_candidate", "failure_learning_processed"}:
+    elif kind == "turn_event":
         public_payload = {
-            "candidate_id": _safe_text(candidate["raw"].get("candidate_id"), max_chars=128),
-            "reason_codes": _safe_string_list(payload.get("reason_codes"), max_items=8, max_chars=120),
-            "status": _safe_text(candidate["raw"].get("status") or payload.get("status"), max_chars=80),
+            key: value
+            for key, value in {
+                "status": _safe_enum(payload.get("status"), {"partial"}),
+                "activation_outcome": _safe_enum(
+                    payload.get("activation_outcome"), {"denied", "activated"}
+                ),
+                "blocker_code": _safe_enum(
+                    payload.get("blocker_code"),
+                    {"plan_finalization_required", "tool_activation_denied"},
+                ),
+            }.items()
+            if value is not None
         }
     elif kind == "message":
         public_payload = {
@@ -577,17 +1083,25 @@ def _public_event(candidate: Mapping[str, Any]) -> dict[str, Any]:
         }
     else:
         public_payload = {}
-    event_id = "adaptive:v1:" + hashlib.sha256(
-        json.dumps(
-            {"event": kind, "turn_id": candidate.get("turn_id"), "revision": candidate.get("revision"), "payload": public_payload},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()[:32]
+    event_id = (
+        "adaptive:v1:"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "event": public_kind,
+                    "turn_id": candidate.get("turn_id"),
+                    "revision": candidate.get("revision"),
+                    "payload": public_payload,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+    )
     return {
         "event_id": event_id,
-        "event": kind,
+        "event": public_kind,
         "schema_version": ADAPTIVE_RUNTIME_SCHEMA_VERSION,
         "sequence": int(candidate["order"]),
         "revision": int(candidate["revision"]),
@@ -637,20 +1151,35 @@ def _public_plan(payload: Mapping[str, Any], *, max_items: int) -> dict[str, Any
             item = {
                 "item_id": _safe_text(raw_item.get("item_id"), max_chars=128),
                 "title": _safe_text(raw_item.get("title"), max_chars=200),
-                "status": _safe_enum(raw_item.get("status"), {"pending", "in_progress", "completed", "blocked", "cancelled"}),
-                "dependencies": _safe_string_list(raw_item.get("dependencies"), max_items=8, max_chars=128),
-                "success_criteria": _safe_string_list(raw_item.get("success_criteria"), max_items=8, max_chars=240),
-                "evidence_refs": _safe_string_list(raw_item.get("evidence_refs"), max_items=8, max_chars=128),
-                "blocker_reason": _safe_text(raw_item.get("blocker_reason"), max_chars=160),
+                "status": _safe_enum(
+                    raw_item.get("status"),
+                    {"pending", "in_progress", "completed", "blocked", "cancelled"},
+                ),
+                "dependencies": _safe_string_list(
+                    raw_item.get("dependencies"), max_items=8, max_chars=128
+                ),
+                "success_criteria": _safe_string_list(
+                    raw_item.get("success_criteria"), max_items=8, max_chars=240
+                ),
+                "evidence_refs": _safe_string_list(
+                    raw_item.get("evidence_refs"), max_items=8, max_chars=128
+                ),
+                "blocker_reason": _safe_text(
+                    raw_item.get("blocker_reason"), max_chars=160
+                ),
                 "attempts": _non_negative_int(raw_item.get("attempts")),
             }
             items.append(item)
     return {
         "ledger_id": _safe_text(payload.get("ledger_id"), max_chars=128),
         "revision": _non_negative_int(payload.get("revision")),
-        "status": _safe_enum(payload.get("status"), {"active", "completed", "blocked", "cancelled"}),
+        "status": _safe_enum(
+            payload.get("status"), {"active", "completed", "blocked", "cancelled"}
+        ),
         "objective": _safe_text(payload.get("objective"), max_chars=240),
-        "reason_codes": _safe_string_list(payload.get("reason_codes"), max_items=8, max_chars=120),
+        "reason_codes": _safe_string_list(
+            payload.get("reason_codes"), max_items=8, max_chars=120
+        ),
         "items": items,
         "blockers": _bounded_unique(
             [item["blocker_reason"] for item in items if item.get("blocker_reason")],
@@ -665,21 +1194,46 @@ def _public_complexity(payload: Any) -> dict[str, Any]:
         return {}
     return {
         "decision_version": _safe_text(payload.get("decision_version"), max_chars=64),
-        "kind": _safe_enum(payload.get("kind"), {"no_plan", "plan_required", "continue_existing_plan", "preserve_existing_plan", "blocked_for_clarification"}),
+        "kind": _safe_enum(
+            payload.get("kind"),
+            {
+                "no_plan",
+                "plan_required",
+                "continue_existing_plan",
+                "preserve_existing_plan",
+                "blocked_for_clarification",
+            },
+        ),
         "score": _bounded_int(payload.get("score"), 0, 100),
-        "hard_reason_codes": _safe_string_list(payload.get("hard_reason_codes"), max_items=8, max_chars=120),
-        "soft_reason_codes": _safe_string_list(payload.get("soft_reason_codes"), max_items=8, max_chars=120),
-        "advisor_used": payload.get("advisor_used") if type(payload.get("advisor_used")) is bool else None,
-        "advisor_confidence": _bounded_float(payload.get("advisor_confidence"), 0.0, 1.0),
+        "hard_reason_codes": _safe_string_list(
+            payload.get("hard_reason_codes"), max_items=8, max_chars=120
+        ),
+        "soft_reason_codes": _safe_string_list(
+            payload.get("soft_reason_codes"), max_items=8, max_chars=120
+        ),
+        "advisor_used": (
+            payload.get("advisor_used")
+            if type(payload.get("advisor_used")) is bool
+            else None
+        ),
+        "advisor_confidence": _bounded_float(
+            payload.get("advisor_confidence"), 0.0, 1.0
+        ),
     }
 
 
 def _public_retrieval(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         return {}
-    eligible = _safe_string_list(payload.get("eligible_tool_names"), max_items=100, max_chars=128)
-    exposed = _safe_string_list(payload.get("exposed_tool_names"), max_items=100, max_chars=128)
-    activation = _safe_string_list(payload.get("activation_eligible_tool_names"), max_items=100, max_chars=128)
+    eligible = _safe_string_list(
+        payload.get("eligible_tool_names"), max_items=100, max_chars=128
+    )
+    exposed = _safe_string_list(
+        payload.get("exposed_tool_names"), max_items=100, max_chars=128
+    )
+    activation = _safe_string_list(
+        payload.get("activation_eligible_tool_names"), max_items=100, max_chars=128
+    )
     return {
         "catalog_scope": _safe_text(payload.get("catalog_scope"), max_chars=80),
         "eligible_count": len(eligible),
@@ -692,27 +1246,60 @@ def _public_retrieval(payload: Any) -> dict[str, Any]:
 def _public_recovery(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     budget = checkpoint.get("recovery_budget")
     receipt = checkpoint.get("execution_receipt")
-    controlled = receipt.get("controlled_recovery") if isinstance(receipt, Mapping) else None
+    controlled = (
+        receipt.get("controlled_recovery") if isinstance(receipt, Mapping) else None
+    )
     if not isinstance(budget, Mapping) and not isinstance(controlled, Mapping):
         return {}
-    remaining_attempts = _non_negative_int(budget.get("remaining_attempts")) if isinstance(budget, Mapping) else None
-    remaining_model = _non_negative_int(budget.get("remaining_extra_model_calls")) if isinstance(budget, Mapping) else None
-    remaining_tools = _non_negative_int(budget.get("remaining_extra_tool_calls")) if isinstance(budget, Mapping) else None
-    remaining_wall = _bounded_float(budget.get("remaining_extra_wall_seconds"), 0.0, 3600.0) if isinstance(budget, Mapping) else None
+    remaining_attempts = (
+        _non_negative_int(budget.get("remaining_attempts"))
+        if isinstance(budget, Mapping)
+        else None
+    )
+    remaining_model = (
+        _non_negative_int(budget.get("remaining_extra_model_calls"))
+        if isinstance(budget, Mapping)
+        else None
+    )
+    remaining_tools = (
+        _non_negative_int(budget.get("remaining_extra_tool_calls"))
+        if isinstance(budget, Mapping)
+        else None
+    )
+    remaining_wall = (
+        _bounded_float(budget.get("remaining_extra_wall_seconds"), 0.0, 3600.0)
+        if isinstance(budget, Mapping)
+        else None
+    )
     exhausted = _safe_text(
-        (controlled or {}).get("exhausted_reason") if isinstance(controlled, Mapping) else None,
+        (
+            (controlled or {}).get("exhausted_reason")
+            if isinstance(controlled, Mapping)
+            else None
+        ),
         max_chars=120,
     )
     if exhausted is None and remaining_attempts == 0:
         exhausted = "recovery_attempt_budget_exhausted"
     return {
-        "attempts_used": _non_negative_int((controlled or {}).get("replans_used")) if isinstance(controlled, Mapping) else None,
+        "attempts_used": (
+            _non_negative_int((controlled or {}).get("replans_used"))
+            if isinstance(controlled, Mapping)
+            else None
+        ),
         "remaining_attempts": remaining_attempts,
         "remaining_model_calls": remaining_model,
         "remaining_tool_calls": remaining_tools,
         "remaining_wall_seconds": remaining_wall,
         "exhausted_reason": exhausted,
-        "reason_code": _safe_text((controlled or {}).get("reason_code") if isinstance(controlled, Mapping) else None, max_chars=120),
+        "reason_code": _safe_text(
+            (
+                (controlled or {}).get("reason_code")
+                if isinstance(controlled, Mapping)
+                else None
+            ),
+            max_chars=120,
+        ),
     }
 
 
@@ -726,29 +1313,48 @@ def _public_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
             criteria.append(
                 {
                     "criterion_id": _safe_text(raw.get("criterion_id"), max_chars=128),
-                    "verdict": _safe_enum(raw.get("verdict"), {"verified", "failed", "unverified", "not_applicable"}),
+                    "verdict": _safe_enum(
+                        raw.get("verdict"),
+                        {"verified", "failed", "unverified", "not_applicable"},
+                    ),
                     "verifier_id": _safe_text(raw.get("verifier_id"), max_chars=128),
-                    "evidence_refs": _safe_string_list(raw.get("evidence_refs"), max_items=8, max_chars=128),
+                    "evidence_refs": _safe_string_list(
+                        raw.get("evidence_refs"), max_items=8, max_chars=128
+                    ),
                     "reason_code": _safe_text(raw.get("reason_code"), max_chars=120),
-                    "retry_disposition": _safe_text(raw.get("retry_disposition"), max_chars=80),
+                    "retry_disposition": _safe_text(
+                        raw.get("retry_disposition"), max_chars=80
+                    ),
                 }
             )
     return {
         "receipt_id": _safe_text(payload.get("receipt_id"), max_chars=128),
         "turn_id": _safe_text(payload.get("turn_id"), max_chars=128),
-        "verdict": _safe_enum(payload.get("verdict"), {"verified", "failed", "unverified", "not_applicable"}) or "unverified",
-        "hard_failure": payload.get("hard_failure") if type(payload.get("hard_failure")) is bool else False,
+        "verdict": _safe_enum(
+            payload.get("verdict"),
+            {"verified", "failed", "unverified", "not_applicable"},
+        )
+        or "unverified",
+        "hard_failure": (
+            payload.get("hard_failure")
+            if type(payload.get("hard_failure")) is bool
+            else False
+        ),
         "retry_disposition": _safe_text(payload.get("retry_disposition"), max_chars=80),
         "criteria": criteria,
     }
 
 
-def _timeline_turn(timeline: Mapping[str, Any], turn_id: Any) -> Mapping[str, Any] | None:
+def _timeline_turn(
+    timeline: Mapping[str, Any], turn_id: Any
+) -> Mapping[str, Any] | None:
     turns = timeline.get("turns")
     if not isinstance(turns, (list, tuple)):
         return None
     for item in turns:
-        if isinstance(item, Mapping) and (turn_id is None or item.get("turn_id") == turn_id):
+        if isinstance(item, Mapping) and (
+            turn_id is None or item.get("turn_id") == turn_id
+        ):
             return item
     return None
 
@@ -767,12 +1373,98 @@ def _count_complexity(metrics: dict[str, Any], complexity: Mapping[str, Any]) ->
         by_kind[kind] = int(by_kind.get(kind, 0)) + 1
         gate_by_kind = metrics["gate"]["by_kind"]
         gate_by_kind[kind] = int(gate_by_kind.get(kind, 0)) + 1
-    for reason in list(complexity.get("hard_reason_codes", [])) + list(complexity.get("soft_reason_codes", [])):
+    for reason in list(complexity.get("hard_reason_codes", [])) + list(
+        complexity.get("soft_reason_codes", [])
+    ):
         if isinstance(reason, str):
             by_reason = metrics["complexity_decisions"]["by_reason"]
             by_reason[reason] = int(by_reason.get(reason, 0)) + 1
             gate_by_reason = metrics["gate"]["by_reason"]
             gate_by_reason[reason] = int(gate_by_reason.get(reason, 0)) + 1
+            if reason == "advisor_timeout":
+                metrics["gate"]["advisor_timeouts"] += 1
+            if reason == "advisor_malformed":
+                metrics["gate"]["advisor_malformed"] += 1
+    if complexity.get("advisor_used") is True:
+        metrics["gate"]["advisor_calls"] += 1
+
+
+def _count_diagnostics(
+    metrics: dict[str, Any],
+    diagnostics: Mapping[str, Any],
+) -> None:
+    classification = diagnostics.get("classification")
+    counters = diagnostics.get("counters")
+    if classification not in {"simple", "complex", "unknown"} or not isinstance(
+        counters, Mapping
+    ):
+        return
+
+    def value(name: str) -> int:
+        candidate = counters.get(name)
+        return candidate if type(candidate) is int and candidate >= 0 else 0
+
+    metrics["plan"]["effectful_guard_blocks"] += value("effectful_plan_guard_blocks")
+    retrieval = metrics["retrieval"]
+    for metric_name, counter_name in (
+        ("search_queries", "retrieval_search_queries"),
+        ("zero_match_queries", "retrieval_zero_match_queries"),
+        ("candidates", "retrieval_candidates"),
+        ("activations", "retrieval_activations"),
+        ("schema_count_before_total", "retrieval_schema_count_before_total"),
+        ("schema_count_after_total", "retrieval_schema_count_after_total"),
+        (
+            "schema_token_estimate_before_total",
+            "retrieval_schema_token_estimate_before_total",
+        ),
+        (
+            "schema_token_estimate_after_total",
+            "retrieval_schema_token_estimate_after_total",
+        ),
+    ):
+        retrieval[metric_name] += value(counter_name)
+
+    recovery = metrics["recovery"]
+    for metric_name, counter_name in (
+        ("attempts", "recovery_attempts"),
+        ("blocked", "recovery_blocked"),
+        ("budget_exhausted", "recovery_budget_exhaustions"),
+        ("extra_model_calls", "recovery_model_calls"),
+        ("extra_tool_calls", "recovery_tool_calls"),
+        ("extra_input_tokens", "recovery_input_tokens"),
+        ("extra_output_tokens", "recovery_output_tokens"),
+        ("extra_model_wall_ms", "recovery_model_wall_ms"),
+        ("extra_tool_wall_ms", "recovery_tool_wall_ms"),
+    ):
+        recovery[metric_name] += value(counter_name)
+
+    by_classification = metrics["cost"]["by_classification"]
+    bucket = by_classification.setdefault(
+        classification,
+        {
+            "turns": 0,
+            "model_calls": 0,
+            "model_usage_observed_calls": 0,
+            "model_wall_observed_calls": 0,
+            "tool_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model_wall_ms": 0,
+            "tool_wall_ms": 0,
+        },
+    )
+    bucket["turns"] += 1
+    for name in (
+        "model_calls",
+        "model_usage_observed_calls",
+        "model_wall_observed_calls",
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "model_wall_ms",
+        "tool_wall_ms",
+    ):
+        bucket[name] += value(name)
 
 
 def _add_blocker(turn: dict[str, Any], value: Any) -> None:
@@ -828,8 +1520,29 @@ def _safe_string_list(value: Any, *, max_items: int, max_chars: int) -> list[str
     return result
 
 
-def _bounded_unique(values: Iterable[Any], *, max_items: int, max_chars: int) -> list[str]:
+def _bounded_unique(
+    values: Iterable[Any], *, max_items: int, max_chars: int
+) -> list[str]:
     return _safe_string_list(list(values), max_items=max_items, max_chars=max_chars)
+
+
+def _bounded_counter_map(value: Any, *, max_items: int) -> dict[str, int]:
+    """Return a deterministic, redacted, cardinality-bounded counter map."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    aggregated: dict[str, int] = {}
+    for raw_key, raw_count in value.items():
+        key = _safe_text(raw_key, max_chars=120)
+        if key is None or type(raw_count) is not int or raw_count < 0:
+            continue
+        aggregated[key] = aggregated.get(key, 0) + raw_count
+    return dict(
+        sorted(
+            aggregated.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:max_items]
+    )
 
 
 def _safe_enum(value: Any, allowed: set[str]) -> str | None:

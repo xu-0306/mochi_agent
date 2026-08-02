@@ -1,0 +1,1176 @@
+{
+  "schema_name": "agent-foreman/plan",
+  "schema_version": "1.0",
+  "profile": "full",
+  "metadata": {
+    "plan_id": "PLAN-2026-08-01-SEMANTIC-FALLBACK-TOOL-ACTIVATION",
+    "objective": "Implement a policy-bounded semantic-interpreter fallback that preserves minimal direct tool exposure while allowing safe read-only tools to be discovered, activated, and invoked through the existing registry path, without natural-language keyword routing or expanded mutation, execution, approval, or plan-runtime authority.",
+    "repo_root": "H:/_python/agent_mochi",
+    "revision": "76f46b7dfba7c03fcc99c693da75e0e5cab7da8f",
+    "dirty_state": "dirty: extensive pre-existing modified and untracked files were observed before this plan was created; preserve all existing deltas and limit this planning turn to docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation",
+    "status": "integrated",
+    "completed_by": null,
+    "resolution_state": "resolved"
+  },
+  "main_model": {
+    "source": "current_conversation",
+    "resolved_model_id": null,
+    "verification": "unavailable",
+    "reasoning_effort": null
+  },
+  "architecture_decision": {
+    "mode": "hybrid_main_seams",
+    "selected_profile": "full",
+    "reasons": [
+      "The user explicitly authorized a gpt-5.6-terra subagent to implement the frozen plan.",
+      "Terra receives bounded implementation ownership, while Main retains architecture, engine-to-registry producer-consumer integration, deterministic review, repair, and completion authority.",
+      "The frozen invariants and executable component plus integration gates bound the worker package."
+    ],
+    "rejected_modes": [
+      {
+        "mode": "main_plan_weak_leaf",
+        "reason": "Resolver, planner, adapter, and registry activation form one authorization chain and cannot be treated as independent weak leaves."
+      },
+      {
+        "mode": "main_direct",
+        "reason": "The user explicitly requested gpt-5.6-terra to implement before Main review."
+      }
+    ],
+    "advisor_required": false
+  },
+  "capability_cards": [
+    {
+      "card_id": "CARD-GPT-5-6-TERRA",
+      "requested_selector": "gpt-5.6-terra",
+      "resolved_model_id": "custom/gpt-5.6-terra",
+      "verification": "verified",
+      "context_limit": "host-managed",
+      "tool_access": [
+        "apply_patch",
+        "shell_command",
+        "shared workspace filesystem"
+      ],
+      "repository_access": "Read and bounded write access to H:/_python/agent_mochi through the shared collaboration workspace; dispatch path ownership is enforced by fingerprint and delta review.",
+      "evidence": [
+        "The host collaboration API exposes gpt-5.6-terra as an explicit model override with shared workspace and tool access.",
+        "The user explicitly selected gpt-5.6-terra for this implementation.",
+        "Authoritative subagent turn_context in C:/Users/Xu/.codex/sessions/2026/08/01/rollout-2026-08-01T13-18-51-019fbbc2-c475-7853-afa3-f14cfc3b63a6.jsonl reports model_provider=custom, model=gpt-5.6-terra, and effort=medium."
+      ],
+      "known_limits": [
+        "The worktree contains extensive pre-existing user changes.",
+        "The worker may report only implemented or blocked; Main retains integration and completion authority.",
+        "No independent worktree isolation is available, so path ownership is checked by dispatch fingerprint and Main delta review."
+      ],
+      "routing_confidence": "qualified"
+    }
+  ],
+  "current_state_evidence": [
+    {
+      "path": "D:/_download/mochi-chat (3).md",
+      "symbol": "captured turn metadata for the failed weather request",
+      "observation": "The captured run records interpreter_status=unavailable after a 502 response, a fallback contract with conversation plus tool_discovery and mutation forbidden, activation_allowed_tool_names containing only tool_search, deferred tool_result_read, and capability_not_required exclusions for web_search, web_fetch, and get_current_time.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/conversation_resolver.py",
+      "symbol": "ConversationResolution and ConversationResolver.resolve",
+      "observation": "ConversationResolution carries contract, task state, bounded context, and diagnostics but has no typed interpreter-versus-fallback provenance; resolve selects _fallback_resolution whenever no validated contract exists.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/conversation_resolver.py",
+      "symbol": "ConversationResolver._fallback_resolution",
+      "observation": "The deterministic fallback intentionally grants only conversation and tool_discovery, forbids mutation, and sets confidence to zero; this permits pure conversation but provides no safe lookup activation envelope.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/turn_contract_rollout.py",
+      "symbol": "build_capability_plan",
+      "observation": "The rollout converts the policy-eligible BaseTool catalog into descriptors and calls CapabilityPlanner.plan with only the resolved contract and policy/environment ceilings, so structured fallback provenance is currently lost at this boundary.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/capability_planner.py",
+      "symbol": "CapabilityPlanner.plan",
+      "observation": "Eligibility requires a tool capability to intersect required_capabilities. Under fallback, required_capabilities is tool_discovery, so safe web and time tools are excluded as capability_not_required; exposed_tools is then selected as a minimal cover of the available required capabilities.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/capability_planner.py",
+      "symbol": "CatalogToolDescriptor",
+      "observation": "The existing descriptor already centralizes capabilities, read_only, destructive, requires_approval, risk, and directly_exposable metadata, which is sufficient to define a general policy predicate without request keywords or tool-name lists.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/capability_exposure_adapter.py",
+      "symbol": "_activation_allowed_tool_names and _enforced_discoverable_tool_names",
+      "observation": "The activation allowlist is derived from capability_plan.eligible_tools, but discoverability separately admits neutral infrastructure tools. This permits tool_result_read to be deferred even when it is absent from activation_allowed_tool_names.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/agents/engine.py",
+      "symbol": "AgentEngine._invoke_shared_runtime activation policy and registry view construction",
+      "observation": "The engine copies adapter activation_allowed_tool_names into ToolExecutionContext and passes exposure tool_names plus discoverable_tool_names into ToolRegistry.create_view, making the adapter output the real producer consumed by runtime activation.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/tools/registry.py",
+      "symbol": "ToolRegistry.create_view and ToolRegistry.request_tool_activation",
+      "observation": "create_view adds tool_activate whenever discoverable names contain a deferred tool, while request_tool_activation denies a deferred tool unless it appears in activation_allowed_tool_names. Therefore discoverability and authorization must be consistent before view creation.",
+      "status": "observed"
+    },
+    {
+      "path": "mochi/tools/update_plan.py",
+      "symbol": "UpdatePlanTool",
+      "observation": "update_plan is state-changing and reports is_read_only false; engine and react-loop logic expose it only when the durable plan runtime is explicitly active, so semantic fallback must not grant it.",
+      "status": "observed"
+    },
+    {
+      "path": "tests/unit/engine/test_turn_contract_rollout.py",
+      "symbol": "test_interpreter_backend_outage_allows_safe_baseline_generation",
+      "observation": "The existing outage regression proves only that a no-tool answer can complete; it does not exercise discovery, activation, invocation, or denial through the real engine-to-registry boundary.",
+      "status": "observed"
+    },
+    {
+      "path": "tests/unit/engine/test_tool_exposure_and_invocation.py",
+      "symbol": "weather, temporal lookup, and update_plan exposure tests",
+      "observation": "Existing weather and time tests inject successful semantic capability resolution, and existing update_plan tests cover explicit plan-runtime exposure; no test combines interpreter outage with safe read-only activation.",
+      "status": "observed"
+    }
+  ],
+  "control_flow": [
+    {
+      "id": "FLOW-001",
+      "kind": "production entry and provenance",
+      "path": "mochi/agents/conversation_resolver.py",
+      "symbol": "ConversationResolver.resolve",
+      "next": [
+        "FLOW-002",
+        "FLOW-003"
+      ],
+      "failure_path": "BackendRequestError, rejected interpretation, or missing interpreter selects FLOW-002; an accepted interpretation proceeds directly to FLOW-003 with resolution_source=interpreter."
+    },
+    {
+      "id": "FLOW-002",
+      "kind": "implementation phase 1: structured fallback provenance",
+      "path": "mochi/agents/conversation_resolver.py",
+      "symbol": "ConversationResolution.resolution_source and ConversationResolver._fallback_resolution",
+      "next": [
+        "FLOW-003"
+      ],
+      "failure_path": "If the source cannot be assigned from control flow, stop; do not infer it from diagnostics text, confidence, objective content, exception text, or user phrasing."
+    },
+    {
+      "id": "FLOW-003",
+      "kind": "implementation phase 1: producer handoff",
+      "path": "mochi/agents/turn_contract_rollout.py",
+      "symbol": "build_capability_plan",
+      "next": [
+        "FLOW-004"
+      ],
+      "failure_path": "Pass the structured semantic_fallback state derived from resolution_source into the planner while retaining all existing allowlist, denylist, profile, sandbox, and mutation ceilings."
+    },
+    {
+      "id": "FLOW-004",
+      "kind": "implementation phase 2: capability eligibility",
+      "path": "mochi/agents/capability_planner.py",
+      "symbol": "CapabilityPlanner.plan",
+      "next": [
+        "FLOW-005"
+      ],
+      "failure_path": "When semantic fallback is active, keep required_capabilities unchanged and augment only eligible_tools with catalog entries satisfying the centralized safe read-only capability predicate; compute exposed_tools only as the minimal cover of contract-required capabilities."
+    },
+    {
+      "id": "FLOW-005",
+      "kind": "implementation phase 3: exposure and activation consistency",
+      "path": "mochi/agents/capability_exposure_adapter.py",
+      "symbol": "adapt_capability_plan_to_exposure",
+      "next": [
+        "FLOW-006"
+      ],
+      "failure_path": "Derive activation allowlist, discoverable tools, and effective deferred tools from the same policy-filtered eligible set; remove any bypass that creates a deferred tool outside the activation allowlist."
+    },
+    {
+      "id": "FLOW-006",
+      "kind": "real producer boundary",
+      "path": "mochi/agents/engine.py",
+      "symbol": "tool_activation_policy construction",
+      "next": [
+        "FLOW-007"
+      ],
+      "failure_path": "If adapter diagnostics and exposure discoverability disagree, fail the integration gate before constructing a registry view."
+    },
+    {
+      "id": "FLOW-007",
+      "kind": "real consumer boundary",
+      "path": "mochi/tools/registry.py",
+      "symbol": "ToolRegistry.create_view",
+      "next": [
+        "FLOW-008"
+      ],
+      "failure_path": "Create tool_activate only when the effective deferred set is nonempty and every deferred tool is activation-authorized."
+    },
+    {
+      "id": "FLOW-008",
+      "kind": "runtime activation and invocation",
+      "path": "mochi/tools/registry.py",
+      "symbol": "ToolRegistry.request_tool_activation",
+      "next": [],
+      "failure_path": "Policy-ineligible, unsafe, denied, non-discoverable, or plan-runtime-only tools remain denied; an authorized safe read-only tool is atomically activated and made callable for the next model iteration."
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-001-STRUCTURED-PROVENANCE",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "Every ConversationResolution states whether its authoritative contract came from an accepted interpreter result or the deterministic fallback, and downstream code consumes that typed state instead of reverse-engineering diagnostics.",
+      "enforcement_owner": "ConversationResolver.resolve assignment of ConversationResolution.resolution_source",
+      "prohibited_behavior": "Inferring fallback from confidence==0, an empty objective, evidence text, interpreter_status strings, exception messages, or request content.",
+      "counterexample": "A valid interpreter result with low confidence or an empty objective is mislabeled as fallback and gains the fallback activation envelope.",
+      "gate_ids": [
+        "GATE-001-RESOLVER-PROVENANCE",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION"
+      ],
+      "oracle_origin": [
+        "deterministic_derived",
+        "existing_contract"
+      ],
+      "phase_exit": [
+        "Accepted, unavailable, rejected, and absent interpreter paths assign the expected source.",
+        "No diagnostic or natural-language parser is used as the source of truth."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "During semantic fallback, eligible_tools may be augmented only by policy-eligible catalog tools that are read-only, low risk, non-destructive, require no approval, contain neither workspace_write nor execution, and match a centralized safe capability contract: temporal_lookup, open_world_lookup, literature_research, workspace_read, or tool_discovery.",
+      "enforcement_owner": "CapabilityPlanner.plan safe fallback activation predicate",
+      "prohibited_behavior": "Admitting a tool because its name, description, user request, city, weather phrase, language, provider, or current bug example matches a literal list.",
+      "counterexample": "A tool named safe_weather_lookup that requires approval or also carries execution is admitted merely because the request asks for weather.",
+      "gate_ids": [
+        "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+        "GATE-005-ENGINE-DENIAL-ENVELOPE"
+      ],
+      "oracle_origin": [
+        "deterministic_derived",
+        "existing_contract"
+      ],
+      "phase_exit": [
+        "Safe candidates are selected solely from normalized CatalogToolDescriptor metadata and existing policy ceilings.",
+        "Different languages and unrelated lookup phrasing produce the same safe fallback envelope."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-003-MINIMAL-DIRECT-EXPOSURE",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "Semantic fallback does not add lookup candidates to required_capabilities or direct exposure; required_capabilities remains tool_discovery and exposed_tools remains the minimal cover of contract-required capabilities, normally tool_search.",
+      "enforcement_owner": "CapabilityPlanner.plan separation of eligible_tools from _minimal_exposure inputs",
+      "prohibited_behavior": "Changing fallback operations to open_world_lookup or passing fallback activation-only capabilities into the direct schema cover.",
+      "counterexample": "An interpreter outage causes every safe web, literature, time, and workspace-read schema to be sent directly to the model on the first iteration.",
+      "gate_ids": [
+        "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+        "GATE-003-ADAPTER-CONSISTENCY",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION"
+      ],
+      "oracle_origin": [
+        "deterministic_derived",
+        "existing_contract"
+      ],
+      "phase_exit": [
+        "Fallback plan required_capabilities equals tool_discovery.",
+        "Lookup tools are activatable but not directly exposed before activation."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-004-DEFERRED-SUBSET",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "For every enforced exposure plan, effective deferred_tools is a subset of activation_allowed_tool_names after all hard ceilings and schema-budget reconciliation.",
+      "enforcement_owner": "capability_exposure_adapter.adapt_capability_plan_to_exposure derivation of discoverable and deferred tool names",
+      "prohibited_behavior": "Adding neutral infrastructure or baseline discoverable tools after the activation allowlist has been computed.",
+      "counterexample": "tool_result_read appears in deferred_tool_names while activation_allowed_tool_names contains only tool_search, causing a broker that can never authorize its only deferred tool.",
+      "gate_ids": [
+        "GATE-003-ADAPTER-CONSISTENCY",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+        "GATE-005-ENGINE-DENIAL-ENVELOPE"
+      ],
+      "oracle_origin": [
+        "deterministic_derived",
+        "existing_contract"
+      ],
+      "phase_exit": [
+        "The adapter asserts or constructs the subset relation after final reconciliation.",
+        "The engine-to-registry integration fixture observes the same set on both sides."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-005-BROKER-IFF-DEFERRED",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "The activation broker is present if and only if at least one genuinely activatable deferred tool remains, and its reserved schema slot is included in the runtime schema budget.",
+      "enforcement_owner": "capability_exposure_adapter broker_required calculation and ToolRegistry.create_view deferred-name check",
+      "prohibited_behavior": "Creating tool_activate for an empty or entirely unauthorized deferred set, or exceeding the schema limit after broker insertion.",
+      "counterexample": "The only discoverable item is an unauthorized tool_result_read, yet tool_activate is inserted and consumes a schema slot.",
+      "gate_ids": [
+        "GATE-003-ADAPTER-CONSISTENCY",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION"
+      ],
+      "oracle_origin": [
+        "deterministic_derived",
+        "existing_contract"
+      ],
+      "phase_exit": [
+        "Zero effective deferred tools yields no broker.",
+        "One or more authorized deferred tools yields exactly one broker without exceeding the schema limit."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-006-FAIL-CLOSED-AUTHORITY",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "Interpreter fallback never expands mutation, execution, destructive, approval-required, denied, sandbox-ineligible, or durable plan-runtime authority; update_plan remains unavailable unless the existing plan runtime explicitly exposes it.",
+      "enforcement_owner": "CapabilityPlanner.plan policy predicate, ExposurePolicyCeilings, and ToolRegistry.request_tool_activation",
+      "prohibited_behavior": "Treating all non-destructive or all read-looking tools as safe without checking read_only, risk, approval, capabilities, allowlist, denylist, sandbox, and plan-runtime ownership.",
+      "counterexample": "After a 502 interpretation failure, the model activates update_plan, exec_command, file_write, a destructive read tool, or an approval-required network tool.",
+      "gate_ids": [
+        "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+        "GATE-005-ENGINE-DENIAL-ENVELOPE",
+        "GATE-006-PLAN-RUNTIME-BOUNDARY"
+      ],
+      "oracle_origin": [
+        "existing_contract",
+        "deterministic_derived"
+      ],
+      "phase_exit": [
+        "Positive safe lookup activation and negative unsafe activation are exercised through the real registry view.",
+        "Existing explicit update_plan exposure tests continue to pass."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "When semantic interpretation succeeds, required capabilities, eligible tools, direct exposure, mutation handling, and activation behavior remain unchanged from the existing contract-driven path.",
+      "enforcement_owner": "ConversationResolver.resolve source branch and CapabilityPlanner.plan semantic_fallback=false branch",
+      "prohibited_behavior": "Applying the broad safe fallback envelope to accepted interpreter results or weakening their operation-specific minimal exposure.",
+      "counterexample": "A successfully interpreted temporal_lookup request gains workspace_read and literature tools as activation candidates, or a successful weather request changes its direct web subset.",
+      "gate_ids": [
+        "GATE-007-SEMANTIC-SUCCESS-REGRESSION",
+        "GATE-008-FOCUSED-REGRESSION-SUITE"
+      ],
+      "oracle_origin": [
+        "existing_contract",
+        "deterministic_derived"
+      ],
+      "phase_exit": [
+        "Existing successful weather, temporal lookup, write, clarification, allowlist, and denylist tests pass unchanged."
+      ],
+      "not_applicable": null
+    },
+    {
+      "id": "INV-008-OPEN-WORLD-GENERALIZATION",
+      "applies": true,
+      "classification": "critical",
+      "severity": "high",
+      "statement": "Fallback behavior is independent of natural-language tokens and generalizes across languages, synonyms, locations, and lookup domains because it is determined only by resolution provenance, catalog metadata, capability contracts, and runtime policy.",
+      "enforcement_owner": "ConversationResolver provenance and CapabilityPlanner catalog-policy abstraction",
+      "prohibited_behavior": "Adding weather, city, Chinese, English, Spanish, provider, or exact prompt literals to production routing logic.",
+      "counterexample": "The reported Chinese weather request passes, but an equivalent Spanish current-information request or a non-weather read-only lookup receives a different fallback capability envelope.",
+      "gate_ids": [
+        "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION"
+      ],
+      "oracle_origin": [
+        "deterministic_derived",
+        "existing_contract"
+      ],
+      "phase_exit": [
+        "At least two different languages or phrasings share the same policy envelope.",
+        "A negative unsafe tool case proves the tests cannot pass by adding only the observed phrase."
+      ],
+      "not_applicable": null
+    }
+  ],
+  "interfaces": [
+    {
+      "contract_id": "resolution-provenance-v1",
+      "producer": "ConversationResolver.resolve",
+      "consumer": "turn_contract_rollout.build_capability_plan",
+      "input": "Interpreter control-flow outcome",
+      "output": "ConversationResolution.resolution_source with exactly interpreter or fallback",
+      "errors": "Unknown or unassigned provenance is rejected; downstream code does not infer provenance from diagnostics or request text."
+    },
+    {
+      "contract_id": "fallback-activation-envelope-v1",
+      "producer": "CapabilityPlanner.plan",
+      "consumer": "capability_exposure_adapter.adapt_capability_plan_to_exposure",
+      "input": "Structured semantic_fallback state, normalized CatalogToolDescriptor metadata, and policy/environment ceilings",
+      "output": "required_capabilities remains contract-derived; eligible_tools may include safe fallback activation candidates; exposed_tools remains the minimal required-capability cover",
+      "errors": "Unsafe, capability-less, policy-blocked, write, execution, destructive, elevated-risk, or approval-required candidates remain excluded with deterministic reason codes."
+    },
+    {
+      "contract_id": "exposure-activation-consistency-v1",
+      "producer": "capability_exposure_adapter.adapt_capability_plan_to_exposure",
+      "consumer": "AgentEngine tool_activation_policy and ToolRegistry.create_view",
+      "input": "CapabilityPlan plus hard ceilings and schema budget",
+      "output": "Direct tool_names, discoverable_tool_names, activation_allowed_tool_names, and broker requirement with deferred_tools as a subset of the activation allowlist",
+      "errors": "No broker is produced for an empty effective deferred set; unauthorized discoverable candidates are removed before registry construction."
+    }
+  ],
+  "lifecycle": [
+    {
+      "phase": "resolve",
+      "owner": "ConversationResolver",
+      "entry": "bounded conversation context",
+      "exit": "authoritative contract plus typed provenance"
+    },
+    {
+      "phase": "plan",
+      "owner": "CapabilityPlanner",
+      "entry": "contract, provenance, catalog, profile, environment, and policy",
+      "exit": "auditable required, eligible, and exposed capability plan"
+    },
+    {
+      "phase": "adapt",
+      "owner": "capability_exposure_adapter",
+      "entry": "baseline exposure and authoritative capability plan",
+      "exit": "policy-consistent direct and deferred exposure"
+    },
+    {
+      "phase": "activate",
+      "owner": "ToolRegistry",
+      "entry": "engine-produced registry view and activation policy",
+      "exit": "safe tool activated or explicit denial with no side effect"
+    }
+  ],
+  "state_transitions": [
+    {
+      "from": "interpreter_attempted",
+      "event": "validated interpretation",
+      "to": "resolution_source=interpreter"
+    },
+    {
+      "from": "interpreter_attempted",
+      "event": "unavailable, rejected, or absent interpreter",
+      "to": "resolution_source=fallback"
+    },
+    {
+      "from": "fallback capability plan",
+      "event": "safe descriptor and policy predicate passes",
+      "to": "activation-eligible but not directly exposed"
+    },
+    {
+      "from": "deferred and authorized",
+      "event": "tool_activate request",
+      "to": "callable in the registry view"
+    },
+    {
+      "from": "deferred but unauthorized or unsafe",
+      "event": "activation attempt",
+      "to": "explicit denied result without registration or side effect"
+    }
+  ],
+  "failure_boundaries": [
+    {
+      "boundary": "semantic interpreter availability",
+      "fault": "BackendRequestError, invalid response, or no interpreter",
+      "required_behavior": "Continue with typed fallback provenance and a fail-closed safe read-only activation envelope."
+    },
+    {
+      "boundary": "planner-to-adapter authorization",
+      "fault": "eligible, discoverable, deferred, and activation allowlist drift",
+      "required_behavior": "Derive all activation-facing sets from the same policy-filtered eligible set and block inconsistent plans."
+    },
+    {
+      "boundary": "adapter-to-registry producer-consumer seam",
+      "fault": "A deferred tool is not activatable or a broker exists without a usable deferred tool",
+      "required_behavior": "Integration gate fails before completion; registry never grants authority absent from the engine-produced policy."
+    },
+    {
+      "boundary": "plan runtime",
+      "fault": "The model requests update_plan during ordinary fallback",
+      "required_behavior": "Keep update_plan unavailable unless the pre-existing durable plan runtime explicitly enables it."
+    }
+  ],
+  "packages": [
+    {
+      "id": "PKG-TERRA-IMPLEMENTATION",
+      "wave": 1,
+      "depends_on": [],
+      "may_impact": [
+        "PKG-MAIN-INTEGRATION"
+      ],
+      "consumes": [
+        "resolution-provenance-v1",
+        "fallback-activation-envelope-v1",
+        "exposure-activation-consistency-v1"
+      ],
+      "produces": [
+        "terra-implementation-delta-v1",
+        "terra-focused-test-evidence-v1",
+        "terra-handoff-v1"
+      ],
+      "owner_role": "worker",
+      "capability_card_id": "CARD-GPT-5-6-TERRA",
+      "owned_paths": [
+        "mochi/agents/conversation_resolver.py",
+        "mochi/agents/turn_contract_rollout.py",
+        "mochi/agents/capability_planner.py",
+        "mochi/agents/capability_exposure_adapter.py",
+        "tests/unit/agents/test_conversation_resolver.py",
+        "tests/unit/agents/test_capability_planner.py",
+        "tests/unit/tool_exposure/test_capability_adapter.py",
+        "tests/unit/engine/test_tool_exposure_and_invocation.py",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-terra-implementation.json"
+      ],
+      "prohibited_paths": [
+        "mochi/agents/engine.py",
+        "mochi/tools/registry.py",
+        "mochi/tools/base.py",
+        "mochi/tools/update_plan.py",
+        "mochi/backends",
+        "mochi/api",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.json",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.md"
+      ],
+      "read_first": [
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.json",
+        "mochi/tools/base.py",
+        "mochi/tools/registry.py",
+        "mochi/tools/update_plan.py",
+        "mochi/agents/engine.py",
+        "tests/unit/engine/test_turn_contract_rollout.py"
+      ],
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "verification_gate_ids": [
+        "GATE-001-RESOLVER-PROVENANCE",
+        "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+        "GATE-003-ADAPTER-CONSISTENCY",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+        "GATE-005-ENGINE-DENIAL-ENVELOPE",
+        "GATE-006-PLAN-RUNTIME-BOUNDARY",
+        "GATE-007-SEMANTIC-SUCCESS-REGRESSION",
+        "GATE-009-RUFF",
+        "GATE-010-PYRIGHT"
+      ],
+      "replan_policy": "main_takeover",
+      "status": "blocked",
+      "size_exception": "The single user-requested Terra implementer owns four tightly coupled internal authorization modules and four matching test files. Splitting these contracts across workers would increase provenance, eligibility, and exposure drift; engine.py and registry.py remain Main-owned prohibited integration seams."
+    },
+    {
+      "id": "PKG-MAIN-INTEGRATION",
+      "wave": 2,
+      "depends_on": [
+        "PKG-TERRA-IMPLEMENTATION"
+      ],
+      "may_impact": [],
+      "consumes": [
+        "terra-implementation-delta-v1",
+        "terra-focused-test-evidence-v1",
+        "terra-handoff-v1"
+      ],
+      "produces": [
+        "main-reviewed-delta-v1",
+        "producer-consumer-integration-evidence-v1",
+        "completion-ruling-v1"
+      ],
+      "owner_role": "main",
+      "capability_card_id": null,
+      "owned_paths": [
+        "mochi/agents/engine.py",
+        "mochi/tools/registry.py",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.json",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.md",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/fingerprint_scope_windows.py",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/dispatch-manifest.json",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/integration-main-review.json",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/evaluation-main-review.json"
+      ],
+      "prohibited_paths": [
+        "mochi/backends",
+        "mochi/api"
+      ],
+      "read_first": [
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-terra-implementation.json",
+        "mochi/agents/conversation_resolver.py",
+        "mochi/agents/turn_contract_rollout.py",
+        "mochi/agents/capability_planner.py",
+        "mochi/agents/capability_exposure_adapter.py",
+        "tests/unit/engine/test_tool_exposure_and_invocation.py"
+      ],
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "verification_gate_ids": [
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+        "GATE-005-ENGINE-DENIAL-ENVELOPE",
+        "GATE-006-PLAN-RUNTIME-BOUNDARY",
+        "GATE-007-SEMANTIC-SUCCESS-REGRESSION",
+        "GATE-008-FOCUSED-REGRESSION-SUITE",
+        "GATE-009-RUFF",
+        "GATE-010-PYRIGHT",
+        "GATE-011-DIFF-CHECK"
+      ],
+      "replan_policy": "affected_subgraph",
+      "status": "integrated",
+      "size_exception": "Main owns two production integration seams and six exact governance artifacts. The artifact paths do not enlarge production scope and are required for Windows-safe delta guarding, integration evidence, evaluation, and canonical plan state."
+    }
+  ],
+  "dependency_graph": {
+    "nodes": [
+      "PKG-TERRA-IMPLEMENTATION",
+      "PKG-MAIN-INTEGRATION"
+    ],
+    "edges": [
+      {
+        "from": "PKG-TERRA-IMPLEMENTATION",
+        "to": "PKG-MAIN-INTEGRATION"
+      }
+    ]
+  },
+  "acceptance_gates": [
+    {
+      "id": "GATE-001-RESOLVER-PROVENANCE",
+      "command": "rtk pytest -q tests/unit/agents/test_conversation_resolver.py -k resolution_source --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/resolver-provenance.xml",
+      "oracle": "Named tests prove accepted interpretation yields interpreter, while BackendRequestError, rejected interpretation, and absent interpreter yield fallback; pytest exits 0 and the JUnit artifact reports zero failures.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/resolver-provenance.xml",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE"
+      ],
+      "blocking": true,
+      "scope": "component",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+      "command": "rtk pytest -q tests/unit/agents/test_capability_planner.py -k semantic_fallback --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/planner-fallback.xml",
+      "oracle": "The fallback planner tests report required_capabilities exactly tool_discovery, directly expose only the contract-required minimal cover, mark safe read-only candidates eligible, and exclude write, execution, destructive, elevated-risk, approval-required, capability-less update_plan, allowlist-blocked, denylisted, and environment-ineligible candidates; pytest exits 0.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/planner-fallback.xml",
+      "invariant_ids": [
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "blocking": true,
+      "scope": "component",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-003-ADAPTER-CONSISTENCY",
+      "command": "rtk pytest -q tests/unit/tool_exposure/test_capability_adapter.py -k 'deferred_tools_are_activation_allowed or omits_broker_without_activatable_deferred_tools or reserves_broker_slot or records_result_reader_for_reference_continuation_without_activation' --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/adapter-consistency.xml",
+      "oracle": "Every tested enforced plan satisfies deferred_tools subset-of activation_allowed_tool_names; zero effective deferred tools yields no tool_activate schema; nonempty authorized deferred tools yield exactly one broker within budget; continuation-only tools are recorded separately without entering activation authorization; pytest exits 0.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/adapter-consistency.xml",
+      "invariant_ids": [
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED"
+      ],
+      "blocking": true,
+      "scope": "component",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+      "command": "rtk pytest -q tests/unit/engine/test_tool_exposure_and_invocation.py -k interpreter_outage_safe_read_only_activation --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/engine-fallback-activation.xml",
+      "oracle": "A scripted real AgentEngine invocation with an unavailable interpreter sends only the minimal direct schemas, exposes one activation broker only when needed, activates and invokes a safe web or time tool through ToolRegistry, and returns its result. Parameterized Chinese weather and a differently phrased non-Chinese lookup case observe the same activation envelope; pytest exits 0.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/engine-fallback-activation.xml",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "blocking": true,
+      "scope": "integration",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-005-ENGINE-DENIAL-ENVELOPE",
+      "command": "rtk pytest -q tests/unit/engine/test_tool_exposure_and_invocation.py -k interpreter_outage_denies_unsafe_activation --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/engine-fallback-denials.xml",
+      "oracle": "Using the engine-produced activation policy and registry view, direct activation attempts for update_plan, file_write, exec_command, destructive, approval-required, denied, and sandbox-ineligible fixtures are absent or return explicit denial with no side effect, while a policy-eligible safe read-only control succeeds; pytest exits 0.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/engine-fallback-denials.xml",
+      "invariant_ids": [
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-006-FAIL-CLOSED-AUTHORITY"
+      ],
+      "blocking": true,
+      "scope": "integration",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-006-PLAN-RUNTIME-BOUNDARY",
+      "command": "rtk pytest -q tests/unit/engine/test_tool_exposure_and_invocation.py -k 'configure_plan_runtime_exposes_update_plan_for_active_chat_plan or configure_plan_runtime_keeps_update_plan_hidden_when_chat_plan_runtime_is_unavailable' --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/plan-runtime-boundary.xml",
+      "oracle": "update_plan remains hidden without an active durable plan runtime and is exposed only by the existing explicit plan-runtime path; both named tests pass and pytest exits 0.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/plan-runtime-boundary.xml",
+      "invariant_ids": [
+        "INV-006-FAIL-CLOSED-AUTHORITY"
+      ],
+      "blocking": true,
+      "scope": "integration",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-007-SEMANTIC-SUCCESS-REGRESSION",
+      "command": "rtk pytest -q tests/unit/engine/test_tool_exposure_and_invocation.py -k 'weather_prompt_exposes_only_web_subset or temporal_lookup_contract_allows_read_only_datetime_activation' --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/semantic-success.xml",
+      "oracle": "The existing successful semantic weather path retains its bounded web subset and the temporal lookup path retains datetime activation behavior; pytest exits 0 with zero failures.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/semantic-success.xml",
+      "invariant_ids": [
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED"
+      ],
+      "blocking": true,
+      "scope": "integration",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-008-FOCUSED-REGRESSION-SUITE",
+      "command": "rtk pytest -q tests/unit/agents/test_conversation_resolver.py tests/unit/agents/test_capability_planner.py tests/unit/tool_exposure/test_capability_adapter.py tests/unit/engine/test_turn_contract_rollout.py tests/unit/engine/test_tool_exposure_and_invocation.py --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/focused-regression.xml",
+      "oracle": "All component and integration tests for resolver, planner, adapter, rollout, engine exposure, activation, denials, successful semantic interpretation, and plan-runtime exposure pass with pytest exit code 0.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/focused-regression.xml",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "blocking": true,
+      "scope": "integration",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-009-RUFF",
+      "command": "rtk proxy .venv\\Scripts\\ruff.exe check mochi/agents/conversation_resolver.py mochi/agents/turn_contract_rollout.py mochi/agents/capability_planner.py mochi/agents/capability_exposure_adapter.py mochi/tools/tool_result_read.py tests/unit/agents/test_conversation_resolver.py tests/unit/agents/test_capability_planner.py tests/unit/tool_exposure/test_capability_adapter.py tests/unit/engine/test_tool_exposure_and_invocation.py",
+      "oracle": "Ruff exits 0 for every planned production and test file and emits no lint diagnostics.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/ruff.txt",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-004-DEFERRED-SUBSET"
+      ],
+      "blocking": true,
+      "scope": "component",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-010-PYRIGHT",
+      "command": "rtk proxy .venv\\Scripts\\pyright.exe mochi/agents/conversation_resolver.py mochi/agents/turn_contract_rollout.py mochi/agents/capability_planner.py mochi/agents/capability_exposure_adapter.py mochi/tools/tool_result_read.py",
+      "oracle": "Pyright exits 0 and reports no type errors for the changed production boundary files.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/pyright.txt",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-004-DEFERRED-SUBSET"
+      ],
+      "blocking": true,
+      "scope": "component",
+      "result": "passed"
+    },
+    {
+      "id": "GATE-011-DIFF-CHECK",
+      "command": "rtk git diff --check",
+      "oracle": "Git exits 0 with no whitespace errors; Main reviews the scoped resolver, rollout, planner, adapter, engine integration, continuation-tool metadata, and focused test delta while preserving all unrelated user changes.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/diff-check.txt",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "blocking": true,
+      "scope": "component",
+      "result": "passed"
+    }
+  ],
+  "evidence_ledger": [
+    {
+      "evidence_id": "EVID-001-TERRA-HANDOFF",
+      "actor_role": "worker",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY"
+      ],
+      "gate_id": "GATE-009-RUFF",
+      "command": null,
+      "exit_code": 1,
+      "observed": "Terra implemented its bounded source and test delta but returned blocked after failing to locate Ruff and Pyright.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-terra-implementation.json",
+      "classification": "advisory"
+    },
+    {
+      "evidence_id": "EVID-002-INITIAL-EVALUATOR",
+      "actor_role": "evaluator",
+      "invariant_ids": [
+        "INV-006-FAIL-CLOSED-AUTHORITY"
+      ],
+      "gate_id": "GATE-005-ENGINE-DENIAL-ENVELOPE",
+      "command": "Two inline rtk python probes recorded in the artifact",
+      "exit_code": 1,
+      "observed": "Initial evaluator proved tool_result_read was activatable without a continuation reference and recommended REVISE.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/evaluation-initial-revise.json",
+      "classification": "deterministic"
+    },
+    {
+      "evidence_id": "EVID-003-AGGREGATE",
+      "actor_role": "gate_runner",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "gate_id": "GATE-008-FOCUSED-REGRESSION-SUITE",
+      "command": "rtk pytest -q tests/unit/agents/test_conversation_resolver.py tests/unit/agents/test_capability_planner.py tests/unit/tool_exposure/test_capability_adapter.py tests/unit/engine/test_turn_contract_rollout.py tests/unit/engine/test_tool_exposure_and_invocation.py --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/focused-regression.xml",
+      "exit_code": 0,
+      "observed": "113 passed",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/focused-regression.xml",
+      "classification": "deterministic"
+    },
+    {
+      "evidence_id": "EVID-004-STATIC-CHECKS",
+      "actor_role": "gate_runner",
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-004-DEFERRED-SUBSET"
+      ],
+      "gate_id": "GATE-010-PYRIGHT",
+      "command": "Scoped Ruff and Pyright commands recorded in their artifacts",
+      "exit_code": 0,
+      "observed": "Ruff passed; Pyright reported 0 errors, 0 warnings, 0 informations.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/pyright.txt",
+      "classification": "deterministic"
+    },
+    {
+      "evidence_id": "EVID-005-FINAL-EVALUATOR",
+      "actor_role": "evaluator",
+      "invariant_ids": [
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "gate_id": "GATE-005-ENGINE-DENIAL-ENVELOPE",
+      "command": "rtk python C:\\tmp\\mochi_fallback_recheck_probe.py",
+      "exit_code": 0,
+      "observed": "Fresh read-only recheck recommended PASS after safe activation, unsafe denial, state-requirement, and continuation-preservation probes all satisfied their oracles.",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/evaluation-final-pass.json",
+      "classification": "deterministic"
+    }
+  ],
+  "dispatches": [
+    {
+      "schema_name": "agent-foreman/dispatch",
+      "schema_version": "1.0",
+      "profile": "full",
+      "plan_id": "PLAN-2026-08-01-SEMANTIC-FALLBACK-TOOL-ACTIVATION",
+      "package_id": "PKG-TERRA-IMPLEMENTATION",
+      "authorization_source": "User message on 2026-08-01: 接著調用gpt5.6 terra subagent實作，實作結束你再審核",
+      "requested_selector": "gpt-5.6-terra",
+      "expected_model_verification": "verified",
+      "objective": "Implement the frozen semantic-interpreter fallback contracts in the resolver, rollout, capability planner, and exposure adapter, together with focused component and real engine-to-registry integration tests, without modifying Main-owned seams or introducing natural-language hardcoding.",
+      "frozen_contracts": [
+        "resolution-provenance-v1: ConversationResolution carries exactly interpreter or fallback, assigned from resolver control flow and never inferred from diagnostics, confidence, exception text, or request content.",
+        "fallback-activation-envelope-v1: semantic fallback keeps required_capabilities contract-derived and equal to tool_discovery for the baseline fallback contract.",
+        "Safe fallback activation candidates must be read_only, low risk, non-destructive, require no approval, contain neither workspace_write nor execution, pass all existing policy/environment ceilings, and match the centralized closed capability contract temporal_lookup, open_world_lookup, literature_research, workspace_read, or tool_discovery.",
+        "Fallback activation-only candidates enter eligible_tools but not exposed_tools; direct exposure remains the minimal cover of contract-required capabilities.",
+        "exposure-activation-consistency-v1: effective deferred_tools is a subset of activation_allowed_tool_names after hard ceilings and schema-budget reconciliation.",
+        "The activation broker exists if and only if the final effective deferred set is nonempty and fits the schema budget.",
+        "update_plan, mutation, execution, destructive, elevated-risk, approval-required, denied, and sandbox-ineligible tools remain unavailable during semantic fallback.",
+        "Successful semantic interpretation behavior remains unchanged.",
+        "Production routing must not contain weather, city, language, provider, exact prompt, or other natural-language keyword special cases."
+      ],
+      "owned_paths": [
+        "mochi/agents/conversation_resolver.py",
+        "mochi/agents/turn_contract_rollout.py",
+        "mochi/agents/capability_planner.py",
+        "mochi/agents/capability_exposure_adapter.py",
+        "tests/unit/agents/test_conversation_resolver.py",
+        "tests/unit/agents/test_capability_planner.py",
+        "tests/unit/tool_exposure/test_capability_adapter.py",
+        "tests/unit/engine/test_tool_exposure_and_invocation.py",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-terra-implementation.json"
+      ],
+      "prohibited_paths": [
+        "mochi/agents/engine.py",
+        "mochi/tools/registry.py",
+        "mochi/tools/base.py",
+        "mochi/tools/update_plan.py",
+        "mochi/backends",
+        "mochi/api",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.json",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.md"
+      ],
+      "read_first": [
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/plan.json",
+        "mochi/tools/base.py",
+        "mochi/tools/registry.py",
+        "mochi/tools/update_plan.py",
+        "mochi/agents/engine.py",
+        "tests/unit/engine/test_turn_contract_rollout.py"
+      ],
+      "invariant_ids": [
+        "INV-001-STRUCTURED-PROVENANCE",
+        "INV-002-SAFE-FALLBACK-ELIGIBILITY",
+        "INV-003-MINIMAL-DIRECT-EXPOSURE",
+        "INV-004-DEFERRED-SUBSET",
+        "INV-005-BROKER-IFF-DEFERRED",
+        "INV-006-FAIL-CLOSED-AUTHORITY",
+        "INV-007-SEMANTIC-SUCCESS-UNCHANGED",
+        "INV-008-OPEN-WORLD-GENERALIZATION"
+      ],
+      "gate_ids": [
+        "GATE-001-RESOLVER-PROVENANCE",
+        "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+        "GATE-003-ADAPTER-CONSISTENCY",
+        "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+        "GATE-005-ENGINE-DENIAL-ENVELOPE",
+        "GATE-006-PLAN-RUNTIME-BOUNDARY",
+        "GATE-007-SEMANTIC-SUCCESS-REGRESSION",
+        "GATE-009-RUFF",
+        "GATE-010-PYRIGHT"
+      ],
+      "commands": [
+        "rtk pytest -q tests/unit/agents/test_conversation_resolver.py -k resolution_source --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/resolver-provenance.xml",
+        "rtk pytest -q tests/unit/agents/test_capability_planner.py -k semantic_fallback --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/planner-fallback.xml",
+        "rtk pytest -q tests/unit/tool_exposure/test_capability_adapter.py -k 'deferred_tools_are_activation_allowed or omits_broker_without_activatable_deferred_tools or reserves_broker_slot' --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/adapter-consistency.xml",
+        "rtk pytest -q tests/unit/engine/test_tool_exposure_and_invocation.py -k 'interpreter_outage_safe_read_only_activation or interpreter_outage_denies_unsafe_activation or configure_plan_runtime or weather_prompt_exposes_only_web_subset or temporal_lookup_contract_allows_read_only_datetime_activation' --junitxml=docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/terra-engine-focused.xml",
+        "rtk ruff check mochi/agents/conversation_resolver.py mochi/agents/turn_contract_rollout.py mochi/agents/capability_planner.py mochi/agents/capability_exposure_adapter.py tests/unit/agents/test_conversation_resolver.py tests/unit/agents/test_capability_planner.py tests/unit/tool_exposure/test_capability_adapter.py tests/unit/engine/test_tool_exposure_and_invocation.py",
+        "rtk pyright mochi/agents/conversation_resolver.py mochi/agents/turn_contract_rollout.py mochi/agents/capability_planner.py mochi/agents/capability_exposure_adapter.py"
+      ],
+      "expected_artifacts": [
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/resolver-provenance.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/planner-fallback.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/adapter-consistency.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/terra-engine-focused.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/terra-implementation.diff",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-terra-implementation.json"
+      ],
+      "stop_conditions": [
+        "Stop as blocked if any required change falls outside owned_paths or touches a prohibited path.",
+        "Stop as blocked if the frozen contracts cannot be satisfied using existing normalized tool metadata and policy ceilings.",
+        "Stop and report the exact conflict instead of overwriting or reverting pre-existing user changes.",
+        "Stop if a proposed fix uses request keywords, languages, cities, weather terms, provider strings, confidence, diagnostics text, or exception text as routing authority.",
+        "Stop after the first non-transient critical gate failure and return the invariant, gate, location, actual result, expected result, artifact, and one next action.",
+        "Do not commit, stage, reset, revert, or modify plan.json or plan.md."
+      ],
+      "allowed_statuses": [
+        "implemented",
+        "blocked"
+      ]
+    }
+  ],
+  "handoffs": [
+    {
+      "schema_name": "agent-foreman/handoff",
+      "schema_version": "1.0",
+      "profile": "full",
+      "plan_id": "PLAN-2026-08-01-SEMANTIC-FALLBACK-TOOL-ACTIVATION",
+      "package_id": "PKG-TERRA-IMPLEMENTATION",
+      "status": "blocked",
+      "requested_selector": "gpt-5.6-terra",
+      "resolved_model_id": "custom/gpt-5.6-terra",
+      "model_verification": "verified",
+      "reasoning_effort": "medium",
+      "changed_paths": [
+        "mochi/agents/conversation_resolver.py",
+        "mochi/agents/turn_contract_rollout.py",
+        "mochi/agents/capability_planner.py",
+        "mochi/agents/capability_exposure_adapter.py",
+        "tests/unit/agents/test_conversation_resolver.py",
+        "tests/unit/agents/test_capability_planner.py",
+        "tests/unit/tool_exposure/test_capability_adapter.py",
+        "tests/unit/engine/test_tool_exposure_and_invocation.py"
+      ],
+      "diff_artifact": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/terra-implementation.diff",
+      "test_artifacts": [
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/resolver-provenance.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/planner-fallback.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/adapter-consistency.xml",
+        "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/artifacts/terra-engine-focused.xml"
+      ],
+      "gate_results": [
+        {
+          "gate_id": "GATE-001-RESOLVER-PROVENANCE",
+          "exit_code": 0,
+          "observed": "4 passed"
+        },
+        {
+          "gate_id": "GATE-002-PLANNER-FALLBACK-ENVELOPE",
+          "exit_code": 0,
+          "observed": "Worker version reported 2 passed; Main later expanded and reran 4 passed."
+        },
+        {
+          "gate_id": "GATE-003-ADAPTER-CONSISTENCY",
+          "exit_code": 0,
+          "observed": "Worker version reported 3 passed; Main later expanded and reran 4 passed."
+        },
+        {
+          "gate_id": "GATE-004-ENGINE-FALLBACK-ACTIVATION",
+          "exit_code": 0,
+          "observed": "Included in the worker's 6-pass combined engine selection."
+        },
+        {
+          "gate_id": "GATE-005-ENGINE-DENIAL-ENVELOPE",
+          "exit_code": 0,
+          "observed": "Included in the worker's 6-pass combined engine selection; Main later expanded denials."
+        },
+        {
+          "gate_id": "GATE-006-PLAN-RUNTIME-BOUNDARY",
+          "exit_code": 0,
+          "observed": "Included in the worker's 6-pass combined engine selection."
+        },
+        {
+          "gate_id": "GATE-007-SEMANTIC-SUCCESS-REGRESSION",
+          "exit_code": 0,
+          "observed": "Included in the worker's 6-pass combined engine selection."
+        },
+        {
+          "gate_id": "GATE-009-RUFF",
+          "exit_code": 1,
+          "observed": "Worker did not locate the project-local Ruff executable."
+        },
+        {
+          "gate_id": "GATE-010-PYRIGHT",
+          "exit_code": 1,
+          "observed": "Worker did not locate the project-local Pyright executable."
+        }
+      ],
+      "summary": "Terra implemented the bounded resolver, planner, adapter, and focused test delta, then returned blocked on checker discovery. Main took over integration and verification.",
+      "blocked_record": {
+        "blocked_from": "in_progress",
+        "invariant_id": "INV-001-STRUCTURED-PROVENANCE",
+        "gate_id": "GATE-009-RUFF",
+        "location": "verification environment:project-local checker discovery",
+        "actual": "The worker did not locate Ruff or Pyright and returned nonzero gate results.",
+        "expected": "Ruff and Pyright execute from the project environment and exit zero for the scoped paths.",
+        "evidence_artifact": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/handoff-terra-implementation.json",
+        "next_action": "Main locates the project-local executables and reruns GATE-009 and GATE-010."
+      }
+    }
+  ],
+  "integration_records": [
+    {
+      "schema_name": "agent-foreman/integration",
+      "schema_version": "1.0",
+      "profile": "full",
+      "plan_id": "PLAN-2026-08-01-SEMANTIC-FALLBACK-TOOL-ACTIVATION",
+      "phase_id": "PHASE-MAIN-REVIEW-FINAL",
+      "actor_role": "main",
+      "status": "integrated",
+      "deterministic_result": "passed",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/integration-main-review.json",
+      "formal_release_status": "provisional",
+      "delta_guard_passed": false
+    }
+  ],
+  "evaluations": [
+    {
+      "schema_name": "agent-foreman/evaluation",
+      "schema_version": "1.0",
+      "profile": "full",
+      "new_probes": [
+        {
+          "probe_id": "PROBE-INITIAL-RESULT-READER-AUTHORITY",
+          "invariant_id": "INV-006-FAIL-CLOSED-AUTHORITY"
+        }
+      ],
+      "recommendation": "revise",
+      "deterministic_result": "failed",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/evaluation-initial-revise.json"
+    },
+    {
+      "schema_name": "agent-foreman/evaluation",
+      "schema_version": "1.0",
+      "profile": "full",
+      "new_probes": [
+        {
+          "probe_id": "PROBE-FINAL-RESULT-READER-DENIAL",
+          "invariant_id": "INV-006-FAIL-CLOSED-AUTHORITY"
+        },
+        {
+          "probe_id": "PROBE-FINAL-GENERIC-STATE-REQUIREMENT",
+          "invariant_id": "INV-002-SAFE-FALLBACK-ELIGIBILITY"
+        },
+        {
+          "probe_id": "PROBE-FINAL-CONTINUATION-PRESERVATION",
+          "invariant_id": "INV-007-SEMANTIC-SUCCESS-UNCHANGED"
+        }
+      ],
+      "recommendation": "pass",
+      "deterministic_result": "passed",
+      "artifact_path": "docs/superpowers/plans/2026-08-01-semantic-fallback-tool-activation/evaluation-final-pass.json"
+    }
+  ],
+  "stop_conditions": [
+    "Stop implementation if resolution provenance would need to be inferred from diagnostics, confidence, exception text, or natural-language content instead of assigned by resolver control flow.",
+    "Stop and redesign if any proposed production change adds weather, city, language, provider, or exact prompt keyword routing.",
+    "Block integration if required_capabilities changes from tool_discovery during semantic fallback or if safe fallback candidates become directly exposed on the first iteration.",
+    "Block integration if any write, execution, destructive, elevated-risk, approval-required, denied, sandbox-ineligible, or update_plan tool becomes fallback-activatable.",
+    "Block integration if effective deferred_tools is not a subset of activation_allowed_tool_names, or if a broker exists without an activatable deferred tool.",
+    "Block integration if the real engine producer and registry consumer are tested only as independent snapshots rather than exchanging the same exposure and activation policy.",
+    "Block integration if any existing successful semantic interpretation, plan-runtime exposure, allowlist, denylist, clarification, or mutation test regresses.",
+    "Treat Codex Invalid prompt policy rejection and provider-native Responses tool transport as out of scope; do not modify backend adapters for this issue.",
+    "Preserve all pre-existing dirty work; if overlapping user edits make an invariant or gate impossible to satisfy without overwriting them, stop with the exact file, symbol, actual conflict, and one proposed reconciliation action."
+  ],
+  "fallback_policy": {
+    "mode": "single_main",
+    "triggers": [
+      "A shared producer-consumer contract changes during implementation.",
+      "A blocking component or integration gate fails after one precise repair.",
+      "The safe capability predicate cannot be expressed entirely through existing normalized tool metadata and policy ceilings.",
+      "Implementation requires touching backend transport or unrelated adaptive-runtime behavior.",
+      "Pre-existing user changes conflict with a planned shared-seam edit."
+    ]
+  }
+}

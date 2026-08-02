@@ -179,6 +179,13 @@ def test_turn_contract_types_strictly_round_trip() -> None:
     with pytest.raises(ValueError, match="unexpected fields"):
         TurnIntentContract.from_dict(invalid_criterion)
 
+    invalid_digest = contract.to_dict()
+    invalid_digest["deliverables"][0]["acceptance_criteria"][1][
+        "arguments_digest"
+    ] = "not-a-sha256-digest"
+    with pytest.raises(ValueError, match="arguments_digest must be a SHA-256 digest"):
+        TurnIntentContract.from_dict(invalid_digest)
+
 
 @pytest.mark.asyncio
 async def test_repository_round_trips_across_process_reload(tmp_path) -> None:

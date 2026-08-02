@@ -1,0 +1,3 @@
+command: rtk proxy .venv\Scripts\ruff.exe check mochi\agents\conversation_resolver.py mochi\agents\turn_contract_rollout.py mochi\agents\capability_planner.py mochi\agents\capability_exposure_adapter.py mochi\tools\tool_result_read.py tests\unit\agents\test_conversation_resolver.py tests\unit\agents\test_capability_planner.py tests\unit\tool_exposure\test_capability_adapter.py tests\unit\engine\test_tool_exposure_and_invocation.py
+exit_code: 0
+observed: All checks passed!

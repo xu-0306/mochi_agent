@@ -24,6 +24,8 @@ from mochi.api.tool_workflow_outbox import (
     ToolWorkflowOutboxRepository,
 )
 from mochi.config.schema import MochiConfig
+from mochi.learning.failure_outbox import FAILURE_OUTBOX_SESSION_ID
+from mochi.learning.failure_store import FAILURE_STORE_SESSION_ID
 from mochi.runtime.models import (
     AgentRunMessageRequest,
     SessionSubagentMessageRequest,
@@ -48,6 +50,17 @@ _RESERVED_AUTHORITATIVE_SESSION_EVENTS = frozenset(
         TOOL_WORKFLOW_OUTBOX_EVENT,
     }
 )
+_INTERNAL_LEARNING_SESSION_IDS = frozenset(
+    {
+        FAILURE_OUTBOX_SESSION_ID,
+        FAILURE_STORE_SESSION_ID,
+    }
+)
+
+
+def _ensure_public_session_id(session_id: str) -> None:
+    if session_id in _INTERNAL_LEARNING_SESSION_IDS:
+        raise HTTPException(status_code=404, detail="Session not found")
 
 
 class SessionSecurityOverrideRequest(BaseModel):
@@ -270,6 +283,8 @@ async def _list_session_summaries(store: SessionStore) -> list[dict[str, object]
 
     summaries: list[dict[str, object]] = []
     for session_id in await store.list_session_ids():
+        if session_id in _INTERNAL_LEARNING_SESSION_IDS:
+            continue
         events = await store.load_session(session_id)
         modified_at = await store.session_last_modified(session_id)
         # An inventory item may be deleted immediately after the scan.  Keep
@@ -487,6 +502,8 @@ async def create_session(
     config = await _get_config(app)
     store = _get_session_store(app, config=config)
     session_id = (request.session_id if request is not None else None) or str(uuid4())
+    if session_id in _INTERNAL_LEARNING_SESSION_IDS:
+        raise HTTPException(status_code=422, detail="Reserved session_id")
     now = datetime.now(tz=UTC).isoformat()
     security_override = (
         _normalize_session_security_override(request.security_override.model_dump())
@@ -722,6 +739,7 @@ async def get_session(
     include_adaptive_runtime: bool = Query(default=False),
 ) -> dict[str, object]:
     """讀取單一 session 的事件列表。"""
+    _ensure_public_session_id(session_id)
     app = http_request.app
     config = await _get_config(app)
     store = _get_session_store(app, config=config)
@@ -751,6 +769,7 @@ async def get_adaptive_runtime_projection(
 ) -> dict[str, Any]:
     """Return the bounded replay-safe ordinary Chat runtime projection."""
 
+    _ensure_public_session_id(session_id)
     config = await _get_config(http_request.app)
     store = _get_session_store(http_request.app, config=config)
     if not await store.session_exists(session_id):
@@ -769,29 +788,43 @@ async def get_adaptive_runtime_range(
     session_id: str,
     http_request: Request,
     after_sequence: int = Query(default=0, ge=0),
+    after_event_id: str | None = Query(default=None, min_length=1, max_length=256),
     limit: int = Query(default=100, ge=1, le=200),
 ) -> dict[str, Any]:
     """Return a bounded range of projected durable adaptive events."""
 
+    _ensure_public_session_id(session_id)
     config = await _get_config(http_request.app)
     store = _get_session_store(http_request.app, config=config)
     if not await store.session_exists(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     projection = project_adaptive_runtime(session_id, await store.load_session(session_id))
-    available = [
-        event
-        for event in projection["events"]
-        if int(event["sequence"]) > after_sequence
-    ]
+    records = list(projection["events"])
+    if after_event_id:
+        cursor_index = next(
+            (index for index, event in enumerate(records) if event.get("event_id") == after_event_id),
+            None,
+        )
+        if cursor_index is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "adaptive_runtime_cursor_not_found", "requires_snapshot": True},
+            )
+        available = records[cursor_index + 1 :]
+    else:
+        # Legacy sequence cursors cannot distinguish sibling derived events.
+        available = [event for event in records if int(event["sequence"]) > after_sequence]
     selected = available[:limit]
     return {
         "type": "ordinary_chat_adaptive_runtime_range",
         "schema_version": 1,
         "session_id": session_id,
         "after_sequence": after_sequence,
+        "after_event_id": after_event_id,
         "limit": limit,
         "events": selected,
         "next_after_sequence": int(selected[-1]["sequence"]) if selected else after_sequence,
+        "next_event_id": selected[-1]["event_id"] if selected else after_event_id,
         "has_more": len(available) > len(selected),
         "projection": {
             "projection_version": projection["projection_version"],
@@ -809,6 +842,7 @@ async def stream_adaptive_runtime_projection(
 ) -> StreamingResponse:
     """Replay projected adaptive events as named SSE records."""
 
+    _ensure_public_session_id(session_id)
     config = await _get_config(http_request.app)
     store = _get_session_store(http_request.app, config=config)
     if not await store.session_exists(session_id):
@@ -817,11 +851,11 @@ async def stream_adaptive_runtime_projection(
     records = list(projection["events"])
     last_event_id = http_request.headers.get("last-event-id")
     if last_event_id:
-        matched = next(
-            (event for event in records if event.get("event_id") == last_event_id),
+        cursor_index = next(
+            (index for index, event in enumerate(records) if event.get("event_id") == last_event_id),
             None,
         )
-        if matched is None:
+        if cursor_index is None:
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -829,8 +863,9 @@ async def stream_adaptive_runtime_projection(
                     "requires_snapshot": True,
                 },
             )
-        after_sequence = int(matched["sequence"])
-    records = [event for event in records if int(event["sequence"]) > after_sequence]
+        records = records[cursor_index + 1 :]
+    else:
+        records = [event for event in records if int(event["sequence"]) > after_sequence]
 
     async def events() -> Any:
         for event in records:

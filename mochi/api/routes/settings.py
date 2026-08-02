@@ -23,6 +23,7 @@ from mochi.config.manager import (
 from mochi.config.schema import (
     AgentConfig,
     ChannelsConfig,
+    ComplexityGateConfig,
     DiscordPlatformConfig,
     GGUFConfig,
     InferencePreset,
@@ -233,6 +234,7 @@ class AgentSettingsPatch(BaseModel):
     show_token_stats: bool | None = None
     presets: list[InferencePreset] | None = None
     active_preset: str | None = None
+    complexity_mode: Literal["off", "shadow", "enforce"] | None = None
 
 
 class SecuritySettingsPatch(BaseModel):
@@ -800,10 +802,25 @@ def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> di
 def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -> MochiConfig:
     updates: dict[str, Any] = {}
     if payload.agent is not None:
+        agent_updates = payload.agent.model_dump(exclude_unset=True)
+        complexity_mode = agent_updates.pop("complexity_mode", None)
+        if complexity_mode is not None:
+            adaptive = config.agent.ordinary_chat_adaptive_runtime
+            complexity = ComplexityGateConfig.model_validate(
+                {
+                    **adaptive.complexity.model_dump(),
+                    "mode": complexity_mode,
+                    "rollout_version": "operator-v2",
+                }
+            )
+            agent_updates["ordinary_chat_adaptive_runtime"] = {
+                **adaptive.model_dump(),
+                "complexity": complexity.model_dump(),
+            }
         updates["agent"] = AgentConfig.model_validate(
             {
                 **config.agent.model_dump(),
-                **payload.agent.model_dump(exclude_unset=True),
+                **agent_updates,
             }
         )
     if payload.voice is not None:

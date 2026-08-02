@@ -43,7 +43,9 @@
     ".next-fixture-subagent/types/**/*.ts",
     ".next-fixture-subagent/dev/types/**/*.ts",
     ".next-fixture-reload/types/**/*.ts",
-    ".next-fixture-reload/dev/types/**/*.ts"
+    ".next-fixture-reload/dev/types/**/*.ts",
+    ".next-codex-webbrowser-019fb358/types/**/*.ts",
+    ".next-codex-webbrowser-019fb358/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

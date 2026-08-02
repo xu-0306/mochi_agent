@@ -11,17 +11,17 @@ import json
 import logging
 import os
 import re
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Condition, RLock
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any
 from uuid import uuid4
 
 from mochi.config import defaults
-
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,8 @@ _MAX_COMPAT_FILENAME_CHARS = 240
 _STORAGE_MARKER_FILENAME = ".mochi-storage.json"
 _STORAGE_MARKER_VERSION = 1
 _STORAGE_ID_RE = re.compile(r"^storage:v1:[0-9a-f]{32}$")
+_ATOMIC_REPLACE_MAX_ATTEMPTS = 7
+_ATOMIC_REPLACE_RETRY_BASE_SECONDS = 0.01
 
 _TOOL_WORKFLOW_GATE_CONTROLLED_EVENTS = frozenset(
     {
@@ -85,6 +87,27 @@ _TOOL_WORKFLOW_GATE_CONTROLLED_EVENTS = frozenset(
         "tool_workflow_aggregate_outbox",
     }
 )
+
+
+def _replace_with_transient_lock_retry(source: Path, target: Path) -> None:
+    """Replace a file after bounded retries for transient sharing violations.
+
+    Windows rejects ``os.replace`` while another request briefly has the
+    destination JSONL open for reading. Session reads are intentionally
+    concurrent, so tolerate that short-lived condition without weakening the
+    atomic replacement contract or swallowing a persistent permission error.
+    """
+
+    delay = _ATOMIC_REPLACE_RETRY_BASE_SECONDS
+    for attempt in range(_ATOMIC_REPLACE_MAX_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == _ATOMIC_REPLACE_MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 class StrictSessionSnapshotError(ValueError):
@@ -588,7 +611,7 @@ class SessionStore:
                 fh.write("\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_path, identity_path)
+            _replace_with_transient_lock_retry(tmp_path, identity_path)
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
@@ -721,7 +744,7 @@ class SessionStore:
                 self._assert_v1_path_owned_by(source_path, sid)
             else:
                 self._assert_legacy_path_owned_by(source_path, sid)
-            os.replace(source_path, v2_path)
+            _replace_with_transient_lock_retry(source_path, v2_path)
             return v2_path
 
     @staticmethod
@@ -1166,7 +1189,7 @@ class SessionStore:
                     fh.write("\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_path, path)
+            _replace_with_transient_lock_retry(tmp_path, path)
             # Directory fsync is meaningful on POSIX.  Windows has no
             # equivalent available through this portable file API.
             if os.name != "nt":

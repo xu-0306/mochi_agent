@@ -84,6 +84,7 @@ def create_app() -> FastAPI:
     app.state.vllm_runtime_manager = None
     app.state.voice_bridge_diagnostics = _create_voice_bridge_diagnostics_state()
     app.state.runtime_service = None
+    app.state.learning_runtime_started_for = None
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_resolve_initial_cors_origins(),
@@ -433,12 +434,14 @@ async def _get_or_create_engine(app: FastAPI) -> Any:
     """取得可供 API 共用的 AgentEngine。"""
     existing = cast(Any, app.state.engine)
     if existing is not None:
+        await _start_learning_runtime(app, existing)
         return existing
 
     factory = cast(Callable[[], Any] | Callable[[FastAPI], Any] | None, app.state.engine_factory)
     if factory is not None:
         engine = await _maybe_await(_call_with_supported_kwargs(factory, app=app))
         app.state.engine = engine
+        await _start_learning_runtime(app, engine)
         return engine
 
     from mochi.agents.engine import AgentEngine
@@ -448,7 +451,18 @@ async def _get_or_create_engine(app: FastAPI) -> Any:
         vllm_runtime_manager=_get_or_create_vllm_runtime_manager(app),
     )
     app.state.engine = engine
+    await _start_learning_runtime(app, engine)
     return engine
+
+
+async def _start_learning_runtime(app: FastAPI, engine: Any) -> None:
+    runtime = getattr(engine, "learning_runtime", None)
+    if runtime is None or getattr(app.state, "learning_runtime_started_for", None) is runtime:
+        return
+    start = getattr(runtime, "start", None)
+    if callable(start):
+        await _maybe_await(start())
+        app.state.learning_runtime_started_for = runtime
 
 
 def _get_or_create_vllm_runtime_manager(app: FastAPI) -> Any:
@@ -763,10 +777,15 @@ async def _shutdown_engine(app: FastAPI) -> None:
 
     engine = cast(Any, app.state.engine)
     if engine is not None:
+        runtime = getattr(engine, "learning_runtime", None)
+        stop_learning = getattr(runtime, "stop", None)
+        if callable(stop_learning):
+            await _maybe_await(stop_learning())
         close = getattr(engine, "close", None)
         if callable(close):
             await _maybe_await(close())
     app.state.engine = None
+    app.state.learning_runtime_started_for = None
 
     vllm_manager = cast(Any | None, getattr(app.state, "vllm_runtime_manager", None))
     if vllm_manager is not None:

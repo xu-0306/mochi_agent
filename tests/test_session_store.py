@@ -26,6 +26,32 @@ def test_save_and_load_session_round_trip(tmp_path) -> None:
     ]
 
 
+def test_atomic_replace_retries_a_transient_destination_lock(tmp_path, monkeypatch) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = "transient-lock"
+    asyncio.run(store.save_event(session_id, {"type": "user", "content": "before"}))
+    real_replace = os.replace
+    attempts = 0
+    delays: list[float] = []
+
+    def replace_after_transient_lock(source, target) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(13, "destination is temporarily locked", str(target))
+        real_replace(source, target)
+
+    monkeypatch.setattr("mochi.sessions.store.os.replace", replace_after_transient_lock)
+    monkeypatch.setattr("mochi.sessions.store.time.sleep", delays.append)
+
+    replacement = [{"type": "assistant", "content": "after"}]
+    asyncio.run(store.replace_session(session_id, replacement))
+
+    assert attempts == 3
+    assert delays == [0.01, 0.02]
+    assert asyncio.run(store.load_session(session_id)) == replacement
+
+
 def test_save_event_creates_directory_automatically(tmp_path) -> None:
     """save_event() 應自動建立不存在的 sessions 目錄。"""
     sessions_dir = tmp_path / "nested" / "sessions"

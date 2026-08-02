@@ -172,6 +172,24 @@ def test_advisor_request_and_response_round_trip_strictly() -> None:
     assert ComplexityAdvisorResponse.from_dict(response.to_dict()) == response
 
 
+def test_temporal_lookup_is_read_only_and_planless() -> None:
+    decision = ComplexityGate().evaluate_deterministic(
+        ComplexityGateRequest(
+            turn_intent=_turn_contract(
+                turn_id="turn-temporal",
+                objective="Report the current time",
+                speech_act="request_information",
+                operations=frozenset({"temporal_lookup"}),
+            ),
+        )
+    )
+
+    assert decision.kind == "no_plan"
+    assert decision.effectful_action_requires_plan is False
+    assert "read_only_request" in decision.soft_reason_codes
+    assert "effectful_operation" not in decision.soft_reason_codes
+
+
 @pytest.mark.asyncio
 async def test_simple_information_request_stays_planless_without_advisor_call() -> None:
     advisor = _Advisor(
@@ -221,11 +239,56 @@ async def test_single_safe_edit_remains_planless_and_recheckable() -> None:
     assert decision.dynamic_recheck_after_iterations == 1
     assert gate.should_recheck(decision, completed_iterations=0) is False
     assert gate.should_recheck(decision, completed_iterations=1) is True
-    assert await gate.recheck(
+    rechecked = await gate.recheck(
         request,
         prior_decision=decision,
         completed_iterations=1,
-    ) == decision
+    )
+    assert rechecked is not None
+    assert rechecked.kind == "plan_required"
+    assert rechecked.advisor_used is False
+    assert "dynamic_iteration_threshold" in rechecked.soft_reason_codes
+
+
+@pytest.mark.asyncio
+async def test_dynamic_recheck_is_deterministic_and_never_reinvokes_grey_zone_advisor() -> None:
+    advisor = _Advisor(
+        raw_response={
+            "response_version": COMPLEXITY_ADVISOR_RESPONSE_VERSION,
+            "plan_recommended": False,
+            "estimated_distinct_actions": 1,
+            "dependency_count": 0,
+            "confidence": 0.8,
+            "reason_codes": ["single_safe_edit"],
+        }
+    )
+    gate = ComplexityGate(advisor=advisor)
+    request = ComplexityGateRequest(
+        turn_intent=_turn_contract(
+            turn_id="turn-dynamic-advisor",
+            deliverables=(_deliverable(),),
+        ),
+        task_relation="start",
+        capability_summary=ComplexityCapabilitySummary(effectful_tool_count=2),
+    )
+
+    initial = await gate.evaluate(request)
+    assert initial.kind == "no_plan"
+    assert len(advisor.requests) == 1
+
+    rechecked = await gate.recheck(
+        request,
+        prior_decision=initial,
+        completed_iterations=1,
+        signals=("third_distinct_tool", "read_to_effectful"),
+    )
+
+    assert rechecked is not None
+    assert rechecked.kind == "plan_required"
+    assert rechecked.advisor_used is False
+    assert len(advisor.requests) == 1
+    assert "dynamic_third_distinct_tool" in rechecked.soft_reason_codes
+    assert "dynamic_read_to_effectful" in rechecked.soft_reason_codes
 
 
 @pytest.mark.asyncio
@@ -307,6 +370,34 @@ async def test_side_question_and_cancel_preserve_but_do_not_advance_active_plan(
 
     assert side_decision.kind == "preserve_existing_plan"
     assert cancel_decision.kind == "preserve_existing_plan"
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_never_creates_a_dynamic_plan_decision() -> None:
+    gate = ComplexityGate()
+    request = ComplexityGateRequest(
+        turn_intent=_turn_contract(
+            turn_id="turn-cancel-dynamic",
+            objective="Stop the current task",
+            speech_act="cancel",
+            operations=frozenset({"conversation"}),
+            deliverables=(),
+        ),
+        task_relation="cancel",
+    )
+    prior = ComplexityGate().evaluate_deterministic(
+        ComplexityGateRequest(
+            turn_intent=_turn_contract(deliverables=(_deliverable(),)),
+            task_relation="start",
+        )
+    )
+
+    assert await gate.recheck(
+        request,
+        prior_decision=prior,
+        completed_iterations=1,
+        signals=("read_to_effectful",),
+    ) is None
 
 
 @pytest.mark.asyncio

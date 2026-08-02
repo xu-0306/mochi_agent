@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,17 +20,22 @@ from mochi.agents.events import (
     AgentEvent,
     FinalAnswerEvent,
     StatusEvent,
+    ToolCallResultEvent,
 )
 from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest
 from mochi.agents.plan_ledger import PLAN_LEDGER_VERSION, PlanItem, PlanLedger
 from mochi.agents.tool_exposure import ToolExposurePlan
 from mochi.agents.turn_intent_contract import DeliverableContract
+from mochi.backends.base import BackendRequestError
 from mochi.backends.types import (
     AttachmentRef,
+    GenerationResult,
     Message,
     ModelInfo,
+    ToolCall,
 )
 from mochi.config.schema import MochiConfig
+from mochi.learning.runtime import FailureAdvisoryHint
 from mochi.tools.base import ToolExecutionContext
 from mochi.tools.registry import ToolRegistry
 from mochi.tools.update_plan import UpdatePlanTool
@@ -60,6 +66,252 @@ def _resolver_factory(*operations: str):  # type: ignore[no-untyped-def]
     return lambda backend: ConversationResolver(
         interpreter=_OperationInterpreter(*operations)
     )
+
+
+def _unavailable_resolver_factory():  # type: ignore[no-untyped-def]
+    class _UnavailableInterpreter:
+        async def interpret(self, context: BoundedConversationContext) -> IntentInterpretation:
+            del context
+            raise BackendRequestError("interpreter unavailable")
+
+    return lambda backend: ConversationResolver(interpreter=_UnavailableInterpreter())
+
+
+async def _bind_fake_backend(engine: AgentEngine, backend: FakeBackend) -> None:
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = backend  # noqa: SLF001
+        return backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+
+
+class _FallbackActivationBackend(FakeBackend):
+    def __init__(self, *, activation_target: str, invoke_datetime: bool) -> None:
+        super().__init__()
+        self._activation_target = activation_target
+        self._invoke_datetime = invoke_datetime
+        self.schema_history: list[list[str]] = []
+
+    async def generate(  # type: ignore[override]
+        self,
+        messages: list[Message],
+        tools: list | None = None,
+        **kwargs: object,
+    ) -> GenerationResult:
+        self.calls.append(messages)
+        tool_names = [tool.name for tool in tools or []]
+        self.tool_calls_seen.append(tool_names)
+        self.schema_history.append(tool_names)
+        self.generation_kwargs.append(dict(kwargs))
+        call_number = len(self.calls)
+        if call_number == 1:
+            assert "tool_activate" in tool_names
+            assert "get_current_time" not in tool_names
+            return GenerationResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="activate-1",
+                        name="tool_activate",
+                        arguments={"tool_name": self._activation_target},
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if self._invoke_datetime and call_number == 2:
+            assert "get_current_time" in tool_names
+            return GenerationResult(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="datetime-1",
+                        name="get_current_time",
+                        arguments={"timezone": "UTC"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return GenerationResult(content="completed", finish_reason="stop")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "請回報現在的 UTC 時間。",
+        "Report the current UTC timestamp using an available read-only tool.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_interpreter_outage_safe_read_only_activation(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    backend = _FallbackActivationBackend(
+        activation_target="get_current_time",
+        invoke_datetime=True,
+    )
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config, conversation_resolver_factory=_unavailable_resolver_factory())
+    await _bind_fake_backend(engine, backend)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(message=message, persist_session=False)
+    )
+
+    adapter = result.diagnostics.tool_exposure["diagnostics"]["capability_exposure_adapter"]
+    allowed = set(adapter["activation_allowed_tool_names"])
+    direct = set(result.diagnostics.exposed_tools)
+    assert adapter["required_capabilities"] == ["tool_discovery"]
+    assert "tool_search" in direct
+    assert {"web_search", "get_current_time"} & allowed
+    assert not ({"web_search", "get_current_time"} & direct)
+    deferred = set(adapter["activation_broker"]["deferred_tool_names"])
+    assert deferred <= allowed
+    tool_results = [
+        event for event in result.events if isinstance(event, ToolCallResultEvent)
+    ]
+    assert [event.tool_name for event in tool_results] == [
+        "tool_activate",
+        "get_current_time",
+    ]
+    assert tool_results[0].error is None
+    assert tool_results[0].metadata["status"] == "tool_activated"
+    assert tool_results[1].error is None
+    assert tool_results[1].result["timezone"] == "UTC"
+    assert tool_results[1].result["iso"]
+    assert "get_current_time" not in backend.schema_history[0]
+    assert "get_current_time" in backend.schema_history[1]
+    assert result.content == "completed"
+    await engine.close()
+
+
+@pytest.mark.parametrize(
+    "unsafe_tool",
+    ["file_write", "exec_command", "update_plan", "tool_result_read"],
+)
+@pytest.mark.asyncio
+async def test_interpreter_outage_denies_unsafe_activation(
+    tmp_path: Path,
+    unsafe_tool: str,
+) -> None:
+    backend = _FallbackActivationBackend(
+        activation_target=unsafe_tool,
+        invoke_datetime=False,
+    )
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config, conversation_resolver_factory=_unavailable_resolver_factory())
+    await _bind_fake_backend(engine, backend)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(message="do the task", persist_session=False)
+    )
+
+    adapter = result.diagnostics.tool_exposure["diagnostics"]["capability_exposure_adapter"]
+    allowed = set(adapter["activation_allowed_tool_names"])
+    assert not allowed & {
+        "update_plan",
+        "file_write",
+        "exec_command",
+        "tool_result_read",
+    }
+    assert adapter["activation_broker"]["deferred_tool_names"]
+    tool_results = [
+        event for event in result.events if isinstance(event, ToolCallResultEvent)
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0].tool_name == "tool_activate"
+    assert tool_results[0].error is not None
+    assert tool_results[0].metadata["error_type"] == "tool_activation_denied"
+    assert tool_results[0].metadata["requested_tool"] == unsafe_tool
+    assert all(unsafe_tool not in schemas for schemas in backend.schema_history)
+    assert not any(
+        event.tool_name == unsafe_tool
+        for event in result.events
+        if isinstance(event, ToolCallResultEvent)
+    )
+    assert not (tmp_path / "denied-side-effect.txt").exists()
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_invoke_failure_hints_are_advisory_and_do_not_expand_tools(tmp_path: Path) -> None:
+    def config(enabled: bool) -> MochiConfig:
+        return MochiConfig.model_validate({
+            "model": "ollama:test", "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / ("on" if enabled else "off")),
+            "memory": {"db_path": str(tmp_path / ("on.db" if enabled else "off.db"))},
+            "agent": {"ordinary_chat_adaptive_runtime": {"failure_learning": {"hint_injection_enabled": enabled}}},
+        })
+    async def bind(engine: AgentEngine, backend: FakeBackend) -> None:
+        async def load(_: str) -> FakeBackend:
+            engine._router._active = backend  # noqa: SLF001
+            return backend
+        engine._router.load = load  # type: ignore[method-assign]
+
+    off_backend = FakeBackend()
+    off = AgentEngine(config(False), conversation_resolver_factory=_resolver_factory())
+    off.learning_runtime.advisory_hint_selections = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            FailureAdvisoryHint(
+                candidate_id="candidate-off",
+                text="SHOULD NOT APPEAR",
+            ),
+        )
+    )
+    await bind(off, off_backend)
+    await off.invoke(AgentInvocationRequest(message="hello", session_id="off", persist_session=False))
+    assert off.learning_runtime.advisory_hint_selections.await_count == 0
+    assert "SHOULD NOT APPEAR" not in str(off_backend.calls[0][0].content)
+
+    on_backend = FakeBackend()
+    on = AgentEngine(config(True), conversation_resolver_factory=_resolver_factory())
+    on.learning_runtime.advisory_hint_selections = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            FailureAdvisoryHint(
+                candidate_id="candidate-on",
+                text="bounded hint",
+            ),
+        )
+    )
+    on.learning_runtime.record_hint_selections = AsyncMock(  # type: ignore[method-assign]
+        return_value=1
+    )
+    await bind(on, on_backend)
+    await on.invoke(
+        AgentInvocationRequest(
+            message="hello",
+            session_id="on",
+            turn_id="turn-hint",
+            persist_session=True,
+        )
+    )
+    assert on.learning_runtime.advisory_hint_selections.await_count >= 1
+    on.learning_runtime.record_hint_selections.assert_awaited_once()
+    hint_attribution = (
+        on.learning_runtime.record_hint_selections.await_args.kwargs
+    )
+    assert hint_attribution["session_id"] == "on"
+    assert hint_attribution["turn_id"] == "turn-hint"
+    system = str(on_backend.calls[0][0].content)
+    assert "bounded hint" in system and "grant no tools or authority" in system
+    assert on_backend.tool_calls_seen[0] == off_backend.tool_calls_seen[0]
+    await off.close()
+    await on.close()
 
 
 def _plan_item(
@@ -142,6 +394,59 @@ async def test_engine_weather_prompt_exposes_only_web_subset_for_local_backend(
     assert {"web_search", "tool_search", "tool_activate"} <= set(exposed)
     assert "file_read" not in exposed
     assert len(exposed) <= 6
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_temporal_lookup_contract_allows_read_only_datetime_activation(
+    tmp_path: Path,
+) -> None:
+    fake_backend = FakeBackend()
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("temporal_lookup"),
+    )
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message="Use get_current_time to report the current time.",
+            session_id="read-only-datetime-exposure",
+            persist_session=False,
+        )
+    )
+
+    adapter = result.diagnostics.tool_exposure["diagnostics"][
+        "capability_exposure_adapter"
+    ]
+    assert "get_current_time" in adapter["activation_allowed_tool_names"]
+    rollout_stage = next(
+        stage
+        for stage in result.diagnostics.tool_exposure["diagnostics"]["stages"]
+        if stage.get("stage") == "turn_contract_rollout"
+    )
+    assert "get_current_time" in rollout_stage["capability_plan"]["eligible_tools"]
+    datetime_diagnostic = next(
+        diagnostic
+        for diagnostic in rollout_stage["capability_plan"]["tool_diagnostics"]
+        if diagnostic["tool_name"] == "get_current_time"
+    )
+    assert datetime_diagnostic["status"] == "exposed"
 
     await engine.close()
 
@@ -494,13 +799,17 @@ async def test_configure_plan_runtime_exposes_update_plan_for_active_chat_plan(
         idempotency_key="plan-update:seed",
     )
     assert saved.status == "saved"
+    async def _continue_existing_plan(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "kind": "continue_existing_plan",
+            "hard_reason_codes": ["multiple_deliverables"],
+        }
+
     monkeypatch.setattr(
         engine,
         "_resolve_complexity_decision",
-        lambda **kwargs: {  # noqa: ARG005
-            "kind": "continue_existing_plan",
-            "hard_reason_codes": ["multiple_deliverables"],
-        },
+        _continue_existing_plan,
     )
     tool_execution_context = ToolExecutionContext(session_id="plan-session")
     exposure_plan = ToolExposurePlan(
@@ -580,13 +889,17 @@ async def test_configure_plan_runtime_keeps_update_plan_hidden_when_chat_plan_ru
         }
     )
     engine = AgentEngine(config)
+    async def _plan_required(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "kind": "plan_required",
+            "hard_reason_codes": ["multiple_deliverables"],
+        }
+
     monkeypatch.setattr(
         engine,
         "_resolve_complexity_decision",
-        lambda **kwargs: {  # noqa: ARG005
-            "kind": "plan_required",
-            "hard_reason_codes": ["multiple_deliverables"],
-        },
+        _plan_required,
     )
     tool_execution_context = ToolExecutionContext(session_id="plan-session")
     exposure_plan = ToolExposurePlan(
@@ -644,7 +957,7 @@ async def test_engine_invoke_exposes_diagnostics_and_honors_disabled_tool_mode(
     )
     engine = AgentEngine(
         config,
-        conversation_resolver_factory=_resolver_factory("workspace_read"),
+        conversation_resolver_factory=_resolver_factory(),
     )
 
     async def fake_load(model_spec: str) -> FakeBackend:
@@ -992,7 +1305,10 @@ async def test_engine_invocation_tool_overrides_are_limited_by_profile(
             "security": {"autonomy_mode": "auto_review"},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("workspace_read"),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -1176,7 +1492,10 @@ async def test_engine_invocation_max_iterations_override_reaches_react_loop(
             "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory(),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -1339,7 +1658,10 @@ async def test_engine_uses_higher_default_max_iterations_for_local_backends(
             "agent": {"max_react_iterations": 10},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory(),
+    )
 
     async def fake_load(model_spec: str) -> FakeBackend:
         engine._router._active = fake_backend  # noqa: SLF001
@@ -1360,6 +1682,96 @@ async def test_engine_uses_higher_default_max_iterations_for_local_backends(
 
     assert result.content == "spy reply"
     assert seen_iterations == [15]
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_keeps_contract_rollout_when_preflight_overflow_is_unreliable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_backend = FakeBackend()
+    activation_policies: list[dict[str, object]] = []
+
+    class SpyReActLoop:
+        def __init__(
+            self,
+            *args: object,
+            tool_execution_context: ToolExecutionContext,
+            **kwargs: object,
+        ) -> None:
+            del args, kwargs
+            activation_policies.append(
+                dict(tool_execution_context.state["tool_activation_policy"])
+            )
+
+        async def run(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> AsyncIterator[AgentEvent]:
+            del args, kwargs
+            yield FinalAnswerEvent(content="spy reply")
+
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db"), "fts_top_k": 3},
+        }
+    )
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=_resolver_factory("execution"),
+    )
+
+    async def fake_load(model_spec: str) -> FakeBackend:
+        del model_spec
+        engine._router._active = fake_backend  # noqa: SLF001
+        return fake_backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
+    original_estimate_prompt_budget = engine._estimate_prompt_budget  # noqa: SLF001
+
+    def unreliable_preflight_budget(**kwargs: object) -> dict[str, object]:
+        budget = original_estimate_prompt_budget(**kwargs)  # type: ignore[arg-type]
+        if kwargs.get("tool_schemas") == []:
+            return {
+                **budget,
+                "hard_gate_enabled": False,
+                "hard_overflow": True,
+                "overflow": True,
+            }
+        return budget
+
+    monkeypatch.setattr(
+        engine,
+        "_estimate_prompt_budget",
+        unreliable_preflight_budget,
+    )
+    monkeypatch.setattr(engine_module, "AsyncReActLoop", SpyReActLoop)
+
+    result = await engine.invoke(
+        AgentInvocationRequest(
+            message="Run one read-only execution tool.",
+            session_id="unreliable-preflight-overflow",
+            persist_session=False,
+        )
+    )
+
+    adapter = result.diagnostics.tool_exposure["diagnostics"][
+        "capability_exposure_adapter"
+    ]
+    assert adapter["applied"] is True
+    assert "exec_command" in adapter["activation_allowed_tool_names"]
+    assert result.diagnostics.tool_exposure["diagnostics"]["tool_mode"] == "auto"
+    assert len(activation_policies) == 1
+    activation_policy = activation_policies[0]
+    assert activation_policy["tool_mode"] == "auto"
+    assert activation_policy["capability_enforcement_mode"] == "enforce"
+    assert "exec_command" in activation_policy["activation_allowed_tool_names"]
 
     await engine.close()
 

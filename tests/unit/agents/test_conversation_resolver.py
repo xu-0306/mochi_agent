@@ -18,6 +18,7 @@ from mochi.agents.turn_intent_contract import (
     ResolvedReference,
     TurnIntentContract,
 )
+from mochi.backends.base import BackendRequestError
 
 
 class _Interpreter:
@@ -151,6 +152,7 @@ async def test_side_question_preserves_active_task_without_inheriting_its_delive
     assert result.contract.deliverables == ()
     assert result.contract.modifies_active_task is False
     assert result.next_active_task is active
+    assert result.resolution_source == "interpreter"
 
 
 @pytest.mark.asyncio
@@ -265,22 +267,22 @@ async def test_supersession_replaces_inherited_operations_and_deliverables() -> 
 
 
 @pytest.mark.asyncio
-async def test_missing_interpreter_fails_closed_with_bounded_clarification() -> None:
+async def test_missing_interpreter_fails_open_to_a_safe_conversation_contract() -> None:
     active = _active_task()
     result = await ConversationResolver().resolve(
         current_turn=ConversationTurn("turn-now", "user", "ambiguous"),
         active_task=active,
     )
 
-    assert result.contract.clarification_needed is True
-    assert result.contract.mutation_requirement == "unknown"
-    assert result.contract.operations == frozenset()
+    assert result.contract.clarification_needed is False
+    assert result.contract.mutation_requirement == "forbidden"
+    assert result.contract.operations == frozenset({"conversation", "tool_discovery"})
     assert result.contract.modifies_active_task is False
     assert result.next_active_task is active
 
 
 @pytest.mark.asyncio
-async def test_invalid_or_fabricated_interpreter_evidence_fails_closed() -> None:
+async def test_invalid_or_fabricated_interpreter_evidence_falls_back_without_mutation() -> None:
     resolver = ConversationResolver(
         interpreter=_Interpreter(
             IntentInterpretation(
@@ -301,12 +303,14 @@ async def test_invalid_or_fabricated_interpreter_evidence_fails_closed() -> None
     )
 
     assert result.diagnostics["interpreter_status"] == "rejected"
-    assert result.contract.operations == frozenset()
-    assert result.contract.clarification is not None
+    assert result.contract.operations == frozenset({"conversation", "tool_discovery"})
+    assert result.contract.mutation_requirement == "forbidden"
+    assert result.contract.clarification is None
+    assert result.resolution_source == "fallback"
 
 
 @pytest.mark.asyncio
-async def test_invalid_interpreter_contract_fields_fail_closed() -> None:
+async def test_invalid_interpreter_contract_fields_fall_back_without_mutation() -> None:
     interpretation = IntentInterpretation(
         current_speech_act="request_execution",
         task_relation="standalone",
@@ -320,8 +324,99 @@ async def test_invalid_interpreter_contract_fields_fail_closed() -> None:
     )
 
     assert result.diagnostics["interpreter_status"] == "rejected"
-    assert result.contract.clarification_needed is True
-    assert result.contract.operations == frozenset()
+    assert result.contract.clarification_needed is False
+    assert result.contract.operations == frozenset({"conversation", "tool_discovery"})
+
+
+@pytest.mark.asyncio
+async def test_backend_interpreter_failure_falls_open_without_mutation() -> None:
+    class _UnavailableInterpreter:
+        async def interpret(self, context):  # type: ignore[no-untyped-def]
+            del context
+            raise BackendRequestError("provider unavailable", metadata={"status_code": 503})
+
+    result = await ConversationResolver(interpreter=_UnavailableInterpreter()).resolve(
+        current_turn=ConversationTurn("turn-now", "user", "你好"),
+    )
+
+    assert result.diagnostics["interpreter_status"] == "unavailable"
+    assert result.contract.operations == frozenset({"conversation", "tool_discovery"})
+    assert result.contract.mutation_requirement == "forbidden"
+    assert result.resolution_source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_empty_task_shape_normalizes_to_language_agnostic_conversation() -> None:
+    result = await ConversationResolver(
+        interpreter=_Interpreter(
+            IntentInterpretation(
+                current_speech_act="unknown",
+                task_relation="start",
+                confidence=0.6,
+            )
+        )
+    ).resolve(current_turn=ConversationTurn("turn-now", "user", "hola"))
+
+    assert result.diagnostics["interpreter_status"] == "accepted"
+    assert result.contract.current_speech_act == "request_information"
+    assert result.contract.operations == frozenset({"conversation"})
+    assert result.contract.mutation_requirement == "forbidden"
+
+
+@pytest.mark.asyncio
+async def test_accepted_interpretation_sets_resolution_source_to_interpreter() -> None:
+    result = await ConversationResolver(
+        interpreter=_Interpreter(
+            IntentInterpretation(
+                current_speech_act="request_information",
+                task_relation="standalone",
+                operations=frozenset({"conversation"}),
+                mutation_requirement="forbidden",
+                confidence=0.9,
+            )
+        )
+    ).resolve(current_turn=ConversationTurn("turn-now", "user", "question"))
+
+    assert result.resolution_source == "interpreter"
+
+
+@pytest.mark.asyncio
+async def test_resolution_source_is_fallback_when_interpreter_is_absent() -> None:
+    result = await ConversationResolver().resolve(
+        current_turn=ConversationTurn("turn-now", "user", "question")
+    )
+
+    assert result.resolution_source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_resolution_source_is_fallback_when_interpreter_rejects() -> None:
+    result = await ConversationResolver(
+        interpreter=_Interpreter(
+            IntentInterpretation(
+                current_speech_act="request_execution",
+                task_relation="standalone",
+                operations=frozenset({"unsupported_operation"}),  # type: ignore[arg-type]
+                confidence=0.9,
+            )
+        )
+    ).resolve(current_turn=ConversationTurn("turn-now", "user", "question"))
+
+    assert result.resolution_source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_resolution_source_is_fallback_when_interpreter_is_unavailable() -> None:
+    class _UnavailableInterpreter:
+        async def interpret(self, context):  # type: ignore[no-untyped-def]
+            del context
+            raise BackendRequestError("unavailable")
+
+    result = await ConversationResolver(interpreter=_UnavailableInterpreter()).resolve(
+        current_turn=ConversationTurn("turn-now", "user", "question")
+    )
+
+    assert result.resolution_source == "fallback"
 
 
 @pytest.mark.asyncio

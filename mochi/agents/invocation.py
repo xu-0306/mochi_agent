@@ -36,6 +36,7 @@ class AgentInvocationRequest:
     permission_policy: dict[str, Any] | None = None
     selected_skill_ids: list[str] | None = None
     attachments: list[AttachmentRef] | None = None
+    client_timezone: str | None = None
     backend_override: BaseLLMBackend | None = None
     tool_mode: ToolMode = "auto"
     execution_profile: ExecutionProfile = "chat"
@@ -47,6 +48,9 @@ class AgentInvocationRequest:
     persist_session: bool = True
     persist_turn_events: bool | None = None
     persist_learning: bool | None = None
+    # External qualification must use the production Engine without inheriting
+    # a user's history, durable memory, or skill suggestions.
+    isolate_context: bool = False
     turn_id: str | None = None
     active_tool_controller: ActiveToolController | None = None
     cancellation_context: RunCancellationContext | None = None

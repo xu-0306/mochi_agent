@@ -40,6 +40,7 @@ async def test_apply_config_rebinds_owned_outbox_sources_and_preserves_injected_
     engine = AgentEngine(config)
     original_state = engine._conversation_state_repository  # noqa: SLF001
     original_checkpoint = engine._turn_checkpoint_repository  # noqa: SLF001
+    original_learning = engine.learning_runtime
 
     await engine.apply_config(config.model_copy(deep=True))
 
@@ -49,6 +50,9 @@ async def test_apply_config_rebinds_owned_outbox_sources_and_preserves_injected_
     assert engine._turn_checkpoint_repository is not original_checkpoint  # noqa: SLF001
     assert engine._conversation_state_repository._session_store is engine._session_store  # noqa: SLF001
     assert engine._turn_checkpoint_repository._session_store is engine._session_store  # noqa: SLF001
+    assert engine.learning_runtime is not original_learning
+    assert engine.learning_runtime._outbox._session_store is engine._session_store  # noqa: SLF001
+    assert engine.learning_runtime._store._session_store is engine._session_store  # noqa: SLF001
 
     timeline = SessionTurnTimelineRepository(engine._session_store)  # noqa: SLF001
     snapshot = await engine._session_store.load_strict_snapshot("enabled-session")  # noqa: SLF001
@@ -77,6 +81,7 @@ async def test_apply_config_rebinds_owned_outbox_sources_and_preserves_injected_
         )
     ).status == "admitted"
     assert await engine._tool_workflow_outbox.list("disabled-session") == ()  # noqa: SLF001
+    assert engine.learning_runtime.enabled is True
 
     injected_state = object()
     injected_checkpoint = object()
@@ -88,6 +93,8 @@ async def test_apply_config_rebinds_owned_outbox_sources_and_preserves_injected_
     await injected_engine.apply_config(disabled)
     assert injected_engine._conversation_state_repository is injected_state  # noqa: SLF001
     assert injected_engine._turn_checkpoint_repository is injected_checkpoint  # noqa: SLF001
+    await engine.close()
+    await injected_engine.close()
 
 
 def test_engine_get_model_info_before_initialize_prefers_ollama_model_spec(

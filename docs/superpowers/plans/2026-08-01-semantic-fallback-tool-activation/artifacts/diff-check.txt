@@ -1,0 +1,4 @@
+command: rtk git diff --check
+exit_code: 0
+observed: no whitespace errors.
+

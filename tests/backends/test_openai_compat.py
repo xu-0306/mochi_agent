@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -11,6 +12,190 @@ from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.types import Message, ToolCall, ToolSchema
 
 from ._support import _httpx_json_response, _mock_response
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_gpt54_omits_unsupported_minimal_reasoning_effort() -> None:
+    backend = OpenAICompatBackend(
+        base_url="https://example.test/v1",
+        model="gpt-5.4",
+        provider="openai_compat",
+    )
+    response = _mock_response(
+        {
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "{}"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+        }
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as post:
+            await backend.generate(
+                messages=[Message(role="user", content="Return JSON.")],
+                reasoning_effort="minimal",
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    assert post.await_args.args[0] == "https://example.test/v1/chat/completions"
+    payload = post.await_args.kwargs["json"]
+    assert "reasoning_effort" not in payload
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_discovers_efforts_once_and_serializes_chat_effort() -> None:
+    backend = OpenAICompatBackend("https://example.test/v1", "proxy-model")
+    response = _mock_response(
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    models = _mock_response(
+        {
+            "data": [
+                {
+                    "id": "proxy-model",
+                    "capabilities": {"effort": {"supported": ["low", "max"]}},
+                }
+            ]
+        }
+    )
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock, return_value=models) as get, patch.object(
+            backend._client, "post", new_callable=AsyncMock, return_value=response
+        ) as post:
+            await backend.generate([Message(role="user", content="one")], reasoning_effort="max")
+            await backend.generate([Message(role="user", content="two")], reasoning_effort="max")
+    finally:
+        await backend.close()
+
+    assert get.await_count == 1
+    assert post.await_args.kwargs["json"]["reasoning_effort"] == "max"
+    metadata = backend.get_model_info().metadata
+    assert metadata["capability_source"] == "endpoint_metadata"
+    assert metadata["capability_status"] == "resolved"
+    assert metadata["supported_reasoning_efforts"] == ["low", "max"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_standard_models_payload_is_unavailable_then_uses_registry() -> None:
+    backend = OpenAICompatBackend("https://example.test/v1", "gpt-5.4")
+    models = _mock_response(
+        {"data": [{"id": "gpt-5.4", "object": "model", "owned_by": "openai"}]}
+    )
+    response = _mock_response(
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock, return_value=models), patch.object(
+            backend._client, "post", new_callable=AsyncMock, return_value=response
+        ):
+            await backend.generate([Message(role="user", content="one")], reasoning_effort="xhigh")
+    finally:
+        await backend.close()
+
+    metadata = backend.get_model_info().metadata
+    assert metadata["capability_source"] == "registry"
+    assert metadata["capability_status"] == "unavailable"
+    assert metadata["supported_reasoning_efforts"][-1] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_concurrent_generate_discovers_once() -> None:
+    backend = OpenAICompatBackend("https://example.test/v1", "proxy-model")
+    models = _mock_response(
+        {"data": [{"id": "proxy-model", "capabilities": {"effort": {"low": True}}}]}
+    )
+    response = _mock_response(
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+
+    async def delayed_models(*args: object, **kwargs: object) -> httpx.Response:
+        del args, kwargs
+        await asyncio.sleep(0)
+        return models
+
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock, side_effect=delayed_models) as get, patch.object(
+            backend._client, "post", new_callable=AsyncMock, return_value=response
+        ):
+            await asyncio.gather(
+                backend.generate([Message(role="user", content="one")]),
+                backend.generate([Message(role="user", content="two")]),
+            )
+    finally:
+        await backend.close()
+
+    assert get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_discovery_failure_fails_open_without_effort() -> None:
+    backend = OpenAICompatBackend("https://example.test/v1", "unknown-model")
+    response = _mock_response(
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock, side_effect=httpx.ReadTimeout("slow")), patch.object(
+            backend._client, "post", new_callable=AsyncMock, return_value=response
+        ) as post:
+            await backend.generate([Message(role="user", content="one")], reasoning_effort="minimal")
+    finally:
+        await backend.close()
+
+    assert "reasoning_effort" not in post.await_args.kwargs["json"]
+    assert backend.get_model_info().metadata["capability_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_responses_serializes_only_discovered_effort() -> None:
+    backend = OpenAICompatBackend("https://example.test/v1/responses", "proxy-model")
+    models = _mock_response(
+        {"data": [{"id": "proxy-model", "capabilities": {"effort": {"supported": ["max"]}}}]}
+    )
+    response = _mock_response({"output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]})
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock, return_value=models), patch.object(
+            backend._client, "post", new_callable=AsyncMock, return_value=response
+        ) as post:
+            await backend.generate([Message(role="user", content="one")], reasoning_effort="max")
+    finally:
+        await backend.close()
+
+    assert post.await_args.kwargs["json"]["reasoning"]["effort"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_configured_capability_metadata_overrides_discovery() -> None:
+    backend = OpenAICompatBackend(
+        "https://example.test/v1",
+        "proxy-model",
+        capability_metadata={"capabilities": {"effort": {"supported": ["max"]}}},
+    )
+    response = _mock_response(
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock) as get, patch.object(
+            backend._client, "post", new_callable=AsyncMock, return_value=response
+        ) as post:
+            await backend.generate([Message(role="user", content="one")], reasoning_effort="max")
+    finally:
+        await backend.close()
+
+    assert get.await_count == 0
+    assert post.await_args.kwargs["json"]["reasoning_effort"] == "max"
+    assert backend.get_model_info().metadata["capability_source"] == "configured_override"
 
 
 @pytest.mark.asyncio

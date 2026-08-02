@@ -12,7 +12,7 @@ from pydantic import SecretStr
 from mochi.auth.models import OpenAICodexAuthProfile
 from mochi.backends.base import BackendRequestError
 from mochi.backends.openai_codex import OpenAICodexBackend
-from mochi.backends.types import Message
+from mochi.backends.types import Message, ResponsesReplayState
 
 
 def _mock_response(data: dict) -> MagicMock:
@@ -46,6 +46,51 @@ class _MockStreamContext:
     async def aiter_lines(self) -> AsyncIterator[str]:
         for line in self._lines:
             yield line
+
+
+@pytest.mark.asyncio
+async def test_codex_backend_explicitly_uses_response_id_continuity() -> None:
+    backend = OpenAICodexBackend(
+        base_url="https://adapter-specific.invalid/backend-api",
+        model="any-adapter-model",
+        access_token="test-token",
+    )
+
+    try:
+        input_state = backend._build_responses_input(  # noqa: SLF001
+            [
+                Message(role="user", content="Find Mochi"),
+                Message(
+                    role="assistant",
+                    content="",
+                    responses_replay=ResponsesReplayState(
+                        response_id="resp_native",
+                        assistant_output_items=[
+                            {
+                                "type": "function_call",
+                                "call_id": "call-native",
+                                "name": "web_search",
+                                "arguments": '{"query":"Mochi"}',
+                            }
+                        ],
+                    ),
+                ),
+                Message(
+                    role="tool",
+                    content='{"ok": true}',
+                    tool_call_id="call-native",
+                    name="web_search",
+                ),
+            ]
+        )
+    finally:
+        await backend.close()
+
+    assert input_state.previous_response_id == "resp_native"
+    assert input_state.continuity_mode == "previous_response_id"
+    assert input_state.input_items == [
+        {"type": "function_call_output", "call_id": "call-native", "output": '{"ok": true}'}
+    ]
 
 
 @pytest.mark.asyncio

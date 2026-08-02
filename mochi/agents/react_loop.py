@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
+from pathlib import Path
 import re
 import time
-from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any, Mapping, cast
+from collections.abc import AsyncIterator, Mapping
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -31,9 +34,15 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.agents.adaptive_diagnostics import (
+    AdaptiveDiagnosticsAccumulator,
+    DIAGNOSTICS_CONTEXT_TURN_KEY,
+    get_context_diagnostics_accumulator,
+)
+from mochi.agents.context_snapshot import estimate_backend_text_tokens
 from mochi.backends.base import BackendRequestError
 from mochi.backends.tool_call_parsers import parse_tool_calls, strip_tool_call_blocks
-from mochi.backends.types import Message, StreamChunk, ToolCall
+from mochi.backends.types import GenerationResult, Message, StreamChunk, ToolCall
 from mochi.tools.base import ToolResult
 from mochi.tools.transport_guard import ToolResultTransportGuard
 
@@ -109,7 +118,10 @@ def _find_partial_tag_suffix(source: str, candidates: tuple[str, ...]) -> str:
     max_size = min(len(source), max(len(candidate) - 1 for candidate in candidates))
     for size in range(max_size, 0, -1):
         suffix = lowered[-size:]
-        if any(candidate.startswith(suffix) and candidate != suffix for candidate in candidates):
+        if any(
+            candidate.startswith(suffix) and candidate != suffix
+            for candidate in candidates
+        ):
             return source[-size:]
     return ""
 
@@ -137,6 +149,99 @@ class AsyncReActLoop:
         self._turn_messages: list[Message] = []
         self._requires_file_mutation = bool(requires_file_mutation)
 
+    def _diagnostics_accumulator(
+        self,
+        *,
+        reset: bool = False,
+    ) -> AdaptiveDiagnosticsAccumulator | None:
+        return get_context_diagnostics_accumulator(
+            self._tool_execution_context,
+            reset=reset,
+        )
+
+    def _reset_diagnostics_for_new_run(self) -> None:
+        context = self._tool_execution_context
+        state = getattr(context, "state", None)
+        # A recovery context is an in-turn fork.  Its copied state already
+        # contains the first-pass accumulator and must not be reset.
+        recovery_continuation = isinstance(state, dict) and isinstance(
+            state.get("controlled_recovery_budget_runtime"),
+            dict,
+        )
+        turn_is_marked = isinstance(state, dict) and isinstance(
+            state.get(DIAGNOSTICS_CONTEXT_TURN_KEY),
+            str,
+        )
+        self._diagnostics_accumulator(
+            reset=not recovery_continuation and not turn_is_marked,
+        )
+
+    @staticmethod
+    def _diagnostic_measurement(value: Any) -> int:
+        """Accept only safe counter inputs; diagnostics must never break Chat."""
+        if type(value) is not int or value < 0:
+            return 0
+        return min(value, 1_000_000)
+
+    def _record_model_attempt(self, *, started_at: float, result: Any) -> None:
+        accumulator = self._diagnostics_accumulator()
+        if accumulator is None:
+            return
+        try:
+            accumulator.add_model_call(
+                input_tokens=self._diagnostic_measurement(
+                    getattr(result, "input_tokens", 0)
+                ),
+                output_tokens=self._diagnostic_measurement(
+                    getattr(result, "output_tokens", 0)
+                ),
+                wall_ms=self._diagnostic_measurement(
+                    int(max(0.0, time.perf_counter() - started_at) * 1000)
+                ),
+                usage_observed=(
+                    isinstance(result, GenerationResult)
+                    and (
+                        bool(getattr(result, "usage_observed", False))
+                        or result.input_tokens > 0
+                        or result.output_tokens > 0
+                    )
+                ),
+                wall_observed=True,
+                recovery=isinstance(
+                    getattr(self._tool_execution_context, "state", None), dict
+                )
+                and isinstance(
+                    self._tool_execution_context.state.get(
+                        "controlled_recovery_budget_runtime"
+                    ),
+                    dict,
+                ),
+            )
+        except Exception:
+            logger.debug("Unable to record adaptive model diagnostics")
+
+    def _record_tool_attempt(self, *, started_at: float) -> None:
+        accumulator = self._diagnostics_accumulator()
+        if accumulator is None:
+            return
+        try:
+            accumulator.add_tool_call(
+                wall_ms=self._diagnostic_measurement(
+                    int(max(0.0, time.perf_counter() - started_at) * 1000)
+                ),
+                recovery=isinstance(
+                    getattr(self._tool_execution_context, "state", None), dict
+                )
+                and isinstance(
+                    self._tool_execution_context.state.get(
+                        "controlled_recovery_budget_runtime"
+                    ),
+                    dict,
+                ),
+            )
+        except Exception:
+            logger.debug("Unable to record adaptive tool diagnostics")
+
     async def run(
         self,
         system_prompt: str,
@@ -152,10 +257,19 @@ class AsyncReActLoop:
         repeat_penalty: float = 1.0,
         reasoning_effort: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
+        # AgentEngine caches ToolExecutionContext by session/workspace.  Until
+        # finalization supplies a trusted turn marker, each new ``run`` starts
+        # a fresh accumulator; recovery and approval continuation paths retain
+        # their existing accumulator instead.
+        self._reset_diagnostics_for_new_run()
         messages: list[Message] = [
             Message(role="system", content=system_prompt),
             *history,
-            Message(role="user", content=user_message),
+            Message(
+                role="user",
+                content=user_message,
+                native_tool_protocol_active=True,
+            ),
         ]
         self._turn_messages = []
         tools = self._collect_tool_schemas()
@@ -185,13 +299,19 @@ class AsyncReActLoop:
         """Continue the interrupted ReAct turn after its exact tool result is available."""
         continuation = checkpoint.get("react_continuation")
         if not isinstance(continuation, Mapping):
-            raise ValueError("Ordinary-Chat approval is missing its ReAct continuation checkpoint.")
+            raise ValueError(
+                "Ordinary-Chat approval is missing its ReAct continuation checkpoint."
+            )
         messages = self._messages_from_ordinary_chat_checkpoint(continuation)
         cursor = checkpoint.get("resume_cursor")
         if not isinstance(cursor, Mapping):
-            raise ValueError("Ordinary-Chat approval is missing its ReAct resume cursor.")
+            raise ValueError(
+                "Ordinary-Chat approval is missing its ReAct resume cursor."
+            )
         tool_call_id = str(cursor.get("tool_call_id") or "").strip()
-        tool_name = str(cursor.get("tool_name") or checkpoint.get("tool_name") or "").strip()
+        tool_name = str(
+            cursor.get("tool_name") or checkpoint.get("tool_name") or ""
+        ).strip()
         if not tool_call_id or not tool_name:
             raise ValueError("Ordinary-Chat approval resume cursor is invalid.")
 
@@ -206,11 +326,18 @@ class AsyncReActLoop:
             None,
         )
         if tool_call is None:
-            raise ValueError("Ordinary-Chat approval cursor does not match its original tool call.")
+            raise ValueError(
+                "Ordinary-Chat approval cursor does not match its original tool call."
+            )
 
         expected_tool_names = continuation.get("callable_tool_names")
-        if not isinstance(expected_tool_names, list) or tool_name not in expected_tool_names:
-            raise ValueError("Ordinary-Chat approval checkpoint does not authorize its original tool.")
+        if (
+            not isinstance(expected_tool_names, list)
+            or tool_name not in expected_tool_names
+        ):
+            raise ValueError(
+                "Ordinary-Chat approval checkpoint does not authorize its original tool."
+            )
         tools = self._collect_tool_schemas()
         available_tool_names = {tool.name for tool in tools}
         missing_tools = {
@@ -219,10 +346,14 @@ class AsyncReActLoop:
             if isinstance(name, str) and name and name not in available_tool_names
         }
         if missing_tools:
-            raise ValueError("Ordinary-Chat approval continuation tools are no longer available.")
+            raise ValueError(
+                "Ordinary-Chat approval continuation tools are no longer available."
+            )
 
         if self._tool_registry is None:
-            raise ValueError("Ordinary-Chat approval continuation has no tool registry.")
+            raise ValueError(
+                "Ordinary-Chat approval continuation has no tool registry."
+            )
         tool_definition = self._tool_registry.get(tool_name)
         formatted_content = (
             tool_definition.format_result_for_model(
@@ -242,9 +373,7 @@ class AsyncReActLoop:
             formatted_content=formatted_content,
         )
         metadata = (
-            dict(tool_result.metadata)
-            if isinstance(tool_result.metadata, dict)
-            else {}
+            dict(tool_result.metadata) if isinstance(tool_result.metadata, dict) else {}
         )
         metadata.update(
             {
@@ -280,7 +409,9 @@ class AsyncReActLoop:
 
         generation = continuation.get("generation")
         if not isinstance(generation, Mapping):
-            raise ValueError("Ordinary-Chat approval checkpoint is missing generation settings.")
+            raise ValueError(
+                "Ordinary-Chat approval checkpoint is missing generation settings."
+            )
         async for event in self._run_nonstream(
             messages,
             tools,
@@ -306,8 +437,7 @@ class AsyncReActLoop:
             initial_file_mutation_satisfied=(
                 bool(continuation.get("file_mutation_satisfied"))
                 or (
-                    self._is_file_mutation_tool(tool_name)
-                    and tool_result.error is None
+                    self._is_file_mutation_tool(tool_name) and tool_result.error is None
                 )
             ),
         ):
@@ -330,6 +460,37 @@ class AsyncReActLoop:
             )
             for schema in self._tool_registry.get_schemas()
         ]
+
+    def _tool_schema_diagnostics(self, tools: list[ToolSchema]) -> tuple[int, int]:
+        count = min(len(tools), 1_000_000)
+        try:
+            payload = json.dumps(
+                [tool.to_dict() for tool in tools], ensure_ascii=False, sort_keys=True
+            )
+            estimate = estimate_backend_text_tokens(
+                payload,
+                backend=self._backend,
+                model_info=self._backend.get_model_info(),
+            )
+            return count, self._diagnostic_measurement(estimate.tokens)
+        except Exception:
+            return count, 0
+
+    @staticmethod
+    def _is_new_callable_schema(
+        *,
+        requested_tool: object,
+        before_names: set[str],
+        after_names: set[str],
+    ) -> bool:
+        if not isinstance(requested_tool, str):
+            return False
+        normalized_name = requested_tool.strip()
+        return bool(
+            normalized_name
+            and normalized_name not in before_names
+            and normalized_name in after_names
+        )
 
     def _recovery_budget_runtime(self) -> dict[str, Any] | None:
         context = self._tool_execution_context
@@ -385,6 +546,75 @@ class AsyncReActLoop:
             )
         runtime["tool_calls_used"] = used + 1
         return None
+
+    def _recovery_scope_tool_result(
+        self, tool_call: ToolCall, tool_definition: Any | None = None
+    ) -> ToolResult | None:
+        """Host-enforce corrective file targets before registry execution."""
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return None
+        allowed = context.state.get("controlled_recovery_allowed_targets")
+        if not isinstance(allowed, (list, tuple, set)):
+            return None
+        # Read-only tools have no effect boundary to scope. Every unknown or
+        # effectful tool fails closed unless it is a target-bearing file tool.
+        if bool(getattr(tool_definition, "is_read_only", False)):
+            return None
+        # Keep this classifier aligned with the normal file-artifact guard,
+        # which is itself aligned with the registry's mutation tool set.
+        if not self._is_file_mutation_tool(tool_call.name):
+            return self._recovery_scope_blocker(tool_call)
+        # apply_patch carries a free-form diff; it has no trustworthy
+        # canonical target contract, so scoped recovery fails closed.
+        if tool_call.name == "apply_patch":
+            return self._recovery_scope_blocker(tool_call)
+        raw_targets = [tool_call.arguments.get(key) for key in ("path", "file_path")]
+        targets = [
+            target
+            for target in raw_targets
+            if isinstance(target, str) and target.strip()
+        ]
+        if len(targets) != 1:
+            return self._recovery_scope_blocker(tool_call)
+        workspace = context.workspace_dir or context.project_workspace
+        target = Path(targets[0])
+        if not target.is_absolute() and workspace:
+            target = Path(workspace) / target
+        try:
+            canonical_target = target.resolve(strict=False)
+            canonical_allowed = {
+                os.path.normcase(
+                    str(
+                        (
+                            Path(item)
+                            if Path(item).is_absolute() or not workspace
+                            else Path(workspace) / item
+                        ).resolve(strict=False)
+                    )
+                )
+                for item in allowed
+                if isinstance(item, str) and item.strip()
+            }
+        except (OSError, ValueError):
+            return self._recovery_scope_blocker(tool_call)
+        if os.path.normcase(str(canonical_target)) not in canonical_allowed:
+            return self._recovery_scope_blocker(tool_call)
+        return None
+
+    @staticmethod
+    def _recovery_scope_blocker(tool_call: ToolCall) -> ToolResult:
+        return ToolResult(
+            error="The bounded corrective pass cannot modify a target outside its verified recovery scope.",
+            metadata={
+                "runtime_category": "controlled_recovery",
+                "error_type": "controlled_recovery_scope_violation",
+                "recoverability": "blocked",
+                "tool_name": tool_call.name,
+            },
+            retryable=False,
+            suggestion="Stop the corrective pass and report the recovery scope blocker.",
+        )
 
     @staticmethod
     def _recovery_budget_tool_result(tool_call: ToolCall, reason: str) -> ToolResult:
@@ -497,12 +727,15 @@ class AsyncReActLoop:
                         },
                     )
                     return
-                progress_event = self._build_iteration_progress_event(iteration=iteration + 1)
+                progress_event = self._build_iteration_progress_event(
+                    iteration=iteration + 1
+                )
                 if progress_event is not None:
                     yield progress_event
 
                 started_at = time.perf_counter()
                 iteration_tools = [] if force_plain_answer_without_tools else tools
+                result: Any = None
                 try:
                     streamed_generation = False
                     held_stream_text = ""
@@ -541,13 +774,17 @@ class AsyncReActLoop:
                             streamed_tool_calls: dict[str, ToolCall] = {}
                             streamed_finish_reason = "stop"
 
-                            async for chunk in cast(AsyncIterator[StreamChunk], stream_result):
+                            async for chunk in cast(
+                                AsyncIterator[StreamChunk], stream_result
+                            ):
                                 if chunk.thinking_delta:
                                     thinking_parts.append(chunk.thinking_delta)
                                 if chunk.delta:
-                                    visible_delta, thinking_delta = self._split_stream_thinking_delta(
-                                        chunk.delta,
-                                        think_filter_state,
+                                    visible_delta, thinking_delta = (
+                                        self._split_stream_thinking_delta(
+                                            chunk.delta,
+                                            think_filter_state,
+                                        )
                                     )
                                     if thinking_delta:
                                         thinking_parts.append(thinking_delta)
@@ -565,8 +802,10 @@ class AsyncReActLoop:
                                 if chunk.finish_reason:
                                     streamed_finish_reason = chunk.finish_reason
 
-                            visible_tail, thinking_tail = self._finalize_stream_thinking_delta(
-                                think_filter_state,
+                            visible_tail, thinking_tail = (
+                                self._finalize_stream_thinking_delta(
+                                    think_filter_state,
+                                )
                             )
                             if thinking_tail:
                                 thinking_parts.append(thinking_tail)
@@ -577,7 +816,9 @@ class AsyncReActLoop:
                                 else:
                                     yield TextChunkEvent(content=visible_tail)
                             streamed_thinking = "".join(thinking_parts).strip()
-                            streamed_tool_call_list = self._ordered_stream_tool_calls(streamed_tool_calls)
+                            streamed_tool_call_list = self._ordered_stream_tool_calls(
+                                streamed_tool_calls
+                            )
                             if streamed_tool_call_list:
                                 streamed_finish_reason = "tool_calls"
 
@@ -588,7 +829,9 @@ class AsyncReActLoop:
                                 tool_calls=streamed_tool_call_list,
                                 model=backend_info.name,
                                 finish_reason=streamed_finish_reason
-                                or ("tool_calls" if streamed_tool_call_list else "stop"),
+                                or (
+                                    "tool_calls" if streamed_tool_call_list else "stop"
+                                ),
                             )
                     else:
                         result = await self._backend.generate(
@@ -614,7 +857,9 @@ class AsyncReActLoop:
                         retry_count=invalid_tool_turn_recovery_attempts,
                     )
                     if recovery_mode is not None:
-                        rejected_thinking = self._extract_invalid_tool_turn_thinking(exc)
+                        rejected_thinking = self._extract_invalid_tool_turn_thinking(
+                            exc
+                        )
                         if rejected_thinking:
                             yield ThinkingEvent(
                                 content=rejected_thinking,
@@ -649,6 +894,11 @@ class AsyncReActLoop:
                         ),
                     )
                     return
+                finally:
+                    self._record_model_attempt(
+                        started_at=started_at,
+                        result=result,
+                    )
                 total_generation_time_ms += (time.perf_counter() - started_at) * 1000.0
 
                 if not isinstance(result, GenerationResult):
@@ -674,17 +924,26 @@ class AsyncReActLoop:
                         if self._parse_final_text_tool_calls(combined_source):
                             rescued_source_content = combined_source
                             rescue_reason = "truncated_final_text_tool_call_rescue"
-                    if not self._parse_final_text_tool_calls(rescued_source_content) and result.thinking:
+                    if (
+                        not self._parse_final_text_tool_calls(rescued_source_content)
+                        and result.thinking
+                    ):
                         combined_source = "\n".join(
                             part for part in (result.content, result.thinking) if part
                         )
                         if self._parse_final_text_tool_calls(combined_source):
                             rescued_source_content = combined_source
                             rescue_reason = "thinking_tool_call_rescue"
-                    rescued_tool_calls = self._parse_final_text_tool_calls(rescued_source_content)
+                    rescued_tool_calls = self._parse_final_text_tool_calls(
+                        rescued_source_content
+                    )
                     if rescued_tool_calls:
-                        rescued_visible_content = strip_tool_call_blocks(result.content).strip()
-                        rescued_thinking_content = strip_tool_call_blocks(result.thinking).strip()
+                        rescued_visible_content = strip_tool_call_blocks(
+                            result.content
+                        ).strip()
+                        rescued_thinking_content = strip_tool_call_blocks(
+                            result.thinking
+                        ).strip()
                         result = GenerationResult(
                             content=rescued_visible_content,
                             thinking=rescued_thinking_content,
@@ -705,13 +964,17 @@ class AsyncReActLoop:
                                     runtime_category="tool_protocol",
                                 ),
                                 "reason": rescue_reason,
-                                "tool_names": [tool_call.name for tool_call in rescued_tool_calls],
+                                "tool_names": [
+                                    tool_call.name for tool_call in rescued_tool_calls
+                                ],
                                 "rescued_tool_call_count": len(rescued_tool_calls),
                             },
                         )
 
                 if result.tool_calls:
-                    current_tool_signature = self._build_tool_call_signature(result.tool_calls)
+                    current_tool_signature = self._build_tool_call_signature(
+                        result.tool_calls
+                    )
                     if current_tool_signature == last_tool_signature:
                         repeated_tool_rounds += 1
                     else:
@@ -725,7 +988,9 @@ class AsyncReActLoop:
                         repeated_loop_message = "Model repeated the same tool-call pattern without making progress."
                         backend_detail = self._build_backend_runtime_detail()
                         if backend_detail:
-                            repeated_loop_message = f"{repeated_loop_message} ({backend_detail})"
+                            repeated_loop_message = (
+                                f"{repeated_loop_message} ({backend_detail})"
+                            )
                         yield ErrorEvent(
                             message=repeated_loop_message,
                             code="REPEATED_TOOL_LOOP",
@@ -789,34 +1054,101 @@ class AsyncReActLoop:
                         tool_result_payload = ToolResult(output=None, error=None)
                         observed_operation_id: str | None = None
                         self._mark_literature_research_mode(tool_call, literature_state)
-                        followup_retrieval_attempt = self._is_followup_retrieval_attempt(
-                            tool_call=tool_call,
-                            evidence_guard_state=evidence_guard_state,
+                        followup_retrieval_attempt = (
+                            self._is_followup_retrieval_attempt(
+                                tool_call=tool_call,
+                                evidence_guard_state=evidence_guard_state,
+                            )
                         )
                         tool_definition = (
                             self._tool_registry.get(tool_call.name)
                             if self._tool_registry is not None
                             else None
                         )
+                        dynamic_recheck_result = await self._dynamic_complexity_recheck(
+                            tool_call=tool_call,
+                            completed_iterations=iteration,
+                        )
+                        if (
+                            self._tool_execution_context is not None
+                            and self._tool_execution_context.state.pop(
+                                "dynamic_complexity_schema_refresh", False
+                            )
+                            is True
+                        ):
+                            tools = self._collect_tool_schemas()
+                            allowed_tool_names = {tool.name for tool in tools}
                         plan_guarded_tool_result = self._build_plan_guarded_tool_result(
                             tool_call=tool_call,
                             batch_plan_guard_state=batch_plan_guard_state,
                         )
-                        activation_tool_result = self._request_tool_activation_if_needed(
-                            tool_call=tool_call,
-                            allowed_tool_names=allowed_tool_names,
-                            terminal_unavailable_mutation_signatures=(
-                                terminal_unavailable_mutation_signatures
-                            ),
-                        )
                         if (
-                            activation_tool_result is not None
-                            and activation_tool_result.metadata.get("status") == "tool_activated"
+                            plan_guarded_tool_result is not None
+                            and plan_guarded_tool_result.metadata.get("guard")
+                            == "plan_effect_boundary"
                         ):
+                            accumulator = self._diagnostics_accumulator()
+                            if accumulator is not None:
+                                try:
+                                    accumulator.record_plan_guard_block()
+                                except Exception:
+                                    logger.debug(
+                                        "Unable to record plan-guard diagnostics"
+                                    )
+                        implicit_activation_before = self._tool_schema_diagnostics(
+                            tools
+                        )
+                        implicit_activation_before_names = {
+                            tool.name for tool in tools
+                        }
+                        activation_tool_result = (
+                            self._request_tool_activation_if_needed(
+                                tool_call=tool_call,
+                                allowed_tool_names=allowed_tool_names,
+                                terminal_unavailable_mutation_signatures=(
+                                    terminal_unavailable_mutation_signatures
+                                ),
+                            )
+                        )
+                        activation_tool_metadata = (
+                            activation_tool_result.metadata
+                            if activation_tool_result is not None
+                            and isinstance(activation_tool_result.metadata, dict)
+                            else {}
+                        )
+                        if activation_tool_metadata.get("status") == "tool_activated":
                             tools = self._collect_tool_schemas()
                             allowed_tool_names = {tool.name for tool in tools}
+                            accumulator = self._diagnostics_accumulator()
+                            if (
+                                accumulator is not None
+                                and self._is_new_callable_schema(
+                                    requested_tool=tool_call.name,
+                                    before_names=implicit_activation_before_names,
+                                    after_names=allowed_tool_names,
+                                )
+                            ):
+                                try:
+                                    after_count, after_tokens = (
+                                        self._tool_schema_diagnostics(tools)
+                                    )
+                                    accumulator.record_activation(
+                                        schema_count_before=implicit_activation_before[
+                                            0
+                                        ],
+                                        schema_count_after=after_count,
+                                        schema_token_estimate_before=implicit_activation_before[
+                                            1
+                                        ],
+                                        schema_token_estimate_after=after_tokens,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Unable to record implicit activation diagnostics"
+                                    )
                         unavailable_tool_result = (
-                            plan_guarded_tool_result
+                            dynamic_recheck_result
+                            or plan_guarded_tool_result
                             or activation_tool_result
                             or self._build_unavailable_tool_result(
                                 tool_call=tool_call,
@@ -831,15 +1163,21 @@ class AsyncReActLoop:
                         repeated_unavailable_mutation = (
                             unavailable_tool_result is not None
                             and mutation_tool_signature is not None
-                            and mutation_tool_signature in terminal_unavailable_mutation_signatures
+                            and mutation_tool_signature
+                            in terminal_unavailable_mutation_signatures
                         )
                         if (
                             unavailable_tool_result is not None
                             and mutation_tool_signature is not None
                             and unavailable_tool_result.retryable is False
                         ):
-                            terminal_unavailable_mutation_signatures.add(mutation_tool_signature)
-                        if repeated_unavailable_mutation and unavailable_tool_result is not None:
+                            terminal_unavailable_mutation_signatures.add(
+                                mutation_tool_signature
+                            )
+                        if (
+                            repeated_unavailable_mutation
+                            and unavailable_tool_result is not None
+                        ):
                             repeated_metadata = (
                                 dict(unavailable_tool_result.metadata)
                                 if isinstance(unavailable_tool_result.metadata, dict)
@@ -861,7 +1199,10 @@ class AsyncReActLoop:
                             unavailable_tool_result = ToolResult(
                                 output=unavailable_tool_result.output,
                                 error=(
-                                    (unavailable_tool_result.error or "Mutation tool is not available.")
+                                    (
+                                        unavailable_tool_result.error
+                                        or "Mutation tool is not available."
+                                    )
                                     + " Repeating the same unavailable mutation call is blocked; replan or request activation."
                                 ),
                                 metadata=repeated_metadata,
@@ -898,7 +1239,10 @@ class AsyncReActLoop:
                             web_fetch_guard_state=web_fetch_guard_state,
                             web_search_guard_state=web_search_guard_state,
                         )
-                        if unavailable_tool_result is None and guarded_tool_result is not None:
+                        if (
+                            unavailable_tool_result is None
+                            and guarded_tool_result is not None
+                        ):
                             tool_output = guarded_tool_result.output
                             tool_error = guarded_tool_result.error
                             tool_metadata = (
@@ -911,22 +1255,45 @@ class AsyncReActLoop:
                                 output=tool_output,
                                 error=tool_error,
                             )
-                        if unavailable_tool_result is None and guarded_tool_result is None:
-                            recovery_tool_budget_result = self._consume_recovery_tool_call(
-                                tool_call
+                        recovery_scope_result: ToolResult | None = None
+                        if (
+                            unavailable_tool_result is None
+                            and guarded_tool_result is None
+                        ):
+                            recovery_tool_budget_result = (
+                                self._consume_recovery_tool_call(tool_call)
+                            )
+                            recovery_scope_result = self._recovery_scope_tool_result(
+                                tool_call, tool_definition
                             )
                             if recovery_tool_budget_result is not None:
                                 unavailable_tool_result = recovery_tool_budget_result
                                 tool_output = recovery_tool_budget_result.output
                                 tool_error = recovery_tool_budget_result.error
-                                tool_metadata = dict(recovery_tool_budget_result.metadata)
+                                tool_metadata = dict(
+                                    recovery_tool_budget_result.metadata
+                                )
                                 tool_result_payload = recovery_tool_budget_result
                                 formatted_content = self._format_tool_message_content(
                                     output=tool_output,
                                     error=tool_error,
                                 )
+                            elif recovery_scope_result is not None:
+                                unavailable_tool_result = recovery_scope_result
+                                tool_output = recovery_scope_result.output
+                                tool_error = recovery_scope_result.error
+                                tool_metadata = dict(recovery_scope_result.metadata)
+                                tool_result_payload = recovery_scope_result
+                                formatted_content = self._format_tool_message_content(
+                                    output=tool_output,
+                                    error=tool_error,
+                                )
                         if self._tool_registry is not None:
-                            if unavailable_tool_result is None and guarded_tool_result is None:
+                            if (
+                                unavailable_tool_result is None
+                                and guarded_tool_result is None
+                                and recovery_scope_result is None
+                            ):
                                 self._record_preplan_read_attempt(tool_call)
                                 active_tool_controller = (
                                     self._tool_execution_context.active_tool_controller
@@ -938,7 +1305,9 @@ class AsyncReActLoop:
                                         tool_call_id=tool_call.id,
                                         tool_name=tool_call.name,
                                         cancellable=bool(
-                                            getattr(tool_definition, "is_cancellable", False)
+                                            getattr(
+                                                tool_definition, "is_cancellable", False
+                                            )
                                         ),
                                     )
                                 self._bind_ordinary_chat_approval_cursor(tool_call)
@@ -971,12 +1340,61 @@ class AsyncReActLoop:
                                                 f"tool-execution-{uuid4().hex}"
                                             )
                                     else:
-                                        observed_operation_id = f"tool-execution-{uuid4().hex}"
-                                    tool_result = await self._tool_registry.execute(
-                                        tool_call.name,
-                                        tool_call.arguments,
-                                        context=self._tool_execution_context,
+                                        observed_operation_id = (
+                                            f"tool-execution-{uuid4().hex}"
+                                        )
+                                    tool_started_at = time.perf_counter()
+                                    activation_before = (
+                                        self._tool_schema_diagnostics(tools)
+                                        if tool_call.name == "tool_activate"
+                                        else None
                                     )
+                                    activation_before_names = (
+                                        {tool.name for tool in tools}
+                                        if tool_call.name == "tool_activate"
+                                        else set()
+                                    )
+                                    tool_result = None
+                                    try:
+                                        tool_result = await self._tool_registry.execute(
+                                            tool_call.name,
+                                            tool_call.arguments,
+                                            context=self._tool_execution_context,
+                                        )
+                                    finally:
+                                        self._record_tool_attempt(
+                                            started_at=tool_started_at,
+                                        )
+                                        if tool_call.name == "tool_search":
+                                            accumulator = (
+                                                self._diagnostics_accumulator()
+                                            )
+                                            if accumulator is not None:
+                                                try:
+                                                    metadata = getattr(
+                                                        tool_result, "metadata", {}
+                                                    )
+                                                    count = (
+                                                        metadata.get("count")
+                                                        if getattr(
+                                                            tool_result, "error", None
+                                                        )
+                                                        is None
+                                                        and isinstance(metadata, dict)
+                                                        else None
+                                                    )
+                                                    accumulator.record_tool_search(
+                                                        candidates=(
+                                                            count
+                                                            if type(count) is int
+                                                            and count >= 0
+                                                            else None
+                                                        )
+                                                    )
+                                                except Exception:
+                                                    logger.debug(
+                                                        "Unable to record tool-search diagnostics"
+                                                    )
                                     tool_output = tool_result.output
                                     tool_error = tool_result.error
                                     tool_metadata = (
@@ -986,46 +1404,97 @@ class AsyncReActLoop:
                                     )
                                     tool_result_payload = tool_result
                                     if tool_definition is not None:
-                                        formatted_content = tool_definition.format_result_for_model(
-                                            tool_result,
-                                            max_chars=self._max_tool_message_chars,
+                                        formatted_content = (
+                                            tool_definition.format_result_for_model(
+                                                tool_result,
+                                                max_chars=self._max_tool_message_chars,
+                                            )
                                         )
                                     else:
-                                        formatted_content = self._tool_registry.format_result_for_model(
-                                            tool_call.name,
-                                            tool_result,
-                                            max_chars=self._max_tool_message_chars,
+                                        formatted_content = (
+                                            self._tool_registry.format_result_for_model(
+                                                tool_call.name,
+                                                tool_result,
+                                                max_chars=self._max_tool_message_chars,
+                                            )
                                         )
                                     if (
                                         tool_call.name == "tool_activate"
                                         and tool_result.error is None
-                                        and tool_result.metadata.get("status")
+                                        and tool_metadata.get("status")
                                         in {"tool_activated", "tool_already_callable"}
                                     ):
                                         tools = self._collect_tool_schemas()
-                                        allowed_tool_names = {tool.name for tool in tools}
+                                        allowed_tool_names = {
+                                            tool.name for tool in tools
+                                        }
+                                        if (
+                                            activation_before is not None
+                                            and tool_metadata.get("status")
+                                            == "tool_activated"
+                                            and self._is_new_callable_schema(
+                                                requested_tool=tool_call.arguments.get(
+                                                    "tool_name"
+                                                ),
+                                                before_names=activation_before_names,
+                                                after_names=allowed_tool_names,
+                                            )
+                                        ):
+                                            after_count, after_tokens = (
+                                                self._tool_schema_diagnostics(tools)
+                                            )
+                                            accumulator = (
+                                                self._diagnostics_accumulator()
+                                            )
+                                            if accumulator is not None:
+                                                try:
+                                                    accumulator.record_activation(
+                                                        schema_count_before=activation_before[
+                                                            0
+                                                        ],
+                                                        schema_count_after=after_count,
+                                                        schema_token_estimate_before=activation_before[
+                                                            1
+                                                        ],
+                                                        schema_token_estimate_after=after_tokens,
+                                                    )
+                                                except Exception:
+                                                    logger.debug(
+                                                        "Unable to record activation diagnostics"
+                                                    )
                                 except Exception as exc:
                                     tool_error = str(exc)
-                                    tool_result_payload = ToolResult(output=tool_output, error=tool_error)
-                                    formatted_content = self._format_tool_message_content(
-                                        output=tool_output,
-                                        error=tool_error,
+                                    tool_result_payload = ToolResult(
+                                        output=tool_output, error=tool_error
+                                    )
+                                    formatted_content = (
+                                        self._format_tool_message_content(
+                                            output=tool_output,
+                                            error=tool_error,
+                                        )
                                     )
                                 finally:
                                     if active_tool_controller is not None:
                                         await active_tool_controller.finish_tool()
-                        elif unavailable_tool_result is None and guarded_tool_result is None:
+                        elif (
+                            unavailable_tool_result is None
+                            and guarded_tool_result is None
+                        ):
                             tool_error = "No tool registry configured."
-                            tool_result_payload = ToolResult(output=tool_output, error=tool_error)
+                            tool_result_payload = ToolResult(
+                                output=tool_output, error=tool_error
+                            )
                             formatted_content = self._format_tool_message_content(
                                 output=tool_output,
                                 error=tool_error,
                             )
 
-                        tool_result_payload = self._postprocess_plan_runtime_tool_result(
-                            tool_call=tool_call,
-                            tool_result=tool_result_payload,
-                            batch_plan_guard_state=batch_plan_guard_state,
+                        tool_result_payload = (
+                            self._postprocess_plan_runtime_tool_result(
+                                tool_call=tool_call,
+                                tool_result=tool_result_payload,
+                                batch_plan_guard_state=batch_plan_guard_state,
+                            )
                         )
                         tool_output = tool_result_payload.output
                         tool_error = tool_result_payload.error
@@ -1034,7 +1503,11 @@ class AsyncReActLoop:
                             if isinstance(tool_result_payload.metadata, dict)
                             else {}
                         )
-                        if tool_definition is not None and unavailable_tool_result is None and guarded_tool_result is None:
+                        if (
+                            tool_definition is not None
+                            and unavailable_tool_result is None
+                            and guarded_tool_result is None
+                        ):
                             formatted_content = tool_definition.format_result_for_model(
                                 tool_result_payload,
                                 max_chars=self._max_tool_message_chars,
@@ -1071,21 +1544,26 @@ class AsyncReActLoop:
                             result=tool_result_payload,
                             formatted_content=formatted_content,
                         )
-                        tool_content, evidence_diagnostics = self._augment_low_information_web_fetch(
-                            tool_call=tool_call,
-                            tool_result=tool_result_payload,
-                            tool_content=tool_content,
+                        tool_content, evidence_diagnostics = (
+                            self._augment_low_information_web_fetch(
+                                tool_call=tool_call,
+                                tool_result=tool_result_payload,
+                                tool_content=tool_content,
+                            )
                         )
                         if followup_retrieval_attempt:
                             evidence_guard_state["followup_attempts"] = (
-                                int(evidence_guard_state.get("followup_attempts") or 0) + 1
+                                int(evidence_guard_state.get("followup_attempts") or 0)
+                                + 1
                             )
                             if evidence_diagnostics is None:
-                                tool_content, evidence_diagnostics = self._augment_insufficient_followup_retrieval(
-                                    tool_call=tool_call,
-                                    tool_result=tool_result_payload,
-                                    tool_content=tool_content,
-                                    evidence_guard_state=evidence_guard_state,
+                                tool_content, evidence_diagnostics = (
+                                    self._augment_insufficient_followup_retrieval(
+                                        tool_call=tool_call,
+                                        tool_result=tool_result_payload,
+                                        tool_content=tool_content,
+                                        evidence_guard_state=evidence_guard_state,
+                                    )
                                 )
                         self._last_transport_diagnostics = transport_diagnostics
                         tool_metadata = {
@@ -1093,17 +1571,24 @@ class AsyncReActLoop:
                             "transport": transport_diagnostics,
                         }
                         if observed_operation_id is not None:
-                            tool_metadata.setdefault("operation_id", observed_operation_id)
+                            tool_metadata.setdefault(
+                                "operation_id", observed_operation_id
+                            )
                             tool_metadata["execution_observed"] = True
                         if evidence_diagnostics:
                             tool_metadata["evidence_quality"] = evidence_diagnostics
-                            if evidence_diagnostics.get("reason") == "low_information_web_fetch":
+                            if (
+                                evidence_diagnostics.get("reason")
+                                == "low_information_web_fetch"
+                            ):
                                 self._mark_low_information_fetch(
                                     evidence_guard_state=evidence_guard_state,
                                     diagnostics=evidence_diagnostics,
                                 )
                         elif followup_retrieval_attempt and not tool_error:
-                            self._clear_low_information_fetch_guard(evidence_guard_state)
+                            self._clear_low_information_fetch_guard(
+                                evidence_guard_state
+                            )
 
                         if tool_metadata.get("status") == "runtime_steering":
                             yield StatusEvent(
@@ -1133,18 +1618,25 @@ class AsyncReActLoop:
                             arguments=tool_call.arguments,
                             result=tool_output,
                             error=tool_error,
-                            metadata={**tool_metadata, "compat_event_type": "tool_call_result"},
+                            metadata={
+                                **tool_metadata,
+                                "compat_event_type": "tool_call_result",
+                            },
                         )
                         if tool_metadata.get("timeline_fail_closed") is True:
                             return
                         if self._is_durable_approval_interrupt(tool_metadata):
-                            approval_id = str(tool_metadata.get("approval_id") or "").strip()
+                            approval_id = str(
+                                tool_metadata.get("approval_id") or ""
+                            ).strip()
                             approval_metadata = {
                                 "status": "approval_pending",
                                 "approval_id": approval_id,
                                 "tool_name": tool_call.name,
                                 "operation_id": tool_metadata.get("operation_id"),
-                                "arguments_digest": tool_metadata.get("arguments_digest"),
+                                "arguments_digest": tool_metadata.get(
+                                    "arguments_digest"
+                                ),
                                 "resume_cursor": tool_metadata.get("resume_cursor"),
                                 "requires_approval": True,
                             }
@@ -1173,17 +1665,24 @@ class AsyncReActLoop:
                         injected_guidance = await self._consume_live_subagent_guidance()
                         if injected_guidance is not None:
                             messages.append(injected_guidance)
-                    if literature_state["summary_ready"] and not literature_state["prompt_injected"]:
+                    if (
+                        literature_state["summary_ready"]
+                        and not literature_state["prompt_injected"]
+                    ):
                         messages.append(
                             Message(
                                 role="user",
-                                content=self._build_literature_summary_prompt(literature_state),
+                                content=self._build_literature_summary_prompt(
+                                    literature_state
+                                ),
                             )
                         )
                         literature_state["prompt_injected"] = True
                     continue
 
-                final_text, final_thinking = self._split_thinking_blocks(result.content, result.thinking)
+                final_text, final_thinking = self._split_thinking_blocks(
+                    result.content, result.thinking
+                )
                 if streamed_generation and held_stream_text and not final_text.strip():
                     final_text = held_stream_text.strip()
                     held_stream_text = ""
@@ -1191,10 +1690,14 @@ class AsyncReActLoop:
                     messages.append(
                         Message(
                             role="user",
-                            content=self._build_followup_retrieval_prompt(evidence_guard_state),
+                            content=self._build_followup_retrieval_prompt(
+                                evidence_guard_state
+                            ),
                         )
                     )
-                    evidence_guard_state["nudge_count"] = int(evidence_guard_state.get("nudge_count") or 0) + 1
+                    evidence_guard_state["nudge_count"] = (
+                        int(evidence_guard_state.get("nudge_count") or 0) + 1
+                    )
                     continue
                 if self._should_force_plan_finalization_followup():
                     messages.append(
@@ -1204,7 +1707,9 @@ class AsyncReActLoop:
                         )
                     )
                     self._increment_plan_runtime_counter("finalization_nudges_used")
-                    finalization_nudges_used = self._plan_runtime_counter("finalization_nudges_used")
+                    finalization_nudges_used = self._plan_runtime_counter(
+                        "finalization_nudges_used"
+                    )
                     yield StatusEvent(
                         content=(
                             "A durable task plan is required for this turn; requesting a final plan update "
@@ -1250,23 +1755,33 @@ class AsyncReActLoop:
                             ),
                             "reason": "file_artifact_missing",
                             "nudge_count": file_artifact_guard_state["nudge_count"],
-                            "available_file_mutation_tools": self._available_file_mutation_tools(allowed_tool_names),
-                            "last_file_mutation_error": file_artifact_guard_state.get("last_error"),
-                            "last_file_mutation_tool": file_artifact_guard_state.get("last_tool_name"),
+                            "available_file_mutation_tools": self._available_file_mutation_tools(
+                                allowed_tool_names
+                            ),
+                            "last_file_mutation_error": file_artifact_guard_state.get(
+                                "last_error"
+                            ),
+                            "last_file_mutation_tool": file_artifact_guard_state.get(
+                                "last_tool_name"
+                            ),
                         },
                     )
                     continue
                 if self._should_block_unsatisfied_plan_final(final_text):
                     final_text = self._build_plan_blocker_final()
                     final_plan_blocker_metadata = self._build_plan_blocker_metadata()
-                if self._should_block_unsatisfied_file_artifact_final(file_artifact_guard_state, final_text):
+                if self._should_block_unsatisfied_file_artifact_final(
+                    file_artifact_guard_state, final_text
+                ):
                     final_text = self._build_file_artifact_blocker_final(
                         file_artifact_guard_state=file_artifact_guard_state,
                         allowed_tool_names=allowed_tool_names,
                     )
-                    final_file_artifact_blocker_metadata = self._build_file_artifact_blocker_metadata(
-                        file_artifact_guard_state=file_artifact_guard_state,
-                        allowed_tool_names=allowed_tool_names,
+                    final_file_artifact_blocker_metadata = (
+                        self._build_file_artifact_blocker_metadata(
+                            file_artifact_guard_state=file_artifact_guard_state,
+                            allowed_tool_names=allowed_tool_names,
+                        )
                     )
                 if final_thinking:
                     yield ThinkingEvent(
@@ -1289,7 +1804,9 @@ class AsyncReActLoop:
                         )
                         continue
                     backend_info = self._backend.get_model_info()
-                    logger.warning("ReAct loop received an empty final response from the backend.")
+                    logger.warning(
+                        "ReAct loop received an empty final response from the backend."
+                    )
                     yield ErrorEvent(
                         message="Model returned an empty response.",
                         metadata=self._with_runtime_error_taxonomy(
@@ -1362,18 +1879,22 @@ class AsyncReActLoop:
                 repeated_tool_rounds = 0
                 break
             else:
-                logger.warning(f"ReAct loop reached max iterations ({self._max_iterations})")
-                max_iterations_message = (
-                    "Model reached the maximum tool-call iterations without producing a final answer."
+                logger.warning(
+                    f"ReAct loop reached max iterations ({self._max_iterations})"
                 )
+                max_iterations_message = "Model reached the maximum tool-call iterations without producing a final answer."
                 backend_detail = self._build_backend_runtime_detail()
                 if backend_detail:
-                    max_iterations_message = f"{max_iterations_message} ({backend_detail})"
+                    max_iterations_message = (
+                        f"{max_iterations_message} ({backend_detail})"
+                    )
                 yield ErrorEvent(
                     message=max_iterations_message,
                     code="MAX_ITERATIONS_REACHED",
                     metadata=self._with_runtime_error_taxonomy(
-                        self._build_max_iterations_metadata(finish_reason=finish_reason),
+                        self._build_max_iterations_metadata(
+                            finish_reason=finish_reason
+                        ),
                         error_type="max_iterations_reached",
                         recoverability="not_retryable",
                     ),
@@ -1396,7 +1917,11 @@ class AsyncReActLoop:
             final_metadata.update(
                 self._runtime_error_taxonomy(
                     error_type="output_truncated",
-                    recoverability="recovered" if not self._is_length_finish_reason(finish_reason) else "partial",
+                    recoverability=(
+                        "recovered"
+                        if not self._is_length_finish_reason(finish_reason)
+                        else "partial"
+                    ),
                     runtime_category="truncation",
                 )
             )
@@ -1440,7 +1965,10 @@ class AsyncReActLoop:
         if context is None or not isinstance(context.state, dict):
             return
         approval_context = context.state.get("ordinary_chat_approval_context")
-        if not isinstance(approval_context, dict) or approval_context.get("source") != "ordinary_chat":
+        if (
+            not isinstance(approval_context, dict)
+            or approval_context.get("source") != "ordinary_chat"
+        ):
             return
         cursor = approval_context.get("resume_cursor")
         next_cursor = dict(cursor) if isinstance(cursor, dict) else {}
@@ -1474,12 +2002,23 @@ class AsyncReActLoop:
         if context is None or not isinstance(context.state, dict):
             return
         approval_context = context.state.get("ordinary_chat_approval_context")
-        if not isinstance(approval_context, dict) or approval_context.get("source") != "ordinary_chat":
+        if (
+            not isinstance(approval_context, dict)
+            or approval_context.get("source") != "ordinary_chat"
+        ):
             return
+        tool_registry_view = approval_context.get("tool_registry_view")
         approval_context["react_continuation"] = {
             "schema_version": 1,
-            "messages": [self._serialize_ordinary_chat_message(message) for message in messages],
+            "messages": [
+                self._serialize_ordinary_chat_message(message) for message in messages
+            ],
             "callable_tool_names": [tool.name for tool in tools],
+            "tool_registry_view": (
+                dict(tool_registry_view)
+                if isinstance(tool_registry_view, Mapping)
+                else None
+            ),
             "max_iterations": self._max_iterations,
             "requires_file_mutation": self._requires_file_mutation,
             "next_iteration": iteration + 1,
@@ -1519,6 +2058,7 @@ class AsyncReActLoop:
             ],
             "tool_call_id": message.tool_call_id,
             "name": message.name,
+            "native_tool_protocol_active": message.native_tool_protocol_active,
             "attachments": [attachment.to_dict() for attachment in message.attachments],
             "responses_replay": (
                 message.responses_replay.to_dict()
@@ -1533,15 +2073,23 @@ class AsyncReActLoop:
     ) -> list[Message]:
         raw_messages = checkpoint.get("messages")
         if not isinstance(raw_messages, list) or not raw_messages:
-            raise ValueError("Ordinary-Chat approval continuation transcript is missing.")
+            raise ValueError(
+                "Ordinary-Chat approval continuation transcript is missing."
+            )
         messages: list[Message] = []
         for raw in raw_messages:
             if not isinstance(raw, Mapping):
-                raise ValueError("Ordinary-Chat approval continuation transcript is invalid.")
+                raise ValueError(
+                    "Ordinary-Chat approval continuation transcript is invalid."
+                )
             role = raw.get("role")
             content = raw.get("content")
-            if role not in {"system", "user", "assistant", "tool"} or not isinstance(content, str):
-                raise ValueError("Ordinary-Chat approval continuation message is invalid.")
+            if role not in {"system", "user", "assistant", "tool"} or not isinstance(
+                content, str
+            ):
+                raise ValueError(
+                    "Ordinary-Chat approval continuation message is invalid."
+                )
             raw_tool_calls = raw.get("tool_calls")
             tool_calls: list[ToolCall] = []
             if isinstance(raw_tool_calls, list):
@@ -1551,13 +2099,26 @@ class AsyncReActLoop:
                     call_id = raw_call.get("id")
                     name = raw_call.get("name")
                     arguments = raw_call.get("arguments")
-                    if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                    if (
+                        isinstance(call_id, str)
+                        and call_id
+                        and isinstance(name, str)
+                        and name
+                    ):
                         tool_calls.append(
                             ToolCall(
                                 id=call_id,
                                 name=name,
-                                arguments=dict(arguments) if isinstance(arguments, Mapping) else {},
-                                index=(raw_call.get("index") if isinstance(raw_call.get("index"), int) else None),
+                                arguments=(
+                                    dict(arguments)
+                                    if isinstance(arguments, Mapping)
+                                    else {}
+                                ),
+                                index=(
+                                    raw_call.get("index")
+                                    if isinstance(raw_call.get("index"), int)
+                                    else None
+                                ),
                             )
                         )
             from mochi.backends.types import AttachmentRef, ResponsesReplayState
@@ -1576,12 +2137,25 @@ class AsyncReActLoop:
                 Message(
                     role=role,
                     content=content,
-                    thinking=raw.get("thinking") if isinstance(raw.get("thinking"), str) else "",
+                    thinking=(
+                        raw.get("thinking")
+                        if isinstance(raw.get("thinking"), str)
+                        else ""
+                    ),
                     tool_calls=tool_calls,
-                    tool_call_id=(raw.get("tool_call_id") if isinstance(raw.get("tool_call_id"), str) else None),
+                    tool_call_id=(
+                        raw.get("tool_call_id")
+                        if isinstance(raw.get("tool_call_id"), str)
+                        else None
+                    ),
                     name=raw.get("name") if isinstance(raw.get("name"), str) else None,
+                    native_tool_protocol_active=bool(
+                        raw.get("native_tool_protocol_active", False)
+                    ),
                     attachments=attachments,
-                    responses_replay=ResponsesReplayState.from_dict(raw.get("responses_replay")),
+                    responses_replay=ResponsesReplayState.from_dict(
+                        raw.get("responses_replay")
+                    ),
                 )
             )
         return messages
@@ -1607,6 +2181,105 @@ class AsyncReActLoop:
         if not isinstance(plan_runtime, dict):
             return None
         return plan_runtime
+
+    async def _dynamic_complexity_recheck(
+        self,
+        *,
+        tool_call: ToolCall,
+        completed_iterations: int,
+    ) -> ToolResult | None:
+        """Run the Engine-owned deterministic recheck before an effect boundary."""
+        context = self._tool_execution_context
+        if context is None or not isinstance(context.state, dict):
+            return None
+        if self._is_runtime_control_tool(tool_call.name) or self._tool_is_read_only(
+            tool_call.name
+        ):
+            return None
+        callback = context.state.get("dynamic_complexity_recheck")
+        if not callable(callback):
+            return None
+        prior = context.state.get("complexity_decision")
+        plan_event = context.state.get("dynamic_complexity_plan_event")
+        trusted_plan_event = (
+            plan_event
+            if isinstance(plan_event, Mapping)
+            and plan_event.get("kind")
+            in {"stale_revision", "ledger_missing", "snapshot_invalid"}
+            else None
+        )
+        if not isinstance(prior, Mapping) or (
+            prior.get("kind") != "no_plan" and trusted_plan_event is None
+        ):
+            return None
+
+        signals: list[str] = []
+        observed_tools = context.state.get("dynamic_complexity_observed_tools")
+        prior_tools = (
+            {str(name) for name in observed_tools if isinstance(name, str)}
+            if isinstance(observed_tools, (list, tuple, set, frozenset))
+            else set()
+        )
+        if len(prior_tools | {tool_call.name}) >= 3:
+            signals.append("third_distinct_tool")
+        if context.state.get("dynamic_complexity_read_observed") is True:
+            signals.append("read_to_effectful")
+        if context.state.get("dynamic_complexity_verifier_failed") is True:
+            signals.append("verifier_failed")
+        if trusted_plan_event is not None or context.state.get(
+            "dynamic_complexity_active_plan_invalidated"
+        ) is True:
+            signals.append("active_plan_invalidated")
+        threshold = prior.get("dynamic_recheck_after_iterations")
+        if type(threshold) is int and threshold > 0 and completed_iterations >= threshold:
+            signals.append("iteration_threshold")
+        if not signals:
+            return None
+        try:
+            outcome = callback(
+                completed_iterations=completed_iterations,
+                signals=tuple(dict.fromkeys(signals)),
+            )
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+        except Exception:
+            outcome = {"status": "persistence_failed"}
+        if not isinstance(outcome, Mapping) or outcome.get("status") != "saved":
+            return ToolResult(
+                error=(
+                    "The host could not durably persist the dynamic planning decision. "
+                    "The effectful tool call is blocked."
+                ),
+                metadata={
+                    **self._runtime_error_taxonomy(
+                        error_type="dynamic_plan_recheck_persist_failed",
+                        recoverability="requires_replanning_or_activation",
+                        runtime_category="task_planning",
+                    ),
+                    "guard": "dynamic_plan_effect_boundary",
+                    "reason": "dynamic_plan_recheck_persist_failed",
+                    "dynamic_recheck_signals": list(dict.fromkeys(signals)),
+                },
+                retryable=False,
+                suggestion="Retry the turn after durable plan state is available; do not execute the mutation.",
+            )
+        plan_runtime = self._plan_runtime_state()
+        update_plan_tool = context.state.get("dynamic_complexity_update_plan_tool")
+        if (
+            self._tool_registry is not None
+            and isinstance(plan_runtime, Mapping)
+            and plan_runtime.get("exposed") is True
+            and getattr(update_plan_tool, "name", None) == "update_plan"
+        ):
+            # The runtime-control schema is revealed only after the upgraded
+            # decision was durably written. It grants no new effect authority.
+            self._tool_registry.register(update_plan_tool)
+            context.state["dynamic_complexity_schema_refresh"] = True
+        if trusted_plan_event is not None:
+            # The event is host-owned and one-shot.  It is consumed only after
+            # the replacement decision was durably checkpointed.
+            context.state.pop("dynamic_complexity_plan_event", None)
+        return None
 
     def _plan_ledger_snapshot(self) -> Mapping[str, Any] | None:
         context = self._tool_execution_context
@@ -1649,14 +2322,18 @@ class AsyncReActLoop:
         plan_runtime = self._plan_runtime_state()
         if plan_runtime is None:
             return None
-        if not bool(plan_runtime.get("enabled")) or not bool(plan_runtime.get("required")):
+        if not bool(plan_runtime.get("enabled")) or not bool(
+            plan_runtime.get("required")
+        ):
             return None
         if plan_runtime.get("state") == "unavailable":
             return None
         if self._is_runtime_control_tool(tool_call.name):
             return None
 
-        if batch_plan_guard_state.get("stale_effect_boundary") and not self._tool_is_read_only(tool_call.name):
+        if batch_plan_guard_state.get(
+            "stale_effect_boundary"
+        ) and not self._tool_is_read_only(tool_call.name):
             return ToolResult(
                 error=(
                     "A previous update_plan call did not commit because its plan revision was stale. "
@@ -1670,8 +2347,12 @@ class AsyncReActLoop:
                     ),
                     "guard": "plan_effect_boundary",
                     "reason": "plan_stale_before_effect",
-                    "plan_corrections_used": self._plan_runtime_counter("plan_corrections_used"),
-                    "max_plan_corrections": self._plan_runtime_counter("max_plan_prompt_corrections"),
+                    "plan_corrections_used": self._plan_runtime_counter(
+                        "plan_corrections_used"
+                    ),
+                    "max_plan_corrections": self._plan_runtime_counter(
+                        "max_plan_prompt_corrections"
+                    ),
                 },
                 retryable=True,
                 suggestion="Call update_plan view or retry update_plan with the latest revision before continuing.",
@@ -1709,17 +2390,28 @@ class AsyncReActLoop:
         max_corrections = self._plan_runtime_counter("max_plan_prompt_corrections")
         retryable = corrections_used < max_corrections
         if retryable:
-            corrections_used = self._increment_plan_runtime_counter("plan_corrections_used")
+            corrections_used = self._increment_plan_runtime_counter(
+                "plan_corrections_used"
+            )
         return ToolResult(
-            error=str(plan_issue.get("error") or "A durable task plan is required before effectful tool execution."),
+            error=str(
+                plan_issue.get("error")
+                or "A durable task plan is required before effectful tool execution."
+            ),
             metadata={
                 **self._runtime_error_taxonomy(
-                    error_type=str(plan_issue.get("error_type") or "plan_required_before_effect"),
-                    recoverability="retrying" if retryable else "requires_replanning_or_activation",
+                    error_type=str(
+                        plan_issue.get("error_type") or "plan_required_before_effect"
+                    ),
+                    recoverability=(
+                        "retrying" if retryable else "requires_replanning_or_activation"
+                    ),
                     runtime_category="task_planning",
                 ),
                 "guard": "plan_effect_boundary",
-                "reason": str(plan_issue.get("reason") or "plan_required_before_effect"),
+                "reason": str(
+                    plan_issue.get("reason") or "plan_required_before_effect"
+                ),
                 "plan_corrections_used": corrections_used,
                 "max_plan_corrections": max_corrections,
                 **{
@@ -1762,6 +2454,20 @@ class AsyncReActLoop:
                 "error_type": "plan_stale_before_effect",
                 "reason": "plan_stale_before_effect",
             }
+        snapshot_revision = snapshot.get("revision")
+        runtime_revision = plan_runtime.get("current_revision")
+        if (
+            isinstance(snapshot_revision, int)
+            and isinstance(runtime_revision, int)
+            and snapshot_revision != runtime_revision
+        ):
+            return {
+                "error": "The durable task plan changed while this turn was running. Refresh it with update_plan before proceeding.",
+                "error_type": "plan_stale_before_effect",
+                "reason": "plan_revision_mismatch",
+                "snapshot_revision": snapshot_revision,
+                "current_revision": runtime_revision,
+            }
         items = snapshot.get("items")
         if not isinstance(items, list):
             return {
@@ -1772,7 +2478,8 @@ class AsyncReActLoop:
         in_progress_items = [
             item
             for item in items
-            if isinstance(item, Mapping) and str(item.get("status") or "") == "in_progress"
+            if isinstance(item, Mapping)
+            and str(item.get("status") or "") == "in_progress"
         ]
         if len(in_progress_items) != 1:
             return {
@@ -1792,12 +2499,17 @@ class AsyncReActLoop:
             if isinstance(item, Mapping) and str(item.get("item_id") or "").strip()
         }
         dependencies = current_item.get("dependencies")
-        unmet_dependencies = [
-            dependency
-            for dependency in dependencies
-            if isinstance(dependency, str)
-            and str(item_by_id.get(dependency, {}).get("status") or "") != "completed"
-        ] if isinstance(dependencies, list) else []
+        unmet_dependencies = (
+            [
+                dependency
+                for dependency in dependencies
+                if isinstance(dependency, str)
+                and str(item_by_id.get(dependency, {}).get("status") or "")
+                != "completed"
+            ]
+            if isinstance(dependencies, list)
+            else []
+        )
         if unmet_dependencies:
             return {
                 "error": (
@@ -1830,6 +2542,19 @@ class AsyncReActLoop:
                 tool_result=tool_result,
                 batch_plan_guard_state=batch_plan_guard_state,
             )
+        if tool_result.error is None and not self._is_runtime_control_tool(tool_call.name):
+            context = self._tool_execution_context
+            if context is not None and isinstance(context.state, dict):
+                observed = context.state.get("dynamic_complexity_observed_tools")
+                names = (
+                    {str(name) for name in observed if isinstance(name, str)}
+                    if isinstance(observed, (list, tuple, set, frozenset))
+                    else set()
+                )
+                names.add(tool_call.name)
+                context.state["dynamic_complexity_observed_tools"] = sorted(names)
+                if self._tool_is_read_only(tool_call.name):
+                    context.state["dynamic_complexity_read_observed"] = True
         if tool_result.error is None:
             self._record_successful_plan_evidence_ref(tool_call, tool_result)
         return tool_result
@@ -1840,10 +2565,14 @@ class AsyncReActLoop:
         tool_result: ToolResult,
         batch_plan_guard_state: dict[str, Any],
     ) -> ToolResult:
-        metadata = dict(tool_result.metadata) if isinstance(tool_result.metadata, dict) else {}
+        metadata = (
+            dict(tool_result.metadata) if isinstance(tool_result.metadata, dict) else {}
+        )
         output = tool_result.output if isinstance(tool_result.output, Mapping) else None
         if tool_result.error is None:
-            save_status = str(metadata.get("save_status") or output.get("status") or "").strip()
+            save_status = str(
+                metadata.get("save_status") or output.get("status") or ""
+            ).strip()
             if save_status == "saved":
                 batch_plan_guard_state["successful_update_plan"] = True
                 batch_plan_guard_state["stale_effect_boundary"] = False
@@ -1853,8 +2582,21 @@ class AsyncReActLoop:
         if error_type == "stale_plan_revision":
             batch_plan_guard_state["stale_effect_boundary"] = True
             plan_runtime = self._plan_runtime_state()
-            if plan_runtime is not None and isinstance(metadata.get("current_revision"), int):
+            if plan_runtime is not None and isinstance(
+                metadata.get("current_revision"), int
+            ):
                 plan_runtime["current_revision"] = int(metadata["current_revision"])
+            context = self._tool_execution_context
+            if context is not None and isinstance(context.state, dict):
+                context.state["dynamic_complexity_plan_event"] = {
+                    "kind": "stale_revision",
+                    "ledger_id": (
+                        plan_runtime.get("ledger_id")
+                        if plan_runtime is not None
+                        else None
+                    ),
+                    "observed_revision": metadata.get("current_revision"),
+                }
             return ToolResult(
                 output=tool_result.output,
                 error=tool_result.error,
@@ -1870,7 +2612,11 @@ class AsyncReActLoop:
                 suggestion="Refresh the latest ledger revision with update_plan view, then retry the plan update.",
             )
 
-        if error_type not in {"plan_tool_invalid_request", "plan_transition_invalid", "plan_mutation_invalid"}:
+        if error_type not in {
+            "plan_tool_invalid_request",
+            "plan_transition_invalid",
+            "plan_mutation_invalid",
+        }:
             return tool_result
         used = self._plan_runtime_counter("plan_corrections_used")
         max_corrections = self._plan_runtime_counter("max_plan_prompt_corrections")
@@ -1893,7 +2639,9 @@ class AsyncReActLoop:
                 **metadata,
                 **self._runtime_error_taxonomy(
                     error_type="plan_update_malformed",
-                    recoverability="retrying" if retryable else "requires_replanning_or_activation",
+                    recoverability=(
+                        "retrying" if retryable else "requires_replanning_or_activation"
+                    ),
                     runtime_category="task_planning",
                 ),
                 "plan_corrections_used": used,
@@ -1907,7 +2655,9 @@ class AsyncReActLoop:
             ),
         )
 
-    def _record_successful_plan_evidence_ref(self, tool_call: ToolCall, tool_result: ToolResult) -> None:
+    def _record_successful_plan_evidence_ref(
+        self, tool_call: ToolCall, tool_result: ToolResult
+    ) -> None:
         context = self._tool_execution_context
         if context is None or not isinstance(context.state, dict):
             return
@@ -1918,17 +2668,23 @@ class AsyncReActLoop:
             else set()
         )
         recognized.add(tool_call.id)
-        metadata = tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        metadata = (
+            tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        )
         explicit_refs = metadata.get("evidence_refs")
         if isinstance(explicit_refs, (list, tuple, set, frozenset)):
-            recognized.update(str(item) for item in explicit_refs if isinstance(item, str) and item)
+            recognized.update(
+                str(item) for item in explicit_refs if isinstance(item, str) and item
+            )
         context.state["recognized_plan_evidence_refs"] = sorted(recognized)
 
     def _plan_finalization_issue(self) -> dict[str, Any] | None:
         plan_runtime = self._plan_runtime_state()
         if plan_runtime is None:
             return None
-        if not bool(plan_runtime.get("enabled")) or not bool(plan_runtime.get("required")):
+        if not bool(plan_runtime.get("enabled")) or not bool(
+            plan_runtime.get("required")
+        ):
             return None
         if plan_runtime.get("state") == "unavailable":
             return None
@@ -1938,7 +2694,10 @@ class AsyncReActLoop:
                 "error": "A durable task plan is still required before the turn can finalize.",
             }
         ledger_status = str(plan_runtime.get("ledger_status") or "").strip()
-        if ledger_status in {"completed", "cancelled"} or plan_runtime.get("state") == "terminal":
+        if (
+            ledger_status in {"completed", "cancelled"}
+            or plan_runtime.get("state") == "terminal"
+        ):
             return None
         return {
             "reason": "plan_incomplete_at_finalization",
@@ -1949,9 +2708,9 @@ class AsyncReActLoop:
     def _should_force_plan_finalization_followup(self) -> bool:
         if self._plan_finalization_issue() is None:
             return False
-        return self._plan_runtime_counter("finalization_nudges_used") < self._plan_runtime_counter(
-            "max_finalization_nudges"
-        )
+        return self._plan_runtime_counter(
+            "finalization_nudges_used"
+        ) < self._plan_runtime_counter("max_finalization_nudges")
 
     def _should_block_unsatisfied_plan_final(self, final_text: str) -> bool:
         if self._plan_finalization_issue() is None:
@@ -1983,7 +2742,9 @@ class AsyncReActLoop:
                 "A durable task plan is required for this turn before you can finalize. "
                 "Use update_plan to create the plan, set exactly one item to in_progress, and then continue."
             )
-        item_hint = f" Current in-progress item: {current_item_id}." if current_item_id else ""
+        item_hint = (
+            f" Current in-progress item: {current_item_id}." if current_item_id else ""
+        )
         return (
             "The durable task plan is still incomplete and must be updated before you finalize."
             f"{item_hint} Use update_plan to reflect the latest task state. "
@@ -2011,21 +2772,36 @@ class AsyncReActLoop:
                 runtime_category="task_planning",
             ),
             "reason": issue.get("reason") or "plan_finalization_required",
-            "plan_corrections_used": self._plan_runtime_counter("plan_corrections_used"),
-            "max_plan_corrections": self._plan_runtime_counter("max_plan_prompt_corrections"),
-            "finalization_nudges_used": self._plan_runtime_counter("finalization_nudges_used"),
-            "max_finalization_nudges": self._plan_runtime_counter("max_finalization_nudges"),
+            "plan_corrections_used": self._plan_runtime_counter(
+                "plan_corrections_used"
+            ),
+            "max_plan_corrections": self._plan_runtime_counter(
+                "max_plan_prompt_corrections"
+            ),
+            "finalization_nudges_used": self._plan_runtime_counter(
+                "finalization_nudges_used"
+            ),
+            "max_finalization_nudges": self._plan_runtime_counter(
+                "max_finalization_nudges"
+            ),
             "current_item_id": issue.get("current_item_id"),
         }
 
     @staticmethod
     def _available_file_mutation_tools(allowed_tool_names: set[str]) -> list[str]:
         preferred_order = ("file_write", "file_edit", "apply_patch")
-        return [tool_name for tool_name in preferred_order if tool_name in allowed_tool_names]
+        return [
+            tool_name
+            for tool_name in preferred_order
+            if tool_name in allowed_tool_names
+        ]
 
     @staticmethod
     def _is_file_mutation_tool(tool_name: str) -> bool:
-        return tool_name in {"file_write", "file_edit", "apply_patch"}
+        # Keep aligned with recovery operation evidence and any dynamically
+        # registered deletion implementation; delete uses the same canonical
+        # path allowlist as write/edit.
+        return tool_name in {"file_write", "file_edit", "file_delete", "apply_patch"}
 
     def _update_file_artifact_guard_state(
         self,
@@ -2037,17 +2813,23 @@ class AsyncReActLoop:
         if not self._is_file_mutation_tool(tool_call.name):
             return
         file_artifact_guard_state["last_tool_name"] = tool_call.name
-        metadata = tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        metadata = (
+            tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        )
         file_changes = metadata.get("file_changes")
         has_file_changes = isinstance(file_changes, list) and bool(file_changes)
         if tool_result.error:
             file_artifact_guard_state["last_error"] = tool_result.error
             return
-        if has_file_changes and ("bytes_written" in metadata or tool_result.output is not None):
+        if has_file_changes and (
+            "bytes_written" in metadata or tool_result.output is not None
+        ):
             file_artifact_guard_state["satisfied"] = True
             paths = metadata.get("paths")
             if isinstance(paths, list):
-                file_artifact_guard_state["mutation_paths"] = [str(path) for path in paths if path]
+                file_artifact_guard_state["mutation_paths"] = [
+                    str(path) for path in paths if path
+                ]
             elif len(file_changes) == 1 and isinstance(file_changes[0], dict):
                 path = file_changes[0].get("path")
                 if path:
@@ -2055,7 +2837,9 @@ class AsyncReActLoop:
             file_artifact_guard_state["last_error"] = None
 
     @staticmethod
-    def _should_force_file_artifact_followup(file_artifact_guard_state: dict[str, Any]) -> bool:
+    def _should_force_file_artifact_followup(
+        file_artifact_guard_state: dict[str, Any],
+    ) -> bool:
         if bool(file_artifact_guard_state.get("satisfied")):
             return False
         return int(file_artifact_guard_state.get("nudge_count") or 0) < 2
@@ -2098,7 +2882,11 @@ class AsyncReActLoop:
         allowed_tool_names: set[str],
     ) -> str:
         available_tools = self._available_file_mutation_tools(allowed_tool_names)
-        tool_hint = ", ".join(available_tools) if available_tools else "no file mutation tools are exposed"
+        tool_hint = (
+            ", ".join(available_tools)
+            if available_tools
+            else "no file mutation tools are exposed"
+        )
         last_error = str(file_artifact_guard_state.get("last_error") or "").strip()
         if last_error:
             return (
@@ -2125,7 +2913,9 @@ class AsyncReActLoop:
     ) -> str:
         available_tools = self._available_file_mutation_tools(allowed_tool_names)
         last_error = str(file_artifact_guard_state.get("last_error") or "").strip()
-        last_tool_name = str(file_artifact_guard_state.get("last_tool_name") or "").strip()
+        last_tool_name = str(
+            file_artifact_guard_state.get("last_tool_name") or ""
+        ).strip()
         hidden_mutation_tool = (
             bool(last_tool_name)
             and self._is_file_mutation_tool(last_tool_name)
@@ -2152,10 +2942,14 @@ class AsyncReActLoop:
                 runtime_category="deliverable_guard",
             ),
             "reason": "file_artifact_not_mutated",
-            "available_file_mutation_tools": self._available_file_mutation_tools(allowed_tool_names),
+            "available_file_mutation_tools": self._available_file_mutation_tools(
+                allowed_tool_names
+            ),
             "last_file_mutation_error": last_error,
             "last_file_mutation_tool": last_tool_name,
-            "mutation_paths": list(file_artifact_guard_state.get("mutation_paths") or []),
+            "mutation_paths": list(
+                file_artifact_guard_state.get("mutation_paths") or []
+            ),
         }
 
     async def _consume_live_subagent_guidance(self) -> Message | None:
@@ -2176,14 +2970,17 @@ class AsyncReActLoop:
         lines.extend(f"- {content}" for content in contents)
         return Message(role="user", content="\n".join(lines))
 
-    def _split_thinking_blocks(self, content: str, thinking: str = "") -> tuple[str, str]:
+    def _split_thinking_blocks(
+        self, content: str, thinking: str = ""
+    ) -> tuple[str, str]:
         closing_only_match = _find_closing_reasoning_tag(content)
-        if _find_opening_reasoning_tag(content) is None and closing_only_match is not None:
+        if (
+            _find_opening_reasoning_tag(content) is None
+            and closing_only_match is not None
+        ):
             visible = content[closing_only_match[0] + len(closing_only_match[2]) :]
             combined_thinking = "".join(
-                part
-                for part in (thinking, content[: closing_only_match[0]])
-                if part
+                part for part in (thinking, content[: closing_only_match[0]]) if part
             ).strip()
             return (
                 self._sanitize_reasoning_artifacts(visible),
@@ -2193,11 +2990,11 @@ class AsyncReActLoop:
         visible, extracted_thinking = self._split_stream_thinking_delta(content, state)
         visible_tail, thinking_tail = self._finalize_stream_thinking_delta(state)
         combined_thinking = "".join(
-            part
-            for part in (thinking, extracted_thinking, thinking_tail)
-            if part
+            part for part in (thinking, extracted_thinking, thinking_tail) if part
         ).strip()
-        sanitized_visible = self._sanitize_reasoning_artifacts((visible + visible_tail).strip())
+        sanitized_visible = self._sanitize_reasoning_artifacts(
+            (visible + visible_tail).strip()
+        )
         sanitized_thinking = self._sanitize_reasoning_artifacts(combined_thinking)
         return sanitized_visible, sanitized_thinking
 
@@ -2224,10 +3021,15 @@ class AsyncReActLoop:
                         in_think = False
                     continue
                 if target is None and any(
-                    candidate.startswith(lowered_buffer) for candidate in _REASONING_OPEN_TAGS
+                    candidate.startswith(lowered_buffer)
+                    for candidate in _REASONING_OPEN_TAGS
                 ):
                     matched_open_tag = next(
-                        (candidate for candidate in _REASONING_OPEN_TAGS if candidate == lowered_buffer),
+                        (
+                            candidate
+                            for candidate in _REASONING_OPEN_TAGS
+                            if candidate == lowered_buffer
+                        ),
                         None,
                     )
                     if matched_open_tag is not None:
@@ -2337,14 +3139,20 @@ class AsyncReActLoop:
         tool_call: ToolCall,
         allowed_tool_names: set[str],
     ) -> ToolResult | None:
-        if tool_call.name and tool_call.name in allowed_tool_names and self._tool_registry is not None:
+        if (
+            tool_call.name
+            and tool_call.name in allowed_tool_names
+            and self._tool_registry is not None
+        ):
             if self._tool_registry.get(tool_call.name) is not None:
                 return None
 
         available_tools = sorted(name for name in allowed_tool_names if name)
         available_preview = ", ".join(available_tools[:12])
         if len(available_tools) > 12:
-            available_preview = f"{available_preview}, +{len(available_tools) - 12} more"
+            available_preview = (
+                f"{available_preview}, +{len(available_tools) - 12} more"
+            )
         available_hint = available_preview or "(none)"
         requested_tool = tool_call.name or "(empty tool name)"
 
@@ -2404,7 +3212,9 @@ class AsyncReActLoop:
         elif isinstance(output, str):
             compact_payload = {
                 "ok": True,
-                "output": self._truncate_text(output, self._max_tool_message_chars // 2),
+                "output": self._truncate_text(
+                    output, self._max_tool_message_chars // 2
+                ),
                 "truncated": True,
                 "original_length": len(output),
             }
@@ -2467,7 +3277,9 @@ class AsyncReActLoop:
 
     @staticmethod
     def _combine_reasoning_segments(*segments: str) -> str:
-        cleaned = [segment.strip() for segment in segments if segment and segment.strip()]
+        cleaned = [
+            segment.strip() for segment in segments if segment and segment.strip()
+        ]
         return "\n\n".join(cleaned)
 
     @staticmethod
@@ -2482,7 +3294,9 @@ class AsyncReActLoop:
         evidence_guard_state["last_low_info_lines"] = diagnostics.get("lines")
 
     @staticmethod
-    def _clear_low_information_fetch_guard(evidence_guard_state: dict[str, Any]) -> None:
+    def _clear_low_information_fetch_guard(
+        evidence_guard_state: dict[str, Any],
+    ) -> None:
         evidence_guard_state["requires_more_retrieval"] = False
         evidence_guard_state["nudge_count"] = 0
         evidence_guard_state["followup_attempts"] = 0
@@ -2572,7 +3386,10 @@ class AsyncReActLoop:
         tool_result: ToolResult,
         evidence_guard_state: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if isinstance(tool_result.output, str) and len(tool_result.output.strip()) >= 24:
+        if (
+            isinstance(tool_result.output, str)
+            and len(tool_result.output.strip()) >= 24
+        ):
             return None
         results = self._extract_web_search_results(tool_result.output)
         if not results:
@@ -2584,7 +3401,9 @@ class AsyncReActLoop:
                 "attempts": int(evidence_guard_state.get("followup_attempts") or 0),
             }
 
-        last_low_info_url = self._normalize_url(str(evidence_guard_state.get("last_low_info_url") or ""))
+        last_low_info_url = self._normalize_url(
+            str(evidence_guard_state.get("last_low_info_url") or "")
+        )
         normalized_urls = [
             self._normalize_url(str(item.get("url") or ""))
             for item in results
@@ -2592,7 +3411,8 @@ class AsyncReActLoop:
         ]
         distinct_urls = {url for url in normalized_urls if url}
         different_urls = {
-            url for url in distinct_urls
+            url
+            for url in distinct_urls
             if not last_low_info_url or url != last_low_info_url
         }
         text_chars = 0
@@ -2606,7 +3426,9 @@ class AsyncReActLoop:
             text_chars += len(title) + len(snippet) + len(content)
             content_chars += len(content)
 
-        if different_urls and (text_chars >= 180 or len(different_urls) >= 2 or content_chars >= 120):
+        if different_urls and (
+            text_chars >= 180 or len(different_urls) >= 2 or content_chars >= 120
+        ):
             return None
 
         reason = "web_search_repeated_low_information_source"
@@ -2653,7 +3475,9 @@ class AsyncReActLoop:
         if not normalized:
             return tool_content, None
         non_empty_lines = [line.strip() for line in output.splitlines() if line.strip()]
-        metadata = tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        metadata = (
+            tool_result.metadata if isinstance(tool_result.metadata, dict) else {}
+        )
         if (
             len(normalized) >= 600
             and len(non_empty_lines) >= 6
@@ -2708,7 +3532,9 @@ class AsyncReActLoop:
             return True
 
         punctuation_light = sum(1 for char in normalized if char in ":：|/»›>")
-        if punctuation_light >= 6 and len(unique_lines) <= max(4, len(non_empty_lines) // 2):
+        if punctuation_light >= 6 and len(unique_lines) <= max(
+            4, len(non_empty_lines) // 2
+        ):
             return True
 
         return False
@@ -2756,7 +3582,9 @@ class AsyncReActLoop:
     ) -> str | None:
         if retry_count >= 1 or not isinstance(exc, BackendRequestError):
             return None
-        tool_turn_reason = str(exc.metadata.get("tool_turn_reason") or "").strip().lower()
+        tool_turn_reason = (
+            str(exc.metadata.get("tool_turn_reason") or "").strip().lower()
+        )
         if tool_turn_reason not in {"thinking_only", "empty"}:
             return None
         if any(message.role == "tool" for message in messages):
@@ -2874,9 +3702,14 @@ class AsyncReActLoop:
     def _build_iteration_progress_event(self, *, iteration: int) -> StatusEvent | None:
         backend_info = self._backend.get_model_info()
         backend_type = backend_info.backend_type.strip().lower()
-        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        metadata = (
+            backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        )
         tool_mode = metadata.get("tool_call_mode")
-        if backend_type in {"gguf", "safetensors", "llama_cpp_server"} and tool_mode != "simulated_fallback":
+        if (
+            backend_type in {"gguf", "safetensors", "llama_cpp_server"}
+            and tool_mode != "simulated_fallback"
+        ):
             return None
 
         backend_detail = self._build_backend_runtime_detail()
@@ -2895,7 +3728,9 @@ class AsyncReActLoop:
     def _build_backend_runtime_detail(self) -> str:
         backend_info = self._backend.get_model_info()
         details: list[str] = []
-        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        metadata = (
+            backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        )
         has_interesting_metadata = False
 
         api_mode = metadata.get("api_mode")
@@ -2909,7 +3744,11 @@ class AsyncReActLoop:
             details.append(f"tools={tool_mode}")
 
         native_status = metadata.get("native_tool_calling_status")
-        if isinstance(native_status, str) and native_status and native_status != "unknown":
+        if (
+            isinstance(native_status, str)
+            and native_status
+            and native_status != "unknown"
+        ):
             has_interesting_metadata = True
             details.append(f"native_status={native_status}")
 
@@ -2930,7 +3769,9 @@ class AsyncReActLoop:
         if backend_type not in {"openai_compat", "openai_codex"}:
             return False
 
-        metadata = backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        metadata = (
+            backend_info.metadata if isinstance(backend_info.metadata, dict) else {}
+        )
         if metadata.get("request_shape") == "responses":
             return False
         tool_mode = metadata.get("tool_call_mode")
@@ -2999,7 +3840,9 @@ class AsyncReActLoop:
             current.index = next_tool_call.index
 
     @staticmethod
-    def _ordered_stream_tool_calls(streamed_tool_calls: dict[str, ToolCall]) -> list[ToolCall]:
+    def _ordered_stream_tool_calls(
+        streamed_tool_calls: dict[str, ToolCall],
+    ) -> list[ToolCall]:
         return sorted(
             streamed_tool_calls.values(),
             key=lambda tool_call: (
@@ -3016,7 +3859,12 @@ class AsyncReActLoop:
     ) -> None:
         if not isinstance(metadata, dict):
             return
-        for key in ("api_mode", "tool_call_mode", "native_tool_calling_status", "request_shape"):
+        for key in (
+            "api_mode",
+            "tool_call_mode",
+            "native_tool_calling_status",
+            "request_shape",
+        ):
             value = metadata.get(key)
             if isinstance(value, str) and value:
                 backend_metadata[key] = value
@@ -3045,11 +3893,16 @@ class AsyncReActLoop:
             return value.strip()
         if isinstance(value, dict):
             return {
-                str(child_key): AsyncReActLoop._normalize_tool_argument_value(str(child_key), child_value)
+                str(child_key): AsyncReActLoop._normalize_tool_argument_value(
+                    str(child_key), child_value
+                )
                 for child_key, child_value in sorted(value.items())
             }
         if isinstance(value, list):
-            return [AsyncReActLoop._normalize_tool_argument_value(key, item) for item in value]
+            return [
+                AsyncReActLoop._normalize_tool_argument_value(key, item)
+                for item in value
+            ]
         return value
 
     @staticmethod
@@ -3077,12 +3930,22 @@ class AsyncReActLoop:
         web_search_guard_state: dict[str, Any],
     ) -> ToolResult | None:
         if tool_call.name == "web_fetch":
-            normalized_url = self._normalize_url(str(tool_call.arguments.get("url", "")))
+            normalized_url = self._normalize_url(
+                str(tool_call.arguments.get("url", ""))
+            )
             blocked_urls = web_fetch_guard_state.get("blocked_urls", {})
             if isinstance(blocked_urls, dict) and normalized_url in blocked_urls:
                 blocked_info = blocked_urls[normalized_url]
-                failure_count = blocked_info.get("failure_count", 2) if isinstance(blocked_info, dict) else 2
-                status_code = blocked_info.get("status_code") if isinstance(blocked_info, dict) else None
+                failure_count = (
+                    blocked_info.get("failure_count", 2)
+                    if isinstance(blocked_info, dict)
+                    else 2
+                )
+                status_code = (
+                    blocked_info.get("status_code")
+                    if isinstance(blocked_info, dict)
+                    else None
+                )
                 return ToolResult(
                     error=(
                         "Skipping repeated fetch because this URL already failed multiple times: "
@@ -3098,12 +3961,25 @@ class AsyncReActLoop:
                     suggestion="Use another source or summarize from the evidence already collected.",
                 )
         if tool_call.name == "web_search":
-            normalized_query = self._normalize_text(str(tool_call.arguments.get("query", "")))
+            normalized_query = self._normalize_text(
+                str(tool_call.arguments.get("query", ""))
+            )
             blocked_queries = web_search_guard_state.get("blocked_queries", {})
-            if isinstance(blocked_queries, dict) and normalized_query in blocked_queries:
+            if (
+                isinstance(blocked_queries, dict)
+                and normalized_query in blocked_queries
+            ):
                 blocked_info = blocked_queries[normalized_query]
-                failure_count = blocked_info.get("failure_count", 2) if isinstance(blocked_info, dict) else 2
-                provider = blocked_info.get("provider") if isinstance(blocked_info, dict) else None
+                failure_count = (
+                    blocked_info.get("failure_count", 2)
+                    if isinstance(blocked_info, dict)
+                    else 2
+                )
+                provider = (
+                    blocked_info.get("provider")
+                    if isinstance(blocked_info, dict)
+                    else None
+                )
                 return ToolResult(
                     error=(
                         "Skipping repeated search because this query already failed multiple times: "
@@ -3122,7 +3998,9 @@ class AsyncReActLoop:
                     ),
                 )
 
-        if literature_state["summary_ready"] and self._is_research_retrieval_tool_call(tool_call):
+        if literature_state["summary_ready"] and self._is_research_retrieval_tool_call(
+            tool_call
+        ):
             return ToolResult(
                 output=(
                     "Sufficient literature evidence is already collected. "
@@ -3163,7 +4041,9 @@ class AsyncReActLoop:
         if tool_result.error:
             last_failed_url = web_fetch_guard_state.get("last_failed_url")
             failure_streak = int(web_fetch_guard_state.get("failure_streak", 0))
-            failure_streak = failure_streak + 1 if last_failed_url == normalized_url else 1
+            failure_streak = (
+                failure_streak + 1 if last_failed_url == normalized_url else 1
+            )
             web_fetch_guard_state["last_failed_url"] = normalized_url
             web_fetch_guard_state["failure_streak"] = failure_streak
             if failure_streak >= 2:
@@ -3188,7 +4068,9 @@ class AsyncReActLoop:
         if tool_call.name != "web_search":
             return
 
-        normalized_query = self._normalize_text(str(tool_call.arguments.get("query", "")))
+        normalized_query = self._normalize_text(
+            str(tool_call.arguments.get("query", ""))
+        )
         if not normalized_query:
             return
 
@@ -3200,11 +4082,15 @@ class AsyncReActLoop:
         if tool_result.error:
             last_failed_query = web_search_guard_state.get("last_failed_query")
             failure_streak = int(web_search_guard_state.get("failure_streak", 0))
-            failure_streak = failure_streak + 1 if last_failed_query == normalized_query else 1
+            failure_streak = (
+                failure_streak + 1 if last_failed_query == normalized_query else 1
+            )
             web_search_guard_state["last_failed_query"] = normalized_query
             web_search_guard_state["failure_streak"] = failure_streak
             if failure_streak >= 2:
-                provider = tool_result.metadata.get("engine") or tool_result.metadata.get("provider")
+                provider = tool_result.metadata.get(
+                    "engine"
+                ) or tool_result.metadata.get("provider")
                 blocked_queries[normalized_query] = {
                     "failure_count": failure_streak,
                     "provider": provider,
@@ -3216,8 +4102,12 @@ class AsyncReActLoop:
             web_search_guard_state["failure_streak"] = 0
         blocked_queries.pop(normalized_query, None)
 
-    def _mark_literature_research_mode(self, tool_call: ToolCall, literature_state: dict[str, Any]) -> None:
-        if self._is_literature_tool_name(tool_call.name) or self._tool_call_mentions_literature(tool_call):
+    def _mark_literature_research_mode(
+        self, tool_call: ToolCall, literature_state: dict[str, Any]
+    ) -> None:
+        if self._is_literature_tool_name(
+            tool_call.name
+        ) or self._tool_call_mentions_literature(tool_call):
             literature_state["research_mode"] = True
 
     def _update_literature_state(
@@ -3231,7 +4121,12 @@ class AsyncReActLoop:
         if tool_result.error:
             return
 
-        if tool_call.name in {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"}:
+        if tool_call.name in {
+            "arxiv_search",
+            "semantic_scholar_search",
+            "crossref_search",
+            "pubmed_search",
+        }:
             output = tool_result.output if isinstance(tool_result.output, list) else []
             literature_state["paper_hits"] += len(output)
             literature_state["abstract_hits"] += sum(
@@ -3249,7 +4144,9 @@ class AsyncReActLoop:
                     search_tools.add(tool_call.name)
                 query = tool_call.arguments.get("query")
                 if isinstance(query, str) and query.strip():
-                    search_queries = literature_state.setdefault("search_queries", set())
+                    search_queries = literature_state.setdefault(
+                        "search_queries", set()
+                    )
                     if isinstance(search_queries, set):
                         search_queries.add(self._normalize_text(query))
         elif tool_call.name == "web_fetch":
@@ -3260,11 +4157,18 @@ class AsyncReActLoop:
                     literature_state["fetched_docs"] += 1
                     literature_state["fetched_chars"] += len(output)
 
-        literature_state["summary_ready"] = self._has_sufficient_literature_evidence(literature_state)
+        literature_state["summary_ready"] = self._has_sufficient_literature_evidence(
+            literature_state
+        )
 
     @staticmethod
     def _is_literature_tool_name(tool_name: str) -> bool:
-        return tool_name in {"arxiv_search", "semantic_scholar_search", "crossref_search", "pubmed_search"}
+        return tool_name in {
+            "arxiv_search",
+            "semantic_scholar_search",
+            "crossref_search",
+            "pubmed_search",
+        }
 
     def _tool_call_mentions_literature(self, tool_call: ToolCall) -> bool:
         query = tool_call.arguments.get("query")
@@ -3301,7 +4205,9 @@ class AsyncReActLoop:
             "pubmed_search",
         }
 
-    def _has_sufficient_literature_evidence(self, literature_state: dict[str, Any]) -> bool:
+    def _has_sufficient_literature_evidence(
+        self, literature_state: dict[str, Any]
+    ) -> bool:
         if not literature_state["research_mode"]:
             return False
         paper_hits = int(literature_state["paper_hits"])
@@ -3310,12 +4216,22 @@ class AsyncReActLoop:
         fetched_chars = int(literature_state["fetched_chars"])
         search_tools = literature_state.get("search_tools")
         search_queries = literature_state.get("search_queries")
-        distinct_search_tools = len(search_tools) if isinstance(search_tools, set) else 0
-        distinct_search_queries = len(search_queries) if isinstance(search_queries, set) else 0
-        has_corroborated_search = distinct_search_tools >= 2 or distinct_search_queries >= 2
+        distinct_search_tools = (
+            len(search_tools) if isinstance(search_tools, set) else 0
+        )
+        distinct_search_queries = (
+            len(search_queries) if isinstance(search_queries, set) else 0
+        )
+        has_corroborated_search = (
+            distinct_search_tools >= 2 or distinct_search_queries >= 2
+        )
         return (
             (has_corroborated_search and paper_hits >= 3 and abstract_hits >= 2)
-            or (paper_hits >= 2 and fetched_docs >= 1 and (abstract_hits >= 1 or fetched_chars >= 2500))
+            or (
+                paper_hits >= 2
+                and fetched_docs >= 1
+                and (abstract_hits >= 1 or fetched_chars >= 2500)
+            )
             or (paper_hits >= 2 and fetched_docs >= 2)
         )
 

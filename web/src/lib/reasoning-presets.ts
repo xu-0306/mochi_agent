@@ -17,6 +17,7 @@ const ALL_REASONING_EFFORTS: ReasoningEffort[] = [
   'medium',
   'high',
   'xhigh',
+  'max',
 ]
 
 const THINKING_LEVEL_DEFINITIONS: Array<{
@@ -29,25 +30,25 @@ const THINKING_LEVEL_DEFINITIONS: Array<{
     value: 'fast',
     label: 'Fast',
     description: 'Keep latency down with a lighter reasoning pass.',
-    priorities: ['minimal', 'low', 'none', 'medium', 'high', 'xhigh'],
+    priorities: ['minimal', 'low', 'none', 'medium', 'high', 'xhigh', 'max'],
   },
   {
     value: 'balanced',
     label: 'Balanced',
     description: 'Default tradeoff for most chats and coding work.',
-    priorities: ['medium', 'low', 'minimal', 'high', 'none', 'xhigh'],
+    priorities: ['medium', 'low', 'minimal', 'high', 'none', 'xhigh', 'max'],
   },
   {
     value: 'deep',
     label: 'Deep',
     description: 'Spend more effort on harder planning and debugging tasks.',
-    priorities: ['high', 'xhigh', 'medium', 'low', 'minimal', 'none'],
+    priorities: ['high', 'xhigh', 'max', 'medium', 'low', 'minimal', 'none'],
   },
   {
     value: 'max',
     label: 'Max',
     description: 'Use the highest supported effort when quality matters most.',
-    priorities: ['xhigh', 'high', 'medium', 'low', 'minimal', 'none'],
+    priorities: ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'],
   },
 ]
 
@@ -57,6 +58,9 @@ export function formatReasoningEffortLabel(value: ReasoningEffort | null | undef
   }
   if (value === 'xhigh') {
     return 'Extra High'
+  }
+  if (value === 'max') {
+    return 'Max'
   }
   if (value === 'minimal') {
     return 'Minimal'
@@ -107,7 +111,7 @@ export function resolveThinkingLevel(value: ReasoningEffort | null | undefined):
   if (value === 'high') {
     return 'deep'
   }
-  if (value === 'xhigh') {
+  if (value === 'xhigh' || value === 'max') {
     return 'max'
   }
   return 'fast'

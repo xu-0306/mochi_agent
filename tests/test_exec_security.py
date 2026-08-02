@@ -140,6 +140,29 @@ def test_command_security_cmd_c_classification() -> None:
     assert deny_result.rule_id == "cmd_high_risk_chaining"
 
 
+def test_command_security_does_not_treat_wrapped_cmd_switches_as_paths() -> None:
+    policy = CommandSecurityPolicy(
+        workspace_dir="H:/_python/agent_mochi",
+        allow_dangerous_interpreters=True,
+    )
+
+    result = policy.classify(
+        "rtk proxy cmd.exe /d /c echo TOOL_FLOW_OK",
+    )
+
+    assert result.action == "ask"
+    assert result.rule_id == "unknown_requires_approval"
+    assert result.parsed_tokens == (
+        "rtk",
+        "proxy",
+        "cmd.exe",
+        "/d",
+        "/c",
+        "echo",
+        "TOOL_FLOW_OK",
+    )
+
+
 def test_command_security_saved_rules_apply_inside_windows_shell_branches() -> None:
     powershell_policy = CommandSecurityPolicy(
         command_rules=[_allow_rule("Get-Process", shells=["powershell"])],

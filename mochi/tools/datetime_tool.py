@@ -2,59 +2,41 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from mochi.tools.base import BaseTool, ToolResult
-
-# zoneinfo 在 Windows 需要 tzdata 套件；我們提供常用時區的 UTC offset fallback
-try:
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-    _zoneinfo_available = True
-except ImportError:
-    _zoneinfo_available = False
-
-    class ZoneInfoNotFoundError(KeyError):  # type: ignore[no-redef]
-        """Stub for missing zoneinfo."""
-
-# 常用 IANA 時區 → UTC offset (hours) 的 fallback 對照表
-_FALLBACK_OFFSETS: dict[str, float] = {
-    "Asia/Taipei": 8, "Asia/Shanghai": 8, "Asia/Hong_Kong": 8, "Asia/Singapore": 8,
-    "Asia/Tokyo": 9, "Asia/Seoul": 9,
-    "Asia/Kolkata": 5.5, "Asia/Bangkok": 7,
-    "US/Eastern": -5, "America/New_York": -5,
-    "US/Central": -6, "America/Chicago": -6,
-    "US/Mountain": -7, "America/Denver": -7,
-    "US/Pacific": -8, "America/Los_Angeles": -8,
-    "Europe/London": 0, "Europe/Berlin": 1, "Europe/Paris": 1,
-    "Europe/Moscow": 3,
-    "Australia/Sydney": 11, "Pacific/Auckland": 12,
-}
+from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
-def _resolve_timezone(tz_name: str) -> timezone | Any | None:
-    """解析時區名稱，支援 zoneinfo → fallback offset → None。"""
+def _resolve_timezone(tz_name: str) -> tzinfo | None:
+    """Resolve one IANA timezone through the platform/tzdata database."""
     if tz_name.upper() == "UTC":
         return UTC
 
-    # 嘗試 zoneinfo（需要 tzdata）
-    if _zoneinfo_available:
-        try:
-            return ZoneInfo(tz_name)
-        except (ZoneInfoNotFoundError, KeyError):
-            pass
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
 
-    # Fallback: 常用時區 offset 對照表
-    offset = _FALLBACK_OFFSETS.get(tz_name)
-    if offset is not None:
-        return timezone(timedelta(hours=offset), name=tz_name)
 
-    return None
+def _local_timezone() -> tuple[str, tzinfo]:
+    """Return the backend system timezone without assuming a named region."""
+    local_now = datetime.now().astimezone()
+    local_tz = local_now.tzinfo
+    if local_tz is None:
+        return "UTC", UTC
+    zone_key = getattr(local_tz, "key", None)
+    if isinstance(zone_key, str) and zone_key.strip():
+        return zone_key.strip(), local_tz
+    return local_now.tzname() or "UTC", local_tz
 
 
 class DateTimeTool(BaseTool):
     """取得目前日期時間或執行時間運算。"""
+
+    def __init__(self, *, default_timezone: str | None = "auto") -> None:
+        self._default_timezone = default_timezone
 
     @property
     def name(self) -> str:
@@ -70,16 +52,27 @@ class DateTimeTool(BaseTool):
         )
 
     @property
+    def is_read_only(self) -> bool:
+        return True
+
+    @property
+    def tool_capabilities(self) -> dict[str, Any]:
+        return {
+            **super().tool_capabilities,
+            "capabilities": ["temporal_lookup"],
+        }
+
+    @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
                 "timezone": {
                     "type": "string",
-                    "default": "UTC",
                     "description": (
-                        "IANA timezone name (e.g. 'Asia/Taipei', 'US/Eastern', "
-                        "'Europe/London', 'UTC'). Defaults to UTC."
+                        "Optional IANA timezone name (e.g. 'Asia/Taipei', "
+                        "'Africa/Nairobi', or 'UTC'). Omit it to use the "
+                        "current user's timezone."
                     ),
                 },
                 "format": {
@@ -107,21 +100,53 @@ class DateTimeTool(BaseTool):
             "additionalProperties": False,
         }
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        context: ToolExecutionContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """取得時間。"""
-        tz_name = str(kwargs.get("timezone", "UTC")).strip()
         fmt = str(kwargs.get("format", "iso")).strip()
         offset_days = int(kwargs.get("offset_days", 0))
         offset_hours = int(kwargs.get("offset_hours", 0))
 
-        # 解析時區
-        tz = _resolve_timezone(tz_name)
+        timezone_source = "tool_argument"
+        if "timezone" in kwargs:
+            tz_name = str(kwargs["timezone"]).strip()
+            tz = _resolve_timezone(tz_name)
+        else:
+            timezone_source = "client"
+            client_timezone = (
+                context.client_timezone.strip()
+                if context is not None
+                and isinstance(context.client_timezone, str)
+                and context.client_timezone.strip()
+                else None
+            )
+            tz_name = client_timezone or ""
+            tz = _resolve_timezone(tz_name) if tz_name else None
+
+            configured_timezone = (
+                self._default_timezone.strip()
+                if isinstance(self._default_timezone, str)
+                and self._default_timezone.strip()
+                and self._default_timezone.strip().casefold() != "auto"
+                else None
+            )
+            if tz is None and client_timezone is None and configured_timezone is not None:
+                timezone_source = "configured_default"
+                tz_name = configured_timezone
+                tz = _resolve_timezone(tz_name)
+            if tz is None and client_timezone is None:
+                timezone_source = "system"
+                tz_name, tz = _local_timezone()
+
         if tz is None:
             return ToolResult(
                 error=f"Unknown timezone: '{tz_name}'.",
                 suggestion=(
                     "Use a valid IANA timezone name like 'Asia/Taipei', "
-                    "'US/Eastern', 'Europe/London', or 'UTC'."
+                    "'Africa/Nairobi', 'Europe/London', or 'UTC'."
                 ),
             )
 
@@ -153,5 +178,9 @@ class DateTimeTool(BaseTool):
                 "date": now.strftime("%Y-%m-%d"),
                 "time": now.strftime("%H:%M:%S"),
             },
-            metadata={"timezone": tz_name, "format": fmt},
+            metadata={
+                "timezone": tz_name,
+                "timezone_source": timezone_source,
+                "format": fmt,
+            },
         )

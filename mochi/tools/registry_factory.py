@@ -582,10 +582,10 @@ class ToolRegistryFactory:
         return CalculatorTool()
 
     def _build_datetime(self, config: MochiConfig, workspace_dir: str, services: dict[str, Any]) -> BaseTool:
-        del config, workspace_dir, services
+        del workspace_dir, services
         from mochi.tools.datetime_tool import DateTimeTool
 
-        return DateTimeTool()
+        return DateTimeTool(default_timezone=config.locale_defaults.timezone)
 
     def _resolve_exec_default_shell(self) -> str:
         configured = self._config.security.exec_default_shell

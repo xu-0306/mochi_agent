@@ -32,8 +32,10 @@ from mochi.agents.capability_exposure_adapter import (
 )
 from mochi.agents.capability_planner import CapabilityPlanner, CatalogToolDescriptor
 from mochi.agents.complexity_gate import (
+    ComplexityAdvisorRequest,
     ComplexityActivePlanSummary,
     ComplexityCapabilitySummary,
+    ComplexityDecision,
     ComplexityGate,
     ComplexityGateConfig as RuntimeComplexityGateConfig,
     ComplexityGateRequest,
@@ -55,6 +57,13 @@ from mochi.agents.artifact_verifier import (
     ArtifactVerifier,
     ToolExecutionEvidence,
     ValidationProfileRegistry,
+)
+from mochi.agents.adaptive_diagnostics import (
+    AdaptiveDiagnosticsAccumulator,
+    AdaptiveDiagnosticsRecord,
+    AdaptiveDiagnosticsRepository,
+    get_context_diagnostics_accumulator,
+    initialize_turn_diagnostics_accumulator,
 )
 from mochi.agents.context import ContextManager, PromptContext
 from mochi.agents.context_snapshot import (
@@ -108,14 +117,18 @@ from mochi.agents.outcome_verifier import (
 )
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
-from mochi.agents.recovery_policy import RecoveryBudget, RecoveryPolicy
+from mochi.agents.recovery_policy import (
+    RECOVERY_CONTEXT_VERSION,
+    RecoveryBudget,
+    RecoveryPolicy,
+)
 from mochi.agents.turn_intent_contract import DeliverableContract
 from mochi.agents.turn_contract_rollout import (
     TurnContractRolloutResult,
     build_capability_plan,
     conversation_inputs_from_prompt_context,
 )
-from mochi.backends.base import BaseLLMBackend
+from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.inference_capabilities import (
     InferenceCapabilities,
     ReasoningEffort,
@@ -478,6 +491,109 @@ def _active_remote_model_name(config: MochiConfig) -> str:
     return config.openai_compat.model
 
 
+def _record_direct_model_diagnostics(
+    accumulator: AdaptiveDiagnosticsAccumulator | None,
+    *,
+    started_at: float,
+    result: GenerationResult | None,
+) -> None:
+    if accumulator is None:
+        return
+    input_tokens = (
+        result.input_tokens
+        if result is not None and type(result.input_tokens) is int
+        and result.input_tokens >= 0
+        else 0
+    )
+    output_tokens = (
+        result.output_tokens
+        if result is not None and type(result.output_tokens) is int
+        and result.output_tokens >= 0
+        else 0
+    )
+    usage_observed = bool(
+        result is not None
+        and (
+            bool(getattr(result, "usage_observed", False))
+            or input_tokens > 0
+            or output_tokens > 0
+        )
+    )
+    try:
+        accumulator.add_model_call(
+            input_tokens=min(input_tokens, 1_000_000),
+            output_tokens=min(output_tokens, 1_000_000),
+            wall_ms=min(
+                int(max(0.0, time.perf_counter() - started_at) * 1000),
+                1_000_000,
+            ),
+            usage_observed=usage_observed,
+            wall_observed=True,
+        )
+    except Exception:
+        logger.debug("Unable to record direct adaptive model diagnostics")
+
+
+class _BackendComplexityAdvisor:
+    """Tool-less bounded JSON advisor over the validated semantic contract."""
+
+    def __init__(
+        self,
+        *,
+        backend: BaseLLMBackend,
+        max_tokens: int,
+        diagnostics: AdaptiveDiagnosticsAccumulator | None,
+    ) -> None:
+        self._backend = backend
+        self._max_tokens = max_tokens
+        self._diagnostics = diagnostics
+
+    async def advise(self, request: ComplexityAdvisorRequest) -> Mapping[str, Any]:
+        result: GenerationResult | None = None
+        started_at = time.perf_counter()
+        try:
+            raw = await self._backend.generate(
+                [
+                    Message(
+                        role="system",
+                        content=(
+                            "Return exactly one JSON object and no other text. "
+                            "Assess only the supplied validated task contract. Required "
+                            "keys: response_version, plan_recommended, "
+                            "estimated_distinct_actions, dependency_count, reason_codes, "
+                            "confidence. Do not request or call tools."
+                        ),
+                    ),
+                    Message(
+                        role="user",
+                        content=json.dumps(
+                            request.to_dict(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ],
+                tools=None,
+                temperature=0.0,
+                max_tokens=self._max_tokens,
+                stream=False,
+            )
+            if not isinstance(raw, GenerationResult):
+                raise TypeError("complexity advisor expected GenerationResult")
+            result = raw
+            payload = json.loads(raw.content)
+            if not isinstance(payload, Mapping):
+                raise TypeError("complexity advisor response must be a JSON object")
+            return payload
+        finally:
+            _record_direct_model_diagnostics(
+                self._diagnostics,
+                started_at=started_at,
+                result=result,
+            )
+
+
 class _BackendSemanticJudge:
     """Bounded, tool-less semantic judge over host-provided evidence only."""
 
@@ -489,12 +605,14 @@ class _BackendSemanticJudge:
         configured_model_id: str | None,
         max_tokens: int,
         max_evidence_chars: int,
+        diagnostics: AdaptiveDiagnosticsAccumulator | None = None,
     ) -> None:
         self._engine = engine
         self._backend = backend
         self._configured_model_id = configured_model_id
         self._max_tokens = max_tokens
         self._max_evidence_chars = max_evidence_chars
+        self._diagnostics = diagnostics
 
     async def judge(
         self,
@@ -555,27 +673,39 @@ class _BackendSemanticJudge:
                 ),
             ),
         ]
-        if self._configured_model_id is not None:
-            result = await self._engine.generate_with_configured_model(
-                model_id=self._configured_model_id,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=self._max_tokens,
+        result: GenerationResult | None = None
+        started_at = time.perf_counter()
+        try:
+            if self._configured_model_id is not None:
+                result = await self._engine.generate_with_configured_model(
+                    model_id=self._configured_model_id,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=self._max_tokens,
+                )
+            else:
+                backend = self._backend
+                if backend is None:
+                    backend = self._engine._router.active
+                raw_result = await backend.generate(
+                    messages,
+                    tools=None,
+                    temperature=0.0,
+                    max_tokens=self._max_tokens,
+                    stream=False,
+                )
+                if not isinstance(raw_result, GenerationResult):
+                    raise TypeError(
+                        "semantic judge expected a non-stream GenerationResult"
+                    )
+                result = raw_result
+        finally:
+            _record_direct_model_diagnostics(
+                self._diagnostics,
+                started_at=started_at,
+                result=result,
             )
-        else:
-            backend = self._backend
-            if backend is None:
-                backend = self._engine._router.active
-            raw_result = await backend.generate(
-                messages,
-                tools=None,
-                temperature=0.0,
-                max_tokens=self._max_tokens,
-                stream=False,
-            )
-            if not isinstance(raw_result, GenerationResult):
-                raise TypeError("semantic judge expected a non-stream GenerationResult")
-            result = raw_result
+        assert result is not None
         payload = json.loads(result.content)
         if not isinstance(payload, Mapping):
             raise TypeError("semantic judge response must be a JSON object")
@@ -713,8 +843,8 @@ class AgentEngine:
         self._session_store = self._make_session_store(config)
         self._owns_learning_runtime = learning_runtime is None
         self._learning_runtime = learning_runtime or LearningRuntime(
-            FailureOutboxRepository(self._session_store),
-            FailureStore(self._session_store),
+            FailureOutboxRepository(self._session_store, retention_days=config.agent.ordinary_chat_adaptive_runtime.failure_learning.retention_days),
+            FailureStore(self._session_store, retention_days=config.agent.ordinary_chat_adaptive_runtime.failure_learning.retention_days),
             enabled=config.agent.ordinary_chat_adaptive_runtime.failure_learning.enabled,
         )
         self._verification_receipt_repository = VerificationReceiptRepository(
@@ -751,6 +881,9 @@ class AgentEngine:
             validation_profiles=validation_profile_registry
         )
         self._conversation_state_locks: dict[str, asyncio.Lock] = {}
+        self._turn_contract_rollout_flights: dict[
+            tuple[str, str], asyncio.Task[TurnContractRolloutResult]
+        ] = {}
         self._project_store = ProjectStore(
             Path(config.workspace_dir).expanduser() / "projects.json"
         )
@@ -1065,7 +1198,10 @@ class AgentEngine:
                 episode_id=f"failure-episode:{identity}",
                 idempotency_key=f"failure-learning:{identity}",
             )
-            await self._learning_runtime.submit(episode)
+            await self._learning_runtime.submit(
+                episode,
+                attribution_session_id=session_id,
+            )
         except Exception as exc:
             logger.warning(
                 "ordinary-chat failure-learning candidate append failed for turn={}: {}",
@@ -1361,6 +1497,7 @@ class AgentEngine:
         tool_mode: Literal["disabled", "auto", "required"] = "auto",
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
+        client_timezone: str | None = None,
         turn_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         async for event in self._run_chat(
@@ -1374,6 +1511,7 @@ class AgentEngine:
                 permission_policy=permission_policy,
                 selected_skill_ids=selected_skill_ids,
                 attachments=attachments,
+                client_timezone=client_timezone,
                 backend_override=None,
                 tool_mode=tool_mode,
                 execution_profile="chat",
@@ -1482,14 +1620,58 @@ class AgentEngine:
         if resolved_workspace != str(Path(self._config.workspace_dir).expanduser().resolve(strict=False)):
             workspace_registry = self._tool_registry_factory.create_registry(resolved_workspace)
         available_tool_names = {tool.name for tool in workspace_registry.list_tools()}
-        missing_tool_names = sorted(set(expected_tool_names) - available_tool_names)
+        runtime_rehydrated_tool_names = {"tool_activate"}
+        durable_expected_tool_names = [
+            name
+            for name in dict.fromkeys(expected_tool_names)
+            if name not in runtime_rehydrated_tool_names
+        ]
+        missing_tool_names = sorted(
+            set(durable_expected_tool_names) - available_tool_names
+        )
         if missing_tool_names:
             raise ValueError("Ordinary-Chat continuation tool inventory changed while approval was pending.")
-        tool_registry = workspace_registry.create_view(
-            expected_tool_names,
-            tool_search_catalog_names=expected_tool_names,
-            schema_limit=max(1, len(expected_tool_names)),
+
+        expects_activation_broker = "tool_activate" in expected_tool_names
+        tool_search_catalog_names = list(durable_expected_tool_names)
+        raw_tool_registry_view = continuation.get("tool_registry_view")
+        raw_catalog_names = (
+            raw_tool_registry_view.get("tool_search_catalog_names")
+            if isinstance(raw_tool_registry_view, Mapping)
+            else None
         )
+        activation_policy = continuation.get("tool_activation_policy")
+        if raw_catalog_names is None and isinstance(activation_policy, Mapping):
+            raw_catalog_names = activation_policy.get("discoverable_tool_names")
+        if expects_activation_broker and isinstance(raw_catalog_names, list):
+            tool_search_catalog_names = list(
+                dict.fromkeys(
+                    name
+                    for name in raw_catalog_names
+                    if isinstance(name, str) and name
+                )
+            )
+
+        raw_schema_limit = (
+            raw_tool_registry_view.get("schema_limit")
+            if isinstance(raw_tool_registry_view, Mapping)
+            else None
+        )
+        schema_limit = max(
+            1,
+            len(expected_tool_names),
+            raw_schema_limit
+            if isinstance(raw_schema_limit, int) and raw_schema_limit > 0
+            else 0,
+        )
+        tool_registry = workspace_registry.create_view(
+            durable_expected_tool_names,
+            tool_search_catalog_names=tool_search_catalog_names,
+            schema_limit=schema_limit,
+        )
+        rehydrated_tool_names = {tool.name for tool in tool_registry.list_tools()}
+        if rehydrated_tool_names != set(expected_tool_names):
+            raise ValueError("Ordinary-Chat continuation tool inventory changed while approval was pending.")
 
         base_context = self._get_tool_execution_context(
             session_id=session_id,
@@ -1510,11 +1692,14 @@ class AgentEngine:
                 "turn_id": checkpoint.get("turn_id"),
                 "phase": "tool_call",
             },
+            "tool_registry_view": {
+                "tool_search_catalog_names": tool_search_catalog_names,
+                "schema_limit": schema_limit,
+            },
         }
         tool_execution_context.state["tool_workflow_approval_observer"] = (
             self._observe_tool_workflow_approval
         )
-        activation_policy = continuation.get("tool_activation_policy")
         if isinstance(activation_policy, Mapping):
             tool_execution_context.state["tool_activation_policy"] = dict(activation_policy)
         if original_turn_checkpoint is not None:
@@ -1992,8 +2177,10 @@ class AgentEngine:
         workspace_dir: str | None = None,
         selected_skill_ids: list[str] | None = None,
         attachments: list[AttachmentRef] | None = None,
+        client_timezone: str | None = None,
     ) -> dict[str, Any]:
         """Estimate the next request budget without mutating the session."""
+        del client_timezone
         if not self._initialized:
             await self.initialize()
 
@@ -2052,35 +2239,10 @@ class AgentEngine:
             autonomy_mode=autonomy_mode,
             attachment_count=attachment_count,
         )
-        policy_eligible_tool_names = set(exposure_plan.discoverable_tool_names)
-        await self._router.mark_backend_busy(active_backend)
-        try:
-            rollout = await self._resolve_turn_contract_rollout(
-                active_backend=active_backend,
-                session_id=session_key,
-                turn_id=str(uuid4()),
-                message=message,
-                prompt_context=prompt_context,
-                available_tools=available_tools,
-                preferred_tool_names=contract_tool_preferences,
-                policy_eligible_tool_names=policy_eligible_tool_names,
-                execution_profile="chat",
-                tool_mode="auto",
-                workspace_mutation_eligible=bool(str(effective_workspace_dir).strip()),
-                tool_allowlist=None,
-                tool_denylist=None,
-                load_durable_state=False,
-                user_message_already_persisted=False,
-                selected_skill_ids=list(selected_skill_ids or []),
-                attachments=attachments,
-            )
-        finally:
-            await self._router.mark_backend_idle(active_backend)
-        exposure_plan = adapt_capability_plan_to_exposure(
-            baseline_plan=exposure_plan,
-            capability_plan=rollout.capability_plan,
-            contract=rollout.resolution.contract,
-        )
+        # Context preview estimates the policy baseline only.  It must not
+        # invoke the semantic interpreter: the submitted turn owns exactly
+        # one interpretation attempt and may arrive while this preview is in
+        # flight.
         exposure_plan = self._apply_adaptive_retrieval_switch(exposure_plan)
         preview_registry = workspace_registry.create_view(
             exposure_plan.tool_names,
@@ -2097,6 +2259,9 @@ class AgentEngine:
                 self._config.locale_defaults.response_language,
                 message,
             )
+        )
+        system_prompt_addendum = await self._with_advisory_failure_hints(
+            system_prompt_addendum, exposure_plan.tool_names
         )
 
         system_prompt = self._prompt_builder.build_system_prompt(
@@ -2336,7 +2501,7 @@ class AgentEngine:
                 if timeline is not None:
                     await timeline.request_cancel()
                 cancel_result = await cancellation_context.request_generation_cancel()
-                if cancel_result.state == "cancelled":
+                if cancel_result.state in {"cancelled", "pending"}:
                     with contextlib.suppress(asyncio.CancelledError):
                         await worker
             elif worker.done():
@@ -2355,8 +2520,34 @@ class AgentEngine:
         if not self._initialized:
             await self.initialize()
 
+        if request.isolate_context:
+            # `isolate_context` is a reduction boundary, not a best-effort
+            # privacy preference.  Reject any request that could reintroduce
+            # private state or execution capability before assembling a prompt.
+            if (
+                request.tool_mode != "disabled"
+                or request.persist_session
+                or request.persist_turn_events is not False
+                or request.persist_learning is not False
+                or request.attachments
+                or request.selected_skill_ids
+                or request.project_id is not None
+                or request.workspace_dir is not None
+                or request.task_workspace_dir is not None
+                or request.timeline_history_events is not None
+                or request.timeline_transcript is not None
+                or request.timeline_coordinator is not None
+            ):
+                raise ValueError("isolated invocation has unsafe context or persistence fields")
+
         session_key = request.session_id or "default"
-        if request.timeline_history_events is None:
+        if request.isolate_context:
+            # This is a host-enforced boundary for controlled external-model
+            # qualification.  `persist_session=False` prevents writes, but is
+            # not enough: the normal context path would still restore durable
+            # history and query the shared memory store.
+            context = self._new_context(include_memory=False)
+        elif request.timeline_history_events is None:
             context = await self._get_context(session_key)
         else:
             context = self._new_context()
@@ -2372,9 +2563,13 @@ class AgentEngine:
             memory_top_k=self._config.memory.fts_top_k,
             reserve_output_tokens=reserve_output_tokens,
         )
-        skill_selection = await self._select_skills(
-            request.message,
-            selected_skill_ids=request.selected_skill_ids,
+        skill_selection = (
+            SkillSelection(explicit_skills=[], suggested_skills=[], preferred_tool_names=[])
+            if request.isolate_context
+            else await self._select_skills(
+                request.message,
+                selected_skill_ids=request.selected_skill_ids,
+            )
         )
         contract_tool_preferences = (
             skill_selection.preferred_tool_names
@@ -2444,16 +2639,18 @@ class AgentEngine:
                 request.system_prompt_addendum,
             ),
         )
+        semantic_preflight_budget = self._estimate_prompt_budget(
+            system_prompt=preflight_system_prompt,
+            history=prompt_context.history,
+            user_message=request.message,
+            tool_schemas=[],
+            backend=active_backend,
+            model_info=active_backend.get_model_info(),
+            reserve_output_tokens=reserve_output_tokens,
+        )
         semantic_preflight_overflow = bool(
-            self._estimate_prompt_budget(
-                system_prompt=preflight_system_prompt,
-                history=prompt_context.history,
-                user_message=request.message,
-                tool_schemas=[],
-                backend=active_backend,
-                model_info=active_backend.get_model_info(),
-                reserve_output_tokens=reserve_output_tokens,
-            )["hard_overflow"]
+            semantic_preflight_budget["hard_gate_enabled"]
+            and semantic_preflight_budget["hard_overflow"]
         )
         rollout_turn_id = (
             str(request.turn_id or "").strip() or str(uuid4())
@@ -2612,12 +2809,19 @@ class AgentEngine:
                 "cleared_tools": before_preflight_count > 0 and not exposure_plan.tool_names,
             },
         )
+        turn_id = rollout_turn_id or str(request.turn_id or "").strip() or str(uuid4())
         system_prompt_addendum = _merge_prompt_addenda(
             _build_response_language_prompt_addendum(
                 self._config.locale_defaults.response_language,
                 request.message,
             ),
             request.system_prompt_addendum,
+        )
+        system_prompt_addendum = await self._with_advisory_failure_hints(
+            system_prompt_addendum,
+            exposure_plan.tool_names,
+            session_id=session_key if request.persist_session else None,
+            turn_id=turn_id if request.persist_session else None,
         )
         persist_turn_events = (
             request.persist_session
@@ -2632,7 +2836,6 @@ class AgentEngine:
         trajectory_id = (
             self._start_trajectory(request.message) if persist_learning else None
         )
-        turn_id = rollout_turn_id or str(request.turn_id or "").strip() or str(uuid4())
         turn_event_seq = 0
         user_msg = Message(
             role="user",
@@ -2657,12 +2860,18 @@ class AgentEngine:
             task_workspace_dir=request.task_workspace_dir,
             permission_policy_override=request.permission_policy,
             active_tool_controller=request.active_tool_controller,
+            client_timezone=request.client_timezone,
         )
         if turn_contract_rollout is not None:
             tool_execution_context = self._fork_turn_tool_execution_context(
                 tool_execution_context
             )
         tool_execution_context.state["turn_id"] = turn_id
+        if request.execution_profile == "chat":
+            initialize_turn_diagnostics_accumulator(
+                tool_execution_context,
+                turn_id=turn_id,
+            )
         if request.execution_profile == "chat":
             # File/exec tools use this only when a concrete call requires
             # human review.  It makes that result a durable Chat interrupt and
@@ -2771,18 +2980,38 @@ class AgentEngine:
                             if part
                         ),
                     )
-            (
-                exposure_plan,
-                complexity_decision,
-                task_plan_context,
-            ) = await self._configure_plan_runtime(
-                session_id=session_key,
-                turn_id=turn_id,
-                request=request,
-                rollout=turn_contract_rollout,
-                available_tools=available_tools,
-                exposure_plan=exposure_plan,
-                tool_execution_context=tool_execution_context,
+            try:
+                (
+                    exposure_plan,
+                    complexity_decision,
+                    task_plan_context,
+                ) = await self._configure_plan_runtime(
+                    active_backend=active_backend,
+                    session_id=session_key,
+                    turn_id=turn_id,
+                    request=request,
+                    rollout=turn_contract_rollout,
+                    available_tools=available_tools,
+                    exposure_plan=exposure_plan,
+                    tool_execution_context=tool_execution_context,
+                )
+            except asyncio.CancelledError:
+                tool_execution_context.state[
+                    "_ordinary_chat_adaptive_diagnostics_classification"
+                ] = "unknown"
+                await asyncio.shield(
+                    self._persist_adaptive_diagnostics(
+                        session_id=session_key,
+                        turn_id=turn_id,
+                        request=request,
+                        tool_execution_context=tool_execution_context,
+                    )
+                )
+                raise
+
+        if request.execution_profile == "chat":
+            tool_execution_context.state["_ordinary_chat_adaptive_diagnostics_classification"] = (
+                self._adaptive_diagnostics_classification(complexity_decision)
             )
 
         before_continuation_count = len(exposure_plan.tool_names)
@@ -2823,6 +3052,17 @@ class AgentEngine:
             tool_search_catalog_names=exposure_plan.discoverable_tool_names,
             schema_limit=exposure_plan.limit,
         )
+        if request.execution_profile == "chat":
+            approval_context = tool_execution_context.state.get(
+                "ordinary_chat_approval_context"
+            )
+            if isinstance(approval_context, dict):
+                approval_context["tool_registry_view"] = {
+                    "tool_search_catalog_names": list(
+                        exposure_plan.discoverable_tool_names
+                    ),
+                    "schema_limit": exposure_plan.limit,
+                }
         turn_checkpoint: TurnCheckpoint | None = None
         turn_checkpoint_error: str | None = None
         controlled_recovery_reentry_blocker: str | None = None
@@ -2879,8 +3119,48 @@ class AgentEngine:
                             resume_cursor={"turn_id": turn_id, "phase": "react"},
                         )
                     )
+                    if turn_checkpoint is not None:
+                        tool_execution_context.state[
+                            "dynamic_complexity_checkpoint"
+                        ] = turn_checkpoint
             except Exception as exc:
                 turn_checkpoint_error = f"{type(exc).__name__}: {exc}"
+            if turn_checkpoint is not None:
+                async def _persist_dynamic_complexity_decision(
+                    decision: Mapping[str, Any],
+                ) -> bool:
+                    checkpoint = tool_execution_context.state.get(
+                        "dynamic_complexity_checkpoint"
+                    )
+                    if not isinstance(checkpoint, TurnCheckpoint):
+                        return False
+                    candidate = replace(
+                        checkpoint,
+                        complexity_decision=_checkpoint_json_safe(decision),
+                        plan_ledger_snapshot=_checkpoint_json_safe(
+                            tool_execution_context.state.get("plan_ledger_snapshot")
+                        )
+                        if tool_execution_context.state.get("plan_ledger_snapshot")
+                        is not None
+                        else None,
+                    )
+                    try:
+                        saved = await self._turn_checkpoint_repository.save(
+                            candidate,
+                            expected_revision=checkpoint.revision,
+                        )
+                    except Exception:
+                        return False
+                    if saved.status != "saved" or saved.checkpoint is None:
+                        return False
+                    tool_execution_context.state[
+                        "dynamic_complexity_checkpoint"
+                    ] = saved.checkpoint
+                    return True
+
+                tool_execution_context.state[
+                    "dynamic_complexity_checkpoint_persist"
+                ] = _persist_dynamic_complexity_decision
             if turn_checkpoint_error is not None:
                 existing_error = turn_contract_rollout.state_persist_error
                 turn_contract_rollout = replace(
@@ -3025,6 +3305,12 @@ class AgentEngine:
                     )
             if owns_invocation_backend:
                 await active_backend.close()
+            await self._persist_adaptive_diagnostics(
+                session_id=session_key,
+                turn_id=turn_id,
+                request=request,
+                tool_execution_context=tool_execution_context,
+            )
             return AgentInvocationResult(
                 content=final_text,
                 events=[final_event],
@@ -3122,6 +3408,12 @@ class AgentEngine:
                     )
             if owns_invocation_backend:
                 await active_backend.close()
+            await self._persist_adaptive_diagnostics(
+                session_id=session_key,
+                turn_id=turn_id,
+                request=request,
+                tool_execution_context=tool_execution_context,
+            )
             return AgentInvocationResult(
                 content=final_text,
                 events=events,
@@ -3185,6 +3477,7 @@ class AgentEngine:
             )
 
         final_text = ""
+        react_loop_completed = False
         await self._router.mark_backend_busy(active_backend)
         try:
             for event in pre_generation_events:
@@ -3245,7 +3538,15 @@ class AgentEngine:
                     event_callback=event_callback,
                     turn_event_seq=turn_event_seq,
                 )
+            react_loop_completed = True
         finally:
+            if not react_loop_completed:
+                await self._persist_adaptive_diagnostics(
+                    session_id=session_key,
+                    turn_id=turn_id,
+                    request=request,
+                    tool_execution_context=tool_execution_context,
+                )
             await self._router.mark_backend_idle(active_backend)
             if owns_invocation_backend:
                 await active_backend.close()
@@ -3275,6 +3576,11 @@ class AgentEngine:
         pending_tool_call: dict[str, Any] | None = None
         approval_record: dict[str, Any] | None = None
         if turn_checkpoint is not None:
+            dynamically_persisted_checkpoint = tool_execution_context.state.get(
+                "dynamic_complexity_checkpoint"
+            )
+            if isinstance(dynamically_persisted_checkpoint, TurnCheckpoint):
+                turn_checkpoint = dynamically_persisted_checkpoint
             (
                 execution_receipt,
                 pending_tool_call,
@@ -3309,12 +3615,17 @@ class AgentEngine:
                             checkpoint_transition_error
                         )
                         break
+            elif turn_checkpoint is not None:
+                tool_execution_context.state[
+                    "dynamic_complexity_checkpoint"
+                ] = turn_checkpoint
 
         completion_persist_error: str | None = None
         if checkpoint_transition_error is None and approval_record is None:
             completion_persist_error = await self._complete_turn_contract_task_if_satisfied(
                 session_id=session_key,
                 turn_id=turn_id,
+                diagnostics_request=request,
                 rollout=turn_contract_rollout,
                 events=events,
                 persist_session=request.persist_session,
@@ -3405,6 +3716,7 @@ class AgentEngine:
                             )
 
         controlled_recovery_blocker_reason: str | None = None
+        recovery_diagnostics_considered = False
         recovery_budget_runtime: dict[str, Any] | None = None
         if turn_checkpoint is not None and approval_record is None:
             initial_final_event = next(
@@ -3454,13 +3766,22 @@ class AgentEngine:
                 and self._config.agent.ordinary_chat_adaptive_runtime.enabled
                 and self._config.agent.ordinary_chat_adaptive_runtime.recovery.enabled
             ):
+                recovery_diagnostics_considered = True
                 recovery_state, recovery_state_error = self._controlled_recovery_state(
                     execution_receipt
                 )
                 recovery_budget, recovery_budget_error = (
                     self._controlled_recovery_budget(turn_checkpoint)
                 )
-                operation, operation_error = self._recovery_operation_from_events(events)
+                operation, operation_error = self._recovery_operation_from_events(
+                    events,
+                    allow_pre_effect_no_operation=bool(request.timeline_pre_effect_failure),
+                    preferred_targets=tuple(
+                        value
+                        for value in initial_receipt.get("resolved_targets", ())
+                        if isinstance(value, str)
+                    ),
+                )
                 decision: ControlledRecoveryDecision | None = None
                 policy_decision: Any | None = None
                 corrective_context: Mapping[str, Any] | None = None
@@ -3470,8 +3791,6 @@ class AgentEngine:
                     controlled_recovery_blocker_reason = recovery_budget_error
                 elif aggregate_policy_receipt_error is not None:
                     controlled_recovery_blocker_reason = aggregate_policy_receipt_error
-                elif request.timeline_pre_effect_failure:
-                    controlled_recovery_blocker_reason = "timeline_pre_effect_failure"
                 elif (
                     not aggregate_recovery_requested
                     and not self._is_automatically_correctable_receipt(initial_receipt)
@@ -3578,6 +3897,60 @@ class AgentEngine:
                         controlled_recovery_blocker_reason = (
                             "controlled_recovery_context_invalid"
                         )
+
+                if (
+                    decision is not None
+                    and corrective_context is None
+                    and controlled_recovery_blocker_reason is None
+                ):
+                    allowed_targets = list(
+                        dict.fromkeys(
+                            value
+                            for value in initial_receipt.get("resolved_targets", ())
+                            if isinstance(value, str) and value.strip()
+                        )
+                    )[:16]
+                    if not allowed_targets:
+                        controlled_recovery_blocker_reason = (
+                            "controlled_recovery_context_invalid"
+                        )
+                    else:
+                        failed_criteria = [
+                            {
+                                "criterion_id": str(
+                                    check.get("criterion")
+                                    or check.get("code")
+                                    or "failed_criterion"
+                                ),
+                                "reason_code": str(
+                                    check.get("code") or "verification_failed"
+                                ),
+                                "evidence_refs": [],
+                            }
+                            for target in initial_receipt.get("targets", ())
+                            if isinstance(target, Mapping)
+                            for check in target.get("acceptance_checks", ())
+                            if isinstance(check, Mapping)
+                            and check.get("passed") is False
+                        ][:16]
+                        corrective_context = {
+                            "context_version": RECOVERY_CONTEXT_VERSION,
+                            "failed_criteria": failed_criteria,
+                            "prior_operation_id": decision.operation_id,
+                            "allowed_targets": allowed_targets,
+                            "active_plan_item": None,
+                            "remaining_budget": recovery_budget,
+                            "prohibited_repeats": [decision.operation_id],
+                            "scope_rule": (
+                                "Correct only failed criteria within the existing "
+                                "task scope."
+                            ),
+                            "instruction": (
+                                "Mint a fresh corrective operation. Do not replay the "
+                                "prior operation, claim success without new evidence, "
+                                "or expand the task scope."
+                            ),
+                        }
 
                 if decision is not None and decision.action not in {
                     "new_operation",
@@ -3691,11 +4064,19 @@ class AgentEngine:
                             "controlled_recovery_budget_runtime"
                         ] = recovery_budget_runtime
                         recovery_start = len(events)
+                        host_recovery_final_message: Message | None = None
                         recovery_history = [
                             *prompt_context.history,
                             Message(role="user", content=request.message),
                             *react_loop.turn_messages,
                         ]
+                        # Trusted recovery state: the verifier rejected the
+                        # preceding artifact and a corrective pass is about to
+                        # cross an effect boundary.  ReAct consumes this
+                        # before executing any recovery effect.
+                        tool_execution_context.state[
+                            "dynamic_complexity_verifier_failed"
+                        ] = True
                         try:
                             corrective_loop, corrective_final_text, turn_event_seq = (
                                 await self._run_controlled_recovery_pass(
@@ -3824,6 +4205,7 @@ class AgentEngine:
                                     await self._complete_turn_contract_task_if_satisfied(
                                         session_id=session_key,
                                         turn_id=turn_id,
+                                        diagnostics_request=request,
                                         rollout=turn_contract_rollout,
                                         events=events,
                                         persist_session=request.persist_session,
@@ -3832,14 +4214,116 @@ class AgentEngine:
                                         semantic_judge_backend=active_backend,
                                     )
                                 )
-                                recovery_final_event = next(
+                                corrective_final_event = next(
                                     (
                                         event
-                                        for event in reversed(events)
+                                        for event in reversed(corrective_events)
                                         if isinstance(event, FinalAnswerEvent)
                                     ),
                                     None,
                                 )
+                                recovery_final_event = (
+                                    corrective_final_event
+                                    or next(
+                                        (
+                                            event
+                                            for event in reversed(events)
+                                            if isinstance(event, FinalAnswerEvent)
+                                        ),
+                                        None,
+                                    )
+                                )
+                                recovery_verification = (
+                                    recovery_final_event.metadata.get(
+                                        "artifact_verification"
+                                    )
+                                    if recovery_final_event is not None
+                                    else None
+                                )
+                                recovery_aggregate_verdict = (
+                                    str(
+                                        recovery_verification.get(
+                                            "aggregate_verdict"
+                                        )
+                                        or ""
+                                    ).strip()
+                                    if isinstance(recovery_verification, Mapping)
+                                    else ""
+                                )
+                                recovery_verification_status = (
+                                    str(
+                                        recovery_verification.get(
+                                            "verification_status"
+                                        )
+                                        or ""
+                                    ).strip()
+                                    if isinstance(recovery_verification, Mapping)
+                                    else ""
+                                )
+                                host_verification_succeeded = (
+                                    completion_persist_error is None
+                                    and recovery_verification_status == "verified"
+                                    and recovery_aggregate_verdict
+                                    in {"", "verified"}
+                                )
+                                if (
+                                    corrective_final_event is None
+                                    and recovery_final_event is not None
+                                    and host_verification_succeeded
+                                ):
+                                    host_final_text = (
+                                        "The bounded corrective operation completed, "
+                                        "and independent verification confirmed the "
+                                        "requested artifact."
+                                    )
+                                    host_final = FinalAnswerEvent(
+                                        content=host_final_text,
+                                        finish_reason="stop",
+                                        metadata={
+                                            "runtime_category": "verification",
+                                            "artifact_verification": _checkpoint_json_safe(
+                                                recovery_verification
+                                            ),
+                                            "artifact_verification_status": "verified",
+                                            "controlled_recovery": _checkpoint_json_safe(
+                                                {
+                                                    "reason": (
+                                                        "host_verified_without_"
+                                                        "followup_model"
+                                                    ),
+                                                    "predecessor_operation_id": (
+                                                        recovery_metadata.get(
+                                                            "predecessor_operation_id"
+                                                        )
+                                                    ),
+                                                    "successor_operation_id": (
+                                                        recovery_metadata.get(
+                                                            "successor_operation_id"
+                                                        )
+                                                    ),
+                                                }
+                                            ),
+                                        },
+                                    )
+                                    final_text = host_final_text
+                                    recovery_final_event = host_final
+                                    host_recovery_final_message = Message(
+                                        role="assistant",
+                                        content=host_final_text,
+                                    )
+                                    turn_event_seq = await self._record_react_event(
+                                        event=host_final,
+                                        trajectory_id=trajectory_id,
+                                        tool_exposure_metadata=tool_exposure_metadata,
+                                        turn_id=turn_id,
+                                        session_id=session_key,
+                                        request=request,
+                                        persist_turn_events=persist_turn_events,
+                                        events=events,
+                                        event_callback=event_callback,
+                                        turn_event_seq=turn_event_seq,
+                                        controlled_recovery=recovery_metadata,
+                                    )
                                 if (
                                     recovery_final_event is None
                                     or recovery_final_event.metadata.get(
@@ -3951,6 +4435,10 @@ class AgentEngine:
                             execution_receipt["controlled_recovery"] = recovery_metadata
                             if request.persist_session:
                                 corrective_transcript = corrective_loop.turn_messages
+                                if host_recovery_final_message is not None:
+                                    corrective_transcript.append(
+                                        host_recovery_final_message
+                                    )
                                 for replay_message in corrective_transcript:
                                     context.add_message(replay_message)
                                 if request.timeline_user_message_admitted:
@@ -3965,6 +4453,26 @@ class AgentEngine:
                                             replay_message,
                                             turn_id=turn_id,
                                         )
+
+        if recovery_diagnostics_considered:
+            accumulator = get_context_diagnostics_accumulator(tool_execution_context)
+            if accumulator is not None:
+                runtime_exhausted_reason = (
+                    recovery_budget_runtime.get("exhausted_reason")
+                    if isinstance(recovery_budget_runtime, Mapping)
+                    else None
+                )
+                try:
+                    accumulator.record_recovery_attempt(
+                        blocked=controlled_recovery_blocker_reason is not None,
+                        budget_exhausted=(
+                            controlled_recovery_blocker_reason
+                            == "controlled_recovery_budget_exhausted"
+                            or bool(runtime_exhausted_reason)
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Unable to record adaptive recovery diagnostics")
 
         if recovery_budget_runtime is not None and turn_checkpoint is not None:
             runtime = recovery_budget_runtime
@@ -4093,6 +4601,12 @@ class AgentEngine:
                 ),
             )
 
+        await self._persist_adaptive_diagnostics(
+            session_id=session_key,
+            turn_id=turn_id,
+            request=request,
+            tool_execution_context=tool_execution_context,
+        )
         return AgentInvocationResult(
             content=final_text,
             events=events,
@@ -4469,7 +4983,19 @@ class AgentEngine:
             return exposure_plan
         if "tool_result_read" not in available_tool_names:
             return exposure_plan
-        if "tool_result_read" not in exposure_plan.discoverable_tool_names:
+        continuation_candidates = set(exposure_plan.discoverable_tool_names)
+        adapter_diagnostics = exposure_plan.diagnostics.get(
+            "capability_exposure_adapter"
+        )
+        if isinstance(adapter_diagnostics, dict):
+            recorded_candidates = adapter_diagnostics.get(
+                "continuation_candidate_tool_names"
+            )
+            if isinstance(recorded_candidates, list):
+                continuation_candidates.update(
+                    name for name in recorded_candidates if isinstance(name, str)
+                )
+        if "tool_result_read" not in continuation_candidates:
             return exposure_plan
         if exposure_plan.limit <= 0:
             return exposure_plan
@@ -4607,6 +5133,7 @@ class AgentEngine:
     async def _configure_plan_runtime(
         self,
         *,
+        active_backend: BaseLLMBackend | None = None,
         session_id: str,
         turn_id: str,
         request: AgentInvocationRequest,
@@ -4641,14 +5168,28 @@ class AgentEngine:
             if active_ledger is not None
             else None
         )
-        complexity_decision = self._resolve_complexity_decision(
+        complexity_decision = await self._resolve_complexity_decision(
+            active_backend=active_backend,
             rollout=rollout,
             available_tools=available_tools,
             exposure_plan=exposure_plan,
             active_plan_summary=active_plan_summary,
+            diagnostics=get_context_diagnostics_accumulator(
+                tool_execution_context
+            ),
         )
         if complexity_decision:
             tool_execution_context.state["complexity_decision"] = complexity_decision
+            self._install_dynamic_complexity_recheck(
+                session_id=session_id,
+                turn_id=turn_id,
+                rollout=rollout,
+                available_tools=available_tools,
+                exposure_plan=exposure_plan,
+                active_plan_summary=active_plan_summary,
+                complexity_decision=complexity_decision,
+                tool_execution_context=tool_execution_context,
+            )
 
         relation = self._resolve_complexity_task_relation(rollout)
         decision_kind = str(complexity_decision.get("kind") or "no_plan")
@@ -4766,6 +5307,189 @@ class AgentEngine:
             complexity_decision,
             self._build_task_plan_context(tool_execution_context),
         )
+
+    def _install_dynamic_complexity_recheck(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        rollout: TurnContractRolloutResult,
+        available_tools: Sequence[BaseTool],
+        exposure_plan: ToolExposurePlan,
+        active_plan_summary: ComplexityActivePlanSummary | None,
+        complexity_decision: Mapping[str, Any],
+        tool_execution_context: ToolExecutionContext,
+    ) -> None:
+        """Install the trusted, persistence-first dynamic gate used by ReAct."""
+        adaptive_runtime = self._config.agent.ordinary_chat_adaptive_runtime
+        if (
+            not adaptive_runtime.enabled
+            or adaptive_runtime.complexity.mode != "enforce"
+            or complexity_decision.get("kind")
+            not in {"no_plan", "continue_existing_plan"}
+        ):
+            return
+        try:
+            initial_decision = ComplexityDecision.from_dict(complexity_decision)
+        except Exception:
+            return
+        candidate_names = set(rollout.capability_plan.eligible_tools)
+        candidate_names.update(exposure_plan.tool_names)
+        descriptors = [
+            CatalogToolDescriptor.from_capability_metadata(
+                name=tool.name,
+                metadata=tool.tool_capabilities,
+                requires_approval=tool.requires_approval,
+                risk=(
+                    "high"
+                    if tool.is_destructive
+                    else "elevated" if tool.requires_approval else "low"
+                ),
+            )
+            for tool in available_tools
+            if tool.name in candidate_names
+        ]
+        capability_summary = ComplexityCapabilitySummary(
+            requires_user_approval=any(
+                tool.requires_approval
+                and not tool.supports_timeline_side_effect_boundary
+                for tool in available_tools
+                if tool.name in candidate_names
+            ),
+            destructive_tool_available=any(
+                descriptor.destructive for descriptor in descriptors
+            ),
+            effectful_tool_count=sum(
+                1
+                for descriptor in descriptors
+                if descriptor.mutating or "execution" in descriptor.capabilities
+            ),
+        )
+        gate = ComplexityGate(
+            # Dynamic re-gating intentionally never receives an advisor.
+            config=RuntimeComplexityGateConfig(
+                no_plan_max_score=adaptive_runtime.complexity.no_plan_max_score,
+                plan_required_min_score=adaptive_runtime.complexity.plan_required_min_score,
+                advisor_enabled=False,
+                advisor_timeout_seconds=adaptive_runtime.complexity.advisor_timeout_seconds,
+                dynamic_recheck_after_iterations=(
+                    adaptive_runtime.complexity.dynamic_recheck_after_iterations
+                ),
+            )
+        )
+        request = ComplexityGateRequest(
+            turn_intent=rollout.resolution.contract,
+            task_relation=self._resolve_complexity_task_relation(rollout),
+            capability_summary=capability_summary,
+            active_plan=active_plan_summary,
+        )
+
+        async def recheck(
+            *, completed_iterations: int, signals: Sequence[str]
+        ) -> dict[str, Any]:
+            raw_prior = tool_execution_context.state.get("complexity_decision")
+            try:
+                prior = ComplexityDecision.from_dict(
+                    raw_prior if isinstance(raw_prior, Mapping) else initial_decision.to_dict()
+                )
+            except Exception:
+                return {"status": "persistence_failed"}
+            if "active_plan_invalidated" in signals:
+                # A stale plan snapshot is a host-observed concurrency event.
+                # It must re-establish the effect boundary, regardless of the
+                # captured initial active-plan summary.
+                decision = replace(
+                    prior,
+                    kind="plan_required",
+                    hard_reason_codes=tuple(
+                        dict.fromkeys(
+                            (*prior.hard_reason_codes, "active_plan_invalidated")
+                        )
+                    ),
+                    soft_reason_codes=tuple(
+                        dict.fromkeys(
+                            (*prior.soft_reason_codes, "dynamic_active_plan_invalidated")
+                        )
+                    ),
+                    effectful_action_requires_plan=True,
+                    dynamic_recheck_after_iterations=0,
+                )
+            else:
+                try:
+                    decision = await gate.recheck(
+                        request,
+                        prior_decision=prior,
+                        completed_iterations=completed_iterations,
+                        signals=tuple(signals),  # type: ignore[arg-type]
+                    )
+                except Exception:
+                    return {"status": "persistence_failed"}
+            if decision is None:
+                return {"status": "saved", "changed": False}
+            payload = decision.to_dict()
+            persist = tool_execution_context.state.get(
+                "dynamic_complexity_checkpoint_persist"
+            )
+            if not callable(persist):
+                return {"status": "persistence_failed"}
+            persisted = persist(payload)
+            if inspect.isawaitable(persisted):
+                persisted = await persisted
+            if persisted is not True:
+                return {"status": "persistence_failed"}
+            tool_execution_context.state["complexity_decision"] = payload
+            # This host-derived recovery signal remains visible until its
+            # planning decision has been durably checkpointed.  A failed CAS
+            # deliberately leaves it set so a later effect stays guarded.
+            tool_execution_context.state.pop(
+                "dynamic_complexity_verifier_failed", None
+            )
+            if decision.kind == "plan_required":
+                plan_runtime = tool_execution_context.state.get("plan_runtime")
+                if isinstance(plan_runtime, dict):
+                    plan_runtime.update(
+                        {
+                            "enabled": True,
+                            "state": "required",
+                            "required": True,
+                            "exposed": True,
+                            "mutable": True,
+                            "decision_kind": "plan_required",
+                            "reason_codes": list(
+                                dict.fromkeys(
+                                    list(decision.hard_reason_codes)
+                                    + list(decision.soft_reason_codes)
+                                )
+                            ),
+                            "ledger_id": plan_runtime.get("ledger_id")
+                            or f"plan:{plan_runtime.get('goal_id') or turn_id}",
+                        }
+                    )
+                    goal_id = plan_runtime.get("goal_id")
+                    if isinstance(goal_id, str) and goal_id:
+                        tool_execution_context.state["update_plan_runtime"] = {
+                            "session_id": session_id,
+                            "goal_id": goal_id,
+                            "ledger_id": plan_runtime["ledger_id"],
+                            "turn_id": turn_id,
+                            "objective": rollout.resolution.contract.objective,
+                            "reason_codes": list(plan_runtime["reason_codes"]),
+                        }
+                        tool_execution_context.state["update_plan_controller"] = _RuntimePlanController(
+                            repository=self._plan_ledger_repository,
+                            tool_execution_context=tool_execution_context,
+                        )
+            return {"status": "saved", "changed": True, "decision": payload}
+
+        tool_execution_context.state["dynamic_complexity_recheck"] = recheck
+        update_plan_tool = next(
+            (tool for tool in available_tools if tool.name == "update_plan"),
+            None,
+        )
+        if update_plan_tool is not None:
+            tool_execution_context.state[
+                "dynamic_complexity_update_plan_tool"
+            ] = update_plan_tool
 
     def _build_task_plan_context(
         self,
@@ -5124,6 +5848,7 @@ class AgentEngine:
         results: Sequence[ToolCallResultEvent],
         final_response_text: str | None,
         semantic_judge_backend: BaseLLMBackend | None = None,
+        diagnostics: AdaptiveDiagnosticsAccumulator | None = None,
     ) -> dict[str, Any] | None:
         adaptive_runtime = self._config.agent.ordinary_chat_adaptive_runtime
         verification_config = adaptive_runtime.verification
@@ -5197,6 +5922,7 @@ class AgentEngine:
                             configured_model_id=configured_model_id,
                             max_tokens=verification_config.judge_max_tokens,
                             max_evidence_chars=verification_config.max_evidence_chars,
+                            diagnostics=diagnostics,
                         ),
                         timeout_seconds=verification_config.judge_timeout_seconds,
                         max_criteria=verification_config.max_semantic_criteria,
@@ -5783,6 +6509,13 @@ class AgentEngine:
             )
 
         try:
+            await backend.generate(
+                messages=[Message(role="user", content="Reply with exactly OK.")],
+                tools=None,
+                temperature=0.0,
+                max_tokens=16,
+                stream=False,
+            )
             return backend.get_model_info()
         finally:
             await backend.close()
@@ -5831,8 +6564,8 @@ class AgentEngine:
             learning_worker_was_running = self._learning_runtime.worker.running
             await self._learning_runtime.stop()
             self._learning_runtime = LearningRuntime(
-                FailureOutboxRepository(self._session_store),
-                FailureStore(self._session_store),
+                FailureOutboxRepository(self._session_store, retention_days=config.agent.ordinary_chat_adaptive_runtime.failure_learning.retention_days),
+                FailureStore(self._session_store, retention_days=config.agent.ordinary_chat_adaptive_runtime.failure_learning.retention_days),
                 enabled=config.agent.ordinary_chat_adaptive_runtime.failure_learning.enabled,
             )
             if learning_worker_was_running:
@@ -6631,6 +7364,7 @@ class AgentEngine:
         task_workspace_dir: str | None = None,
         permission_policy_override: dict[str, Any] | None = None,
         active_tool_controller: ActiveToolController | None = None,
+        client_timezone: str | None = None,
     ) -> ToolExecutionContext:
         key = (session_id, str(workspace_dir), str(task_workspace_dir or ""))
         existing = self._tool_execution_contexts.get(key)
@@ -6638,6 +7372,7 @@ class AgentEngine:
             existing is not None
             and permission_policy_override is None
             and active_tool_controller is None
+            and client_timezone is None
         ):
             return existing
 
@@ -6656,7 +7391,11 @@ class AgentEngine:
             self._tool_execution_contexts[key] = context
             existing = context
 
-        if permission_policy_override is None and active_tool_controller is None:
+        if (
+            permission_policy_override is None
+            and active_tool_controller is None
+            and client_timezone is None
+        ):
             return existing
 
         merged_policy = dict(existing.permission_policy or base_permission_policy)
@@ -6665,6 +7404,7 @@ class AgentEngine:
         return ToolExecutionContext(
             workspace_dir=existing.workspace_dir,
             session_id=existing.session_id,
+            client_timezone=client_timezone,
             project_workspace=existing.project_workspace,
             task_sandbox_dir=existing.task_sandbox_dir,
             permission_policy=merged_policy,
@@ -6689,7 +7429,7 @@ class AgentEngine:
         self._contexts[session_id] = context
         return context
 
-    def _new_context(self) -> ContextManager:
+    def _new_context(self, *, include_memory: bool = True) -> ContextManager:
         """Create an uncached context for a single strict timeline snapshot."""
         return ContextManager(
             conversation_memory=ConversationMemory(
@@ -6698,7 +7438,7 @@ class AgentEngine:
                     self._config.memory.semantic_keep_recent_messages + 12,
                 )
             ),
-            memory_store=self._memory_store,
+            memory_store=self._memory_store if include_memory else None,
             compactor=ConversationCompactor.from_settings(
                 max_messages=self._config.memory.max_short_term_messages,
                 semantic_compaction_enabled=self._config.memory.semantic_compaction_enabled,
@@ -6868,19 +7608,72 @@ class AgentEngine:
             return
 
         timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+        event_id = f"{turn_id}:{seq}"
         await self._session_store.save_event(
             session_id,
             {
                 "type": "turn_event",
                 "schema_version": 1,
                 "turn_id": turn_id,
-                "event_id": f"{turn_id}:{seq}",
+                "event_id": event_id,
                 "seq": seq,
                 "phase": phase,
                 "timestamp": timestamp,
                 "payload": payload,
             },
         )
+        # Keep replay authority out-of-band.  The chat route uses this private
+        # marker to avoid writing the same event a second time while preserving
+        # the public event payload unchanged.
+        event._session_replay_persisted = True  # type: ignore[attr-defined]
+        event._session_replay_event_id = event_id  # type: ignore[attr-defined]
+        event._session_replay_seq = seq  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _adaptive_diagnostics_classification(
+        decision: Mapping[str, Any] | None,
+    ) -> Literal["simple", "complex", "unknown"]:
+        if not isinstance(decision, Mapping):
+            return "unknown"
+        kind = decision.get("kind")
+        if kind == "no_plan":
+            return "simple"
+        if kind in {"plan_required", "continue_existing_plan", "preserve_existing_plan"}:
+            return "complex"
+        return "unknown"
+
+    async def _persist_adaptive_diagnostics(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        request: AgentInvocationRequest,
+        tool_execution_context: ToolExecutionContext,
+    ) -> None:
+        """Best-effort final durable diagnostics; never changes Chat outcome."""
+        if not request.persist_session or request.execution_profile != "chat":
+            return
+        accumulator = get_context_diagnostics_accumulator(tool_execution_context)
+        if accumulator is None:
+            return
+        classification = tool_execution_context.state.get(
+            "_ordinary_chat_adaptive_diagnostics_classification",
+            "unknown",
+        )
+        if classification not in {"simple", "complex", "unknown"}:
+            classification = "unknown"
+        try:
+            record = AdaptiveDiagnosticsRecord.create(
+                session_id=session_id,
+                turn_id=turn_id,
+                classification=classification,
+                accumulator=accumulator,
+                timestamp=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            await AdaptiveDiagnosticsRepository(self._session_store).append(record)
+        except Exception as exc:
+            tool_execution_context.state["adaptive_diagnostics_persist_error"] = type(exc).__name__
+            logger.warning("Adaptive diagnostics persistence failed: %s", type(exc).__name__)
 
     async def _record_react_event(
         self,
@@ -6960,6 +7753,9 @@ class AgentEngine:
                         else None
                     ),
                 )
+            event._session_replay_persisted = True  # type: ignore[attr-defined]
+            event._session_replay_event_id = f"{turn_id}:{next_seq}"  # type: ignore[attr-defined]
+            event._session_replay_seq = next_seq  # type: ignore[attr-defined]
         elif persist_turn_events:
             await self._persist_turn_event(
                 session_id,
@@ -6977,16 +7773,63 @@ class AgentEngine:
     @staticmethod
     def _recovery_operation_from_events(
         events: Sequence[AgentEvent],
+        *,
+        allow_pre_effect_no_operation: bool = False,
+        preferred_targets: Sequence[str] = (),
     ) -> tuple[TimelineOperationState | None, str | None]:
         mutation_results = [
             event
             for event in events
             if isinstance(event, ToolCallResultEvent)
             and event.tool_name in {"file_write", "file_edit", "file_delete", "apply_patch"}
+            # A TimelineCoordinator pre-effect rejection is a durable proof
+            # that this particular call never crossed the effect boundary;
+            # do not mistake it for missing mutation lifecycle evidence.
+            and not (
+                isinstance(event.metadata, Mapping)
+                and (
+                    bool(event.metadata.get("timeline_pre_effect_failure"))
+                    or bool(event.metadata.get("timeline_unstarted_blocked"))
+                    or bool(event.metadata.get("timeline_fail_closed"))
+                    or bool(event.metadata.get("timeline_pre_effect_abandoned"))
+                )
+            )
         ]
-        if len(mutation_results) != 1:
-            return None, "timeline_operation_evidence_ambiguous"
-        event = mutation_results[0]
+        # Absence of a mutation receipt alone is not evidence that no effect
+        # started: it can be a logging gap.  Only TimelineCoordinator's
+        # durable pre-effect abandonment marker may authorize the bounded
+        # operation=None replan path.
+        if not mutation_results:
+            return (
+                (None, None)
+                if allow_pre_effect_no_operation
+                else (None, "timeline_operation_evidence_missing")
+            )
+        if len(mutation_results) > 1:
+            wanted = {str(value).replace("\\", "/").casefold() for value in preferred_targets}
+            matches: list[ToolCallResultEvent] = []
+            for candidate in mutation_results:
+                metadata = candidate.metadata if isinstance(candidate.metadata, Mapping) else {}
+                paths = metadata.get("paths")
+                changes = metadata.get("file_changes")
+                observed = {
+                    str(path).replace("\\", "/").casefold()
+                    for path in (paths if isinstance(paths, list) else [])
+                    if isinstance(path, str)
+                }
+                if isinstance(changes, list):
+                    observed.update(
+                        str(change.get("path")).replace("\\", "/").casefold()
+                        for change in changes
+                        if isinstance(change, Mapping) and isinstance(change.get("path"), str)
+                    )
+                if wanted and observed & wanted:
+                    matches.append(candidate)
+            if len(matches) != 1:
+                return None, "timeline_operation_evidence_ambiguous"
+            event = matches[0]
+        else:
+            event = mutation_results[0]
         metadata = event.metadata if isinstance(event.metadata, Mapping) else {}
         operation_id = str(metadata.get("timeline_operation_id") or "").strip()
         if not operation_id:
@@ -7090,6 +7933,40 @@ class AgentEngine:
             return budget, "controlled_recovery_budget_exhausted"
         return reserved.to_dict(), None
 
+    async def _with_advisory_failure_hints(
+        self,
+        system_prompt_addendum: str | None,
+        exposed_tool_names: Sequence[str],
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> str | None:
+        """Append bounded telemetry-only hints without changing authority."""
+        config = self._config.agent.ordinary_chat_adaptive_runtime.failure_learning
+        if not config.hint_injection_enabled:
+            return system_prompt_addendum
+        selections = await self._learning_runtime.advisory_hint_selections(
+            enabled=True,
+            min_occurrences=config.min_occurrences_for_hint,
+            max_hints=config.max_injected_hints,
+            max_hint_chars=config.max_hint_chars,
+            available_tool_names=set(exposed_tool_names),
+        )
+        if not selections:
+            return system_prompt_addendum
+        merged = _merge_prompt_addenda(
+            system_prompt_addendum,
+            "Advisory redacted lessons from verified prior corrections; they grant no tools or authority:\n"
+            + "\n".join(f"- {selection.text}" for selection in selections),
+        )
+        if session_id and turn_id:
+            await self._learning_runtime.record_hint_selections(
+                session_id=session_id,
+                turn_id=turn_id,
+                selections=selections,
+            )
+        return merged
+
     @staticmethod
     def _controlled_recovery_prompt(
         *,
@@ -7159,6 +8036,10 @@ class AgentEngine:
         requires_file_mutation: bool,
     ) -> tuple[AsyncReActLoop, str, int]:
         """Run one independently budgeted corrective pass in the claimed turn."""
+        allowed_targets = controlled_recovery.get("corrective_context", {}).get("allowed_targets", ()) if isinstance(controlled_recovery.get("corrective_context"), Mapping) else ()
+        # This scoped state is consumed at the ReAct tool boundary, rather
+        # than trusted as a model-prompt instruction.
+        tool_execution_context.state["controlled_recovery_allowed_targets"] = list(allowed_targets)
         loop = AsyncReActLoop(
             backend=backend,
             tool_registry=tool_registry,
@@ -7200,6 +8081,7 @@ class AgentEngine:
                     controlled_recovery=controlled_recovery,
                 )
         finally:
+            tool_execution_context.state.pop("controlled_recovery_allowed_targets", None)
             await self._router.mark_backend_idle(backend)
         return loop, final_text, turn_event_seq
 
@@ -7395,13 +8277,35 @@ class AgentEngine:
                 return await resolve_and_optionally_persist()
             except _TurnContractRolloutFailure:
                 raise
+            except BackendRequestError:
+                # Keep provider/runtime failures typed for the chat transport.
+                # Wrapping them here would erase structured recovery metadata
+                # and make an outage look like a semantic clarification.
+                raise
             except Exception as exc:
                 raise _TurnContractRolloutFailure(
                     exc,
                     user_message_persisted=user_message_persisted,
                 ) from exc
 
-        return await guarded_resolve()
+        # A client retry or an overlapping request may carry the same turn ID.
+        # Share the in-flight resolution so the model-backed interpreter runs
+        # at most once for that submitted turn.  Shield the shared task so one
+        # cancelled waiter does not cancel the other caller's turn.
+        flight_key = (session_id, turn_id)
+        flight = self._turn_contract_rollout_flights.get(flight_key)
+        if flight is None:
+            flight = asyncio.create_task(guarded_resolve())
+            self._turn_contract_rollout_flights[flight_key] = flight
+
+            def _discard_completed_flight(
+                completed: asyncio.Task[TurnContractRolloutResult],
+            ) -> None:
+                if self._turn_contract_rollout_flights.get(flight_key) is completed:
+                    self._turn_contract_rollout_flights.pop(flight_key, None)
+
+            flight.add_done_callback(_discard_completed_flight)
+        return await asyncio.shield(flight)
 
     async def _persist_turn_contract_rollout_state(
         self,
@@ -7454,13 +8358,15 @@ class AgentEngine:
             return f"{type(exc).__name__}: {exc}", None
         return None, expected_state_revision
 
-    def _resolve_complexity_decision(
+    async def _resolve_complexity_decision(
         self,
         *,
+        active_backend: BaseLLMBackend | None = None,
         rollout: TurnContractRolloutResult,
         available_tools: Sequence[BaseTool],
         exposure_plan: ToolExposurePlan,
         active_plan_summary: ComplexityActivePlanSummary | None = None,
+        diagnostics: AdaptiveDiagnosticsAccumulator | None = None,
     ) -> dict[str, Any]:
         adaptive_runtime = self._config.agent.ordinary_chat_adaptive_runtime
         complexity_config = adaptive_runtime.complexity
@@ -7511,14 +8417,27 @@ class AgentEngine:
             ),
         )
         gate = ComplexityGate(
+            advisor=(
+                _BackendComplexityAdvisor(
+                    backend=active_backend,
+                    max_tokens=complexity_config.advisor_max_tokens,
+                    diagnostics=diagnostics,
+                )
+                if complexity_config.model_advisor_enabled
+                and active_backend is not None
+                else None
+            ),
             config=RuntimeComplexityGateConfig(
                 no_plan_max_score=complexity_config.no_plan_max_score,
                 plan_required_min_score=complexity_config.plan_required_min_score,
                 advisor_enabled=complexity_config.model_advisor_enabled,
                 advisor_timeout_seconds=complexity_config.advisor_timeout_seconds,
+                dynamic_recheck_after_iterations=(
+                    complexity_config.dynamic_recheck_after_iterations
+                ),
             )
         )
-        decision = gate.evaluate_deterministic(
+        decision = await gate.evaluate(
             ComplexityGateRequest(
                 turn_intent=rollout.resolution.contract,
                 task_relation=self._resolve_complexity_task_relation(rollout),
@@ -7832,6 +8751,7 @@ class AgentEngine:
         *,
         session_id: str,
         turn_id: str,
+        diagnostics_request: AgentInvocationRequest,
         rollout: TurnContractRolloutResult | None,
         events: list[AgentEvent],
         persist_session: bool,
@@ -7889,44 +8809,61 @@ class AgentEngine:
             return None
 
         active_task = rollout.resolution.next_active_task
-        receipt, completion_error = await self._verify_and_complete_active_task(
-            session_id=session_id,
-            turn_id=turn_id,
-            workspace_dir=workspace_dir,
-            active_task=active_task,
-            state_revision=rollout.state_revision,
-            requests=mutation_requests,
-            results=mutation_results,
-            evidence_requests=turn_tool_requests,
-            evidence_results=turn_tool_results,
-            verification_plan=(
-                cast(
-                    Mapping[str, Any],
-                    tool_execution_context.state["verification_plan"],
+        try:
+            receipt, completion_error = await self._verify_and_complete_active_task(
+                session_id=session_id,
+                turn_id=turn_id,
+                workspace_dir=workspace_dir,
+                active_task=active_task,
+                state_revision=rollout.state_revision,
+                requests=mutation_requests,
+                results=mutation_results,
+                evidence_requests=turn_tool_requests,
+                evidence_results=turn_tool_results,
+                verification_plan=(
+                    cast(
+                        Mapping[str, Any],
+                        tool_execution_context.state["verification_plan"],
+                    )
+                    if isinstance(
+                        tool_execution_context.state.get("verification_plan"),
+                        Mapping,
+                    )
+                    else self._build_verification_plan(
+                        rollout,
+                        semantic_fallback_enabled=(
+                            self._config.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
+                            == "fallback"
+                        ),
+                    )
+                ),
+                final_response_text=final_event.content,
+                plan_ledger_snapshot=cast(
+                    Mapping[str, Any] | None,
+                    tool_execution_context.state.get("plan_ledger_snapshot"),
+                ),
+                recognized_evidence_refs=cast(
+                    Collection[str],
+                    tool_execution_context.state.get(
+                        "recognized_plan_evidence_refs"
+                    )
+                    or (),
+                ),
+                semantic_judge_backend=semantic_judge_backend,
+                diagnostics=get_context_diagnostics_accumulator(
+                    tool_execution_context
+                ),
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._persist_adaptive_diagnostics(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    request=diagnostics_request,
+                    tool_execution_context=tool_execution_context,
                 )
-                if isinstance(
-                    tool_execution_context.state.get("verification_plan"),
-                    Mapping,
-                )
-                else self._build_verification_plan(
-                    rollout,
-                    semantic_fallback_enabled=(
-                        self._config.agent.ordinary_chat_adaptive_runtime.verification.semantic_judge_mode
-                        == "fallback"
-                    ),
-                )
-            ),
-            final_response_text=final_event.content,
-            plan_ledger_snapshot=cast(
-                Mapping[str, Any] | None,
-                tool_execution_context.state.get("plan_ledger_snapshot"),
-            ),
-            recognized_evidence_refs=cast(
-                Collection[str],
-                tool_execution_context.state.get("recognized_plan_evidence_refs") or (),
-            ),
-            semantic_judge_backend=semantic_judge_backend,
-        )
+            )
+            raise
         final_event.metadata["artifact_verification"] = receipt
         updated_plan_ledger = receipt.get("plan_ledger")
         if isinstance(updated_plan_ledger, Mapping):
@@ -7938,15 +8875,18 @@ class AgentEngine:
                 if plan_runtime.get("ledger_status") in {"completed", "cancelled"}:
                     plan_runtime["state"] = "terminal"
         aggregate_verdict = str(receipt.get("aggregate_verdict") or "").strip()
-        if receipt.get("verification_status") != "verified" or aggregate_verdict in {
-            "failed",
-            "unverified",
-        }:
-            final_event.metadata["artifact_verification_status"] = receipt[
-                "verification_status"
-            ]
-            if aggregate_verdict in {"failed", "unverified"}:
-                final_event.metadata["artifact_verification_status"] = aggregate_verdict
+        verification_status = str(
+            receipt.get("verification_status") or "unverified"
+        ).strip()
+        # A controlled recovery may reuse the first-pass final as the bounded
+        # host-verification carrier when no second model call is available.
+        # Always overwrite the prior status so a newly verified receipt cannot
+        # inherit stale ``failed`` metadata from the first pass.
+        final_event.metadata["artifact_verification_status"] = (
+            aggregate_verdict
+            if aggregate_verdict in {"verified", "failed", "unverified"}
+            else verification_status
+        )
         return completion_error
 
     async def _verify_and_complete_active_task(
@@ -7966,6 +8906,7 @@ class AgentEngine:
         plan_ledger_snapshot: Mapping[str, Any] | None = None,
         recognized_evidence_refs: Collection[str] = (),
         semantic_judge_backend: BaseLLMBackend | None = None,
+        diagnostics: AdaptiveDiagnosticsAccumulator | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         """Persist verified evidence before a CAS-protected task completion.
 
@@ -8040,6 +8981,7 @@ class AgentEngine:
                     results=evidence_results or results,
                     final_response_text=final_response_text,
                     semantic_judge_backend=semantic_judge_backend,
+                    diagnostics=diagnostics,
                 )
             except Exception as exc:
                 receipt["aggregate_verification_error"] = (
@@ -8170,6 +9112,7 @@ class AgentEngine:
         return ToolExecutionContext(
             workspace_dir=context.workspace_dir,
             session_id=context.session_id,
+            client_timezone=context.client_timezone,
             project_workspace=context.project_workspace,
             task_sandbox_dir=context.task_sandbox_dir,
             permission_policy=dict(context.permission_policy),
@@ -8919,6 +9862,8 @@ def _resolve_agent_run_evidence_permission_policy(
 
 def _checkpoint_json_safe(value: Any) -> dict[str, Any]:
     """Normalize runtime metadata before putting it in a durable checkpoint."""
+    if isinstance(value, Mapping):
+        value = dict(value)
     normalized = json.loads(
         json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     )

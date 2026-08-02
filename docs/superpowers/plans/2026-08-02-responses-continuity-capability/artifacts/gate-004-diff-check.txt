@@ -1,0 +1,7 @@
+Gate: GATE-004-DIFF-CHECK
+Command: rtk git diff --check
+Exit code: 0
+Observed: No whitespace errors.
+Ownership review: The worker was dispatched with exclusive ownership of five files. Main and a fresh evaluator reviewed the bounded five-file delta; no tool-discovery, activation-policy, schema, UI, or configuration files were attributed to this package.
+Anti-hardcode review: Responses continuity is controlled by a closed-set construction policy with local_replay as the safe default. The tests use unrelated host/model variants and an api.openai.com + GPT-5.9 negative case, so the reported provider/model pair cannot satisfy the suite by itself.
+Limitation: The standard fingerprint script could not run on Windows because its configured .venv-wsl/bin/python interpreter is an invalid Windows symlink. This artifact records bounded diff inspection rather than claiming a successful fingerprint guard.

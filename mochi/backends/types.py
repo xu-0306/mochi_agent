@@ -8,6 +8,7 @@ from functools import partial
 from typing import Any, Literal
 
 Role = Literal["system", "user", "assistant", "tool"]
+ResponsesContinuityPolicy = Literal["local_replay", "previous_response_id"]
 ResponsesContinuityMode = Literal[
     "none",
     "previous_response_id",
@@ -153,6 +154,9 @@ class Message:
     name: str | None = None
     attachments: list[AttachmentRef] = field(default_factory=partial(list[AttachmentRef]))
     responses_replay: ResponsesReplayState | None = None
+    # Transient ReAct boundary.  It is intentionally excluded from ``to_dict``
+    # so canonical session messages never acquire transport-only state.
+    native_tool_protocol_active: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize into an OpenAI-compatible chat message payload."""

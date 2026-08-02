@@ -126,6 +126,38 @@ async def test_ollama_generate_omits_reasoning_effort_for_unknown_models() -> No
     payload = post.await_args.kwargs["json"]
     assert "think" not in payload
 
+
+@pytest.mark.asyncio
+async def test_ollama_generate_disables_thinking_for_none() -> None:
+    backend = OllamaBackend(model="qwen3.5:4b", base_url="http://localhost:11434")
+    mock_resp = _mock_response(
+        {
+            "model": "qwen3.5:4b",
+            "message": {"role": "assistant", "content": "{}"},
+            "done": True,
+            "done_reason": "stop",
+        }
+    )
+
+    try:
+        with patch.object(
+            backend._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_resp,
+        ) as post:
+            await backend.generate(
+                messages=[Message(role="user", content="Return JSON.")],
+                reasoning_effort="none",
+                stream=False,
+            )
+    finally:
+        await backend.close()
+
+    payload = post.await_args.kwargs["json"]
+    assert payload["think"] is False
+
+
 @pytest.mark.asyncio
 async def test_ollama_retry_that_returns_only_thinking_raises_backend_error() -> None:
     backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")

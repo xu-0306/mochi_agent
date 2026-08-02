@@ -23,6 +23,7 @@ dependencies = [
     "torch>=2.4",
     "safetensors>=0.4",
     "pypdf>=6.12.2",
+    "tzdata>=2026.1; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

@@ -10,6 +10,8 @@ _SENSITIVE_PATH_RE = re.compile(
     r"(?i)(?:\b|[/\\])(?:\.git|\.ssh|\.aws|\.gnupg|\.kube|system32|etc/passwd|id_rsa|id_ed25519)(?:\b|[/\\])"
 )
 _ABS_PATH_RE = re.compile(r"(?i)^[A-Z]:[/\\]|^/|^~[/\\]|^\\\\")
+_CMD_PROGRAMS = frozenset({"cmd", "cmd.exe"})
+_CMD_SWITCHES = frozenset({"/a", "/c", "/d", "/k", "/q", "/s", "/u"})
 
 
 @dataclass(frozen=True)
@@ -28,9 +30,25 @@ def _looks_like_path(token: str) -> bool:
         return True
     if _ABS_PATH_RE.match(normalized):
         return True
-    if "/" in normalized or "\\" in normalized:
-        return True
-    return False
+    return "/" in normalized or "\\" in normalized
+
+
+def _cmd_switch_indexes(tokens: list[str]) -> frozenset[int]:
+    """Return cmd.exe option positions that must not be parsed as POSIX paths."""
+
+    ignored: set[int] = set()
+    for index, token in enumerate(tokens):
+        program = token.strip().strip("\"'").lower()
+        if program not in _CMD_PROGRAMS:
+            continue
+        for option_index in range(index + 1, len(tokens)):
+            option = tokens[option_index].strip().strip("\"'").lower()
+            if option not in _CMD_SWITCHES:
+                break
+            ignored.add(option_index)
+            if option in {"/c", "/k"}:
+                break
+    return frozenset(ignored)
 
 
 def classify_path_risks(
@@ -48,7 +66,10 @@ def classify_path_risks(
         return None
 
     workspace = Path(workspace_dir).expanduser().resolve(strict=False)
-    for token in tokens:
+    cmd_switch_indexes = _cmd_switch_indexes(tokens)
+    for index, token in enumerate(tokens):
+        if index in cmd_switch_indexes:
+            continue
         if not _looks_like_path(token):
             continue
         normalized = token.strip().strip("\"'")

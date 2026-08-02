@@ -439,7 +439,7 @@ export function ChatInput({
   composerSeed = null,
   composerResetKey,
 }: ChatInputProps) {
-  const { t } = useI18n()
+  const { resolvedTimeZone, t } = useI18n()
   const [value, setValue] = React.useState('')
   const [showModelMenu, setShowModelMenu] = React.useState(false)
   const [paletteIndex, setPaletteIndex] = React.useState(0)
@@ -599,6 +599,7 @@ export function ChatInput({
             model: currentModel ?? undefined,
             selected_skill_ids: selectedSkills.map((skill) => skill.id),
             attachments: attachedFiles,
+            client_timezone: resolvedTimeZone,
             system_prompt: inference.systemPrompt,
             temperature: inference.temperature,
             max_tokens: inference.maxTokens,
@@ -648,6 +649,7 @@ export function ChatInput({
     inference.topK,
     inference.topP,
     projectId,
+    resolvedTimeZone,
     selectedSkills,
     sessionId,
     value,

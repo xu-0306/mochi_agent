@@ -7,8 +7,9 @@ the resolver intentionally contains no language-specific keyword router.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from collections.abc import Callable, Hashable
+from dataclasses import dataclass, replace
+from typing import Any, Literal, Protocol, TypeVar
 
 from mochi.agents.turn_intent_contract import (
     ActiveTaskState,
@@ -23,11 +24,14 @@ from mochi.agents.turn_intent_contract import (
     TurnIntentContract,
     TurnOperation,
 )
+from mochi.backends.base import BackendRequestError
 
 TurnRole = Literal["user", "assistant", "system", "tool"]
 TaskRelation = Literal[
     "continue", "side_question", "start", "supersede", "cancel", "standalone"
 ]
+ResolutionSource = Literal["interpreter", "fallback"]
+_MergedItem = TypeVar("_MergedItem")
 _TURN_ROLES = frozenset({"user", "assistant", "system", "tool"})
 _TASK_RELATIONS = frozenset(
     {"continue", "side_question", "start", "supersede", "cancel", "standalone"}
@@ -76,7 +80,7 @@ class IntentInterpretation:
     current_speech_act: SpeechAct
     task_relation: TaskRelation
     objective: str | None = None
-    operations: frozenset[TurnOperation] = field(default_factory=frozenset)
+    operations: frozenset[TurnOperation] = frozenset()
     deliverables: tuple[DeliverableContract, ...] = ()
     resolved_references: tuple[ResolvedReference, ...] = ()
     positive_constraints: tuple[IntentConstraint, ...] = ()
@@ -92,6 +96,7 @@ class ConversationInterpreter(Protocol):
         self, context: BoundedConversationContext
     ) -> IntentInterpretation:
         """Interpret language into a semantic proposal without granting permissions."""
+        ...
 
 
 class AdvisoryIntentClassifier(Protocol):
@@ -101,6 +106,7 @@ class AdvisoryIntentClassifier(Protocol):
         contract: TurnIntentContract,
     ) -> IntentAdvisory | None:
         """Return telemetry or routing advice; the result cannot mutate the contract."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,7 @@ class ConversationResolution:
     next_active_task: ActiveTaskState | None
     context: BoundedConversationContext
     diagnostics: dict[str, Any]
+    resolution_source: ResolutionSource
 
 
 class ConversationResolver:
@@ -158,9 +165,13 @@ class ConversationResolver:
 
         contract: TurnIntentContract | None = None
         next_active_task: ActiveTaskState | None = None
+        resolution_source: ResolutionSource = "fallback"
         if self._interpreter is not None:
             try:
                 candidate = await self._interpreter.interpret(context)
+                candidate = self._normalize_conversation_only_interpretation(
+                    candidate
+                )
                 interpretation = self._validate_interpretation(
                     candidate, context=context
                 )
@@ -169,6 +180,14 @@ class ConversationResolver:
                     interpretation=interpretation,
                 )
                 diagnostics["interpreter_status"] = "accepted"
+                resolution_source = "interpreter"
+            except BackendRequestError as exc:
+                # Intent interpretation is an optimization for capability
+                # selection, never a prerequisite for an ordinary response.
+                # Fall back to a capability-denying conversation contract so
+                # the main model can answer while mutation remains blocked.
+                diagnostics["interpreter_status"] = "unavailable"
+                diagnostics["interpreter_error"] = f"{type(exc).__name__}: {exc}"
             except Exception as exc:
                 diagnostics["interpreter_status"] = "rejected"
                 diagnostics["interpreter_error"] = f"{type(exc).__name__}: {exc}"
@@ -179,12 +198,15 @@ class ConversationResolver:
         if self._advisory_classifier is not None:
             semantic_before = contract.semantic_projection()
             try:
-                advisory = await self._advisory_classifier.classify(context, contract)
-                if advisory is not None:
-                    if not isinstance(advisory, IntentAdvisory):
+                advisory_candidate: Any = await self._advisory_classifier.classify(
+                    context, contract
+                )
+                if advisory_candidate is not None:
+                    if not isinstance(advisory_candidate, IntentAdvisory):
                         raise TypeError(
                             "advisory classifier must return IntentAdvisory"
                         )
+                    advisory = advisory_candidate
                     self._validate_source_ids(advisory.source_turn_ids, context=context)
                     contract = contract.with_advisories(
                         (*contract.advisories, advisory)
@@ -205,6 +227,7 @@ class ConversationResolver:
             next_active_task=next_active_task,
             context=context,
             diagnostics=diagnostics,
+            resolution_source=resolution_source,
         )
 
     def _bound_context(
@@ -289,7 +312,7 @@ class ConversationResolver:
 
     def _validate_interpretation(
         self,
-        interpretation: IntentInterpretation,
+        interpretation: object,
         *,
         context: BoundedConversationContext,
     ) -> IntentInterpretation:
@@ -350,6 +373,37 @@ class ConversationResolver:
         return interpretation
 
     @staticmethod
+    def _normalize_conversation_only_interpretation(
+        interpretation: object,
+    ) -> object:
+        """Recover a structurally empty task proposal as ordinary conversation.
+
+        Some backends emit a task relation even for a turn that carries no
+        objective, deliverable, operation, or mutation obligation.  Treating
+        that malformed shape as a task would turn a harmless conversation into
+        a validation failure.  This is deliberately structural rather than a
+        phrase or language based classifier.
+        """
+        if not isinstance(interpretation, IntentInterpretation):
+            return interpretation
+        if (
+            interpretation.task_relation in {"start", "supersede"}
+            and not str(interpretation.objective or "").strip()
+            and not interpretation.operations
+            and not interpretation.deliverables
+            and interpretation.mutation_requirement == "unknown"
+            and interpretation.clarification is None
+        ):
+            return replace(
+                interpretation,
+                current_speech_act="request_information",
+                task_relation="standalone",
+                operations=frozenset({"conversation"}),
+                mutation_requirement="forbidden",
+            )
+        return interpretation
+
+    @staticmethod
     def _validate_source_ids(
         source_turn_ids: tuple[str, ...],
         *,
@@ -371,7 +425,9 @@ class ConversationResolver:
         relation = interpretation.task_relation
         inherit_task = relation == "continue" and active is not None
 
-        operations = set(active.operations if inherit_task and active else ())
+        operations: set[TurnOperation] = set(
+            active.operations if inherit_task and active else ()
+        )
         operations.update(interpretation.operations)
         if interpretation.mutation_requirement == "required":
             operations.add("workspace_write")
@@ -541,24 +597,21 @@ class ConversationResolver:
         context: BoundedConversationContext,
     ) -> tuple[TurnIntentContract, ActiveTaskState | None]:
         active = context.active_task
-        clarification = ClarificationRequest(
-            question="Please clarify the intended outcome before I select capabilities or modify state.",
-            missing_fields=("current_turn_intent",),
-            source_turn_ids=(context.current_turn.turn_id,),
-            reason_code="semantic_interpretation_unavailable",
-        )
         contract = TurnIntentContract(
             turn_id=context.current_turn.turn_id,
             active_goal_id=active.goal_id if active else None,
             objective=active.objective if active else "",
-            current_speech_act="unknown",
-            operations=frozenset(),
+            current_speech_act="request_information",
+            # The baseline permits an answer and controlled capability
+            # discovery.  It intentionally grants neither mutation nor
+            # execution; those still require a validated semantic contract.
+            operations=frozenset({"conversation", "tool_discovery"}),
             deliverables=(),
             resolved_references=(),
             positive_constraints=(),
             negative_constraints=(),
-            mutation_requirement="unknown",
-            clarification=clarification,
+            mutation_requirement="forbidden",
+            clarification=None,
             supersedes_previous_goal=False,
             cancels_active_goal=False,
             modifies_active_task=False,
@@ -575,9 +628,12 @@ class ConversationResolver:
 
     @staticmethod
     def _merge_items(
-        base: tuple[Any, ...], updates: tuple[Any, ...], *, key: Any
-    ) -> tuple[Any, ...]:
-        merged: dict[Any, Any] = {key(item): item for item in base}
+        base: tuple[_MergedItem, ...],
+        updates: tuple[_MergedItem, ...],
+        *,
+        key: Callable[[_MergedItem], Hashable],
+    ) -> tuple[_MergedItem, ...]:
+        merged: dict[Hashable, _MergedItem] = {key(item): item for item in base}
         for item in updates:
             merged[key(item)] = item
         return tuple(merged.values())

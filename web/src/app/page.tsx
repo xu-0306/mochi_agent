@@ -102,7 +102,10 @@ import { buildProjectedDisplayMessages } from '@/lib/chat-projections'
 import {
   hydrateOrdinaryChatPlanProjection,
   markProvisionalOrdinaryChatFinals,
+  reduceOrdinaryChatPlanEvent,
+  type OrdinaryChatPlanState,
 } from '@/lib/ordinary-chat-plan'
+import { observeOrdinaryChatRuntime } from '@/lib/ordinary-chat-runtime-observer'
 import { DELEGATE_SUBAGENT_TOOL_NAME } from '@/lib/subagent-tasks'
 import {
   findRegeneratePrompt,
@@ -1633,7 +1636,7 @@ function HeaderRuntimeIndicator({
 
 export default function ChatPage() {
   const router = useRouter()
-  const { t } = useI18n()
+  const { resolvedTimeZone, t } = useI18n()
   const [modelOptions, setModelOptions] = React.useState<ChatInputModelOption[]>([])
   const [currentModel, setCurrentModel] = React.useState<string | null>(null)
   const [currentModelLoaded, setCurrentModelLoaded] = React.useState<boolean | null>(null)
@@ -1703,6 +1706,8 @@ export default function ChatPage() {
   const [, setVoiceRuntimeLoading] = React.useState(false)
   const [exportOpen, setExportOpen] = React.useState(false)
   const [showScrollToBottom, setShowScrollToBottom] = React.useState(false)
+  const [liveOrdinaryChatPlanState, setLiveOrdinaryChatPlanState] =
+    React.useState<OrdinaryChatPlanState | null>(null)
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const shouldAutoScrollRef = React.useRef(true)
   const voiceClientRef = React.useRef<VoiceWsClient | null>(null)
@@ -2118,10 +2123,48 @@ export default function ChatPage() {
     () => buildWorkflowProgressCardView(projectedWorkflowRun),
     [projectedWorkflowRun]
   )
-  const ordinaryChatPlanState = React.useMemo(
+  const ordinaryChatPlanSnapshot = React.useMemo(
     () => hydrateOrdinaryChatPlanProjection(currentSessionDetail?.adaptiveRuntime),
     [currentSessionDetail?.adaptiveRuntime]
   )
+  const ordinaryChatPlanState = liveOrdinaryChatPlanState ?? ordinaryChatPlanSnapshot
+
+  React.useEffect(() => {
+    if (
+      !currentSessionId ||
+      currentSessionDetail?.id !== currentSessionId ||
+      streamingSessionId !== currentSessionId
+    ) {
+      setLiveOrdinaryChatPlanState(null)
+      return
+    }
+    const controller = new AbortController()
+    const run = async () => {
+      try {
+        await observeOrdinaryChatRuntime({
+          signal: controller.signal,
+          fetchSnapshot: async (signal) => {
+            const snapshot = await api.fetchOrdinaryChatRuntimeProjection(currentSessionId, { signal })
+            return { state: hydrateOrdinaryChatPlanProjection(snapshot), lastEventId: snapshot.events.at(-1)?.event_id ?? null }
+          },
+          stream: ({ lastEventId }, signal) => api.streamOrdinaryChatRuntime(currentSessionId, { lastEventId, signal }),
+          reduce: reduceOrdinaryChatPlanEvent,
+          onState: setLiveOrdinaryChatPlanState,
+          isStaleCursor: (error) => error instanceof api.ApiError && error.status === 409,
+        })
+      } catch {
+        // Snapshot refresh remains the bounded reconnect fallback.  The card
+        // is display-only, so a failed stream never mutates chat history.
+        if (!controller.signal.aborted) {
+          setLiveOrdinaryChatPlanState(null)
+        }
+      }
+    }
+    void run()
+    return () => {
+      controller.abort()
+    }
+  }, [currentSessionDetail?.id, currentSessionId, streamingSessionId])
   const displayMessages = React.useMemo<Message[]>(() => {
     return buildProjectedDisplayMessages({
       messages: markProvisionalOrdinaryChatFinals(messages, ordinaryChatPlanState),
@@ -4193,6 +4236,7 @@ export default function ChatPage() {
             toolMode,
             selectedSkillIds,
             attachments,
+            clientTimezone: resolvedTimeZone,
             systemPrompt: systemPromptOverride ?? effectiveInference.systemPrompt,
             temperature: effectiveInference.temperature,
             maxTokens: effectiveInference.maxTokens,
@@ -4379,6 +4423,7 @@ export default function ChatPage() {
       finishStreaming,
       modelOptions,
       projects,
+      resolvedTimeZone,
       resolveMessagesForSession,
       selectSession,
       setSessionMessages,

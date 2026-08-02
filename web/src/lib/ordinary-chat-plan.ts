@@ -58,6 +58,24 @@ export interface OrdinaryChatEvidence {
   receipts: OrdinaryChatReceipt[]
 }
 
+export interface OrdinaryChatFailureLearningMetrics {
+  coverage: 'partial' | 'complete'
+  valid_transition_count: number
+  ignored_transition_count: number
+  candidates: number
+  processed: number
+  rejected: number
+  hints_selected: number
+}
+
+export interface OrdinaryChatCostCoverageMetrics {
+  coverage: 'partial' | 'complete'
+  token_coverage: 'partial' | 'complete'
+  wall_coverage: 'partial' | 'complete'
+  observed_turns: number
+  expected_turns: number
+}
+
 export interface OrdinaryChatTurn {
   turn_id: string
   status: OrdinaryChatTurnStatus
@@ -70,6 +88,8 @@ export interface OrdinaryChatTurn {
   failure_learning: {
     candidate_count: number
     processed_count: number
+    rejected_count: number
+    hints_selected_count: number
   }
   blockers: string[]
 }
@@ -101,9 +121,27 @@ export interface OrdinaryChatPlanState {
   turns: Record<string, OrdinaryChatTurn>
   seenEventIds: Set<string>
   ignoredEventCount: number
+  failureLearning: OrdinaryChatFailureLearningMetrics
+  costCoverage: OrdinaryChatCostCoverageMetrics
 }
 
 const EMPTY_EVIDENCE = (): OrdinaryChatEvidence => ({ status: 'not_observed', receipts: [] })
+const EMPTY_FAILURE_LEARNING = (): OrdinaryChatFailureLearningMetrics => ({
+  coverage: 'partial',
+  valid_transition_count: 0,
+  ignored_transition_count: 0,
+  candidates: 0,
+  processed: 0,
+  rejected: 0,
+  hints_selected: 0,
+})
+const EMPTY_COST_COVERAGE = (): OrdinaryChatCostCoverageMetrics => ({
+  coverage: 'partial',
+  token_coverage: 'partial',
+  wall_coverage: 'partial',
+  observed_turns: 0,
+  expected_turns: 0,
+})
 
 export function createOrdinaryChatPlanState(sessionId: string): OrdinaryChatPlanState {
   return {
@@ -112,6 +150,8 @@ export function createOrdinaryChatPlanState(sessionId: string): OrdinaryChatPlan
     turns: {},
     seenEventIds: new Set<string>(),
     ignoredEventCount: 0,
+    failureLearning: EMPTY_FAILURE_LEARNING(),
+    costCoverage: EMPTY_COST_COVERAGE(),
   }
 }
 
@@ -138,6 +178,7 @@ export function reduceOrdinaryChatPlanEvent(
     latestSequence: Math.max(state.latestSequence, event.sequence),
     seenEventIds,
     turns: { ...state.turns },
+    failureLearning: { ...state.failureLearning },
   }
   if (!event.turn_id) {
     return next
@@ -171,7 +212,7 @@ export function reduceOrdinaryChatPlanEvent(
     blockers: [...previous.blockers],
     updated_sequence: Math.max(previous.updated_sequence, event.sequence),
   }
-  applyEvent(turn, event)
+  applyEvent(turn, event, next.failureLearning)
   turn.status = deriveStatus(turn)
   next.turns[event.turn_id] = turn
   return next
@@ -194,15 +235,37 @@ export function hydrateOrdinaryChatPlanProjection(
     return createOrdinaryChatPlanState('')
   }
   const state = reduceOrdinaryChatPlanEvents(projection.session_id, projection.events ?? [])
-  if (state.latestSequence > 0 || Object.keys(state.turns).length > 0) {
-    return state
-  }
-  for (const turn of projection.turns ?? []) {
-    if (turn && typeof turn.turn_id === 'string') {
-      state.turns[turn.turn_id] = normalizeTurn(turn)
+  // The event replay is intentionally bounded, while turns is the
+  // authoritative bounded snapshot.  Merge it even when replay contained a
+  // recent event so older turn state is not lost after a long-session reload.
+  const snapshotTurns = (projection.turns ?? []).filter(
+    (turn): turn is OrdinaryChatTurn =>
+      Boolean(turn && typeof turn.turn_id === 'string')
+  )
+  if (snapshotTurns.length > 0) {
+    const snapshotTurnIds = new Set(snapshotTurns.map((turn) => turn.turn_id))
+    for (const turnId of Object.keys(state.turns)) {
+      if (!snapshotTurnIds.has(turnId)) delete state.turns[turnId]
     }
   }
-  state.latestSequence = projection.latest_sequence ?? 0
+  for (const turn of snapshotTurns) {
+    const snapshot = normalizeTurn(turn)
+    const replayed = state.turns[turn.turn_id]
+    // Snapshot is authoritative even at an equal sequence: bounded replay
+    // may carry only a derived/status event for that durable checkpoint.
+    if (!replayed || snapshot.updated_sequence >= replayed.updated_sequence) {
+      state.turns[turn.turn_id] = snapshot
+    }
+  }
+  state.latestSequence = Math.max(state.latestSequence, projection.latest_sequence ?? 0)
+  state.failureLearning = normalizeFailureLearningMetrics(
+    isRecord(projection.metrics?.failure_learning)
+      ? projection.metrics.failure_learning
+      : null
+  )
+  state.costCoverage = normalizeCostCoverageMetrics(
+    isRecord(projection.metrics?.cost) ? projection.metrics.cost : null
+  )
   return state
 }
 
@@ -295,7 +358,11 @@ export function markProvisionalOrdinaryChatFinals(
   })
 }
 
-function applyEvent(turn: OrdinaryChatTurn, event: OrdinaryChatRuntimeEvent): void {
+function applyEvent(
+  turn: OrdinaryChatTurn,
+  event: OrdinaryChatRuntimeEvent,
+  failureLearning: OrdinaryChatFailureLearningMetrics
+): void {
   const payload = isRecord(event.payload) ? event.payload : {}
   if (event.event === 'ordinary_chat_plan_ledger_updated') {
     const plan = isRecord(payload.plan) ? normalizePlan(payload.plan) : null
@@ -330,23 +397,64 @@ function applyEvent(turn: OrdinaryChatTurn, event: OrdinaryChatRuntimeEvent): vo
     if (verificationStatus) turn.evidence.status = verificationStatus
     addBlocker(turn, getString(payload.blocker_reason))
     if (stage === 'awaiting_approval') addBlocker(turn, 'awaiting_approval')
+  } else if (event.event === 'turn_status_hint') {
+    const extended = turn as OrdinaryChatTurn & {
+      runtimeStatusHint?: string
+      activationOutcome?: string
+    }
+    const status = getString(payload.status)
+    if (status === 'partial') extended.runtimeStatusHint = status
+    const activationOutcome = getString(payload.activation_outcome)
+    if (activationOutcome === 'denied' || activationOutcome === 'activated') {
+      extended.activationOutcome = activationOutcome
+      if (activationOutcome === 'activated') {
+        turn.blockers = turn.blockers.filter((item) => item !== 'tool_activation_denied')
+      }
+    }
+    addBlocker(turn, getString(payload.blocker_code))
   } else if (event.event === 'session_turn_timeline') {
     const status = getString(payload.status)
     const terminalOutcome = getString(payload.terminal_outcome)
     const cancellationOutcome = getString(payload.cancellation_outcome)
+    const extended = turn as OrdinaryChatTurn & {
+      timelineCancelled?: boolean
+      terminalOutcome?: string
+    }
     if (status === 'cancelled' || terminalOutcome === 'cancelled' || cancellationOutcome) {
-      ;(turn as OrdinaryChatTurn & { timelineCancelled?: boolean }).timelineCancelled = true
+      extended.timelineCancelled = true
+      extended.terminalOutcome = 'cancelled'
       addBlocker(turn, cancellationOutcome ?? 'cancelled')
+    } else if (status === 'terminal') {
+      extended.terminalOutcome =
+        terminalOutcome === 'completed' || terminalOutcome === 'blocked'
+          ? terminalOutcome
+          : 'unknown'
+      if (terminalOutcome === 'blocked') addBlocker(turn, 'blocked')
     }
   } else if (event.event === 'message') {
     addBlocker(turn, getString(payload.error_code))
     addBlocker(turn, getString(payload.status) === 'blocked' ? 'blocked' : null)
-  } else if (event.event === 'failure_learning_candidate') {
-    turn.failure_learning.candidate_count += 1
-    const reasons = Array.isArray(payload.reason_codes) ? payload.reason_codes : []
-    for (const reason of reasons) addBlocker(turn, getString(reason))
-  } else if (event.event === 'failure_learning_processed') {
-    turn.failure_learning.processed_count += 1
+  } else if (event.event === 'failure_learning_attribution_recorded') {
+    const transition = getString(payload.transition)
+    if (transition === 'candidate') {
+      turn.failure_learning.candidate_count += 1
+      failureLearning.candidates += 1
+    } else if (transition === 'processed') {
+      turn.failure_learning.processed_count += 1
+      failureLearning.processed += 1
+    } else if (transition === 'rejected') {
+      turn.failure_learning.rejected_count += 1
+      failureLearning.rejected += 1
+    } else if (transition === 'hint_selected') {
+      turn.failure_learning.hints_selected_count += 1
+      failureLearning.hints_selected += 1
+    } else {
+      failureLearning.ignored_transition_count += 1
+      return
+    }
+    failureLearning.valid_transition_count += 1
+    failureLearning.coverage =
+      failureLearning.ignored_transition_count === 0 ? 'complete' : 'partial'
   }
 }
 
@@ -360,7 +468,12 @@ function createTurn(turnId: string): OrdinaryChatTurn {
     retrieval: {},
     evidence: EMPTY_EVIDENCE(),
     recovery: {},
-    failure_learning: { candidate_count: 0, processed_count: 0 },
+    failure_learning: {
+      candidate_count: 0,
+      processed_count: 0,
+      rejected_count: 0,
+      hints_selected_count: 0,
+    },
     blockers: [],
   }
 }
@@ -375,8 +488,58 @@ function normalizeTurn(value: OrdinaryChatTurn): OrdinaryChatTurn {
     retrieval: isRecord(value.retrieval) ? { ...value.retrieval } : {},
     evidence: normalizeEvidence(value.evidence),
     recovery: isRecord(value.recovery) ? { ...value.recovery } : {},
+    failure_learning: normalizeTurnFailureLearning(value.failure_learning),
     blockers: Array.isArray(value.blockers) ? value.blockers.filter((item) => typeof item === 'string') : [],
   }
+}
+
+function normalizeTurnFailureLearning(value: unknown): OrdinaryChatTurn['failure_learning'] {
+  const record = isRecord(value) ? value : {}
+  return {
+    candidate_count: getNonNegativeInteger(record.candidate_count),
+    processed_count: getNonNegativeInteger(record.processed_count),
+    rejected_count: getNonNegativeInteger(record.rejected_count),
+    hints_selected_count: getNonNegativeInteger(record.hints_selected_count),
+  }
+}
+
+function normalizeFailureLearningMetrics(
+  value: Record<string, unknown> | null
+): OrdinaryChatFailureLearningMetrics {
+  if (!value) return EMPTY_FAILURE_LEARNING()
+  return {
+    coverage: value.coverage === 'complete' ? 'complete' : 'partial',
+    valid_transition_count: getNonNegativeInteger(value.valid_transition_count),
+    ignored_transition_count: getNonNegativeInteger(value.ignored_transition_count),
+    candidates: getNonNegativeInteger(value.candidates),
+    processed: getNonNegativeInteger(value.processed),
+    rejected: getNonNegativeInteger(value.rejected),
+    hints_selected: getNonNegativeInteger(value.hints_selected),
+  }
+}
+
+function normalizeCostCoverageMetrics(
+  value: Record<string, unknown> | null
+): OrdinaryChatCostCoverageMetrics {
+  if (!value) return EMPTY_COST_COVERAGE()
+  return {
+    coverage: value.coverage === 'complete' ? 'complete' : 'partial',
+    token_coverage: value.token_coverage === 'complete' ? 'complete' : 'partial',
+    wall_coverage: value.wall_coverage === 'complete' ? 'complete' : 'partial',
+    observed_turns: getNonNegativeInteger(value.observed_turns),
+    expected_turns: getNonNegativeInteger(value.expected_turns),
+  }
+}
+
+export function failureLearningDisplayItems(
+  state: OrdinaryChatPlanState
+): ReadonlyArray<{ label: string; value: number }> {
+  return [
+    { label: 'Candidates', value: state.failureLearning.candidates },
+    { label: 'Processed', value: state.failureLearning.processed },
+    { label: 'Rejected', value: state.failureLearning.rejected },
+    { label: 'Hints selected', value: state.failureLearning.hints_selected },
+  ]
 }
 
 function normalizePlan(value: Record<string, unknown> | OrdinaryChatPlan): OrdinaryChatPlan {
@@ -434,13 +597,34 @@ function normalizeReceipt(value: Record<string, unknown>): OrdinaryChatReceipt {
 }
 
 function deriveStatus(turn: OrdinaryChatTurn): OrdinaryChatTurnStatus {
-  const extended = turn as OrdinaryChatTurn & { stage?: string; timelineCancelled?: boolean }
+  const extended = turn as OrdinaryChatTurn & {
+    stage?: string
+    timelineCancelled?: boolean
+    terminalOutcome?: string
+    runtimeStatusHint?: string
+    activationOutcome?: string
+  }
   if (extended.timelineCancelled) return 'cancelled'
   if (turn.evidence.status === 'failed' || turn.plan?.status === 'blocked') return 'blocked'
   if (extended.stage === 'blocked') return 'blocked'
+  if (extended.runtimeStatusHint === 'partial') return 'partial'
+  if (extended.terminalOutcome === 'blocked') return 'blocked'
+  if (
+    (extended.terminalOutcome === 'completed' || extended.terminalOutcome === 'unknown') &&
+    extended.activationOutcome === 'denied'
+  ) {
+    return 'blocked'
+  }
   if (turn.evidence.status === 'unverified') return 'partial'
   if (turn.plan?.status === 'cancelled') return 'cancelled'
-  if (turn.plan?.status === 'completed' || extended.stage === 'completed') return 'completed'
+  if (extended.terminalOutcome === 'unknown') return 'partial'
+  if (
+    turn.plan?.status === 'completed' ||
+    extended.stage === 'completed' ||
+    extended.terminalOutcome === 'completed'
+  ) {
+    return 'completed'
+  }
   if (extended.stage === 'awaiting_approval') return 'awaiting_approval'
   return 'running'
 }
@@ -463,6 +647,10 @@ function getNullableString(value: unknown): string | null {
 
 function getNullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function getNonNegativeInteger(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0
 }
 
 function getStringArray(value: unknown): string[] {

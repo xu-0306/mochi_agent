@@ -1530,6 +1530,7 @@ dependencies = [
     { name = "torch" },
     { name = "transformers" },
     { name = "typer" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1608,6 +1609,7 @@ requires-dist = [
     { name = "trafilatura", marker = "extra == 'tools'", specifier = ">=1.12" },
     { name = "transformers", specifier = ">=4.44" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2026.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "vosk", marker = "extra == 'voice-extras'", specifier = ">=0.3.45" },
     { name = "whisper-cpp-python", marker = "extra == 'voice-extras'", specifier = ">=0.2" },

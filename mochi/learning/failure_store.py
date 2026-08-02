@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from mochi.learning.failure_episode import FailureEpisode
@@ -37,6 +38,7 @@ class FailureAggregate:
     capability_tags: tuple[str, ...]
     tool_name: str | None
     verified_correction_summary: str | None
+    hint_candidate_id: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,6 +49,7 @@ class FailureAggregate:
             "capability_tags": list(self.capability_tags),
             "tool_name": self.tool_name,
             "verified_correction_summary": self.verified_correction_summary,
+            "hint_candidate_id": self.hint_candidate_id,
         }
 
 
@@ -58,9 +61,13 @@ class FailureStore:
         session_store: FailureStoreSessionStore,
         *,
         session_id: str = FAILURE_STORE_SESSION_ID,
+        retention_days: int | None = None,
     ) -> None:
         self._session_store = session_store
         self._session_id = session_id
+        if retention_days is not None and (type(retention_days) is not int or retention_days < 1):
+            raise FailureStoreError("retention_days must be positive")
+        self._retention_days = retention_days
 
     async def record(self, episode: FailureEpisode) -> bool:
         if type(episode) is not FailureEpisode:
@@ -83,7 +90,7 @@ class FailureStore:
 
         return await self._session_store.append_event_if(self._session_id, event, predicate)
 
-    async def aggregates(self) -> tuple[FailureAggregate, ...]:
+    async def aggregates(self, *, now: datetime | None = None) -> tuple[FailureAggregate, ...]:
         events = await self._session_store.load_session(self._session_id)
         by_signature: dict[str, list[FailureEpisode]] = {}
         for event in events:
@@ -95,20 +102,32 @@ class FailureStore:
             if not isinstance(payload, Mapping):
                 raise FailureStoreError("failure store episode must be an object")
             episode = FailureEpisode.from_dict(cast(Mapping[str, Any], payload))
+            if self._retention_days is not None:
+                current = now or datetime.now(tz=UTC)
+                if current.tzinfo is None:
+                    raise FailureStoreError("retention now must be timezone-aware")
+                current = current.astimezone(UTC)
+                created = datetime.fromisoformat(episode.created_at.replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    raise FailureStoreError("episode created_at must be timezone-aware")
+                created = created.astimezone(UTC)
+                if created < current - timedelta(days=self._retention_days):
+                    continue
             by_signature.setdefault(episode.failure_signature, []).append(episode)
         aggregates: list[FailureAggregate] = []
         for signature, episodes in by_signature.items():
             latest = max(episodes, key=lambda episode: episode.created_at)
             verified = [episode for episode in episodes if episode.correction_verified]
-            summary = next(
+            hint_source = next(
                 (
-                    feedback
+                    (episode, feedback)
                     for episode in verified
                     for feedback in episode.verifier_feedback
                     if feedback
                 ),
                 None,
             )
+            summary = hint_source[1] if hint_source is not None else None
             aggregates.append(
                 FailureAggregate(
                     failure_signature=signature,
@@ -118,6 +137,11 @@ class FailureStore:
                     capability_tags=latest.capability_tags,
                     tool_name=latest.tool_name,
                     verified_correction_summary=summary,
+                    hint_candidate_id=(
+                        hint_source[0].episode_id
+                        if hint_source is not None
+                        else None
+                    ),
                 )
             )
         return tuple(sorted(aggregates, key=lambda item: item.failure_signature))
@@ -128,6 +152,7 @@ class FailureStore:
         min_occurrences: int = 2,
         max_hints: int = 2,
         max_hint_chars: int = 800,
+        available_tool_names: set[str] | None = None,
     ) -> tuple[FailureAggregate, ...]:
         if type(min_occurrences) is not int or min_occurrences < 1:
             raise FailureStoreError("min_occurrences must be positive")
@@ -141,6 +166,11 @@ class FailureStore:
             if aggregate.occurrence_count >= min_occurrences
             and aggregate.verified_correction_count > 0
             and aggregate.verified_correction_summary
+            and (
+                available_tool_names is None
+                or aggregate.tool_name is None
+                or aggregate.tool_name in available_tool_names
+            )
         ]
         return tuple(
             FailureAggregate(
@@ -153,6 +183,7 @@ class FailureStore:
                 verified_correction_summary=(
                     aggregate.verified_correction_summary or ""
                 )[:max_hint_chars],
+                hint_candidate_id=aggregate.hint_candidate_id,
             )
             for aggregate in candidates[:max_hints]
         )

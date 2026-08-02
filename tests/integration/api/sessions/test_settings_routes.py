@@ -67,6 +67,29 @@ def test_settings_revision_etag_and_conflict_preserve_winner(tmp_path: Path) -> 
     assert "log_level: DEBUG" in config_path.read_text(encoding="utf-8")
 
 
+def test_settings_complexity_mode_patch_is_an_explicit_operator_rollback(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    app = create_app()
+    app.state.config = MochiConfig(model="ollama:initial")
+    app.state.config_path = config_path
+
+    with TestClient(app) as client:
+        initial = client.get("/v1/settings")
+        revision = initial.json()["revision"]
+        patched = client.patch(
+            "/v1/settings",
+            headers={"If-Match": f'"{revision}"'},
+            json={"agent": {"complexity_mode": "shadow"}},
+        )
+
+    assert patched.status_code == 200
+    complexity = app.state.config.agent.ordinary_chat_adaptive_runtime.complexity
+    assert complexity.mode == "shadow"
+    assert complexity.rollout_version == "operator-v2"
+
+
 def test_settings_hides_secrets_and_returns_bounded_summary(tmp_path: Path) -> None:
     """`/v1/settings` 不得回傳 token 或 API key。"""
     config = MochiConfig.model_validate(

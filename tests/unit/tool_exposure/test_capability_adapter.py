@@ -113,19 +113,28 @@ def _capability_plan(
     )
 
 
-def _baseline_plan(*, tool_names: list[str], limit: int = 8) -> ToolExposurePlan:
+def _baseline_plan(
+    *,
+    tool_names: list[str],
+    limit: int = 8,
+    discoverable_tool_names: list[str] | None = None,
+) -> ToolExposurePlan:
     return ToolExposurePlan(
         tool_names=tool_names,
         matched_groups=["baseline_policy"],
         limit=limit,
-        discoverable_tool_names=[
-            "file_read",
-            "file_write",
-            "file_edit",
-            "apply_patch",
-            "exec_command",
-            "tool_search",
-        ],
+        discoverable_tool_names=(
+            discoverable_tool_names
+            if discoverable_tool_names is not None
+            else [
+                "file_read",
+                "file_write",
+                "file_edit",
+                "apply_patch",
+                "exec_command",
+                "tool_search",
+            ]
+        ),
         workspace_bound=True,
         diagnostics={
             "workspace_write_obligation": {
@@ -335,7 +344,7 @@ def test_enforce_removes_baseline_business_tools_outside_capability_plan() -> No
     )
 
     assert result.tool_names == ["file_read", "tool_search"]
-    assert result.discoverable_tool_names == ["file_read", "tool_search"]
+    assert result.discoverable_tool_names == ["file_read"]
     adapter = result.diagnostics["capability_exposure_adapter"]
     assert adapter["activation_allowed_tool_names"] == ["file_read"]
     assert adapter["reasons"]["exec_command"] == [
@@ -407,3 +416,79 @@ def test_enforce_reserves_broker_slot_in_actual_registry_view() -> None:
     adapter = result.diagnostics["capability_exposure_adapter"]
     assert adapter["activation_broker"]["required"] is True
     assert adapter["schema_budget"]["expected_runtime_schema_count"] == 2
+
+
+def test_deferred_tools_are_activation_allowed() -> None:
+    contract = _contract(
+        operations=frozenset({"tool_discovery"}),
+        mutation_requirement="forbidden",
+    )
+    capability_plan = _capability_plan(
+        contract=contract,
+        required_capabilities=frozenset({"tool_discovery"}),
+        exposed_tools=("tool_search",),
+        eligible_tools=("tool_search", "safe_lookup"),
+    )
+    result = adapt_capability_plan_to_exposure(
+        baseline_plan=_baseline_plan(tool_names=["tool_search", "tool_result_read"]),
+        capability_plan=capability_plan,
+        contract=contract,
+    )
+
+    adapter = result.diagnostics["capability_exposure_adapter"]
+    deferred = set(adapter["activation_broker"]["deferred_tool_names"])
+    assert deferred <= set(adapter["activation_allowed_tool_names"])
+    assert "tool_result_read" not in deferred
+
+
+def test_omits_broker_without_activatable_deferred_tools() -> None:
+    contract = _contract(
+        operations=frozenset({"tool_discovery"}),
+        mutation_requirement="forbidden",
+    )
+    capability_plan = _capability_plan(
+        contract=contract,
+        required_capabilities=frozenset({"tool_discovery"}),
+        exposed_tools=("tool_search",),
+    )
+    result = adapt_capability_plan_to_exposure(
+        baseline_plan=_baseline_plan(tool_names=["tool_search", "tool_result_read"]),
+        capability_plan=capability_plan,
+        contract=contract,
+    )
+
+    adapter = result.diagnostics["capability_exposure_adapter"]
+    assert adapter["activation_broker"]["required"] is False
+    assert adapter["activation_broker"]["deferred_tool_names"] == []
+
+
+def test_records_result_reader_for_reference_continuation_without_activation() -> None:
+    contract = _contract(
+        operations=frozenset({"open_world_lookup"}),
+        mutation_requirement="forbidden",
+    )
+    capability_plan = _capability_plan(
+        contract=contract,
+        required_capabilities=frozenset({"open_world_lookup"}),
+        exposed_tools=("web_search",),
+        eligible_tools=("web_search",),
+    )
+    result = adapt_capability_plan_to_exposure(
+        baseline_plan=_baseline_plan(
+            tool_names=["web_search", "tool_search"],
+            discoverable_tool_names=[
+                "web_search",
+                "tool_search",
+                "tool_result_read",
+            ],
+        ),
+        capability_plan=capability_plan,
+        contract=contract,
+    )
+
+    adapter = result.diagnostics["capability_exposure_adapter"]
+    assert adapter["continuation_candidate_tool_names"] == ["tool_result_read"]
+    assert "tool_result_read" not in adapter["activation_allowed_tool_names"]
+    assert "tool_result_read" not in adapter["activation_broker"][
+        "deferred_tool_names"
+    ]

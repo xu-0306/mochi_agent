@@ -12,6 +12,8 @@ import type {
   ToolTransportDiagnostics,
   TokenStats,
 } from '@/lib/chat'
+import { formatChatErrorDiagnostics } from '@/lib/chat-error-display'
+import { decodeSseJsonFrames, normalizeAdaptiveRuntimeEnvelope } from './ordinary-chat-runtime-stream'
 import {
   normalizeToolExposureDiagnostics,
   normalizeToolWorkflowProjection,
@@ -64,7 +66,7 @@ export type {
 } from '@/lib/tool-workflow-aggregate'
 export type { OrdinaryChatRuntimeProjection } from '@/lib/ordinary-chat-plan'
 
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 type ApiPrimitive = string | number | boolean | null
 type ApiValue = ApiPrimitive | ApiValue[] | { [key: string]: ApiValue }
@@ -115,7 +117,8 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
     value === 'low' ||
     value === 'medium' ||
     value === 'high' ||
-    value === 'xhigh'
+    value === 'xhigh' ||
+    value === 'max'
   )
 }
 
@@ -351,6 +354,7 @@ export interface SendMessageOptions {
   toolMode?: 'disabled' | 'auto' | 'required'
   selectedSkillIds?: string[]
   attachments?: ChatAttachment[]
+  clientTimezone?: string
   temperature?: number
   maxTokens?: number | null
   reserveOutputTokens?: number | null
@@ -505,6 +509,8 @@ export interface PostChatPayload {
   selected_skill_ids?: string[]
   selectedSkillIds?: string[]
   attachments?: ChatAttachment[]
+  client_timezone?: string | null
+  clientTimezone?: string | null
   system_prompt?: string
   temperature?: number
   max_tokens?: number | null
@@ -1319,7 +1325,10 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
       turnKey,
       turnId: turnKey,
       reasoningSteps: [step],
-      errorCode: step.errorCode,
+      errorCode:
+        step.type === 'error'
+          ? formatChatErrorDiagnostics(step.errorCode, step.toolMeta)
+          : step.errorCode,
       isStreaming: step.type !== 'error',
       reasoningBuffer: step.type === 'error' ? undefined : createInlineReasoningBuffer(),
       inlineReasoningStepId: undefined,
@@ -1352,6 +1361,7 @@ export async function sendMessage(
       tool_mode: options.toolMode,
       selected_skill_ids: options.selectedSkillIds,
       attachments: serializeChatAttachments(options.attachments),
+      client_timezone: options.clientTimezone,
       system_prompt: options.systemPrompt,
       temperature: options.temperature,
       max_tokens: options.maxTokens,
@@ -1393,6 +1403,7 @@ export async function postChat(payload: PostChatPayload): Promise<BackendChatRes
       tool_mode: payload.tool_mode,
       selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
       attachments: serializeChatAttachments(payload.attachments),
+      client_timezone: payload.client_timezone ?? payload.clientTimezone,
       system_prompt: payload.system_prompt,
       temperature: payload.temperature,
       max_tokens: payload.max_tokens,
@@ -1432,6 +1443,7 @@ export async function fetchChatContextPreview(
         tool_mode: payload.tool_mode,
         selected_skill_ids: payload.selected_skill_ids ?? payload.selectedSkillIds,
         attachments: serializeChatAttachments(payload.attachments),
+        client_timezone: payload.client_timezone ?? payload.clientTimezone,
         system_prompt: payload.system_prompt,
         temperature: payload.temperature,
         max_tokens: payload.max_tokens,
@@ -1644,6 +1656,7 @@ async function requestStreamResponse(
         tool_mode: options.toolMode,
         selected_skill_ids: options.selectedSkillIds,
         attachments: serializeChatAttachments(options.attachments),
+        client_timezone: options.clientTimezone,
         system_prompt: options.systemPrompt,
         temperature: options.temperature,
         max_tokens: options.maxTokens,
@@ -2250,15 +2263,17 @@ export async function fetchSession(sessionId: string): Promise<SessionDetail> {
 
 export async function fetchOrdinaryChatRuntimeProjection(
   sessionId: string,
-  input: { maxTurns?: number; maxEvents?: number } = {}
+  input: { maxTurns?: number; maxEvents?: number; signal?: AbortSignal } = {}
 ): Promise<OrdinaryChatRuntimeProjection> {
   const params = new URLSearchParams({
     max_turns: String(input.maxTurns ?? 12),
     max_events: String(input.maxEvents ?? 128),
   })
-  const payload = await requestJson<unknown>(
-    `/sessions/${encodeURIComponent(sessionId)}/adaptive-runtime?${params.toString()}`
-  )
+  const response = await fetch(resolveApiUrl(`/sessions/${encodeURIComponent(sessionId)}/adaptive-runtime?${params.toString()}`), {
+    headers: { Accept: 'application/json' }, signal: input.signal, cache: 'no-store',
+  })
+  if (!response.ok) throw new ApiError(response.status, response.statusText || 'Request failed')
+  const payload = await parseResponseBody(response)
   const projection = normalizeOrdinaryChatRuntimeProjection(payload)
   if (!projection) throw new Error('Ordinary Chat adaptive runtime projection is invalid.')
   return projection
@@ -2266,7 +2281,7 @@ export async function fetchOrdinaryChatRuntimeProjection(
 
 export async function* streamOrdinaryChatRuntime(
   sessionId: string,
-  input: { afterSequence?: number; lastEventId?: string | null } = {}
+  input: { afterSequence?: number; lastEventId?: string | null; signal?: AbortSignal } = {}
 ): AsyncGenerator<OrdinaryChatRuntimeEvent, void, unknown> {
   const params = new URLSearchParams({
     after_sequence: String(input.afterSequence ?? 0),
@@ -2281,6 +2296,7 @@ export async function* streamOrdinaryChatRuntime(
         ...(input.lastEventId ? { 'Last-Event-ID': input.lastEventId } : {}),
       },
       cache: 'no-store',
+      signal: input.signal,
     }
   )
   if (!response.ok) {
@@ -2292,10 +2308,10 @@ export async function* streamOrdinaryChatRuntime(
     )
   }
   if (!response.body) throw new ApiError(0, 'Adaptive runtime stream body is unavailable.')
-  for await (const rawFrame of readSseStream(response.body)) {
-    const frame = rawFrame as unknown as Record<string, unknown>
-    if (frame.type !== 'ordinary_chat_adaptive_runtime') continue
-    const event = normalizeOrdinaryChatRuntimeEvent(frame.event)
+  for await (const rawFrame of decodeSseJsonFrames(response.body)) {
+    const envelope = normalizeAdaptiveRuntimeEnvelope(rawFrame)
+    if (!envelope) continue
+    const event = normalizeOrdinaryChatRuntimeEvent(envelope.event)
     if (event) yield event
   }
 }

@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 
 TurnOperation = Literal[
     "conversation",
+    "temporal_lookup",
     "open_world_lookup",
     "literature_research",
     "workspace_read",
@@ -46,6 +47,7 @@ TURN_INTENT_CONTRACT_VERSION = "turn-intent-v1"
 _ALLOWED_OPERATIONS = frozenset(
     {
         "conversation",
+        "temporal_lookup",
         "open_world_lookup",
         "literature_research",
         "workspace_read",

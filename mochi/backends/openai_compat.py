@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -16,6 +17,7 @@ import httpx
 
 from mochi.backends.inference_capabilities import (
     ReasoningEffort,
+    parse_model_capability_metadata,
     resolve_model_inference_capabilities,
 )
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
@@ -30,6 +32,7 @@ from mochi.backends.types import (
     GenerationResult,
     Message,
     ModelInfo,
+    ResponsesContinuityPolicy,
     ResponsesContinuityMode,
     ResponsesReplayState,
     StreamChunk,
@@ -42,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 
 ApiMode = Literal["chat_completions", "responses"]
+
+_HISTORICAL_TOOL_ARGUMENTS_MAX_CHARS = 1_000
+_HISTORICAL_TOOL_RESULT_MAX_CHARS = 6_000
+_HISTORICAL_TOOL_EVIDENCE_MAX_CHARS = 8_000
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,8 @@ class OpenAICompatBackend(BaseLLMBackend):
         api_key: str = "",
         timeout: float = 120.0,
         provider: str = "openai_compat",
+        responses_continuity_policy: ResponsesContinuityPolicy = "local_replay",
+        capability_metadata: dict[str, Any] | None = None,
     ) -> None:
         """初始化 OpenAI-compatible 後端。
 
@@ -83,6 +92,12 @@ class OpenAICompatBackend(BaseLLMBackend):
             model: 預設模型名稱。
             api_key: API 金鑰，若提供則以 Bearer token 送出。
             timeout: HTTP 請求逾時秒數。
+            responses_continuity_policy: Responses follow-up continuity strategy.
+                Generic compatible backends replay local history; only an
+                explicitly native adapter may opt into response-ID chaining.
+            capability_metadata: Explicit endpoint/model capability override.
+                It takes precedence over discovered metadata and the built-in
+                model-family registry.
         """
         endpoint = _normalize_openai_compat_endpoint(base_url)
         self.base_url = endpoint.input_url
@@ -95,6 +110,14 @@ class OpenAICompatBackend(BaseLLMBackend):
         self.model = model
         self.api_key = api_key
         self.provider = provider
+        self._capability_metadata_override = (
+            dict(capability_metadata) if isinstance(capability_metadata, dict) else None
+        )
+        if responses_continuity_policy not in {"local_replay", "previous_response_id"}:
+            raise ValueError(
+                "responses_continuity_policy must be 'local_replay' or 'previous_response_id'."
+            )
+        self._responses_continuity_policy = responses_continuity_policy
         self._tool_state = ToolCallingState()
         self._tool_call_simulator = ToolCallSimulator()
         self._simulated_tool_protocol = SimulatedToolProtocol(self._tool_call_simulator)
@@ -108,6 +131,16 @@ class OpenAICompatBackend(BaseLLMBackend):
         self._responses_reasoning_summary_received = False
         self._responses_last_replayed_items = 0
         self._responses_last_continuity_mode: ResponsesContinuityMode = "none"
+        # A Models endpoint is metadata-only discovery, never a generation
+        # probe.  Keep it instance-scoped so each configured endpoint/model is
+        # checked at most once and provider outages remain fail-open.
+        self._capability_discovery: dict[str, Any] = {
+            "status": "not_checked",
+            "source": "unknown",
+            "checked_at": None,
+            "metadata": None,
+        }
+        self._capability_discovery_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def generate(
@@ -137,6 +170,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         Returns:
             非串流時回傳 GenerationResult，串流時回傳 AsyncIterator[StreamChunk]。
         """
+        await self._ensure_capability_discovery()
         tools_requested = bool(tools)
         post_tool_continuation = self._is_post_tool_continuation(messages)
         prepared_messages = self._prepare_messages(messages, tools)
@@ -269,9 +303,19 @@ class OpenAICompatBackend(BaseLLMBackend):
     def _is_openai_native_reasoning_model(self) -> bool:
         normalized_provider = (self.provider or "").strip().lower()
         normalized_model = self.model.strip().lower()
-        return normalized_provider in {"openai_compat", "openai_codex"} and normalized_model.startswith(
-            "gpt-5"
-        )
+        if not normalized_model.startswith("gpt-5"):
+            return False
+        if normalized_provider == "openai_codex":
+            return True
+        if normalized_provider != "openai_compat":
+            return False
+
+        # A generic OpenAI-compatible provider may expose OpenAI model names
+        # without implementing the Responses API. Only infer native Responses
+        # support for OpenAI's own API; third-party endpoints stay on Chat
+        # Completions unless the URL or a successful capability probe pins the
+        # Responses protocol explicitly.
+        return (urlsplit(self.base_url).hostname or "").lower() == "api.openai.com"
 
     def _reasoning_transport_preference(self) -> str:
         if self._responses_chat_completions_alias:
@@ -292,7 +336,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                 provider=self.provider,
                 backend_type="openai_compat",
                 supports_tool_calling=self.supports_tool_calling(),
-                metadata={"api_mode": self._api_mode},
+                metadata=self._capability_metadata_for_model_info(),
             )
         )
         probe = self._native_tool_probe if isinstance(self._native_tool_probe, dict) else {}
@@ -318,6 +362,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                 "reasoning_summary_received": self._responses_reasoning_summary_received,
                 "reasoning_items_replayed": self._responses_last_replayed_items,
                 "responses_continuity_mode": self._responses_last_continuity_mode,
+                "responses_continuity_policy": self._responses_continuity_policy,
                 "tool_call_mode": self._tool_call_mode(),
                 "native_tool_calling_status": probe.get("status", self._tool_state.native_status),
                 "native_tool_calling_message": probe.get("message"),
@@ -332,6 +377,67 @@ class OpenAICompatBackend(BaseLLMBackend):
                 **capabilities.to_metadata(),
             },
         )
+
+    def _capability_metadata_for_model_info(self) -> dict[str, Any]:
+        discovery = self._capability_discovery
+        overridden = self._capability_metadata_override is not None
+        return {
+            "api_mode": self._api_mode,
+            "capability_metadata": (
+                self._capability_metadata_override if overridden else discovery.get("metadata")
+            ),
+            "capability_source": "configured_override" if overridden else discovery.get("source"),
+            "capability_status": "overridden" if overridden else discovery.get("status"),
+            "capability_checked_at": discovery.get("checked_at"),
+        }
+
+    async def _ensure_capability_discovery(self) -> None:
+        """Fetch a compatible Models list once before the first generation.
+
+        The standard OpenAI schema does not expose effort enums, which is a
+        normal ``unavailable`` outcome rather than an error.  A short timeout
+        prevents metadata discovery from delaying a usable generation path.
+        """
+
+        if self._capability_discovery["status"] != "not_checked":
+            return
+        async with self._capability_discovery_lock:
+            if self._capability_discovery["status"] != "not_checked":
+                return
+            if self._capability_metadata_override is not None:
+                self._capability_discovery.update(
+                    {"status": "overridden", "source": "configured_override"}
+                )
+                return
+            checked_at = datetime.now(UTC).isoformat()
+            self._capability_discovery["checked_at"] = checked_at
+            models_url = self._health_urls[0]
+            try:
+                response = await self._client.get(
+                    models_url,
+                    headers=self._build_headers(),
+                    timeout=1.0,
+                )
+                response.raise_for_status()
+                raw = response.json()
+                metadata = _find_model_metadata(raw, self.model)
+                has_effort_metadata = bool(parse_model_capability_metadata(metadata))
+                self._capability_discovery.update(
+                    {
+                        "status": "resolved" if has_effort_metadata else "unavailable",
+                        "source": (
+                            "endpoint_metadata"
+                            if has_effort_metadata
+                            else "standard_models_payload"
+                        ),
+                        "metadata": metadata,
+                    }
+                )
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                logger.debug("Model capability discovery failed for %s: %s", models_url, exc)
+                self._capability_discovery.update(
+                    {"status": "failed", "source": "discovery_failed", "metadata": None}
+                )
 
     async def health_check(self) -> bool:
         """檢查 API 是否可用，優先嘗試 /models。"""
@@ -428,7 +534,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         except httpx.HTTPError as exc:
             logger.warning(
                 "Chat-completions alias retry failed for responses endpoint %s: %s",
-                request_url,
+                responses_url,
                 exc,
             )
             return result
@@ -1316,7 +1422,10 @@ class OpenAICompatBackend(BaseLLMBackend):
         supported = set(capabilities.supported_inference_parameters)
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": [
+                message.to_dict()
+                for message in self._project_chat_completions_history(messages)
+            ],
             "stream": stream,
         }
         if "temperature" in supported:
@@ -1338,6 +1447,156 @@ class OpenAICompatBackend(BaseLLMBackend):
         ):
             payload["reasoning_effort"] = cast(ReasoningEffort, reasoning_effort)
         return payload
+
+    @staticmethod
+    def _chat_completions_active_start(messages: list[Message]) -> int:
+        """Return the current ReAct turn boundary for Chat Completions.
+
+        ReAct marks the user message that begins its current invocation.  The
+        final-user fallback keeps direct backend callers safe: native protocol
+        before their newest user prompt is historical; a list without a user is
+        treated as a single in-flight protocol exchange.
+        """
+        for index, message in enumerate(messages):
+            if message.native_tool_protocol_active:
+                return index
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user":
+                return index
+        return 0
+
+    @classmethod
+    def _project_chat_completions_history(cls, messages: list[Message]) -> list[Message]:
+        """Replace completed historical native tool protocol with evidence text.
+
+        Generic Chat Completions gateways may not support replaying a completed
+        function-call/result pair on a later ordinary-chat turn.  The durable
+        transcript remains untouched; this only derives a provider payload.
+        """
+        active_start = cls._chat_completions_active_start(messages)
+        historical = messages[:active_start]
+        active = messages[active_start:]
+        if not historical:
+            return [Message(**message.__dict__) for message in active]
+
+        results_by_assistant, matched_result_indexes = cls._match_historical_tool_results(
+            historical
+        )
+
+        projected: list[Message] = []
+        for index, message in enumerate(historical):
+            if message.role == "assistant" and message.tool_calls:
+                projected.append(
+                    Message(
+                        role="assistant",
+                        content=cls._render_historical_tool_calls(
+                            message,
+                            result_by_call_id=results_by_assistant.get(index, {}),
+                        ),
+                    )
+                )
+                continue
+            if message.role == "tool":
+                if index in matched_result_indexes:
+                    continue
+                projected.append(
+                    Message(
+                        role="assistant",
+                        content=cls._render_orphan_historical_tool_result(message),
+                    )
+                )
+                continue
+            projected.append(Message(**message.__dict__))
+
+        projected.extend(Message(**message.__dict__) for message in active)
+        return projected
+
+    @staticmethod
+    def _match_historical_tool_results(
+        messages: list[Message],
+    ) -> tuple[dict[int, dict[str, list[Message]]], set[int]]:
+        """Pair tool results only with the assistant block that introduced them."""
+        results_by_assistant: dict[int, dict[str, list[Message]]] = {}
+        matched_result_indexes: set[int] = set()
+        for assistant_index, assistant_message in enumerate(messages):
+            if assistant_message.role != "assistant" or not assistant_message.tool_calls:
+                continue
+            call_ids = {tool_call.id for tool_call in assistant_message.tool_calls if tool_call.id}
+            if not call_ids:
+                continue
+            matching_results: dict[str, list[Message]] = {}
+            for result_index in range(assistant_index + 1, len(messages)):
+                candidate = messages[result_index]
+                if candidate.role != "tool":
+                    break
+                if candidate.tool_call_id in call_ids:
+                    matching_results.setdefault(candidate.tool_call_id, []).append(candidate)
+                    matched_result_indexes.add(result_index)
+            results_by_assistant[assistant_index] = matching_results
+        return results_by_assistant, matched_result_indexes
+
+    @classmethod
+    def _render_historical_tool_calls(
+        cls,
+        message: Message,
+        *,
+        result_by_call_id: dict[str, list[Message]],
+    ) -> str:
+        sections = [message.content] if message.content else []
+        for tool_call in message.tool_calls:
+            arguments = cls._bound_historical_tool_text(
+                json.dumps(
+                    tool_call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                limit=_HISTORICAL_TOOL_ARGUMENTS_MAX_CHARS,
+                suffix="Historical tool arguments truncated for provider context.",
+            )
+            section = (
+                "[Historical tool evidence]\n"
+                f"Tool: {tool_call.name}\n"
+                f"Arguments: {arguments}"
+            )
+            results = result_by_call_id.get(tool_call.id, [])
+            if results:
+                for result in results:
+                    section += "\nResult:\n" + cls._bound_historical_tool_evidence(
+                        result.content
+                    )
+            else:
+                section += "\nResult:\nNo recorded result."
+            sections.append(section)
+        return cls._bound_historical_tool_text(
+            "\n\n".join(sections),
+            limit=_HISTORICAL_TOOL_EVIDENCE_MAX_CHARS,
+            suffix="Historical tool evidence truncated for provider context.",
+        )
+
+    @classmethod
+    def _render_orphan_historical_tool_result(cls, message: Message) -> str:
+        tool_name = message.name or "unknown"
+        return (
+            "[Historical tool evidence]\n"
+            f"Unpaired tool result from: {tool_name}\n"
+            "Result:\n"
+            f"{cls._bound_historical_tool_evidence(message.content)}"
+        )
+
+    @staticmethod
+    def _bound_historical_tool_evidence(content: str) -> str:
+        return OpenAICompatBackend._bound_historical_tool_text(
+            content,
+            limit=_HISTORICAL_TOOL_RESULT_MAX_CHARS,
+            suffix="Historical tool result truncated for provider context.",
+        )
+
+    @staticmethod
+    def _bound_historical_tool_text(content: str, *, limit: int, suffix: str) -> str:
+        if len(content) <= limit:
+            return content
+        return content[:limit] + "\n[" + suffix + "]"
 
     def _build_responses_payload(
         self,
@@ -1496,7 +1755,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         self,
         messages: list[Message],
     ) -> tuple[str | None, int | None]:
-        if not self._should_use_responses_transport():
+        if self._responses_continuity_policy != "previous_response_id":
             return None, None
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
@@ -2315,6 +2574,24 @@ def _url_without_path_suffix(parts: Any, suffix: str) -> str:
         path = path[: -len(suffix)] or "/"
     path = path.rstrip("/")
     return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
+
+
+def _find_model_metadata(payload: Any, model: str) -> dict[str, Any] | None:
+    """Return an exact model entry from either OpenAI-compatible Models shape."""
+
+    entries: list[Any]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        entries = payload["data"]
+    elif isinstance(payload, dict):
+        entries = [payload]
+    else:
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == model:
+            # Do not synthesize a `/models/{id}` retry: one list GET is the
+            # bounded discovery contract.
+            return dict(entry)
+    return None
 
 
 def _coerce_text(value: Any) -> str:

@@ -650,6 +650,9 @@ class _ResumeStrategyRecordingService:
     def update_security_config(self, security: Any) -> None:
         del security
 
+    def update_sandbox_config(self, sandbox: Any) -> None:
+        del sandbox
+
     def bind_app_config(self, *, config: Any, config_path: Any) -> None:
         del config, config_path
 

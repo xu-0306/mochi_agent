@@ -1,0 +1,42 @@
+{
+  "gate_id": "GATE-005-RUNTIME",
+  "timestamp": "2026-08-02T03:42:28+08:00",
+  "entrypoint": "http://127.0.0.1:3000/",
+  "backend_restart": {
+    "old_pid": 32452,
+    "new_pid": 53880,
+    "command": ".venv-win/Scripts/python.exe -m uvicorn mochi.api.server:create_app --factory --host 127.0.0.1 --port 8000"
+  },
+  "pure_chat": {
+    "prompt": "只回覆：重啟後純對話測試通過。不要使用任何工具。",
+    "observed_final": "重啟後純對話測試通過。",
+    "passed": true
+  },
+  "strict_tool_session": {
+    "session_id": "e7e1155f-87c7-4abb-bb15-ad1a37b14158",
+    "turn_id": "3fdd6257-0a26-4b3a-89b7-6d95506c9693",
+    "prompt": "請依序真正呼叫 tool_search 搜尋 get_current_time，再啟用並呼叫 get_current_time。若任何一步未實際執行，請只回覆 TOOL_CALL_FAILED；禁止猜測或自行產生時間。",
+    "persisted_trace": [
+      {"event_index": 11, "phase": "tool_call_result", "tool_name": "tool_search", "error": null},
+      {"event_index": 17, "phase": "tool_call_result", "tool_name": "tool_activate", "error": null},
+      {"event_index": 22, "phase": "tool_call_result", "tool_name": "get_current_time", "error": "Unknown timezone: 'Etc/UTC'."},
+      {"event_index": 28, "phase": "tool_call_result", "tool_name": "get_current_time", "error": null, "timezone": "UTC", "datetime": "Saturday, August 01, 2026 at 19:42:23 UTC"},
+      {"event_index": 30, "phase": "final_answer", "content": "目前時間：Saturday, August 01, 2026 at 19:42:23 UTC"}
+    ],
+    "unrelated_greeting_observed": false,
+    "passed": true
+  },
+  "backend_diagnostics": {
+    "request_shape": "responses",
+    "tool_calling_protocol": "responses",
+    "responses_continuity_policy": "local_replay",
+    "responses_continuity_mode": "manual_encrypted",
+    "reasoning_items_replayed": 8
+  },
+  "nonblocking_observations": [
+    "The semantic conversation interpreter saw an external 502 from https://co.yes.vg/v1/responses, then the deterministic fallback preserved the tool-discovery obligation.",
+    "The model first requested Etc/UTC, which the time tool rejected, then recovered with UTC and completed successfully."
+  ],
+  "exit_code": 0,
+  "result": "passed"
+}

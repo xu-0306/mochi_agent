@@ -16,10 +16,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from mochi.backends.inference_capabilities import ReasoningEffort
-from mochi.agents.invocation import ToolMode
-from mochi.backends.types import AttachmentRef
-from mochi.api.attachment_schema import AttachmentPayload
 from mochi.agents.events import (
     AssistantTruncatedEvent,
     ErrorEvent,
@@ -36,23 +32,66 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.agents.invocation import ToolMode
+from mochi.api.attachment_schema import AttachmentPayload
 from mochi.api.session_store_binding import resolve_route_session_store
+from mochi.api.tool_workflow_observability import (
+    build_tool_workflow_observability,
+)
 from mochi.api.tool_workflow_outbox import (
     ToolWorkflowOutboxError,
     ToolWorkflowOutboxRepository,
 )
+from mochi.backends.base import BackendRequestError
+from mochi.backends.inference_capabilities import ReasoningEffort
+from mochi.backends.types import AttachmentRef
+from mochi.runtime.recovery import classify_agent_run_recovery_issue
 from mochi.security.policy import EffectivePolicyResolver
 from mochi.sessions.store import SessionStore
 from mochi.utils.streaming import sse_stream
-
-from mochi.api.tool_workflow_observability import (
-    build_tool_workflow_observability,
-)
 
 router = APIRouter(prefix="/v1")
 
 _CHAT_SUBAGENT_LIVE_DRAIN_IDLE_SECONDS = 0.15
 _CHAT_SUBAGENT_LIVE_DRAIN_MAX_SECONDS = 1.0
+
+_CHAT_MODEL_ERROR_MESSAGE = (
+    "The configured model request failed. No tools were run. "
+    "Retry later or select another model."
+)
+_CHAT_PROVIDER_AUTH_ERROR_MESSAGES = {
+    401: (
+        "The model provider rejected authentication (HTTP 401 Unauthorized). "
+        "No tools were run. Check the API key and retry."
+    ),
+    403: (
+        "The model provider denied the request (HTTP 403 Forbidden). "
+        "No tools were run. Check the API key's model/provider permissions "
+        "or select another model."
+    ),
+}
+_CHAT_RESOURCE_ERROR_MESSAGES = {
+    "quota_exhausted": (
+        "The configured model has no available quota. No tools were run. "
+        "Restore quota or select another model, then retry."
+    ),
+    "rate_limited": (
+        "The model provider is rate-limiting requests. No tools were run. "
+        "Wait briefly or select another model, then retry."
+    ),
+    "provider_timeout": (
+        "The configured model provider timed out. No tools were run. "
+        "Retry after the provider recovers or select another model."
+    ),
+    "provider_unavailable": (
+        "The configured model is currently unavailable from its provider. "
+        "No tools were run. Retry later or select an available model."
+    ),
+    "local_model_unavailable": (
+        "The configured local model is unavailable. No tools were run. "
+        "Restart the local runtime or select another model, then retry."
+    ),
+}
 
 
 class ChatRequest(BaseModel):
@@ -76,6 +115,7 @@ class ChatRequest(BaseModel):
     reasoning_effort: ReasoningEffort | None = None
     selected_skill_ids: list[str] | None = None
     attachments: list[AttachmentPayload] | None = None
+    client_timezone: str | None = Field(default=None, max_length=255)
     expected_policy_version: str | None = Field(default=None, min_length=1)
 
 
@@ -164,6 +204,7 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         workspace_dir=resolved_workspace_dir,
         selected_skill_ids=payload.selected_skill_ids,
         attachments=_resolve_chat_attachments(payload),
+        client_timezone=payload.client_timezone,
         turn_id=turn_id,
         tool_mode=payload.tool_mode,
         permission_policy=permission_policy,
@@ -234,6 +275,7 @@ async def chat_context(request: Request, payload: ChatRequest) -> ChatContextRes
         workspace_dir=resolved_workspace_dir,
         selected_skill_ids=payload.selected_skill_ids,
         attachments=_resolve_chat_attachments(payload),
+        client_timezone=payload.client_timezone,
         permission_policy=permission_policy,
     )
     if isinstance(preview, dict):
@@ -280,6 +322,7 @@ async def chat_stream(request: Request, payload: ChatRequest) -> StreamingRespon
         workspace_dir=resolved_workspace_dir,
         selected_skill_ids=payload.selected_skill_ids,
         attachments=_resolve_chat_attachments(payload),
+        client_timezone=payload.client_timezone,
         turn_id=turn_id,
         tool_mode=payload.tool_mode,
         permission_policy=permission_policy,
@@ -347,6 +390,8 @@ async def _stream_chat_events(
 ) -> AsyncIterator[dict[str, Any]]:
     """串流 serialized chat events，必要時補做 session replay 持久化。"""
     events: list[dict[str, Any]] = []
+    fallback_replay_events: list[dict[str, Any]] = []
+    persisted_replay_seqs: set[int] = set()
     pending_subagent_requests: dict[str, dict[str, Any]] = {}
     delegated_task_ids: set[str] = set()
     stream_task: asyncio.Task[Any] | None = None
@@ -401,6 +446,13 @@ async def _stream_chat_events(
             if task_id:
                 delegated_task_ids.add(task_id)
             events.append(serialized)
+            phase = _event_phase(serialized)
+            persisted_seq = _persisted_replay_seq(event, turn_id=fallback_turn_id)
+            if phase is not None:
+                if persisted_seq is None:
+                    fallback_replay_events.append(serialized)
+                else:
+                    persisted_replay_seqs.add(persisted_seq)
             yield serialized
             for snapshot in await _get_chat_tool_workflow_updates(
                 request,
@@ -438,16 +490,14 @@ async def _stream_chat_events(
                 events.append(live_event)
                 yield live_event
     except Exception as exc:
+        error_payload = _chat_stream_error_payload(exc)
         error_event = _attach_turn_id(
             None,
-            {
-                "type": "error",
-                "error": str(exc),
-                "code": "CHAT_STREAM_ERROR",
-            },
+            error_payload,
             fallback_turn_id=fallback_turn_id,
         )
         events.append(error_event)
+        fallback_replay_events.append(error_event)
         yield error_event
     finally:
         for task in (stream_task, live_task):
@@ -466,14 +516,21 @@ async def _stream_chat_events(
                 payload = close_stream()
                 if inspect.isawaitable(payload):
                     await payload
-        if _should_persist_fallback_events(events, fallback_turn_id):
-            await _persist_turn_events(request, session_id, events, turn_id=fallback_turn_id)
-            await _persist_chat_subagent_events(
+        if fallback_replay_events:
+            await _persist_turn_events(
                 request,
-                session_id=session_id,
+                session_id,
+                fallback_replay_events,
                 turn_id=fallback_turn_id,
-                events=events,
+                start_seq=max(persisted_replay_seqs, default=0),
             )
+        await _persist_chat_subagent_events(
+            request,
+            session_id=session_id,
+            turn_id=fallback_turn_id,
+            events=events,
+        )
+        if events:
             for snapshot in await _get_chat_tool_workflow_updates(
                 request,
                 session_id=session_id,
@@ -491,6 +548,91 @@ async def _stream_chat_events(
                 }
 
 
+def _chat_stream_error_payload(exc: Exception) -> dict[str, Any]:
+    if not isinstance(exc, BackendRequestError):
+        return {
+            "type": "error",
+            "error": str(exc),
+            "code": "CHAT_STREAM_ERROR",
+        }
+    backend_metadata = dict(exc.metadata or {})
+    status_code = _coerce_http_status(backend_metadata.get("status_code"))
+    backend_name = _clean_backend_diagnostic(backend_metadata.get("backend_name"))
+    model = _clean_backend_diagnostic(backend_metadata.get("model"))
+    if status_code in _CHAT_PROVIDER_AUTH_ERROR_MESSAGES:
+        classification = (
+            "provider_authentication_failed"
+            if status_code == 401
+            else "provider_access_denied"
+        )
+        code = (
+            "MODEL_PROVIDER_AUTHENTICATION_FAILED"
+            if status_code == 401
+            else "MODEL_PROVIDER_ACCESS_DENIED"
+        )
+        return {
+            "type": "error",
+            "error": _CHAT_PROVIDER_AUTH_ERROR_MESSAGES[status_code],
+            "code": code,
+            "metadata": {
+                "classification": classification,
+                "retryable": False,
+                "backend_name": backend_name,
+                "status_code": status_code,
+                "model": model,
+            },
+        }
+    issue = classify_agent_run_recovery_issue(exc)
+    if issue is None:
+        error_message = _CHAT_MODEL_ERROR_MESSAGE
+        error_metadata: dict[str, Any] = {
+            "classification": "unclassified_backend_failure",
+            "retryable": False,
+        }
+        if status_code is not None:
+            error_message = (
+                f"The configured model request failed (provider HTTP {status_code}). "
+                "No tools were run. Check the model/provider configuration and retry."
+            )
+            error_metadata["status_code"] = status_code
+        if backend_name is not None:
+            error_metadata["backend_name"] = backend_name
+        if model is not None:
+            error_metadata["model"] = model
+        return {
+            "type": "error",
+            "error": error_message,
+            "code": "MODEL_REQUEST_FAILED",
+            "metadata": error_metadata,
+        }
+    return {
+        "type": "error",
+        "error": _CHAT_RESOURCE_ERROR_MESSAGES[issue.kind],
+        "code": f"MODEL_{issue.kind.upper()}",
+        "metadata": {
+            "classification": issue.kind,
+            "retryable": issue.retryable,
+            "backend_name": issue.backend_name,
+            "status_code": issue.status_code,
+        },
+    }
+
+
+def _coerce_http_status(value: Any) -> int | None:
+    try:
+        status_code = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status_code if 100 <= status_code <= 599 else None
+
+
+def _clean_backend_diagnostic(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:128] if text else None
+
+
 async def _drain_live_subagent_events(
     live_subscription: Any,
     *,
@@ -506,7 +648,7 @@ async def _drain_live_subagent_events(
             return
         try:
             envelope = await asyncio.wait_for(live_subscription.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         live_event = _serialize_live_subagent_event(
             envelope,
@@ -842,6 +984,7 @@ async def _persist_turn_events(
     events: list[dict[str, Any]],
     *,
     turn_id: str | None = None,
+    start_seq: int = 0,
 ) -> str | None:
     """將本輪 replay event 以 `turn_event` schema 追加到 session JSONL。"""
     if not events:
@@ -850,7 +993,7 @@ async def _persist_turn_events(
     store = await _get_session_store(request)
     resolved_turn_id = turn_id or str(uuid4())
 
-    for index, event in enumerate(events, start=1):
+    for index, event in enumerate(events, start=start_seq + 1):
         phase = _event_phase(event)
         if phase is None:
             continue
@@ -861,7 +1004,7 @@ async def _persist_turn_events(
                 "type": "turn_event",
                 "schema_version": 1,
                 "turn_id": resolved_turn_id,
-                "event_id": str(uuid4()),
+                "event_id": f"{resolved_turn_id}:{index}",
                 "seq": index,
                 "phase": phase,
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -920,14 +1063,20 @@ def _merge_chat_and_subagent_events(
     return merged
 
 
-def _should_persist_fallback_events(
-    events: list[dict[str, Any]],
-    fallback_turn_id: str,
-) -> bool:
-    """判斷是否需要以 route fallback 寫入 turn replay events。"""
-    if not events:
-        return False
-    return _response_turn_id(events) == fallback_turn_id
+def _persisted_replay_seq(event: Any, *, turn_id: str) -> int | None:
+    """Read the private engine-to-route replay authority marker."""
+    if getattr(event, "_session_replay_persisted", False) is not True:
+        return None
+    seq = getattr(event, "_session_replay_seq", None)
+    event_id = getattr(event, "_session_replay_event_id", None)
+    if (
+        not isinstance(seq, int)
+        or seq < 1
+        or event_id != f"{turn_id}:{seq}"
+        or getattr(event, "turn_id", None) != turn_id
+    ):
+        return None
+    return seq
 
 
 async def _get_session_store(request: Request) -> SessionStore:
@@ -1017,11 +1166,12 @@ async def _start_engine_chat(
     workspace_dir: str,
     selected_skill_ids: list[str] | None,
     attachments: list[AttachmentRef],
+    client_timezone: str | None,
     turn_id: str,
     tool_mode: ToolMode,
     permission_policy: dict[str, Any],
 ) -> AsyncIterator[Any]:
-    chat_callable = getattr(engine, "chat")
+    chat_callable = engine.chat
     kwargs: dict[str, Any] = {
         "message": message,
         "session_id": session_id,
@@ -1039,6 +1189,8 @@ async def _start_engine_chat(
         kwargs["tool_mode"] = tool_mode
     if signature is None or "turn_id" in signature.parameters:
         kwargs["turn_id"] = turn_id
+    if signature is None or "client_timezone" in signature.parameters:
+        kwargs["client_timezone"] = client_timezone
     if signature is None or "permission_policy" in signature.parameters:
         kwargs["permission_policy"] = permission_policy
     return await _maybe_await_result(chat_callable(**kwargs))
@@ -1054,9 +1206,10 @@ async def _start_engine_chat_context_preview(
     workspace_dir: str,
     selected_skill_ids: list[str] | None,
     attachments: list[AttachmentRef],
+    client_timezone: str | None,
     permission_policy: dict[str, Any],
 ) -> Any:
-    preview_callable = getattr(engine, "preview_chat_context")
+    preview_callable = engine.preview_chat_context
     kwargs: dict[str, Any] = {
         "message": message,
         "session_id": session_id,
@@ -1072,6 +1225,8 @@ async def _start_engine_chat_context_preview(
         signature = None
     if signature is None or "permission_policy" in signature.parameters:
         kwargs["permission_policy"] = permission_policy
+    if signature is None or "client_timezone" in signature.parameters:
+        kwargs["client_timezone"] = client_timezone
     return await _maybe_await_result(preview_callable(**kwargs))
 
 

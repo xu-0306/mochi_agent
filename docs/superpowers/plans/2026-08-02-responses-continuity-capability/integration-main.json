@@ -1,0 +1,24 @@
+{
+  "schema_name": "agent-foreman/integration",
+  "schema_version": "1.0",
+  "profile": "full",
+  "plan_id": "PLAN-20260802-RESPONSES-CONTINUITY",
+  "phase_id": "PHASE-RESPONSES-CONTINUITY",
+  "actor_role": "main",
+  "packages": ["PKG-TERRA-CONTINUITY", "PKG-MAIN-INTEGRATION"],
+  "delta_guard": {
+    "passed": true,
+    "artifact": "docs/superpowers/plans/2026-08-02-responses-continuity-capability/artifacts/gate-004-diff-check.txt",
+    "method": "bounded five-file diff review; standard fingerprint unavailable on Windows due invalid .venv-wsl symlink"
+  },
+  "focused_gates": ["GATE-001-SERIALIZER", "GATE-002-NATIVE"],
+  "aggregate_gates": ["GATE-003-INTEGRATION", "GATE-004-DIFF-CHECK", "GATE-005-RUNTIME"],
+  "deterministic_result": "passed",
+  "evaluator_recommendation": "pass",
+  "status": "verified",
+  "rework": {
+    "worker_changed_lines": 147,
+    "main_changed_lines_in_worker_scope": 0
+  },
+  "runtime_session_id": "e7e1155f-87c7-4abb-bb15-ad1a37b14158"
+}

@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from mochi.learning.failure_attribution import (
+    FailureAttributionRecord,
+    FailureAttributionRepository,
+)
 from mochi.learning.failure_episode import FailureEpisode
 from mochi.learning.failure_outbox import FailureOutboxRepository
 from mochi.learning.failure_store import FailureStore
@@ -38,6 +42,7 @@ class FailureWorker:
         max_attempts: int = 3,
         backoff_base_seconds: float = 1.0,
         processor: FailureProcessor | None = None,
+        attribution_repository: FailureAttributionRepository | None = None,
     ) -> None:
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -53,6 +58,8 @@ class FailureWorker:
         self._max_attempts = max_attempts
         self._backoff_base_seconds = backoff_base_seconds
         self._processor = processor
+        self._attribution_repository = attribution_repository
+        self._attribution_failure_count = 0
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -63,6 +70,41 @@ class FailureWorker:
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    @property
+    def attribution_failure_count(self) -> int:
+        """Best-effort attribution failures that never alter worker state."""
+
+        return self._attribution_failure_count
+
+    async def _attribute_terminal(
+        self,
+        record: object,
+        *,
+        transition: str,
+        timestamp: str,
+    ) -> None:
+        repository = self._attribution_repository
+        session_id = getattr(record, "attribution_session_id", None)
+        episode = getattr(record, "episode", None)
+        if (
+            repository is None
+            or not isinstance(session_id, str)
+            or not isinstance(episode, FailureEpisode)
+        ):
+            return
+        try:
+            await repository.append(
+                session_id,
+                FailureAttributionRecord.create(
+                    candidate_id=episode.episode_id,
+                    turn_id=episode.turn_id,
+                    transition=transition,  # type: ignore[arg-type]
+                    timestamp=timestamp,
+                ),
+            )
+        except Exception:
+            self._attribution_failure_count += 1
 
     async def process_once(self, *, now: datetime | None = None) -> FailureWorkerBatchResult:
         result = FailureWorkerBatchResult()
@@ -84,17 +126,23 @@ class FailureWorker:
                     await processed
             except Exception as exc:
                 if claimed.attempts >= self._max_attempts:
-                    await self._outbox.reject(
+                    rejected = await self._outbox.reject(
                         claimed.episode.episode_id,
                         worker_id=self._worker_id,
                         reason=f"processor_failed:{type(exc).__name__}",
                         now=current,
                     )
+                    if rejected:
+                        await self._attribute_terminal(
+                            claimed,
+                            transition="rejected",
+                            timestamp=current.isoformat(),
+                        )
                     result = FailureWorkerBatchResult(
                         claimed=result.claimed,
                         acked=result.acked,
                         retried=result.retried,
-                        rejected=result.rejected + 1,
+                        rejected=result.rejected + int(rejected),
                     )
                 else:
                     backoff = self._backoff_base_seconds * (2 ** max(0, claimed.attempts - 1))
@@ -112,13 +160,20 @@ class FailureWorker:
                         rejected=result.rejected,
                     )
             else:
-                await self._outbox.ack(
+                acked = await self._outbox.ack(
                     claimed.episode.episode_id,
                     worker_id=self._worker_id,
+                    now=current,
                 )
+                if acked:
+                    await self._attribute_terminal(
+                        claimed,
+                        transition="processed",
+                        timestamp=current.isoformat(),
+                    )
                 result = FailureWorkerBatchResult(
                     claimed=result.claimed,
-                    acked=result.acked + 1,
+                    acked=result.acked + int(acked),
                     retried=result.retried,
                     rejected=result.rejected,
                 )

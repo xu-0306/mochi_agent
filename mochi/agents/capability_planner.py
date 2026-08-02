@@ -7,12 +7,14 @@ plan, while policy and environment inputs can only narrow that plan.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, cast
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, cast
 
 from mochi.agents.turn_intent_contract import DeliverableContract, TurnIntentContract
 
 PlannerCapability = Literal[
+    "temporal_lookup",
     "open_world_lookup",
     "literature_research",
     "workspace_read",
@@ -25,8 +27,9 @@ ToolPlanStatus = Literal["excluded", "eligible", "exposed"]
 
 CAPABILITY_PLAN_VERSION = "capability-plan-v1"
 
-_ALL_CAPABILITIES = frozenset(
+_ALL_CAPABILITIES: frozenset[PlannerCapability] = frozenset(
     {
+        "temporal_lookup",
         "open_world_lookup",
         "literature_research",
         "workspace_read",
@@ -37,6 +40,7 @@ _ALL_CAPABILITIES = frozenset(
 )
 _OPERATION_CAPABILITIES: dict[str, frozenset[PlannerCapability]] = {
     "conversation": frozenset(),
+    "temporal_lookup": frozenset({"temporal_lookup"}),
     "open_world_lookup": frozenset({"open_world_lookup"}),
     "literature_research": frozenset({"literature_research"}),
     "workspace_read": frozenset({"workspace_read"}),
@@ -44,6 +48,15 @@ _OPERATION_CAPABILITIES: dict[str, frozenset[PlannerCapability]] = {
     "execution": frozenset({"execution"}),
     "tool_discovery": frozenset({"tool_discovery"}),
 }
+_SEMANTIC_FALLBACK_SAFE_CAPABILITIES: frozenset[PlannerCapability] = frozenset(
+    {
+        "temporal_lookup",
+        "open_world_lookup",
+        "literature_research",
+        "workspace_read",
+        "tool_discovery",
+    }
+)
 
 # Exact stable tool identifiers bridge current BaseTool metadata that predates
 # explicit planner capabilities.  This is catalog normalization, not natural
@@ -92,7 +105,8 @@ def _clean_capabilities(
 def _string_values(value: Any) -> frozenset[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
         return frozenset()
-    return frozenset(str(item).strip() for item in value if str(item).strip())
+    items = cast(Iterable[object], value)
+    return frozenset(str(item).strip() for item in items if str(item).strip())
 
 
 @dataclass(frozen=True)
@@ -101,9 +115,10 @@ class CatalogToolDescriptor:
 
     name: str
     capabilities: frozenset[PlannerCapability]
-    domains: frozenset[str] = field(default_factory=frozenset)
-    retrieval_modes: frozenset[str] = field(default_factory=frozenset)
-    preference_tags: frozenset[str] = field(default_factory=frozenset)
+    domains: frozenset[str] = frozenset()
+    retrieval_modes: frozenset[str] = frozenset()
+    preference_tags: frozenset[str] = frozenset()
+    activation_requirements: frozenset[str] = frozenset()
     read_only: bool = False
     destructive: bool = False
     open_world: bool = False
@@ -123,7 +138,12 @@ class CatalogToolDescriptor:
             raise ValueError(f"unsupported tool risk: {self.risk!r}")
         if self.exposure_priority < 0:
             raise ValueError("exposure_priority must be non-negative")
-        for field_name in ("domains", "retrieval_modes", "preference_tags"):
+        for field_name in (
+            "domains",
+            "retrieval_modes",
+            "preference_tags",
+            "activation_requirements",
+        ):
             values = getattr(self, field_name)
             object.__setattr__(
                 self,
@@ -170,7 +190,7 @@ class CatalogToolDescriptor:
         raw_explicit = payload.get("capabilities", payload.get("operations"))
         for value in _string_values(raw_explicit):
             if value in _ALL_CAPABILITIES:
-                normalized.add(cast(PlannerCapability, value))
+                normalized.add(value)
 
         read_only = bool(payload.get("read_only", False))
         open_world = bool(payload.get("open_world", False))
@@ -187,6 +207,9 @@ class CatalogToolDescriptor:
             domains=domains,
             retrieval_modes=retrieval_modes,
             preference_tags=_string_values(payload.get("preference_tags")),
+            activation_requirements=_string_values(
+                payload.get("activation_requirements")
+            ),
             read_only=read_only,
             destructive=bool(payload.get("destructive", False)),
             open_world=open_world,
@@ -351,6 +374,7 @@ class CapabilityPlanner:
         environment: EnvironmentEligibility,
         allowed_tools: frozenset[str] | None = None,
         denied_tools: frozenset[str] = frozenset(),
+        semantic_fallback: bool = False,
     ) -> CapabilityPlan:
         self._validate_inputs(
             catalog=catalog,
@@ -372,9 +396,15 @@ class CapabilityPlanner:
         diagnostics: dict[str, ToolPlanDiagnostic] = {}
         for tool in catalog:
             matched = tool.capabilities & required
+            fallback_candidate = semantic_fallback and self._is_safe_fallback_tool(tool)
+            eligible_capabilities = (
+                matched
+                if not fallback_candidate
+                else tool.capabilities & _SEMANTIC_FALLBACK_SAFE_CAPABILITIES
+            )
             reasons = self._exclusion_reasons(
                 tool=tool,
-                matched=matched,
+                matched=eligible_capabilities,
                 required=required,
                 session_capabilities=session_capabilities,
                 profile_capabilities=execution_profile.capabilities,
@@ -384,7 +414,17 @@ class CapabilityPlanner:
                 denied_tools=denied_tools,
                 contract=contract,
             )
-            usable = matched & available
+            if semantic_fallback and not fallback_candidate:
+                reasons = (*reasons, "semantic_fallback_unsafe_tool")
+            usable = eligible_capabilities & (
+                available
+                if not fallback_candidate
+                else (
+                    session_capabilities
+                    & execution_profile.capabilities
+                    & environment.capabilities
+                )
+            )
             if reasons or not usable:
                 if not reasons:
                     reasons = ("required_capability_unavailable",)
@@ -400,7 +440,11 @@ class CapabilityPlanner:
                 tool_name=tool.name,
                 status="eligible",
                 matched_capabilities=usable,
-                include_reasons=("matches_required_capability",),
+                include_reasons=(
+                    "semantic_fallback_safe_candidate"
+                    if fallback_candidate and not matched
+                    else "matches_required_capability",
+                ),
             )
 
         exposed = self._minimal_exposure(
@@ -451,6 +495,19 @@ class CapabilityPlanner:
             exposed_tools=tuple(tool.name for tool in exposed),
             artifact_obligation=artifact_obligation,
             tool_diagnostics=tuple(diagnostics[tool.name] for tool in catalog),
+        )
+
+    @staticmethod
+    def _is_safe_fallback_tool(tool: CatalogToolDescriptor) -> bool:
+        return (
+            tool.read_only
+            and not tool.destructive
+            and not tool.requires_approval
+            and tool.risk == "low"
+            and not tool.activation_requirements
+            and "workspace_write" not in tool.capabilities
+            and "execution" not in tool.capabilities
+            and bool(tool.capabilities & _SEMANTIC_FALLBACK_SAFE_CAPABILITIES)
         )
 
     @staticmethod

@@ -1,0 +1,5 @@
+Gate: GATE-003-INTEGRATION
+Command: rtk pytest -q tests/test_openai_compat_backend.py tests/backends/test_openai_compat.py tests/test_openai_codex_backend.py tests/test_tool_activation_contract.py
+Exit code: 0
+Observed: Pytest: 86 passed
+Oracle: Backend continuity, native opt-in, and tool activation contract regressions pass together.

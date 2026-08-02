@@ -5,11 +5,11 @@
 > silently broaden scope, or replace the named contracts with an unrelated
 > planner/workflow framework.
 
-**Status:** Wave 1 integrated and stabilized; Wave 2 Phase 6/7/A complete; Phase 8 in progress
+**Status:** Waves 1–4 implemented in the working tree; Waves 5–6 release-qualification tooling is implemented; live external qualification remains operator-owned; default complexity mode is `enforce`
 
 **Date:** 2026-07-26
 
-**Last progress update:** 2026-07-27
+**Last progress update:** 2026-07-29
 
 **Target:** Mochi ordinary Chat (`chat -> AgentEngine -> ReAct`)
 
@@ -35,7 +35,7 @@ Plan mode, Team, CLI flag, or user-visible special entrypoint.
 
 ---
 
-## Current Progress Snapshot - 2026-07-27
+## Current Progress Snapshot - 2026-07-29
 
 - Wave 1 base implementation is committed in
   `ee420155c617f3e32e9ff759a0f4d684a233d78f`.
@@ -63,12 +63,31 @@ Plan mode, Team, CLI flag, or user-visible special entrypoint.
   until verification or expose/render the earlier event explicitly as
   provisional. Phase 8 now renders such a final as a bounded provisional
   display when the replayed authoritative projection is blocked/partial.
-- Phase 8 backend/UI slice is in progress: bounded redacted projection,
-  session snapshot/range/SSE replay routes, ordinary-Chat reducer/card, and
-  projection counters are implemented. Existing session response shape stays
-  backward compatible unless `include_adaptive_runtime=true` is requested.
+- Wave 3 Phase 8 is complete: bounded redacted projection, session
+  snapshot/range/SSE replay routes, ordinary-Chat reducer/card, and projection
+  counters are implemented. Existing session response shape stays backward
+  compatible unless `include_adaptive_runtime=true` is requested.
+- Wave 4 rollout gates are complete in the working tree. Shadow mode has a
+  complex-effect fixture proving it records a `plan_required` decision without
+  exposing or enforcing `update_plan`; simple-information gate coverage proves
+  no advisor call. Enforce-mode complex/effectful, recovery, cancellation,
+  approval, restart, replay, concurrency, frontend, session, API, and security
+  groups passed.
+- The product default is now `complexity.mode=enforce`. Roll back without
+  losing readable durable state by setting
+  `agent.ordinary_chat_adaptive_runtime.complexity.mode` to `shadow` (observe
+  only) or `off` (disable the gate).
+- The Wave 4 changes are validated working-tree changes only; they are not yet
+  committed or released.
+- Wave 5/6 tooling is implemented and covered by no-network tests: opt-in,
+  redacted external qualification evidence; hash-bound human review; and a
+  recommendation-only canary decision. No configured external backend has been
+  contacted by this implementation work, so no live model qualification or
+  canary-release result is claimed.
 - Detailed closeout evidence:
-  `docs/superpowers/handoffs/2026-07-27-ordinary-chat-adaptive-runtime-wave1-stabilization.md`.
+  `docs/superpowers/handoffs/2026-07-27-ordinary-chat-adaptive-runtime-wave1-stabilization.md`,
+  `docs/superpowers/handoffs/2026-07-29-ordinary-chat-adaptive-runtime-wave4-review-remediation.md`,
+  and `docs/superpowers/handoffs/2026-07-29-ordinary-chat-adaptive-runtime-wave4-measurement.json`.
 
 ---
 
@@ -319,7 +338,7 @@ user flags or a special mode.
 
 ```python
 class ComplexityGateConfig(BaseModel):
-    mode: Literal["off", "shadow", "enforce"] = "shadow"
+    mode: Literal["off", "shadow", "enforce"] = "enforce"
     no_plan_max_score: int = Field(default=2, ge=0, le=100)
     plan_required_min_score: int = Field(default=6, ge=0, le=100)
     model_advisor_enabled: bool = True
@@ -388,8 +407,12 @@ class OrdinaryChatAdaptiveRuntimeConfig(BaseModel):
 ### Configuration rollout rule
 
 - During Phases 1–7, `complexity.mode` defaults to `shadow`.
-- After the full acceptance matrix passes and performance budgets are met,
-  change the final product default to `enforce`.
+- The Phase 1–7 shadow rollout is complete. Following the Wave 4 acceptance
+  matrix and representative-fixture gates, the product default is `enforce`.
+- Roll back by setting `complexity.mode` to `shadow` for observe-only planning
+  decisions or `off` to disable the gate. Existing plan, receipt, recovery,
+  discovery, and learning events remain readable; rollback never deletes or
+  rewrites them.
 - This internal rollout flag is not a user-facing mode and must not alter the
   ordinary Chat entrypoint.
 
@@ -1569,16 +1592,102 @@ Chat is invoked.
 
 Steps:
 
-- [ ] Run shadow mode on representative test fixtures.
-- [ ] Measure simple-turn extra calls/tokens/latency.
-- [ ] Review false-positive and false-negative complexity decisions.
-- [ ] Enable enforce mode for complex effectful fixtures.
-- [ ] Run security, restart, cancellation, approval, and concurrency suites.
-- [ ] Change final product default from shadow to enforce only after all gates.
-- [ ] Document rollback: set nested complexity mode to shadow/off while keeping
+- [x] Run shadow mode on representative test fixtures.
+- [x] Measure simple-turn adaptive extra calls/tokens/latency with paired
+      off/shadow/enforce fixtures; total turn cost and recovery-only counters
+      are not sufficient evidence. Evidence:
+      `docs/superpowers/handoffs/2026-07-29-ordinary-chat-adaptive-runtime-wave4-measurement.json`.
+- [x] Review labelled false-positive and false-negative complexity decisions
+      (TP=2, TN=4, FP=0, FN=0 in the bounded fixture matrix).
+- [x] Enable enforce mode for complex effectful fixtures.
+- [x] Run security, restart, cancellation, approval, and concurrency suites.
+- [x] Accept final product default rollout after the paired measurement and
+      labelled confusion review pass; keep legacy-v1 and operator rollback
+      semantics explicit.
+- [x] Document rollback: set nested complexity mode to shadow/off while keeping
       durable state readable.
 
 Exit: ordinary Chat transparently activates the components only when needed.
+
+### Wave 5 — Opt-in external-model release qualification
+
+Wave 5 is a release gate, not an ordinary-Chat runtime feature. It exercises a
+small, public-safe fixture document through the configured backend only after a
+human operator explicitly supplies `--allow-external-model`. Loading fixtures,
+validating evidence, or running Wave 6 must never initialize or contact a
+model.
+
+- Fixtures use the exact `ordinary-chat-adaptive-wave5-fixture-v1` schema and
+  reject credential-shaped content. They are bounded to 20 fixtures and 600
+  characters per message.
+- Each invocation uses the real `AgentEngine` with tools disabled, one ReAct
+  iteration, and session, timeline, and learning persistence disabled.
+- Evidence uses the exact `ordinary-chat-adaptive-wave5-evidence-v2` schema.
+  Each result carries the executed fixture's call/visible-response contract;
+  a passing result must match complexity, stay within the pre-call budget,
+  have zero tool calls, meet response visibility, and have observed usage.
+  v1 is deliberately rejected: this tooling is unreleased, so there is no
+  weak-evidence migration path.
+- The qualification request uses an Engine-enforced isolated context: no
+  durable/default-session history, global-memory retrieval, skill selection,
+  attachments, workspace override, timeline, tools, or persistence. Fixed
+  bounded initialize and fixture wall-clock timeouts fail closed. Streaming
+  usage that the backend cannot expose is recorded as unknown and cannot pass.
+- Fixture document bytes are parsed strictly (including duplicate-key
+  rejection) and must exactly equal the fixtures executed. Model fingerprints
+  are hashes of the active backend's bounded ModelInfo identity, never the
+  configured model string or exposed provider metadata.
+  It contains only fixture IDs, expected/observed classification, bounded
+  numeric counters, fingerprints, hashes, statuses, and reason codes; it never
+  contains prompts, completions, URLs, tool arguments, exception text, or
+  credentials.
+- The configured model's semantic contract interpretation and any main answer
+  are both counted in each fixture's explicit backend-call budget. The shipped
+  information fixtures therefore permit up to two bounded calls; they do not
+  hide an interpreter call as free adaptive overhead.
+- Run a live qualification only through an operator-owned command, for example:
+
+  ```powershell
+  rtk proxy python tests/evaluation/evaluate_adaptive_runtime_wave5.py `
+    --config <operator-config> `
+    --fixtures tests/fixtures/adaptive_runtime/wave5_external_qualification_fixtures.json `
+    --output <redacted-evidence.json> `
+    --allow-external-model
+  ```
+
+Exit: a redacted evidence file exists for the chosen configured model. Code or
+fixture tests alone are not evidence that an external model was qualified.
+
+### Wave 6 — Evidence-bound human canary decision
+
+Wave 6 accepts a strict `ordinary-chat-adaptive-wave6-review-v2` review record
+only when its SHA-256 points to the exact Wave 5 evidence document. It emits a
+strict `ordinary-chat-adaptive-wave6-decision-v1` recommendation:
+
+- passing evidence plus `accept` recommends `keep_enforce`;
+- a hold remains a hold;
+- failed or unavailable qualification forces a `rollback_shadow`
+  recommendation, even when the review says `accept`;
+- a human may explicitly recommend `rollback_shadow` or `rollback_off`.
+
+The command never changes settings. Applying a rollback remains an
+operator-owned Settings ETag/CAS action, so Wave 6 cannot bypass the existing
+rollback, approval, or audit contracts.
+
+Both review binding and the emitted decision's review digest use the exact raw
+UTF-8 JSON bytes, not a parsed/reformatted canonicalization. Byte-distinct
+documents therefore cannot share a binding; duplicate JSON keys are rejected.
+
+```powershell
+rtk proxy python tests/evaluation/evaluate_adaptive_runtime_wave6.py `
+  --evidence <redacted-evidence.json> `
+  --review <human-review.json> `
+  --output <recommendation.json>
+```
+
+Exit: a reviewer-bound recommendation exists; a real canary release still
+requires the operator to apply it deliberately, if any settings change is
+desired.
 
 ---
 

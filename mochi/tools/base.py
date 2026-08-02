@@ -350,6 +350,7 @@ class ToolExecutionContext:
     progress_callback: Any | None = None
     cancellation_requested: bool = False
     active_tool_controller: ActiveToolController | None = None
+    client_timezone: str | None = None
 
 
 class BaseTool(ABC):

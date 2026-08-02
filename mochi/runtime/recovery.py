@@ -134,6 +134,7 @@ def classify_agent_run_recovery_issue(exc: BaseException) -> AgentRunRecoveryIss
             "upstream",
             "connection refused",
             "connection error",
+            "connection attempts failed",
             "network error",
             "provider unavailable",
         ),

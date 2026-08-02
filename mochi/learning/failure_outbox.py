@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -64,6 +65,28 @@ def _clean_text(value: object, *, field_name: str, max_chars: int = 128) -> str:
     return value
 
 
+def _clean_attribution_session_id(
+    value: object,
+    *,
+    episode: FailureEpisode,
+) -> str:
+    session_id = _clean_text(
+        value,
+        field_name="attribution_session_id",
+        max_chars=256,
+    )
+    if session_id.startswith("__mochi_"):
+        raise FailureOutboxError(
+            "attribution_session_id must identify a user session"
+        )
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    if digest != episode.session_id_hash:
+        raise FailureOutboxError(
+            "attribution_session_id does not match episode session hash"
+        )
+    return session_id
+
+
 def _clean_non_negative_int(value: object, *, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise FailureOutboxError(f"{field_name} must be a non-negative integer")
@@ -82,6 +105,7 @@ class FailureOutboxRecord:
     status: OutboxStatus
     attempts: int
     next_attempt_at: str
+    attribution_session_id: str | None = None
     lease_owner: str | None = None
     lease_expires_at: str | None = None
     last_error: str | None = None
@@ -96,6 +120,15 @@ class FailureOutboxRecord:
             _clean_non_negative_int(self.attempts, field_name="attempts"),
         )
         _parse_timestamp(self.next_attempt_at, field_name="next_attempt_at")
+        if self.attribution_session_id is not None:
+            object.__setattr__(
+                self,
+                "attribution_session_id",
+                _clean_attribution_session_id(
+                    self.attribution_session_id,
+                    episode=self.episode,
+                ),
+            )
         if self.lease_owner is not None:
             object.__setattr__(
                 self,
@@ -128,13 +161,36 @@ class FailureOutboxRepository:
         session_store: FailureOutboxSessionStore,
         *,
         session_id: str = FAILURE_OUTBOX_SESSION_ID,
+        retention_days: int | None = None,
     ) -> None:
         self._session_store = session_store
         self._session_id = _clean_text(session_id, field_name="session_id", max_chars=256)
+        if retention_days is not None and (type(retention_days) is not int or retention_days < 1):
+            raise FailureOutboxError("retention_days must be positive")
+        self._retention_days = retention_days
 
-    async def append_candidate(self, episode: FailureEpisode) -> bool:
+    @property
+    def session_store(self) -> FailureOutboxSessionStore:
+        """Return the shared store used for user-session attribution writes."""
+
+        return self._session_store
+
+    async def append_candidate(
+        self,
+        episode: FailureEpisode,
+        *,
+        attribution_session_id: str | None = None,
+    ) -> bool:
         if type(episode) is not FailureEpisode:
             raise FailureOutboxError("episode must be a FailureEpisode")
+        attribution_target = (
+            _clean_attribution_session_id(
+                attribution_session_id,
+                episode=episode,
+            )
+            if attribution_session_id is not None
+            else None
+        )
         created = episode.created_at
         event = {
             "type": "session_meta",
@@ -143,6 +199,10 @@ class FailureOutboxRepository:
             "idempotency_key": episode.idempotency_key,
             "candidate_id": episode.episode_id,
             "failure_episode": episode.to_dict(),
+            # Internal durable routing target only.  Public APIs explicitly
+            # deny the global outbox session and project only the redacted
+            # attribution event written to this target.
+            "attribution_session_id": attribution_target,
             "status": "pending",
             "attempts": 0,
             "next_attempt_at": created,
@@ -162,7 +222,7 @@ class FailureOutboxRepository:
             predicate,
         )
 
-    async def list_records(self) -> tuple[FailureOutboxRecord, ...]:
+    async def list_records(self, *, now: datetime | None = None) -> tuple[FailureOutboxRecord, ...]:
         events = await self._session_store.load_session(self._session_id)
         candidates: dict[str, FailureEpisode] = {}
         states: dict[str, FailureOutboxRecord] = {}
@@ -186,6 +246,9 @@ class FailureOutboxRepository:
                         event.get("next_attempt_at"),
                         field_name="next_attempt_at",
                     ),
+                    attribution_session_id=event.get(
+                        "attribution_session_id"
+                    ),
                 )
             elif event.get("event") == FAILURE_OUTBOX_PROCESSED_EVENT:
                 if event.get("schema_version") != FAILURE_OUTBOX_SCHEMA_VERSION:
@@ -194,13 +257,25 @@ class FailureOutboxRepository:
                 if candidate_id not in candidates:
                     raise FailureOutboxError("processed outbox event has no candidate")
                 states[candidate_id] = self._record_from_transition(
-                    candidates[candidate_id], event
+                    candidates[candidate_id],
+                    event,
+                    attribution_session_id=states[
+                        candidate_id
+                    ].attribution_session_id,
                 )
-        return tuple(states[candidate_id] for candidate_id in sorted(states))
+        records = tuple(states[candidate_id] for candidate_id in sorted(states))
+        if self._retention_days is None or now is None:
+            return records
+        cutoff = _now(now) - timedelta(days=self._retention_days)
+        # Append-only audit is retained; expiry only bounds worker processing.
+        return tuple(record for record in records if _parse_timestamp(record.episode.created_at, field_name="created_at") >= cutoff)
 
     @staticmethod
     def _record_from_transition(
-        episode: FailureEpisode, event: Mapping[str, Any]
+        episode: FailureEpisode,
+        event: Mapping[str, Any],
+        *,
+        attribution_session_id: str | None,
     ) -> FailureOutboxRecord:
         status = _clean_status(event.get("status"))
         return FailureOutboxRecord(
@@ -211,6 +286,7 @@ class FailureOutboxRepository:
                 event.get("next_attempt_at"),
                 field_name="next_attempt_at",
             ),
+            attribution_session_id=attribution_session_id,
             lease_owner=event.get("lease_owner"),
             lease_expires_at=event.get("lease_expires_at"),
             last_error=event.get("last_error"),
@@ -227,7 +303,7 @@ class FailureOutboxRepository:
         if isinstance(lease_seconds, bool) or lease_seconds <= 0:
             raise FailureOutboxError("lease_seconds must be positive")
         current_time = _now(now)
-        for record in await self.list_records():
+        for record in await self.list_records(now=current_time):
             eligible = record.status == "pending" and _parse_timestamp(
                 record.next_attempt_at,
                 field_name="next_attempt_at",
@@ -254,12 +330,19 @@ class FailureOutboxRepository:
                 return await self._get_record(record.episode.episode_id)
         return None
 
-    async def ack(self, candidate_id: str, *, worker_id: str) -> bool:
+    async def ack(
+        self,
+        candidate_id: str,
+        *,
+        worker_id: str,
+        now: datetime | None = None,
+    ) -> bool:
         return await self._finish_claim(
             candidate_id,
             worker_id=worker_id,
             status="acked",
             last_error=None,
+            now=now,
         )
 
     async def retry(
@@ -349,7 +432,11 @@ class FailureOutboxRepository:
                 and event.get("idempotency_key") == transition_key
                 for event in events
             ):
-                return True
+                # append_event_if() appends when its predicate is true.  A
+                # transition key is therefore a compare-and-swap conflict,
+                # not an idempotent success: accepting it here would append
+                # a second claim and let competing workers process one item.
+                return False
             current = self._record_from_events_for_candidate(
                 events,
                 record.episode.episode_id,
@@ -382,6 +469,9 @@ class FailureOutboxRepository:
                         event.get("next_attempt_at"),
                         field_name="next_attempt_at",
                     ),
+                    attribution_session_id=event.get(
+                        "attribution_session_id"
+                    ),
                 )
             elif (
                 event.get("event") == FAILURE_OUTBOX_PROCESSED_EVENT
@@ -389,7 +479,15 @@ class FailureOutboxRepository:
             ):
                 if candidate is None:
                     raise FailureOutboxError("processed outbox event has no candidate")
-                current = FailureOutboxRepository._record_from_transition(candidate, event)
+                current = FailureOutboxRepository._record_from_transition(
+                    candidate,
+                    event,
+                    attribution_session_id=(
+                        current.attribution_session_id
+                        if current is not None
+                        else None
+                    ),
+                )
         if current is None:
             raise FailureOutboxError("candidate not found")
         return current

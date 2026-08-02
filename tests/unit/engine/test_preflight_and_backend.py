@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -23,6 +24,38 @@ from mochi.config.schema import MochiConfig
 from tests.unit.engine._support import (
     FakeBackend,
 )
+
+
+@pytest.mark.asyncio
+async def test_model_connection_performs_minimal_generation_before_reporting_success(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "https://api.example.com/v1",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    backend = FakeBackend(backend_type="openai_compat")
+    engine._router.acquire_temporary_backend = AsyncMock(return_value=backend)  # type: ignore[method-assign]  # noqa: SLF001
+
+    model_info = await engine.test_model_connection(
+        provider="openai_compat",
+        model="gpt-test",
+        base_url="https://api.example.com/v1",
+        api_key="test-key",
+    )
+
+    assert model_info.name == "fake"
+    assert backend.calls == [[Message(role="user", content="Reply with exactly OK.")]]
+    assert backend.tool_calls_seen == [[]]
+    assert backend.generation_kwargs[0]["temperature"] == 0.0
+    assert backend.generation_kwargs[0]["max_tokens"] == 16
+    assert backend.generation_kwargs[0]["stream"] is False
+    assert backend.closed is True
 
 
 @pytest.mark.asyncio
@@ -348,7 +381,7 @@ async def test_engine_preflight_probe_skips_terminal_non_ollama_state_without_re
 
 
 @pytest.mark.asyncio
-async def test_engine_preview_and_chat_invoke_share_turn_contract_resolver(
+async def test_engine_preview_does_not_interpret_the_submitted_turn(
     tmp_path: Path,
 ) -> None:
     config = MochiConfig.model_validate(
@@ -412,7 +445,7 @@ async def test_engine_preview_and_chat_invoke_share_turn_contract_resolver(
         )
     )
 
-    assert interpreter.calls == 2
+    assert interpreter.calls == 1
     await engine.close()
 
 

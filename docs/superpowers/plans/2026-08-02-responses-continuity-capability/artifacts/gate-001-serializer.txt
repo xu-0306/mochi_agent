@@ -1,0 +1,5 @@
+Gate: GATE-001-SERIALIZER
+Command: rtk pytest -q tests/test_openai_compat_backend.py -k "responses_input or continuity or state_policy"
+Exit code: 0
+Observed: Pytest: 4 passed
+Oracle: Generic Responses serialization replays ordered local history without previous_response_id, invalid policy values fail construction, and unrelated provider/model variants remain on the safe default.
