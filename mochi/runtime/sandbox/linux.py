@@ -128,8 +128,16 @@ class BubblewrapSandboxBackend(SandboxBackend):
                 normalized = canonical_path(root)
                 args.extend(("--ro-bind", normalized, normalized))
                 mounted.add(normalized)
-        for parent in _mount_parent_dirs((*plan.read_roots, *plan.write_roots)):
+        mount_parents = _mount_parent_dirs((*plan.read_roots, *plan.write_roots))
+        for parent in mount_parents:
             args.extend(("--dir", parent))
+        # ``--dir`` creates writable directories inside bubblewrap's private
+        # tmpfs.  Without sealing those mount points, a command can report a
+        # successful write beside an approved root even though the write never
+        # reaches the host.  Make every synthetic parent read-only before the
+        # approved roots are mounted over their final destinations.
+        for parent in reversed(mount_parents):
+            args.extend(("--chmod", "0555", parent))
         for root in plan.read_roots:
             if root not in mounted:
                 args.extend(("--ro-bind", root, root))
