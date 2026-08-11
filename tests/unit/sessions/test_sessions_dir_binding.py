@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,8 +15,8 @@ from mochi.config.schema import MochiConfig
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
 from mochi.sessions.store import (
-    SessionStore,
     SessionsDirectoryRestartRequired,
+    SessionStore,
     StorageIdentityError,
     ToolWorkflowPublicationGate,
     canonical_sessions_dir,

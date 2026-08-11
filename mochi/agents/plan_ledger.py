@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
 
@@ -526,11 +526,13 @@ class PlanLedgerTransitionValidator:
         prior_items = {item.item_id: item for item in previous.items}
         next_items = {item.item_id: item for item in proposed.items}
         for item_id, prior_item in prior_items.items():
-            if prior_item.status in _TERMINAL_ITEM_STATUSES:
-                if next_items.get(item_id) != prior_item:
-                    raise ValueError(
-                        f"terminal plan item {item_id!r} must remain unchanged in replacements"
-                    )
+            if (
+                prior_item.status in _TERMINAL_ITEM_STATUSES
+                and next_items.get(item_id) != prior_item
+            ):
+                raise ValueError(
+                    f"terminal plan item {item_id!r} must remain unchanged in replacements"
+                )
 
     def set_item_status(
         self,

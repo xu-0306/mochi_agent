@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import zipfile
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
-import zipfile
 
 from mochi.config import defaults
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult

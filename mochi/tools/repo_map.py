@@ -5,9 +5,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Any
 
 from mochi.config import defaults
@@ -190,7 +190,7 @@ def _extract_js_ts_symbols(text: str, *, max_symbols: int) -> list[_SymbolInfo]:
             break
 
     symbols: list[_SymbolInfo] = []
-    for index, (name, kind, start_line) in enumerate(starts):
+    for _index, (name, kind, start_line) in enumerate(starts):
         symbols.append(
             _SymbolInfo(
                 name=name,
@@ -229,9 +229,14 @@ def _find_js_ts_symbol_end(lines: list[str], *, start_index: int) -> int:
         paren_depth += open_parens - close_parens
         bracket_depth += open_brackets - close_brackets
 
-        if saw_structure and brace_depth <= 0 and paren_depth <= 0 and bracket_depth <= 0:
-            if stripped.endswith(("}", "};", ";")):
-                return last_non_empty
+        if (
+            saw_structure
+            and brace_depth <= 0
+            and paren_depth <= 0
+            and bracket_depth <= 0
+            and stripped.endswith(("}", "};", ";"))
+        ):
+            return last_non_empty
 
         if (
             index > start_index

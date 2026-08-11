@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from mochi.agents.engine import AgentEngine
+from mochi.config.schema import MochiConfig
 from mochi.learning.failure_episode import (
     FAILURE_EPISODE_VERSION,
     FailureEpisode,
@@ -16,8 +18,6 @@ from mochi.learning.failure_store import FailureStore
 from mochi.learning.failure_worker import FailureWorker
 from mochi.learning.runtime import LearningRuntime
 from mochi.sessions.store import SessionStore
-from mochi.agents.engine import AgentEngine
-from mochi.config.schema import MochiConfig
 
 
 class _MemorySessionStore:

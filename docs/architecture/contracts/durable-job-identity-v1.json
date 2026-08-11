@@ -1,0 +1,69 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "durable-job-identity-v1",
+  "producer_package": "PKG-MAIN-57-DURABLE-JOB-IDENTITY",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "capture_process_identity",
+    "open_verified_process",
+    "VerifiedProcessHandle",
+    "ExecSessionSnapshot"
+  ],
+  "inputs": {
+    "windows_identity": {
+      "fields": ["platform", "pid", "windows_process_creation_filetime"],
+      "rule": "platform=windows, pid is a positive integer, and windows_process_creation_filetime is a non-negative integer."
+    },
+    "linux_identity": {
+      "fields": ["platform", "pid", "linux_boot_id", "linux_proc_start_time"],
+      "rule": "platform=linux, pid is a positive integer, linux_boot_id is non-empty, and linux_proc_start_time is a non-negative integer."
+    }
+  },
+  "outputs": {
+    "manifest_v2": {
+      "fields": [
+        "manifest_version",
+        "session_id",
+        "status",
+        "durable_process_identity",
+        "identity_state"
+      ],
+      "identity_state_values": ["verified", "exited", "unknown", "mismatch", "legacy"]
+    },
+    "verification": {
+      "states": ["verified", "exited", "unknown", "mismatch"],
+      "rule": "Only verification=verified exposes a stable handle for liveness or termination."
+    }
+  },
+  "rules": [
+    "New persisted detached sessions write manifest_version=2 and a platform-specific durable_process_identity before the manifest is persisted.",
+    "Windows identity is PID plus process creation FILETIME. Termination operates on the same verified process handle, never by reopening a PID after verification.",
+    "Linux identity is PID plus boot ID plus /proc/<pid>/stat start time. The identity is checked again after pidfd open; missing pidfd support or a failed pidfd open is unknown and fails closed.",
+    "A v1 manifest is accepted only to migrate it to v2 with status=orphaned and identity_state=legacy.",
+    "Malformed identity data, lookup failure, identity mismatch, and missing stable handle classify a running detached job as orphaned. Orphaned jobs are neither live, reattachable, nor terminable.",
+    "A verified handle that reports process exit transitions the job to a terminal completed or failed state and is closed."
+  ],
+  "errors": [
+    "Unsupported identity platforms, invalid PIDs, and malformed platform fields do not create a trusted identity.",
+    "A newly launched detached process whose identity cannot be captured and verified is terminated through its original Popen handle and startup fails.",
+    "Unknown or orphaned sessions never fall back to PID-only liveness or termination."
+  ],
+  "compatibility": {
+    "manifest_version": "2",
+    "v1": "accepted for migration only; its running process is never reattached or terminated",
+    "unknown_future_version": "reject",
+    "additional_identity_fields": "Consumers ignore fields they do not require."
+  },
+  "consumers": [
+    "PKG-MAIN-60-SUPERVISOR-EXEC-RESOURCE",
+    "PKG-WORKER-62-EXEC-RESTART",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-DURABLE-JOB-IDENTITY",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

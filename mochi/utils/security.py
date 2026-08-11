@@ -7,8 +7,8 @@ import shlex
 from pathlib import Path
 from typing import Literal
 
-from mochi.utils.command_security import CommandSecurityResult, classify_command
 from mochi.security.decision import SecurityDecision, deny_security_decision
+from mochi.utils.command_security import CommandSecurityResult, classify_command
 
 FORBIDDEN_SHELL_PATTERNS: tuple[str, ...] = (
     "&&",

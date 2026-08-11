@@ -13,6 +13,7 @@ does not invoke an engine, a tool registry, or a continuation callback.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -20,7 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mochi.agents.conversation_state_store import TURN_CHECKPOINT_EVENT, TurnCheckpoint
 from mochi.api.tool_workflow_aggregate import (
@@ -370,6 +371,13 @@ class ToolWorkflowOutboxRepository:
         self._session_store = session_store
         self._enabled = bool(enabled)
         self._publication_gate = publication_gate
+        # The session detail UI requests one aggregate snapshot for every
+        # visible turn.  They all read the same append-only JSONL history, so
+        # let simultaneous requests share its one strict snapshot rather than
+        # queueing duplicate exclusive sidecar reads in the default worker
+        # pool.  This is deliberately an in-flight cache only: every later
+        # request loads a fresh durable snapshot and can observe a new commit.
+        self._inflight_snapshots: dict[str, asyncio.Task[DurableSessionSnapshot]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -379,11 +387,31 @@ class ToolWorkflowOutboxRepository:
     async def list(self, session_id: str, *, turn_id: str | None = None) -> tuple[dict[str, Any], ...]:
         """Read validated entries even while publication is rolled back/off."""
 
-        snapshot = await self._session_store.load_strict_snapshot(session_id)
+        snapshot = await self._load_shared_snapshot(session_id)
         records = _outbox_records(session_id, snapshot.events)
         if turn_id is not None:
             records = [record for record in records if record["turn_id"] == turn_id]
         return tuple(copy.deepcopy(record) for record in records)
+
+    async def _load_shared_snapshot(self, session_id: str) -> DurableSessionSnapshot:
+        """Load one current snapshot, coalescing only concurrent readers.
+
+        ``asyncio`` executes the dictionary lookup and task installation
+        without an await point, so requests handled by this application loop
+        cannot race to start duplicate reads.  ``shield`` keeps one cancelled
+        HTTP request from cancelling the shared disk read still needed by its
+        peers.
+        """
+
+        current = self._inflight_snapshots.get(session_id)
+        if current is None:
+            current = asyncio.create_task(self._session_store.load_strict_snapshot(session_id))
+            self._inflight_snapshots[session_id] = current
+        try:
+            return await asyncio.shield(current)
+        finally:
+            if current.done() and self._inflight_snapshots.get(session_id) is current:
+                self._inflight_snapshots.pop(session_id, None)
 
     async def verify_session(self, session_id: str) -> ToolWorkflowOutboxVerificationResult:
         """Replay durable sources and compare every cached aggregate read-only."""

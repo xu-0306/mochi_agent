@@ -13,7 +13,6 @@ from typing import Any, Literal, Protocol, cast
 
 from mochi.agents.artifact_verifier import (
     ArtifactReceipt,
-    RetryDisposition,
     ToolExecutionEvidence,
 )
 from mochi.agents.plan_ledger import PlanItem
@@ -1092,9 +1091,7 @@ class StateVerifier:
             container = resolved
             expected = payload.get("contains")
             passed = False
-            if isinstance(container, str) and isinstance(expected, str):
-                passed = expected in container
-            elif isinstance(container, Sequence) and not isinstance(container, (str, bytes)):
+            if isinstance(container, str) and isinstance(expected, str) or isinstance(container, Sequence) and not isinstance(container, (str, bytes)):
                 passed = expected in container
             return CriterionReceipt(
                 criterion_id=criterion.criterion_id,
@@ -1214,7 +1211,7 @@ class SemanticJudgeVerifier:
                 self._judge.judge(criterion, evidence),
                 timeout=self._timeout_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return CriterionReceipt(
                 criterion_id=criterion.criterion_id,
                 verdict="unverified",

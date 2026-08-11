@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, cast
+from typing import Any, Literal, cast
 
 from mochi.agents.turn_intent_contract import ActiveTaskState, TurnIntentContract
 from mochi.sessions.store import SessionStore

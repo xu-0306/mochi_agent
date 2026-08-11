@@ -25,6 +25,7 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { WorkflowDesk } from '@/components/workflow/WorkflowDesk'
+import { AgentRunFailurePresentation } from '@/components/agent-runs/AgentRunFailurePresentation'
 import {
   buildThinkingLevelOptions,
   findThinkingLevelOption,
@@ -2193,8 +2194,12 @@ export default function AgentRunsPage() {
                         ? `Recovery state: ${String(activeRunSummary.recovery_state.status)}`
                         : 'No active recovery state.'}
                     </p>
-                    {activeRunSummary?.latest_error ? (
-                      <p className="mt-2 text-xs text-destructive">{activeRunSummary.latest_error}</p>
+                    {activeRunSummary?.failure || activeRunSummary?.latest_error ? (
+                      <AgentRunFailurePresentation
+                        failure={activeRunSummary?.failure}
+                        latestError={activeRunSummary?.latest_error}
+                        className="mt-3"
+                      />
                     ) : null}
                   </div>
 

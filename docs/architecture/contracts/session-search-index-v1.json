@@ -1,0 +1,75 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "session-search-index-v1",
+  "producer_package": "PKG-MAIN-35-SESSION-INDEX-SEAM",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "SessionIndexSnapshot",
+    "SessionSearchDocument",
+    "SessionSearchIndex",
+    "SessionSearchIndexRebuildReport",
+    "SessionSearchIndexUnavailableError",
+    "SessionStore.session_search_index",
+    "SessionStore.rebuild_session_search_index"
+  ],
+  "inputs": {
+    "canonical_source": "Strict JSONL session histories exposed by SessionStore. The source is authoritative and is never replaced by SQLite state.",
+    "source_snapshot": "session_id, immutable events, history_revision, and source_modified_ns supplied after a successful source commit or during rebuild.",
+    "query": "A text query and integer limit from 1 through 100. Query syntax is tokenized and quoted before it reaches FTS5."
+  },
+  "outputs": {
+    "database": {
+      "filename": ".mochi-session-search-index-v1.sqlite3",
+      "schema_version": 1,
+      "storage": "SQLite FTS5 external-content index over session_search_documents; it is rebuildable derived state."
+    },
+    "document": {
+      "fields": [
+        "session_id",
+        "event_index",
+        "turn_id",
+        "timestamp",
+        "source",
+        "preview",
+        "artifact_ref",
+        "content_kind"
+      ],
+      "turn_reference": "session_id plus zero-based event_index identifies the original canonical event.",
+      "preview_bound": 512,
+      "content_kinds": [
+        "bounded_text",
+        "bounded_text_and_artifact",
+        "artifact_only"
+      ]
+    },
+    "rebuild": "A complete staging database is built from strict source snapshots and atomically replaces the old database only after success."
+  },
+  "errors": [
+    "SessionSearchIndexUnavailableError is raised for a missing, corrupted, schema-incompatible, or explicitly unavailable index; callers must not report this as an empty search result.",
+    "A malformed strict JSONL source aborts rebuild rather than producing a partial index.",
+    "A post-source-commit index write failure is logged, preserves the JSONL commit, and marks the derived index unavailable until rebuild.",
+    "SessionSearchIndexSchemaError requires explicit rebuild migration; unknown schema versions are never queried."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject and rebuild from canonical JSONL",
+    "source_of_truth": "JSONL remains canonical; SQLite is disposable derived state.",
+    "write_order": "Source writes commit first. Derived replacements use source_modified_ns so an older refresh cannot overwrite a newer source snapshot.",
+    "content_policy": "Only named textual fields contribute a normalized preview of at most 512 characters. Binary-looking payloads contribute no preview. Oversized or binary payloads retain an artifact_ref instead of raw content.",
+    "search_policy": "The index exposes bounded primitive results only. Lineage grouping, exclusion, routes, and UI are owned by later packages."
+  },
+  "consumers": [
+    "PKG-WORKER-31-SESSION-SEARCH",
+    "PKG-WORKER-32-SESSION-API",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SESSION-INDEX-SEAM",
+    "GATE-SESSION-SEARCH-CORE",
+    "GATE-SESSION-SEARCH",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

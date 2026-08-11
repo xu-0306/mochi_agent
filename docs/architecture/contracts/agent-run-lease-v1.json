@@ -1,0 +1,81 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "agent-run-lease-v1",
+  "producer_package": "PKG-MAIN-56-AGENT-RUN-LEASE-STORE",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "RuntimeStore.acquire_agent_run_lease",
+    "RuntimeStore.renew_agent_run_lease",
+    "RuntimeStore.release_agent_run_lease",
+    "RuntimeStore.get_agent_run_lease",
+    "RuntimeStore.update_agent_run_status_if_lease_current"
+  ],
+  "inputs": {
+    "agent_run_lease": {
+      "fields": [
+        "run_id",
+        "owner_id",
+        "lease_epoch",
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+        "metadata"
+      ],
+      "rule": "run_id and owner_id are non-empty strings, lease_epoch is a positive integer, and timestamps are ISO-8601 values."
+    }
+  },
+  "outputs": {
+    "lease_result": {
+      "fields": [
+        "run_id",
+        "owner_id",
+        "lease_epoch",
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+        "status"
+      ],
+      "status_values": [
+        "acquired",
+        "renewed",
+        "taken_over",
+        "held_by_other",
+        "stale_fence",
+        "expired",
+        "released",
+        "missing"
+      ]
+    }
+  },
+  "rules": [
+    "Only standalone AgentRuns use agent_run_leases; Goal-backed runs keep using goal_leases.",
+    "Acquire, renew, expired takeover, and release are serialized with a durable SQLite transaction.",
+    "A first lease starts at lease_epoch 1. Every expired takeover or post-release reacquisition advances a durable per-run epoch high-water mark, so an earlier fencing token is never reused.",
+    "Renewal, release, and status mutation require matching owner_id and lease_epoch; stale fencing tokens do not mutate a run.",
+    "A status mutation also requires an unexpired current lease within the same transaction."
+  ],
+  "errors": [
+    "Empty identifiers, invalid timestamps, and non-positive or boolean lease epochs are rejected.",
+    "A missing AgentRun returns status=missing and does not create a lease.",
+    "A fresh foreign lease returns status=held_by_other and is not overwritten."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "additional_output_fields": "Consumers ignore fields they do not require.",
+    "ownership_rule": "Goal-backed AgentRuns do not use this contract.",
+    "fencing_rule": "Consumers must carry the returned lease_epoch into every guarded AgentRun mutation."
+  },
+  "consumers": [
+    "PKG-MAIN-60-SUPERVISOR-EXEC-RESOURCE",
+    "PKG-WORKER-61-SUPERVISOR-RESTART",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-AGENT-RUN-LEASE-CAS",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

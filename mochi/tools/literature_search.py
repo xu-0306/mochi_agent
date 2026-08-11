@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import xml.etree.ElementTree as ET
 from email.utils import parseaddr
 from typing import Any, cast
 
-import asyncio
 import httpx
 
 from mochi.tools._http import (

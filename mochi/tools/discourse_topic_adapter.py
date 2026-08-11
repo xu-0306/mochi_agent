@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import unescape
 from html.parser import HTMLParser
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
@@ -512,9 +513,7 @@ def _post_is_collectable(post: Mapping[str, Any]) -> bool:
         return False
     if bool(post.get("user_deleted")):
         return False
-    if _string(post.get("deleted_at")) is not None:
-        return False
-    return True
+    return _string(post.get("deleted_at")) is None
 
 
 def _build_dataset_record(

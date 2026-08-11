@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 import importlib.util
 import json
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
 import platform
 import shlex
 import shutil
@@ -18,10 +13,17 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from typing import Literal
 import zipfile
+from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
 
 import httpx
+
 try:
     from loguru import logger
 except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
@@ -650,10 +652,8 @@ def _build_hf_candidate(path: Path) -> LocalModelCandidate | None:
             if file_path.is_symlink() or not file_path.is_file():
                 continue
             file_count += 1
-            try:
+            with suppress(OSError):
                 size_bytes += file_path.stat().st_size
-            except OSError:
-                pass
     except PermissionError:
         return None
 

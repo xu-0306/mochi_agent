@@ -21,6 +21,7 @@ from mochi.security.file_contract import (
     FileIdentity,
     authorization_request_digest,
     canonical_json,
+    file_change_subset_entry_id,
 )
 
 from .store import RuntimeStore
@@ -176,6 +177,8 @@ class ChangeSetStore:
             or manifest.workspace_identity != envelope.context.workspace_identity
             or manifest.entries != request.entries
             or manifest.patch_sha256 != request.patch_sha256
+            or manifest.parent_request_digest != request.parent_request_digest
+            or manifest.selected_entry_ids != request.selected_entry_ids
             or manifest.policy_version != envelope.policy_version
         ):
             raise ChangeSetConflict(
@@ -246,6 +249,8 @@ class ChangeSetStore:
                     raise RuntimeError("idempotent change set disappeared")
                 conn.commit()
                 return loaded
+
+            self._validate_subset_parent(conn, manifest, envelope)
 
             conn.execute(
                 """
@@ -319,6 +324,82 @@ class ChangeSetStore:
             conn.commit()
             return loaded
 
+    @staticmethod
+    def _validate_subset_parent(
+        conn: sqlite3.Connection,
+        manifest: ChangeManifest,
+        envelope: AuthorizationEnvelope,
+    ) -> None:
+        request = envelope.file_request
+        if request is None or request.parent_request_digest is None:
+            return
+        parent_row = conn.execute(
+            """
+            SELECT requester_id, session_id, task_id, workspace_root,
+                   workspace_identity_json, policy_version,
+                   authorization_envelope_json
+            FROM change_sets
+            WHERE request_digest=?
+            LIMIT 1
+            """,
+            (request.parent_request_digest,),
+        ).fetchone()
+        if parent_row is None:
+            raise ChangeSetConflict("parent_request_missing")
+        if (
+            str(parent_row["requester_id"]) != envelope.context.requester_id
+            or str(parent_row["session_id"]) != envelope.context.session_id
+            or (parent_row["task_id"] or None) != envelope.context.task_id
+            or str(parent_row["workspace_root"]) != manifest.workspace_root
+            or str(parent_row["workspace_identity_json"])
+            != canonical_json(manifest.workspace_identity.to_dict())
+            or str(parent_row["policy_version"]) != manifest.policy_version
+        ):
+            raise ChangeSetConflict("parent_request_context_changed")
+        parent_envelope = AuthorizationEnvelope.from_dict(
+            json.loads(str(parent_row["authorization_envelope_json"]))
+        )
+        parent_request = parent_envelope.file_request
+        if parent_request is None:
+            raise ChangeSetConflict("parent_request_invalid")
+        if authorization_request_digest(parent_envelope) != request.parent_request_digest:
+            raise ChangeSetConflict("parent_request_digest_mismatch")
+        if manifest.request_digest == request.parent_request_digest:
+            raise ChangeSetConflict("subset_reuses_parent_approval")
+
+        parent_entries = {entry.entry_id: entry for entry in parent_request.entries}
+        selected = set(request.selected_entry_ids)
+        if len(selected) != len(manifest.entries) or not selected <= set(parent_entries):
+            raise ChangeSetConflict("subset_selection_mismatch")
+        expected_entries = {
+            file_change_subset_entry_id(
+                parent_request_digest=request.parent_request_digest,
+                parent_entry=parent_entries[parent_entry_id],
+            ): replace(
+                parent_entries[parent_entry_id],
+                entry_id=file_change_subset_entry_id(
+                    parent_request_digest=request.parent_request_digest,
+                    parent_entry=parent_entries[parent_entry_id],
+                ),
+            )
+            for parent_entry_id in selected
+        }
+        if (
+            set(expected_entries) != {entry.entry_id for entry in manifest.entries}
+            or any(expected_entries[entry.entry_id] != entry for entry in manifest.entries)
+        ):
+            raise ChangeSetConflict("subset_entry_changed")
+        for entry in parent_request.entries:
+            if entry.dependency_group is None or entry.entry_id not in selected:
+                continue
+            group_ids = {
+                candidate.entry_id
+                for candidate in parent_request.entries
+                if candidate.dependency_group == entry.dependency_group
+            }
+            if not group_ids <= selected:
+                raise ChangeSetConflict("partial_dependency_group")
+
     def _load_change_set(
         self,
         conn: sqlite3.Connection,
@@ -365,6 +446,10 @@ class ChangeSetStore:
             for entry in entry_rows
         )
         envelope_data = json.loads(str(row["authorization_envelope_json"]))
+        envelope = AuthorizationEnvelope.from_dict(envelope_data)
+        request = envelope.file_request
+        if request is None:
+            raise ChangeSetConflict("change set lost file request")
         metadata = json.loads(str(row["metadata_json"]))
         manifest = ChangeManifest(
             version=int(row["schema_version"]),
@@ -381,13 +466,15 @@ class ChangeSetStore:
             created_at=str(row["created_at"]),
             expires_at=str(row["expires_at"]),
             request_digest=str(row["request_digest"]),
+            parent_request_digest=request.parent_request_digest,
+            selected_entry_ids=request.selected_entry_ids,
             ui_metadata=metadata,
         )
         return {
             "id": str(row["id"]),
             "status": str(row["status"]),
             "manifest": manifest,
-            "envelope": AuthorizationEnvelope.from_dict(envelope_data),
+            "envelope": envelope,
             "applied_at": row["applied_at"],
             "updated_at": str(row["updated_at"]),
         }

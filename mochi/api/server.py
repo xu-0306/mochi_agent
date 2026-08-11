@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from fastapi import Body, FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,12 +21,12 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
     logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 
-from mochi.voice.capabilities import get_voice_capabilities
-from mochi.voice.ws_bridge import VoiceWebSocketBridge
 from mochi.sessions.store import (
     SessionsDirectoryRestartRequired,
     ensure_sessions_dir_unchanged,
 )
+from mochi.voice.capabilities import get_voice_capabilities
+from mochi.voice.ws_bridge import VoiceWebSocketBridge
 
 
 def create_app() -> FastAPI:
@@ -154,7 +154,9 @@ def create_app() -> FastAPI:
         })
 
     @app.post("/v1/voice/prepare")
-    async def prepare_voice_runtime(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    async def prepare_voice_runtime(
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> dict[str, Any]:
         """預先載入 WebGUI 語音所需 runtime，讓開始錄音可直接進入待機。"""
         engine = await _get_or_create_engine(app)
         session_id = payload.get("session_id") if isinstance(payload, dict) else None

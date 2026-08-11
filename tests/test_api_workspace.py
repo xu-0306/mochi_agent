@@ -5,8 +5,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from mochi.api.server import create_app
 from mochi.api.routes.workspace import _parse_git_status_porcelain_v2
+from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
 from mochi.projects.store import ProjectStore
 from mochi.sessions.store import SessionStore

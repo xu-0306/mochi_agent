@@ -61,7 +61,8 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
 
         get_response = client.get("/v1/sessions/alpha")
         assert get_response.status_code == 200
-        assert get_response.json() == {
+        session_payload = get_response.json()
+        assert {key: value for key, value in session_payload.items() if key != "events"} == {
             "type": "session",
             "session_id": "alpha",
             "title": "alpha",
@@ -70,15 +71,23 @@ def test_sessions_create_list_get_round_trip(tmp_path: Path) -> None:
             "goal": None,
             "security_override": None,
             "protected_workspace": alpha_projection,
-            "events": [
-                {
-                    "type": "session_meta",
-                    "event": "created",
-                    "session_id": "alpha",
-                    "timestamp": get_response.json()["events"][0]["timestamp"],
-                }
-            ],
         }
+        assert session_payload["events"] == [
+            {
+                "type": "session_meta",
+                "event": "created",
+                "session_id": "alpha",
+                "timestamp": session_payload["events"][0]["timestamp"],
+                "lineage": {
+                    "schema_version": 1,
+                    "storage_id": app.state.session_store.storage_id,
+                    "session_id": "alpha",
+                    "parent_session_id": None,
+                    "parent_storage_id": None,
+                    "fork_until_turn_id": None,
+                },
+            }
+        ]
 
         update_response = client.patch("/v1/sessions/alpha", json={"title": "Alpha"})
         assert update_response.status_code == 200
@@ -315,6 +324,7 @@ def test_sessions_can_fork_from_turn_and_preserve_project(tmp_path: Path) -> Non
                 "alpha",
                 {
                     "type": "message",
+                    "session_id": "alpha",
                     "role": "user",
                     "content": "first question",
                     "turn_id": "turn-1",
@@ -327,6 +337,7 @@ def test_sessions_can_fork_from_turn_and_preserve_project(tmp_path: Path) -> Non
                 "alpha",
                 {
                     "type": "message",
+                    "session_id": "alpha",
                     "role": "assistant",
                     "content": "first answer",
                     "turn_id": "turn-1",
@@ -379,6 +390,19 @@ def test_sessions_can_fork_from_turn_and_preserve_project(tmp_path: Path) -> Non
         assert fork_response.status_code == 200
         forked_session_id = fork_response.json()["session_id"]
         assert forked_session_id != "alpha"
+        forked_lineage = asyncio.run(store.resolve_session_lineage(forked_session_id))
+        assert (forked_lineage.session_id, forked_lineage.root_session_id) == (
+            forked_session_id,
+            "alpha",
+        )
+        assert asyncio.run(store.load_session(forked_session_id))[0]["lineage"] == {
+            "schema_version": 1,
+            "storage_id": store.storage_id,
+            "session_id": forked_session_id,
+            "parent_session_id": "alpha",
+            "parent_storage_id": store.storage_id,
+            "fork_until_turn_id": "turn-1",
+        }
 
         forked_detail = client.get(f"/v1/sessions/{forked_session_id}")
         assert forked_detail.status_code == 200
@@ -392,12 +416,88 @@ def test_sessions_can_fork_from_turn_and_preserve_project(tmp_path: Path) -> Non
             ("message", "user", "first question", "turn-1"),
             ("message", "assistant", "first answer", "turn-1"),
         ]
+        assert {
+            event.get("session_id")
+            for event in payload["events"]
+            if event.get("type") == "message"
+        } == {forked_session_id}
 
         list_payload = client.get("/v1/sessions").json()
         forked_summary = next(
             item for item in list_payload["items"] if item["session_id"] == forked_session_id
         )
         assert forked_summary["project_id"] == project["id"]
+
+
+def test_session_fork_rejections_leave_no_child_or_conflicting_lineage(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    config = MochiConfig.model_validate({"sessions_dir": str(sessions_dir)})
+    store = SessionStore(sessions_dir)
+    app = _create_test_app(config=config, session_store=store)
+
+    with TestClient(app) as client:
+        assert client.post("/v1/sessions", json={"session_id": "source"}).status_code == 200
+        asyncio.run(
+            store.save_event(
+                "source",
+                {
+                    "type": "message",
+                    "session_id": "source",
+                    "role": "assistant",
+                    "content": "fork point",
+                    "turn_id": "turn-1",
+                    "timestamp": "2026-08-08T00:00:01+00:00",
+                },
+            )
+        )
+        source_before = asyncio.run(store.load_session("source"))
+
+        invalid_turn = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "missing-turn-child",
+                "fork_from_session_id": "source",
+                "fork_until_turn_id": "missing-turn",
+            },
+        )
+        assert invalid_turn.status_code == 404
+        assert invalid_turn.json() == {"detail": "Fork turn not found"}
+        assert asyncio.run(store.session_exists("missing-turn-child")) is False
+        assert asyncio.run(store.load_session("source")) == source_before
+
+        assert client.post("/v1/sessions", json={"session_id": "destination"}).status_code == 200
+        destination_before = asyncio.run(store.load_session("destination"))
+
+        duplicate_root = client.post("/v1/sessions", json={"session_id": "destination"})
+        assert duplicate_root.status_code == 409
+        assert duplicate_root.json() == {"detail": "Session already exists"}
+
+        duplicate_fork = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "destination",
+                "fork_from_session_id": "source",
+                "fork_until_turn_id": "turn-1",
+            },
+        )
+        assert duplicate_fork.status_code == 409
+        assert duplicate_fork.json() == {"detail": "Session already exists"}
+
+        self_fork = client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "source",
+                "fork_from_session_id": " source ",
+                "fork_until_turn_id": "turn-1",
+            },
+        )
+        assert self_fork.status_code == 422
+        assert self_fork.json() == {"detail": "fork destination must differ from source session"}
+
+    assert asyncio.run(store.load_session("source")) == source_before
+    assert asyncio.run(store.load_session("destination")) == destination_before
+    assert asyncio.run(store.resolve_session_root("source")) == "source"
+    assert asyncio.run(store.resolve_session_root("destination")) == "destination"
 
 
 def test_session_fork_uses_explicit_create_override_without_inheriting_metadata(
@@ -523,7 +623,6 @@ def test_sessions_can_rewrite_from_turn_in_place(tmp_path: Path) -> None:
             ("message", "user", "first question", "turn-1"),
             ("message", "assistant", "first answer", "turn-1"),
         ]
-
         reloaded_detail = client.get("/v1/sessions/alpha")
         assert reloaded_detail.status_code == 200
         assert [

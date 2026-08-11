@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
 from uuid import uuid4
@@ -26,8 +26,9 @@ class ProjectRecord(TypedDict):
 class ProjectStore:
     """JSON-backed project persistence."""
 
-    def __init__(self, path: str | Path = Path(defaults.default_workspace_dir()) / "projects.json") -> None:
-        self._path = Path(path).expanduser()
+    def __init__(self, path: str | Path | None = None) -> None:
+        effective_path = path if path is not None else Path(defaults.default_workspace_dir()) / "projects.json"
+        self._path = Path(effective_path).expanduser()
 
     async def list_projects(self) -> list[ProjectRecord]:
         records = await asyncio.to_thread(self._read_records)
@@ -71,7 +72,7 @@ class ProjectStore:
                 next_record["name"] = name.strip()
             if workspace_dir is not None:
                 next_record["workspace_dir"] = str(normalize_workspace_dir(workspace_dir))
-            next_record["updated_at"] = datetime.now(tz=UTC).isoformat()
+            next_record["updated_at"] = _next_updated_at(record["updated_at"])
             updated = next_record  # type: ignore[assignment]
             records[index] = next_record  # type: ignore[assignment]
             break
@@ -79,7 +80,6 @@ class ProjectStore:
             return None
         await asyncio.to_thread(self._write_records, records)
         return updated
-
     async def delete_project(self, project_id: str) -> bool:
         records = await asyncio.to_thread(self._read_records)
         next_records = [record for record in records if record["id"] != project_id]
@@ -131,3 +131,21 @@ class ProjectStore:
             json.dumps(records, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+
+def _next_updated_at(previous: str) -> str:
+    """Return a UTC timestamp strictly later than a project's last update."""
+
+    now = datetime.now(tz=UTC)
+    try:
+        previous_timestamp = datetime.fromisoformat(previous)
+    except ValueError:
+        return now.isoformat()
+
+    if previous_timestamp.tzinfo is None:
+        previous_timestamp = previous_timestamp.replace(tzinfo=UTC)
+    else:
+        previous_timestamp = previous_timestamp.astimezone(UTC)
+    if now <= previous_timestamp:
+        now = previous_timestamp + timedelta(microseconds=1)
+    return now.isoformat()

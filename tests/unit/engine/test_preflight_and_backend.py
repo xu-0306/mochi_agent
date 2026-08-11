@@ -533,6 +533,69 @@ def test_engine_context_hint_prefers_effective_context_metadata(tmp_path: Path) 
     assert engine._snapshot_context_length(engine._preinitialized_model_info_cache) == 8192  # noqa: SLF001
 
 
+def test_engine_preserves_advertised_context_as_non_hard_limit(tmp_path: Path) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    model_info = ModelInfo(
+        name="ollama:test",
+        backend_type="ollama",
+        provider="ollama",
+        context_length=32768,
+        metadata={
+            "effective_context_length": 32768,
+            "effective_context_length_source": "api_show.model_info.llama.context_length",
+            "effective_context_source": "advertised",
+            "effective_context_confidence": "medium",
+            "effective_context_is_hard_limit": False,
+            "advertised_context_length": 32768,
+        },
+    )
+
+    effective_context = engine._effective_context_for_model_info(model_info)  # noqa: SLF001
+
+    assert effective_context.context_length == 32768
+    assert effective_context.source.value == "advertised"
+    assert effective_context.confidence.value == "medium"
+    assert effective_context.is_hard_limit is False
+
+
+def test_engine_does_not_promote_legacy_effective_context_to_serving(
+    tmp_path: Path,
+) -> None:
+    config = MochiConfig.model_validate(
+        {
+            "model": "ollama:test",
+            "workspace_dir": str(tmp_path),
+            "sessions_dir": str(tmp_path / "sessions"),
+            "memory": {"db_path": str(tmp_path / "memory.db")},
+        }
+    )
+    engine = AgentEngine(config)
+    model_info = ModelInfo(
+        name="legacy-provider",
+        backend_type="ollama",
+        context_length=None,
+        metadata={
+            "effective_context_length": 8192,
+            "effective_context_length_source": "legacy_provider_metadata",
+        },
+    )
+
+    effective_context = engine._effective_context_for_model_info(model_info)  # noqa: SLF001
+
+    assert effective_context.context_length == 8192
+    assert effective_context.source.value == "advertised"
+    assert effective_context.confidence.value == "medium"
+    assert effective_context.is_hard_limit is False
+
+
 def test_engine_resolve_inference_params_uses_conservative_auto_fallback_without_context_hint(
     tmp_path: Path,
 ) -> None:
@@ -629,7 +692,9 @@ async def test_engine_preview_runtime_and_backend_payload_keep_output_cap_and_re
         inference_overrides={"max_tokens": 8192},
     )
 
-    assert preview["reserved_output_tokens"] == 2816
+    assert preview["reserved_output_tokens"] == 1024
+    assert preview["context_source"] == "advertised"
+    assert preview["context_is_hard_limit"] is False
     assert preview["compaction_triggered"] is True
     assert preview["compaction_reason"] == "token_budget"
     assert context.summary is None

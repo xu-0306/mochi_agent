@@ -47,6 +47,26 @@ interface ProjectDialogState {
   workspaceDir: string
 }
 
+const MOBILE_SIDEBAR_QUERY = '(max-width: 767px)'
+
+function useMobileSidebarViewport() {
+  const [matches, setMatches] = React.useState(false)
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return
+    }
+    const mediaQuery = window.matchMedia(MOBILE_SIDEBAR_QUERY)
+    const syncMatches = () => setMatches(mediaQuery.matches)
+
+    syncMatches()
+    mediaQuery.addEventListener('change', syncMatches)
+    return () => mediaQuery.removeEventListener('change', syncMatches)
+  }, [])
+
+  return matches
+}
+
 function basename(path: string): string {
   const normalized = path.replace(/[\\/]+$/, '')
   if (!normalized) {
@@ -81,8 +101,11 @@ export function Sidebar() {
   const router = useRouter()
   const pathname = usePathname()
   const { t } = useI18n()
-  const collapsed = useUIStore((state) => state.sidebarCollapsed)
+  const storedCollapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed)
+  const mobileViewport = useMobileSidebarViewport()
+  const [mobileExpanded, setMobileExpanded] = React.useState(false)
+  const collapsed = mobileViewport ? !mobileExpanded : storedCollapsed
   const [search, setSearch] = React.useState('')
   const [selectionMode, setSelectionMode] = React.useState(false)
   const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([])
@@ -353,7 +376,11 @@ export function Sidebar() {
         className={cn(
           'flex h-full shrink-0 flex-col overflow-hidden border-r border-border bg-sidebar-layer',
           'transition-[width] duration-300 ease-out-smooth',
-          collapsed ? 'w-16' : 'w-[300px]'
+          mobileViewport && !collapsed
+            ? 'fixed inset-y-0 left-0 z-40 w-[min(300px,calc(100vw-3rem))] shadow-2xl'
+            : collapsed
+              ? 'w-16'
+              : 'w-[300px]'
         )}
       >
         <div className={cn('flex h-12 items-center border-b border-border px-3 shrink-0', collapsed && 'justify-center px-0')}>
@@ -366,7 +393,13 @@ export function Sidebar() {
           <Button
             variant="ghost"
             size="icon-sm"
-            onClick={() => setSidebarCollapsed(!collapsed)}
+            onClick={() => {
+              if (mobileViewport) {
+                setMobileExpanded((expanded) => !expanded)
+                return
+              }
+              setSidebarCollapsed(!collapsed)
+            }}
             aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
             className="shrink-0"
           >

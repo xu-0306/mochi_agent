@@ -18,6 +18,7 @@ import {
   Workflow,
 } from 'lucide-react'
 import * as api from '@/lib/api'
+import { GoalFailurePresentation } from '@/components/chat/GoalFailurePresentation'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -768,11 +769,7 @@ function CurrentAttemptPanel({
         <LabeledValue label="Started" value={formatDateTime(attempt.started_at)} />
         <LabeledValue label="Finished" value={formatDateTime(attempt.finished_at)} />
       </div>
-      {attempt.latest_error ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          {attempt.latest_error}
-        </div>
-      ) : null}
+      <GoalFailurePresentation failure={attempt.failure} latestError={attempt.latest_error} />
       <JsonPreview value={attempt.summary} emptyLabel="No attempt summary." />
     </div>
   )
@@ -1988,11 +1985,10 @@ export default function GoalsPage() {
                           actionPending={actionPending}
                         />
 
-                        {selectedGoal.latest_error ? (
-                          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                            {selectedGoal.latest_error}
-                          </div>
-                        ) : null}
+                        <GoalFailurePresentation
+                          failure={selectedGoal.failure}
+                          latestError={selectedGoal.latest_error}
+                        />
 
                         <Separator />
 

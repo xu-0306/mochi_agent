@@ -13,6 +13,7 @@ import type {
   TokenStats,
 } from '@/lib/chat'
 import { formatChatErrorDiagnostics } from '@/lib/chat-error-display'
+import { presentFailure, type FailureEnvelopeInput } from '@/lib/failure-presentation'
 import { decodeSseJsonFrames, normalizeAdaptiveRuntimeEnvelope } from './ordinary-chat-runtime-stream'
 import {
   normalizeToolExposureDiagnostics,
@@ -397,6 +398,7 @@ export interface LegacyChatEvent {
     | 'goal_state_changed'
     | 'error'
     | 'final_answer'
+  failure?: FailureEnvelopeInput
 }
 
 export interface TurnEventPayload extends Record<string, unknown> {
@@ -424,6 +426,7 @@ export interface TurnEventPayload extends Record<string, unknown> {
   output_tokens?: unknown
   generation_time_ms?: unknown
   finish_reason?: unknown
+  failure?: unknown
 }
 
 export interface SessionMessageEvent {
@@ -445,6 +448,7 @@ export interface SessionTurnEvent {
   timestamp?: string
   turn_id?: string | number
   turnId?: string | number
+  failure?: FailureEnvelopeInput
 }
 
 export interface UnknownSessionEvent {
@@ -608,6 +612,7 @@ interface NormalizedTurnEvent {
   outputTokens?: number
   generationTimeMs?: number
   finishReason?: string
+  failure?: FailureEnvelopeInput
 }
 
 interface NormalizedTextChunkEvent {
@@ -686,6 +691,10 @@ function getPayloadNumber(
   const snakeCaseValue = payload[snakeCaseKey]
   const camelCaseValue = payload[camelCaseKey]
   return getNumber(snakeCaseValue) ?? getNumber(camelCaseValue) ?? undefined
+}
+
+function normalizeFailureEnvelope(value: unknown): FailureEnvelopeInput | undefined {
+  return isRecord(value) ? (value as FailureEnvelopeInput) : undefined
 }
 
 function normalizeTransportDiagnostics(
@@ -818,6 +827,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getPayloadNumber(payload, 'output_tokens', 'outputTokens'),
       generationTimeMs: getPayloadNumber(payload, 'generation_time_ms', 'generationTimeMs'),
       finishReason,
+      failure: normalizeFailureEnvelope(payload.failure) ?? normalizeFailureEnvelope(event.failure),
     }
   }
 
@@ -868,6 +878,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getNumber(event.output_tokens) ?? undefined,
       generationTimeMs: getNumber(event.generation_time_ms) ?? undefined,
       finishReason: getNonEmptyString(event.finish_reason) ?? undefined,
+      failure: normalizeFailureEnvelope(event.failure),
     }
   }
 
@@ -965,12 +976,16 @@ function buildReasoningStep(
       return {
         id,
         type: 'error',
-        content: event.toolError ?? event.content ?? 'Unknown error.',
+        // Failure event content can contain transport diagnostics. Keep it in
+        // the API event for compatibility, but never carry it into the chat
+        // timeline where reasoning steps are rendered to the user.
+        content: failurePresentationDetail(event.failure),
         timestamp,
         toolMeta: event.toolMeta,
         toolExposure,
         transport,
         errorCode: event.errorCode,
+        failure: event.failure,
         status: 'error',
       }
     default:
@@ -1329,6 +1344,7 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
         step.type === 'error'
           ? formatChatErrorDiagnostics(step.errorCode, step.toolMeta)
           : step.errorCode,
+      failure: step.failure,
       isStreaming: step.type !== 'error',
       reasoningBuffer: step.type === 'error' ? undefined : createInlineReasoningBuffer(),
       inlineReasoningStepId: undefined,
@@ -4246,6 +4262,22 @@ export interface WorkspacePatchPreviewRequest extends Omit<WorkspaceQueryOptions
   patchText: string
 }
 
+function failurePresentationDetail(failure: FailureEnvelopeInput | undefined): string {
+  if (!failure) {
+    return 'The task could not be completed. Review it before starting another attempt.'
+  }
+  try {
+    return presentFailure(failure).detail
+  } catch {
+    return 'The task could not be completed. Review it before starting another attempt.'
+  }
+}
+
+export interface WorkspaceSubsetPreviewRequest {
+  approvalId: string
+  selectedEntryIds: string[]
+}
+
 export interface WorkspaceQueryOptions {
   sessionId?: string | null
   projectId?: string | null
@@ -4388,6 +4420,19 @@ export async function previewWorkspacePatch(
       session_id: input.sessionId ?? null,
       project_id: input.projectId ?? null,
       patch_text: input.patchText,
+    }),
+  })
+  return extractPatchPreviewResult(payload)
+}
+
+export async function previewWorkspacePatchSubset(
+  input: WorkspaceSubsetPreviewRequest
+): Promise<PatchPreviewResult> {
+  const payload = await requestJson<unknown>('/workspace/patch/subset-preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      approval_id: input.approvalId,
+      selected_entry_ids: input.selectedEntryIds,
     }),
   })
   return extractPatchPreviewResult(payload)
@@ -6355,6 +6400,7 @@ export interface AgentRunHealthSummary {
   status: string
   degraded: boolean
   latest_error: string | null
+  failure: FailureEnvelopeInput | null
   schedule_health_status?: string | null
   recovery_state: AgentRunRecoveryState
   candidate_count: number
@@ -6379,6 +6425,7 @@ export interface AgentRunSummary {
   recovery_state: AgentRunRecoveryState
   degraded: boolean
   latest_error: string | null
+  failure: FailureEnvelopeInput | null
   evidence_status: Record<string, unknown>
   artifacts: AgentRunArtifact[]
   created_at: string
@@ -6912,6 +6959,7 @@ function normalizeAgentRunSummary(payload: unknown): AgentRunSummary {
       : {},
     degraded: getBoolean(record.degraded) ?? false,
     latest_error: getNullableString(record.latest_error),
+    failure: normalizeFailureEnvelope(record.failure) ?? null,
     evidence_status: isRecord(record.evidence_status) ? record.evidence_status : {},
     artifacts: getRecordArray(record.artifacts)
       .map((item) => normalizeAgentRunArtifact(item))
@@ -6939,6 +6987,7 @@ function normalizeAgentRunHealthSummary(payload: unknown): AgentRunHealthSummary
     status: getString(record.status) ?? 'unknown',
     degraded: getBoolean(record.degraded) ?? false,
     latest_error: getNullableString(record.latest_error),
+    failure: normalizeFailureEnvelope(record.failure) ?? null,
     schedule_health_status: getNullableString(record.schedule_health_status),
     recovery_state: isRecord(record.recovery_state)
       ? (record.recovery_state as AgentRunRecoveryState)
@@ -7604,6 +7653,7 @@ export interface GoalAttemptSummary {
   summary: Record<string, unknown>
   metadata: Record<string, unknown>
   latest_error: string | null
+  failure: FailureEnvelopeInput | null
   created_at: string
   updated_at: string
   started_at: string | null
@@ -7638,6 +7688,7 @@ export interface GoalSummary {
   summary: Record<string, unknown>
   metadata: Record<string, unknown>
   latest_error: string | null
+  failure: FailureEnvelopeInput | null
   attempts: GoalAttemptSummary[]
   created_at: string
   updated_at: string
@@ -7816,6 +7867,7 @@ export interface GoalHealthSummary {
   capability_policy: Record<string, unknown>
   operator_controls: GoalOperatorControls
   latest_error: string | null
+  failure: FailureEnvelopeInput | null
   current_attempt: GoalAttemptSummary | null
   runtime_budget: Record<string, unknown>
   recovery_state: Record<string, unknown>
@@ -8096,6 +8148,7 @@ function normalizeGoalAttemptSummary(payload: unknown): GoalAttemptSummary | nul
     summary: isRecord(record.summary) ? record.summary : {},
     metadata: isRecord(record.metadata) ? record.metadata : {},
     latest_error: getNullableString(record.latest_error),
+    failure: normalizeFailureEnvelope(record.failure) ?? null,
     created_at: getString(record.created_at) ?? new Date(0).toISOString(),
     updated_at: getString(record.updated_at) ?? new Date(0).toISOString(),
     started_at: getNullableString(record.started_at),
@@ -8134,6 +8187,7 @@ function normalizeGoalSummary(payload: unknown): GoalSummary {
     summary: isRecord(record.summary) ? record.summary : {},
     metadata: isRecord(record.metadata) ? record.metadata : {},
     latest_error: getNullableString(record.latest_error),
+    failure: normalizeFailureEnvelope(record.failure) ?? null,
     attempts: getRecordArray(record.attempts)
       .map((item) => normalizeGoalAttemptSummary(item))
       .filter((item): item is GoalAttemptSummary => item !== null),
@@ -8336,6 +8390,7 @@ function normalizeGoalHealthSummary(payload: unknown): GoalHealthSummary {
     capability_policy: isRecord(record.capability_policy) ? record.capability_policy : {},
     operator_controls: normalizeGoalOperatorControls(record.operator_controls),
     latest_error: getNullableString(record.latest_error),
+    failure: normalizeFailureEnvelope(record.failure) ?? null,
     current_attempt: normalizeGoalAttemptSummary(record.current_attempt),
     runtime_budget: isRecord(record.runtime_budget) ? record.runtime_budget : {},
     recovery_state: isRecord(record.recovery_state) ? record.recovery_state : {},

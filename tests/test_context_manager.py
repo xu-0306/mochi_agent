@@ -102,6 +102,34 @@ def test_prepare_prompt_context_tolerates_memory_error() -> None:
     assert context.memory_context is None
 
 
+def test_restore_durable_snapshot_keeps_revisions_monotonic() -> None:
+    manager = ContextManager(history_window=4)
+    manager.add_message(Message(role="user", content="before restart"))
+    assert manager.next_snapshot_revision() == 1
+
+    restored_history = [
+        Message(role="user", content="before restart"),
+        Message(role="assistant", content="durable reply"),
+    ]
+    manager.restore_durable_snapshot(
+        history=restored_history,
+        summary="Current task: retain context",
+        summary_state=None,
+        compaction_diagnostics=None,
+        compaction_revision=3,
+        snapshot_revision=7,
+    )
+
+    assert [message.content for message in manager.get_full_history()] == [
+        "before restart",
+        "durable reply",
+    ]
+    assert manager.summary == "Current task: retain context"
+    assert manager.compaction_revision == 3
+    assert manager.snapshot_revision == 7
+    assert manager.next_snapshot_revision() == 8
+
+
 def test_preview_prompt_context_simulates_compaction_without_mutating_session() -> None:
     manager = ContextManager(
         conversation_memory=ConversationMemory(max_messages=20),

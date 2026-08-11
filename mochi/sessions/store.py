@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import errno
 import hashlib
 import inspect
 import json
@@ -21,7 +22,20 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
+from mochi.agents.failures import normalize_persisted_failure_event
 from mochi.config import defaults
+from mochi.sessions.index import (
+    SessionIndexSnapshot,
+    SessionSearchIndex,
+    SessionSearchIndexRebuildReport,
+)
+from mochi.sessions.lineage import (
+    SessionLineageEnvelope,
+    SessionLineageError,
+    SessionLineageResolution,
+    SessionLineageResolver,
+    lineage_envelope_from_events,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +94,8 @@ _STORAGE_MARKER_VERSION = 1
 _STORAGE_ID_RE = re.compile(r"^storage:v1:[0-9a-f]{32}$")
 _ATOMIC_REPLACE_MAX_ATTEMPTS = 7
 _ATOMIC_REPLACE_RETRY_BASE_SECONDS = 0.01
+_WINDOWS_SIDECAR_LOCK_RETRY_SECONDS = 0.01
+_WINDOWS_SIDECAR_LOCK_TIMEOUT_SECONDS = 10.0
 
 _TOOL_WORKFLOW_GATE_CONTROLLED_EVENTS = frozenset(
     {
@@ -226,7 +242,7 @@ class SessionStore:
 
     def __init__(
         self,
-        sessions_dir: str | Path = defaults.default_sessions_dir(),
+        sessions_dir: str | Path | None = None,
         *,
         tool_observability_v1: bool = False,
         tool_workflow_publication_gate: ToolWorkflowPublicationGate | None = None,
@@ -237,6 +253,8 @@ class SessionStore:
         Args:
             sessions_dir: 會話檔案目錄，會自動建立。
         """
+        if sessions_dir is None:
+            sessions_dir = defaults.default_sessions_dir()
         self._sessions_dir = Path(sessions_dir).expanduser()
         self._storage_id = self._load_or_create_storage_id()
         # The hook is intentionally at the SessionStore strict-CAS boundary.
@@ -245,6 +263,13 @@ class SessionStore:
         self._tool_observability_v1 = bool(tool_observability_v1)
         self._tool_workflow_publication_gate = tool_workflow_publication_gate
         self._post_strict_commit_observer = post_strict_commit_observer
+        # This SQLite database is derived state; construction alone never
+        # creates it.  A source commit or explicit rebuild does that work.
+        self._session_search_index = SessionSearchIndex(self._sessions_dir)
+        self._session_lineage_resolver = SessionLineageResolver(
+            self._storage_id,
+            self._load_session_lineage_envelope,
+        )
 
     def bind_tool_workflow_publication_gate(
         self,
@@ -288,6 +313,22 @@ class SessionStore:
 
         return self._storage_id
 
+    @property
+    def session_search_index(self) -> SessionSearchIndex:
+        """Return the rebuildable derived index for this canonical store."""
+
+        return self._session_search_index
+
+    async def resolve_session_lineage(self, session_id: str) -> SessionLineageResolution:
+        """Resolve one canonical session to its same-store lineage root."""
+
+        return await self._session_lineage_resolver.resolve(self._normalized_session_id(session_id))
+
+    async def resolve_session_root(self, session_id: str) -> str:
+        """Return the root callback consumed by lineage-aware search."""
+
+        return await self._session_lineage_resolver.resolve_root(self._normalized_session_id(session_id))
+
     def _load_or_create_storage_id(self) -> str:
         marker_path = self._sessions_dir / _STORAGE_MARKER_FILENAME
         with self._sidecar_lock(marker_path):
@@ -322,6 +363,7 @@ class SessionStore:
         """將事件追加寫入 JSONL 檔案。"""
         if not isinstance(event, dict):
             raise TypeError("event must be a dict.")
+        event = normalize_persisted_failure_event(event)
 
         if self._tool_observability_v1 or self._tool_workflow_publication_gate is not None:
             # Source records participating in aggregate reduction must use the
@@ -347,6 +389,54 @@ class SessionStore:
         # ``session_id`` field.
         path = await asyncio.to_thread(self._prepare_writer_path, sid)
         await asyncio.to_thread(self._append_line, path, line)
+        await self._refresh_session_search_index(sid)
+
+    async def create_session_if_absent(
+        self,
+        session_id: str,
+        *,
+        events: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        """Create one complete strict session history if its destination is absent.
+
+        The durable existence check and complete JSONL replacement share the
+        destination sidecar lock, so concurrent creators cannot append a second
+        ``session_meta.created`` record or observe a partially created fork.
+        A reserved v2 identity sidecar without a JSONL history is deliberately
+        not a session and remains reusable after an interrupted first create.
+        """
+
+        sid = self._normalized_session_id(session_id)
+        if isinstance(events, (str, bytes)) or not isinstance(events, Sequence):
+            raise TypeError("events must be a sequence of objects.")
+        candidates = self._normalize_strict_events(events, session_id=sid)
+        if not candidates:
+            raise ValueError("new session history must not be empty.")
+
+        created, after, new_outbox_start_position = await asyncio.to_thread(
+            self._create_session_if_absent,
+            sid,
+            candidates,
+        )
+        if not created:
+            return False
+
+        assert after is not None  # A successful durable creation always reloads its strict snapshot.
+        await self._refresh_session_search_index(sid)
+        if (
+            new_outbox_start_position is not None
+            and self._post_strict_commit_observer is not None
+        ):
+            try:
+                observation = self._post_strict_commit_observer(after, new_outbox_start_position)
+                if inspect.isawaitable(observation):
+                    await observation
+            except Exception as exc:
+                logger.warning(
+                    "Tool-workflow post-commit observer failed: %s",
+                    type(exc).__name__,
+                )
+        return True
 
     async def load_strict_snapshot(self, session_id: str) -> DurableSessionSnapshot:
         """Read one immutable durable snapshot without legacy recovery.
@@ -408,6 +498,8 @@ class SessionStore:
             expected_history_revision,
             build_events,
         )
+        if result.status == "appended":
+            await self._refresh_session_search_index(sid)
         if (
             result.status == "appended"
             and result.new_outbox_start_position is not None
@@ -452,12 +544,15 @@ class SessionStore:
             raise TypeError("predicate must be callable.")
         sid = self._normalized_session_id(session_id)
         path = await asyncio.to_thread(self._prepare_writer_path, sid)
-        return await asyncio.to_thread(
+        appended = await asyncio.to_thread(
             self._append_line_if,
             path,
             event,
             predicate,
         )
+        if appended:
+            await self._refresh_session_search_index(sid)
+        return appended
 
     async def load_session(self, session_id: str) -> list[dict]:
         """從 JSONL 載入完整會話，遇到壞資料時跳過該行。"""
@@ -513,7 +608,14 @@ class SessionStore:
         """刪除 session 檔案；不存在時回傳 False。"""
         sid = self._normalized_session_id(session_id)
         path = await asyncio.to_thread(self._resolve_existing_path, sid)
-        return await asyncio.to_thread(self._delete_file, path, sid)
+        deleted = await asyncio.to_thread(self._delete_file, path, sid)
+        if deleted:
+            try:
+                await self._session_search_index.remove_session(sid)
+            except Exception as exc:
+                logger.warning("Session search index removal failed: %s", type(exc).__name__)
+                await self._mark_session_search_index_unavailable()
+        return deleted
 
     async def replace_session(self, session_id: str, events: list[dict]) -> None:
         """Atomically replace one session file with the provided ordered events."""
@@ -521,10 +623,28 @@ class SessionStore:
             raise TypeError("events must be a list.")
         if any(not isinstance(event, dict) for event in events):
             raise TypeError("every event must be a dict.")
+        events = [normalize_persisted_failure_event(event) for event in events]
 
         sid = self._normalized_session_id(session_id)
         path = await asyncio.to_thread(self._prepare_writer_path, sid)
-        await asyncio.to_thread(self._write_lines, path, events)
+        await asyncio.to_thread(self._replace_session_preserving_lineage, path, sid, events)
+        await self._refresh_session_search_index(sid)
+
+    async def rebuild_session_search_index(self) -> SessionSearchIndexRebuildReport:
+        """Atomically rebuild FTS state from every strict JSONL source session.
+
+        A malformed source history fails closed rather than producing a partial
+        derived database.  The previous database remains available until a
+        complete replacement has been built.
+        """
+
+        try:
+            return await self._session_search_index.rebuild_from_supplier(
+                self._collect_session_search_index_snapshots,
+            )
+        except Exception:
+            await self._mark_session_search_index_unavailable()
+            raise
 
     def _session_path(self, session_id: str) -> Path:
         """Return the primary fixed-length, case-insensitive-safe v2 path.
@@ -858,11 +978,10 @@ class SessionStore:
 
     def _append_line(self, path: Path, line: str) -> None:
         """同步追加寫入單行事件。"""
-        with self._sidecar_lock(path):
-            with path.open("a", encoding="utf-8", newline="\n") as fh:
-                fh.write(f"{line}\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+        with self._sidecar_lock(path), path.open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(f"{line}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _append_line_if(
         self,
@@ -874,12 +993,91 @@ class SessionStore:
             events = self._load_lines(path)
             if not predicate(events):
                 return False
-            line = json.dumps(event, ensure_ascii=False)
+            # The predicate may atomically enrich the candidate event from the
+            # locked snapshot (for example, assigning a CAS revision).  Apply
+            # failure-envelope normalization only after that transition so the
+            # durable line contains those accepted mutations.  Normalization
+            # still happens under the same sidecar lock and never runs when
+            # the predicate rejects the transition.
+            line = json.dumps(
+                normalize_persisted_failure_event(event),
+                ensure_ascii=False,
+            )
             with path.open("a", encoding="utf-8", newline="\n") as event_file:
                 event_file.write(f"{line}\n")
                 event_file.flush()
                 os.fsync(event_file.fileno())
             return True
+
+    def _create_session_if_absent(
+        self,
+        session_id: str,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> tuple[bool, DurableSessionSnapshot | None, int | None]:
+        """Commit one initial strict batch while the destination remains absent."""
+
+        gate = self._tool_workflow_publication_gate
+        gate_transaction = (
+            gate.publication_transaction()
+            if gate is not None
+            else _static_publication_transaction(self._tool_observability_v1)
+        )
+        # Match strict mutation lock ordering: a publication lease always
+        # precedes every per-session sidecar lock.
+        with gate_transaction as publication_enabled:
+            v2_path = self._ensure_v2_path(session_id)
+            pre_v2_paths = self._pre_v2_compatibility_paths(session_id)
+            with self._sidecar_locks(v2_path, *pre_v2_paths):
+                # Do not migrate a legacy collision during creation: an
+                # existing history, regardless of its filename generation,
+                # owns the requested destination.
+                if v2_path.exists() or any(path.exists() for path in pre_v2_paths):
+                    return False, None, None
+
+                normalized = self._normalize_strict_events(candidates, session_id=session_id)
+                if gate is not None and not publication_enabled:
+                    normalized = tuple(
+                        event
+                        for event in normalized
+                        if event.get("event") not in _TOOL_WORKFLOW_GATE_CONTROLLED_EVENTS
+                    )
+                if not normalized:
+                    raise ValueError("new session history must not be empty.")
+                if publication_enabled:
+                    # Local import avoids the Store <-> reducer import cycle
+                    # and keeps the durable transition pure while locked.
+                    from mochi.api.tool_workflow_outbox import build_outbox_companion_events_v1
+
+                    companions = build_outbox_companion_events_v1(
+                        session_id=session_id,
+                        before_events=(),
+                        source_events=normalized,
+                    )
+                    normalized = (*normalized, *companions)
+                new_outbox_start_position = next(
+                    (
+                        index
+                        for index, event in enumerate(normalized, start=1)
+                        if event.get("event") == "tool_workflow_aggregate_outbox"
+                    ),
+                    None,
+                )
+                lines = [
+                    json.dumps(
+                        _json_clone(event),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    for event in normalized
+                ]
+                self._atomic_replace_lines(v2_path, lines)
+                return (
+                    True,
+                    self._load_strict_snapshot(v2_path, session_id),
+                    new_outbox_start_position,
+                )
 
     def _session_last_modified(self, session_id: str) -> float | None:
         path = self._resolve_existing_path(session_id)
@@ -924,8 +1122,23 @@ class SessionStore:
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            return
+            # ``LK_LOCK`` waits in one-second increments when the byte is
+            # already held.  Strict timeline reads run in separate worker
+            # threads, so a brief ordinary read/write overlap otherwise turns
+            # into a one-second FIFO admission stall.  Retry the non-blocking
+            # mode with the same ten-second overall budget instead.
+            deadline = time.monotonic() + _WINDOWS_SIDECAR_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EDEADLK}:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(_WINDOWS_SIDECAR_LOCK_RETRY_SECONDS, remaining))
         import fcntl
 
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -953,11 +1166,96 @@ class SessionStore:
             # not make an existing colliding session in slot 1 unreachable.
             return True
 
-    def _write_lines(self, path: Path, events: list[dict]) -> None:
-        """Atomically replace the session file contents."""
+    def _replace_session_preserving_lineage(
+        self,
+        path: Path,
+        session_id: str,
+        events: list[dict],
+    ) -> None:
+        """Validate immutable lineage and replace while holding one lock."""
+
         with self._sidecar_lock(path):
+            before = self._load_strict_snapshot(path, session_id)
+            if before.exists:
+                existing_lineage = lineage_envelope_from_events(
+                    before.events,
+                    expected_storage_id=self._storage_id,
+                    expected_session_id=session_id,
+                )
+                replacement_lineage = lineage_envelope_from_events(
+                    events,
+                    expected_storage_id=self._storage_id,
+                    expected_session_id=session_id,
+                )
+                if existing_lineage != replacement_lineage:
+                    raise SessionLineageError("conflicting_record")
             lines = [json.dumps(event, ensure_ascii=False) for event in events]
             self._atomic_replace_lines(path, lines)
+
+    async def _refresh_session_search_index(self, session_id: str) -> None:
+        """Refresh derived state after a successful source commit.
+
+        Source durability is never contingent on SQLite.  A failed refresh is
+        logged and makes future queries fail explicitly until a rebuild repairs
+        the derived index.
+        """
+
+        try:
+            snapshot = await asyncio.to_thread(self._load_session_index_snapshot, session_id)
+            await self._session_search_index.replace_snapshot(snapshot)
+        except Exception as exc:
+            logger.warning("Session search index refresh failed: %s", type(exc).__name__)
+            await self._mark_session_search_index_unavailable()
+
+    async def _mark_session_search_index_unavailable(self) -> None:
+        try:
+            await self._session_search_index.mark_unavailable()
+        except Exception as exc:
+            logger.warning("Session search index availability update failed: %s", type(exc).__name__)
+
+    def _load_session_index_snapshot(self, session_id: str) -> SessionIndexSnapshot:
+        sid = self._normalized_session_id(session_id)
+        path = self._resolve_existing_path(sid)
+        with self._sidecar_lock(path):
+            strict = self._load_strict_snapshot(path, sid)
+            if not strict.exists:
+                raise StrictSessionSnapshotError("cannot index a missing strict session history")
+            try:
+                modified_ns = path.stat().st_mtime_ns
+            except OSError as exc:
+                raise StrictSessionSnapshotError("cannot stat strict session history for indexing") from exc
+            return SessionIndexSnapshot(
+                session_id=sid,
+                events=strict.events,
+                history_revision=strict.history_revision,
+                source_modified_ns=modified_ns,
+            )
+
+    async def _load_session_lineage_envelope(self, session_id: str) -> SessionLineageEnvelope | None:
+        """Read one strict source record for the resolver without using FTS state."""
+
+        sid = self._normalized_session_id(session_id)
+        try:
+            snapshot = await self.load_strict_snapshot(sid)
+        except Exception as exc:
+            raise SessionLineageError("resolver_unavailable") from exc
+        if not snapshot.exists:
+            raise SessionLineageError("record_not_found")
+        return lineage_envelope_from_events(
+            snapshot.events,
+            expected_storage_id=self._storage_id,
+            expected_session_id=sid,
+        )
+
+    def _collect_session_search_index_snapshots(self) -> tuple[SessionIndexSnapshot, ...]:
+        session_ids = sorted(self._list_session_ids(None))
+        snapshots: list[SessionIndexSnapshot] = []
+        for session_id in session_ids:
+            path = self._resolve_existing_path(session_id)
+            if not path.exists():
+                continue
+            snapshots.append(self._load_session_index_snapshot(session_id))
+        return tuple(snapshots)
 
     def _load_lines(self, path: Path) -> list[dict]:
         """同步讀取 JSONL 檔案，並跳過無法解析或格式不符的行。"""
@@ -977,7 +1275,7 @@ class SessionStore:
                     continue
 
                 if isinstance(parsed, dict):
-                    events.append(parsed)
+                    events.append(normalize_persisted_failure_event(parsed))
 
         return events
 
@@ -1174,7 +1472,7 @@ class SessionStore:
                 raise ValueError(
                     f"strict mutation event {index} session_id does not match the requested session."
                 )
-            normalized.append(candidate)
+            normalized.append(normalize_persisted_failure_event(candidate))
         return tuple(normalized)
 
     @staticmethod
@@ -1258,7 +1556,7 @@ class SessionStore:
                 raise StrictSessionSnapshotError(
                     f"strict session history line {index} must be a JSON object"
                 )
-            events.append(normalized)
+            events.append(normalize_persisted_failure_event(normalized))
         frozen_events = tuple(_freeze_json(event) for event in events)
         return DurableSessionSnapshot(
             session_id=session_id,

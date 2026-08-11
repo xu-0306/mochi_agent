@@ -12,8 +12,8 @@ import httpx
 
 from mochi.diagnostics.fallbacks import append_fallback_diagnostic
 from mochi.tools._http import (
-    BoundHttpToolCancellation,
     DEFAULT_USER_AGENT,
+    BoundHttpToolCancellation,
     ToolHttpError,
     error_to_tool_result,
     http_request,
@@ -1184,9 +1184,7 @@ def _domain_allowed(url: str, allowed_domains: list[str], blocked_domains: list[
         return False
     if allowed_domains and not any(host == domain or host.endswith(f".{domain}") for domain in allowed_domains):
         return False
-    if any(host == domain or host.endswith(f".{domain}") for domain in blocked_domains):
-        return False
-    return True
+    return not any(host == domain or host.endswith(f".{domain}") for domain in blocked_domains)
 
 
 def _results_to_tool_result(

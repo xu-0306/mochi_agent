@@ -10,8 +10,8 @@ from mochi.agents.adaptive_diagnostics import (
     AdaptiveDiagnosticsAccumulator,
     AdaptiveDiagnosticsConflictError,
     AdaptiveDiagnosticsError,
-    AdaptiveDiagnosticsRepository,
     AdaptiveDiagnosticsRecord,
+    AdaptiveDiagnosticsRepository,
 )
 from mochi.sessions.store import SessionStore
 
@@ -170,16 +170,23 @@ def test_constructor_rejects_recovery_subset_larger_than_total() -> None:
     lambda value: AdaptiveDiagnosticsAccumulator().record_tool_search(candidates=value),
 ])
 def test_public_helper_invalid_measurement_is_atomic(action) -> None:  # type: ignore[no-untyped-def]
-    with pytest.raises(AdaptiveDiagnosticsError): action(-1)
+    with pytest.raises(AdaptiveDiagnosticsError):
+        action(-1)
 
 
 def test_public_helper_invalid_flags_are_rejected_without_mutation() -> None:
-    counters = AdaptiveDiagnosticsAccumulator(); before = counters.snapshot()
-    with pytest.raises(AdaptiveDiagnosticsError): counters.add_model_call(recovery=1)  # type: ignore[arg-type]
-    with pytest.raises(AdaptiveDiagnosticsError): counters.add_model_call(usage_observed=1)  # type: ignore[arg-type]
-    with pytest.raises(AdaptiveDiagnosticsError): counters.add_model_call(wall_observed=1)  # type: ignore[arg-type]
-    with pytest.raises(AdaptiveDiagnosticsError): counters.record_tool_search(candidates=True)  # type: ignore[arg-type]
-    with pytest.raises(AdaptiveDiagnosticsError): counters.record_recovery_attempt(blocked=1)  # type: ignore[arg-type]
+    counters = AdaptiveDiagnosticsAccumulator()
+    before = counters.snapshot()
+    with pytest.raises(AdaptiveDiagnosticsError):
+        counters.add_model_call(recovery=1)  # type: ignore[arg-type]
+    with pytest.raises(AdaptiveDiagnosticsError):
+        counters.add_model_call(usage_observed=1)  # type: ignore[arg-type]
+    with pytest.raises(AdaptiveDiagnosticsError):
+        counters.add_model_call(wall_observed=1)  # type: ignore[arg-type]
+    with pytest.raises(AdaptiveDiagnosticsError):
+        counters.record_tool_search(candidates=True)  # type: ignore[arg-type]
+    with pytest.raises(AdaptiveDiagnosticsError):
+        counters.record_recovery_attempt(blocked=1)  # type: ignore[arg-type]
     assert counters.snapshot() == before
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import cast
 
 from mochi.auth.openai_codex import OPENAI_CODEX_DEFAULT_BASE_URL, OpenAICodexAuthService
 from mochi.backends.base import BackendRequestError
@@ -74,7 +74,7 @@ class OpenAICodexBackend(OpenAICompatBackend):
             raise await self._raise_auth_specific_error(
                 BackendRequestError(str(exc), metadata={"backend_name": "openai_codex"}),
                 str(exc),
-            )
+            ) from exc
 
         if stream:
             return self._stream_generate_with_auth_retry(
@@ -179,12 +179,12 @@ class OpenAICodexBackend(OpenAICompatBackend):
                 raise await self._raise_auth_specific_error(
                     exc,
                     str(refresh_exc),
-                )
+                ) from refresh_exc
             except BackendRequestError as retry_exc:
                 raise await self._raise_auth_specific_error(
                     retry_exc,
                     "OpenAI Codex request was rejected after token refresh.",
-                )
+                ) from retry_exc
 
     async def _stream_generate_with_auth_retry(
         self,
@@ -232,10 +232,13 @@ class OpenAICodexBackend(OpenAICompatBackend):
                 raise await self._raise_auth_specific_error(
                     exc,
                     "OpenAI Codex streaming request was rejected after token refresh.",
-                )
+                ) from exc
             except RuntimeError as refresh_exc:
                 if first_failure is not None:
-                    raise await self._raise_auth_specific_error(first_failure, str(refresh_exc))
+                    raise await self._raise_auth_specific_error(
+                        first_failure,
+                        str(refresh_exc),
+                    ) from refresh_exc
                 raise
 
     async def _should_retry_auth_failure(self, exc: BackendRequestError) -> bool:

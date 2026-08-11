@@ -10,8 +10,7 @@ from mochi.learning.failure_attribution import (
     FailureAttributionRepository,
 )
 from mochi.learning.failure_episode import FailureEpisode
-from mochi.learning.failure_outbox import FailureOutboxRepository
-from mochi.learning.failure_outbox import FailureOutboxError
+from mochi.learning.failure_outbox import FailureOutboxError, FailureOutboxRepository
 from mochi.learning.failure_store import FailureStore
 from mochi.learning.failure_worker import FailureWorker, FailureWorkerBatchResult
 

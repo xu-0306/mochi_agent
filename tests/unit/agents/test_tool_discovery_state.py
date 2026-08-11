@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 
 import pytest
 
 from mochi.agents.tool_discovery_state import (
     TOOL_DISCOVERY_EVENT,
-    TOOL_DISCOVERY_STATE_VERSION,
     ToolDiscoveryObservation,
     ToolDiscoveryState,
     ToolDiscoveryStateRepository,

@@ -562,13 +562,12 @@ def test_chat_stream_route_does_not_duplicate_engine_replay_events(tmp_path: Pat
     )
     app.state.session_store = store
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={"message": "hello", "session_id": "session-engine-authority"},
-        ) as response:
-            _ = list(response.iter_lines())
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={"message": "hello", "session_id": "session-engine-authority"},
+    ) as response:
+        _ = list(response.iter_lines())
 
     assert response.status_code == 200
     store_events = asyncio.run(store.load_session("session-engine-authority"))
@@ -635,13 +634,12 @@ def test_chat_stream_route_appends_only_unpersisted_error_after_engine_failure(
     )
     app.state.session_store = store
 
-    with TestClient(app) as client:
-        with client.stream(
-            "POST",
-            "/v1/chat/stream",
-            json={"message": "hello", "session_id": "session-partial-engine"},
-        ) as response:
-            _ = list(response.iter_lines())
+    with TestClient(app) as client, client.stream(
+        "POST",
+        "/v1/chat/stream",
+        json={"message": "hello", "session_id": "session-partial-engine"},
+    ) as response:
+        _ = list(response.iter_lines())
 
     assert response.status_code == 200
     store_events = asyncio.run(store.load_session("session-partial-engine"))

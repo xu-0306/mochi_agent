@@ -1,0 +1,82 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "cancellation-capability-v1",
+  "producer_package": "PKG-MAIN-38-CANCELLATION-SEAM",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "CancellationCapability",
+    "CancellationDecision",
+    "CancellationCapabilityRegistry",
+    "CommitState",
+    "CommitOutcome",
+    "CommitFenceDecision",
+    "CommitFence"
+  ],
+  "inputs": {
+    "target": "A non-empty named cancellation boundary selected by the orchestration layer.",
+    "requested_at": "An optional non-negative monotonic request timestamp supplied by the caller.",
+    "safe_point": "A non-empty name for the caller's observed cancellation or commit boundary.",
+    "capabilities": "A registry mapping named boundaries to immediate, deferred, or unsupported capability."
+  },
+  "outputs": {
+    "cancellation_decision": {
+      "fields": [
+        "target",
+        "capability",
+        "requested_at",
+        "safe_point",
+        "reason"
+      ],
+      "capability_values": [
+        "immediate",
+        "deferred",
+        "unsupported"
+      ],
+      "rule": "Unknown targets resolve to unsupported; callers must not report cancellation as complete from that result."
+    },
+    "commit_fence_decision": {
+      "fields": [
+        "commit_state",
+        "durable_outcome",
+        "safe_point",
+        "cancellation_requested",
+        "commit_permitted"
+      ],
+      "transitions": [
+        "open -> cancellation_requested when cancellation arrives before commit",
+        "open -> committed on the first commit request",
+        "cancellation_requested -> cancellation_requested on later commit requests",
+        "committed -> committed on later cancellation or commit requests"
+      ],
+      "rule": "A fence permits exactly one commit or one pre-commit cancellation, never both."
+    }
+  },
+  "errors": [
+    "Empty boundary names, invalid capability values, and boolean, negative, or non-integer requested_at values are rejected.",
+    "Unknown cancellation targets are unsupported rather than inferred from orchestration state.",
+    "A cancellation after a durable commit reports already_committed and must not undo or duplicate that effect."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "additional_output_fields": "Consumers ignore fields they do not require.",
+    "unknown_target": "unsupported",
+    "pre_commit_cancellation": "cancelled_pre_commit",
+    "post_commit_cancellation": "already_committed"
+  },
+  "consumers": [
+    "PKG-MAIN-40-CANCELLATION-CONTRACT",
+    "PKG-WORKER-41-CANCELLATION-E2E",
+    "PKG-MAIN-55-RUN-ADOPTION-SEAM",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SEAM-CANCELLATION",
+    "GATE-CANCELLATION",
+    "GATE-EXEC-RESTART",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

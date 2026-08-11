@@ -10,6 +10,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from mochi.agents.failures import (
+    FailureEnvelope,
+    FailureEnvelopeValidationError,
+    legacy_failure_envelope,
+)
 from mochi.runtime.goal_strategy_registry import DEFAULT_GOAL_STRATEGY_ID, get_goal_strategy_entry
 from mochi.runtime.runtime_approval_lifecycle import (
     RuntimeApprovalLifecycleMixin,
@@ -35,6 +40,7 @@ _GOAL_WORKER_GENERATION_TERMINAL_STATUSES = {
     "superseded",
     "succeeded",
 }
+_PERSISTED_FAILURE_KEY = "failure_envelope"
 
 
 class RuntimeStore(RuntimeApprovalLifecycleMixin):
@@ -151,6 +157,46 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_run_leases (
+                    run_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    lease_epoch INTEGER NOT NULL CHECK (lease_epoch >= 1),
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_run_lease_epochs (
+                    run_id TEXT PRIMARY KEY,
+                    last_epoch INTEGER NOT NULL CHECK (last_epoch >= 0),
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_run_lease_epochs (run_id, last_epoch)
+                SELECT agent_runs.id, CAST(strftime('%s', 'now') AS INTEGER) * 1000000
+                FROM agent_runs
+                LEFT JOIN agent_run_lease_epochs
+                  ON agent_run_lease_epochs.run_id = agent_runs.id
+                WHERE agent_run_lease_epochs.run_id IS NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_run_leases_owner
+                ON agent_run_leases(owner_id)
                 """
             )
             conn.execute(
@@ -984,6 +1030,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         summary: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         latest_error: str | None = None,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
     ) -> dict[str, Any]:
         await self.initialize()
         now = _now_iso()
@@ -1046,7 +1093,15 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         json.dumps(run_policy or {}, ensure_ascii=False),
                         json.dumps(capability_policy or {}, ensure_ascii=False),
                         json.dumps(source_manifest or {}, ensure_ascii=False),
-                        json.dumps(summary or {}, ensure_ascii=False),
+                        json.dumps(
+                            _summary_with_persisted_failure(
+                                summary or {},
+                                failure=failure,
+                                status="created",
+                                latest_error=latest_error,
+                            ),
+                            ensure_ascii=False,
+                        ),
                         json.dumps(metadata or {}, ensure_ascii=False),
                         latest_error,
                         None,
@@ -1072,6 +1127,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         summary: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         latest_error: str | None = None,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
     ) -> dict[str, Any]:
         await self.initialize()
         now = _now_iso()
@@ -1095,7 +1151,15 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         status,
                         trigger,
                         agent_run_id,
-                        json.dumps(summary or {}, ensure_ascii=False),
+                        json.dumps(
+                            _summary_with_persisted_failure(
+                                summary or {},
+                                failure=failure,
+                                status=status,
+                                latest_error=latest_error,
+                            ),
+                            ensure_ascii=False,
+                        ),
                         json.dumps(metadata or {}, ensure_ascii=False),
                         latest_error,
                         started_at,
@@ -1129,6 +1193,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         status: str,
         *,
         latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
         current_attempt_id: str | None | object = _UNSET,
         reset_started_at: bool = False,
         reset_finished_at: bool = False,
@@ -1140,7 +1205,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
             with sqlite3.connect(self._db_path) as conn:
                 existing = conn.execute(
                     """
-                    SELECT started_at, finished_at, latest_error, current_attempt_id
+                    SELECT started_at, finished_at, latest_error, current_attempt_id, summary_json
                     FROM goals
                     WHERE id=?
                     """,
@@ -1152,6 +1217,14 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 current_finished_at = None if reset_finished_at else existing[1]
                 current_latest_error = existing[2]
                 current_current_attempt_id = existing[3]
+                current_summary = json.loads(str(existing[4] or "{}"))
+                next_latest_error = current_latest_error if latest_error is _UNSET else latest_error
+                next_summary = _summary_with_persisted_failure(
+                    current_summary,
+                    failure=failure,
+                    status=status,
+                    latest_error=latest_error,
+                )
                 started_at = now if status in {"queued", "running"} and not current_started_at else current_started_at
                 finished_at = (
                     now
@@ -1162,6 +1235,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     """
                     UPDATE goals
                     SET status=?,
+                        summary_json=?,
                         latest_error=?,
                         current_attempt_id=?,
                         started_at=?,
@@ -1171,7 +1245,8 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     """,
                     (
                         status,
-                        current_latest_error if latest_error is _UNSET else latest_error,
+                        json.dumps(next_summary, ensure_ascii=False),
+                        next_latest_error,
                         current_current_attempt_id if current_attempt_id is _UNSET else current_attempt_id,
                         started_at,
                         finished_at if finished_at is not None else current_finished_at,
@@ -1189,6 +1264,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         status: str,
         *,
         latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
         agent_run_id: str | None | object = _UNSET,
         summary: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -1216,6 +1292,19 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 current_agent_run_id = existing[3]
                 current_summary = json.loads(str(existing[4] or "{}"))
                 current_metadata = json.loads(str(existing[5] or "{}"))
+                next_latest_error = current_latest_error if latest_error is _UNSET else latest_error
+                next_summary = _summary_with_persisted_failure(
+                    _summary_preserving_unchanged_failure(
+                        current_summary=current_summary,
+                        replacement_summary=summary,
+                        failure=failure,
+                        latest_error=latest_error,
+                        current_latest_error=current_latest_error,
+                    ),
+                    failure=failure,
+                    status=status,
+                    latest_error=latest_error,
+                )
                 started_at = now if status in {"queued", "running"} and not current_started_at else current_started_at
                 finished_at = (
                     now
@@ -1238,9 +1327,9 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     (
                         status,
                         current_agent_run_id if agent_run_id is _UNSET else agent_run_id,
-                        json.dumps(current_summary if summary is None else summary, ensure_ascii=False),
+                        json.dumps(next_summary, ensure_ascii=False),
                         json.dumps(current_metadata if metadata is None else metadata, ensure_ascii=False),
-                        current_latest_error if latest_error is _UNSET else latest_error,
+                        next_latest_error,
                         started_at,
                         finished_at if finished_at is not None else current_finished_at,
                         now,
@@ -1259,6 +1348,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         attempt_id: str,
         attempt_status: str,
         latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
         current_attempt_id: str | None | object = _UNSET,
         agent_run_id: str | None | object = _UNSET,
         attempt_summary: dict[str, Any] | None = None,
@@ -1268,12 +1358,46 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         reset_goal_finished_at: bool = False,
         reset_attempt_started_at: bool = False,
         reset_attempt_finished_at: bool = False,
-    ) -> None:
+        source_agent_run_status: str | object = _UNSET,
+        source_agent_run_updated_at: str | object = _UNSET,
+    ) -> bool:
+        """Project a linked Agent Run only while its observed status is current.
+
+        Callers that provide source-run status and revision receive ``False``
+        when the linked run changed after they built the projection. This
+        prevents a delayed supervisor snapshot from replacing a newer terminal
+        projection.
+        """
         await self.initialize()
         now = _now_iso()
 
-        def _op() -> None:
+        def _op() -> bool:
             with sqlite3.connect(self._db_path) as conn:
+                if source_agent_run_status is not _UNSET:
+                    if source_agent_run_updated_at is _UNSET:
+                        raise ValueError(
+                            "source_agent_run_updated_at is required with source_agent_run_status"
+                        )
+                    conn.execute("BEGIN IMMEDIATE")
+                    source_run_id = (
+                        str(agent_run_id).strip()
+                        if agent_run_id is not _UNSET and agent_run_id is not None
+                        else ""
+                    )
+                    source_row = (
+                        conn.execute(
+                            "SELECT status, updated_at FROM agent_runs WHERE id=?",
+                            (source_run_id,),
+                        ).fetchone()
+                        if source_run_id
+                        else None
+                    )
+                    if (
+                        source_row is None
+                        or str(source_row[0] or "created") != str(source_agent_run_status)
+                        or str(source_row[1] or "") != str(source_agent_run_updated_at)
+                    ):
+                        return False
                 goal_existing = conn.execute(
                     """
                     SELECT started_at, finished_at, latest_error, current_attempt_id, summary_json
@@ -1291,13 +1415,28 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     (attempt_id,),
                 ).fetchone()
                 if goal_existing is None or attempt_existing is None:
-                    return
+                    return False
 
                 goal_started_at = None if reset_goal_started_at else goal_existing[0]
                 goal_finished_at = None if reset_goal_finished_at else goal_existing[1]
                 goal_latest_error = goal_existing[2]
                 goal_current_attempt_id = goal_existing[3]
                 goal_current_summary = json.loads(str(goal_existing[4] or "{}"))
+                next_goal_latest_error = (
+                    goal_latest_error if latest_error is _UNSET else latest_error
+                )
+                next_goal_summary = _summary_with_persisted_failure(
+                    _summary_preserving_unchanged_failure(
+                        current_summary=goal_current_summary,
+                        replacement_summary=goal_summary,
+                        failure=failure,
+                        latest_error=latest_error,
+                        current_latest_error=goal_latest_error,
+                    ),
+                    failure=failure,
+                    status=goal_status,
+                    latest_error=latest_error,
+                )
                 next_goal_started_at = (
                     now
                     if goal_status in {"queued", "running"} and not goal_started_at
@@ -1315,6 +1454,21 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 attempt_agent_run_id = attempt_existing[3]
                 attempt_current_summary = json.loads(str(attempt_existing[4] or "{}"))
                 attempt_current_metadata = json.loads(str(attempt_existing[5] or "{}"))
+                next_attempt_latest_error = (
+                    attempt_latest_error if latest_error is _UNSET else latest_error
+                )
+                next_attempt_summary = _summary_with_persisted_failure(
+                    _summary_preserving_unchanged_failure(
+                        current_summary=attempt_current_summary,
+                        replacement_summary=attempt_summary,
+                        failure=failure,
+                        latest_error=latest_error,
+                        current_latest_error=attempt_latest_error,
+                    ),
+                    failure=failure,
+                    status=attempt_status,
+                    latest_error=latest_error,
+                )
                 next_attempt_started_at = (
                     now
                     if attempt_status in {"queued", "running"} and not attempt_started_at
@@ -1343,14 +1497,14 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         attempt_status,
                         attempt_agent_run_id if agent_run_id is _UNSET else agent_run_id,
                         json.dumps(
-                            attempt_current_summary if attempt_summary is None else attempt_summary,
+                            next_attempt_summary,
                             ensure_ascii=False,
                         ),
                         json.dumps(
                             attempt_current_metadata if attempt_metadata is None else attempt_metadata,
                             ensure_ascii=False,
                         ),
-                        attempt_latest_error if latest_error is _UNSET else latest_error,
+                        next_attempt_latest_error,
                         next_attempt_started_at,
                         next_attempt_finished_at,
                         now,
@@ -1372,10 +1526,10 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     (
                         goal_status,
                         json.dumps(
-                            goal_current_summary if goal_summary is None else goal_summary,
+                            next_goal_summary,
                             ensure_ascii=False,
                         ),
-                        goal_latest_error if latest_error is _UNSET else latest_error,
+                        next_goal_latest_error,
                         goal_current_attempt_id if current_attempt_id is _UNSET else current_attempt_id,
                         next_goal_started_at,
                         next_goal_finished_at,
@@ -1384,8 +1538,9 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     ),
                 )
                 conn.commit()
+                return True
 
-        await asyncio.to_thread(_op)
+        return await asyncio.to_thread(_op)
 
     async def claim_goal_attempt_agent_run_id(
         self,
@@ -1447,6 +1602,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         project_id: str | None | object = _UNSET,
         workspace_dir: str | None | object = _UNSET,
         latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
         current_attempt_id: str | None | object = _UNSET,
     ) -> None:
         await self.initialize()
@@ -1457,7 +1613,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 existing = conn.execute(
                     """
                     SELECT summary_json, metadata_json, strategy_id, selection_source, selection_reason,
-                           latest_error, project_id, workspace_dir, current_attempt_id
+                           latest_error, project_id, workspace_dir, current_attempt_id, status
                     FROM goals
                     WHERE id=?
                     """,
@@ -1474,6 +1630,22 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 current_project_id = existing[6]
                 current_workspace_dir = existing[7]
                 current_current_attempt_id = existing[8]
+                current_status = str(existing[9] or "created")
+                next_latest_error = (
+                    current_latest_error if latest_error is _UNSET else latest_error
+                )
+                next_summary = _summary_with_persisted_failure(
+                    _summary_preserving_unchanged_failure(
+                        current_summary=current_summary,
+                        replacement_summary=summary,
+                        failure=failure,
+                        latest_error=latest_error,
+                        current_latest_error=current_latest_error,
+                    ),
+                    failure=failure,
+                    status=current_status,
+                    latest_error=latest_error,
+                )
                 conn.execute(
                     """
                     UPDATE goals
@@ -1490,14 +1662,14 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     WHERE id=?
                     """,
                     (
-                        json.dumps(current_summary if summary is None else summary, ensure_ascii=False),
+                        json.dumps(next_summary, ensure_ascii=False),
                         json.dumps(current_metadata if metadata is None else metadata, ensure_ascii=False),
                         current_strategy_id if strategy_id is _UNSET else strategy_id,
                         current_selection_source if selection_source is _UNSET else selection_source,
                         current_selection_reason if selection_reason is _UNSET else selection_reason,
                         current_project_id if project_id is _UNSET else project_id,
                         current_workspace_dir if workspace_dir is _UNSET else workspace_dir,
-                        current_latest_error if latest_error is _UNSET else latest_error,
+                        next_latest_error,
                         current_current_attempt_id if current_attempt_id is _UNSET else current_attempt_id,
                         now,
                         goal_id,
@@ -2011,7 +2183,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     previous_owner_id
                     and previous_owner_id != owner_id
                     and not force_takeover
-                    and not _goal_lease_is_stale(previous_expires_at, now=now)
+                    and not _lease_is_stale(previous_expires_at, now=now)
                 ):
                     return
                 takeover_count = previous_takeover_count
@@ -2709,14 +2881,14 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     rows = conn.execute(
                         """
                         SELECT * FROM goal_operator_audit_log
-                        ORDER BY datetime(created_at) DESC, id DESC
+                        ORDER BY created_at DESC, id DESC
                         """
                     ).fetchall()
                 elif event_type is None:
                     rows = conn.execute(
                         """
                         SELECT * FROM goal_operator_audit_log
-                        ORDER BY datetime(created_at) DESC, id DESC
+                        ORDER BY created_at DESC, id DESC
                         LIMIT ?
                         """,
                         (limit or 100,),
@@ -2726,7 +2898,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         """
                         SELECT * FROM goal_operator_audit_log
                         WHERE event_type=?
-                        ORDER BY datetime(created_at) DESC, id DESC
+                        ORDER BY created_at DESC, id DESC
                         """,
                         (event_type,),
                     ).fetchall()
@@ -2735,7 +2907,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         """
                         SELECT * FROM goal_operator_audit_log
                         WHERE event_type=?
-                        ORDER BY datetime(created_at) DESC, id DESC
+                        ORDER BY created_at DESC, id DESC
                         LIMIT ?
                         """,
                         (event_type, limit or 100),
@@ -2764,6 +2936,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         schedule: dict[str, Any] | None = None,
         summary: dict[str, Any] | None = None,
         latest_error: str | None = None,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
         evidence_status: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -2792,7 +2965,15 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         json.dumps(evaluation_policy or {}, ensure_ascii=False),
                         json.dumps(run_policy or {}, ensure_ascii=False),
                         json.dumps(schedule or {}, ensure_ascii=False),
-                        json.dumps(summary or {}, ensure_ascii=False),
+                        json.dumps(
+                            _summary_with_persisted_failure(
+                                summary or {},
+                                failure=failure,
+                                status="created",
+                                latest_error=latest_error,
+                            ),
+                            ensure_ascii=False,
+                        ),
                         latest_error,
                         json.dumps(evidence_status or {}, ensure_ascii=False),
                         None,
@@ -2800,6 +2981,14 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                         now,
                         now,
                     ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO agent_run_lease_epochs (run_id, last_epoch)
+                    VALUES (?, 0)
+                    ON CONFLICT(run_id) DO NOTHING
+                    """,
+                    (run_id,),
                 )
                 for artifact in artifacts or []:
                     conn.execute(
@@ -2833,6 +3022,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         status: str,
         *,
         latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
         reset_started_at: bool = False,
         reset_finished_at: bool = False,
     ) -> None:
@@ -2842,7 +3032,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         def _op() -> None:
             with sqlite3.connect(self._db_path) as conn:
                 existing = conn.execute(
-                    "SELECT started_at, finished_at, latest_error FROM agent_runs WHERE id=?",
+                    "SELECT started_at, finished_at, latest_error, summary_json FROM agent_runs WHERE id=?",
                     (run_id,),
                 ).fetchone()
                 if existing is None:
@@ -2850,6 +3040,14 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 current_started_at = None if reset_started_at else existing[0]
                 current_finished_at = None if reset_finished_at else existing[1]
                 current_latest_error = existing[2]
+                current_summary = json.loads(str(existing[3] or "{}"))
+                next_latest_error = current_latest_error if latest_error is _UNSET else latest_error
+                next_summary = _summary_with_persisted_failure(
+                    current_summary,
+                    failure=failure,
+                    status=status,
+                    latest_error=latest_error,
+                )
                 started_at = now if status == "running" else current_started_at
                 finished_at = (
                     now
@@ -2860,6 +3058,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     """
                     UPDATE agent_runs
                     SET status=?,
+                        summary_json=?,
                         latest_error=?,
                         started_at=?,
                         finished_at=?,
@@ -2868,7 +3067,8 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     """,
                     (
                         status,
-                        current_latest_error if latest_error is _UNSET else latest_error,
+                        json.dumps(next_summary, ensure_ascii=False),
+                        next_latest_error,
                         started_at,
                         finished_at if finished_at is not None else current_finished_at,
                         now,
@@ -2878,6 +3078,391 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 conn.commit()
 
         await asyncio.to_thread(_op)
+
+    async def acquire_agent_run_lease(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        expires_at: str,
+        metadata: dict[str, Any] | None = None,
+        acquired_at: str | None = None,
+        heartbeat_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically acquire or renew a standalone AgentRun ownership lease.
+
+        A lease_epoch is a fencing token.  Every expiration takeover increments
+        it, so a runtime that held an earlier epoch cannot mutate the run after
+        another runtime has adopted it.
+        """
+
+        _require_agent_run_lease_identifier("run_id", run_id)
+        _require_agent_run_lease_identifier("owner_id", owner_id)
+        _require_agent_run_lease_timestamp("expires_at", expires_at)
+        if acquired_at is not None:
+            _require_agent_run_lease_timestamp("acquired_at", acquired_at)
+        if heartbeat_at is not None:
+            _require_agent_run_lease_timestamp("heartbeat_at", heartbeat_at)
+
+        await self.initialize()
+        now = _now_iso()
+        effective_acquired_at = acquired_at or now
+        effective_heartbeat_at = heartbeat_at or now
+
+        def _op() -> dict[str, Any]:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                run = conn.execute(
+                    "SELECT id FROM agent_runs WHERE id=?",
+                    (run_id,),
+                ).fetchone()
+                if run is None:
+                    conn.commit()
+                    return {"run_id": run_id, "owner_id": owner_id, "status": "missing"}
+
+                existing = conn.execute(
+                    "SELECT * FROM agent_run_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if existing is None:
+                    counter = conn.execute(
+                        "SELECT last_epoch FROM agent_run_lease_epochs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    last_epoch = int(counter["last_epoch"] or 0) if counter is not None else 0
+                    next_epoch = last_epoch + 1
+                    conn.execute(
+                        """
+                        INSERT INTO agent_run_lease_epochs (run_id, last_epoch)
+                        VALUES (?, ?)
+                        ON CONFLICT(run_id) DO UPDATE SET last_epoch=excluded.last_epoch
+                        """,
+                        (run_id, next_epoch),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO agent_run_leases (
+                            run_id, owner_id, lease_epoch, acquired_at, heartbeat_at,
+                            expires_at, metadata_json, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            owner_id,
+                            next_epoch,
+                            effective_acquired_at,
+                            effective_heartbeat_at,
+                            expires_at,
+                            json.dumps(metadata or {}, ensure_ascii=False),
+                            now,
+                        ),
+                    )
+                    status = "acquired"
+                else:
+                    current_owner_id = str(existing["owner_id"] or "")
+                    current_epoch = int(existing["lease_epoch"] or 0)
+                    if not _lease_is_stale(str(existing["expires_at"] or ""), now=now):
+                        if current_owner_id != owner_id:
+                            conn.commit()
+                            payload = _row_to_agent_run_lease_payload(existing) or {}
+                            payload["status"] = "held_by_other"
+                            return payload
+                        next_metadata = (
+                            metadata
+                            if metadata is not None
+                            else json.loads(str(existing["metadata_json"] or "{}"))
+                        )
+                        conn.execute(
+                            """
+                            UPDATE agent_run_leases
+                            SET heartbeat_at=?, expires_at=?, metadata_json=?, updated_at=?
+                            WHERE run_id=? AND owner_id=? AND lease_epoch=?
+                            """,
+                            (
+                                effective_heartbeat_at,
+                                expires_at,
+                                json.dumps(next_metadata, ensure_ascii=False),
+                                now,
+                                run_id,
+                                owner_id,
+                                current_epoch,
+                            ),
+                        )
+                        status = "renewed"
+                    else:
+                        next_metadata = metadata or {}
+                        counter = conn.execute(
+                            "SELECT last_epoch FROM agent_run_lease_epochs WHERE run_id=?",
+                            (run_id,),
+                        ).fetchone()
+                        last_epoch = (
+                            int(counter["last_epoch"] or 0)
+                            if counter is not None
+                            else current_epoch
+                        )
+                        next_epoch = max(last_epoch, current_epoch) + 1
+                        conn.execute(
+                            """
+                            INSERT INTO agent_run_lease_epochs (run_id, last_epoch)
+                            VALUES (?, ?)
+                            ON CONFLICT(run_id) DO UPDATE SET last_epoch=excluded.last_epoch
+                            """,
+                            (run_id, next_epoch),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE agent_run_leases
+                            SET owner_id=?, lease_epoch=?, acquired_at=?, heartbeat_at=?,
+                                expires_at=?, metadata_json=?, updated_at=?
+                            WHERE run_id=? AND lease_epoch=?
+                            """,
+                            (
+                                owner_id,
+                                next_epoch,
+                                effective_acquired_at,
+                                effective_heartbeat_at,
+                                expires_at,
+                                json.dumps(next_metadata, ensure_ascii=False),
+                                now,
+                                run_id,
+                                current_epoch,
+                            ),
+                        )
+                        status = "taken_over"
+
+                row = conn.execute(
+                    "SELECT * FROM agent_run_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                conn.commit()
+                payload = _row_to_agent_run_lease_payload(row) or {}
+                payload["status"] = status
+                return payload
+
+        return await asyncio.to_thread(_op)
+
+    async def renew_agent_run_lease(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        lease_epoch: int,
+        expires_at: str,
+        metadata: dict[str, Any] | None = None,
+        heartbeat_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Renew only a current, unexpired AgentRun lease fencing token."""
+
+        _require_agent_run_lease_identifier("run_id", run_id)
+        _require_agent_run_lease_identifier("owner_id", owner_id)
+        _require_agent_run_lease_epoch(lease_epoch)
+        _require_agent_run_lease_timestamp("expires_at", expires_at)
+        if heartbeat_at is not None:
+            _require_agent_run_lease_timestamp("heartbeat_at", heartbeat_at)
+
+        await self.initialize()
+        now = _now_iso()
+        effective_heartbeat_at = heartbeat_at or now
+
+        def _op() -> dict[str, Any]:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT * FROM agent_run_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if existing is None:
+                    conn.commit()
+                    return {"run_id": run_id, "owner_id": owner_id, "status": "missing"}
+
+                payload = _row_to_agent_run_lease_payload(existing) or {}
+                if (
+                    str(existing["owner_id"] or "") != owner_id
+                    or int(existing["lease_epoch"] or 0) != lease_epoch
+                ):
+                    conn.commit()
+                    payload["status"] = "stale_fence"
+                    return payload
+                if _lease_is_stale(str(existing["expires_at"] or ""), now=now):
+                    conn.commit()
+                    payload["status"] = "expired"
+                    return payload
+
+                next_metadata = (
+                    metadata
+                    if metadata is not None
+                    else json.loads(str(existing["metadata_json"] or "{}"))
+                )
+                conn.execute(
+                    """
+                    UPDATE agent_run_leases
+                    SET heartbeat_at=?, expires_at=?, metadata_json=?, updated_at=?
+                    WHERE run_id=? AND owner_id=? AND lease_epoch=?
+                    """,
+                    (
+                        effective_heartbeat_at,
+                        expires_at,
+                        json.dumps(next_metadata, ensure_ascii=False),
+                        now,
+                        run_id,
+                        owner_id,
+                        lease_epoch,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM agent_run_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                conn.commit()
+                payload = _row_to_agent_run_lease_payload(row) or {}
+                payload["status"] = "renewed"
+                return payload
+
+        return await asyncio.to_thread(_op)
+
+    async def release_agent_run_lease(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        lease_epoch: int,
+    ) -> dict[str, Any]:
+        """Release a lease only when its owner and fencing token still match."""
+
+        _require_agent_run_lease_identifier("run_id", run_id)
+        _require_agent_run_lease_identifier("owner_id", owner_id)
+        _require_agent_run_lease_epoch(lease_epoch)
+
+        await self.initialize()
+
+        def _op() -> dict[str, Any]:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT * FROM agent_run_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if existing is None:
+                    conn.commit()
+                    return {"run_id": run_id, "owner_id": owner_id, "status": "missing"}
+
+                payload = _row_to_agent_run_lease_payload(existing) or {}
+                if (
+                    str(existing["owner_id"] or "") != owner_id
+                    or int(existing["lease_epoch"] or 0) != lease_epoch
+                ):
+                    conn.commit()
+                    payload["status"] = "stale_fence"
+                    return payload
+                conn.execute(
+                    "DELETE FROM agent_run_leases WHERE run_id=? AND owner_id=? AND lease_epoch=?",
+                    (run_id, owner_id, lease_epoch),
+                )
+                conn.commit()
+                payload["status"] = "released"
+                return payload
+
+        return await asyncio.to_thread(_op)
+
+    async def get_agent_run_lease(self, run_id: str) -> dict[str, Any] | None:
+        """Return the current standalone AgentRun lease, if one exists."""
+
+        _require_agent_run_lease_identifier("run_id", run_id)
+        await self.initialize()
+
+        def _op() -> dict[str, Any] | None:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT * FROM agent_run_leases WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+            return _row_to_agent_run_lease_payload(row)
+
+        return await asyncio.to_thread(_op)
+
+    async def update_agent_run_status_if_lease_current(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        owner_id: str,
+        lease_epoch: int,
+        latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
+    ) -> bool:
+        """Update a run only while the supplied lease fencing token is current."""
+
+        _require_agent_run_lease_identifier("run_id", run_id)
+        _require_agent_run_lease_identifier("owner_id", owner_id)
+        _require_agent_run_lease_epoch(lease_epoch)
+        await self.initialize()
+        now = _now_iso()
+
+        def _op() -> bool:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    """
+                    SELECT runs.started_at, runs.finished_at, runs.latest_error, leases.expires_at,
+                           runs.summary_json
+                    FROM agent_runs AS runs
+                    JOIN agent_run_leases AS leases ON leases.run_id = runs.id
+                    WHERE runs.id=? AND leases.owner_id=? AND leases.lease_epoch=?
+                    """,
+                    (run_id, owner_id, lease_epoch),
+                ).fetchone()
+                if existing is None or _lease_is_stale(existing[3], now=now):
+                    conn.commit()
+                    return False
+
+                current_started_at = existing[0]
+                current_finished_at = existing[1]
+                current_latest_error = existing[2]
+                current_summary = json.loads(str(existing[4] or "{}"))
+                next_latest_error = current_latest_error if latest_error is _UNSET else latest_error
+                next_summary = _summary_with_persisted_failure(
+                    current_summary,
+                    failure=failure,
+                    status=status,
+                    latest_error=latest_error,
+                )
+                started_at = now if status == "running" else current_started_at
+                finished_at = (
+                    now
+                    if status in {"cancelled", "failed", "succeeded", "partial"}
+                    else current_finished_at
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE agent_runs
+                    SET status=?, summary_json=?, latest_error=?, started_at=?, finished_at=?, updated_at=?
+                    WHERE id=?
+                      AND EXISTS (
+                          SELECT 1 FROM agent_run_leases
+                          WHERE run_id=? AND owner_id=? AND lease_epoch=?
+                      )
+                    """,
+                    (
+                        status,
+                        json.dumps(next_summary, ensure_ascii=False),
+                        next_latest_error,
+                        started_at,
+                        finished_at,
+                        now,
+                        run_id,
+                        run_id,
+                        owner_id,
+                        lease_epoch,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+
+        return await asyncio.to_thread(_op)
 
     async def update_agent_run_schedule(
         self,
@@ -2915,6 +3500,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
         project_id: str | None | object = _UNSET,
         workspace_dir: str | None | object = _UNSET,
         latest_error: str | None | object = _UNSET,
+        failure: FailureEnvelope | Mapping[str, Any] | None | object = _UNSET,
     ) -> None:
         await self.initialize()
         now = _now_iso()
@@ -2923,7 +3509,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
             with sqlite3.connect(self._db_path) as conn:
                 existing = conn.execute(
                     """
-                    SELECT summary_json, evidence_status_json, latest_error, project_id, workspace_dir
+                    SELECT summary_json, evidence_status_json, latest_error, project_id, workspace_dir, status
                     FROM agent_runs
                     WHERE id=?
                     """,
@@ -2936,11 +3522,22 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 current_latest_error = existing[2]
                 current_project_id = existing[3]
                 current_workspace_dir = existing[4]
-                next_summary = current_summary if summary is None else summary
                 next_evidence_status = (
                     current_evidence_status if evidence_status is None else evidence_status
                 )
                 next_latest_error = current_latest_error if latest_error is _UNSET else latest_error
+                next_summary = _summary_with_persisted_failure(
+                    _summary_preserving_unchanged_failure(
+                        current_summary=current_summary,
+                        replacement_summary=summary,
+                        failure=failure,
+                        latest_error=latest_error,
+                        current_latest_error=current_latest_error,
+                    ),
+                    failure=failure,
+                    status=str(existing[5] or "created"),
+                    latest_error=latest_error,
+                )
                 next_project_id = current_project_id if project_id is _UNSET else project_id
                 next_workspace_dir = current_workspace_dir if workspace_dir is _UNSET else workspace_dir
                 conn.execute(
@@ -3424,6 +4021,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                 payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
                 payload["schedule"] = json.loads(payload.pop("schedule_json") or "{}")
                 payload["summary"] = json.loads(payload.pop("summary_json") or "{}")
+                payload["failure"] = _extract_persisted_failure(payload["summary"])
                 payload["evidence_status"] = json.loads(payload.pop("evidence_status_json") or "{}")
                 payload["artifacts"] = _load_agent_run_artifacts(conn, run_id)
                 return payload
@@ -3451,6 +4049,7 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
                     payload["run_policy"] = json.loads(payload.pop("run_policy_json") or "{}")
                     payload["schedule"] = json.loads(payload.pop("schedule_json") or "{}")
                     payload["summary"] = json.loads(payload.pop("summary_json") or "{}")
+                    payload["failure"] = _extract_persisted_failure(payload["summary"])
                     payload["evidence_status"] = json.loads(
                         payload.pop("evidence_status_json") or "{}"
                     )
@@ -3459,6 +4058,109 @@ class RuntimeStore(RuntimeApprovalLifecycleMixin):
             return output
 
         return await asyncio.to_thread(_op)
+
+
+def _summary_with_persisted_failure(
+    summary: Mapping[str, Any] | None,
+    *,
+    failure: FailureEnvelope | Mapping[str, Any] | None | object,
+    status: str,
+    latest_error: str | None | object,
+) -> dict[str, Any]:
+    """Store an explicit failure envelope without using error text as a classifier."""
+
+    result = dict(summary or {})
+    normalized_failure = _normalize_persisted_failure(
+        failure=failure,
+        status=status,
+        latest_error=latest_error,
+    )
+    if normalized_failure is _UNSET:
+        return result
+    if normalized_failure is None:
+        result.pop(_PERSISTED_FAILURE_KEY, None)
+    else:
+        result[_PERSISTED_FAILURE_KEY] = normalized_failure
+    return result
+
+
+def _summary_preserving_unchanged_failure(
+    *,
+    current_summary: Mapping[str, Any],
+    replacement_summary: Mapping[str, Any] | None,
+    failure: FailureEnvelope | Mapping[str, Any] | None | object,
+    latest_error: str | None | object,
+    current_latest_error: str | None,
+) -> dict[str, Any]:
+    """Preserve an unchanged private envelope across summary replacements."""
+
+    result = dict(current_summary if replacement_summary is None else replacement_summary)
+    if (
+        failure is _UNSET
+        and (latest_error is _UNSET or latest_error == current_latest_error)
+        and _PERSISTED_FAILURE_KEY in current_summary
+    ):
+        result[_PERSISTED_FAILURE_KEY] = current_summary[_PERSISTED_FAILURE_KEY]
+    return result
+
+
+def _normalize_persisted_failure(
+    *,
+    failure: FailureEnvelope | Mapping[str, Any] | None | object,
+    status: str,
+    latest_error: str | None | object,
+) -> dict[str, Any] | None | object:
+    if failure is not _UNSET:
+        if failure is None:
+            return None
+        if isinstance(failure, FailureEnvelope):
+            return failure.to_dict()
+        if isinstance(failure, Mapping):
+            return FailureEnvelope.from_mapping(failure).to_dict()
+        raise FailureEnvelopeValidationError("failure must be a FailureEnvelope, mapping, or null")
+
+    if latest_error is _UNSET:
+        return _UNSET
+    if latest_error is None:
+        return None
+    if not isinstance(latest_error, str) or not latest_error.strip():
+        return None
+
+    normalized_status = str(status or "").strip().lower()
+    metadata: dict[str, Any] = {"status": normalized_status}
+    terminal = normalized_status in {"cancelled", "failed"}
+    if normalized_status == "cancelled":
+        metadata["cancelled"] = True
+    elif normalized_status in {"waiting_approval", "awaiting_approval"}:
+        metadata["requires_approval"] = True
+    else:
+        # The status, not unstructured error text, selects the canonical kind.
+        metadata["error_type"] = "runtime_status_failure"
+    envelope = legacy_failure_envelope(
+        event_type="error",
+        metadata=metadata,
+        terminal=terminal,
+    )
+    if envelope is None:  # Defensive: every runtime error transition must be versioned.
+        raise FailureEnvelopeValidationError("unable to classify persisted runtime failure")
+    return envelope.to_dict()
+
+
+def _extract_persisted_failure(summary: dict[str, Any]) -> dict[str, Any] | None:
+    """Move a validated envelope out of public summary payloads.
+
+    The stored summary is intentionally the durable carrier.  API callers get
+    the same envelope in an explicit field, while generic JSON-summary views
+    never receive the diagnostics reference by accident.
+    """
+
+    raw_failure = summary.pop(_PERSISTED_FAILURE_KEY, None)
+    if not isinstance(raw_failure, Mapping):
+        return None
+    try:
+        return FailureEnvelope.from_mapping(raw_failure).to_dict()
+    except FailureEnvelopeValidationError:
+        return None
 
 
 def _now_iso() -> str:
@@ -3480,7 +4182,7 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _goal_lease_is_stale(expires_at: str | None, *, now: str | None = None) -> bool:
+def _lease_is_stale(expires_at: str | None, *, now: str | None = None) -> bool:
     expires_at_dt = _parse_iso_datetime(expires_at)
     if expires_at_dt is None:
         return True
@@ -3549,6 +4251,7 @@ def _row_to_goal_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload["capability_policy"] = json.loads(payload.pop("capability_policy_json") or "{}")
     payload["source_manifest"] = json.loads(payload.pop("source_manifest_json") or "{}")
     payload["summary"] = summary
+    payload["failure"] = _extract_persisted_failure(summary)
     payload["metadata"] = metadata
     return payload
 
@@ -3558,6 +4261,7 @@ def _row_to_goal_attempt_payload(row: sqlite3.Row | None) -> dict[str, Any] | No
         return None
     payload = dict(row)
     payload["summary"] = json.loads(payload.pop("summary_json") or "{}")
+    payload["failure"] = _extract_persisted_failure(payload["summary"])
     payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
     return payload
 
@@ -3609,6 +4313,30 @@ def _row_to_goal_lease_payload(row: sqlite3.Row | None) -> dict[str, Any] | None
     payload["takeover_count"] = int(payload.get("takeover_count") or 0)
     payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
     return payload
+
+
+def _row_to_agent_run_lease_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["lease_epoch"] = int(payload.get("lease_epoch") or 0)
+    payload["metadata"] = json.loads(payload.pop("metadata_json") or "{}")
+    return payload
+
+
+def _require_agent_run_lease_identifier(name: str, value: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+def _require_agent_run_lease_epoch(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("lease_epoch must be a positive integer")
+
+
+def _require_agent_run_lease_timestamp(name: str, value: str) -> None:
+    if _parse_iso_datetime(value) is None:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp")
 
 
 def _row_to_goal_audit_finding_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:

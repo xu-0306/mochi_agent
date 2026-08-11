@@ -14,6 +14,41 @@ from ._support import (
 )
 
 
+def test_chat_api_defaults_are_isolated_from_repository_storage(tmp_path: Path) -> None:
+    """Chat tests must never persist their default sessions in the repository."""
+
+    repository_sessions = Path(__file__).resolve().parents[4] / ".mochi" / "sessions"
+
+    def repository_fingerprint() -> tuple[tuple[str, int, int], ...]:
+        if not repository_sessions.exists():
+            return ()
+        return tuple(
+            sorted(
+                (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+                for path in repository_sessions.iterdir()
+                if path.is_file()
+            )
+        )
+
+    before = repository_fingerprint()
+    app, _engine = _build_app()
+    config = app.state.config_factory()
+    isolated_sessions = (tmp_path / ".mochi" / "sessions").resolve()
+
+    assert Path.cwd().resolve() == tmp_path.resolve()
+    assert Path(config.sessions_dir).resolve() == isolated_sessions
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat",
+            json={"message": "isolation probe", "session_id": "chat-test-isolation-probe"},
+        )
+
+    assert response.status_code == 200
+    assert asyncio.run(SessionStore(isolated_sessions).session_exists("chat-test-isolation-probe"))
+    assert repository_fingerprint() == before
+
+
 def test_chat_route_returns_bounded_response_with_serialized_events() -> None:
     """`POST /v1/chat` 應收斂事件流並回傳 final answer/trajectory。"""
     app, engine = _build_app()

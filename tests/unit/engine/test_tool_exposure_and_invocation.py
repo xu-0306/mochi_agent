@@ -1854,6 +1854,7 @@ async def test_engine_blocks_invocation_when_prompt_exceeds_effective_context(
         metadata={
             "effective_context_length": 128,
             "effective_context_length_source": "test.effective_context",
+            "effective_context_source": "serving",
         }
     )
     react_loop_called = False

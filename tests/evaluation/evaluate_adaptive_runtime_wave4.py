@@ -22,18 +22,17 @@ from typing import Any, Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mochi.agents.engine import AgentEngine
 from mochi.agents.complexity_gate import (
     ComplexityCapabilitySummary,
     ComplexityGate,
     ComplexityGateRequest,
 )
-from mochi.agents.turn_intent_contract import DeliverableContract, TurnIntentContract
+from mochi.agents.engine import AgentEngine
 from mochi.agents.invocation import AgentInvocationRequest
+from mochi.agents.turn_intent_contract import DeliverableContract, TurnIntentContract
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo
 from mochi.config.schema import MochiConfig
-
 
 Mode = Literal["off", "shadow", "enforce"]
 

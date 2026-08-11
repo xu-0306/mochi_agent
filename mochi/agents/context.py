@@ -58,6 +58,8 @@ class ContextManager:
         self._summary: str | None = None
         self._summary_state: ConversationStateSummary | None = None
         self._compaction_diagnostics: CompactionDiagnostics | None = None
+        self._compaction_revision = 0
+        self._snapshot_revision = 0
         self._max_short_term_tokens = max_short_term_tokens
         self._reserve_output_tokens = reserve_output_tokens
 
@@ -67,6 +69,11 @@ class ContextManager:
     def get_recent_history(self, limit: int | None = None) -> list[Message]:
         n = self._history_window if limit is None else limit
         return self._conversation.get_history(n)
+
+    def get_full_history(self) -> list[Message]:
+        """Return the complete in-memory state used for a durable snapshot."""
+
+        return self._conversation.get_history()
 
     def clear_history(self) -> None:
         self._conversation.clear()
@@ -85,6 +92,41 @@ class ContextManager:
     @property
     def compaction_diagnostics(self) -> CompactionDiagnostics | None:
         return self._compaction_diagnostics
+
+    @property
+    def compaction_revision(self) -> int:
+        return self._compaction_revision
+
+    @property
+    def snapshot_revision(self) -> int:
+        return self._snapshot_revision
+
+    def next_snapshot_revision(self) -> int:
+        """Reserve the next monotonic revision before its durable write."""
+
+        self._snapshot_revision += 1
+        return self._snapshot_revision
+
+    def restore_durable_snapshot(
+        self,
+        *,
+        history: list[Message],
+        summary: str | None,
+        summary_state: ConversationStateSummary | None,
+        compaction_diagnostics: CompactionDiagnostics | None,
+        compaction_revision: int,
+        snapshot_revision: int,
+    ) -> None:
+        """Replace transient state with one validated durable context snapshot."""
+
+        self._conversation.clear()
+        for message in history:
+            self._conversation.add(message)
+        self._summary = summary
+        self._summary_state = summary_state
+        self._compaction_diagnostics = compaction_diagnostics
+        self._compaction_revision = max(0, compaction_revision)
+        self._snapshot_revision = max(0, snapshot_revision)
 
     async def prepare_prompt_context(
         self,
@@ -174,6 +216,7 @@ class ContextManager:
         self._summary = result.summary
         self._summary_state = result.summary_state
         self._compaction_diagnostics = result.diagnostics
+        self._compaction_revision += 1
         self._conversation.clear()
         for message in result.retained_history:
             self._conversation.add(message)

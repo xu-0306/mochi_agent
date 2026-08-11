@@ -17,6 +17,11 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
     logger = logging.getLogger(__name__)
 
+from mochi.agents.effective_context import (
+    ContextSource,
+    select_effective_context,
+)
+from mochi.agents.generation_policy import normalize_generation_terminal
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.simulated_tool_protocol import SimulatedToolProtocol
 from mochi.backends.tool_call_contract import (
@@ -112,7 +117,6 @@ class OllamaBackend(BaseLLMBackend):
         self._runtime_context_length_source = "unknown"
         self._model_max_context_length: int | None = None
         self._model_max_context_length_source = "unknown"
-        self._apply_configured_num_ctx()
 
     def supports_tool_calling(self) -> bool:
         return self._tool_state.supports_tool_calling()
@@ -137,23 +141,25 @@ class OllamaBackend(BaseLLMBackend):
     def get_model_info(self) -> ModelInfo:
         supports_reasoning_effort = self._supports_reasoning_effort_model(self.model)
         probe = self._native_tool_probe if isinstance(self._native_tool_probe, dict) else {}
-        context_length = self._context_length
-        request_num_ctx = self._request_num_ctx()
-        if request_num_ctx is not None:
-            effective_context_length = request_num_ctx
-            if self._configured_num_ctx is not None:
-                effective_context_length_source = "config.num_ctx"
-            elif self._runtime_context_length is not None:
-                effective_context_length_source = self._runtime_context_length_source
-            elif self._model_max_context_length is not None:
-                effective_context_length_source = "auto_num_ctx.model_max_cap"
-            else:
-                effective_context_length_source = "auto_num_ctx.fallback_default"
-        else:
-            effective_context_length = context_length or self._CONTEXT_LENGTH_FALLBACK
-            effective_context_length_source = (
-                self._context_length_source if context_length is not None else "fallback_default"
-            )
+        effective_context = select_effective_context(
+            configured_context=self._configured_num_ctx,
+            serving_context=self._runtime_context_length,
+            advertised_context=self._model_max_context_length,
+            fallback_context=self._CONTEXT_LENGTH_FALLBACK,
+        )
+        context_length = (
+            effective_context.context_length
+            if effective_context.source is not ContextSource.FALLBACK_DEFAULT
+            else None
+        )
+        context_length_source = (
+            self._context_length_source
+            if effective_context.source is ContextSource.FALLBACK_DEFAULT
+            else self._context_length_source_for(effective_context.source)
+        )
+        effective_context_length_source = self._context_length_source_for(
+            effective_context.source
+        )
         return ModelInfo(
             name=self.model,
             backend_type="ollama",
@@ -163,18 +169,23 @@ class OllamaBackend(BaseLLMBackend):
             metadata={
                 "supports_reasoning_effort": supports_reasoning_effort,
                 "reasoning_effort_param": "think" if supports_reasoning_effort else None,
-                "context_length_source": self._context_length_source,
+                "context_length_source": context_length_source,
                 "context_length_fallback": (
                     None if context_length is not None else self._CONTEXT_LENGTH_FALLBACK
                 ),
-                "effective_context_length": effective_context_length,
+                "effective_context_length": effective_context.context_length,
                 "effective_context_length_source": effective_context_length_source,
+                "effective_context_source": effective_context.source.value,
+                "effective_context_confidence": effective_context.confidence.value,
+                "effective_context_is_hard_limit": effective_context.is_hard_limit,
                 "configured_num_ctx": self._configured_num_ctx,
                 "auto_num_ctx": self._auto_num_ctx,
                 "auto_num_ctx_cap": self._auto_num_ctx_cap,
                 "auto_num_ctx_value": self._auto_num_ctx_value(),
+                "serving_context_length": self._runtime_context_length,
                 "runtime_context_length": self._runtime_context_length,
                 "runtime_context_length_source": self._runtime_context_length_source,
+                "advertised_context_length": self._model_max_context_length,
                 "model_max_context_length": self._model_max_context_length,
                 "model_max_context_length_source": self._model_max_context_length_source,
                 "tool_call_mode": self._tool_call_mode(),
@@ -219,7 +230,6 @@ class OllamaBackend(BaseLLMBackend):
         self._model_max_context_length_source = metadata["model_max_context_length_source"]
         self._context_length = metadata["context_length"]
         self._context_length_source = metadata["context_length_source"]
-        self._apply_configured_num_ctx()
 
     async def generate(
         self,
@@ -413,6 +423,11 @@ class OllamaBackend(BaseLLMBackend):
                 },
             )
 
+        terminal = normalize_generation_terminal(
+            terminal_signal=data.get("done_reason"),
+            has_structured_tool_calls=bool(tool_calls),
+            output=content,
+        )
         usage = data.get("prompt_eval_count", 0), data.get("eval_count", 0)
         return GenerationResult(
             content=content,
@@ -421,7 +436,7 @@ class OllamaBackend(BaseLLMBackend):
             input_tokens=usage[0],
             output_tokens=usage[1],
             model=data.get("model", self.model),
-            finish_reason="tool_calls" if tool_calls else data.get("done_reason", "stop"),
+            finish_reason=terminal.terminal.value,
         )
 
     def _prepare_messages(
@@ -572,9 +587,7 @@ class OllamaBackend(BaseLLMBackend):
             return True
         if uses_tool_word and (usage_phrase or ends_like_placeholder):
             return True
-        if usage_phrase and (ends_like_placeholder or fenced_placeholder):
-            return True
-        return False
+        return bool(usage_phrase and (ends_like_placeholder or fenced_placeholder))
 
     def _extract_context_metadata_from_show_payload(
         self,
@@ -604,13 +617,14 @@ class OllamaBackend(BaseLLMBackend):
             "model_max_context_length_source": model_max_context_length_source,
         }
 
-    def _apply_configured_num_ctx(self) -> None:
-        if self._configured_num_ctx is None:
-            return
-        self._runtime_context_length = self._configured_num_ctx
-        self._runtime_context_length_source = "config.num_ctx"
-        self._context_length = self._configured_num_ctx
-        self._context_length_source = "config.num_ctx"
+    def _context_length_source_for(self, source: ContextSource) -> str:
+        if source is ContextSource.CONFIGURED:
+            return "config.num_ctx"
+        if source is ContextSource.SERVING:
+            return self._runtime_context_length_source
+        if source is ContextSource.ADVERTISED:
+            return self._model_max_context_length_source
+        return "fallback_default"
 
     def _auto_num_ctx_value(self) -> int | None:
         if not self._auto_num_ctx or self._configured_num_ctx is not None:
@@ -801,7 +815,7 @@ class OllamaBackend(BaseLLMBackend):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         previous_mode = self._tool_state.active_mode
-        changed = self._tool_state.enter_simulated(status)
+        self._tool_state.enter_simulated(status)
         self._native_tool_probe = {
             "status": status,
             "message": reason,
@@ -950,6 +964,7 @@ class OllamaBackend(BaseLLMBackend):
         return self._native_tool_probe
 
     async def _stream_generate(self, payload: dict[str, Any]) -> AsyncIterator[StreamChunk]:
+        visible_output = ""
         try:
             async with self._client.stream("POST", "/api/chat", json=payload) as resp:
                 resp.raise_for_status()
@@ -965,12 +980,23 @@ class OllamaBackend(BaseLLMBackend):
                     msg = data.get("message", {})
                     delta = msg.get("content", "")
                     thinking_delta = msg.get("thinking", "")
+                    text_delta = delta if isinstance(delta, str) else ""
+                    visible_output += text_delta
+                    terminal = (
+                        normalize_generation_terminal(
+                            terminal_signal=data.get("done_reason"),
+                            has_structured_tool_calls=False,
+                            output=visible_output,
+                        )
+                        if done
+                        else None
+                    )
 
                     yield StreamChunk(
-                        delta=delta if isinstance(delta, str) else "",
+                        delta=text_delta,
                         thinking_delta=thinking_delta if isinstance(thinking_delta, str) else "",
                         is_final=done,
-                        finish_reason=data.get("done_reason") if done else None,
+                        finish_reason=terminal.terminal.value if terminal is not None else None,
                     )
                     if done:
                         break

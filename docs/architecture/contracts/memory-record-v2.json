@@ -1,0 +1,65 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "memory-record-v2",
+  "producer_package": "PKG-MAIN-70-MEMORY-SKILL-GOVERNANCE",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "MemoryStore.save",
+    "MemoryStore.update",
+    "MemoryStore.export",
+    "MemoryStore.backup",
+    "MemoryStore.restore"
+  ],
+  "inputs": {
+    "memory": "content, category, metadata, namespace, provenance, and optional supersedes_id. Legacy callers that supply only content, category, and metadata use namespace default and empty provenance.",
+    "backup": "A v2 object containing canonical records, user profile state, and a deterministic checksum for each record.",
+    "restore": "A backup object and dry_run flag. Validation occurs before an active-store transaction begins."
+  },
+  "outputs": {
+    "record": {
+      "required": [
+        "id",
+        "content",
+        "category",
+        "metadata",
+        "namespace",
+        "provenance",
+        "revision",
+        "supersedes_id",
+        "created_at",
+        "updated_at",
+        "checksum"
+      ],
+      "schema_version": 2,
+      "authority": "SQLite memories rows and retained memory revision snapshots are canonical. FTS is derived and rebuildable."
+    },
+    "restore_report": "Dry runs return validated without changing the database. Successful restores return restored only after the complete replacement transaction commits."
+  },
+  "errors": [
+    "Memory backup schema version must be 2.",
+    "A memory record checksum mismatch rejects the restore before active state changes.",
+    "A restore with duplicate ids, invalid namespace, malformed provenance, or invalid revision rejects atomically.",
+    "Search-index rebuild failure never replaces or corrupts canonical memory records."
+  ],
+  "compatibility": {
+    "major_version": "2",
+    "legacy_rows": "Existing v1 rows migrate in place with namespace default, empty provenance, revision 1, null supersedes_id, updated_at equal to created_at, and an immediately calculated checksum.",
+    "search": "Legacy search, export, update, and delete call shapes remain supported. New governance fields are additive in returned records.",
+    "atomicity": "A failed restore leaves the canonical active rows and user profile unchanged; FTS remains disposable derived state.",
+    "unknown_major": "reject without mutating the active store"
+  },
+  "consumers": [
+    "mochi.agents.context",
+    "mochi.agents.engine",
+    "PKG-WORKER-72-MEMORY-RESTORE",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-MEMORY-LIFECYCLE-CORE",
+    "GATE-MEMORY-LIFECYCLE",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

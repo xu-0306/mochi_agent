@@ -31,4 +31,4 @@ def __getattr__(name: str) -> Any:
     if module_name is None:
         raise AttributeError(name)
     module = import_module(module_name)
-    return getattr(module, "router")
+    return module.router

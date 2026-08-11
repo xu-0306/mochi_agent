@@ -1,0 +1,66 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "browser-harness-v1",
+  "producer_package": "PKG-MAIN-05-BROWSER-TEST-INFRA",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "BrowserFixtureServer",
+    "start_fixture_server",
+    "browser_fixture_server",
+    "test-browser-harness-smoke.mjs"
+  ],
+  "inputs": {
+    "fixture_state": "normal or injected mismatch served by tests/browser/_fixture_server.py",
+    "viewports": [
+      {"name": "desktop", "width": 1440, "height": 900},
+      {"name": "mobile", "width": 390, "height": 844}
+    ],
+    "artifact_dir": "defaults to artifacts/quality/browser-harness; MOCHI_BROWSER_ARTIFACT_DIR may select a non-empty subdirectory of artifacts/quality or artifacts/foreman for an isolated evaluator run",
+    "browser_runtime": "Playwright plus an explicitly resolved Chromium executable; no product API or product UI source is modified."
+  },
+  "outputs": {
+    "manifest": {
+      "artifact_path": "artifacts/quality/browser-harness/manifest.json",
+      "required": [
+        "schema_version",
+        "harness",
+        "status",
+        "baseline_update_policy",
+        "reference_image_policy",
+        "viewports",
+        "failure"
+      ]
+    },
+    "screenshots": "Each desktop and mobile viewport emits normal, expected, actual, and diff PNG artifacts with SHA-256 values in the manifest."
+  },
+  "errors": [
+    "fixture server fails to start or serve a requested state",
+    "Playwright or Chromium is unavailable",
+    "normal or mismatch fixture navigation fails",
+    "injected mismatch creates no pixel difference",
+    "reference image hash changes during a run",
+    "browser console or page errors occur"
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "additional_manifest_fields": "consumers ignore fields they do not require",
+    "baseline_policy": "the harness never writes or updates a repository visual baseline; it writes run-scoped expected, actual, and diff evidence only",
+    "failure_retention": "the manifest and every screenshot produced before a failure remain in the selected artifact directory"
+  },
+  "consumers": [
+    "PKG-WORKER-12-FAILURE-WEB",
+    "PKG-WORKER-51-FILE-WEB",
+    "PKG-WORKER-71-SKILL-API",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-BROWSER-INFRA",
+    "GATE-FAILURE-UI",
+    "GATE-FILE-WORKFLOW",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

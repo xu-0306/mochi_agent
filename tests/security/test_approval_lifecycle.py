@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 
 from mochi.config.manager import load_config_snapshot
+from mochi.config.schema import MochiConfig, SecurityConfig
 from mochi.runtime import approval_side_effect_worker as side_effect_worker_module
 from mochi.runtime.approval_side_effect_worker import ApprovalSideEffectWorker
 from mochi.runtime.approvals import (
@@ -27,13 +28,6 @@ from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.models import ApprovalResolution
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
-from mochi.security.policy import EffectivePolicyResolver
-from mochi.config.schema import SecurityConfig
-from mochi.config.schema import MochiConfig
-from mochi.sessions.store import SessionStore
-from mochi.tools.base import ToolExecutionContext
-from mochi.tools.exec_command import ExecCommandTool
-from mochi.tools.file_ops import FileWriteTool
 from mochi.security.file_contract import (
     AuthorizationContext,
     AuthorizationEnvelope,
@@ -43,6 +37,11 @@ from mochi.security.file_contract import (
     ResourceLimits,
     authorization_request_digest,
 )
+from mochi.security.policy import EffectivePolicyResolver
+from mochi.sessions.store import SessionStore
+from mochi.tools.base import ToolExecutionContext
+from mochi.tools.exec_command import ExecCommandTool
+from mochi.tools.file_ops import FileWriteTool
 
 
 def _future(seconds: int = 300) -> str:
@@ -1481,7 +1480,7 @@ def test_ordinary_chat_dispatcher_startup_continues_once_without_mutation_execut
             executions += 1
             raise AssertionError("automatic continuation must not execute the approved mutation")
 
-        setattr(service, "_execute_approved_standalone_request", unexpected_mutation_executor)
+        service._execute_approved_standalone_request = unexpected_mutation_executor
         await service.start()
         for _ in range(40):
             if engine.calls == 1:
@@ -1717,11 +1716,7 @@ def test_reconciliation_cancellation_becomes_terminal_unknown_before_reraising(
             calls += 1
             raise asyncio.CancelledError()
 
-        setattr(
-            service,
-            "_resume_ordinary_chat_approval_react_loop",
-            cancelled_resume,
-        )
+        service._resume_ordinary_chat_approval_react_loop = cancelled_resume
 
         with pytest.raises(asyncio.CancelledError):
             await service._reconcile_recovered_ordinary_chat_approval_with_policy(
@@ -1786,7 +1781,7 @@ def test_reconciliation_terminal_cas_loss_returns_unknown(
                 conn.commit()
             return dict(resume_outcome)
 
-        setattr(service, "_resume_ordinary_chat_approval_react_loop", resumed)
+        service._resume_ordinary_chat_approval_react_loop = resumed
 
         response = await service._reconcile_recovered_ordinary_chat_approval_with_policy(
             approval_id=approval_id,

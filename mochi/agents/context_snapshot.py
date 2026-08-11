@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
+from mochi.agents.compaction import CompactionDiagnostics, ConversationStateSummary
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.backends.types import Message, ModelInfo
 
@@ -51,9 +52,161 @@ class ChatContextSnapshot:
     state_tokens: int = 0
     recent_raw_tokens: int = 0
     reasoning_effort: ReasoningEffort | None = None
+    context_source: str = "fallback_default"
+    context_confidence: str = "low"
+    context_is_hard_limit: bool = False
+    revision: int = 0
+    compaction_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ContextLifecycleSnapshot:
+    """Versioned durable context state for restart-safe prompt assembly."""
+
+    invocation_id: str
+    revision: int
+    compaction_revision: int
+    phase: Literal["pre_prompt", "post_compaction", "post_response"]
+    history: tuple[Mapping[str, Any], ...]
+    summary: str | None
+    summary_state: ConversationStateSummary | None
+    compaction_diagnostics: CompactionDiagnostics | None
+    schema_version: int = 2
+    type: str = "context_snapshot"
+
+    def to_event(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "schema_version": self.schema_version,
+            "invocation_id": self.invocation_id,
+            "revision": self.revision,
+            "compaction_revision": self.compaction_revision,
+            "phase": self.phase,
+            "history": [dict(message) for message in self.history],
+            "summary": self.summary,
+            "summary_state": (
+                self.summary_state.to_dict() if self.summary_state is not None else None
+            ),
+            "compaction_diagnostics": (
+                self.compaction_diagnostics.to_dict()
+                if self.compaction_diagnostics is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_event(cls, event: Mapping[str, Any]) -> ContextLifecycleSnapshot | None:
+        """Parse only complete v2 snapshots; older events remain compatible."""
+
+        if event.get("type") != "context_snapshot" or event.get("schema_version") != 2:
+            return None
+        invocation_id = event.get("invocation_id")
+        revision = event.get("revision")
+        compaction_revision = event.get("compaction_revision")
+        phase = event.get("phase")
+        history = event.get("history")
+        summary = event.get("summary")
+        if (
+            not isinstance(invocation_id, str)
+            or not invocation_id
+            or not _positive_int(revision)
+            or _nonnegative_int(compaction_revision) is None
+            or phase not in {"pre_prompt", "post_compaction", "post_response"}
+            or not isinstance(history, list)
+            or not all(isinstance(message, Mapping) for message in history)
+            or summary is not None
+            and not isinstance(summary, str)
+        ):
+            return None
+
+        summary_state = _summary_state_from_dict(event.get("summary_state"))
+        if event.get("summary_state") is not None and summary_state is None:
+            return None
+        diagnostics = _diagnostics_from_dict(event.get("compaction_diagnostics"))
+        if event.get("compaction_diagnostics") is not None and diagnostics is None:
+            return None
+        return cls(
+            invocation_id=invocation_id,
+            revision=revision,
+            compaction_revision=compaction_revision,
+            phase=phase,
+            history=tuple(dict(message) for message in history),
+            summary=summary,
+            summary_state=summary_state,
+            compaction_diagnostics=diagnostics,
+        )
+
+
+def _positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _nonnegative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _summary_state_from_dict(value: object) -> ConversationStateSummary | None:
+    if not isinstance(value, Mapping):
+        return None
+
+    def text(field: str) -> str:
+        candidate = value.get(field)
+        return candidate if isinstance(candidate, str) else ""
+
+    def text_list(field: str) -> list[str]:
+        candidate = value.get(field)
+        if not isinstance(candidate, list) or not all(isinstance(item, str) for item in candidate):
+            return []
+        return list(candidate)
+
+    return ConversationStateSummary(
+        current_task=text("current_task"),
+        current_state=text("current_state"),
+        important_files=text_list("important_files"),
+        decisions=text_list("decisions"),
+        errors_and_corrections=text_list("errors_and_corrections"),
+        open_questions=text_list("open_questions"),
+        next_step=text("next_step"),
+        recent_user_intent=text("recent_user_intent"),
+    )
+
+
+def _diagnostics_from_dict(value: object) -> CompactionDiagnostics | None:
+    if not isinstance(value, Mapping):
+        return None
+    compaction_mode = value.get("compaction_mode")
+    summary_mode = value.get("summary_mode")
+    reason = value.get("reason")
+    compacted_count = _nonnegative_int(value.get("compacted_count"))
+    history_tokens = _nonnegative_int(value.get("history_tokens"))
+    retained_tokens = _nonnegative_int(value.get("retained_tokens"))
+    state_tokens = _nonnegative_int(value.get("state_tokens"))
+    max_input_tokens = value.get("max_input_tokens")
+    if (
+        compaction_mode not in {"legacy", "semantic"}
+        or summary_mode not in {None, "deterministic", "hybrid"}
+        or reason not in {None, "history_window", "token_budget"}
+        or compacted_count is None
+        or history_tokens is None
+        or retained_tokens is None
+        or state_tokens is None
+        or max_input_tokens is not None
+        and _positive_int(max_input_tokens) is None
+    ):
+        return None
+    return CompactionDiagnostics(
+        compaction_mode=compaction_mode,
+        summary_mode=summary_mode,
+        reason=reason,
+        compacted_count=compacted_count,
+        history_tokens=history_tokens,
+        retained_tokens=retained_tokens,
+        state_tokens=state_tokens,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def estimate_text_tokens(

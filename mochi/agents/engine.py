@@ -6,14 +6,22 @@ import asyncio
 import contextlib
 import copy
 import hashlib
-import json
 import inspect
+import json
+import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-import tempfile
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -23,41 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
     import logging
 
     logger = logging.getLogger(__name__)
-from pydantic import SecretStr
 
-from mochi.agents.compaction import ConversationCompactor
-from mochi.agents.capability_exposure_adapter import (
-    ExposurePolicyCeilings,
-    adapt_capability_plan_to_exposure,
-)
-from mochi.agents.capability_planner import CapabilityPlanner, CatalogToolDescriptor
-from mochi.agents.complexity_gate import (
-    ComplexityAdvisorRequest,
-    ComplexityActivePlanSummary,
-    ComplexityCapabilitySummary,
-    ComplexityDecision,
-    ComplexityGate,
-    ComplexityGateConfig as RuntimeComplexityGateConfig,
-    ComplexityGateRequest,
-)
-from mochi.agents.controlled_recovery import (
-    ArtifactReceiptState,
-    ControlledRecoveryCoordinator,
-    ControlledRecoveryDecision,
-    TimelineOperationState,
-)
-from mochi.agents.plan_ledger import (
-    PlanLedger,
-    PlanLedgerRepository,
-    PlanLedgerTransitionValidator,
-)
-from mochi.agents.artifact_verifier import (
-    ArtifactReceipt,
-    ArtifactExpectation,
-    ArtifactVerifier,
-    ToolExecutionEvidence,
-    ValidationProfileRegistry,
-)
 from mochi.agents.adaptive_diagnostics import (
     AdaptiveDiagnosticsAccumulator,
     AdaptiveDiagnosticsRecord,
@@ -65,30 +39,42 @@ from mochi.agents.adaptive_diagnostics import (
     get_context_diagnostics_accumulator,
     initialize_turn_diagnostics_accumulator,
 )
+from mochi.agents.artifact_verifier import (
+    ArtifactExpectation,
+    ArtifactReceipt,
+    ArtifactVerifier,
+    ToolExecutionEvidence,
+    ValidationProfileRegistry,
+)
+from mochi.agents.capability_exposure_adapter import (
+    ExposurePolicyCeilings,
+    adapt_capability_plan_to_exposure,
+)
+from mochi.agents.capability_planner import CapabilityPlanner, CatalogToolDescriptor
+from mochi.agents.compaction import ConversationCompactor
+from mochi.agents.complexity_gate import (
+    ComplexityActivePlanSummary,
+    ComplexityAdvisorRequest,
+    ComplexityCapabilitySummary,
+    ComplexityDecision,
+    ComplexityGate,
+    ComplexityGateRequest,
+)
+from mochi.agents.complexity_gate import (
+    ComplexityGateConfig as RuntimeComplexityGateConfig,
+)
 from mochi.agents.context import ContextManager, PromptContext
 from mochi.agents.context_snapshot import (
     ChatContextSnapshot,
+    ContextLifecycleSnapshot,
     estimate_backend_text_tokens,
     estimate_messages_tokens,
 )
-from mochi.agents.multi_agent.evidence_collector import collect_evidence_packets
-from mochi.agents.events import (
-    AgentEvent,
-    AssistantTruncatedEvent,
-    ErrorEvent,
-    FinalAnswerEvent,
-    StatusEvent,
-    ThinkingEvent,
-    GoalStateChangedEvent,
-    ToolCallCompletedEvent,
-    ToolCallCreatedEvent,
-    ToolCallRequestEvent,
-    ToolCallResultEvent,
-)
-from mochi.agents.invocation import (
-    AgentInvocationDiagnostics,
-    AgentInvocationRequest,
-    AgentInvocationResult,
+from mochi.agents.controlled_recovery import (
+    ArtifactReceiptState,
+    ControlledRecoveryCoordinator,
+    ControlledRecoveryDecision,
+    TimelineOperationState,
 )
 from mochi.agents.conversation_resolver import (
     ConversationResolution,
@@ -100,7 +86,27 @@ from mochi.agents.conversation_state_store import (
     TurnCheckpoint,
     TurnCheckpointRepository,
 )
+from mochi.agents.effective_context import EffectiveContext, select_effective_context
+from mochi.agents.events import (
+    AgentEvent,
+    AssistantTruncatedEvent,
+    ErrorEvent,
+    FinalAnswerEvent,
+    GoalStateChangedEvent,
+    StatusEvent,
+    ThinkingEvent,
+    ToolCallCompletedEvent,
+    ToolCallCreatedEvent,
+    ToolCallRequestEvent,
+    ToolCallResultEvent,
+)
+from mochi.agents.invocation import (
+    AgentInvocationDiagnostics,
+    AgentInvocationRequest,
+    AgentInvocationResult,
+)
 from mochi.agents.model_conversation_interpreter import ModelConversationInterpreter
+from mochi.agents.multi_agent.evidence_collector import collect_evidence_packets
 from mochi.agents.outcome_verifier import (
     ArtifactVerifierAdapter,
     DeterministicVerifierRegistry,
@@ -115,6 +121,11 @@ from mochi.agents.outcome_verifier import (
     VerificationReceipt,
     VerificationReceiptRepository,
 )
+from mochi.agents.plan_ledger import (
+    PlanLedger,
+    PlanLedgerRepository,
+    PlanLedgerTransitionValidator,
+)
 from mochi.agents.prompt_builder import PromptBuilder
 from mochi.agents.react_loop import AsyncReActLoop
 from mochi.agents.recovery_policy import (
@@ -122,11 +133,26 @@ from mochi.agents.recovery_policy import (
     RecoveryBudget,
     RecoveryPolicy,
 )
-from mochi.agents.turn_intent_contract import DeliverableContract
+from mochi.agents.tool_discovery_state import (
+    ToolDiscoveryObservation,
+    ToolDiscoveryStateRepository,
+)
+from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
 from mochi.agents.turn_contract_rollout import (
     TurnContractRolloutResult,
     build_capability_plan,
     conversation_inputs_from_prompt_context,
+)
+from mochi.agents.turn_intent_contract import DeliverableContract
+from mochi.api.tool_workflow_outbox import (
+    ToolWorkflowOutboxRepository,
+    ToolWorkflowOutboxVerifierDiagnostics,
+    verify_tool_workflow_outbox_v1,
+)
+from mochi.auth.openai_codex import (
+    OPENAI_CODEX_DEFAULT_BASE_URL,
+    OpenAICodexAuthService,
+    normalize_openai_codex_base_url,
 )
 from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.inference_capabilities import (
@@ -150,18 +176,13 @@ from mochi.backends.vllm_utils import (
     managed_vllm_base_url,
     resolve_vllm_managed_model_spec,
 )
-from mochi.auth.openai_codex import (
-    OPENAI_CODEX_DEFAULT_BASE_URL,
-    OpenAICodexAuthService,
-    normalize_openai_codex_base_url,
-)
 from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.learning.evaluator import OutcomeEvaluator
 from mochi.learning.extractor import SkillExtractor
-from mochi.learning.improver import SkillImprover
 from mochi.learning.failure_episode import FailureEpisode
 from mochi.learning.failure_outbox import FailureOutboxRepository
 from mochi.learning.failure_store import FailureStore
+from mochi.learning.improver import SkillImprover
 from mochi.learning.runtime import LearningRuntime
 from mochi.learning.skill_library import SkillLibrary
 from mochi.learning.skill_library_factory import resolve_skills_db_path
@@ -177,11 +198,6 @@ from mochi.security.policy import (
     EffectivePolicyResolver,
     build_runtime_permission_policy_dict,
 )
-from mochi.api.tool_workflow_outbox import (
-    ToolWorkflowOutboxRepository,
-    ToolWorkflowOutboxVerifierDiagnostics,
-    verify_tool_workflow_outbox_v1,
-)
 from mochi.sessions.store import (
     SessionStore,
     ToolWorkflowPublicationGate,
@@ -192,11 +208,6 @@ from mochi.sessions.timeline_coordinator import (
     TimelineTurnCancelled,
 )
 from mochi.sessions.turn_timeline import SessionTurnTimelineRepository
-from mochi.agents.tool_exposure import ToolExposurePlan, ToolExposurePlanner
-from mochi.agents.tool_discovery_state import (
-    ToolDiscoveryObservation,
-    ToolDiscoveryStateRepository,
-)
 from mochi.tools.base import (
     ActiveToolController,
     BaseTool,
@@ -600,7 +611,7 @@ class _BackendSemanticJudge:
     def __init__(
         self,
         *,
-        engine: "AgentEngine",
+        engine: AgentEngine,
         backend: BaseLLMBackend | None,
         configured_model_id: str | None,
         max_tokens: int,
@@ -1384,6 +1395,7 @@ class AgentEngine:
                 "run_state": None,
                 "cancel_outcome": None,
                 "cancel_reason": None,
+                "durable_outcome": None,
             }
 
         if cancellation_context is None:
@@ -1395,6 +1407,9 @@ class AgentEngine:
                 "run_state": run_state,
                 "cancel_outcome": ("completed" if run_state == "completed" else "cancelled"),
                 "cancel_reason": None,
+                "durable_outcome": (
+                    "already_committed" if run_state == "completed" else "cancelled_pre_commit"
+                ),
             }
 
         if timeline is not None:
@@ -1409,6 +1424,7 @@ class AgentEngine:
                 "run_state": "completed",
                 "cancel_outcome": "completed",
                 "cancel_reason": None,
+                "durable_outcome": "already_committed",
             }
 
         result = await cancellation_context.request_run_cancel()
@@ -1429,6 +1445,16 @@ class AgentEngine:
                 None
                 if cancel_outcome in {"cancelled", "completed"}
                 else result.reason
+            ),
+            "durable_outcome": (
+                result.durable_outcome
+                or (
+                    "already_committed"
+                    if cancel_outcome == "completed"
+                    else "cancelled_pre_commit"
+                    if cancel_outcome == "cancelled"
+                    else None
+                )
             ),
         }
 
@@ -2198,9 +2224,6 @@ class AgentEngine:
             message,
             selected_skill_ids=selected_skill_ids,
         )
-        contract_tool_preferences = (
-            skill_selection.preferred_tool_names if selected_skill_ids else []
-        )
         skills_context = self._render_skills_context(skill_selection)
         scope = await self._execution_scope_resolver.resolve(
             session_id=session_key,
@@ -2328,7 +2351,8 @@ class AgentEngine:
             + draft_estimate.tokens
             + tool_estimate.tokens
         )
-        context_length = self._snapshot_context_length(model_info)
+        effective_context = self._effective_context_for_model_info(model_info)
+        context_length = effective_context.context_length
         remaining_tokens = max(context_length - estimated_prompt_tokens - reserve_output_tokens, 0)
         usage_ratio = min(
             1.0,
@@ -2383,6 +2407,11 @@ class AgentEngine:
                 )
             ),
             reasoning_effort=cast(ReasoningEffort | None, reasoning_effort),
+            context_source=effective_context.source.value,
+            context_confidence=effective_context.confidence.value,
+            context_is_hard_limit=effective_context.is_hard_limit,
+            revision=context.snapshot_revision,
+            compaction_revision=context.compaction_revision,
         )
         return snapshot.to_dict()
 
@@ -2425,11 +2454,22 @@ class AgentEngine:
 
         async def _emit_event(event: AgentEvent) -> None:
             if isinstance(event, FinalAnswerEvent):
-                await cancellation_context.mark_completed()
+                commit = await cancellation_context.try_commit_durable_effect(
+                    safe_point="final_answer_emitted"
+                )
+                # A model final can be provisional until the host verifier
+                # finishes.  Controlled recovery may then publish a corrected
+                # or host-verified final for this already committed turn.  The
+                # commit fence still blocks a cancellation that won the race,
+                # but an idempotent ALREADY_COMMITTED outcome must not hide
+                # that later terminal projection.
+                if commit.cancellation_requested:
+                    return
             await queue.put(event)
 
         async def _run_invocation() -> None:
             nonlocal invocation_error
+            timeline_finished = False
             try:
                 if timeline is not None:
                     request.timeline_history_events = list(await timeline.claim())
@@ -2437,7 +2477,11 @@ class AgentEngine:
                 await self._invoke_shared_runtime(request, event_callback=_emit_event)
                 snapshot = await cancellation_context.snapshot()
                 if str(snapshot.get("state") or "") != "completed":
-                    await cancellation_context.mark_completed()
+                    commit = await cancellation_context.try_commit_durable_effect(
+                        safe_point="invocation_completed"
+                    )
+                    if not commit.commit_permitted:
+                        await cancellation_context.mark_cancelled()
             except TimelineTurnCancelled:
                 snapshot = await cancellation_context.snapshot()
                 if str(snapshot.get("state") or "") != "completed":
@@ -2469,9 +2513,23 @@ class AgentEngine:
                             ),
                             companion_events=transcript_events,
                         )
+                        timeline_finished = True
                     except Exception as exc:  # pragma: no cover - terminal safety boundary
                         if invocation_error is None:
                             invocation_error = exc
+                if (
+                    timeline_finished
+                    and invocation_error is None
+                    and str(final_snapshot.get("state") or "") != "cancelled"
+                ):
+                    context = request.timeline_context
+                    if context is not None:
+                        await self._persist_context_lifecycle_snapshot(
+                            session_id=session_key,
+                            turn_id=turn_id,
+                            context=context,
+                            phase="post_response",
+                        )
                 await self._finalize_chat_run(
                     session_id=session_key,
                     turn_id=turn_id,
@@ -2500,7 +2558,7 @@ class AgentEngine:
             if not worker.done() and str(snapshot.get("state") or "") != "completed":
                 if timeline is not None:
                     await timeline.request_cancel()
-                cancel_result = await cancellation_context.request_generation_cancel()
+                cancel_result = await cancellation_context.request_run_cancel()
                 if cancel_result.state in {"cancelled", "pending"}:
                     with contextlib.suppress(asyncio.CancelledError):
                         await worker
@@ -2520,25 +2578,25 @@ class AgentEngine:
         if not self._initialized:
             await self.initialize()
 
-        if request.isolate_context:
-            # `isolate_context` is a reduction boundary, not a best-effort
-            # privacy preference.  Reject any request that could reintroduce
-            # private state or execution capability before assembling a prompt.
-            if (
-                request.tool_mode != "disabled"
-                or request.persist_session
-                or request.persist_turn_events is not False
-                or request.persist_learning is not False
-                or request.attachments
-                or request.selected_skill_ids
-                or request.project_id is not None
-                or request.workspace_dir is not None
-                or request.task_workspace_dir is not None
-                or request.timeline_history_events is not None
-                or request.timeline_transcript is not None
-                or request.timeline_coordinator is not None
-            ):
-                raise ValueError("isolated invocation has unsafe context or persistence fields")
+        # `isolate_context` is a reduction boundary, not a best-effort privacy
+        # preference. Reject any request that could reintroduce private state
+        # or execution capability before assembling a prompt.
+        if request.isolate_context and (
+            request.tool_mode != "disabled"
+            or request.persist_session
+            or request.persist_turn_events is not False
+            or request.persist_learning is not False
+            or request.attachments
+            or request.selected_skill_ids
+            or request.project_id is not None
+            or request.workspace_dir is not None
+            or request.task_workspace_dir is not None
+            or request.timeline_history_events is not None
+            or request.timeline_context is not None
+            or request.timeline_transcript is not None
+            or request.timeline_coordinator is not None
+        ):
+            raise ValueError("isolated invocation has unsafe context or persistence fields")
 
         session_key = request.session_id or "default"
         if request.isolate_context:
@@ -2551,12 +2609,15 @@ class AgentEngine:
             context = await self._get_context(session_key)
         else:
             context = self._new_context()
-            self._restore_session_history_events(
-                request.timeline_history_events,
-                context,
+            await self._restore_timeline_context(
+                session_id=session_key,
+                history_events=request.timeline_history_events,
+                context=context,
             )
+            request.timeline_context = context
         resolved = self._resolve_inference_params(request.inference_overrides)
         reserve_output_tokens = int(resolved["reserve_output_tokens"])
+        compaction_revision_before_prepare = context.compaction_revision
         prompt_context = await context.prepare_prompt_context(
             request.message,
             history_limit=self._config.memory.max_short_term_messages,
@@ -2853,6 +2914,18 @@ class AgentEngine:
                 user_msg,
                 turn_id=turn_id,
                 selected_skill_ids=list(request.selected_skill_ids or []),
+            )
+        if request.persist_session:
+            await self._persist_context_lifecycle_snapshot(
+                session_id=session_key,
+                turn_id=turn_id,
+                context=context,
+                phase=(
+                    "post_compaction"
+                    if context.compaction_revision > compaction_revision_before_prepare
+                    else "pre_prompt"
+                ),
+                additional_messages=(user_msg,),
             )
         tool_execution_context = self._get_tool_execution_context(
             session_id=session_key,
@@ -3303,6 +3376,13 @@ class AgentEngine:
                         assistant_msg,
                         turn_id=turn_id,
                     )
+                if not request.timeline_user_message_admitted:
+                    await self._persist_context_lifecycle_snapshot(
+                        session_id=session_key,
+                        turn_id=turn_id,
+                        context=context,
+                        phase="post_response",
+                    )
             if owns_invocation_backend:
                 await active_backend.close()
             await self._persist_adaptive_diagnostics(
@@ -3405,6 +3485,13 @@ class AgentEngine:
                 else:
                     await self._persist_session_message(
                         session_key, assistant_msg, turn_id=turn_id
+                    )
+                if not request.timeline_user_message_admitted:
+                    await self._persist_context_lifecycle_snapshot(
+                        session_id=session_key,
+                        turn_id=turn_id,
+                        context=context,
+                        phase="post_response",
                     )
             if owns_invocation_backend:
                 await active_backend.close()
@@ -4601,6 +4688,13 @@ class AgentEngine:
                 ),
             )
 
+        if request.persist_session and not request.timeline_user_message_admitted:
+            await self._persist_context_lifecycle_snapshot(
+                session_id=session_key,
+                turn_id=turn_id,
+                context=context,
+                phase="post_response",
+            )
         await self._persist_adaptive_diagnostics(
             session_id=session_key,
             turn_id=turn_id,
@@ -6306,9 +6400,7 @@ class AgentEngine:
                     return True
                 if backend_type == "llama_cpp_server":
                     return True
-                if model_spec.startswith(("http://", "https://")):
-                    return True
-                return False
+                return bool(model_spec.startswith(("http://", "https://")))
 
         model_info = self.get_model_info()
         backend_type = str(model_info.backend_type or "").strip().lower()
@@ -6318,9 +6410,7 @@ class AgentEngine:
             return True
         if provider in {"openai_compat", "openai_codex", "ollama"}:
             return True
-        if backend_type == "gguf" and str(metadata.get("base_url") or "").strip():
-            return True
-        return False
+        return bool(backend_type == "gguf" and str(metadata.get("base_url") or "").strip())
 
     async def probe_active_tool_calling(self) -> dict[str, Any] | None:
         """Probe native tool-calling support for the active backend when available."""
@@ -6899,40 +6989,11 @@ class AgentEngine:
         elif self._preinitialized_model_info_cache is not None:
             model_info = self._preinitialized_model_info_cache
 
-        hinted = self._reliable_context_length_hint(model_info)
-        if hinted is not None:
-            return hinted
-
-        configured_model = self._config.model.strip().lower()
-        active_remote_provider = _active_remote_provider(self._config)
-        if self._config.ollama.num_ctx is not None:
-            return self._config.ollama.num_ctx
-        if configured_model.endswith(".gguf"):
-            return self._config.gguf.n_ctx
-        if active_remote_provider == "vllm" and self._config.vllm.max_model_len is not None:
-            return self._config.vllm.max_model_len
-        return None
-
-    @staticmethod
-    def _reliable_context_length_hint(model_info: ModelInfo | None) -> int | None:
-        if model_info is None:
-            return None
-        metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
-        effective_context_length = metadata.get("effective_context_length")
-        effective_context_source = metadata.get("effective_context_length_source")
-        if (
-            isinstance(effective_context_length, int)
-            and effective_context_length > 0
-            and effective_context_source != "fallback_default"
-        ):
-            return effective_context_length
-        if not isinstance(model_info.context_length, int) or model_info.context_length <= 0:
-            return None
-        source = metadata.get("context_length_source")
-        fallback = metadata.get("context_length_fallback")
-        if source == "unknown" and isinstance(fallback, int) and fallback > 0:
-            return None
-        return model_info.context_length
+        if model_info is not None:
+            effective = self._effective_context_for_model_info(model_info)
+            if effective.is_hard_limit:
+                return effective.context_length
+        return self._configured_context_candidate(model_info)
 
     @staticmethod
     def _round_up_token_bucket(value: int) -> int:
@@ -6984,18 +7045,82 @@ class AgentEngine:
         provider_params["max_tokens"] = resolved["max_output_tokens"]
         return provider_params
 
-    @staticmethod
-    def _snapshot_context_length(model_info: ModelInfo) -> int:
+    def _snapshot_context_length(self, model_info: ModelInfo) -> int:
+        return self._effective_context_for_model_info(model_info).context_length
+
+    def _effective_context_for_model_info(self, model_info: ModelInfo) -> EffectiveContext:
+        """Map backend metadata into the frozen EffectiveContext v1 seam."""
+
         metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
-        effective_context_length = metadata.get("effective_context_length")
-        if isinstance(effective_context_length, int) and effective_context_length > 0:
-            return effective_context_length
-        if isinstance(model_info.context_length, int) and model_info.context_length > 0:
-            return model_info.context_length
-        fallback = metadata.get("context_length_fallback")
-        if isinstance(fallback, int) and fallback > 0:
-            return fallback
-        return _DEFAULT_CONTEXT_LENGTH_FALLBACK
+        effective_source = metadata.get("effective_context_length_source")
+        effective_value = metadata.get("effective_context_length")
+        canonical_source = metadata.get("effective_context_source")
+        if not isinstance(canonical_source, str):
+            canonical_source = metadata.get("context_source")
+        serving_values: list[object] = [
+            metadata.get("serving_context_length"),
+            metadata.get("runtime_context_length"),
+        ]
+        advertised_values: list[object] = [
+            model_info.context_length,
+            metadata.get("model_max_context_length"),
+            metadata.get("advertised_context_length"),
+        ]
+        if canonical_source == "serving":
+            serving_values.append(effective_value)
+        elif canonical_source == "advertised":
+            advertised_values.append(effective_value)
+        elif canonical_source is None and effective_source != "fallback_default":
+            # Older backends exposed a selected value without contract
+            # provenance. It may narrow estimates, but must not become a hard
+            # serving boundary without an explicit runtime/configured source.
+            advertised_values.append(effective_value)
+        return select_effective_context(
+            configured_context=self._configured_context_candidate(model_info),
+            serving_context=self._smallest_valid_context(*serving_values),
+            advertised_context=self._smallest_valid_context(*advertised_values),
+            fallback_context=metadata.get("context_length_fallback", _DEFAULT_CONTEXT_LENGTH_FALLBACK),
+        )
+
+    def _configured_context_candidate(self, model_info: ModelInfo | None) -> int | None:
+        metadata = (
+            model_info.metadata
+            if model_info is not None and isinstance(model_info.metadata, dict)
+            else {}
+        )
+        configured_values: list[object] = [
+            metadata.get("configured_context_length"),
+            metadata.get("configured_num_ctx"),
+        ]
+        effective_source = metadata.get("effective_context_length_source")
+        canonical_source = metadata.get("effective_context_source")
+        if not isinstance(canonical_source, str):
+            canonical_source = metadata.get("context_source")
+        if canonical_source == "configured" or (
+            canonical_source is None
+            and isinstance(effective_source, str)
+            and effective_source.startswith(("config.", "auto_num_ctx."))
+        ):
+            configured_values.append(metadata.get("effective_context_length"))
+
+        configured_model = self._config.model.strip().lower()
+        backend_type = model_info.backend_type if model_info is not None else ""
+        if self._config.ollama.num_ctx is not None:
+            configured_values.append(self._config.ollama.num_ctx)
+        if backend_type in {"gguf", "safetensors"} or configured_model.endswith(".gguf"):
+            configured_values.append(self._config.gguf.n_ctx)
+        if _active_remote_provider(self._config) == "vllm" and self._config.vllm.max_model_len is not None:
+            configured_values.append(self._config.vllm.max_model_len)
+        return self._smallest_valid_context(*configured_values)
+
+    @staticmethod
+    def _smallest_valid_context(*values: object) -> int | None:
+        candidates = [
+            value
+            for value in values
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        ]
+        return min(candidates) if candidates else None
 
     def _estimate_prompt_budget(
         self,
@@ -7030,11 +7155,13 @@ class AgentEngine:
             + draft_estimate.tokens
             + tool_estimate.tokens
         )
-        reliable_context_length = self._reliable_context_length_hint(model_info)
-        context_length = reliable_context_length or self._snapshot_context_length(model_info)
+        effective_context = self._effective_context_for_model_info(model_info)
+        context_length = effective_context.context_length
         metadata = model_info.metadata if isinstance(model_info.metadata, dict) else {}
-        context_length_source = metadata.get("effective_context_length_source") or metadata.get(
-            "context_length_source"
+        context_length_source = (
+            metadata.get("effective_context_length_source")
+            or metadata.get("context_length_source")
+            or effective_context.source.value
         )
         safe_reserve_output_tokens = max(0, reserve_output_tokens)
         available_input_tokens = max(context_length - safe_reserve_output_tokens, 0)
@@ -7046,7 +7173,9 @@ class AgentEngine:
         return {
             "context_length": context_length,
             "context_length_source": context_length_source,
-            "hard_gate_enabled": reliable_context_length is not None,
+            "effective_context_source": effective_context.source.value,
+            "effective_context_confidence": effective_context.confidence.value,
+            "hard_gate_enabled": effective_context.is_hard_limit,
             "estimated_prompt_tokens": estimated_prompt_tokens,
             "available_input_tokens": available_input_tokens,
             "remaining_tokens": max(remaining_tokens, 0),
@@ -7504,34 +7633,114 @@ class AgentEngine:
         events = await self._session_store.load_session(session_id)
         self._restore_session_history_events(events, context)
 
+    async def _restore_timeline_context(
+        self,
+        *,
+        session_id: str,
+        history_events: Sequence[Mapping[str, Any]],
+        context: ContextManager,
+    ) -> None:
+        """Restore a strict timeline while retaining a matching lifecycle snapshot."""
+
+        history = [
+            message
+            for event in history_events
+            if (message := self._message_from_session_event(event)) is not None
+        ]
+        latest_snapshot: ContextLifecycleSnapshot | None = None
+        for event in await self._session_store.load_session(session_id):
+            snapshot = ContextLifecycleSnapshot.from_event(event)
+            if snapshot is not None and (
+                latest_snapshot is None or snapshot.revision > latest_snapshot.revision
+            ):
+                latest_snapshot = snapshot
+        if latest_snapshot is not None:
+            snapshot_history = [
+                message
+                for event in latest_snapshot.history
+                if (message := self._message_from_session_event(event)) is not None
+            ]
+            if self._timeline_history_matches_snapshot(
+                history=history,
+                snapshot_history=snapshot_history,
+                compaction_revision=latest_snapshot.compaction_revision,
+            ):
+                context.restore_durable_snapshot(
+                    history=snapshot_history,
+                    summary=latest_snapshot.summary,
+                    summary_state=latest_snapshot.summary_state,
+                    compaction_diagnostics=latest_snapshot.compaction_diagnostics,
+                    compaction_revision=latest_snapshot.compaction_revision,
+                    snapshot_revision=latest_snapshot.revision,
+                )
+                return
+        for message in history:
+            context.add_message(message)
+
+    @staticmethod
+    def _timeline_history_matches_snapshot(
+        *,
+        history: Sequence[Message],
+        snapshot_history: Sequence[Message],
+        compaction_revision: int,
+    ) -> bool:
+        """Allow a compacted snapshot to represent a strict-history suffix."""
+
+        if list(snapshot_history) == list(history):
+            return True
+        return (
+            compaction_revision > 0
+            and bool(snapshot_history)
+            and len(snapshot_history) < len(history)
+            and list(snapshot_history) == list(history[-len(snapshot_history) :])
+        )
+
     def _restore_session_history_events(
         self,
         events: Sequence[Mapping[str, Any]],
         context: ContextManager,
     ) -> None:
         """Materialize only supplied durable message events into a context."""
+        newest_snapshot_revision = 0
         for event in events:
-            if event.get("type") != "message":
-                continue
-            role = event.get("role")
-            content = event.get("content")
-            if role in {"system", "user", "assistant", "tool"} and isinstance(content, str):
-                context.add_message(
-                    Message(
-                        role=role,
-                        content=content,
-                        thinking=event.get("thinking") if isinstance(event.get("thinking"), str) else "",
-                        tool_calls=self._deserialize_message_tool_calls(event.get("tool_calls")),
-                        tool_call_id=(
-                            event.get("tool_call_id")
-                            if isinstance(event.get("tool_call_id"), str)
-                            else None
-                        ),
-                        name=event.get("name") if isinstance(event.get("name"), str) else None,
-                        attachments=self._deserialize_message_attachments(event.get("attachments")),
-                        responses_replay=ResponsesReplayState.from_dict(event.get("responses_replay")),
-                    )
+            snapshot = ContextLifecycleSnapshot.from_event(event)
+            if snapshot is not None and snapshot.revision > newest_snapshot_revision:
+                history = [
+                    message
+                    for item in snapshot.history
+                    if (message := self._message_from_session_event(item)) is not None
+                ]
+                context.restore_durable_snapshot(
+                    history=history,
+                    summary=snapshot.summary,
+                    summary_state=snapshot.summary_state,
+                    compaction_diagnostics=snapshot.compaction_diagnostics,
+                    compaction_revision=snapshot.compaction_revision,
+                    snapshot_revision=snapshot.revision,
                 )
+                newest_snapshot_revision = snapshot.revision
+                continue
+            message = self._message_from_session_event(event)
+            if message is not None:
+                context.add_message(message)
+
+    def _message_from_session_event(self, event: Mapping[str, Any]) -> Message | None:
+        if event.get("type") != "message":
+            return None
+        role = event.get("role")
+        content = event.get("content")
+        if role not in {"system", "user", "assistant", "tool"} or not isinstance(content, str):
+            return None
+        return Message(
+            role=role,
+            content=content,
+            thinking=event.get("thinking") if isinstance(event.get("thinking"), str) else "",
+            tool_calls=self._deserialize_message_tool_calls(event.get("tool_calls")),
+            tool_call_id=(event.get("tool_call_id") if isinstance(event.get("tool_call_id"), str) else None),
+            name=event.get("name") if isinstance(event.get("name"), str) else None,
+            attachments=self._deserialize_message_attachments(event.get("attachments")),
+            responses_replay=ResponsesReplayState.from_dict(event.get("responses_replay")),
+        )
 
     async def _persist_session_messages(
         self,
@@ -7562,6 +7771,37 @@ class AgentEngine:
                 selected_skill_ids=selected_skill_ids,
             ),
         )
+
+    async def _persist_context_lifecycle_snapshot(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        context: ContextManager,
+        phase: Literal["pre_prompt", "post_compaction", "post_response"],
+        additional_messages: Sequence[Message] = (),
+    ) -> None:
+        """Persist the complete current compaction state after a lifecycle edge."""
+
+        history = [*context.get_full_history(), *additional_messages]
+        snapshot = ContextLifecycleSnapshot(
+            invocation_id=turn_id,
+            revision=context.next_snapshot_revision(),
+            compaction_revision=context.compaction_revision,
+            phase=phase,
+            history=tuple(
+                self._session_message_event(
+                    message,
+                    turn_id=turn_id,
+                    session_id=session_id,
+                )
+                for message in history
+            ),
+            summary=context.summary,
+            summary_state=context.summary_state,
+            compaction_diagnostics=context.compaction_diagnostics,
+        )
+        await self._session_store.save_event(session_id, snapshot.to_event())
 
     def _session_message_event(
         self,
