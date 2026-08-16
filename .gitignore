@@ -125,6 +125,10 @@ documents/
 /native/mochi-sandbox-windows/
 implementation_plan.md
 scripts/
+!scripts/
+scripts/*
+!scripts/quality_gate/
+!scripts/quality_gate/*.py
 web/scripts/
 !web/scripts/
 web/scripts/*

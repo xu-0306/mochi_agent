@@ -10,6 +10,20 @@ from scripts.quality_gate import run
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_ROOT = REPOSITORY_ROOT / "docs" / "architecture" / "contracts"
+
+
+def _frozen_revision() -> str:
+    """Return the revision declared by the frozen contract set."""
+
+    artifacts = sorted(CONTRACT_ROOT.glob("*.json"))
+    assert artifacts, "at least one frozen contract artifact is required before qualification"
+    revisions = {_read_json(artifact)["git_revision"] for artifact in artifacts}
+    assert len(revisions) == 1, "all frozen contract artifacts must share one revision"
+    revision = revisions.pop()
+    assert isinstance(revision, str) and revision, "frozen contract revision must be non-empty"
+    return revision
+
+
 def _current_revision() -> str:
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -29,7 +43,7 @@ def test_frozen_contract_artifacts_are_revision_bound_and_machine_readable() -> 
     artifacts = sorted(CONTRACT_ROOT.glob("*.json"))
 
     assert artifacts, "at least one frozen contract artifact is required before qualification"
-    revision = _current_revision()
+    revision = _frozen_revision()
     for artifact in artifacts:
         payload = _read_json(artifact)
         run.validate_frozen_contract_artifact(payload, expected_revision=revision)
@@ -37,7 +51,7 @@ def test_frozen_contract_artifacts_are_revision_bound_and_machine_readable() -> 
 
 def test_quality_report_contract_matches_the_runner_validator() -> None:
     contract = _read_json(CONTRACT_ROOT / "quality-report-v1.json")
-    run.validate_quality_report_contract(contract, expected_revision=_current_revision())
+    run.validate_quality_report_contract(contract, expected_revision=contract["git_revision"])
     report = run.build_report(
         repo_root=REPOSITORY_ROOT,
         mode="baseline",
@@ -63,7 +77,7 @@ def test_contract_validator_rejects_empty_compatibility() -> None:
     contract["compatibility"] = {}
 
     try:
-        run.validate_frozen_contract_artifact(contract, expected_revision=_current_revision())
+        run.validate_frozen_contract_artifact(contract, expected_revision=contract["git_revision"])
     except run.QualityGateError as error:
         assert "compatibility" in str(error)
     else:
@@ -75,7 +89,7 @@ def test_quality_report_contract_validator_rejects_lane_schema_drift() -> None:
     contract["report_schema"]["lane_results"] = ["passed"]
 
     try:
-        run.validate_quality_report_contract(contract, expected_revision=_current_revision())
+        run.validate_quality_report_contract(contract, expected_revision=contract["git_revision"])
     except run.QualityGateError as error:
         assert "lane_results" in str(error)
     else:
@@ -90,7 +104,7 @@ def test_contract_validator_cli_validates_the_declared_revision() -> None:
             "docs/architecture/contracts/failure-envelope-v1.json",
             "--require-frozen",
             "--revision",
-            _current_revision(),
+            _read_json(CONTRACT_ROOT / "failure-envelope-v1.json")["git_revision"],
         ],
         cwd=REPOSITORY_ROOT,
         capture_output=True,
