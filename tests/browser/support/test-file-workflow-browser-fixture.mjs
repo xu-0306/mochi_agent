@@ -185,9 +185,14 @@ function requirePlaywright() {
   throw new Error('Playwright is unavailable for the production TaskPanel fixture.')
 }
 
-function findChromiumExecutable() {
+function findChromiumExecutable(chromium) {
   return [
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
+    chromium.executablePath(),
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
     'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
@@ -248,7 +253,7 @@ async function installApiRoutes(page, state) {
 
 async function runBrowserAssertions() {
   const { chromium } = requirePlaywright()
-  const executablePath = findChromiumExecutable()
+  const executablePath = findChromiumExecutable(chromium)
   assert.ok(executablePath, 'No Chromium executable is available for the production TaskPanel fixture.')
   const browser = await chromium.launch({ headless: true, executablePath })
   try {

@@ -1,11 +1,13 @@
 """Browser evidence for the TaskPanel's server-authoritative subset workflow."""
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WEB_DIR = REPOSITORY_ROOT / "web"
-NODE = Path(
+FROZEN_WINDOWS_NODE = Path(
     "C:/Users/xu/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe"
 )
 RUN_BROWSER_FIXTURE = WEB_DIR / "scripts" / "run-browser-fixture.mjs"
@@ -14,12 +16,25 @@ PRODUCTION_FIXTURE = (
 )
 
 
+def _node_executable() -> Path:
+    configured = os.environ.get("MOCHI_NODE_EXECUTABLE")
+    discovered = shutil.which("node")
+    candidates = (
+        Path(configured) if configured else None,
+        FROZEN_WINDOWS_NODE,
+        Path(discovered) if discovered else None,
+    )
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    raise AssertionError("A Node.js runtime is required for the production browser fixture.")
+
+
 def _run_production_fixture() -> None:
-    if not NODE.is_file():
-        raise AssertionError(f"Frozen browser Node runtime is unavailable: {NODE}")
+    node = _node_executable()
     result = subprocess.run(
         [
-            str(NODE),
+            str(node),
             str(RUN_BROWSER_FIXTURE),
             str(Path("..") / PRODUCTION_FIXTURE.relative_to(REPOSITORY_ROOT)),
             ".next-fixture-file-workflow",
