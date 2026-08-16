@@ -302,16 +302,12 @@ class _RuntimeExecLinkedBackgroundFakeEngine:
             return
         yield FinalAnswerEvent(content="done after background exec approval", trajectory_id="traj-exec-bg")
 
-_BACKGROUND_SMOKE_COMMAND = (
-    "(__import__('sys').stdout.write('bg-start\\\\n'), "
-    "__import__('sys').stdout.flush(), "
-    "__import__('time').sleep(5))"
-)
+_BACKGROUND_SMOKE_COMMAND = "(print('bg-start', flush=True), __import__('time').sleep(5))"
 
 _BACKGROUND_SMOKE_COMMAND_RULE = {
     "tokens": [
-        "n),",
-        "__import__(sys).stdout.flush(),",
+        "(print(bg-start,",
+        "flush=true),",
         "__import__(time).sleep(5))",
     ],
     "decision": "allow",
