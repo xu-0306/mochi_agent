@@ -1,0 +1,60 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "effective-context-v1",
+  "producer_package": "PKG-MAIN-15-EFFECTIVE-CONTEXT-SEAM",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "ContextSource",
+    "ContextConfidence",
+    "EffectiveContext",
+    "select_effective_context"
+  ],
+  "inputs": {
+    "configured_context": "Positive integer explicitly configured for the request, or null.",
+    "serving_context": "Positive integer observed from the serving runtime, or null.",
+    "advertised_context": "Positive integer reported as model capacity, or null.",
+    "fallback_context": "Positive fallback integer; an invalid fallback resolves to the contract default of 4096."
+  },
+  "outputs": {
+    "effective_context": {
+      "fields": [
+        "context_length",
+        "source",
+        "confidence",
+        "is_hard_limit"
+      ],
+      "selection": "Select the smallest positive configured, serving, or advertised value. Equal values prefer serving, then configured, then advertised. If no valid value exists, return fallback_default."
+    }
+  },
+  "errors": [
+    "Boolean, non-integer, zero, and negative metadata values are ignored as absent.",
+    "Advertised capacity alone is medium confidence and must not enable a hard request gate.",
+    "Unknown metadata uses a low-confidence fallback and must not be presented as a verified limit."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "additional_output_fields": "Consumers ignore fields they do not require.",
+    "source_values": "serving, configured, advertised, fallback_default",
+    "confidence_values": "high, medium, low",
+    "hard_limit_rule": "Only serving and configured selections are hard limits in v1."
+  },
+  "consumers": [
+    "PKG-MAIN-20-CONTEXT-LIFECYCLE",
+    "PKG-WORKER-21-OPENAI-ADAPTER",
+    "PKG-WORKER-22-OLLAMA-ADAPTER",
+    "PKG-WORKER-23-PROVIDER-MATRIX",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SEAM-CONTEXT",
+    "GATE-CONTEXT-LIFECYCLE",
+    "GATE-OPENAI-ADAPTER",
+    "GATE-OLLAMA-ADAPTER",
+    "GATE-PROVIDER-FIXTURE",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

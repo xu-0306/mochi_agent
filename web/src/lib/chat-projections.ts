@@ -1,6 +1,7 @@
 import type { WorkflowProgressCardView } from '../components/workflow/types'
 import type { AgentRunDetail, TaskSummary } from './api'
 import type { Message } from './chat'
+import { presentFailure, type FailureEnvelopeInput } from './failure-presentation'
 import { stripLegacyGoalCardMessage } from './legacy-goal-card-projection.ts'
 import {
   buildDelegatedSubagentCardView,
@@ -27,6 +28,16 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
 }
 
+function workflowFailureDetail(failure: FailureEnvelopeInput | null | undefined): string {
+  try {
+    return failure
+      ? presentFailure(failure).detail
+      : 'The workflow could not complete. Review the workflow details before trying again.'
+  } catch {
+    return 'The workflow could not complete. Review the workflow details before trying again.'
+  }
+}
+
 export function buildWorkflowCompletionContent(run: AgentRunDetail | null): string | null {
   if (!run || !isWorkflowCompletionReportStatus(run.status)) {
     return null
@@ -34,7 +45,6 @@ export function buildWorkflowCompletionContent(run: AgentRunDetail | null): stri
 
   const status = run.status.toLowerCase()
   const finalAnswer = getString(run.summary?.final_answer)?.trim() ?? ''
-  const latestError = run.latest_error?.trim() ?? ''
   const workflowLink = `/agent-runs/${encodeURIComponent(run.run_id)}`
 
   if (status === 'succeeded' || status === 'completed' || status === 'done') {
@@ -51,7 +61,10 @@ export function buildWorkflowCompletionContent(run: AgentRunDetail | null): stri
     return [
       '### Workflow completed with partial results',
       '',
-      finalAnswer || latestError || 'The workflow stopped after producing partial results.',
+      finalAnswer ||
+        (run.failure
+          ? workflowFailureDetail(run.failure)
+          : 'The workflow stopped after producing partial results.'),
       '',
       `[Open workflow details](${workflowLink})`,
     ].join('\n')
@@ -60,7 +73,7 @@ export function buildWorkflowCompletionContent(run: AgentRunDetail | null): stri
   return [
     '### Workflow stopped',
     '',
-    latestError || finalAnswer || `The workflow ended with status: ${run.status}.`,
+    finalAnswer || workflowFailureDetail(run.failure),
     '',
     `[Open workflow details](${workflowLink})`,
   ].join('\n')

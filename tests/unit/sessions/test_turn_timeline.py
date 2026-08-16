@@ -8,8 +8,8 @@ import pytest
 
 from mochi.sessions.store import SessionStore, StrictSessionSnapshotError
 from mochi.sessions.turn_timeline import (
-    OperationDescriptor,
     SESSION_TURN_TIMELINE_EVENT,
+    OperationDescriptor,
     SessionTurnTimelineRepository,
 )
 

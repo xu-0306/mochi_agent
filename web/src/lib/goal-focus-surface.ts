@@ -99,7 +99,7 @@ export function buildGoalFocusCallout(options: {
       tone: 'warning',
       title: copy.approvalWaitLabel,
       message: blocker
-        ? buildGoalBlockerSummary(userMessage, blocker.summary, blocker.latestError, {
+        ? buildGoalBlockerSummary(userMessage, blocker.summary, null, {
             approvalCount,
             recommendedAction: blocker.recommendedAction,
           })
@@ -118,7 +118,7 @@ export function buildGoalFocusCallout(options: {
     return {
       tone: 'warning',
       title: copy.blockedStatusLabel,
-      message: buildGoalBlockerSummary(userMessage, blocker.summary, blocker.latestError, {
+      message: buildGoalBlockerSummary(userMessage, blocker.summary, null, {
         approvalCount,
         recommendedAction: blocker.recommendedAction,
       }),

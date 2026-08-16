@@ -1,0 +1,65 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "session-lineage-v1",
+  "producer_package": "PKG-MAIN-36-SESSION-LINEAGE-SEAM",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "SessionLineageEnvelope",
+    "SessionLineageResolution",
+    "SessionLineageError",
+    "SessionStore.resolve_session_lineage",
+    "SessionStore.resolve_session_root"
+  ],
+  "inputs": {
+    "canonical_source": "Strict JSONL session histories owned by one SessionStore; SQLite index state is never a lineage source.",
+    "lineage_envelope": "A v1 session_meta.created.lineage mapping with storage_id, session_id, parent_session_id, parent_storage_id, and fork_until_turn_id.",
+    "session_id": "A non-empty canonical session identifier scoped to the current SessionStore.storage_id."
+  },
+  "outputs": {
+    "resolution": {
+      "fields": [
+        "storage_id",
+        "session_id",
+        "root_session_id"
+      ],
+      "rule": "The returned session_id equals the requested ID, storage_id equals the current store, and resolving root_session_id again returns itself."
+    },
+    "legacy": {
+      "rule": "A strict history without a lineage envelope is a legacy root with root_session_id equal to session_id; it is never rewritten or inferred from copied content."
+    }
+  },
+  "rules": [
+    "Every new session created through the session-create route writes one immutable v1 envelope in its canonical created metadata.",
+    "A root has null parent_session_id, parent_storage_id, and fork_until_turn_id. A forked child has non-empty parent_session_id and fork_until_turn_id, and parent_storage_id equals storage_id.",
+    "Resolution traverses only same-store parent links, detects self-parent and cycles, and returns the final root without scanning the full store.",
+    "A session replacement that touches a lineage-enabled history must retain exactly its original envelope; duplicate or conflicting envelopes fail closed.",
+    "The derived session search index remains schema-compatible and contains no lineage fields."
+  ],
+  "errors": [
+    "Malformed IDs, envelope schema mismatch, or a record session_id/storage_id mismatch raise SessionLineageError with malformed_id or invalid_resolution.",
+    "A missing requested record raises record_not_found; a missing referenced parent raises dangling_parent; neither is treated as a legacy root.",
+    "Self-parent, cycles, duplicate/conflicting envelopes, and a different parent storage raise explicit SessionLineageError reasons and never produce a root.",
+    "An unreadable strict source raises resolver_unavailable and must not fall back to FTS/index state or an empty result."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "legacy_history": "No envelope means self-root only; legacy histories are not rewritten or guessed.",
+    "unknown_major": "reject",
+    "cross_store": "reject; v1 has no import or profile rebinding.",
+    "index_v1": "unchanged; lineage is canonical JSONL metadata and root is derived."
+  },
+  "consumers": [
+    "PKG-WORKER-31-SESSION-SEARCH",
+    "PKG-WORKER-32-SESSION-API",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SESSION-LINEAGE-SEAM",
+    "GATE-SESSION-SEARCH-CORE",
+    "GATE-SESSION-SEARCH",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

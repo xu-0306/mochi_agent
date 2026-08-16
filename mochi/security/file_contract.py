@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import ClassVar, Literal, TypeAlias
@@ -318,8 +318,13 @@ class ChangeEntry:
 class FileChangeRequest:
     entries: tuple[ChangeEntry, ...]
     patch_sha256: str | None
+    parent_request_digest: str | None = None
+    selected_entry_ids: tuple[str, ...] = ()
 
-    _FIELDS: ClassVar[frozenset[str]] = frozenset({"entries", "patch_sha256"})
+    _FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"entries", "patch_sha256", "parent_request_digest", "selected_entry_ids"}
+    )
+    _LEGACY_FIELDS: ClassVar[frozenset[str]] = frozenset({"entries", "patch_sha256"})
 
     def __post_init__(self) -> None:
         if not isinstance(self.entries, tuple) or any(
@@ -339,23 +344,127 @@ class FileChangeRequest:
             tuple(sorted(self.entries, key=lambda item: (item.entry_id, item.relative_path))),
         )
         _sha256_digest(self.patch_sha256, "patch_sha256", optional=True)
+        _sha256_digest(
+            self.parent_request_digest,
+            "parent_request_digest",
+            optional=True,
+        )
+        if not isinstance(self.selected_entry_ids, tuple) or any(
+            not isinstance(entry_id, str) or not entry_id
+            for entry_id in self.selected_entry_ids
+        ):
+            raise ValueError("selected_entry_ids must be a tuple of non-empty strings")
+        selected_entry_ids = tuple(sorted(self.selected_entry_ids))
+        if len(selected_entry_ids) != len(set(selected_entry_ids)):
+            raise ValueError("selected_entry_ids must not contain duplicates")
+        object.__setattr__(self, "selected_entry_ids", selected_entry_ids)
+        if self.parent_request_digest is None:
+            if selected_entry_ids:
+                raise ValueError("root requests must not declare selected_entry_ids")
+        elif not selected_entry_ids:
+            raise ValueError("subset request must declare selected_entry_ids")
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
             "entries": [entry.to_dict() for entry in self.entries],
             "patch_sha256": self.patch_sha256,
+            "parent_request_digest": self.parent_request_digest,
+            "selected_entry_ids": list(self.selected_entry_ids),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> FileChangeRequest:
-        _check_fields(data, cls._FIELDS)
+        unknown = set(data) - cls._FIELDS
+        if unknown:
+            raise ValueError(f"unknown contract field(s): {', '.join(sorted(unknown))}")
+        missing = cls._LEGACY_FIELDS - set(data)
+        if missing:
+            raise ValueError(f"missing contract field(s): {', '.join(sorted(missing))}")
         return cls(
             entries=tuple(
                 ChangeEntry.from_dict(_mapping(item, "entries item"))
                 for item in _sequence(data["entries"], "entries")
             ),
             patch_sha256=_string(data["patch_sha256"], "patch_sha256", optional=True),
+            parent_request_digest=_string(
+                data.get("parent_request_digest"),
+                "parent_request_digest",
+                optional=True,
+            ),
+            selected_entry_ids=_sequence(
+                data.get("selected_entry_ids", ()),
+                "selected_entry_ids",
+            ),  # type: ignore[arg-type]
         )
+
+
+def derive_file_change_subset(
+    *,
+    parent_request: FileChangeRequest,
+    parent_request_digest: str,
+    selected_entry_ids: tuple[str, ...],
+) -> FileChangeRequest:
+    """Derive an independently authorizable request for complete entry groups."""
+
+    if not isinstance(parent_request, FileChangeRequest):
+        raise TypeError("parent_request must be FileChangeRequest")
+    _sha256_digest(parent_request_digest, "parent_request_digest")
+    if not isinstance(selected_entry_ids, tuple) or any(
+        not isinstance(entry_id, str) or not entry_id for entry_id in selected_entry_ids
+    ):
+        raise ValueError("selected_entry_ids must be a tuple of non-empty strings")
+
+    selected = frozenset(selected_entry_ids)
+    available = {entry.entry_id: entry for entry in parent_request.entries}
+    if not selected or not selected <= set(available):
+        raise ValueError("selected_entry_ids must reference parent request entries")
+    for entry in parent_request.entries:
+        if entry.dependency_group is None or entry.entry_id not in selected:
+            continue
+        group_entries = {
+            candidate.entry_id
+            for candidate in parent_request.entries
+            if candidate.dependency_group == entry.dependency_group
+        }
+        if not group_entries <= selected:
+            raise ValueError("partial_dependency_group")
+
+    child_entries = tuple(
+        replace(
+            available[entry_id],
+            entry_id=file_change_subset_entry_id(
+                parent_request_digest=parent_request_digest,
+                parent_entry=available[entry_id],
+            ),
+        )
+        for entry_id in selected
+    )
+    return FileChangeRequest(
+        entries=child_entries,
+        patch_sha256=parent_request.patch_sha256,
+        parent_request_digest=parent_request_digest,
+        selected_entry_ids=tuple(selected),
+    )
+
+
+def file_change_subset_entry_id(
+    *,
+    parent_request_digest: str,
+    parent_entry: ChangeEntry,
+) -> str:
+    """Return the immutable child entry identity for one selected parent entry."""
+
+    _sha256_digest(parent_request_digest, "parent_request_digest")
+    if not isinstance(parent_entry, ChangeEntry):
+        raise TypeError("parent_entry must be ChangeEntry")
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "parent_request_digest": parent_request_digest,
+                "parent_entry": parent_entry.to_dict(),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -678,9 +787,19 @@ class ChangeManifest:
     created_at: str
     expires_at: str
     request_digest: str
+    parent_request_digest: str | None = None
+    selected_entry_ids: tuple[str, ...] = ()
     ui_metadata: Mapping[str, object] = field(default_factory=dict)
 
     _FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "version", "change_set_id", "workspace_root", "workspace_identity",
+            "tool_name", "intent", "entries", "patch_sha256", "policy_version",
+            "created_at", "expires_at", "request_digest", "parent_request_digest",
+            "selected_entry_ids", "ui_metadata",
+        }
+    )
+    _LEGACY_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
             "version", "change_set_id", "workspace_root", "workspace_identity",
             "tool_name", "intent", "entries", "patch_sha256", "policy_version",
@@ -723,6 +842,25 @@ class ChangeManifest:
             tuple(sorted(self.entries, key=lambda item: (item.entry_id, item.relative_path))),
         )
         _sha256_digest(self.patch_sha256, "patch_sha256", optional=True)
+        _sha256_digest(
+            self.parent_request_digest,
+            "parent_request_digest",
+            optional=True,
+        )
+        if not isinstance(self.selected_entry_ids, tuple) or any(
+            not isinstance(entry_id, str) or not entry_id
+            for entry_id in self.selected_entry_ids
+        ):
+            raise ValueError("selected_entry_ids must be a tuple of non-empty strings")
+        selected_entry_ids = tuple(sorted(self.selected_entry_ids))
+        if len(selected_entry_ids) != len(set(selected_entry_ids)):
+            raise ValueError("selected_entry_ids must not contain duplicates")
+        object.__setattr__(self, "selected_entry_ids", selected_entry_ids)
+        if self.parent_request_digest is None:
+            if selected_entry_ids:
+                raise ValueError("root manifests must not declare selected_entry_ids")
+        elif not selected_entry_ids:
+            raise ValueError("subset manifest must declare selected_entry_ids")
         metadata = _mapping(self.ui_metadata, "ui_metadata")
         normalized_metadata = canonical_value(metadata)
         object.__setattr__(
@@ -746,12 +884,19 @@ class ChangeManifest:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "request_digest": self.request_digest,
+            "parent_request_digest": self.parent_request_digest,
+            "selected_entry_ids": list(self.selected_entry_ids),
             "ui_metadata": canonical_value(self.ui_metadata),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> ChangeManifest:
-        _check_fields(data, cls._FIELDS)
+        unknown = set(data) - cls._FIELDS
+        if unknown:
+            raise ValueError(f"unknown contract field(s): {', '.join(sorted(unknown))}")
+        missing = cls._LEGACY_FIELDS - set(data)
+        if missing:
+            raise ValueError(f"missing contract field(s): {', '.join(sorted(missing))}")
         return cls(
             version=_integer(data["version"], "version"),  # type: ignore[arg-type]
             change_set_id=_string(data["change_set_id"], "change_set_id"),  # type: ignore[arg-type]
@@ -770,6 +915,15 @@ class ChangeManifest:
             created_at=_string(data["created_at"], "created_at"),  # type: ignore[arg-type]
             expires_at=_string(data["expires_at"], "expires_at"),  # type: ignore[arg-type]
             request_digest=_string(data["request_digest"], "request_digest"),  # type: ignore[arg-type]
+            parent_request_digest=_string(
+                data.get("parent_request_digest"),
+                "parent_request_digest",
+                optional=True,
+            ),
+            selected_entry_ids=_sequence(
+                data.get("selected_entry_ids", ()),
+                "selected_entry_ids",
+            ),  # type: ignore[arg-type]
             ui_metadata=_mapping(data["ui_metadata"], "ui_metadata"),  # type: ignore[arg-type]
         )
 
@@ -886,6 +1040,8 @@ __all__ = [
     "authorization_request_digest",
     "canonical_json",
     "canonical_manifest_digest",
+    "derive_file_change_subset",
+    "file_change_subset_entry_id",
     "canonical_value",
     "capture_file_identity",
     "manifest_digest_projection",

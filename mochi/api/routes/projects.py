@@ -35,7 +35,7 @@ def _get_project_store(app: object, *, config: object | None = None) -> ProjectS
     if config is None:
         raise RuntimeError("config is required when app.state.project_store is not set.")
 
-    workspace_dir = getattr(config, "workspace_dir")
+    workspace_dir = config.workspace_dir
     store = ProjectStore(Path(workspace_dir).expanduser() / "projects.json")
     app.state.project_store = store
     return store

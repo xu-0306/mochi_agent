@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any
 
 from mochi.agents.multi_agent.execution_policy import SubagentExecutionPolicy
 from mochi.agents.multi_agent.roles import build_controlled_execution_roles

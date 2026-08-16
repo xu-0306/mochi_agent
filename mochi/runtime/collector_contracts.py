@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
-import json
-from typing import Any, Mapping
+from typing import Any
 
 COLLECTOR_SHARD_MANIFEST_ARTIFACT_TYPE = "collector_shard_manifest"
 COLLECTOR_SHARD_MANIFEST_SCHEMA_VERSION = "1.0"
@@ -71,27 +72,6 @@ def normalize_collector_shard_manifests(
             payload["policy"] = policy
         manifests.append(payload)
     return manifests
-
-
-def dedupe_collector_shard_manifests(
-    manifests: list[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep the freshest snapshot for each collector shard."""
-
-    latest_by_shard_id: dict[str, dict[str, Any]] = {}
-    latest_timestamp_by_shard_id: dict[str, datetime] = {}
-    for manifest in manifests:
-        shard_id = _string(manifest.get("shard_id")) or _string(manifest.get("artifact_id"))
-        if shard_id is None:
-            continue
-        offset = build_collector_shard_offsets([manifest])
-        last_activity_at = _string(offset[0].get("last_activity_at")) if offset else None
-        last_activity_dt = _parse_iso_datetime(last_activity_at) or datetime.min.replace(tzinfo=UTC)
-        existing_dt = latest_timestamp_by_shard_id.get(shard_id)
-        if existing_dt is None or last_activity_dt >= existing_dt:
-            latest_by_shard_id[shard_id] = dict(manifest)
-            latest_timestamp_by_shard_id[shard_id] = last_activity_dt
-    return list(latest_by_shard_id.values())
 
 
 def collector_record_provenance_for_index(
@@ -580,9 +560,7 @@ def _is_collector_dataset_record(record: Mapping[str, Any]) -> bool:
     metadata = _mapping(record.get("metadata")) or {}
     if normalize_collector_record_provenance(metadata.get("collector_provenance")) is not None:
         return True
-    if _string(metadata.get("capability_family")) == "dataset_collection":
-        return True
-    return False
+    return _string(metadata.get("capability_family")) == "dataset_collection"
 
 
 def _resolve_record_provenance_candidate(value: Any, *, index: int) -> dict[str, Any] | None:

@@ -19,7 +19,7 @@ from mochi.config import defaults
 from mochi.config.schema import SecurityConfig
 from mochi.runtime.approval_state_machine import derive_approval_binding
 from mochi.runtime.approvals import APPROVAL_OWNER_TASK_ID_KEY, ApprovalStore
-from mochi.runtime.change_sets import ChangeSetStore
+from mochi.runtime.change_sets import ChangeSetConflict, ChangeSetStore
 from mochi.runtime.store import RuntimeStore
 from mochi.security import require_approval_decision, with_task_isolation_scope
 from mochi.security.auto_review import (
@@ -40,6 +40,7 @@ from mochi.security.file_contract import (
     authorization_request_digest,
     canonical_json,
     capture_file_identity,
+    derive_file_change_subset,
     detect_content_fidelity,
     tool_arguments_digest,
 )
@@ -51,6 +52,7 @@ from mochi.sessions.timeline_coordinator import (
 from mochi.tools.base import BaseTool, FileReadState, ToolExecutionContext, ToolResult
 from mochi.tools.file_mutations import (
     PatchValidationError,
+    build_editable_patch_text,
     build_file_change_entry,
     build_file_change_payload,
     prepare_apply_patch,
@@ -790,6 +792,20 @@ async def prepare_patch_change_contract(
     )
     persisted = await change_store.persist_manifest(manifest, envelope)
     stored_manifest = persisted["manifest"]
+    file_changes = change_payload.get("file_changes")
+    if not isinstance(file_changes, list) or len(file_changes) != len(entries):
+        raise RuntimeError("prepared patch entries do not match the persisted manifest")
+    for file_change, entry in zip(file_changes, entries, strict=True):
+        if not isinstance(file_change, dict):
+            raise RuntimeError("prepared patch entry is not a mapping")
+        file_change.update(
+            {
+                "entry_id": entry.entry_id,
+                "request_digest": stored_manifest.request_digest,
+                "change_set_id": stored_manifest.change_set_id,
+                "dependency_group": entry.dependency_group,
+            }
+        )
     contract = {
         "change_set_id": stored_manifest.change_set_id,
         "request_digest": stored_manifest.request_digest,
@@ -799,6 +815,213 @@ async def prepare_patch_change_contract(
         "context_digest": _context_digest(envelope.context),
     }
     return prepared, change_payload, contract
+
+
+async def prepare_file_change_subset_contract(
+    *,
+    runtime_store: RuntimeStore,
+    approval: Mapping[str, Any],
+    task: Mapping[str, Any],
+    security: SecurityConfig,
+    selected_entry_ids: tuple[str, ...],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Derive and persist a server-authoritative child file-change request."""
+
+    parent_manifest = await revalidate_patch_change_contract(
+        runtime_store=runtime_store,
+        approval=approval,
+        task=task,
+        security=security,
+    )
+    metadata = approval.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    parent_change_set_id = metadata.get("change_set_id")
+    if not isinstance(parent_change_set_id, str) or not parent_change_set_id:
+        raise FileChangeContractConflict("change_set_missing")
+
+    change_store = ChangeSetStore(runtime_store)
+    persisted_parent = await change_store.get_change_set(parent_change_set_id)
+    if persisted_parent is None:
+        raise FileChangeContractConflict("change_set_missing")
+    parent_envelope = persisted_parent["envelope"]
+    parent_request = parent_envelope.file_request
+    if (
+        persisted_parent["status"] != "prepared"
+        or parent_request is None
+        or parent_manifest.request_digest != authorization_request_digest(parent_envelope)
+    ):
+        raise FileChangeContractConflict("parent_request_invalid")
+
+    child_request = derive_file_change_subset(
+        parent_request=parent_request,
+        parent_request_digest=parent_manifest.request_digest,
+        selected_entry_ids=selected_entry_ids,
+    )
+    child_envelope = AuthorizationEnvelope(
+        schema_version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
+        kind="file_change",
+        context=parent_envelope.context,
+        policy_version=file_change_policy_version(security),
+        file_request=child_request,
+        exec_request=None,
+    )
+    child_digest = authorization_request_digest(child_envelope)
+    child_manifest = ChangeManifest(
+        version=AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
+        change_set_id=str(uuid4()),
+        workspace_root=parent_manifest.workspace_root,
+        workspace_identity=parent_manifest.workspace_identity,
+        tool_name=parent_manifest.tool_name,
+        intent=parent_manifest.intent,
+        entries=child_request.entries,
+        patch_sha256=child_request.patch_sha256,
+        policy_version=child_envelope.policy_version,
+        created_at=datetime.now(UTC).isoformat(),
+        expires_at=parent_manifest.expires_at,
+        request_digest=child_digest,
+        parent_request_digest=parent_manifest.request_digest,
+        selected_entry_ids=child_request.selected_entry_ids,
+        ui_metadata={
+            **dict(parent_manifest.ui_metadata),
+            "parent_change_set_id": parent_manifest.change_set_id,
+            "selected_entry_count": len(child_request.selected_entry_ids),
+        },
+    )
+    try:
+        persisted_child = await change_store.persist_manifest(child_manifest, child_envelope)
+    except ChangeSetConflict as exc:
+        raise FileChangeContractConflict(str(exc)) from exc
+    stored_manifest = persisted_child["manifest"]
+    return (
+        _manifest_file_change_payload(stored_manifest),
+        {
+            "change_set_id": stored_manifest.change_set_id,
+            "request_digest": stored_manifest.request_digest,
+            "parent_request_digest": stored_manifest.parent_request_digest,
+            "selected_entry_ids": list(stored_manifest.selected_entry_ids),
+            "expires_at": stored_manifest.expires_at,
+            "policy_version": stored_manifest.policy_version,
+            "change_contract_mode": security.change_contract_mode,
+            "context_digest": _context_digest(child_envelope.context),
+        },
+    )
+
+
+async def prepare_file_change_subset_replay_arguments(
+    *,
+    runtime_store: RuntimeStore,
+    approval: Mapping[str, Any],
+    task: Mapping[str, Any],
+    security: SecurityConfig,
+) -> dict[str, Any]:
+    """Materialize the server-selected child operations for an approval replay.
+
+    The persisted approval retains the original patch so immutable revalidation
+    can validate its digest.  This function then derives a new execution patch
+    solely from the persisted child manifest, preventing the replay from
+    applying parent operations that were not selected for the child approval.
+    """
+
+    metadata = approval.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    change_set_id = metadata.get("change_set_id")
+    if not isinstance(change_set_id, str) or not change_set_id:
+        raise FileChangeContractConflict("change_set_missing")
+    loaded = await ChangeSetStore(runtime_store).get_change_set(change_set_id)
+    if loaded is None:
+        raise FileChangeContractConflict("change_set_missing")
+    manifest = loaded["manifest"]
+    if manifest.parent_request_digest is None or not manifest.selected_entry_ids:
+        raise FileChangeContractConflict("subset_request_missing")
+
+    arguments = approval.get("arguments")
+    if not isinstance(arguments, Mapping):
+        raise FileChangeContractConflict("approval_arguments_missing")
+    patch = arguments.get("patch")
+    if not isinstance(patch, str) or not patch:
+        raise FileChangeContractConflict("approval_patch_missing")
+    encoding = str(arguments.get("encoding") or "utf-8")
+    workspace_value = (
+        task.get("task_workspace_dir")
+        or task.get("project_workspace_dir")
+        or task.get("workspace_dir")
+    )
+    if not isinstance(workspace_value, str) or not workspace_value:
+        raise FileChangeContractConflict("workspace_context_missing")
+    workspace_root = normalize_workspace_dir(workspace_value)
+    try:
+        prepared, _ = await prepare_apply_patch(
+            patch=patch,
+            workspace_dir=workspace_root,
+            path_scope=security.file_write_scope,
+            encoding=encoding,
+            undo_max_size_mb=security.file_undo_max_size_mb,
+        )
+    except PatchValidationError as exc:
+        raise FileChangeContractConflict("server_patch_invalid") from exc
+
+    prepared_by_projection: dict[tuple[str, str, str | None, str | None], Any] = {}
+    for item in prepared:
+        key = (
+            item.target.relative_to(workspace_root).as_posix(),
+            item.operation.kind,
+            _content_digest(
+                None
+                if item.original_content is None
+                else item.original_content.encode(encoding)
+            ),
+            _content_digest(
+                None if item.new_content is None else item.new_content.encode(encoding)
+            ),
+        )
+        if key in prepared_by_projection:
+            raise FileChangeContractConflict("ambiguous_parent_patch_operation")
+        prepared_by_projection[key] = item
+
+    selected_changes: list[dict[str, Any]] = []
+    for entry in manifest.entries:
+        key = (
+            entry.relative_path,
+            entry.operation,
+            entry.base_sha256,
+            entry.after_sha256,
+        )
+        item = prepared_by_projection.pop(key, None)
+        if item is None:
+            raise FileChangeContractConflict("subset_operation_mismatch")
+        selected_changes.append(dict(item.file_change))
+
+    subset_patch = build_editable_patch_text(file_changes=selected_changes)
+    if not isinstance(subset_patch, str) or not subset_patch:
+        raise FileChangeContractConflict("subset_patch_unavailable")
+    return {"patch": subset_patch, "encoding": encoding}
+
+
+def _manifest_file_change_payload(manifest: ChangeManifest) -> dict[str, Any]:
+    """Project only server-persisted child entries for UI selection state."""
+
+    workspace_root = Path(manifest.workspace_root)
+    file_changes = [
+        {
+            "tool_name": manifest.tool_name,
+            "path": str(workspace_root / Path(entry.relative_path)),
+            "file_path": str(workspace_root / Path(entry.relative_path)),
+            "relative_path": entry.relative_path,
+            "change_type": entry.operation,
+            "entry_id": entry.entry_id,
+            "request_digest": manifest.request_digest,
+            "change_set_id": manifest.change_set_id,
+            "dependency_group": entry.dependency_group,
+            "diff_available": False,
+            "undo_available": False,
+        }
+        for entry in manifest.entries
+    ]
+    return {
+        "change_count": len(file_changes),
+        "paths": [item["path"] for item in file_changes],
+        "file_changes": file_changes,
+    }
 
 
 async def revalidate_patch_change_contract(

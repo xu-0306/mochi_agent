@@ -7,13 +7,12 @@ paths, or any other unredacted execution payload.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-import re
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
-
 
 DIAGNOSTICS_EVENT = "ordinary_chat_adaptive_diagnostics_recorded"
 DIAGNOSTICS_VERSION = 1
@@ -398,7 +397,7 @@ class AdaptiveDiagnosticsRecord:
         classification: DiagnosticsClassification,
         accumulator: AdaptiveDiagnosticsAccumulator,
         timestamp: str,
-    ) -> "AdaptiveDiagnosticsRecord":
+    ) -> AdaptiveDiagnosticsRecord:
         """Build a record with the deterministic v1 idempotency key."""
         return cls(
             session_id=session_id,
@@ -424,7 +423,7 @@ class AdaptiveDiagnosticsRecord:
         }
 
     @classmethod
-    def from_event(cls, value: Mapping[str, Any]) -> "AdaptiveDiagnosticsRecord":
+    def from_event(cls, value: Mapping[str, Any]) -> AdaptiveDiagnosticsRecord:
         """Parse only a complete, exact-key, v1 diagnostics event."""
         if not isinstance(value, Mapping):
             raise AdaptiveDiagnosticsError("diagnostics event must be an object")

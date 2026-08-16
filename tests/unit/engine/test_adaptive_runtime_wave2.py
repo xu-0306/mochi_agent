@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,8 +14,8 @@ from mochi.agents.complexity_gate import (
     ComplexityGate,
     ComplexityGateRequest,
 )
-from mochi.agents.engine import AgentEngine
 from mochi.agents.conversation_state_store import TurnCheckpoint
+from mochi.agents.engine import AgentEngine
 from mochi.agents.react_loop import AsyncReActLoop
 from mochi.agents.tool_exposure import ToolExposurePlan
 from mochi.agents.turn_intent_contract import (
@@ -821,12 +821,14 @@ async def test_react_loop_recovery_scope_blocks_before_probe_execution(tmp_path:
     class Backend(FakeBackend):
         calls = 0
         async def generate(self, messages, **kwargs):  # type: ignore[no-untyped-def]
-            self.calls.append(messages); type(self).calls += 1
+            self.calls.append(messages)
+            type(self).calls += 1
             if type(self).calls == 1:
                 return GenerationResult(content="", tool_calls=[ToolCall(id="escape", name="file_write", arguments={"path": "unrelated.py", "content": "bad"})], finish_reason="tool_calls")
             return GenerationResult(content="blocked")
     probe, backend = Probe(), Backend()
-    registry = ToolRegistry(discover_builtin=False); registry.register(probe)
+    registry = ToolRegistry(discover_builtin=False)
+    registry.register(probe)
     context = ToolExecutionContext(workspace_dir=str(tmp_path), state={"controlled_recovery_allowed_targets": ["report.md"], "controlled_recovery_budget_runtime": {"tool_calls_used": 0, "tool_calls_limit": 1, "model_calls_used": 0, "model_calls_limit": 2, "started_at": time.perf_counter(), "wall_seconds_limit": 30}})
     loop = AsyncReActLoop(backend=backend, tool_registry=registry, tool_execution_context=context, max_iterations=2)
     from mochi.agents.events import ToolCallResultEvent

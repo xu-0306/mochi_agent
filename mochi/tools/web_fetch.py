@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
 try:
     from loguru import logger
 except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs

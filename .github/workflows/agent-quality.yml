@@ -1,0 +1,82 @@
+name: Agent quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Qualification lane to run
+        required: true
+        default: release
+        type: choice
+        options: [pr, main, nightly, release]
+
+permissions:
+  contents: read
+
+jobs:
+  pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps: &quality-steps
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --dev
+      - run: uv run python scripts/quality_gate/run.py --mode pr --execute --changed-from "${{ github.event.pull_request.base.sha }}" --report artifacts/quality/pr.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-pr
+          path: artifacts/quality/pr.json
+          if-no-files-found: error
+
+  main:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --dev
+      - run: uv run python scripts/quality_gate/run.py --mode main --execute --report artifacts/quality/main.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-main
+          path: artifacts/quality/main.json
+          if-no-files-found: error
+
+  nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --dev
+      - run: uv run python scripts/quality_gate/run.py --mode nightly --execute --report artifacts/quality/nightly.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-nightly
+          path: artifacts/quality/nightly.json
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --dev
+      - run: uv run python scripts/quality_gate/run.py --mode ${{ inputs.mode }} --execute --report artifacts/quality/${{ inputs.mode }}.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-${{ inputs.mode }}
+          path: artifacts/quality/${{ inputs.mode }}.json
+          if-no-files-found: error

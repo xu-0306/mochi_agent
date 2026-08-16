@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-import os
 from shlex import quote
-import time
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -633,7 +633,7 @@ class ManagedVLLMRuntimeManager:
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=self._shutdown_timeout_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 process.kill()
                 await process.wait()
 

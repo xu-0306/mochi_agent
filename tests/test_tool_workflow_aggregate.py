@@ -17,7 +17,6 @@ from mochi.api.tool_workflow_aggregate import (
     reduce_tool_workflow_aggregate_v1,
 )
 
-
 _FIXTURES = Path(__file__).parent / "fixtures" / "tool_workflow_aggregate" / "v1_cases.json"
 
 

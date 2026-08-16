@@ -1,5 +1,6 @@
 import type { WorkflowProgressCardView } from '@/components/workflow/types'
 import type { DelegatedSubagentCardView } from '@/lib/subagent-tasks'
+import type { FailureEnvelopeInput } from '@/lib/failure-presentation'
 
 export type MessageType = 'user' | 'assistant' | 'system' | 'error'
 
@@ -57,6 +58,7 @@ export interface ReasoningStep {
   toolCallId?: string
   toolError?: string
   errorCode?: string
+  failure?: FailureEnvelopeInput
   toolExposure?: ToolExposureDiagnostics
   transport?: ToolTransportDiagnostics
   status?: 'running' | 'success' | 'error'
@@ -92,6 +94,7 @@ export interface Message {
   turnId?: string | null
   reasoningSteps?: ReasoningStep[]
   errorCode?: string
+  failure?: FailureEnvelopeInput
   isStreaming?: boolean
   tokenStats?: TokenStats
   attachments?: ChatAttachment[]

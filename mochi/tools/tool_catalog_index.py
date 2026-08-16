@@ -6,8 +6,9 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from mochi.tools.base import BaseTool
 

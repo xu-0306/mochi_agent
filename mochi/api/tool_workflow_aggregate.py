@@ -549,7 +549,14 @@ def _apply_approvals(
     for raw in approvals:
         row = _mapping(raw, "approval")
         metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
-        get = lambda key: row.get(key, metadata.get(key))
+
+        def get(
+            key: str,
+            row: Mapping[str, Any] = row,
+            metadata: Mapping[str, Any] = metadata,
+        ) -> Any:
+            return row.get(key, metadata.get(key))
+
         version = row.get("schema_version", 1)
         if version != 1:
             raise UnsupportedAggregateSourceError("unsupported approval source version")

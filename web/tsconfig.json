@@ -45,7 +45,17 @@
     ".next-fixture-reload/types/**/*.ts",
     ".next-fixture-reload/dev/types/**/*.ts",
     ".next-codex-webbrowser-019fb358/types/**/*.ts",
-    ".next-codex-webbrowser-019fb358/dev/types/**/*.ts"
+    ".next-codex-webbrowser-019fb358/dev/types/**/*.ts",
+    ".next-fixture-file-workflow/types/**/*.ts",
+    ".next-fixture-file-workflow/dev/types/**/*.ts",
+    ".next-fixture-failure-presentation/types/**/*.ts",
+    ".next-fixture-failure-presentation/dev/types/**/*.ts",
+    ".next-fixture-evaluator-failure-20260809-185202/types/**/*.ts",
+    ".next-fixture-evaluator-failure-20260809-185202/dev/types/**/*.ts",
+    ".next-fixture-evaluator-failure-mobile-20260809-185202/types/**/*.ts",
+    ".next-fixture-evaluator-failure-mobile-20260809-185202/dev/types/**/*.ts",
+    ".next-fixture-evaluator-failure-responsive-rerun-20260809/types/**/*.ts",
+    ".next-fixture-evaluator-failure-responsive-rerun-20260809/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

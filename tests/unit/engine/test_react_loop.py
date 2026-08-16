@@ -22,7 +22,7 @@ from tests.unit.engine._support import (
 
 @pytest.mark.asyncio
 async def test_react_loop_stops_at_a_durable_approval_interrupt() -> None:
-    from mochi.agents.events import ToolCallCompletedEvent, ToolCallResultEvent
+    from mochi.agents.events import ToolCallResultEvent
     from mochi.agents.react_loop import AsyncReActLoop
     from mochi.backends.types import ToolCall
     from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult
@@ -467,11 +467,10 @@ async def test_engine_resumes_an_ordinary_chat_approval_without_a_new_user_turn(
 ) -> None:  # type: ignore[no-untyped-def]
     from dataclasses import replace
 
-    from mochi.agents.conversation_state_store import TurnCheckpoint
     from mochi.agents.artifact_verifier import ValidationProfileRegistry
+    from mochi.agents.conversation_state_store import TurnCheckpoint
     from mochi.agents.engine import AgentEngine
     from mochi.agents.turn_intent_contract import ActiveTaskState, DeliverableContract
-    from mochi.backends.types import ToolCall
     from mochi.config.schema import MochiConfig
     from mochi.security.policy import EffectivePolicyResolver
 
@@ -778,7 +777,7 @@ async def test_react_loop_rescues_thinking_tool_call_markup_without_leaking_it()
         event
         for event in events
         if isinstance(event, StatusEvent)
-        and event.metadata.get("reason") == "thinking_tool_call_rescue"
+        and event.metadata.get("reason") == "final_text_tool_call_rescue"
     ]
     thinking_events = [event for event in events if isinstance(event, ThinkingEvent)]
     requests = [event for event in events if isinstance(event, ToolCallRequestEvent)]
@@ -826,7 +825,7 @@ async def test_react_loop_recovers_once_from_length_limited_final_answer() -> No
         event
         for event in events
         if isinstance(event, StatusEvent)
-        and event.metadata.get("reason") == "finish_reason_length"
+        and event.metadata.get("reason") == "output_truncated"
     ]
     finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
     assert len(truncation_events) == 1
@@ -835,20 +834,20 @@ async def test_react_loop_recovers_once_from_length_limited_final_answer() -> No
     assert truncation_events[0].partial_output_chars == len("partial answer")
     assert truncation_events[0].metadata["error_type"] == "output_truncated"
     assert len(statuses) == 1
-    assert statuses[0].metadata["reason"] == "finish_reason_length"
+    assert statuses[0].metadata["reason"] == "output_truncated"
     assert statuses[0].metadata["runtime_category"] == "truncation"
     assert statuses[0].metadata["error_type"] == "output_truncated"
     assert statuses[0].metadata["recoverability"] == "retrying"
     assert len(finals) == 1
-    assert finals[0].content == "completed"
+    assert finals[0].content == "partial answer completed"
     assert finals[0].finish_reason == "stop"
-    assert finals[0].metadata == {
-        "runtime_category": "truncation",
-        "error_type": "output_truncated",
-        "recoverability": "recovered",
-        "truncated": True,
-        "recovery_attempts": 1,
-    }
+    assert finals[0].metadata["runtime_category"] == "truncation"
+    assert finals[0].metadata["error_type"] == "output_truncated"
+    assert finals[0].metadata["recoverability"] == "recovered"
+    assert finals[0].metadata["truncated"] is True
+    assert finals[0].metadata["recovery_attempts"] == 1
+    assert finals[0].metadata["continuation_overlap_chars"] == 0
+    assert finals[0].metadata["recovery_budget"]["attempts_used"] == 1
     assert backend.count == 2
 
 
@@ -885,7 +884,7 @@ async def test_react_loop_recovers_truncated_final_text_tool_call_markup() -> No
         event
         for event in events
         if isinstance(event, StatusEvent)
-        and event.metadata.get("reason") == "finish_reason_length"
+        and event.metadata.get("reason") == "output_truncated"
     ]
     rescue_statuses = [
         event
@@ -1049,18 +1048,18 @@ async def test_react_loop_marks_final_answer_when_length_recovery_also_truncates
         event
         for event in events
         if isinstance(event, StatusEvent)
-        and event.metadata.get("reason") == "finish_reason_length"
+        and event.metadata.get("reason") == "output_truncated"
     ]
     assert len(truncation_statuses) == 1
     finals = [event for event in events if isinstance(event, FinalAnswerEvent)]
     assert len(finals) == 1
-    assert finals[0].content == "part 2"
+    assert finals[0].content == "part 1part 2"
     assert finals[0].finish_reason == "length"
-    assert finals[0].metadata == {
-        "runtime_category": "truncation",
-        "error_type": "output_truncated",
-        "recoverability": "partial",
-        "truncated": True,
-        "recovery_attempts": 1,
-    }
+    assert finals[0].metadata["runtime_category"] == "truncation"
+    assert finals[0].metadata["error_type"] == "output_truncated"
+    assert finals[0].metadata["recoverability"] == "partial"
+    assert finals[0].metadata["truncated"] is True
+    assert finals[0].metadata["recovery_attempts"] == 1
+    assert finals[0].metadata["continuation_overlap_chars"] == 0
+    assert finals[0].metadata["recovery_budget"]["attempts_used"] == 1
     assert len(backend.calls) == 2

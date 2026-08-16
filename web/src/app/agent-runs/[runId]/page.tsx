@@ -25,6 +25,8 @@ import {
 import { useI18n } from '@/lib/i18n'
 import { formatThinkingLevelSummary } from '@/lib/reasoning-presets'
 import { Textarea } from '@/components/ui/textarea'
+import { AgentRunFailurePresentation } from '@/components/agent-runs/AgentRunFailurePresentation'
+import type { FailureEnvelopeInput } from '@/lib/failure-presentation'
 
 const TERMINAL_RUN_STATUSES = new Set([
   'succeeded',
@@ -129,6 +131,14 @@ function isUnavailableError(error: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function isFailureEnvelopeInput(value: unknown): value is FailureEnvelopeInput {
+  return (
+    isRecord(value) &&
+    Object.prototype.hasOwnProperty.call(value, 'schema_version') &&
+    Object.prototype.hasOwnProperty.call(value, 'kind')
+  )
 }
 
 function getArtifactAttemptId(artifact: api.AgentRunArtifact): string | null {
@@ -902,12 +912,7 @@ export default function AgentRunDetailPage() {
                       </div>
                     </div>
                   ) : null}
-                  {run.latest_error ? (
-                    <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-                      <p className="text-xs font-medium uppercase tracking-wide">{t('agentRuns.recovery.latestError')}</p>
-                      <p className="mt-2 whitespace-pre-wrap">{run.latest_error}</p>
-                    </div>
-                  ) : null}
+                  <AgentRunFailurePresentation failure={run.failure} latestError={run.latest_error} />
                   {getNullableString(effectiveRecoveryState.suggested_action) || getNullableString(effectiveRecoveryState.suggested_operator_action) ? (
                     <div className="rounded-lg border border-border bg-surface-layer p-3 text-sm text-foreground">
                       <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -1510,12 +1515,12 @@ export default function AgentRunDetailPage() {
                     <p className="sm:col-span-2">
                       <span className="text-foreground">Updated:</span> {formatDateTime(run.updated_at)}
                     </p>
-                    {run.latest_error ? (
-                      <p className="sm:col-span-2 text-destructive">
-                        <span className="text-foreground">Latest error:</span> {run.latest_error}
-                      </p>
-                    ) : null}
                   </div>
+                  <AgentRunFailurePresentation
+                    failure={run.failure}
+                    latestError={run.latest_error}
+                    className="mt-3"
+                  />
                 </CardContent>
               </Card>
 
@@ -2145,11 +2150,11 @@ export default function AgentRunDetailPage() {
                                     {getString(attempt.final_answer_preview)}
                                   </p>
                                 ) : null}
-                                {getString(attempt.latest_error) ? (
-                                  <p className="mt-2 whitespace-pre-wrap text-xs text-destructive">
-                                    {getString(attempt.latest_error)}
-                                  </p>
-                                ) : null}
+                                <AgentRunFailurePresentation
+                                  failure={isFailureEnvelopeInput(attempt.failure) ? attempt.failure : null}
+                                  latestError={getString(attempt.latest_error)}
+                                  className="mt-2"
+                                />
                               </div>
                             ))}
                           </div>

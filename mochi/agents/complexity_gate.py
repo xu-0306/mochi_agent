@@ -826,9 +826,7 @@ class ComplexityGate:
         score = min(score, _MAX_SOFT_SCORE)
 
         kind: ComplexityDecisionKind
-        if hard_reason_codes:
-            kind = "plan_required"
-        elif score >= self._config.plan_required_min_score:
+        if hard_reason_codes or score >= self._config.plan_required_min_score:
             kind = "plan_required"
         else:
             kind = "no_plan"
@@ -955,9 +953,7 @@ class ComplexityGate:
             return False
         if decision.score >= self._config.plan_required_min_score:
             return False
-        if request.task_relation in {"cancel", "side_question"}:
-            return False
-        return True
+        return request.task_relation not in {"cancel", "side_question"}
 
     async def _run_advisor(
         self,
@@ -970,7 +966,7 @@ class ComplexityGate:
                 self._advisor.advise(request),
                 timeout=self._config.advisor_timeout_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ComplexityAdvisorOutcome(status="timeout", reason_code="advisor_timeout")
         except Exception:
             return ComplexityAdvisorOutcome(status="malformed", reason_code="advisor_error")

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-import math
 import re
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from mochi.agents.context_snapshot import estimate_text_tokens

@@ -7,6 +7,7 @@ import gc
 import json
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -216,10 +217,8 @@ class SafetensorsBackend(BaseLLMBackend):
                             logger.debug("Safetensors model {}() during close failed: {}", attr_name, exc)
                         break
         finally:
-            try:
+            with suppress(Exception):
                 del pipeline
-            except Exception:
-                pass
 
         gc.collect()
         self._release_cuda_cache()

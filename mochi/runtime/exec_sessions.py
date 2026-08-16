@@ -5,9 +5,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
+
+from mochi.runtime.process_identity import DurableProcessIdentity
+
+if TYPE_CHECKING:
+    from mochi.runtime.process_identity import VerifiedProcessHandle
 
 
 def utc_now() -> datetime:
@@ -15,7 +20,7 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-class ExecSessionStatus(str, Enum):
+class ExecSessionStatus(StrEnum):
     """Exec session 狀態。"""
 
     PENDING_APPROVAL = "pending_approval"
@@ -24,6 +29,7 @@ class ExecSessionStatus(str, Enum):
     FAILED = "failed"
     KILLED = "killed"
     TIMED_OUT = "timed_out"
+    ORPHANED = "orphaned"
 
 
 @dataclass
@@ -50,6 +56,9 @@ class ExecSession:
     state_dir: str | None = None
     manifest_path: str | None = None
     log_read_offset: int = 0
+    durable_process_identity: DurableProcessIdentity | None = None
+    identity_state: str = "not_required"
+    verified_process_handle: VerifiedProcessHandle | None = field(default=None, repr=False)
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     log_handle: IO[bytes] | None = field(default=None, repr=False)
     stdout_tail: str = ""
@@ -142,11 +151,13 @@ class ExecSessionSnapshot:
     log_path: str | None
     checkpoint_dir: str | None
     detached_persisted: bool
+    durable_process_identity: DurableProcessIdentity | None
+    identity_state: str
 
     @classmethod
     def from_session(cls, session: ExecSession) -> ExecSessionSnapshot:
         return cls(
-            manifest_version=1,
+            manifest_version=2,
             session_id=session.session_id,
             shell=session.shell,
             command=session.command,
@@ -163,13 +174,34 @@ class ExecSessionSnapshot:
             log_path=session.log_path,
             checkpoint_dir=session.checkpoint_dir,
             detached_persisted=session.detached_persisted,
+            durable_process_identity=session.durable_process_identity,
+            identity_state=session.identity_state,
         )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ExecSessionSnapshot | None:
         try:
+            manifest_version = int(payload.get("manifest_version") or 1)
+            if manifest_version not in {1, 2}:
+                return None
+            durable_identity = (
+                DurableProcessIdentity.from_dict(payload.get("durable_process_identity"))
+                if manifest_version == 2
+                else None
+            )
+            identity_state = "legacy" if manifest_version == 1 else str(
+                payload.get("identity_state") or "unknown"
+            )
+            if manifest_version == 2 and identity_state not in {
+                "verified",
+                "exited",
+                "unknown",
+                "mismatch",
+                "legacy",
+            }:
+                identity_state = "unknown"
             return cls(
-                manifest_version=int(payload.get("manifest_version") or 1),
+                manifest_version=manifest_version,
                 session_id=str(payload["session_id"]),
                 shell=str(payload["shell"]),
                 command=str(payload["command"]),
@@ -188,6 +220,8 @@ class ExecSessionSnapshot:
                     str(payload["checkpoint_dir"]) if isinstance(payload.get("checkpoint_dir"), str) else None
                 ),
                 detached_persisted=bool(payload.get("detached_persisted", False)),
+                durable_process_identity=durable_identity,
+                identity_state=identity_state,
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -211,6 +245,12 @@ class ExecSessionSnapshot:
             "log_path": self.log_path,
             "checkpoint_dir": self.checkpoint_dir,
             "detached_persisted": self.detached_persisted,
+            "durable_process_identity": (
+                self.durable_process_identity.to_dict()
+                if self.durable_process_identity is not None
+                else None
+            ),
+            "identity_state": self.identity_state,
         }
 
     def to_session(
@@ -237,6 +277,8 @@ class ExecSessionSnapshot:
             log_path=self.log_path,
             checkpoint_dir=self.checkpoint_dir,
             detached_persisted=self.detached_persisted,
+            durable_process_identity=self.durable_process_identity,
+            identity_state=self.identity_state,
             recovered=recovered,
             state_dir=str(Path(manifest_path).resolve().parent),
             manifest_path=str(Path(manifest_path).resolve()),

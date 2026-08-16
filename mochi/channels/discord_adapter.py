@@ -593,7 +593,6 @@ class DiscordAdapter(BaseChannel):
                 "isolated_voice": "isolated_voice",
             }
             mapped_value = aliases.get(normalized_value)
-            allowed = set(aliases)
             if mapped_value is None:
                 raise ValueError(
                     "Unsupported session_mode. Use one of: "

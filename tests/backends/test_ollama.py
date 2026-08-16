@@ -97,9 +97,38 @@ async def test_ollama_configured_num_ctx_overrides_model_max_effective_context()
     assert info.context_length == 8192
     assert info.metadata["effective_context_length"] == 8192
     assert info.metadata["effective_context_length_source"] == "config.num_ctx"
-    assert info.metadata["runtime_context_length"] == 8192
-    assert info.metadata["runtime_context_length_source"] == "config.num_ctx"
+    assert info.metadata["effective_context_source"] == "configured"
+    assert info.metadata["effective_context_confidence"] == "high"
+    assert info.metadata["effective_context_is_hard_limit"] is True
+    assert info.metadata["runtime_context_length"] is None
+    assert info.metadata["runtime_context_length_source"] == "unknown"
     assert info.metadata["model_max_context_length"] == 131072
+
+
+@pytest.mark.asyncio
+async def test_ollama_serving_context_wins_over_larger_advertised_context() -> None:
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    response = _mock_response(
+        {
+            "parameters": "num_ctx 4096",
+            "model_info": {"llama.context_length": 32768},
+        }
+    )
+
+    try:
+        with patch.object(backend._client, "post", new_callable=AsyncMock, return_value=response):
+            await backend.prime_model_info()
+    finally:
+        await backend.close()
+
+    info = backend.get_model_info()
+    assert info.context_length == 4096
+    assert info.metadata["serving_context_length"] == 4096
+    assert info.metadata["advertised_context_length"] == 32768
+    assert info.metadata["effective_context_length"] == 4096
+    assert info.metadata["effective_context_source"] == "serving"
+    assert info.metadata["effective_context_confidence"] == "high"
+    assert info.metadata["effective_context_is_hard_limit"] is True
 
 @pytest.mark.asyncio
 async def test_ollama_generate_omits_reasoning_effort_for_unknown_models() -> None:
@@ -375,7 +404,7 @@ async def test_generate_nonstream_thinking_only_is_kept_separate(
 
     assert result.content == ""
     assert result.thinking == "BERT is a bidirectional Transformer encoder model."
-    assert result.finish_reason == "stop"
+    assert result.finish_reason == "complete"
 
 @pytest.mark.asyncio
 async def test_ollama_simulated_tool_mode_flattens_prior_tool_messages() -> None:
@@ -571,7 +600,10 @@ def test_model_info(backend: OllamaBackend) -> None:
     assert info.metadata["context_length_source"] == "unknown"
     assert info.metadata["context_length_fallback"] == 4096
     assert info.metadata["effective_context_length"] == 4096
-    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.fallback_default"
+    assert info.metadata["effective_context_length_source"] == "fallback_default"
+    assert info.metadata["effective_context_source"] == "fallback_default"
+    assert info.metadata["effective_context_confidence"] == "low"
+    assert info.metadata["effective_context_is_hard_limit"] is False
 
 @pytest.mark.asyncio
 async def test_ollama_generate_auto_num_ctx_caps_model_max_context() -> None:
@@ -608,8 +640,11 @@ async def test_ollama_generate_auto_num_ctx_caps_model_max_context() -> None:
     assert info.metadata["auto_num_ctx"] is True
     assert info.metadata["auto_num_ctx_cap"] == 32768
     assert info.metadata["auto_num_ctx_value"] == 32768
-    assert info.metadata["effective_context_length"] == 32768
-    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.model_max_cap"
+    assert info.metadata["effective_context_length"] == 131072
+    assert info.metadata["effective_context_length_source"] == "api_show.model_info.llama.context_length"
+    assert info.metadata["effective_context_source"] == "advertised"
+    assert info.metadata["effective_context_confidence"] == "medium"
+    assert info.metadata["effective_context_is_hard_limit"] is False
 
 def test_ollama_gpt_oss_model_info_supports_reasoning_effort() -> None:
     """Ollama GPT-OSS models support low/medium/high think levels."""
@@ -646,7 +681,52 @@ async def test_ollama_generate_auto_num_ctx_uses_conservative_default_before_pri
     assert options["num_ctx"] == 4096
     info = backend.get_model_info()
     assert info.metadata["effective_context_length"] == 4096
-    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.fallback_default"
+    assert info.metadata["effective_context_length_source"] == "fallback_default"
+
+
+@pytest.mark.asyncio
+async def test_ollama_normalizes_terminal_reason_symmetrically_across_transports() -> None:
+    class StreamingResponse:
+        async def __aenter__(self) -> StreamingResponse:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self):  # type: ignore[no-untyped-def]
+            yield '{"message":{"content":"partial answer"},"done":false}'
+            yield '{"message":{"content":""},"done":true,"done_reason":"length"}'
+
+    backend = OllamaBackend(model="llama3.2", base_url="http://localhost:11434")
+    non_stream_result = backend._parse_generation_result(  # noqa: SLF001
+        {
+            "model": "llama3.2",
+            "message": {"content": "partial answer"},
+            "done": True,
+            "done_reason": "length",
+        },
+        tools=None,
+        use_native_tools=True,
+    )
+
+    try:
+        with patch.object(backend._client, "stream", return_value=StreamingResponse()):
+            stream_chunks = [
+                chunk
+                async for chunk in backend._stream_generate(  # noqa: SLF001
+                    {"model": "llama3.2", "messages": [], "stream": True}
+                )
+            ]
+    finally:
+        await backend.close()
+
+    assert non_stream_result.finish_reason == "output_truncated"
+    assert stream_chunks[-1].is_final is True
+    assert stream_chunks[-1].finish_reason == non_stream_result.finish_reason
+
 
 @pytest.mark.asyncio
 async def test_generate_nonstream_empty_non_tool_response_raises_backend_error(
@@ -1342,7 +1422,10 @@ async def test_ollama_prime_model_info_reads_context_length_from_show_model_info
     assert info.metadata["context_length_source"] == "api_show.model_info.llama.context_length"
     assert info.metadata["context_length_fallback"] is None
     assert info.metadata["effective_context_length"] == 32768
-    assert info.metadata["effective_context_length_source"] == "auto_num_ctx.model_max_cap"
+    assert info.metadata["effective_context_length_source"] == "api_show.model_info.llama.context_length"
+    assert info.metadata["effective_context_source"] == "advertised"
+    assert info.metadata["effective_context_confidence"] == "medium"
+    assert info.metadata["effective_context_is_hard_limit"] is False
     assert info.metadata["runtime_context_length"] is None
     assert info.metadata["model_max_context_length"] == 32768
     assert info.metadata["model_max_context_length_source"] == "api_show.model_info.llama.context_length"
@@ -1369,7 +1452,7 @@ async def test_generate_nonstream_basic(backend: OllamaBackend) -> None:
     assert result.content == "你好！"
     assert result.input_tokens == 10
     assert result.output_tokens == 5
-    assert result.finish_reason == "stop"
+    assert result.finish_reason == "complete"
 
 @pytest.mark.asyncio
 async def test_ollama_prime_model_info_reads_context_length_from_parameters() -> None:

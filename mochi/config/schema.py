@@ -129,7 +129,7 @@ class LocalModelConfig(BaseModel):
     idle_unload_seconds: int | None = Field(default=300, ge=0, le=86_400)
     """本地模型閒置多久後自動卸載；`0` 或 `None` 表示停用。"""
 
-    llama_cpp: "LlamaCppRuntimeConfig" = Field(default_factory=lambda: LlamaCppRuntimeConfig())
+    llama_cpp: LlamaCppRuntimeConfig = Field(default_factory=lambda: LlamaCppRuntimeConfig())
     """llama.cpp 轉換 runtime 的保守 managed/registered metadata。"""
 
     @model_validator(mode="before")
@@ -976,7 +976,7 @@ class ComplexityGateConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_thresholds(self) -> "ComplexityGateConfig":
+    def _validate_thresholds(self) -> ComplexityGateConfig:
         if self.plan_required_min_score <= self.no_plan_max_score:
             raise ValueError(
                 "plan_required_min_score must be greater than no_plan_max_score"
@@ -1002,7 +1002,7 @@ class ToolRetrievalConfig(BaseModel):
     embedding_rerank_enabled: bool = False
 
     @model_validator(mode="after")
-    def _validate_top_k(self) -> "ToolRetrievalConfig":
+    def _validate_top_k(self) -> ToolRetrievalConfig:
         if self.max_top_k < self.default_top_k:
             raise ValueError("max_top_k must be greater than or equal to default_top_k")
         return self

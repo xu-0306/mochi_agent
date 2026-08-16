@@ -16,6 +16,8 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import type { ApprovalSummary } from '@/lib/api'
+import type { FailureEnvelopeInput } from '@/lib/failure-presentation'
+import { GoalFailurePresentation } from './GoalFailurePresentation'
 import { getFileName } from '@/lib/file-change-preview'
 import {
   buildGoalApprovalCountLabel,
@@ -51,6 +53,7 @@ export interface GoalDrawerBlockerView {
   summary: string | null
   recommendedAction: string | null
   latestError: string | null
+  failure?: FailureEnvelopeInput | null
   approvalCount?: number
   approvalIds: string[]
   approvalToolNames: string[]
@@ -189,7 +192,6 @@ function goalCopySource(
   return (
     goal.copySource ||
     blocker?.summary ||
-    blocker?.latestError ||
     goal.title ||
     goal.runtimeMode ||
     goal.protocolId ||
@@ -371,7 +373,7 @@ export function GoalDrawerContent({
               {goal.displayState === 'failed' ? displayLabel : chromeCopy.blockedStatusLabel}
             </p>
             <p className="mt-1 text-sm leading-6 text-foreground">
-              {buildGoalBlockerSummary(copySource, blocker?.summary, blocker?.latestError, {
+              {buildGoalBlockerSummary(copySource, blocker?.summary, null, {
                 approvalCount: blocker?.approvalCount ?? blocker?.approvalIds.length ?? 0,
                 recommendedAction: blocker?.recommendedAction,
               })}
@@ -383,10 +385,12 @@ export function GoalDrawerContent({
                   blocker.recommendedAction}
               </p>
             ) : null}
-            {blocker?.latestError ? (
-              <p className="mt-2 rounded-xl border border-border/70 bg-surface-layer/70 px-3 py-2 font-mono text-[11px] leading-5 text-foreground/85">
-                {blocker.latestError}
-              </p>
+            {blocker?.failure || blocker?.latestError ? (
+              <GoalFailurePresentation
+                failure={blocker?.failure}
+                latestError={blocker?.latestError}
+                className="mt-3"
+              />
             ) : null}
             {(blocker?.blockNetworkUsage ||
               (blocker?.blockedTools.length ?? 0) > 0 ||

@@ -12,7 +12,6 @@ from typing import Literal
 
 from mochi.agents.artifact_verifier import ExecutionStatus, RetryDisposition
 
-
 TimelineOperationStatus = Literal[
     "precommitted",
     "started",

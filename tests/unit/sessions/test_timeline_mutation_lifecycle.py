@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import mochi.agents.engine as engine_module
+from mochi.agents.artifact_verifier import tool_arguments_digest
 from mochi.agents.engine import AgentEngine
 from mochi.agents.events import (
     FinalAnswerEvent,
@@ -16,7 +17,6 @@ from mochi.agents.events import (
 from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.types import Message
 from mochi.config.schema import MochiConfig
-from mochi.agents.artifact_verifier import tool_arguments_digest
 from mochi.runtime.approvals import InMemoryApprovalStore
 from mochi.runtime.exec_sessions import ExecSessionStatus, SessionPollResult
 from mochi.runtime.sandbox.base import (
@@ -1624,14 +1624,15 @@ async def test_terminal_approval_start_has_one_winner_and_late_abandon_cannot_ov
     repository = SessionTurnTimelineRepository(store)
     loaded = await repository.load("pending-approval-resume")
     assert loaded.history_revision is not None
-    start = lambda: repository.mark_terminal_precommitted_operation_started(
-        "pending-approval-resume",
-        turn_id="turn-one",
-        expected_history_revision=loaded.history_revision,
-        operation_id=operation_id,
-        call_id="approval-call-1",
-        arguments_digest=arguments_digest,
-    )
+    def start():
+        return repository.mark_terminal_precommitted_operation_started(
+            "pending-approval-resume",
+            turn_id="turn-one",
+            expected_history_revision=loaded.history_revision,
+            operation_id=operation_id,
+            call_id="approval-call-1",
+            arguments_digest=arguments_digest,
+        )
     first, second = await asyncio.gather(start(), start())
     assert {first.status, second.status} == {"boundary_updated", "rebase_required"}
 

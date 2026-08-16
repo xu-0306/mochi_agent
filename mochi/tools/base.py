@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 import json
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from mochi.runtime.cancellation import (
+    CancellationCapability,
+    CancellationCapabilityRegistry,
+    CommitFence,
+    CommitFenceDecision,
+    CommitOutcome,
+    CommitState,
+)
 
 
 @dataclass
@@ -72,6 +81,8 @@ class RunCancellationResult:
     boundary: Literal["generation", "tool"] | None = None
     reason: str | None = None
     tool_result: ToolCancellationResult | None = None
+    capability: str | None = None
+    durable_outcome: str | None = None
 
 
 class RunCancellationContext:
@@ -85,10 +96,17 @@ class RunCancellationContext:
         self._cancel_confirmed = False
         self._active_tool_controller: ActiveToolController | None = None
         self._generation_cancel_callback: Callable[[], Awaitable[TaskCancellationOutcome]] | None = None
+        self._capabilities = CancellationCapabilityRegistry(
+            {
+                "generation": CancellationCapability.IMMEDIATE,
+                "tool": CancellationCapability.DEFERRED,
+            }
+        )
+        self._commit_fence = CommitFence()
 
     async def bind_active_tool_controller(
         self,
-        controller: "ActiveToolController" | None,
+        controller: ActiveToolController | None,
     ) -> None:
         async with self._lock:
             self._active_tool_controller = controller
@@ -102,14 +120,38 @@ class RunCancellationContext:
 
     async def mark_completed(self) -> None:
         async with self._lock:
-            if self._state != "cancelled":
+            if self._state != "cancelled" and self._commit_fence.state is not CommitState.CANCELLATION_REQUESTED:
                 self._state = "completed"
 
     async def mark_cancelled(self) -> None:
+        decision = self._commit_fence.request_cancellation(safe_point="run_cancelled")
         async with self._lock:
             self._cancel_requested = True
-            self._cancel_confirmed = True
-            self._state = "cancelled"
+            if decision.durable_outcome is CommitOutcome.ALREADY_COMMITTED:
+                self._state = "completed"
+            else:
+                self._cancel_confirmed = True
+                self._state = "cancelled"
+
+    def resolve_cancellation_capability(
+        self,
+        target: str,
+        *,
+        safe_point: str,
+    ) -> CancellationCapability:
+        """Expose the frozen capability classification to orchestration code."""
+
+        return self._capabilities.resolve(target, safe_point=safe_point).capability
+
+    async def try_commit_durable_effect(self, *, safe_point: str) -> CommitFenceDecision:
+        """Cross the one-way durable boundary unless cancellation arrived first."""
+
+        decision = self._commit_fence.try_commit(safe_point=safe_point)
+        async with self._lock:
+            if decision.durable_outcome in {CommitOutcome.COMMITTED, CommitOutcome.ALREADY_COMMITTED}:
+                self._state = "completed"
+                self._cancel_confirmed = False
+        return decision
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
@@ -126,14 +168,43 @@ class RunCancellationContext:
             "cancel_confirmed": cancel_confirmed,
             "generation_bound": generation_bound,
             "active_tool": tool_snapshot,
+            "commit_state": self._commit_fence.state.value,
         }
 
     async def request_generation_cancel(self) -> RunCancellationResult:
+        capability = self.resolve_cancellation_capability(
+            "generation",
+            safe_point="generation_cancel_requested",
+        )
+        if capability is CancellationCapability.UNSUPPORTED:
+            return RunCancellationResult(
+                cancelled=False,
+                state="pending",
+                boundary="generation",
+                reason="generation_cancellation_unsupported",
+                capability=capability.value,
+            )
         async with self._lock:
             if self._state == "completed":
-                return RunCancellationResult(cancelled=False, state="completed", boundary="generation")
+                return RunCancellationResult(
+                    cancelled=False,
+                    state="completed",
+                    boundary="generation",
+                    capability=capability.value,
+                    durable_outcome=(
+                        CommitOutcome.ALREADY_COMMITTED.value
+                        if self._commit_fence.state is CommitState.COMMITTED
+                        else None
+                    ),
+                )
             if self._state == "cancelled":
-                return RunCancellationResult(cancelled=True, state="cancelled", boundary="generation")
+                return RunCancellationResult(
+                    cancelled=True,
+                    state="cancelled",
+                    boundary="generation",
+                    capability=capability.value,
+                    durable_outcome=CommitOutcome.CANCELLED_PRE_COMMIT.value,
+                )
             self._cancel_requested = True
             self._state = "cancelling"
             cancel_callback = self._generation_cancel_callback
@@ -143,22 +214,47 @@ class RunCancellationContext:
                 state="pending",
                 boundary="generation",
                 reason="generation_not_bound",
+                capability=capability.value,
             )
         outcome = await cancel_callback()
         if outcome == "cancelled":
             await self.mark_cancelled()
-            return RunCancellationResult(cancelled=True, state="cancelled", boundary="generation")
+            return RunCancellationResult(
+                cancelled=True,
+                state="cancelled",
+                boundary="generation",
+                capability=capability.value,
+                durable_outcome=CommitOutcome.CANCELLED_PRE_COMMIT.value,
+            )
         if outcome == "completed":
             await self.mark_completed()
-            return RunCancellationResult(cancelled=False, state="completed", boundary="generation")
+            return RunCancellationResult(
+                cancelled=False,
+                state="completed",
+                boundary="generation",
+                capability=capability.value,
+            )
         return RunCancellationResult(
             cancelled=False,
             state="pending",
             boundary="generation",
             reason="generation_in_progress",
+            capability=capability.value,
         )
 
     async def request_active_tool_cancel(self) -> RunCancellationResult:
+        capability = self.resolve_cancellation_capability(
+            "tool",
+            safe_point="tool_cancel_requested",
+        )
+        if capability is CancellationCapability.UNSUPPORTED:
+            return RunCancellationResult(
+                cancelled=False,
+                state="pending",
+                boundary="tool",
+                reason="tool_cancellation_unsupported",
+                capability=capability.value,
+            )
         async with self._lock:
             controller = self._active_tool_controller
         if controller is None:
@@ -167,6 +263,7 @@ class RunCancellationContext:
                 state="pending",
                 boundary="tool",
                 reason="no_active_tool",
+                capability=capability.value,
             )
         tool_result = await controller.request_cancel()
         if tool_result.cancelled:
@@ -176,6 +273,7 @@ class RunCancellationContext:
                 boundary="tool",
                 reason=tool_result.reason,
                 tool_result=tool_result,
+                capability=capability.value,
             )
         return RunCancellationResult(
             cancelled=False,
@@ -183,6 +281,7 @@ class RunCancellationContext:
             boundary="tool",
             reason=tool_result.reason or "tool_in_progress",
             tool_result=tool_result,
+            capability=capability.value,
         )
 
     async def request_run_cancel(self) -> RunCancellationResult:
@@ -193,9 +292,29 @@ class RunCancellationContext:
         snapshot = await self.snapshot()
         state = str(snapshot.get("state") or "running")
         if state == "completed":
-            return RunCancellationResult(cancelled=False, state="completed")
+            return RunCancellationResult(
+                cancelled=False,
+                state="completed",
+                durable_outcome=CommitOutcome.ALREADY_COMMITTED.value,
+            )
         if state == "cancelled":
-            return RunCancellationResult(cancelled=True, state="cancelled")
+            return RunCancellationResult(
+                cancelled=True,
+                state="cancelled",
+                durable_outcome=CommitOutcome.CANCELLED_PRE_COMMIT.value,
+            )
+
+        fence_decision = self._commit_fence.request_cancellation(
+            safe_point="run_cancel_requested"
+        )
+        if fence_decision.durable_outcome is CommitOutcome.ALREADY_COMMITTED:
+            await self.mark_completed()
+            return RunCancellationResult(
+                cancelled=False,
+                state="completed",
+                reason="already_committed",
+                durable_outcome=fence_decision.durable_outcome.value,
+            )
 
         active_tool = snapshot.get("active_tool")
         if isinstance(active_tool, Mapping) and bool(active_tool.get("active")):
@@ -564,6 +683,4 @@ class BaseTool(ABC):
             return False
         if not self.is_read_only or not self.allow_plain_text_result_for_model:
             return False
-        if not output.strip() or len(output) > max_chars:
-            return False
-        return True
+        return not (not output.strip() or len(output) > max_chars)

@@ -349,10 +349,8 @@ def select_goal_strategy_from_registry(
             or "the registry entry is unavailable or deprecated"
         )
         return _default_goal_strategy_selection_with_reason(
-            (
-                f"Defaulted to autonomous_single_agent because {best_entry.id} matched semantically "
-                f"but {availability_note}."
-            )
+            f"Defaulted to autonomous_single_agent because {best_entry.id} matched semantically "
+            f"but {availability_note}."
         )
 
     protocol_id = str(best_entry.protocol_id or best_entry.id).strip() or best_entry.id

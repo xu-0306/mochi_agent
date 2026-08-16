@@ -499,7 +499,8 @@ async def test_model_interpreter_rejects_invalid_structured_acceptance_criterion
 
     assert resolution.diagnostics["interpreter_status"] == "rejected"
     assert expected_error in resolution.diagnostics["interpreter_error"]
-    assert resolution.contract.clarification_needed is True
+    assert resolution.contract.operations == frozenset({"conversation", "tool_discovery"})
+    assert resolution.contract.clarification_needed is False
 
 
 @pytest.mark.asyncio
@@ -633,12 +634,8 @@ async def test_invalid_json_reaches_resolver_fail_closed_path() -> None:
 
     assert resolution.diagnostics["interpreter_status"] == "rejected"
     assert "valid JSON object" in resolution.diagnostics["interpreter_error"]
-    assert resolution.contract.operations == frozenset()
-    assert resolution.contract.clarification is not None
-    assert (
-        resolution.contract.clarification.reason_code
-        == "semantic_interpretation_unavailable"
-    )
+    assert resolution.contract.operations == frozenset({"conversation", "tool_discovery"})
+    assert resolution.contract.clarification is None
     assert resolution.next_active_task == active
 
 
@@ -660,10 +657,14 @@ async def test_backend_outage_is_not_rewritten_as_user_clarification() -> None:
         interpreter=ModelConversationInterpreter(_UnavailableBackend("{}"))
     )
 
-    with pytest.raises(BackendRequestError, match="provider unavailable"):
-        await resolver.resolve(
-            current_turn=ConversationTurn("turn-now", "user", "HI"),
-        )
+    resolution = await resolver.resolve(
+        current_turn=ConversationTurn("turn-now", "user", "HI"),
+    )
+
+    assert resolution.diagnostics["interpreter_status"] == "unavailable"
+    assert "provider unavailable" in resolution.diagnostics["interpreter_error"]
+    assert resolution.contract.operations == frozenset({"conversation", "tool_discovery"})
+    assert resolution.contract.clarification_needed is False
 
 
 @pytest.mark.asyncio
@@ -679,5 +680,5 @@ async def test_schema_validation_failure_also_fails_closed() -> None:
 
     assert resolution.diagnostics["interpreter_status"] == "rejected"
     assert "unsupported operations item" in resolution.diagnostics["interpreter_error"]
-    assert resolution.contract.operations == frozenset()
-    assert resolution.contract.clarification_needed is True
+    assert resolution.contract.operations == frozenset({"conversation", "tool_discovery"})
+    assert resolution.contract.clarification_needed is False

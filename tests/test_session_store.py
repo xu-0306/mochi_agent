@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 
 import pytest
 
+from mochi.agents.failures import FailureEnvelopeVersionError
+from mochi.sessions.index import SessionSearchIndexUnavailableError
 from mochi.sessions.store import SessionIdentityConflictError, SessionStore
 
 
@@ -24,6 +27,130 @@ def test_save_and_load_session_round_trip(tmp_path) -> None:
         {"type": "user", "content": "hello"},
         {"type": "assistant", "content": "world"},
     ]
+
+
+def test_append_event_if_flushes_and_returns_after_a_successful_durable_append(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    event = {"type": "message", "content": "claimed"}
+
+    assert asyncio.run(store.append_event_if("conditional", event, lambda events: not events)) is True
+    assert asyncio.run(store.load_session("conditional")) == [event]
+    assert asyncio.run(store.append_event_if("conditional", event, lambda _events: False)) is False
+
+
+def test_session_store_refreshes_rebuildable_search_index_after_source_commits(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = "indexed-session"
+
+    asyncio.run(store.save_event(session_id, {"type": "user", "turn_id": "first", "content": "old phrase"}))
+    assert [hit.turn_id for hit in asyncio.run(store.session_search_index.search("old phrase"))] == [
+        "first"
+    ]
+
+    asyncio.run(store.replace_session(session_id, [{"type": "assistant", "turn_id": "second", "content": "new phrase"}]))
+    assert asyncio.run(store.session_search_index.search("old phrase")) == ()
+    assert [hit.turn_id for hit in asyncio.run(store.session_search_index.search("new phrase"))] == [
+        "second"
+    ]
+
+    assert asyncio.run(store.delete_session(session_id)) is True
+    assert asyncio.run(store.session_search_index.search("new phrase")) == ()
+
+
+def test_strict_cas_commit_refreshes_the_same_derived_index(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = "strict-indexed"
+    before = asyncio.run(store.load_strict_snapshot(session_id))
+
+    result = asyncio.run(
+        store.append_strict_batch_if_revision(
+            session_id,
+            expected_history_revision=before.history_revision,
+            events=({"type": "assistant", "turn_id": "strict-turn", "content": "strict phrase"},),
+        )
+    )
+
+    assert result.status == "appended"
+    assert [hit.turn_id for hit in asyncio.run(store.session_search_index.search("strict phrase"))] == [
+        "strict-turn"
+    ]
+
+
+def test_rebuild_session_search_index_uses_existing_strict_jsonl_sources(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    asyncio.run(store.save_event("alpha", {"type": "user", "content": "first rebuild token"}))
+    asyncio.run(store.save_event("beta", {"type": "assistant", "content": "second rebuild token"}))
+    store.session_search_index.database_path.unlink()
+
+    report = asyncio.run(store.rebuild_session_search_index())
+
+    assert report.session_count == 2
+    assert [hit.session_id for hit in asyncio.run(store.session_search_index.search("rebuild token"))] == [
+        "alpha",
+        "beta",
+    ]
+
+
+def test_index_failure_never_rolls_back_a_successful_jsonl_source_commit(tmp_path, monkeypatch) -> None:
+    store = SessionStore(tmp_path / "sessions")
+
+    async def fail_refresh(*_args, **_kwargs) -> None:
+        raise RuntimeError("simulated index I/O failure")
+
+    monkeypatch.setattr(store.session_search_index, "replace_snapshot", fail_refresh)
+    asyncio.run(store.save_event("source-wins", {"type": "user", "content": "durable source"}))
+
+    assert asyncio.run(store.load_session("source-wins")) == [
+        {"type": "user", "content": "durable source"},
+    ]
+    with pytest.raises(SessionSearchIndexUnavailableError):
+        asyncio.run(store.session_search_index.search("durable source"))
+
+
+def test_session_store_versions_legacy_terminal_errors_without_removing_legacy_fields(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    event = {
+        "type": "turn_event",
+        "turn_id": "turn-failure",
+        "payload": {
+            "type": "error",
+            "error": "restricted provider detail",
+            "code": "MODEL_REQUEST_FAILED",
+            "metadata": {"error_type": "backend_request_error"},
+        },
+    }
+
+    asyncio.run(store.save_event("failure-session", event))
+
+    persisted = asyncio.run(store.load_session("failure-session"))[0]
+    payload = persisted["payload"]
+    assert payload["error"] == "restricted provider detail"
+    assert payload["code"] == "MODEL_REQUEST_FAILED"
+    assert payload["failure"]["schema_version"] == "1.0"
+    assert payload["failure"]["kind"] == "backend_error"
+    assert payload["failure"]["terminal"] is True
+
+
+def test_session_store_rejects_an_unknown_failure_major(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    unknown_major = {
+        "type": "error",
+        "failure": {
+            "schema_version": "2.0",
+            "kind": "backend_error",
+            "origin": "backend",
+            "recoverability": "manual_retry",
+            "retry_policy": "manual",
+            "terminal": True,
+            "inject_into_model_context": False,
+            "telemetry_key": "failure.backend_error",
+            "ui_hint": "retry",
+            "diagnostics_ref": None,
+        },
+    }
+
+    with pytest.raises(FailureEnvelopeVersionError):
+        asyncio.run(store.save_event("failure-session", unknown_major))
 
 
 def test_atomic_replace_retries_a_transient_destination_lock(tmp_path, monkeypatch) -> None:
@@ -50,6 +177,30 @@ def test_atomic_replace_retries_a_transient_destination_lock(tmp_path, monkeypat
     assert attempts == 3
     assert delays == [0.01, 0.02]
     assert asyncio.run(store.load_session(session_id)) == replacement
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sidecar locking behavior")
+def test_windows_sidecar_lock_retries_nonblocking_contention(tmp_path, monkeypatch) -> None:
+    import msvcrt
+
+    lock_path = tmp_path / "sidecar.lock"
+    lock_path.write_bytes(b"0")
+    calls: list[tuple[int, int]] = []
+    delays: list[float] = []
+
+    def lock_after_brief_contention(file_descriptor: int, mode: int, size: int) -> None:
+        calls.append((mode, size))
+        if len(calls) < 3:
+            raise OSError(errno.EACCES, "sidecar is temporarily locked")
+
+    monkeypatch.setattr(msvcrt, "locking", lock_after_brief_contention)
+    monkeypatch.setattr("mochi.sessions.store.time.sleep", delays.append)
+
+    with lock_path.open("a+b") as lock_file:
+        SessionStore._lock_file(lock_file)  # noqa: SLF001
+
+    assert calls == [(msvcrt.LK_NBLCK, 1)] * 3
+    assert delays == [0.01, 0.01]
 
 
 def test_save_event_creates_directory_automatically(tmp_path) -> None:

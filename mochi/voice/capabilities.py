@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any, get_args
 
 from mochi.config.schema import VoiceConfig
-from mochi.voice.presets import get_voice_recommendations_payload
 from mochi.voice.events import VoiceStage
+from mochi.voice.presets import get_voice_recommendations_payload
 from mochi.voice.ws_bridge import VoiceWebSocketBridge
 
 VOICE_CLIENT_MESSAGE_TYPES: tuple[str, ...] = (

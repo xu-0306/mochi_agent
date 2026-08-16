@@ -6,10 +6,10 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from pathlib import Path
 import re
 import time
 from collections.abc import AsyncIterator, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -21,25 +21,31 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
     logger = logging.getLogger(__name__)
 
+from mochi.agents.adaptive_diagnostics import (
+    DIAGNOSTICS_CONTEXT_TURN_KEY,
+    AdaptiveDiagnosticsAccumulator,
+    get_context_diagnostics_accumulator,
+)
+from mochi.agents.context_snapshot import estimate_backend_text_tokens
 from mochi.agents.events import (
     AgentEvent,
     AssistantTruncatedEvent,
     ErrorEvent,
     FinalAnswerEvent,
     StatusEvent,
-    ThinkingEvent,
     TextChunkEvent,
+    ThinkingEvent,
     ToolCallCompletedEvent,
     ToolCallCreatedEvent,
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
-from mochi.agents.adaptive_diagnostics import (
-    AdaptiveDiagnosticsAccumulator,
-    DIAGNOSTICS_CONTEXT_TURN_KEY,
-    get_context_diagnostics_accumulator,
+from mochi.agents.generation_policy import (
+    GenerationTerminal,
+    RecoveryBudget,
+    merge_continuation,
+    normalize_generation_terminal,
 )
-from mochi.agents.context_snapshot import estimate_backend_text_tokens
 from mochi.backends.base import BackendRequestError
 from mochi.backends.tool_call_parsers import parse_tool_calls, strip_tool_call_blocks
 from mochi.backends.types import GenerationResult, Message, StreamChunk, ToolCall
@@ -662,10 +668,11 @@ class AsyncReActLoop:
         repeated_tool_rounds = 0
         terminal_unavailable_mutation_signatures: set[str] = set()
         empty_final_recovery_attempts = 0
-        invalid_tool_turn_recovery_attempts = 0
-        truncated_final_recovery_attempts = 0
+        generation_recovery_budget = RecoveryBudget(max_attempts=1)
+        final_generation_terminal = GenerationTerminal.COMPLETE
         final_was_truncated = False
         truncated_final_prefix: str | None = None
+        continuation_merge_metadata: dict[str, Any] | None = None
         force_plain_answer_without_tools = False
         web_fetch_guard_state: dict[str, Any] = {
             "last_failed_url": None,
@@ -854,9 +861,30 @@ class AsyncReActLoop:
                     recovery_mode = self._invalid_tool_turn_recovery_mode(
                         exc=exc,
                         messages=messages,
-                        retry_count=invalid_tool_turn_recovery_attempts,
                     )
                     if recovery_mode is not None:
+                        if not generation_recovery_budget.consume():
+                            yield ErrorEvent(
+                                message=(
+                                    "Model returned an invalid tool call and the shared "
+                                    "generation recovery budget is exhausted."
+                                ),
+                                code="INVALID_TOOL_CALL",
+                                metadata={
+                                    **self._runtime_error_taxonomy(
+                                        error_type="invalid_tool_call",
+                                        recoverability="not_retryable",
+                                        runtime_category="tool_protocol",
+                                    ),
+                                    "reason": "invalid_native_tool_turn",
+                                    "terminal": GenerationTerminal.INVALID_TOOL_CALL.value,
+                                    "raw_terminal_signal": exc.metadata.get(
+                                        "rejected_finish_reason"
+                                    ),
+                                    "recovery_budget": generation_recovery_budget.snapshot(),
+                                },
+                            )
+                            return
                         rejected_thinking = self._extract_invalid_tool_turn_thinking(
                             exc
                         )
@@ -868,7 +896,6 @@ class AsyncReActLoop:
                                     "recovery": "invalid_tool_turn",
                                 },
                             )
-                        invalid_tool_turn_recovery_attempts += 1
                         force_plain_answer_without_tools = (
                             recovery_mode == "plain_answer_without_tools"
                         )
@@ -915,9 +942,12 @@ class AsyncReActLoop:
                 total_output_tokens += result.output_tokens
                 finish_reason = result.finish_reason or finish_reason
                 force_plain_answer_without_tools = False
+                terminal_output = result.content
 
                 if not result.tool_calls and not force_plain_answer_without_tools:
-                    rescued_source_content = result.content
+                    rescued_source_content = "\n".join(
+                        part for part in (result.content, result.thinking) if part
+                    )
                     rescue_reason = "final_text_tool_call_rescue"
                     if truncated_final_prefix:
                         combined_source = f"{truncated_final_prefix}{result.content}"
@@ -938,6 +968,10 @@ class AsyncReActLoop:
                         rescued_source_content
                     )
                     if rescued_tool_calls:
+                        if rescue_reason == "truncated_final_text_tool_call_rescue":
+                            # The partial output was tool markup, not text for the user.
+                            # Do not merge it into the final answer after the rescued tool runs.
+                            truncated_final_prefix = None
                         rescued_visible_content = strip_tool_call_blocks(
                             result.content
                         ).strip()
@@ -970,6 +1004,80 @@ class AsyncReActLoop:
                                 "rescued_tool_call_count": len(rescued_tool_calls),
                             },
                         )
+                    terminal_output = rescued_source_content
+
+                terminal_decision = normalize_generation_terminal(
+                    terminal_signal=result.finish_reason,
+                    has_structured_tool_calls=bool(result.tool_calls),
+                    output=terminal_output,
+                )
+                final_generation_terminal = terminal_decision.terminal
+                if terminal_decision.terminal is GenerationTerminal.INVALID_TOOL_CALL:
+                    if generation_recovery_budget.consume():
+                        recovery_metadata = {
+                            **self._runtime_error_taxonomy(
+                                error_type="invalid_tool_call",
+                                recoverability="retrying",
+                                runtime_category="tool_protocol",
+                            ),
+                            "reason": terminal_decision.normalized_reason,
+                            "terminal": terminal_decision.terminal.value,
+                            "raw_terminal_signal": terminal_decision.raw_terminal_signal,
+                            "recovery_attempt": generation_recovery_budget.attempts_used,
+                            "partial_output_chars": len(terminal_output),
+                            "recovery_budget": generation_recovery_budget.snapshot(),
+                        }
+                        messages.append(
+                            Message(
+                                role="user",
+                                content=self._build_invalid_tool_turn_repair_prompt(),
+                            )
+                        )
+                        yield StatusEvent(
+                            content=(
+                                "Model returned malformed tool markup; requesting one "
+                                "bounded repair."
+                            ),
+                            metadata=recovery_metadata,
+                        )
+                        continue
+                    yield ErrorEvent(
+                        message=(
+                            "Model returned malformed tool markup and the shared "
+                            "generation recovery budget is exhausted."
+                        ),
+                        code="INVALID_TOOL_CALL",
+                        metadata={
+                            **self._runtime_error_taxonomy(
+                                error_type="invalid_tool_call",
+                                recoverability="not_retryable",
+                                runtime_category="tool_protocol",
+                            ),
+                            "reason": terminal_decision.normalized_reason,
+                            "terminal": terminal_decision.terminal.value,
+                            "raw_terminal_signal": terminal_decision.raw_terminal_signal,
+                            "partial_output_chars": len(terminal_output),
+                            "recovery_budget": generation_recovery_budget.snapshot(),
+                        },
+                    )
+                    return
+                if terminal_decision.terminal is GenerationTerminal.UNKNOWN:
+                    yield ErrorEvent(
+                        message="Model returned an unknown generation terminal state.",
+                        code="UNKNOWN_GENERATION_TERMINAL",
+                        metadata={
+                            **self._runtime_error_taxonomy(
+                                error_type="unknown_generation_terminal",
+                                recoverability="not_retryable",
+                                runtime_category="generation_terminal",
+                            ),
+                            "reason": terminal_decision.normalized_reason,
+                            "terminal": terminal_decision.terminal.value,
+                            "raw_terminal_signal": terminal_decision.raw_terminal_signal,
+                            "partial_output_chars": len(terminal_output),
+                        },
+                    )
+                    return
 
                 if result.tool_calls:
                     current_tool_signature = self._build_tool_call_signature(
@@ -1680,9 +1788,16 @@ class AsyncReActLoop:
                         literature_state["prompt_injected"] = True
                     continue
 
+                continuation_leading_whitespace = ""
+                if truncated_final_prefix is not None:
+                    continuation_leading_whitespace = result.content[
+                        : len(result.content) - len(result.content.lstrip())
+                    ]
                 final_text, final_thinking = self._split_thinking_blocks(
                     result.content, result.thinking
                 )
+                if continuation_leading_whitespace and final_text:
+                    final_text = continuation_leading_whitespace + final_text
                 if streamed_generation and held_stream_text and not final_text.strip():
                     final_text = held_stream_text.strip()
                     held_stream_text = ""
@@ -1822,9 +1937,8 @@ class AsyncReActLoop:
                         ),
                     )
                     return
-                if self._is_length_finish_reason(finish_reason):
-                    if truncated_final_recovery_attempts < 1:
-                        truncated_final_recovery_attempts += 1
+                if terminal_decision.terminal is GenerationTerminal.OUTPUT_TRUNCATED:
+                    if generation_recovery_budget.consume():
                         final_was_truncated = True
                         truncated_final_prefix = final_text
                         messages.append(
@@ -1847,15 +1961,19 @@ class AsyncReActLoop:
                                 recoverability="retrying",
                                 runtime_category="truncation",
                             ),
-                            "reason": "finish_reason_length",
-                            "finish_reason": finish_reason,
-                            "recovery_attempt": truncated_final_recovery_attempts,
+                            "reason": terminal_decision.normalized_reason,
+                            "finish_reason": terminal_decision.raw_terminal_signal,
+                            "recovery_attempt": generation_recovery_budget.attempts_used,
                             "partial_output_chars": len(final_text),
+                            "recovery_budget": generation_recovery_budget.snapshot(),
                         }
                         yield AssistantTruncatedEvent(
                             content="Model output hit the response length limit; requesting continuation.",
-                            finish_reason=finish_reason or "length",
-                            recovery_attempt=truncated_final_recovery_attempts,
+                            finish_reason=(
+                                terminal_decision.raw_terminal_signal
+                                or "output_truncated"
+                            ),
+                            recovery_attempt=generation_recovery_budget.attempts_used,
                             partial_output_chars=len(final_text),
                             metadata=truncation_metadata,
                         )
@@ -1865,6 +1983,16 @@ class AsyncReActLoop:
                         )
                         continue
                     final_was_truncated = True
+                if truncated_final_prefix is not None:
+                    continuation = merge_continuation(
+                        truncated_final_prefix,
+                        final_text,
+                    )
+                    final_text = continuation.content
+                    continuation_merge_metadata = {
+                        "continuation_overlap_chars": continuation.overlap_chars,
+                        "continuation_merge_digest": continuation.merge_digest,
+                    }
                 if streamed_generation and held_stream_text:
                     yield TextChunkEvent(content=held_stream_text)
                 final_assistant_message = Message(
@@ -1919,14 +2047,17 @@ class AsyncReActLoop:
                     error_type="output_truncated",
                     recoverability=(
                         "recovered"
-                        if not self._is_length_finish_reason(finish_reason)
+                        if final_generation_terminal is GenerationTerminal.COMPLETE
                         else "partial"
                     ),
                     runtime_category="truncation",
                 )
             )
             final_metadata["truncated"] = True
-            final_metadata["recovery_attempts"] = truncated_final_recovery_attempts
+            final_metadata["recovery_attempts"] = generation_recovery_budget.attempts_used
+            final_metadata["recovery_budget"] = generation_recovery_budget.snapshot()
+        if continuation_merge_metadata:
+            final_metadata.update(continuation_merge_metadata)
         if final_plan_blocker_metadata:
             final_metadata.update(final_plan_blocker_metadata)
         if final_file_artifact_blocker_metadata:
@@ -1939,11 +2070,6 @@ class AsyncReActLoop:
             finish_reason=finish_reason,
             metadata=final_metadata,
         )
-
-    @staticmethod
-    def _is_length_finish_reason(finish_reason: str | None) -> bool:
-        normalized = (finish_reason or "").strip().lower()
-        return normalized in {"length", "max_tokens", "token_limit", "context_length"}
 
     @staticmethod
     def _parse_final_text_tool_calls(content: str) -> list[ToolCall]:
@@ -3143,9 +3269,8 @@ class AsyncReActLoop:
             tool_call.name
             and tool_call.name in allowed_tool_names
             and self._tool_registry is not None
-        ):
-            if self._tool_registry.get(tool_call.name) is not None:
-                return None
+        ) and self._tool_registry.get(tool_call.name) is not None:
+            return None
 
         available_tools = sorted(name for name in allowed_tool_names if name)
         available_preview = ", ".join(available_tools[:12])
@@ -3532,12 +3657,7 @@ class AsyncReActLoop:
             return True
 
         punctuation_light = sum(1 for char in normalized if char in ":：|/»›>")
-        if punctuation_light >= 6 and len(unique_lines) <= max(
-            4, len(non_empty_lines) // 2
-        ):
-            return True
-
-        return False
+        return bool(punctuation_light >= 6 and len(unique_lines) <= max(4, len(non_empty_lines) // 2))
 
     @staticmethod
     def _should_retry_empty_final_response(
@@ -3578,9 +3698,8 @@ class AsyncReActLoop:
         *,
         exc: Exception,
         messages: list[Message],
-        retry_count: int,
     ) -> str | None:
-        if retry_count >= 1 or not isinstance(exc, BackendRequestError):
+        if not isinstance(exc, BackendRequestError):
             return None
         tool_turn_reason = (
             str(exc.metadata.get("tool_turn_reason") or "").strip().lower()
@@ -3775,9 +3894,7 @@ class AsyncReActLoop:
         if metadata.get("request_shape") == "responses":
             return False
         tool_mode = metadata.get("tool_call_mode")
-        if tool_mode == "simulated_fallback":
-            return False
-        return True
+        return tool_mode != "simulated_fallback"
 
     @staticmethod
     def _build_generate_kwargs(

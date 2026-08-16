@@ -30,7 +30,6 @@ _SAFE_EVENT_FIELDS = {
     "approval_wait_expires_at",
     "approval_wait_started_at",
     "approval_wait_timeout_sec",
-    "approval_ids",
     "arguments_preview",
     "blocker_type",
     "content",
@@ -201,9 +200,7 @@ def normalize_subagent_event(
         normalized["status"] = status or (
             "blocked" if normalized["blocker_type"] or normalized["approval_ids"] else "failed"
         )
-    elif event_type == "subagent_started" and normalized["status"] is None:
-        normalized["status"] = "running"
-    elif (
+    elif event_type == "subagent_started" and normalized["status"] is None or (
         event_type
         in {
             "subagent_progress",
@@ -348,7 +345,7 @@ def _derive_projection_lane(
 def _fallback_subagent_id(*, parent_id: str, role_id: str | None, stage: str) -> str:
     safe_role = _slugify(role_id or "subagent")
     safe_stage = _slugify(stage or "event")
-    digest = sha1(f"{parent_id}:{role_id or ''}:{stage}".encode("utf-8")).hexdigest()[:8]
+    digest = sha1(f"{parent_id}:{role_id or ''}:{stage}".encode()).hexdigest()[:8]
     if role_id:
         return f"{parent_id}:{safe_role}:{safe_stage}"
     return f"{parent_id}:{safe_stage}:{digest}"

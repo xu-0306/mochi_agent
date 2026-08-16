@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from threading import RLock
-from typing import Iterator, Literal
-
+from typing import Literal
 
 GoalStrategyKind = Literal["protocol", "workflow_template", "execution_strategy"]
 GoalStrategyExecutionTopology = Literal["single_agent", "multi_agent"]

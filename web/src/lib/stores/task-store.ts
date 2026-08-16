@@ -10,6 +10,7 @@ import {
   fetchTask,
   fetchTasks,
   previewWorkspacePatch,
+  previewWorkspacePatchSubset,
   type PatchPreviewResult,
   resolveApproval,
   resumeTask,
@@ -68,6 +69,7 @@ interface TaskStore {
   setApprovalPatchEditing: (approvalId: string, editing: boolean) => void
   setApprovalPatchText: (approvalId: string, patchText: string) => void
   previewApprovalPatch: (approvalId: string) => Promise<void>
+  previewApprovalSubset: (approvalId: string, selectedEntryIds: string[]) => Promise<void>
   resetApprovalPatch: (approvalId: string) => void
   refreshApprovalExecSession: (approvalId: string, yieldTimeMs?: number) => Promise<void>
   stopApprovalExecSession: (approvalId: string) => Promise<void>
@@ -398,6 +400,97 @@ export const useTaskStore = create<TaskStore>((set, get) => ({
             isPreviewLoading: false,
             previewError: error instanceof Error ? error.message : 'Failed to preview patch',
             lastPreviewedPatchText: patchText,
+          },
+        },
+      }))
+    }
+  },
+
+  previewApprovalSubset: async (approvalId, selectedEntryIds) => {
+    const approval = get().approvals.find((item) => item.approval_id === approvalId)
+    const normalizedEntryIds = selectedEntryIds.map((entryId) => entryId.trim())
+    const uniqueEntryIds = [...new Set(normalizedEntryIds)]
+    const validationError =
+      normalizedEntryIds.some((entryId) => entryId.length === 0)
+        ? 'Selected changes must have entry IDs'
+        : uniqueEntryIds.length === 0
+        ? 'Select at least one change before previewing the subset'
+        : uniqueEntryIds.length !== normalizedEntryIds.length
+          ? 'Selected changes must be unique'
+          : null
+
+    if (!approval || validationError) {
+      if (approval && validationError) {
+        set((state) => ({
+          approvalReviewStates: {
+            ...state.approvalReviewStates,
+            [approvalId]: {
+              ...(state.approvalReviewStates[approvalId] ?? buildApprovalReviewState(approval)),
+              isPreviewLoading: false,
+              previewError: validationError,
+            },
+          },
+        }))
+      }
+      return
+    }
+
+    set((state) => ({
+      approvalReviewStates: {
+        ...state.approvalReviewStates,
+        [approvalId]: {
+          ...(state.approvalReviewStates[approvalId] ?? buildApprovalReviewState(approval)),
+          isPreviewLoading: true,
+          previewError: null,
+        },
+      },
+      error: null,
+    }))
+
+    try {
+      const preview = await previewWorkspacePatchSubset({
+        approvalId,
+        selectedEntryIds: uniqueEntryIds,
+      })
+      if (!preview.replacementApprovalId?.trim() || !preview.requestDigest?.trim()) {
+        throw new Error('Subset preview did not create a replacement approval')
+      }
+
+      const approvals = await fetchApprovals()
+      const replacement = approvals.find(
+        (item) => item.approval_id === preview.replacementApprovalId
+      )
+      if (!replacement) {
+        throw new Error('Replacement approval was not available after subset preview')
+      }
+
+      set((state) => {
+        const reconciled = reconcileApprovalReviewStates(state.approvalReviewStates, approvals)
+        return {
+          approvals,
+          approvalReviewStates: {
+            ...reconciled,
+            [approvalId]: {
+              ...(reconciled[approvalId] ?? buildApprovalReviewState(approval)),
+              isPreviewLoading: false,
+              preview: null,
+              previewError: null,
+            },
+            [replacement.approval_id]: {
+              ...buildApprovalReviewState(replacement),
+              preview,
+            },
+          },
+        }
+      })
+    } catch (error) {
+      set((state) => ({
+        approvalReviewStates: {
+          ...state.approvalReviewStates,
+          [approvalId]: {
+            ...(state.approvalReviewStates[approvalId] ?? buildApprovalReviewState(approval)),
+            isPreviewLoading: false,
+            previewError: error instanceof Error ? error.message : 'Failed to preview selected changes',
           },
         },
       }))

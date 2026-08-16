@@ -7,18 +7,27 @@ import inspect
 import json
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from mochi.agents.context_snapshot import estimate_text_tokens
+from mochi.agents.invocation import AgentInvocationRequest
 from mochi.agents.multi_agent.context import (
     DebateContextManager,
-    DebateContextOverflowError,
     DebateContextPolicy,
     summarize_candidate_outputs,
     verification_reduce,
+)
+from mochi.agents.multi_agent.evaluator import (
+    CandidateScore,
+    CandidateVerification,
+    LLMFirstScoringPolicy,
+    evidence_gate_rank,
+    resolve_evidence_gate_status,
 )
 from mochi.agents.multi_agent.execution_coordinator import (
     ControlledExecutionResumeHooks,
@@ -29,13 +38,6 @@ from mochi.agents.multi_agent.execution_policy import (
     SubagentExecutionPolicy,
     execution_policy_to_dict,
     parse_subagent_execution_policy,
-)
-from mochi.agents.multi_agent.evaluator import (
-    CandidateVerification,
-    CandidateScore,
-    LLMFirstScoringPolicy,
-    evidence_gate_rank,
-    resolve_evidence_gate_status,
 )
 from mochi.agents.multi_agent.protocols import (
     AutonomousSingleAgentProtocol,
@@ -63,16 +65,14 @@ from mochi.agents.multi_agent.roles import (
     build_teacher_student_roles,
 )
 from mochi.agents.multi_agent.utils import parse_json_payload
-from mochi.agents.context_snapshot import estimate_text_tokens
-from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.types import GenerationResult, Message
+from mochi.runtime.approvals import ApprovalStore
 from mochi.runtime.collector_contracts import (
     collector_dataset_records_from_result,
     collector_record_provenance_list_from_result,
     collector_shard_manifests_from_result,
     dedupe_collector_shard_manifests,
 )
-from mochi.runtime.approvals import ApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.recovery import (
     build_resource_exhaustion_report,
@@ -1902,7 +1902,7 @@ class MultiAgentOrchestrator:
                 if heartbeat_timeout_sec is not None:
                     return await asyncio.wait_for(operation(), timeout=float(heartbeat_timeout_sec))
                 return await operation()
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 failure_count = self._record_subagent_failure(
                     role_id=role_id,
                     model_id=model_id,
@@ -3946,7 +3946,12 @@ class MultiAgentOrchestrator:
                 session_id = f"multi-agent::{session_scope}::{uuid4()}"
                 active_tool_controller = ActiveToolController()
                 run_cancellation_context = RunCancellationContext(
-                    run_id=str(self._current_run_id or effective_runtime_subagent_id or role_id or session_id)
+                    run_id=str(
+                        self._current_run_id
+                        or effective_runtime_subagent_id
+                        or effective_runtime_role_id
+                        or session_id
+                    )
                 )
                 await run_cancellation_context.bind_active_tool_controller(active_tool_controller)
                 invoke_task = asyncio.create_task(
@@ -4126,7 +4131,13 @@ class MultiAgentOrchestrator:
         while True:
             active_tool_controller = ActiveToolController()
             run_cancellation_context = RunCancellationContext(
-                run_id=str(self._current_run_id or effective_runtime_subagent_id or role_id or model_id or "configured-model")
+                run_id=str(
+                    self._current_run_id
+                    or effective_runtime_subagent_id
+                    or effective_runtime_role_id
+                    or model_id
+                    or "configured-model"
+                )
             )
             await run_cancellation_context.bind_active_tool_controller(active_tool_controller)
             generate_task = asyncio.create_task(
@@ -5056,7 +5067,7 @@ class MultiAgentOrchestrator:
                 prompt = f"{prompt}\n\nResearch context:\n{research_appendix}"
             try:
                 result = await self._await_subagent_operation(
-                    lambda: generate(
+                    lambda prompt=prompt: generate(
                         model_id=verifier_model_id,
                         messages=[
                             Message(

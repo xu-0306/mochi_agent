@@ -73,6 +73,11 @@ class _FakeSkillLibrary:
         return [skill.to_dict() for skill in self.skills.values()]
 
 
+class _PromotionConflictLibrary:
+    async def promote(self, skill_id: str, version: int, evaluation_evidence: dict[str, Any]) -> Skill:
+        raise ValueError("skill version conflict")
+
+
 def test_skills_routes_prefer_app_state_skill_library() -> None:
     """skills routes 應優先使用 app.state.skill_library。"""
     app = _create_app_with_skills_router()
@@ -239,3 +244,92 @@ No manual import command is required.
     indexed = next(item for item in payload if item["skill_id"] == "skill-installer")
     assert indexed["source_type"] == "filesystem"
     assert indexed["body"].startswith("# Skill Installer")
+
+
+def test_skill_version_routes_require_evidence_and_preserve_history_and_pins(tmp_path: Path) -> None:
+    skills_dir = tmp_path / "skills-store"
+    library = SkillLibrary(skills_dir / "skills.db")
+    skill = make_skill(
+        skill_id="skill-versioned",
+        name="Versioned skill",
+        description="Initial retained version",
+        trigger_keywords=["version"],
+        updated_at=10,
+    )
+    _add_skills(library, skill)
+    asyncio.run(library.update(skill.skill_id, {"description": "Improved retained version"}))
+    asyncio.run(library.pin_run_version("recorded-run", skill.skill_id, 1))
+
+    app = _create_app_with_skills_router()
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "skills_dir": str(skills_dir),
+            "learning": {"auto_sync_filesystem_skills": False},
+        },
+    )
+
+    with TestClient(app) as client:
+        history_response = client.get("/v1/skills/skill-versioned/versions")
+        retained_response = client.get("/v1/skills/skill-versioned/versions/1")
+        no_evidence_response = client.post(
+            "/v1/skills/skill-versioned/versions/1/promote",
+            json={"evaluation_evidence": {}},
+        )
+        no_evidence_id_response = client.post(
+            "/v1/skills/skill-versioned/versions/1/promote",
+            json={"evaluation_evidence": {"score": 0.9}},
+        )
+        promoted_response = client.post(
+            "/v1/skills/skill-versioned/versions/1/promote",
+            json={"evaluation_evidence": {"evidence_id": "eval-1", "score": 0.9}},
+        )
+        active_after_promotion = client.get("/v1/skills/skill-versioned")
+        missing_version_response = client.post(
+            "/v1/skills/skill-versioned/versions/99/promote",
+            json={"evaluation_evidence": {"evidence_id": "eval-99"}},
+        )
+        blank_reason_response = client.post(
+            "/v1/skills/skill-versioned/versions/2/rollback",
+            json={"reason": "   "},
+        )
+        rollback_response = client.post(
+            "/v1/skills/skill-versioned/versions/2/rollback",
+            json={"reason": "regression observed"},
+        )
+        active_after_rollback = client.get("/v1/skills/skill-versioned")
+
+    assert history_response.status_code == 200
+    assert [item["version"] for item in history_response.json()] == [1, 2]
+    assert retained_response.status_code == 200
+    assert retained_response.json()["description"] == "Initial retained version"
+
+    assert no_evidence_response.status_code == 422
+    assert no_evidence_id_response.status_code == 422
+    assert promoted_response.status_code == 200
+    assert promoted_response.json()["skill"]["version"] == 1
+    assert promoted_response.json()["promotion"]["evidence"]["evidence_id"] == "eval-1"
+    assert active_after_promotion.json()["version"] == 1
+    assert missing_version_response.status_code == 404
+    assert missing_version_response.json() == {"detail": "Skill version not found"}
+
+    assert blank_reason_response.status_code == 422
+    assert rollback_response.status_code == 200
+    assert rollback_response.json()["skill"]["version"] == 2
+    assert rollback_response.json()["reason"] == "regression observed"
+    assert active_after_rollback.json()["version"] == 2
+    assert [item.version for item in asyncio.run(library.list_versions(skill.skill_id))] == [1, 2]
+    assert asyncio.run(library.get_pinned_version("recorded-run")).version == 1
+
+
+def test_skill_version_routes_map_conflicts_to_409() -> None:
+    app = _create_app_with_skills_router()
+    app.state.skill_library = _PromotionConflictLibrary()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/skills/skill-versioned/versions/1/promote",
+            json={"evaluation_evidence": {"evidence_id": "eval-1"}},
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "skill version conflict"}

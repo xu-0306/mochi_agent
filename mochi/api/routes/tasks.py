@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel
 
@@ -57,7 +59,7 @@ async def append_task_message(
 async def resume_task(
     request: Request,
     task_id: str,
-    payload: ApprovalResolution | None = Body(default=None),
+    payload: Annotated[ApprovalResolution | None, Body()] = None,
 ) -> dict:
     service = await _get_runtime_service(request.app)
     result = await service.resume_task(

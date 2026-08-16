@@ -545,6 +545,9 @@ def test_runtime_service_runs_file_recovery_before_other_startup_work(
     order: list[str] = []
 
     class _ExecRuntime:
+        def list_sessions(self) -> list[object]:
+            return []
+
         async def recover_detached_sessions(self) -> None:
             order.append("exec")
 

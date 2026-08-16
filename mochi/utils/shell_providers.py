@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -112,7 +114,7 @@ def default_shell_providers() -> dict[str, BaseShellProvider]:
     """建立預設 shell provider 集合。"""
 
     providers: list[BaseShellProvider] = [
-        PowerShellProvider(),
+        PowerShellProvider(executable=_default_powershell_executable()),
         BashProvider(),
         CmdProvider(),
     ]
@@ -121,3 +123,11 @@ def default_shell_providers() -> dict[str, BaseShellProvider]:
         for alias in provider.aliases:
             mapping[alias] = provider
     return mapping
+
+
+def _default_powershell_executable() -> str:
+    """Prefer PowerShell 7, with the Windows-inbox shell as a safe fallback."""
+
+    if os.name == "nt" and shutil.which("pwsh") is None and shutil.which("powershell"):
+        return "powershell"
+    return "pwsh"

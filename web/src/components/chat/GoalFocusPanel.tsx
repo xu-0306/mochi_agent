@@ -25,11 +25,14 @@ import {
   type GoalHeaderChipView,
 } from './GoalHeaderChip'
 import { SubagentTimelineCard } from './SubagentTimelineCard'
+import { GoalFailurePresentation } from './GoalFailurePresentation'
+import type { FailureEnvelopeInput } from '@/lib/failure-presentation'
 
 interface GoalFocusPanelProps {
   goal: GoalHeaderChipView
   blocker?: GoalDrawerBlockerView | null
   callout?: GoalFocusCalloutView | null
+  failure?: FailureEnvelopeInput | null
   timelineEvents?: ExecutionTranscriptEvent[]
   subagents?: SubagentTranscriptSummary[]
   timelineError?: string | null
@@ -99,6 +102,7 @@ export function GoalFocusPanel({
   goal,
   blocker = null,
   callout = null,
+  failure = null,
   timelineEvents = [],
   subagents = [],
   timelineError = null,
@@ -113,7 +117,6 @@ export function GoalFocusPanel({
   const copySource =
     goal.copySource ||
     blocker?.summary ||
-    blocker?.latestError ||
     goal.title
   const chromeCopy = buildGoalChromeCopy(copySource)
   const displayLabel = buildGoalDisplayStateLabel(copySource, goal.displayState)
@@ -182,7 +185,13 @@ export function GoalFocusPanel({
         </div>
       </div>
 
-      {callout ? (
+      {failure || blocker?.latestError ? (
+        <GoalFailurePresentation
+          failure={failure}
+          latestError={blocker?.latestError ?? null}
+          className="mt-4"
+        />
+      ) : callout ? (
         <div className={cn('mt-4 rounded-2xl border p-3', calloutTone(callout.tone))}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0 flex-1">

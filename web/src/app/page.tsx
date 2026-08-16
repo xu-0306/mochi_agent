@@ -3907,18 +3907,16 @@ export default function ChatPage() {
         pending_proposal: null,
       })
 
-      const lifecycleContent =
-        nextGoal.latest_error?.trim() ||
-        buildGoalLifecycleMessage(
-          nextGoalSummary.objective || route.raw || '',
-          route.action === 'status'
-            ? 'status_fetched'
-            : route.action === 'pause'
-              ? 'goal_paused'
-              : route.action === 'resume'
-                ? 'goal_resumed'
-                : 'goal_stopped'
-        )
+      const lifecycleContent = buildGoalLifecycleMessage(
+        nextGoalSummary.objective || route.raw || '',
+        route.action === 'status'
+          ? 'status_fetched'
+          : route.action === 'pause'
+            ? 'goal_paused'
+            : route.action === 'resume'
+              ? 'goal_resumed'
+              : 'goal_stopped'
+      )
 
       await persistGoalConversation({
         sessionId,
@@ -5868,11 +5866,10 @@ export default function ChatPage() {
 
     return {
       summary:
-        getString(goalDrawerHealth.recommended_next_action?.summary) ??
-        goalDrawerHealth.latest_error ??
-        null,
+        getString(goalDrawerHealth.recommended_next_action?.summary) ?? null,
       recommendedAction: getString(goalDrawerHealth.recommended_next_action?.action),
       latestError: goalDrawerHealth.latest_error,
+      failure: goalDrawerHealth.failure,
       approvalCount:
         typeof goalDrawerHealth.approval_state?.pending_count === 'number' &&
         Number.isFinite(goalDrawerHealth.approval_state.pending_count)
@@ -6115,7 +6112,7 @@ export default function ChatPage() {
             approvalCount: continuation.approvalIds.length,
             toolNames: continuation.toolNames,
             recommendedAction: continuation.recommendedAction,
-            latestError: refreshedGoal.latest_error ?? null,
+            latestError: null,
           })
 
           await persistGoalConversation({
@@ -6223,7 +6220,7 @@ export default function ChatPage() {
             approvalCount: continuation.approvalIds.length,
             toolNames: continuation.toolNames,
             recommendedAction: continuation.recommendedAction,
-            latestError: refreshedGoal.latest_error ?? null,
+            latestError: null,
           })
           await persistGoalConversation({
             sessionId,
@@ -6510,6 +6507,7 @@ export default function ChatPage() {
                     goal={headerGoal}
                     blocker={goalDrawerBlocker}
                     callout={goalSurfaceCallout}
+                    failure={goalDrawerHealth?.failure ?? null}
                     timelineEvents={goalSurfaceTimelineEvents}
                     subagents={goalSurfaceSubagents}
                     timelineError={executionTimelineError}

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
+from mochi.api.session_store_binding import resolve_route_session_store
 from mochi.projects.execution_scope import ExecutionScopeResolver
 from mochi.runtime.change_sets import (
     ChangeSetStore,
@@ -24,7 +25,6 @@ from mochi.runtime.change_sets import (
 )
 from mochi.runtime.security_audit import SecurityAuditEvent, file_content_observation
 from mochi.runtime.store import RuntimeStore
-from mochi.api.session_store_binding import resolve_route_session_store
 from mochi.security.file_contract import (
     AUTHORIZATION_ENVELOPE_SCHEMA_VERSION,
     AuthorizationContext,

@@ -9,9 +9,10 @@ construction, cancellation delivery, approval reconciliation, and tool calls.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Literal
 
 from mochi.sessions.store import (
     DurableSessionSnapshot,
@@ -1920,9 +1921,7 @@ class SessionTurnTimelineRepository:
         token = _require_text(token, "token")
         if boundary not in {"not_started", "started", "unknown"}:
             raise ValueError(f"unsupported side-effect boundary: {boundary!r}")
-        if boundary in {"started", "unknown"}:
-            operation_id = _require_text(operation_id, "operation_id")
-        elif operation_id is not None:
+        if boundary in {"started", "unknown"} or operation_id is not None:
             operation_id = _require_text(operation_id, "operation_id")
         now_utc = _coerce_now(now)
 

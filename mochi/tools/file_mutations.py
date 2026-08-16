@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import difflib
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -96,9 +97,12 @@ def build_file_change_entry(
         )
     )
     diff_text = "\n".join(diff_lines) if diff_lines else None
-    if diff_text is not None and undo_limit_bytes > 0:
-        if content_size_bytes(diff_text, encoding=encoding) > undo_limit_bytes:
-            diff_text = None
+    if (
+        diff_text is not None
+        and undo_limit_bytes > 0
+        and content_size_bytes(diff_text, encoding=encoding) > undo_limit_bytes
+    ):
+        diff_text = None
 
     undo_available = False
     undo_reason: str | None = None
@@ -510,10 +514,8 @@ def _patch_validation_from_security(
         )
         if path_scope is not None:
             metadata["path_scope"] = path_scope
-        try:
+        with suppress(OSError, RuntimeError, ValueError):
             metadata["resolved_path"] = str(resolve_path_with_scope(path, workspace_root, "any"))
-        except (OSError, RuntimeError, ValueError):
-            pass
     metadata.update(
         {
             "runtime_category": "permission",

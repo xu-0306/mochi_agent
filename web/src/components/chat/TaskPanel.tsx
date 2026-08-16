@@ -8,9 +8,10 @@ import { Textarea } from '@/components/ui/textarea'
 import { FloatingPanelShell } from '@/components/chat/FloatingPanelShell'
 import { FileChangeCard } from '@/components/chat/FileChangeCard'
 import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
+import { AgentRunFailurePresentation } from '@/components/agent-runs/AgentRunFailurePresentation'
 import * as api from '@/lib/api'
 import type { AgentRunDetail, AgentRunHealthSummary, ApprovalSummary, TaskDetail, TaskSummary } from '@/lib/api'
-import type { FileChangeGroupSummary, PatchPreviewResult } from '@/lib/file-change-preview'
+import type { FileChangeGroupSummary, FileChangeSummary, PatchPreviewResult } from '@/lib/file-change-preview'
 import { buildDelegatedSubagentTranscript, delegatedSubagentTitle, resolveDelegatedSubagentView } from '@/lib/subagent-tasks'
 import { useSessionStore } from '@/lib/stores/session-store'
 import { useTaskStore } from '@/lib/stores/task-store'
@@ -196,6 +197,125 @@ function buildPreviewGroup(
   }
 }
 
+interface SubsetSelectionLedger {
+  parentApprovalId: string
+  entries: Array<{
+    entryId: string
+    displayPath: string
+    dependencyGroup: string | null
+  }>
+  selectedEntryIds: string[]
+}
+
+const subsetSelectionLedgers = new Map<string, SubsetSelectionLedger>()
+const subsetSelectionLedgerStoragePrefix = 'mochi:subset-selection:'
+
+function getSubsetSelectionLedger(approvalId: string): SubsetSelectionLedger | null {
+  const cached = subsetSelectionLedgers.get(approvalId)
+  if (cached) {
+    return cached
+  }
+  if (typeof window === 'undefined') {
+    return null
+  }
+  try {
+    const parsed: unknown = JSON.parse(
+      window.sessionStorage.getItem(`${subsetSelectionLedgerStoragePrefix}${approvalId}`) ?? 'null'
+    )
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !Array.isArray((parsed as SubsetSelectionLedger).entries) ||
+      !Array.isArray((parsed as SubsetSelectionLedger).selectedEntryIds)
+    ) {
+      return null
+    }
+    const ledger = parsed as SubsetSelectionLedger
+    subsetSelectionLedgers.set(approvalId, ledger)
+    return ledger
+  } catch {
+    return null
+  }
+}
+
+function rememberSubsetSelection(
+  replacementApprovalId: string,
+  parentApprovalId: string,
+  files: FileChangeSummary[],
+  selectedEntryIds: string[]
+): void {
+  const ledger: SubsetSelectionLedger = {
+    parentApprovalId,
+    entries: files.flatMap((file) => file.entryId
+      ? [{
+          entryId: file.entryId,
+          displayPath: file.displayPath,
+          dependencyGroup: file.dependencyGroup,
+        }]
+      : []),
+    selectedEntryIds,
+  }
+  subsetSelectionLedgers.set(replacementApprovalId, ledger)
+  if (typeof window !== 'undefined') {
+    try {
+      window.sessionStorage.setItem(
+        `${subsetSelectionLedgerStoragePrefix}${replacementApprovalId}`,
+        JSON.stringify(ledger)
+      )
+    } catch {
+      // This display-only history is optional when storage is unavailable.
+    }
+  }
+}
+
+function getSubsetSelectableFiles(approval: ApprovalSummary): FileChangeSummary[] {
+  const seenEntryIds = new Set<string>()
+  const files: FileChangeSummary[] = []
+
+  for (const group of approval.file_change_groups) {
+    for (const file of group.files) {
+      const entryId = file.entryId?.trim()
+      if (!entryId || seenEntryIds.has(entryId)) {
+        continue
+      }
+      seenEntryIds.add(entryId)
+      files.push(file)
+    }
+  }
+
+  return files
+}
+
+function subsetEntryIdsForToggle(
+  files: FileChangeSummary[],
+  selectedEntryIds: ReadonlySet<string>,
+  entryId: string,
+  checked: boolean
+): string[] {
+  const target = files.find((file) => file.entryId === entryId)
+  if (!target) {
+    return Array.from(selectedEntryIds)
+  }
+  const groupEntryIds = files
+    .filter((file) => target.dependencyGroup !== null && file.dependencyGroup === target.dependencyGroup)
+    .map((file) => file.entryId)
+    .filter((item): item is string => Boolean(item))
+  const affectedEntryIds = groupEntryIds.length > 0 ? groupEntryIds : [entryId]
+  const next = new Set(selectedEntryIds)
+
+  for (const affectedEntryId of affectedEntryIds) {
+    if (checked) {
+      next.add(affectedEntryId)
+    } else {
+      next.delete(affectedEntryId)
+    }
+  }
+
+  return files
+    .map((file) => file.entryId)
+    .filter((item): item is string => typeof item === 'string' && next.has(item))
+}
+
 function ApprovalReviewCard({
   approval,
   execState,
@@ -208,6 +328,7 @@ function ApprovalReviewCard({
   setApprovalPatchEditing,
   setApprovalPatchText,
   previewApprovalPatch,
+  previewApprovalSubset,
   resetApprovalPatch,
 }: {
   approval: ApprovalSummary
@@ -235,6 +356,7 @@ function ApprovalReviewCard({
   setApprovalPatchEditing: (approvalId: string, editing: boolean) => void
   setApprovalPatchText: (approvalId: string, patchText: string) => void
   previewApprovalPatch: (approvalId: string) => Promise<void>
+  previewApprovalSubset: (approvalId: string, selectedEntryIds: string[]) => Promise<void>
   resetApprovalPatch: (approvalId: string) => void
 }) {
   const deferredPatchText = React.useDeferredValue(reviewState.patchText ?? '')
@@ -284,6 +406,66 @@ function ApprovalReviewCard({
   const displayedExpiry = contractPreview?.expiresAt ?? approval.change_expires_at
   const displayedPolicy = contractPreview?.policyVersion ?? approval.change_policy_version
   const displayedApprovalState = contractPreview?.approvalState ?? approval.approval_state
+  const subsetSelectableFiles = React.useMemo(
+    () => getSubsetSelectableFiles(approval),
+    [approval]
+  )
+  const [selectedSubsetEntryIds, setSelectedSubsetEntryIds] = React.useState<string[]>(
+    () => subsetSelectableFiles.map((file) => file.entryId as string)
+  )
+  const [isSubsetPreviewPending, setIsSubsetPreviewPending] = React.useState(false)
+  const selectedSubsetEntryIdSet = React.useMemo(
+    () => new Set(selectedSubsetEntryIds),
+    [selectedSubsetEntryIds]
+  )
+  const subsetSelectionAvailable =
+    approval.status === 'pending' &&
+    approval.change_set_id !== null &&
+    approval.request_digest !== null &&
+    subsetSelectableFiles.length > 0
+  const subsetSelectionLedger = getSubsetSelectionLedger(approval.approval_id)
+  const excludedSubsetEntries = subsetSelectionLedger?.entries.filter(
+    (entry) => !subsetSelectionLedger.selectedEntryIds.includes(entry.entryId)
+  ) ?? []
+
+  React.useEffect(() => {
+    setSelectedSubsetEntryIds(subsetSelectableFiles.map((file) => file.entryId as string))
+    setIsSubsetPreviewPending(false)
+  }, [approval.approval_id, subsetSelectableFiles])
+
+  const handleSubsetSelectionChange = async (entryId: string, checked: boolean): Promise<void> => {
+    if (isSubsetPreviewPending) {
+      return
+    }
+    const nextEntryIds = subsetEntryIdsForToggle(
+      subsetSelectableFiles,
+      selectedSubsetEntryIdSet,
+      entryId,
+      checked
+    )
+    if (nextEntryIds.length === 0) {
+      return
+    }
+
+    setSelectedSubsetEntryIds(nextEntryIds)
+    setIsSubsetPreviewPending(true)
+    try {
+      await previewApprovalSubset(approval.approval_id, nextEntryIds)
+      const replacement = useTaskStore.getState().approvals.find(
+        (item) => item.supersedes_approval_id === approval.approval_id
+      )
+      if (replacement) {
+        rememberSubsetSelection(
+          replacement.approval_id,
+          approval.approval_id,
+          subsetSelectableFiles,
+          nextEntryIds
+        )
+      }
+    } finally {
+      setIsSubsetPreviewPending(false)
+    }
+  }
 
   React.useEffect(() => {
     if (!canEditPatch || !reviewState.isEditingPatch) {
@@ -507,6 +689,85 @@ function ApprovalReviewCard({
             <FilePenLine className="h-3.5 w-3.5" />
             {reviewState.isEditingPatch ? 'Hide patch' : 'Edit patch'}
           </Button>
+        </div>
+      ) : null}
+
+      {subsetSelectionAvailable ? (
+        <fieldset
+          className="mb-3 rounded-[1.1rem] border border-primary-500/20 bg-primary-500/5 px-3 py-3"
+          data-testid="subset-selection"
+        >
+          <legend className="px-1 text-sm font-semibold text-foreground">Select changes to approve</legend>
+          <p className="mb-3 text-xs leading-relaxed text-muted-foreground">
+            Changing this selection creates a server-authoritative replacement approval. Unchecked changes are excluded.
+          </p>
+          <div className="space-y-2">
+            {subsetSelectableFiles.map((file) => {
+              const entryId = file.entryId as string
+              const groupFiles = file.dependencyGroup === null
+                ? [file]
+                : subsetSelectableFiles.filter((candidate) => candidate.dependencyGroup === file.dependencyGroup)
+              const groupEntryIds = groupFiles
+                .map((candidate) => candidate.entryId)
+                .filter((item): item is string => Boolean(item))
+              const isSelected = selectedSubsetEntryIdSet.has(entryId)
+              const wouldEmptySelection = isSelected &&
+                selectedSubsetEntryIds.length === groupEntryIds.length
+
+              return (
+                <label
+                  key={entryId}
+                  className="flex cursor-pointer items-start gap-2 rounded-lg border border-white/8 bg-canvas/45 px-2.5 py-2 text-xs text-muted-foreground"
+                  data-testid={`subset-entry-${entryId}`}
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={isSelected}
+                    disabled={isSubsetPreviewPending || wouldEmptySelection}
+                    onChange={(event) => void handleSubsetSelectionChange(entryId, event.target.checked)}
+                  />
+                  <span className="min-w-0">
+                    <span className="block break-all font-medium text-foreground">{file.displayPath}</span>
+                    <span className="mt-0.5 block font-mono text-[10px]">Entry: {entryId}</span>
+                    {file.dependencyGroup !== null ? (
+                      <span className="mt-0.5 block text-amber-100">
+                        Dependency group {file.dependencyGroup}: selected together.
+                      </span>
+                    ) : null}
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+          {isSubsetPreviewPending ? (
+            <p className="mt-3 text-xs text-primary-200">Preparing replacement approval…</p>
+          ) : null}
+          {reviewState.previewError ? (
+            <p className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              The selection was not re-previewed. Resolve the conflict with a fresh review; it will not retry automatically.
+            </p>
+          ) : null}
+        </fieldset>
+      ) : null}
+
+      {excludedSubsetEntries.length > 0 ? (
+        <div
+          className="mb-3 rounded-[1.1rem] border border-amber-400/25 bg-amber-400/10 px-3 py-3 text-xs"
+          data-testid="subset-excluded"
+        >
+          <p className="font-semibold text-amber-50">Excluded from the parent selection</p>
+          <p className="mt-1 text-amber-100">
+            These entries were deliberately left out of this replacement approval.
+          </p>
+          <ul className="mt-2 space-y-1 text-amber-50">
+            {excludedSubsetEntries.map((entry) => (
+              <li key={entry.entryId} className="break-all">
+                {entry.displayPath}
+                {entry.dependencyGroup ? ` (dependency group ${entry.dependencyGroup})` : ''}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
@@ -771,6 +1032,7 @@ function TaskPanelBody({
   setApprovalPatchEditing,
   setApprovalPatchText,
   previewApprovalPatch,
+  previewApprovalSubset,
   resetApprovalPatch,
   refreshApprovalExecSession,
   reject,
@@ -820,6 +1082,7 @@ function TaskPanelBody({
   setApprovalPatchEditing: (approvalId: string, editing: boolean) => void
   setApprovalPatchText: (approvalId: string, patchText: string) => void
   previewApprovalPatch: (approvalId: string) => Promise<void>
+  previewApprovalSubset: (approvalId: string, selectedEntryIds: string[]) => Promise<void>
   resetApprovalPatch: (approvalId: string) => void
   refreshApprovalExecSession: (approvalId: string, yieldTimeMs?: number) => Promise<void>
   reject: (approvalId: string) => Promise<void>
@@ -1005,10 +1268,11 @@ function TaskPanelBody({
                     <p>Detached exec jobs: {Object.keys(workflowHealth.detached_exec_jobs).length}</p>
                   ) : null}
                 </div>
-                {workflowRun.latest_error ? (
-                  <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive">
-                    {workflowRun.latest_error}
-                  </p>
+                {workflowRun.failure || workflowRun.latest_error ? (
+                  <AgentRunFailurePresentation
+                    failure={workflowRun.failure}
+                    latestError={workflowRun.latest_error}
+                  />
                 ) : null}
                 {onOpenWorkflowRun ? (
                   <div className="flex gap-1.5 pt-1">
@@ -1085,6 +1349,7 @@ function TaskPanelBody({
                     setApprovalPatchEditing={setApprovalPatchEditing}
                     setApprovalPatchText={setApprovalPatchText}
                     previewApprovalPatch={previewApprovalPatch}
+                    previewApprovalSubset={previewApprovalSubset}
                     resetApprovalPatch={resetApprovalPatch}
                   />
                 ))
@@ -1378,6 +1643,7 @@ export function TaskPanel({
     setApprovalPatchEditing,
     setApprovalPatchText,
     previewApprovalPatch,
+    previewApprovalSubset,
     resetApprovalPatch,
     refreshApprovalExecSession,
     reject,
@@ -1505,6 +1771,7 @@ export function TaskPanel({
         setApprovalPatchEditing={setApprovalPatchEditing}
         setApprovalPatchText={setApprovalPatchText}
         previewApprovalPatch={previewApprovalPatch}
+        previewApprovalSubset={previewApprovalSubset}
         resetApprovalPatch={resetApprovalPatch}
         refreshApprovalExecSession={refreshApprovalExecSession}
         reject={reject}
