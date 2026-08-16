@@ -19,6 +19,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Enable and verify unprivileged bubblewrap namespaces
+        run: |
+          if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --die-with-parent --new-session --unshare-pid --unshare-net \
+            --ro-bind / / --proc /proc --dev /dev -- /bin/true
       - run: uv sync --dev
       - run: uv run pytest tests/security/test_os_sandbox.py -q
         env:
