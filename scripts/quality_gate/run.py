@@ -405,6 +405,16 @@ def _execute_components(repo_root: Path, components: Sequence[str]) -> tuple[str
         completed = _run(task.command, cwd=repo_root)
         result = "passed" if completed.returncode == 0 else "regression"
         any_regression = any_regression or result == "regression"
+        if result == "regression":
+            print(
+                f"quality component {component!r} failed with exit code "
+                f"{completed.returncode}",
+                file=sys.stderr,
+            )
+            if completed.stdout:
+                print(completed.stdout.rstrip(), file=sys.stderr)
+            if completed.stderr:
+                print(completed.stderr.rstrip(), file=sys.stderr)
         task_results.append(
             {
                 "component": component,

@@ -38,9 +38,6 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: uv run python scripts/quality_gate/run.py --mode pr --execute --changed-from "${{ github.event.pull_request.base.sha }}" --report artifacts/quality/pr.json
-      - name: Show first Python failure
-        if: failure()
-        run: uv run pytest -q -x
       - if: always()
         uses: actions/upload-artifact@v4
         with:

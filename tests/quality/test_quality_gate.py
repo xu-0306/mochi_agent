@@ -246,6 +246,35 @@ def test_missing_optional_dependency_is_environment_blocked(monkeypatch: pytest.
     assert artifacts[0]["result"] == "environment-blocked"
 
 
+def test_failed_component_emits_captured_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failing = run.Task("python", ("python", "-m", "pytest", "-q"))
+    monkeypatch.setattr(run, "_tasks", lambda: {"python": failing})
+    monkeypatch.setattr(run, "_task_available", lambda _task: (True, None))
+    monkeypatch.setattr(
+        run,
+        "_run",
+        lambda _command, *, cwd: subprocess.CompletedProcess(
+            failing.command,
+            1,
+            "FAILED tests/test_first.py\nFAILED tests/test_second.py\n",
+            "collection warning\n",
+        ),
+    )
+
+    result, artifacts = run._execute_components(Path.cwd(), ("python",))
+
+    diagnostics = capsys.readouterr().err
+    assert result == "regression"
+    assert artifacts[0]["exit_code"] == 1
+    assert "quality component 'python' failed with exit code 1" in diagnostics
+    assert "FAILED tests/test_first.py" in diagnostics
+    assert "FAILED tests/test_second.py" in diagnostics
+    assert "collection warning" in diagnostics
+
+
 def test_windows_cmd_shim_is_run_through_cmd_with_tokenized_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
