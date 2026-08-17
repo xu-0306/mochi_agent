@@ -62,7 +62,11 @@ class Task:
     python_module: str | None = None
 
 
-def _command_for_subprocess(command: Sequence[str]) -> list[str]:
+def _command_for_subprocess(
+    command: Sequence[str],
+    *,
+    host_os_name: str | None = None,
+) -> list[str]:
     """Return a Windows-runnable command without broadening task inputs.
 
     The quality task catalog is fixed, but its `pnpm` executable can resolve to
@@ -72,7 +76,7 @@ def _command_for_subprocess(command: Sequence[str]) -> list[str]:
     """
 
     normalized = list(command)
-    if os.name != "nt":
+    if (host_os_name or os.name) != "nt":
         return normalized
 
     configured = Path(normalized[0])

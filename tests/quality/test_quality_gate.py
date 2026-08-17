@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -249,23 +249,16 @@ def test_missing_optional_dependency_is_environment_blocked(monkeypatch: pytest.
 def test_windows_cmd_shim_is_run_through_cmd_with_tokenized_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[list[str], dict[str, object]]] = []
     shim = r"C:\\Program Files\\pnpm\\pnpm.cmd"
     command = ("pnpm", "--dir", "web folder", "run", "typecheck", "--label=a&b")
 
-    def fake_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((arguments, kwargs))
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
     monkeypatch.setattr(run.shutil, "which", lambda executable: shim if executable == "pnpm" else None)
-    monkeypatch.setattr(run.subprocess, "run", fake_run)
 
-    completed = run._run(command, cwd=Path("D:/workspace"))
+    converted = run._command_for_subprocess(command, host_os_name="nt")
 
-    assert completed.returncode == 0
-    assert Path(calls[0][0][0]).name.lower() == "cmd.exe"
-    assert calls[0][0][1:4] == ["/d", "/s", "/c"]
-    assert calls[0][0][4] == subprocess.list2cmdline([shim, *command[1:]])
+    assert PureWindowsPath(converted[0]).name.lower() == "cmd.exe"
+    assert converted[1:4] == ["/d", "/s", "/c"]
+    assert converted[4] == subprocess.list2cmdline([shim, *command[1:]])
 
 
 def test_run_decodes_console_output_as_utf8_with_replacement(
