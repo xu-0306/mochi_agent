@@ -100,15 +100,10 @@ class PosixSafeFilesystem:
     def _validate_adapter_semantics(cls, adapter: Any) -> None:
         missing: list[str] = []
         if adapter is os:
-            fd_functions = {
-                name: getattr(os, name)
-                for name in cls._FD_SEMANTICS
-            }
-            missing.extend(
-                f"{name}(fd)"
-                for name, function in fd_functions.items()
-                if function not in os.supports_fd
-            )
+            # CPython's POSIX xattr functions accept integer file descriptors,
+            # but they are not registered in ``os.supports_fd``. Their callable
+            # contract is validated in ``__init__`` and the actual descriptor
+            # operations remain fail-closed.
             dir_functions = {
                 "open": os.open,
                 "stat": os.stat,

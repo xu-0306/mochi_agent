@@ -322,6 +322,14 @@ def test_agent_runs_api_flow_supports_dr_zero_dataset_package(tmp_path: Path) ->
 def test_agent_runs_api_flow_supports_controlled_execution_dataset_package(tmp_path: Path) -> None:
     app = create_app()
     engine = _AgentRunModelBackedEngine()
+    app.state.runtime_service = RuntimeService(
+        engine=engine,
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+        exec_runtime=ExecRuntime(
+            providers={"test": _ApiRuntimePythonDirectProvider()},
+            default_shell="test",
+        ),
+    )
     app.state.engine_factory = lambda: engine
     app.state.config_factory = lambda: MochiConfig.model_validate(
         {

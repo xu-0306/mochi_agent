@@ -129,6 +129,13 @@ scripts/
 scripts/*
 !scripts/quality_gate/
 !scripts/quality_gate/*.py
+!scripts/dev-backend-windows.ps1
+!scripts/dev-web-windows.ps1
+!scripts/windows/
+scripts/windows/*
+!scripts/windows/README.md
+!scripts/windows/start-mochi.cmd
+!scripts/windows/start-mochi.ps1
 web/scripts/
 !web/scripts/
 web/scripts/*

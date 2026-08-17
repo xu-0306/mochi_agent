@@ -42,6 +42,7 @@ from mochi.sessions.store import SessionStore
 from mochi.tools.base import ToolExecutionContext
 from mochi.tools.exec_command import ExecCommandTool
 from mochi.tools.file_ops import FileWriteTool
+from tests.support.exec_providers import PythonDirectProvider
 
 
 def _future(seconds: int = 300) -> str:
@@ -357,14 +358,17 @@ def test_ordinary_chat_exec_approval_persists_the_exact_checkpoint(tmp_path: Pat
             },
         )
         tool = ExecCommandTool(
-            runtime=ExecRuntime(),
+            runtime=ExecRuntime(
+                providers={"test": PythonDirectProvider()},
+                default_shell="test",
+            ),
             approval_store=exec_store,
             workspace_dir=workspace,
             require_approval=False,
         )
         pending = await tool.execute(
-            command="echo durable-checkpoint",
-            shell="cmd",
+            command="pass",
+            shell="test",
             context=context,
         )
         approval_id = str(pending.metadata["approval_id"])
@@ -375,7 +379,7 @@ def test_ordinary_chat_exec_approval_persists_the_exact_checkpoint(tmp_path: Pat
         payload = approval.command_payload
         assert payload is not None
         checkpoint = payload["ordinary_chat_checkpoint"]
-        assert checkpoint["normalized_arguments"]["command"] == "echo durable-checkpoint"
+        assert checkpoint["normalized_arguments"]["command"] == "pass"
         assert checkpoint["resolved_workspace_dir"] == str(workspace.resolve())
         assert checkpoint["resume_cursor"]["tool_call_id"] == "call-1"
         assert checkpoint["policy_version"] == policy["policy_version"]
@@ -387,7 +391,10 @@ def test_ordinary_chat_exec_approval_persists_the_exact_checkpoint(tmp_path: Pat
             engine=object(),
             store=runtime_store,
             exec_approval_store=exec_store,
-            exec_runtime=ExecRuntime(),
+            exec_runtime=ExecRuntime(
+                providers={"test": PythonDirectProvider()},
+                default_shell="test",
+            ),
         )
         service.update_security_config(security)
         resolved = await service.resolve_approval(

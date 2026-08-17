@@ -13,7 +13,7 @@ from mochi.agents.multi_agent.roles import build_controlled_execution_roles
 from mochi.agents.multi_agent.utils import parse_json_payload
 from mochi.runtime.approvals import ApprovalStore
 from mochi.runtime.exec_runtime import ExecRuntime
-from mochi.tools.exec_command import ExecCommandTool
+from mochi.tools.exec_command import ExecCommandTool, get_shared_exec_runtime
 
 RoleGenerator = Callable[..., Awaitable[Any]]
 TextInvoker = Callable[..., Awaitable[tuple[str, dict[str, Any]]]]
@@ -48,7 +48,7 @@ class SubagentExecutionCoordinator:
     ) -> None:
         self._generate_role_candidate = generate_role_candidate
         self._invoke_text = invoke_text
-        self._exec_runtime = exec_runtime
+        self._exec_runtime = exec_runtime or get_shared_exec_runtime()
         self._exec_approval_store = exec_approval_store
         self._require_approval = bool(require_approval)
         self._command_rules = [dict(rule) for rule in (command_rules or []) if isinstance(rule, dict)]
@@ -570,6 +570,7 @@ class SubagentExecutionCoordinator:
             _prepare_detached_exec_layout(
                 workspace_dir=workspace_dir,
                 request_id=str(execution_request["request_id"]),
+                runtime_state_root=self._exec_runtime.state_root,
             )
             if resolved_background
             else None
@@ -1091,24 +1092,29 @@ def _result_session_id(result: dict[str, Any]) -> str | None:
     return None
 
 
-def _prepare_detached_exec_layout(workspace_dir: str | None, request_id: str) -> dict[str, str] | None:
+def _prepare_detached_exec_layout(
+    workspace_dir: str | None,
+    request_id: str,
+    *,
+    runtime_state_root: str | Path | None = None,
+) -> dict[str, str] | None:
     if not workspace_dir or not str(workspace_dir).strip():
         return None
     root = (Path(workspace_dir).resolve() / ".mochi-detached-exec" / request_id).resolve()
     root.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = root / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    runtime_state_root = (Path(".mochi").resolve() / "exec-runtime").resolve()
-    return {
+    layout = {
         "root_dir": str(root),
         "log_path": str((root / "session.log").resolve()),
         "session_log_path": str((root / "session.log").resolve()),
         "checkpoint_dir": str(checkpoint_dir.resolve()),
-        "manifest_path": str((root / "manifest.json").resolve()),
         "stdout_log_path": str((root / "stdout.log").resolve()),
         "stderr_log_path": str((root / "stderr.log").resolve()),
-        "runtime_state_root": str(runtime_state_root),
     }
+    if runtime_state_root is not None:
+        layout["runtime_state_root"] = str(Path(runtime_state_root).resolve())
+    return layout
 
 
 def _metadata_string(metadata: Mapping[str, Any], key: str) -> str | None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,12 +34,26 @@ def _config(sessions_dir: Path) -> MochiConfig:
     )
 
 
-def test_sessions_root_comparison_normalizes_relative_and_case_variants(
+def test_sessions_root_comparison_normalizes_relative_variants(
     tmp_path: Path,
 ) -> None:
     base = tmp_path / "Parent"
     root = base / "Sessions"
-    equivalent = base / "child" / ".." / "SESSIONS"
+    equivalent = base / "child" / ".." / "Sessions"
+
+    assert canonical_sessions_dir(root) == canonical_sessions_dir(equivalent)
+    ensure_sessions_dir_unchanged(root, equivalent)
+
+
+@pytest.mark.skipif(
+    os.path.normcase("Sessions") != os.path.normcase("SESSIONS"),
+    reason="host filesystem path semantics are case-sensitive",
+)
+def test_sessions_root_comparison_normalizes_case_on_case_insensitive_hosts(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Sessions"
+    equivalent = tmp_path / "SESSIONS"
 
     assert canonical_sessions_dir(root) == canonical_sessions_dir(equivalent)
     ensure_sessions_dir_unchanged(root, equivalent)

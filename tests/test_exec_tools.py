@@ -290,7 +290,7 @@ async def test_exec_command_foreground_cancellation_reports_cancelled_status(
 
 
 @pytest.mark.asyncio
-async def test_exec_command_returns_approval_pending_metadata() -> None:
+async def test_exec_command_returns_approval_pending_metadata(tmp_path: Path) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider(), "cmd": CmdProvider()},
         default_shell="test",
@@ -300,12 +300,12 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
         runtime=runtime,
         approval_store=approvals,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
     )
 
     result = await tool.execute(
-        command="cmd /c more notes.txt",
-        shell="cmd",
+        command="fg",
+        shell="test",
         context=ToolExecutionContext(
             permission_policy=_effective_exec_policy(
                 require_approval=True,
@@ -320,8 +320,8 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
     assert result.metadata["requires_approval"] is True
     assert result.metadata["policy_state"] == "ask"
     assert "requires approval" in result.metadata["policy_reason"]
-    assert result.metadata["rule_id"] == "cmd_c_requires_approval"
-    assert result.metadata["suggested_rule"]["tokens"] == ["cmd", "/c", "more", "notes.txt"]
+    assert result.metadata["rule_id"] == "unknown_requires_approval"
+    assert result.metadata["suggested_rule"]["tokens"] == ["fg"]
     approval_id = result.metadata["approval_id"]
     assert isinstance(approval_id, str)
     stored = approvals.get(approval_id)

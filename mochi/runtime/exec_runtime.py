@@ -65,6 +65,12 @@ class ExecRuntime:
             self._recover_detached_sessions()
         self._session_seq = count(self._next_session_sequence_start())
 
+    @property
+    def state_root(self) -> Path | None:
+        """Return the configured durable session root, when persistence is enabled."""
+
+        return self._state_root
+
     async def start_command(
         self,
         *,

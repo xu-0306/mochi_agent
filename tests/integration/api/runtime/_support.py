@@ -314,11 +314,12 @@ _BACKGROUND_SMOKE_COMMAND_RULE = {
     "match": "exact",
 }
 
+_CONTROLLED_SMOKE_COMMAND = "pass"
+
 _CONTROLLED_SMOKE_COMMAND_RULE = {
-    "tokens": ["echo", "controlled-ok"],
+    "tokens": ["pass"],
     "decision": "allow",
     "match": "exact",
-    "shells": ["powershell"],
 }
 
 class _AgentRunModelBackedEngine:
@@ -436,8 +437,8 @@ class _AgentRunModelBackedEngine:
         if model_id == "controlled-executor-model":
             return GenerationResult(
                 content=(
-                    '{"execution_requests":[{"request_id":"req-1","command":"echo controlled-ok",'
-                    '"shell":"powershell","timeout":30,"rationale":"smoke test",'
+                    f'{{"execution_requests":[{{"request_id":"req-1","command":"{_CONTROLLED_SMOKE_COMMAND}",'
+                    '"shell":"test","timeout":30,"rationale":"smoke test",'
                     '"expected_artifacts":["stdout"],"success_metric":"stdout contains controlled-ok"}]}'
                 ),
                 model=model_id,
@@ -446,7 +447,7 @@ class _AgentRunModelBackedEngine:
             return GenerationResult(
                 content=(
                     '{"status":"approved","reason":"bounded smoke command",'
-                    '"command":"echo controlled-ok","shell":"powershell","timeout":30}'
+                    f'"command":"{_CONTROLLED_SMOKE_COMMAND}","shell":"test","timeout":30}}'
                 ),
                 model=model_id,
             )
