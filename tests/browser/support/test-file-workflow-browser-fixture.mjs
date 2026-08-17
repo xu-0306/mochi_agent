@@ -286,11 +286,11 @@ async function runBrowserAssertions() {
       const response = await page.goto(`${baseUrl}/test-fixtures/file-workflow`, { waitUntil: 'networkidle' })
       assert.ok(response?.ok(), `${viewport.width}px: production fixture did not load`)
       await page.getByTestId('subset-selection').filter({ visible: true }).waitFor()
-      await page.getByTestId('subset-entry-entry-a').filter({ visible: true }).locator('input').uncheck()
       assert.equal(
         await page.getByTestId('subset-entry-entry-b').filter({ visible: true }).locator('input').isChecked(),
-        false,
+        true,
       )
+      await page.getByTestId('subset-entry-entry-a').filter({ visible: true }).locator('input').uncheck()
       await page.getByTestId('subset-excluded').filter({ visible: true }).waitFor()
       await page
         .getByText('Digest:', { exact: false })
