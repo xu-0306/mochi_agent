@@ -16,6 +16,10 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import uuid
+from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -103,6 +107,110 @@ def _run(command: Sequence[str], *, cwd: Path) -> subprocess.CompletedProcess[st
         encoding="utf-8",
         errors="replace",
     )
+
+
+def _component_log_path(artifact_root: Path, component: str) -> Path:
+    """Return the invocation-owned combined output log for a component."""
+
+    return artifact_root / "logs" / f"{component}.log"
+
+
+def _component_junit_path(artifact_root: Path, component: str) -> Path | None:
+    """Return the invocation-owned JUnit result path for pytest tasks."""
+
+    return artifact_root / "junit" / f"{component}.xml" if component in {"contracts", "python"} else None
+
+
+def _generated_artifact_paths(components: Sequence[str], report_target: Path, artifact_root: Path) -> tuple[Path, ...]:
+    """List only the files this invocation is allowed to create or replace."""
+
+    paths = [report_target]
+    for component in components:
+        paths.append(_component_log_path(artifact_root, component))
+        junit_path = _component_junit_path(artifact_root, component)
+        if junit_path is not None:
+            paths.append(junit_path)
+    return tuple(paths)
+
+
+def _run_with_diagnostics(
+    command: Sequence[str], *, cwd: Path, log_path: Path
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Stream a task's output while retaining a bounded failure summary and log.
+
+    ``subprocess.run(capture_output=True)`` is useful for short internal commands,
+    but it hides live task progress in CI.  Component commands use pipes instead so
+    both streams can be emitted immediately and recorded in one durable log.
+    """
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    recent: deque[str] = deque(maxlen=12)
+    recent_lock = threading.Lock()
+    log_lock = threading.Lock()
+    stream_failures: list[str] = []
+    failure_lock = threading.Lock()
+    started = time.monotonic()
+    with log_path.open("w", encoding="utf-8", newline="") as log_file:
+        process = subprocess.Popen(
+            _command_for_subprocess(command),
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        def _tee(stream: Any, destination: Any, label: str) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    # Console output is a convenience only.  Windows consoles may
+                    # reject Unicode which is valid in a UTF-8 subprocess stream;
+                    # never let that prevent draining the pipe or recording its log.
+                    try:
+                        destination.write(line)
+                        destination.flush()
+                    except (OSError, UnicodeError):
+                        pass
+                    compact = line.strip()
+                    try:
+                        with log_lock:
+                            log_file.write(f"[{label}] {line}")
+                            log_file.flush()
+                    except OSError as error:
+                        with failure_lock:
+                            stream_failures.append(f"{label} log write failed: {error}")
+                    if compact:
+                        with recent_lock:
+                            recent.append(f"[{label}] {compact[:240]}")
+            except BaseException as error:  # pragma: no cover - defensive thread boundary
+                with failure_lock:
+                    stream_failures.append(f"{label} diagnostic stream failed: {error}")
+            finally:
+                stream.close()
+
+        threads = [
+            threading.Thread(target=_tee, args=(process.stdout, sys.stdout, "stdout"), daemon=True),
+            threading.Thread(target=_tee, args=(process.stderr, sys.stderr, "stderr"), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        returncode = process.wait()
+        for thread in threads:
+            thread.join()
+
+    if stream_failures:
+        raise QualityGateError("; ".join(stream_failures))
+    completed = subprocess.CompletedProcess(list(command), returncode, "", "")
+    duration = time.monotonic() - started
+    if returncode == 0:
+        return completed, ""
+    with recent_lock:
+        summary = "\n".join(recent)
+    if not summary:
+        summary = f"process exited with code {returncode} after {duration:.2f}s; see the component log"
+    return completed, summary[:2000]
 
 
 def _git_output(repo_root: Path, *arguments: str) -> str:
@@ -384,12 +492,34 @@ def _task_available(task: Task) -> tuple[bool, str | None]:
     return False, f"Executable {executable!r} is unavailable"
 
 
-def _execute_components(repo_root: Path, components: Sequence[str]) -> tuple[str, list[dict[str, Any]]]:
+def _execute_components(
+    repo_root: Path,
+    components: Sequence[str],
+    *,
+    artifact_root: Path | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     task_results: list[dict[str, Any]] = []
     any_regression = False
     any_environment_block = False
+    output_root = artifact_root or repo_root / "artifacts" / "quality" / "local"
+    if not output_root.is_absolute():
+        output_root = repo_root / output_root
+    output_root = output_root.resolve()
+    try:
+        output_root.relative_to(repo_root.resolve())
+    except ValueError as error:
+        raise QualityGateError("component artifact root must be inside the repository") from error
     for component in components:
         task = _tasks()[component]
+        log_path = _component_log_path(output_root, component)
+        log_relative = log_path.relative_to(repo_root)
+        junit_path = _component_junit_path(output_root, component)
+        junit_relative = junit_path.relative_to(repo_root) if junit_path is not None else None
+        command = list(task.command)
+        if junit_relative is not None:
+            assert junit_path is not None
+            junit_path.parent.mkdir(parents=True, exist_ok=True)
+            command.extend(("--junitxml", junit_relative.as_posix()))
         available, reason = _task_available(task)
         if not available:
             any_environment_block = True
@@ -399,28 +529,34 @@ def _execute_components(repo_root: Path, components: Sequence[str]) -> tuple[str
                     "command": list(task.command),
                     "result": "environment-blocked",
                     "detail": reason,
+                    "duration_seconds": 0.0,
+                    "failure_summary": reason,
                 }
             )
             continue
-        completed = _run(task.command, cwd=repo_root)
+        started = time.monotonic()
+        completed, failure_summary = _run_with_diagnostics(command, cwd=repo_root, log_path=log_path)
+        duration_seconds = round(time.monotonic() - started, 3)
         result = "passed" if completed.returncode == 0 else "regression"
         any_regression = any_regression or result == "regression"
         if result == "regression":
             print(
                 f"quality component {component!r} failed with exit code "
-                f"{completed.returncode}",
+                f"{completed.returncode}; full log: {log_relative.as_posix()}",
                 file=sys.stderr,
             )
-            if completed.stdout:
-                print(completed.stdout.rstrip(), file=sys.stderr)
-            if completed.stderr:
-                print(completed.stderr.rstrip(), file=sys.stderr)
+            if failure_summary:
+                print(failure_summary, file=sys.stderr)
         task_results.append(
             {
                 "component": component,
-                "command": list(task.command),
+                "command": command,
                 "result": result,
                 "exit_code": completed.returncode,
+                "duration_seconds": duration_seconds,
+                "log_path": log_relative.as_posix(),
+                "failure_summary": failure_summary,
+                **({"junit_path": junit_relative.as_posix()} if junit_relative is not None else {}),
             }
         )
     if any_regression:
@@ -439,6 +575,7 @@ def build_report(
     git_sha: str | None = None,
     dirty_state: dict[str, Any] | None = None,
     changed_paths: Iterable[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     """Build a report for all release lanes, executing only the requested lane."""
 
@@ -480,7 +617,7 @@ def build_report(
             result = "conditional"
             detail = "execution was not requested"
         else:
-            result, task_results = _execute_components(repo_root, components)
+            result, task_results = _execute_components(repo_root, components, artifact_root=artifact_root)
             detail = "all selected components passed" if result == "passed" else "one or more selected components did not pass"
 
         lane_results.append(
@@ -621,6 +758,25 @@ def validate_report(
                 raise QualityGateError(f"lane {lane['lane']} regression result lacks a failed component")
         elif lane["result"] == "environment-blocked" and "environment-blocked" not in artifact_results:
             raise QualityGateError(f"lane {lane['lane']} environment-blocked result lacks a blocked component")
+        for artifact in lane["artifacts"]:
+            if artifact.get("result") == "environment-blocked":
+                if not isinstance(artifact.get("failure_summary"), str):
+                    raise QualityGateError(f"lane {lane['lane']} blocked component lacks a failure summary")
+                continue
+            required_artifact = {"command", "exit_code", "duration_seconds", "log_path", "failure_summary"}
+            if not required_artifact.issubset(artifact):
+                raise QualityGateError(f"lane {lane['lane']} component artifact lacks diagnostics metadata")
+            if not isinstance(artifact["exit_code"], int) or isinstance(artifact["exit_code"], bool):
+                raise QualityGateError(f"lane {lane['lane']} component exit code must be an integer")
+            if not isinstance(artifact["duration_seconds"], (int, float)) or artifact["duration_seconds"] < 0:
+                raise QualityGateError(f"lane {lane['lane']} component duration must be non-negative")
+            if not isinstance(artifact["failure_summary"], str) or len(artifact["failure_summary"]) > 2000:
+                raise QualityGateError(f"lane {lane['lane']} component failure summary is invalid")
+            if not isinstance(artifact["log_path"], str) or not artifact["log_path"]:
+                raise QualityGateError(f"lane {lane['lane']} component log path must be a non-empty string")
+            log_path = Path(artifact["log_path"])
+            if log_path.is_absolute() or ".." in log_path.parts:
+                raise QualityGateError(f"lane {lane['lane']} component log path must be repository-relative")
 
 
 def write_report(report: dict[str, Any], *, repo_root: Path, destination: Path) -> None:
@@ -715,12 +871,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.mode != "baseline" and not args.execute:
             raise QualityGateError("live qualification lanes require --execute")
-        report_target = args.report if args.report.is_absolute() else repo_root / args.report
-        starting_revision = current_revision(repo_root)
-        starting_dirty_state = current_dirty_state(repo_root, excluded_paths=(report_target,))
+        report_target = (args.report if args.report.is_absolute() else repo_root / args.report).resolve()
+        try:
+            report_target.relative_to(repo_root)
+        except ValueError as error:
+            raise QualityGateError("report destination must be inside the repository") from error
         changed_paths = (
             changed_paths_between(repo_root, args.changed_from) if args.changed_from is not None else None
         )
+        # Determine the selected files before snapshotting so runner-owned logs
+        # do not look like user worktree mutations.  The exclusions are exact
+        # paths, never a broad artifacts directory.
+        provisional_dirty_state = current_dirty_state(repo_root, excluded_paths=(report_target,))
+        provisional_paths = (
+            _changed_paths(provisional_dirty_state)
+            if changed_paths is None
+            else tuple(sorted({*_changed_paths(provisional_dirty_state), *changed_paths}))
+        )
+        provisional_impacts = select_impacts(provisional_paths) if provisional_paths else tuple(sorted(COMPONENTS))
+        invocation_root = report_target.parent / "runs" / f"{report_target.stem}-{uuid.uuid4().hex}"
+        generated_artifacts = _generated_artifact_paths(
+            _components_for_lane(args.mode, provisional_impacts) if args.execute else (),
+            report_target,
+            invocation_root,
+        )
+        starting_revision = current_revision(repo_root)
+        starting_dirty_state = current_dirty_state(repo_root, excluded_paths=generated_artifacts)
         report = build_report(
             repo_root=repo_root,
             mode=args.mode,
@@ -728,14 +904,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             quarantines=_load_quarantines(args.quarantine),
             dirty_state=starting_dirty_state,
             changed_paths=changed_paths,
+            artifact_root=invocation_root,
         )
         if args.execute:
             if current_revision(repo_root) != starting_revision:
                 raise QualityGateError("qualification commands changed the checked-out revision")
-            if current_dirty_state(repo_root, excluded_paths=(report_target,)) != starting_dirty_state:
+            if current_dirty_state(repo_root, excluded_paths=generated_artifacts) != starting_dirty_state:
                 raise QualityGateError("qualification commands changed the pre-existing working tree")
         write_report(report, repo_root=repo_root, destination=args.report)
-        validate_report(report, repo_root=repo_root, excluded_paths=(report_target,))
+        validate_report(report, repo_root=repo_root, excluded_paths=generated_artifacts)
     except QualityGateError as error:
         print(f"quality gate error: {error}", file=sys.stderr)
         return 2

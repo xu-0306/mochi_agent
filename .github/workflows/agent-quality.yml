@@ -3,7 +3,7 @@ name: Agent quality
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ['**']
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -42,11 +42,33 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: quality-pr
-          path: artifacts/quality/pr.json
+          path: artifacts/quality
           if-no-files-found: error
 
+  feature-smoke:
+    # Run a fast quality-infrastructure and targeted runtime signal on every
+    # non-main branch push; the main job below remains full qualification.
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --dev
+      - name: Check branch changes from the default-branch merge base
+        env:
+          AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          BASE="$(git merge-base "origin/$DEFAULT_BRANCH" "$AFTER")"
+          git diff --check "$BASE" "$AFTER"
+      - run: uv run python -m ruff check --no-cache --force-exclude mochi scripts/quality_gate
+      - run: uv run python -m pytest tests/quality/test_quality_gate.py tests/test_detached_exec_layout_metadata.py tests/security/test_file_transaction_posix.py -q
+
   main:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +88,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: quality-main
-          path: artifacts/quality/main.json
+          path: artifacts/quality
           if-no-files-found: error
 
   nightly:
@@ -90,7 +112,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: quality-nightly
-          path: artifacts/quality/nightly.json
+          path: artifacts/quality
           if-no-files-found: error
 
   release:
@@ -114,5 +136,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: quality-${{ inputs.mode }}
-          path: artifacts/quality/${{ inputs.mode }}.json
+          path: artifacts/quality
           if-no-files-found: error

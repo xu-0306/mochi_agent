@@ -246,33 +246,138 @@ def test_missing_optional_dependency_is_environment_blocked(monkeypatch: pytest.
     assert artifacts[0]["result"] == "environment-blocked"
 
 
-def test_failed_component_emits_captured_diagnostics(
-    monkeypatch: pytest.MonkeyPatch,
+def test_component_diagnostics_stream_to_console_and_durable_log(
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    failing = run.Task("python", ("python", "-m", "pytest", "-q"))
-    monkeypatch.setattr(run, "_tasks", lambda: {"python": failing})
-    monkeypatch.setattr(run, "_task_available", lambda _task: (True, None))
-    monkeypatch.setattr(
-        run,
-        "_run",
-        lambda _command, *, cwd: subprocess.CompletedProcess(
-            failing.command,
-            1,
-            "FAILED tests/test_first.py\nFAILED tests/test_second.py\n",
-            "collection warning\n",
-        ),
+    command = (
+        run.sys.executable,
+        "-c",
+        "import sys; print('standard output'); print('standard error', file=sys.stderr); raise SystemExit(3)",
+    )
+    log_path = tmp_path / "artifacts" / "quality" / "logs" / "sample.log"
+
+    completed, summary = run._run_with_diagnostics(command, cwd=tmp_path, log_path=log_path)
+
+    captured = capsys.readouterr()
+    assert completed.returncode == 3
+    assert "standard output" in captured.out
+    assert "standard error" in captured.err
+    assert "[stdout] standard output" in log_path.read_text(encoding="utf-8")
+    assert "[stderr] standard error" in log_path.read_text(encoding="utf-8")
+    assert "standard output" in summary
+    assert "standard error" in summary
+
+
+def test_unicode_console_failure_does_not_stop_diagnostic_pipe_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Cp950Console:
+        def write(self, _text: str) -> int:
+            raise UnicodeEncodeError("cp950", "🦊", 0, 1, "cannot encode")
+
+        def flush(self) -> None:
+            return None
+
+    log_path = tmp_path / "diagnostics.log"
+    monkeypatch.setattr(run.sys, "stdout", Cp950Console())
+
+    completed, summary = run._run_with_diagnostics(
+        (run.sys.executable, "-c", "import sys; sys.stdout.buffer.write('🦊 unicode output\\n'.encode('utf-8'))"),
+        cwd=tmp_path,
+        log_path=log_path,
     )
 
-    result, artifacts = run._execute_components(Path.cwd(), ("python",))
+    assert completed.returncode == 0
+    assert summary == ""
+    assert "🦊 unicode output" in log_path.read_text(encoding="utf-8")
+
+
+def test_failed_component_keeps_diagnostics_and_runs_remaining_components(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    failing = run.Task("first", ("first",))
+    passing = run.Task("second", ("second",))
+    monkeypatch.setattr(run, "_tasks", lambda: {"first": failing, "second": passing})
+    monkeypatch.setattr(run, "_task_available", lambda _task: (True, None))
+    called: list[str] = []
+
+    def fake_run(command: list[str], *, cwd: Path, log_path: Path) -> tuple[subprocess.CompletedProcess[str], str]:
+        called.append(command[0])
+        if command[0] == "first":
+            print("FAILED tests/test_first.py")
+            print("collection warning", file=run.sys.stderr)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("[stdout] FAILED tests/test_first.py\n[stderr] collection warning\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 1, "", ""), "[stdout] FAILED tests/test_first.py\n[stderr] collection warning"
+        return subprocess.CompletedProcess(command, 0, "", ""), ""
+
+    monkeypatch.setattr(run, "_run_with_diagnostics", fake_run)
+
+    result, artifacts = run._execute_components(tmp_path, ("first", "second"))
 
     diagnostics = capsys.readouterr().err
     assert result == "regression"
+    assert called == ["first", "second"]
     assert artifacts[0]["exit_code"] == 1
-    assert "quality component 'python' failed with exit code 1" in diagnostics
+    assert artifacts[0]["log_path"] == "artifacts/quality/local/logs/first.log"
+    assert artifacts[0]["duration_seconds"] >= 0
+    assert artifacts[0]["failure_summary"] == "[stdout] FAILED tests/test_first.py\n[stderr] collection warning"
+    assert "quality component 'first' failed with exit code 1" in diagnostics
     assert "FAILED tests/test_first.py" in diagnostics
-    assert "FAILED tests/test_second.py" in diagnostics
     assert "collection warning" in diagnostics
+
+
+def test_generated_artifact_exclusions_are_limited_to_selected_components(tmp_path: Path) -> None:
+    report_target = tmp_path / "artifacts" / "quality" / "pr.json"
+    invocation_root = tmp_path / "artifacts" / "quality" / "runs" / "pr-unique"
+    user_artifact = tmp_path / "artifacts" / "quality" / "logs" / "user-note.log"
+    user_artifact.parent.mkdir(parents=True)
+    user_artifact.write_text("preserve me", encoding="utf-8")
+
+    paths = run._generated_artifact_paths(("diff", "python"), report_target, invocation_root)
+
+    assert paths == (
+        report_target,
+        invocation_root / "logs" / "diff.log",
+        invocation_root / "logs" / "python.log",
+        invocation_root / "junit" / "python.xml",
+    )
+    assert user_artifact not in paths
+    assert user_artifact.read_text(encoding="utf-8") == "preserve me"
+    assert "artifacts/quality/logs/user-note.log" not in run._excluded_relative_paths(tmp_path, paths)
+
+
+def test_pytest_component_records_a_junit_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = run.Task("python", (run.sys.executable, "-m", "pytest", "-q"), "pytest")
+    monkeypatch.setattr(run, "_tasks", lambda: {"python": task})
+    monkeypatch.setattr(run, "_task_available", lambda _task: (True, None))
+    seen_commands: list[list[str]] = []
+
+    def fake_run(command: list[str], *, cwd: Path, log_path: Path) -> tuple[subprocess.CompletedProcess[str], str]:
+        seen_commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", ""), ""
+
+    monkeypatch.setattr(run, "_run_with_diagnostics", fake_run)
+
+    result, artifacts = run._execute_components(tmp_path, ("python",))
+
+    assert result == "passed"
+    assert seen_commands[0][-2:] == ["--junitxml", "artifacts/quality/local/junit/python.xml"]
+    assert artifacts[0]["junit_path"] == "artifacts/quality/local/junit/python.xml"
+
+
+def test_component_artifact_root_must_stay_inside_repository(tmp_path: Path) -> None:
+    outside_root = tmp_path.parent / "outside-artifacts"
+
+    with pytest.raises(run.QualityGateError, match="inside the repository"):
+        run._execute_components(tmp_path, (), artifact_root=outside_root)
 
 
 def test_windows_cmd_shim_is_run_through_cmd_with_tokenized_arguments(
