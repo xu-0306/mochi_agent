@@ -13,7 +13,8 @@ interface UIStore {
 
 export const useUIStore = create<UIStore>((set) => ({
   sidebarCollapsed: false,
-  workspacePanelOpen: true,
+  // Keep the chat surface calm on first load; the workspace remains one click away.
+  workspacePanelOpen: false,
   setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
   setWorkspacePanelOpen: (open) => set({ workspacePanelOpen: open }),
   toggleSidebar: () =>

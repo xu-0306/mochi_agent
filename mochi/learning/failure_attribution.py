@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
 
-
 FAILURE_ATTRIBUTION_EVENT = "failure_learning_attribution_recorded"
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
@@ -162,7 +161,7 @@ class FailureAttributionRecord:
         turn_id: str,
         transition: FailureAttributionTransition,
         timestamp: str | None = None,
-    ) -> "FailureAttributionRecord":
+    ) -> FailureAttributionRecord:
         if transition not in _TRANSITION_STATUS:
             raise FailureAttributionError("unsupported attribution transition")
         return cls(
@@ -200,7 +199,7 @@ class FailureAttributionRecord:
     def from_event(
         cls,
         value: Mapping[str, Any],
-    ) -> "FailureAttributionRecord":
+    ) -> FailureAttributionRecord:
         if not isinstance(value, Mapping):
             raise FailureAttributionError("attribution event must be an object")
         _require_exact_keys(value)

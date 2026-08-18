@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from mochi.agents.failures import FailureEnvelope, coerce_event_failure
+
 
 @dataclass
 class TextChunkEvent:
@@ -32,6 +34,15 @@ class StatusEvent:
     type: Literal["status"] = field(default="status", init=False)
     content: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    failure: FailureEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        self.failure = coerce_event_failure(
+            self.failure,
+            event_type=self.type,
+            metadata=self.metadata,
+            terminal=False,
+        )
 
 
 @dataclass
@@ -44,6 +55,15 @@ class AssistantTruncatedEvent:
     recovery_attempt: int = 0
     partial_output_chars: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+    failure: FailureEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        self.failure = coerce_event_failure(
+            self.failure,
+            event_type=self.type,
+            metadata=self.metadata,
+            terminal=False,
+        )
 
 
 @dataclass
@@ -135,6 +155,16 @@ class ToolCallCompletedEvent:
     result: Any = None
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    failure: FailureEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        self.failure = coerce_event_failure(
+            self.failure,
+            event_type=self.type,
+            error=self.error,
+            metadata=self.metadata,
+            terminal=False,
+        )
 
 
 @dataclass
@@ -187,6 +217,18 @@ class ToolCallResultEvent:
     """工具附加元資料。"""
 
 
+    failure: FailureEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        self.failure = coerce_event_failure(
+            self.failure,
+            event_type=self.type,
+            error=self.error,
+            metadata=self.metadata,
+            terminal=False,
+        )
+
+
 @dataclass
 class FinalAnswerEvent:
     """Agent 最終回答。"""
@@ -214,6 +256,17 @@ class FinalAnswerEvent:
     """Additional diagnostics."""
 
 
+    failure: FailureEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        self.failure = coerce_event_failure(
+            self.failure,
+            event_type=self.type,
+            metadata=self.metadata,
+            terminal=True,
+        )
+
+
 @dataclass
 class ErrorEvent:
     """Agent 執行過程中的錯誤。"""
@@ -224,6 +277,17 @@ class ErrorEvent:
 
     code: str = "AGENT_ERROR"
     metadata: dict[str, Any] = field(default_factory=dict)
+    failure: FailureEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        self.failure = coerce_event_failure(
+            self.failure,
+            event_type=self.type,
+            error=self.message,
+            code=self.code,
+            metadata=self.metadata,
+            terminal=True,
+        )
     """錯誤代碼。"""
 
 

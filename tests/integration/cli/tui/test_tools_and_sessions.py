@@ -673,7 +673,7 @@ async def test_chat_tui_async_clear_resets_session_history(monkeypatch, capsys) 
 
 
 @pytest.mark.asyncio
-async def test_chat_tui_async_prints_tool_errors(monkeypatch, capsys) -> None:
+async def test_chat_tui_async_prints_tool_errors(monkeypatch, capsys, tmp_path) -> None:
     """Tool failures should still be printed in the TUI."""
     from mochi.main import _chat_tui_async
 
@@ -711,11 +711,20 @@ async def test_chat_tui_async_prints_tool_errors(monkeypatch, capsys) -> None:
 
     inputs = iter(["run tool", "/exit"])
 
-    def fake_load_config(config_path=None):  # noqa: ARG001
-        return SimpleNamespace(model="ollama:base", sessions_dir="/tmp/mochi-sessions")
+    fake_config = SimpleNamespace(
+        model="ollama:base",
+        sessions_dir=str(tmp_path / "sessions"),
+    )
 
     fake_engine = _FakeEngine(None)
-    monkeypatch.setattr("mochi.config.manager.load_config", fake_load_config)
+    monkeypatch.setattr(
+        "mochi.config.manager.load_config_snapshot",
+        lambda config_path=None: SimpleNamespace(  # noqa: ARG005
+            config=fake_config,
+            revision="revision-1",
+            path=tmp_path / "config.yaml",
+        ),
+    )
     monkeypatch.setattr("mochi.agents.engine.AgentEngine", lambda config: fake_engine)  # noqa: ARG005
     monkeypatch.setattr("mochi.main.console.input", lambda prompt="": next(inputs))  # noqa: ARG005
 

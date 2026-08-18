@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 from mochi.agents.events import AgentEvent
 from mochi.backends.base import BaseLLMBackend
-from mochi.backends.types import AttachmentRef
+from mochi.backends.types import AttachmentRef, Message
 from mochi.tools.base import ActiveToolController, RunCancellationContext
 
 ToolMode = Literal["disabled", "auto", "required"]
@@ -57,6 +58,9 @@ class AgentInvocationRequest:
     # Ordinary Chat injects these only after a durable FIFO lane claim.  They
     # are intentionally absent from callers outside the Chat stream path.
     timeline_history_events: list[Mapping[str, Any]] | None = None
+    # The shared runtime returns this transient context to the Chat wrapper so
+    # it can persist a post-response snapshot only after timeline.finish().
+    timeline_context: Any | None = field(default=None, repr=False)
     timeline_user_message_admitted: bool = False
     timeline_transcript: list[Message] | None = None
     timeline_coordinator: Any | None = None

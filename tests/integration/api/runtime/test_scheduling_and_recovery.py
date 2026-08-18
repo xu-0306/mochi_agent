@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mochi.agents.multi_agent.orchestrator import (
@@ -20,9 +21,11 @@ from mochi.config.schema import MochiConfig
 from mochi.runtime.exec_runtime import ExecRuntime
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
+from mochi.utils.command_security import CommandSecurityPolicy
 from tests.support.exec_providers import PythonDirectProvider as _ApiRuntimePythonDirectProvider
 
 from ._support import (
+    _BACKGROUND_SMOKE_COMMAND,
     _BACKGROUND_SMOKE_COMMAND_RULE,
     _CONTROLLED_SMOKE_COMMAND_RULE,
     _AgentRunModelBackedEngine,
@@ -33,6 +36,20 @@ from ._support import (
     _SlowAgentRunModelBackedEngine,
     _wait_agent_run_until,
 )
+
+
+@pytest.mark.parametrize("path_flavor", [PurePosixPath, PureWindowsPath])
+def test_background_smoke_rule_is_independent_of_host_path_flavor(
+    monkeypatch: pytest.MonkeyPatch,
+    path_flavor: type[PurePosixPath] | type[PureWindowsPath],
+) -> None:
+    monkeypatch.setattr("mochi.utils.command_policy_rules.Path", path_flavor)
+    policy = CommandSecurityPolicy(command_rules=[_BACKGROUND_SMOKE_COMMAND_RULE])
+
+    result = policy.classify(_BACKGROUND_SMOKE_COMMAND, shell="test")
+
+    assert result.action == "allow"
+    assert result.rule_id == "persisted_command_rule"
 
 
 def test_agent_runs_api_flow(tmp_path: Path) -> None:
@@ -305,6 +322,14 @@ def test_agent_runs_api_flow_supports_dr_zero_dataset_package(tmp_path: Path) ->
 def test_agent_runs_api_flow_supports_controlled_execution_dataset_package(tmp_path: Path) -> None:
     app = create_app()
     engine = _AgentRunModelBackedEngine()
+    app.state.runtime_service = RuntimeService(
+        engine=engine,
+        store=RuntimeStore(tmp_path / "sessions" / "runtime.db"),
+        exec_runtime=ExecRuntime(
+            providers={"test": _ApiRuntimePythonDirectProvider()},
+            default_shell="test",
+        ),
+    )
     app.state.engine_factory = lambda: engine
     app.state.config_factory = lambda: MochiConfig.model_validate(
         {

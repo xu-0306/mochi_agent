@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
-import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -222,9 +222,7 @@ class McpRuntimeManager:
             return False
         if config.allow_tools and tool not in config.allow_tools:
             return False
-        if tool in config.deny_tools:
-            return False
-        return True
+        return tool not in config.deny_tools
 
     async def _list_tools_from_adapter(self, adapter: Any) -> list[McpToolDefinition]:
         list_tools = getattr(adapter, "list_tools", None)

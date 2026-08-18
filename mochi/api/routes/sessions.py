@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from mochi.agents.conversation_state_store import TURN_CHECKPOINT_EVENT
+from mochi.api.adaptive_runtime_projection import project_adaptive_runtime
 from mochi.api.routes.approvals import _get_runtime_service
 from mochi.api.routes.projects import _get_project_store
 from mochi.api.server import _get_config
 from mochi.api.session_store_binding import resolve_route_session_store
-from mochi.agents.conversation_state_store import TURN_CHECKPOINT_EVENT
-from mochi.api.adaptive_runtime_projection import project_adaptive_runtime
 from mochi.api.tool_workflow_outbox import (
     TOOL_WORKFLOW_APPROVAL_OBSERVATION_EVENT,
     TOOL_WORKFLOW_OUTBOX_EVENT,
@@ -33,6 +33,13 @@ from mochi.runtime.models import (
     SubagentTranscriptSummary,
 )
 from mochi.security.rollout import project_protected_workspace_rollout
+from mochi.sessions.index import SessionSearchIndexUnavailableError
+from mochi.sessions.lineage import SessionLineageError, build_session_lineage_envelope
+from mochi.sessions.search import (
+    SessionSearchLineageError,
+    SessionSearchResultSafetyError,
+    SessionSearchService,
+)
 from mochi.sessions.store import SessionStore
 from mochi.sessions.turn_timeline import SESSION_TURN_TIMELINE_EVENT
 from mochi.terminal_goal_helpers import normalize_goal_session_state
@@ -111,6 +118,75 @@ class AppendSessionEventsRequest(BaseModel):
     """Append one or more replayable session events."""
 
     events: list[dict[str, object]]
+
+
+class SessionSearchRequest(BaseModel):
+    """Validated query filters for the bounded session search endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1)
+    limit: int = Field(default=20, ge=1, le=100)
+    current_session_id: str | None = None
+    exclude_lineage_ids: tuple[str, ...] = ()
+
+    @field_validator("query")
+    @classmethod
+    def _normalize_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("query must contain searchable text")
+        return value
+
+    @field_validator("current_session_id")
+    @classmethod
+    def _normalize_current_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("current_session_id must be a non-empty string")
+        return value
+
+    @field_validator("exclude_lineage_ids")
+    @classmethod
+    def _normalize_exclude_lineage_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                raise ValueError("exclude_lineage_ids items must be non-empty strings")
+            normalized.append(value)
+        return tuple(normalized)
+
+
+class SessionSearchResultResponse(BaseModel):
+    """A bounded search hit with its stable canonical event reference."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    root_session_id: str
+    event_index: int
+    turn_id: str
+    timestamp: str | None
+    source_kind: str
+    bounded_preview: str
+    artifact_ref: str | None
+    score: float | None
+
+
+class SessionSearchResponse(BaseModel):
+    """Filtered, lineage-aware results from the derived session index."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["session_search"] = "session_search"
+    query: str
+    limit: int
+    current_session_id: str | None
+    exclude_lineage_ids: list[str]
+    items: list[SessionSearchResultResponse]
 
 
 class SessionSubagentActionResponse(BaseModel):
@@ -225,11 +301,25 @@ async def _get_tool_workflow_outbox(
     ):
         return engine_outbox
     gate = getattr(engine, "tool_workflow_publication_gate", None)
-    return ToolWorkflowOutboxRepository(
+    enabled = bool(config.agent.tool_observability_v1)
+    cached = getattr(app.state, "tool_workflow_route_outbox", None)
+    if (
+        isinstance(cached, ToolWorkflowOutboxRepository)
+        and getattr(cached, "_session_store", None) is store
+        and getattr(cached, "_enabled", None) is enabled
+        and getattr(cached, "_publication_gate", None) is gate
+    ):
+        return cached
+    outbox = ToolWorkflowOutboxRepository(
         store,
-        enabled=bool(config.agent.tool_observability_v1),
+        enabled=enabled,
         publication_gate=gate,
     )
+    # Apps which have not started an AgentEngine yet still serve session
+    # history.  Keep their route-level reader shared so the browser's
+    # per-turn fan-out has the same single-flight protection as an engine.
+    app.state.tool_workflow_route_outbox = outbox
+    return outbox
 
 
 def _check_tool_workflow_storage_scope(
@@ -430,15 +520,21 @@ def _cloneable_session_events(
     events: list[dict],
     *,
     until_turn_id: str,
+    destination_session_id: str,
 ) -> list[dict]:
-    """Return replayable events through the selected assistant turn."""
+    """Return replayable child-owned events through the selected assistant turn."""
     cloned: list[dict] = []
 
     for event in events:
         if event.get("type") == "session_meta":
             continue
 
-        cloned.append(dict(event))
+        cloned_event = dict(event)
+        # Runtime replay messages name their owning session.  A fork must not
+        # copy that source identity into the child strict history.
+        if "session_id" in cloned_event:
+            cloned_event["session_id"] = destination_session_id
+        cloned.append(cloned_event)
         if (
             event.get("type") == "message"
             and event.get("role") == "assistant"
@@ -501,7 +597,10 @@ async def create_session(
     app = http_request.app
     config = await _get_config(app)
     store = _get_session_store(app, config=config)
-    session_id = (request.session_id if request is not None else None) or str(uuid4())
+    requested_session_id = request.session_id if request is not None else None
+    session_id = requested_session_id.strip() if requested_session_id is not None else str(uuid4())
+    if not session_id:
+        raise HTTPException(status_code=422, detail="session_id must not be empty")
     if session_id in _INTERNAL_LEARNING_SESSION_IDS:
         raise HTTPException(status_code=422, detail="Reserved session_id")
     now = datetime.now(tz=UTC).isoformat()
@@ -530,10 +629,33 @@ async def create_session(
                 status_code=422,
                 detail="fork_until_turn_id is required when fork_from_session_id is provided",
             )
+        if session_id == source_session_id:
+            raise HTTPException(
+                status_code=422,
+                detail="fork destination must differ from source session",
+            )
 
         source_events = await store.load_session(source_session_id)
         if not source_events:
             raise HTTPException(status_code=404, detail="Source session not found")
+        try:
+            await store.resolve_session_lineage(source_session_id)
+        except SessionLineageError as exc:
+            raise HTTPException(status_code=409, detail=f"Source session lineage is invalid: {exc.reason}") from exc
+
+        cloned_events = _cloneable_session_events(
+            source_events,
+            until_turn_id=fork_until_turn_id,
+            destination_session_id=session_id,
+        )
+
+        created_event["lineage"] = build_session_lineage_envelope(
+            storage_id=store.storage_id,
+            session_id=session_id,
+            parent_session_id=source_session_id,
+            parent_storage_id=store.storage_id,
+            fork_until_turn_id=fork_until_turn_id,
+        )
 
         effective_project_id = request.project_id
         if effective_project_id is None:
@@ -545,12 +667,21 @@ async def create_session(
             if project is None:
                 raise HTTPException(status_code=404, detail="Project not found")
 
-        await store.save_event(session_id, created_event)
+        initial_events: list[dict[str, object]] = [created_event]
         if effective_project_id is not None:
-            await _append_project_assignment_event(store, session_id, effective_project_id)
+            initial_events.append(
+                {
+                    "type": "session_meta",
+                    "event": "project_assigned",
+                    "session_id": session_id,
+                    "project_id": effective_project_id,
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                }
+            )
+        initial_events.extend(cloned_events)
 
-        for event in _cloneable_session_events(source_events, until_turn_id=fork_until_turn_id):
-            await store.save_event(session_id, event)
+        if not await store.create_session_if_absent(session_id, events=initial_events):
+            raise HTTPException(status_code=409, detail="Session already exists")
 
         response: dict[str, object] = {
             "type": "session",
@@ -561,15 +692,30 @@ async def create_session(
             response["security_override"] = security_override
         return response
 
+    created_event["lineage"] = build_session_lineage_envelope(
+        storage_id=store.storage_id,
+        session_id=session_id,
+    )
+
     if request is not None and request.project_id is not None:
         project_store = _get_project_store(app, config=config)
         project = await project_store.get_project(request.project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-    await store.save_event(session_id, created_event)
+    initial_events = [created_event]
     if request is not None and request.project_id is not None:
-        await _append_project_assignment_event(store, session_id, request.project_id)
+        initial_events.append(
+            {
+                "type": "session_meta",
+                "event": "project_assigned",
+                "session_id": session_id,
+                "project_id": request.project_id,
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+            }
+        )
+    if not await store.create_session_if_absent(session_id, events=initial_events):
+        raise HTTPException(status_code=409, detail="Session already exists")
     response = {
         "type": "session",
         "session_id": session_id,
@@ -593,6 +739,91 @@ async def list_sessions(http_request: Request) -> dict[str, object]:
             config, session_id
         )
     return {"type": "sessions", "items": items}
+
+
+@router.get("/sessions/search", response_model=SessionSearchResponse)
+async def search_sessions(
+    query: str = Query(...),
+    limit: int = Query(default=20),
+    current_session_id: str | None = Query(default=None),
+    exclude_lineage_ids: Annotated[list[str] | None, Query()] = None,
+    *,
+    http_request: Request,
+) -> SessionSearchResponse:
+    """Return bounded, lineage-aware references from the derived session index."""
+
+    try:
+        request = SessionSearchRequest(
+            query=query,
+            limit=limit,
+            current_session_id=current_session_id,
+            exclude_lineage_ids=exclude_lineage_ids or (),
+        )
+    except ValidationError as exc:
+        # Validate all client-provided filters before resolving configuration or
+        # touching the canonical store/index dependency.
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": list(error["loc"]),
+                    "msg": error["msg"],
+                    "type": error["type"],
+                }
+                for error in exc.errors()
+            ],
+        ) from exc
+
+    app = http_request.app
+    config = await _get_config(app)
+    store = _get_session_store(app, config=config)
+    service = SessionSearchService(
+        store.session_search_index,
+        lineage_resolver=store.resolve_session_root,
+    )
+    try:
+        results = await service.search(
+            request.query,
+            limit=request.limit,
+            current_session_id=request.current_session_id,
+            exclude_lineage_ids=request.exclude_lineage_ids,
+        )
+    except SessionSearchIndexUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except SessionSearchLineageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "session_search_lineage_unavailable", "message": str(exc)},
+        ) from exc
+    except SessionSearchResultSafetyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "session_search_result_unsafe", "message": str(exc)},
+        ) from exc
+
+    return SessionSearchResponse(
+        query=request.query,
+        limit=request.limit,
+        current_session_id=request.current_session_id,
+        exclude_lineage_ids=list(request.exclude_lineage_ids),
+        items=[
+            SessionSearchResultResponse(
+                session_id=result.session_id,
+                root_session_id=result.root_session_id,
+                event_index=result.event_index,
+                turn_id=result.turn_id,
+                timestamp=result.timestamp,
+                source_kind=result.source_kind,
+                bounded_preview=result.bounded_preview,
+                artifact_ref=result.artifact_ref,
+                score=result.score,
+            )
+            for result in results
+        ],
+    )
 
 
 @router.get("/sessions/{session_id}/turns/{turn_id}/tool-workflow")
@@ -647,7 +878,7 @@ async def get_tool_workflow_range(
     expected = after_seq + 1
     contiguous = not selected or int(selected[0]["seq"]) == expected
     if contiguous:
-        for previous, current in zip(selected, selected[1:]):
+        for previous, current in zip(selected, selected[1:], strict=False):
             if int(current["seq"]) != int(previous["seq"]) + 1:
                 contiguous = False
                 break
@@ -1054,7 +1285,7 @@ async def resume_session_subagent(
     session_id: str,
     subagent_id: str,
     http_request: Request,
-    payload: SessionSubagentResumeRequest | None = Body(default=None),
+    payload: Annotated[SessionSubagentResumeRequest | None, Body()] = None,
 ) -> SessionSubagentActionResponse:
     service, transcript = await _get_session_subagent_or_404(
         http_request,

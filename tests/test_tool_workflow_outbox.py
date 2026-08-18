@@ -21,16 +21,15 @@ from mochi.api.tool_workflow_outbox import (
     ToolWorkflowOutboxVerifierDiagnostics,
     approval_observation_from_request,
 )
+from mochi.config.schema import MochiConfig
 from mochi.runtime.approval_lifecycle import InMemoryApprovalStore, PersistentApprovalStore
 from mochi.runtime.service import RuntimeService
 from mochi.runtime.store import RuntimeStore
-from mochi.config.schema import MochiConfig
 from mochi.sessions.store import SessionStore, ToolWorkflowPublicationGate
 from mochi.sessions.turn_timeline import SessionTurnTimelineRepository
 from mochi.tools.base import ToolExecutionContext
 from mochi.tools.exec_command import _observe_ordinary_chat_approval as observe_exec_approval
 from mochi.tools.file_ops import _observe_ordinary_chat_approval as observe_file_approval
-
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "tool_workflow_aggregate" / "v1_cases.json"
 
@@ -113,6 +112,48 @@ async def test_outbox_reuses_idempotency_key_and_never_self_triggers_sequence(tm
     replayed = await after_restart.rebuild_turn(str(case["session_id"]), str(case["turn_id"]))
     assert replayed == initial[0]
     assert await after_restart.list(str(case["session_id"]), turn_id=str(case["turn_id"])) == initial
+
+
+@pytest.mark.asyncio
+async def test_outbox_coalesces_concurrent_turn_reads_to_one_strict_snapshot(tmp_path: Path) -> None:
+    """A session detail fan-out must not exhaust workers with duplicate reads."""
+
+    case = _case()
+    store = SessionStore(tmp_path / "sessions", tool_observability_v1=True)
+    await _append_timeline(store, case)
+    repository = ToolWorkflowOutboxRepository(store, enabled=True)
+    original_load = store.load_strict_snapshot
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def delayed_load(session_id: str):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return await original_load(session_id)
+
+    store.load_strict_snapshot = delayed_load  # type: ignore[method-assign]
+    readers = [
+        asyncio.create_task(repository.list(str(case["session_id"]), turn_id=str(case["turn_id"])))
+        for _ in range(24)
+    ]
+    await started.wait()
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+
+    results = await asyncio.gather(*readers)
+    assert all(result == results[0] for result in results)
+
+    # Coalescing is intentionally limited to overlapping reads; a later
+    # request must re-open the authority so it can observe a new commit.
+    assert await repository.list(
+        str(case["session_id"]),
+        turn_id=str(case["turn_id"]),
+    ) == results[0]
+    assert calls == 2
 
 
 @pytest.mark.asyncio

@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-import socket
-import time
-from typing import Any, Protocol
+from typing import Protocol
 
 import httpx
 
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo, StreamChunk, ToolSchema
-
 
 DEFAULT_LLAMA_SERVER_HOST = "127.0.0.1"
 DEFAULT_LLAMA_SERVER_STARTUP_TIMEOUT_SECONDS = 180.0
@@ -325,7 +324,7 @@ class LlamaCppServerBackend(BaseLLMBackend):
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 process.kill()
                 await process.wait()
 

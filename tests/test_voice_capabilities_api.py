@@ -251,6 +251,29 @@ def test_voice_voices_register_path_updates_shared_config(tmp_path: Path) -> Non
     ]
 
 
+def test_voice_registry_mutation_requires_revision_when_persisted(tmp_path: Path) -> None:
+    custom_voice_path = tmp_path / "voices" / "registered.onnx"
+    custom_voice_path.parent.mkdir(parents=True, exist_ok=True)
+    custom_voice_path.write_bytes(b"voice")
+    app = create_app()
+    app.state.config = MochiConfig(voice=VoiceConfig(voice_pack_dir=tmp_path / "packs"))
+    app.state.config_path = tmp_path / "config.yaml"
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/voice/voices/register-path",
+            json={
+                "path": str(custom_voice_path),
+                "backend": "piper",
+                "voice_id": "registered-piper",
+            },
+        )
+
+    assert response.status_code == 428
+    assert response.json()["detail"]["code"] == "settings_revision_required"
+    assert app.state.config.voice.registered_tts_voices == []
+
+
 def test_voice_voices_upload_registers_uploaded_pack(tmp_path: Path) -> None:
     app = create_app()
     app.state.config_factory = lambda: MochiConfig(voice=VoiceConfig(voice_pack_dir=tmp_path / "packs"))

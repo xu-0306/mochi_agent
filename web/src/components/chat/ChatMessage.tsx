@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { AlertCircle, Bot, Pencil, RefreshCcw } from 'lucide-react'
+import { Bot, Pencil, RefreshCcw } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -18,6 +18,7 @@ import { FileChangeCard } from './FileChangeCard'
 import type { FileChangeGroupSummary } from '@/lib/file-change-preview'
 import { WorkflowProgressCard } from './WorkflowProgressCard'
 import { SubagentTaskCard } from './SubagentTaskCard'
+import { FailurePresentationCard } from '@/components/failures/FailurePresentationCard'
 
 interface ChatMessageProps {
   message: Message
@@ -82,7 +83,7 @@ export function ChatMessage({
   onUndoFileChange,
   onOpenTask,
 }: ChatMessageProps) {
-  const { type, content, errorCode, isStreaming, reasoningSteps } = message
+  const { type, content, isStreaming, reasoningSteps } = message
   const tokenStatsLabel = type === 'assistant' ? formatTokenStats(message) : null
   const timestampLabel = formatRelativeTime(message.timestamp)
   const timestampTitle = formatDate(message.timestamp, {
@@ -120,19 +121,7 @@ export function ChatMessage({
   if (type === 'error') {
     return (
       <div className="flex justify-start animate-slide-up">
-        <div className="flex max-w-[560px] items-start gap-3 rounded-lg border border-error/40 bg-error/10 px-3 py-2.5">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-error" />
-          <div className="min-w-0 flex-1">
-            <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
-              {content}
-            </p>
-            {errorCode ? (
-              <p className="mt-1 break-all text-[11px] text-muted-foreground">
-                {errorCode}
-              </p>
-            ) : null}
-          </div>
-        </div>
+        <FailurePresentationCard failure={message.failure} className="max-w-[560px]" testId="chat-failure-presentation" />
       </div>
     )
   }

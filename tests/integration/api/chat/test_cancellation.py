@@ -79,6 +79,7 @@ def test_agent_engine_cancel_chat_run_cancels_active_run(tmp_path) -> None:
     assert cancel_response["run_state"] == "cancelled"
     assert cancel_response["cancel_outcome"] == "cancelled"
     assert cancel_response["cancel_reason"] is None
+    assert cancel_response["durable_outcome"] == "cancelled_pre_commit"
     assert cancelled.wait(timeout=1.0)
 
 def test_chat_cancel_endpoint_forwards_to_engine() -> None:
@@ -182,6 +183,7 @@ def test_chat_stream_cancel_endpoint_reports_completed_when_final_answer_wins_ra
     assert cancel_response.json()["status"] == "already_completed"
     assert cancel_response.json()["run_state"] == "completed"
     assert cancel_response.json()["cancel_outcome"] == "completed"
+    assert cancel_response.json()["durable_outcome"] == "already_committed"
     assert cancelled.is_set() is False
 
 def test_agent_engine_chat_yields_events_before_invocation_finishes(tmp_path) -> None:
@@ -366,3 +368,15 @@ def test_run_cancellation_context_defers_when_active_tool_is_not_cancellable() -
     assert result["reason"] == "tool_in_progress"
     assert snapshot["state"] == "cancelling"
     assert generation_calls == []
+
+
+def test_run_cancellation_context_fails_closed_for_unknown_boundary() -> None:
+    context = RunCancellationContext(run_id="run-unknown-boundary")
+
+    assert (
+        context.resolve_cancellation_capability(
+            "unregistered-boundary",
+            safe_point="before_commit",
+        ).value
+        == "unsupported"
+    )

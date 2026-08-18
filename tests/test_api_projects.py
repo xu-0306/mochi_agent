@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
-from mochi.projects.store import ProjectStore
+from mochi.projects.store import ProjectStore, _next_updated_at
 from mochi.sessions.store import SessionStore
 
 
@@ -92,6 +93,14 @@ def test_projects_crud_round_trip(tmp_path: Path) -> None:
         final_list = client.get("/v1/projects")
         assert final_list.status_code == 200
         assert final_list.json()["items"] == []
+
+
+def test_project_update_timestamp_advances_when_clock_has_not_advanced() -> None:
+    """A rapid update remains observably newer than its stored predecessor."""
+
+    previous = (datetime.now(tz=UTC) + timedelta(days=1)).isoformat()
+
+    assert _next_updated_at(previous) > previous
 
 
 def test_deleting_project_unassigns_related_sessions(tmp_path: Path) -> None:

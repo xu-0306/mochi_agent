@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mochi.tools.base import ToolExecutionContext, ToolResult
-
 
 _WEB_EVIDENCE_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
 _WEB_EVIDENCE_ALLOWED_JSON_FLAGS = frozenset(

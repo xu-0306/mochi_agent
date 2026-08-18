@@ -266,6 +266,7 @@ class GoalAttemptResponse(BaseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     latest_error: str | None = None
+    failure: dict[str, Any] | None = None
     created_at: str
     updated_at: str
     started_at: str | None = None
@@ -300,6 +301,7 @@ class GoalResponse(BaseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     latest_error: str | None = None
+    failure: dict[str, Any] | None = None
     attempts: list[GoalAttemptResponse] = Field(default_factory=list)
     created_at: str
     updated_at: str
@@ -491,6 +493,7 @@ class AgentRunResponse(BaseModel):
     recovery_state: dict[str, Any] = Field(default_factory=dict)
     degraded: bool = False
     latest_error: str | None = None
+    failure: dict[str, Any] | None = None
     evidence_status: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[AgentRunArtifact] = Field(default_factory=list)
     created_at: str

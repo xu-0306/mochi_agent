@@ -11,12 +11,15 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from pydantic import BaseModel, Field
 
 from mochi.api.server import _get_config, _maybe_await
+from mochi.config.manager import ConfigRevisionConflict
 from mochi.config.schema import RegisteredTTSVoiceConfig, VoiceConfig
 
 from .settings import (
     TTS_VOICE_PRESETS_BY_BACKEND,
     _ensure_config_directories,
     _persist_config_if_enabled,
+    _persistence_enabled,
+    _required_if_match,
 )
 
 router = APIRouter(prefix="/v1/voice", tags=["voice"])
@@ -203,13 +206,29 @@ async def _apply_updated_voice_config(
     current = await _get_config(request.app)
     updated = current.model_copy(update={"voice": voice})
     _ensure_config_directories(updated)
+    expected_revision = _required_if_match(request) if _persistence_enabled(request, persist) else None
+    try:
+        _persist_config_if_enabled(
+            request,
+            updated,
+            persist,
+            expected_revision=expected_revision,
+        )
+    except ConfigRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "settings_revision_conflict",
+                "current_revision": exc.current_revision,
+            },
+        ) from exc
+
     request.app.state.config = updated
     engine = getattr(request.app.state, "engine", None)
     if engine is not None:
         apply_config = getattr(engine, "apply_config", None)
         if callable(apply_config):
             await _maybe_await(apply_config(updated, reload_voice=reload_voice))
-    _persist_config_if_enabled(request, updated, persist)
 
 
 async def _write_upload_file(upload: UploadFile, target: Path) -> None:

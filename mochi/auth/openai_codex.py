@@ -10,7 +10,7 @@ import os
 import secrets
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -175,23 +175,19 @@ def _acquire_lock_file(
             except FileNotFoundError:
                 continue
             if age_seconds >= stale_seconds:
-                try:
+                with suppress(FileNotFoundError):
                     lock_path.unlink()
-                except FileNotFoundError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"Timed out waiting for OpenAI Codex refresh lock at {lock_path.name}."
-                )
+                ) from None
             time.sleep(poll_seconds)
     try:
         yield
     finally:
-        try:
+        with suppress(FileNotFoundError):
             lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 @contextmanager
@@ -541,10 +537,9 @@ class OpenAICodexAuthService:
         if resolved_profile_id is None:
             raise RuntimeError("No OpenAI Codex auth profile is available.")
         lock = _get_refresh_lock(resolved_profile_id)
-        with lock:
-            with _acquire_refresh_file_lock(
-                _profile_refresh_lock_path(self._store.path, resolved_profile_id)
-            ):
+        with lock, _acquire_refresh_file_lock(
+            _profile_refresh_lock_path(self._store.path, resolved_profile_id)
+        ):
                 profile = self.get_profile(resolved_profile_id)
                 if profile is None:
                     raise RuntimeError(f"OpenAI Codex auth profile {resolved_profile_id!r} was not found.")

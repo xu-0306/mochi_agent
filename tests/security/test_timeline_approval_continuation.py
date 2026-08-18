@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pytest
 
@@ -25,8 +26,8 @@ from mochi.security.policy import EffectivePolicyResolver
 from mochi.sessions.timeline_coordinator import TimelineCoordinator
 from mochi.sessions.turn_timeline import SessionTurnTimelineRepository
 from mochi.tools.base import ToolExecutionContext
-from mochi.tools.file_ops import FileWriteTool
 from mochi.tools.exec_command import ExecCommandTool
+from mochi.tools.file_ops import FileWriteTool
 from mochi.tools.registry import ToolRegistry
 
 

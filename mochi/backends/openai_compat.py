@@ -15,12 +15,17 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from mochi.agents.effective_context import (
+    DEFAULT_CONTEXT_LENGTH_FALLBACK,
+    EffectiveContext,
+    select_effective_context,
+)
+from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.inference_capabilities import (
     ReasoningEffort,
     parse_model_capability_metadata,
     resolve_model_inference_capabilities,
 )
-from mochi.backends.base import BackendRequestError, BaseLLMBackend
 from mochi.backends.simulated_tool_protocol import SimulatedToolProtocol
 from mochi.backends.tool_call_contract import (
     build_invalid_tool_turn_metadata,
@@ -32,8 +37,8 @@ from mochi.backends.types import (
     GenerationResult,
     Message,
     ModelInfo,
-    ResponsesContinuityPolicy,
     ResponsesContinuityMode,
+    ResponsesContinuityPolicy,
     ResponsesReplayState,
     StreamChunk,
     ToolCall,
@@ -84,6 +89,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         provider: str = "openai_compat",
         responses_continuity_policy: ResponsesContinuityPolicy = "local_replay",
         capability_metadata: dict[str, Any] | None = None,
+        configured_context_length: int | None = None,
     ) -> None:
         """初始化 OpenAI-compatible 後端。
 
@@ -113,6 +119,21 @@ class OpenAICompatBackend(BaseLLMBackend):
         self._capability_metadata_override = (
             dict(capability_metadata) if isinstance(capability_metadata, dict) else None
         )
+        self._configured_context_length = _smallest_context_length(
+            configured_context_length,
+            _extract_context_length(
+                self._capability_metadata_override,
+                keys=(
+                    "configured_context_length",
+                    "configured_num_ctx",
+                    "context_length",
+                    "context_window",
+                    "max_model_len",
+                ),
+                nested_keys=("config", "configuration"),
+            ),
+        )
+        self._serving_context_length: int | None = None
         if responses_continuity_policy not in {"local_replay", "previous_response_id"}:
             raise ValueError(
                 "responses_continuity_policy must be 'local_replay' or 'previous_response_id'."
@@ -252,9 +273,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             return False
         if not self._is_openai_native_reasoning_model():
             return False
-        if self._responses_transport_rejected():
-            return False
-        return True
+        return not self._responses_transport_rejected()
 
     def _responses_transport_rejected(self) -> bool:
         if not isinstance(self._tool_protocol_probe, dict):
@@ -330,6 +349,7 @@ class OpenAICompatBackend(BaseLLMBackend):
 
     def get_model_info(self) -> ModelInfo:
         """回傳目前模型資訊。"""
+        effective_context = self._effective_context()
         capabilities = resolve_model_inference_capabilities(
             ModelInfo(
                 name=self.model,
@@ -344,6 +364,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             name=self.model,
             provider=self.provider,
             backend_type="openai_compat",
+            context_length=effective_context.context_length,
             supports_tool_calling=self.supports_tool_calling(),
             metadata={
                 "base_url": self.base_url,
@@ -374,9 +395,59 @@ class OpenAICompatBackend(BaseLLMBackend):
                 "tool_protocol_probe": dict(self._tool_protocol_probe)
                 if isinstance(self._tool_protocol_probe, dict)
                 else None,
+                "configured_context_length": self._configured_context_length,
+                "serving_context_length": self._serving_context_length,
+                "advertised_context_length": self._advertised_context_length(),
+                "context_source": effective_context.source.value,
+                "context_confidence": effective_context.confidence.value,
+                "context_is_hard_limit": effective_context.is_hard_limit,
+                "context_length_fallback": DEFAULT_CONTEXT_LENGTH_FALLBACK,
                 **capabilities.to_metadata(),
             },
         )
+
+    def _effective_context(self) -> EffectiveContext:
+        """Select the provider context with explicit configured/runtime provenance."""
+
+        return select_effective_context(
+            configured_context=self._configured_context_length,
+            serving_context=self._serving_context_length,
+            advertised_context=self._advertised_context_length(),
+            fallback_context=DEFAULT_CONTEXT_LENGTH_FALLBACK,
+        )
+
+    def _advertised_context_length(self) -> int | None:
+        return _extract_context_length(
+            self._capability_discovery.get("metadata"),
+            keys=(
+                "context_length",
+                "context_window",
+                "max_context_length",
+                "max_model_len",
+                "model_max_context_length",
+            ),
+            nested_keys=("capabilities", "metadata", "model_info"),
+        )
+
+    def _record_serving_context(self, payload: dict[str, Any]) -> None:
+        """Keep the smallest explicit runtime context observed from this endpoint."""
+
+        observed = _extract_context_length(
+            payload,
+            keys=(
+                "serving_context_length",
+                "runtime_context_length",
+                "context_length",
+                "context_window",
+                "max_context_length",
+            ),
+            nested_keys=("response", "metadata"),
+        )
+        if observed is not None:
+            self._serving_context_length = _smallest_context_length(
+                self._serving_context_length,
+                observed,
+            )
 
     def _capability_metadata_for_model_info(self) -> dict[str, Any]:
         discovery = self._capability_discovery
@@ -1073,6 +1144,7 @@ class OpenAICompatBackend(BaseLLMBackend):
 
     def _parse_chat_completions_result(self, data: dict[str, Any]) -> GenerationResult:
         """解析 Chat Completions 回應。"""
+        self._record_serving_context(data)
         choices: list[dict[str, Any]] = data.get("choices", [])
         choice0 = choices[0] if choices else {}
         message = choice0.get("message", {})
@@ -1083,11 +1155,7 @@ class OpenAICompatBackend(BaseLLMBackend):
         if not tool_calls and self._tool_state.active_mode == "simulated_fallback" and content:
             content, tool_calls = self._simulated_tool_protocol.parse_assistant_content(content)
         usage = data.get("usage", {})
-        finish_reason = choice0.get("finish_reason")
-        if tool_calls:
-            finish_reason = "tool_calls"
-        if not finish_reason:
-            finish_reason = "tool_calls" if tool_calls else "stop"
+        finish_reason = self._chat_terminal_signal(choice0, tool_calls)
 
         return GenerationResult(
             content=content,
@@ -1135,7 +1203,8 @@ class OpenAICompatBackend(BaseLLMBackend):
 
                     if line == "[DONE]":
                         if not emitted_final:
-                            yield StreamChunk(is_final=True, finish_reason="stop")
+                            emitted_final = True
+                            yield StreamChunk(is_final=True, finish_reason="unknown")
                         break
 
                     try:
@@ -1157,7 +1226,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                         tool_call_buffers,
                     )
 
-                    finish_reason = choice0.get("finish_reason")
+                    finish_reason = self._stream_chat_terminal_signal(choice0)
                     is_final = finish_reason is not None
                     if is_final:
                         emitted_final = True
@@ -1217,6 +1286,9 @@ class OpenAICompatBackend(BaseLLMBackend):
         except httpx.RequestError as exc:
             logger.error(f"OpenAI-compatible stream connection error: {exc}")
             raise self._wrap_request_error(exc, stage="stream_generate", request_url=request_url) from exc
+
+        if not emitted_final:
+            yield StreamChunk(is_final=True, finish_reason="unknown")
 
     def _normalize_chat_message_parts(self, message: dict[str, Any]) -> tuple[str, str]:
         content = self._stringify_chat_text_part(message.get("content"))
@@ -1311,7 +1383,7 @@ class OpenAICompatBackend(BaseLLMBackend):
                             tool_call_buffers,
                         )
 
-                        finish_reason = choice0.get("finish_reason")
+                        finish_reason = self._stream_chat_terminal_signal(choice0)
                         is_final = finish_reason is not None
                         if is_final:
                             emitted_final = True
@@ -1345,7 +1417,7 @@ class OpenAICompatBackend(BaseLLMBackend):
 
                     if event_type in {"response.completed", "response.incomplete", "response.failed"}:
                         emitted_final = True
-                        finish_reason = "stop" if event_type == "response.completed" else event_type
+                        finish_reason = self._responses_stream_terminal_signal(data, event_type)
                         yield StreamChunk(is_final=True, finish_reason=finish_reason)
                         break
         except httpx.HTTPStatusError as exc:
@@ -1403,7 +1475,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             raise self._wrap_request_error(exc, stage="stream_generate", request_url=request_url) from exc
 
         if not emitted_final:
-            yield StreamChunk(is_final=True, finish_reason="stop")
+            yield StreamChunk(is_final=True, finish_reason="unknown")
 
     def _build_chat_completions_payload(
         self,
@@ -1768,6 +1840,7 @@ class OpenAICompatBackend(BaseLLMBackend):
 
     def _parse_responses_result(self, data: dict[str, Any]) -> GenerationResult:
         """解析 Responses API 回應。"""
+        self._record_serving_context(data)
         content = _coerce_text(data.get("output_text"))
         output = data.get("output")
         tool_calls = self._parse_responses_tool_calls(output)
@@ -1791,17 +1864,7 @@ class OpenAICompatBackend(BaseLLMBackend):
             content, tool_calls = self._simulated_tool_protocol.parse_assistant_content(content)
 
         usage = data.get("usage", {})
-        finish_reason = data.get("finish_reason")
-        if not isinstance(finish_reason, str) or not finish_reason:
-            choices = data.get("choices", [])
-            if isinstance(choices, list) and choices:
-                choice0 = choices[0]
-                if isinstance(choice0, dict):
-                    raw_finish_reason = choice0.get("finish_reason")
-                    if isinstance(raw_finish_reason, str) and raw_finish_reason:
-                        finish_reason = raw_finish_reason
-            if not isinstance(finish_reason, str) or not finish_reason:
-                finish_reason = "tool_calls" if tool_calls else "stop"
+        finish_reason = self._responses_terminal_signal(data, tool_calls)
 
         return GenerationResult(
             content=content,
@@ -1813,6 +1876,60 @@ class OpenAICompatBackend(BaseLLMBackend):
             finish_reason=finish_reason,
             responses_replay=replay_state,
         )
+
+    @staticmethod
+    def _chat_terminal_signal(choice: Any, tool_calls: list[ToolCall]) -> str:
+        if tool_calls:
+            return "tool_calls"
+        if not isinstance(choice, dict):
+            return "unknown"
+        return _terminal_signal_or_unknown(choice.get("finish_reason"))
+
+    @staticmethod
+    def _stream_chat_terminal_signal(choice: Any) -> str | None:
+        if not isinstance(choice, dict) or choice.get("finish_reason") is None:
+            return None
+        return _terminal_signal_or_unknown(choice.get("finish_reason"))
+
+    def _responses_terminal_signal(
+        self,
+        data: Any,
+        tool_calls: list[ToolCall],
+        *,
+        fallback_signal: object = None,
+    ) -> str:
+        if tool_calls:
+            return "tool_calls"
+        if not isinstance(data, dict):
+            return _terminal_signal_or_unknown(fallback_signal)
+
+        finish_reason = _terminal_signal_or_none(data.get("finish_reason"))
+        if finish_reason is not None:
+            return finish_reason
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice_reason = _terminal_signal_or_none(choices[0].get("finish_reason"))
+            if choice_reason is not None:
+                return choice_reason
+
+        status = _terminal_signal_or_none(data.get("status"))
+        if status == "incomplete":
+            details = data.get("incomplete_details")
+            if isinstance(details, dict):
+                reason = _terminal_signal_or_none(details.get("reason"))
+                if reason is not None:
+                    return reason
+            return "response.incomplete"
+        if status is not None:
+            return status
+        return _terminal_signal_or_unknown(fallback_signal)
+
+    def _responses_stream_terminal_signal(self, event: dict[str, Any], event_type: str) -> str:
+        response = event.get("response")
+        if isinstance(response, dict):
+            self._record_serving_context(response)
+            return self._responses_terminal_signal(response, [], fallback_signal=event_type)
+        return self._responses_terminal_signal(event, [], fallback_signal=event_type)
 
     def _build_responses_replay_state(
         self,
@@ -2592,6 +2709,44 @@ def _find_model_metadata(payload: Any, model: str) -> dict[str, Any] | None:
             # bounded discovery contract.
             return dict(entry)
     return None
+
+
+def _extract_context_length(
+    payload: Any,
+    *,
+    keys: tuple[str, ...],
+    nested_keys: tuple[str, ...],
+) -> int | None:
+    """Read only explicit context fields; arbitrary numeric metadata is untrusted."""
+
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[object] = [payload.get(key) for key in keys]
+    for nested_key in nested_keys:
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.extend(nested.get(key) for key in keys)
+    return _smallest_context_length(*candidates)
+
+
+def _smallest_context_length(*values: object) -> int | None:
+    candidates = [
+        value
+        for value in values
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    ]
+    return min(candidates) if candidates else None
+
+
+def _terminal_signal_or_none(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _terminal_signal_or_unknown(value: object) -> str:
+    return _terminal_signal_or_none(value) or "unknown"
 
 
 def _coerce_text(value: Any) -> str:

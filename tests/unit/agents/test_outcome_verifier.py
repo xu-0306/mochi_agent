@@ -11,6 +11,9 @@ from mochi.agents.artifact_verifier import (
     ToolExecutionEvidence,
 )
 from mochi.agents.outcome_verifier import (
+    VERIFICATION_RECEIPT_EVENT,
+    VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION,
+    VERIFICATION_RECEIPT_VERSION,
     ArtifactVerifierAdapter,
     CriterionReceipt,
     DeterministicVerifierRegistry,
@@ -18,9 +21,6 @@ from mochi.agents.outcome_verifier import (
     SemanticJudgeVerifier,
     StateVerifier,
     ToolExecutionVerifier,
-    VERIFICATION_RECEIPT_EVENT,
-    VERIFICATION_RECEIPT_EVENT_SCHEMA_VERSION,
-    VERIFICATION_RECEIPT_VERSION,
     VerificationCriterion,
     VerificationEvidence,
     VerificationPlanCompiler,

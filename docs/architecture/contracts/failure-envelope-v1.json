@@ -1,0 +1,91 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "failure-envelope-v1",
+  "producer_package": "PKG-MAIN-10-FAILURE-CONTRACT",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "FailureEnvelope",
+    "FailureEnvelopeVersionError",
+    "coerce_event_failure",
+    "legacy_failure_envelope",
+    "normalize_persisted_failure_event"
+  ],
+  "inputs": {
+    "legacy_event": "Agent events and persisted event dictionaries with type, error/code, and optional metadata.",
+    "canonical_failure": "A top-level failure object containing every required v1 field."
+  },
+  "outputs": {
+    "failure": {
+      "location": "Runtime dataclass failure attribute and serialized event top-level failure field.",
+      "schema_version": "1.0",
+      "required": [
+        "schema_version",
+        "kind",
+        "origin",
+        "recoverability",
+        "retry_policy",
+        "terminal",
+        "inject_into_model_context",
+        "telemetry_key",
+        "ui_hint",
+        "diagnostics_ref"
+      ]
+    }
+  },
+  "errors": [
+    "failure envelope is not an object",
+    "failure envelope is missing a required v1 field",
+    "failure envelope has an unknown kind or origin",
+    "failure envelope has an unsupported retry policy",
+    "failure envelope has an unknown major schema version"
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "unknown_minor_fields": "preserve unchanged when parsing and serializing a supported major",
+    "legacy_events": "map deterministically without deleting their documented error, code, or metadata fields",
+    "persistence": "terminal error records persist a top-level versioned failure object",
+    "denials_and_steering": "map to tool_denied and runtime_steering, never tool_error"
+  },
+  "consumers": [
+    "mochi.agents.events",
+    "mochi.sessions.store",
+    "chat SSE projection",
+    "WebGUI failure presentation",
+    "telemetry"
+  ],
+  "gate_ids": [
+    "GATE-FAILURE-CONTRACT-CORE",
+    "GATE-FAILURE-CONTRACT",
+    "GATE-FAILURE-CONSUMER-DRYRUN",
+    "GATE-CONTRACT-FREEZE"
+  ],
+  "failure_schema": {
+    "kinds": [
+      "backend_error",
+      "tool_error",
+      "tool_denied",
+      "runtime_steering",
+      "context_overflow",
+      "output_truncated",
+      "empty_response",
+      "invalid_tool_call",
+      "cancelled"
+    ],
+    "origins": [
+      "agent",
+      "backend",
+      "runtime",
+      "tool",
+      "session"
+    ],
+    "retry_policies": [
+      "automatic",
+      "manual",
+      "none"
+    ],
+    "diagnostics_ref": "An opaque reference or null; failure envelopes never carry raw restricted diagnostics."
+  }
+}

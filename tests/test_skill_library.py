@@ -179,3 +179,101 @@ async def test_db_path_parent_directory_is_created(tmp_path) -> None:
 
     assert db_path.exists()
     assert (await library.get(skill_id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_skill_updates_create_immutable_version_history() -> None:
+    library = SkillLibrary()
+    skill_id = await library.add(make_skill("versioned"))
+    initial = await library.get(skill_id)
+    assert initial is not None
+
+    await library.update(skill_id, {"description": "First revision"})
+    await library.merge(skill_id, make_trajectory("trajectory-v3"))
+
+    versions = await library.list_versions(skill_id)
+    assert [skill.version for skill in versions] == [1, 2, 3]
+    assert versions[0].description == initial.description
+    assert versions[1].description == "First revision"
+    assert versions[2].source_trajectory_id == "trajectory-v3"
+    assert (await library.get_version(skill_id, 1)) == versions[0]
+    assert (await library.get(skill_id)) == versions[2]
+
+
+@pytest.mark.asyncio
+async def test_promotion_requires_evidence_and_rollback_preserves_run_pins() -> None:
+    library = SkillLibrary()
+    skill_id = await library.add(make_skill("governed"))
+    await library.update(skill_id, {"description": "candidate version"})
+
+    with pytest.raises(ValueError, match="evidence"):
+        await library.promote(skill_id, 2, {})
+
+    pinned = await library.pin_run_version("run-1", skill_id, 1)
+    assert pinned.version == 1
+    rolled_back = await library.rollback(skill_id, 1, reason="regression observed")
+    assert rolled_back.version == 1
+    assert (await library.get_pinned_version("run-1")) == pinned
+
+    promoted = await library.promote(
+        skill_id,
+        2,
+        {"evidence_id": "eval-2", "result": "passed"},
+    )
+    assert promoted.version == 2
+    assert (await library.get_pinned_version("run-1")) == pinned
+    promotion = await library.get_promotion(skill_id, 2)
+    assert promotion is not None
+    assert promotion["evidence"]["evidence_id"] == "eval-2"
+
+
+@pytest.mark.asyncio
+async def test_update_after_rollback_appends_beyond_retained_history() -> None:
+    library = SkillLibrary()
+    skill_id = await library.add(make_skill("rollback-update"))
+    await library.update(skill_id, {"description": "candidate version"})
+    await library.rollback(skill_id, 1, reason="candidate regressed")
+
+    await library.update(skill_id, {"description": "replacement candidate"})
+
+    versions = await library.list_versions(skill_id)
+    assert [skill.version for skill in versions] == [1, 2, 3]
+    assert versions[2].description == "replacement candidate"
+    active = await library.get(skill_id)
+    assert active is not None
+    assert active.version == 3
+
+
+@pytest.mark.asyncio
+async def test_upsert_revives_deleted_projection_with_a_new_retained_version() -> None:
+    library = SkillLibrary()
+    skill_id = await library.add(make_skill("revived"))
+    assert await library.delete(skill_id) is True
+
+    replacement = make_skill(skill_id)
+    replacement.description = "revived active projection"
+    assert await library.upsert(replacement) == skill_id
+
+    versions = await library.list_versions(skill_id)
+    assert [skill.version for skill in versions] == [1, 2]
+    active = await library.get(skill_id)
+    assert active is not None
+    assert active.version == 2
+    assert active.description == "revived active projection"
+
+
+@pytest.mark.asyncio
+async def test_legacy_skill_database_backfills_active_history(tmp_path) -> None:
+    db_path = tmp_path / "legacy-skills.db"
+    first = SkillLibrary(db_path)
+    skill_id = await first.add(make_skill("legacy"))
+    first._conn.execute("DROP TABLE skill_versions")
+    first._conn.execute("DROP TABLE skill_active_versions")
+    first._conn.commit()
+    first._conn.close()
+
+    migrated = SkillLibrary(db_path)
+    versions = await migrated.list_versions(skill_id)
+
+    assert [skill.version for skill in versions] == [1]
+    assert (await migrated.get(skill_id)) == versions[0]

@@ -14,10 +14,10 @@ from typing import Any
 import pytest
 
 from mochi.agents.adaptive_release_qualification import (
-    AdaptiveQualificationError,
     CANARY_REVIEW_VERSION,
     EXTERNAL_QUALIFICATION_EVIDENCE_VERSION,
     EXTERNAL_QUALIFICATION_FIXTURE_VERSION,
+    AdaptiveQualificationError,
     CanaryReview,
     ExternalModelConsentRequired,
     ExternalQualificationEvidence,
@@ -28,8 +28,12 @@ from mochi.agents.adaptive_release_qualification import (
     load_evidence,
     load_external_qualification_fixtures,
 )
-from mochi.agents.invocation import AgentInvocationDiagnostics, AgentInvocationRequest, AgentInvocationResult
 from mochi.agents.engine import AgentEngine
+from mochi.agents.invocation import (
+    AgentInvocationDiagnostics,
+    AgentInvocationRequest,
+    AgentInvocationResult,
+)
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo, StreamChunk
 from mochi.config.schema import MochiConfig
@@ -798,7 +802,6 @@ async def test_evidence_model_fingerprint_uses_active_backend_identity(tmp_path:
 
 def test_wave6_binds_exact_evidence_and_review_bytes() -> None:
     evidence = _evidence(passed=True)
-    evidence_bytes = _evidence_bytes(evidence)
     review = _review(evidence)
     with pytest.raises(AdaptiveQualificationError, match="not bound"):
         evaluate_canary(

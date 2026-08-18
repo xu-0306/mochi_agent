@@ -99,6 +99,14 @@ def test_parse_tool_calls_ignores_malformed_qwen_xml() -> None:
     assert tool_calls == []
 
 
+def test_parse_tool_calls_ignores_unterminated_tool_call_markup() -> None:
+    tool_calls = parse_tool_calls(
+        '<tool_call>{"name": "file_read", "arguments": {"path": "README.md"}'
+    )
+
+    assert tool_calls == []
+
+
 def test_tool_call_simulator_delegates_to_multi_format_parser() -> None:
     simulator = ToolCallSimulator()
 

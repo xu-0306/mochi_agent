@@ -1,0 +1,111 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "quality-report-v1",
+  "producer_package": "PKG-MAIN-00-BASELINE-RELEASE",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "QualityReport",
+    "LaneResult",
+    "QuarantineRecord",
+    "current_revision",
+    "current_dirty_state",
+    "dirty_state_digest",
+    "changed_paths_between",
+    "select_impacts",
+    "validate_report",
+    "validate_frozen_contract_artifact",
+    "validate_quality_report_contract"
+  ],
+  "inputs": {
+    "mode": {
+      "enum": [
+        "baseline",
+        "pr",
+        "main",
+        "nightly",
+        "release"
+      ]
+    },
+    "quarantine": "optional JSON list of id, owner, reason, expires_at, and lanes",
+    "execute": "required for a non-baseline lane and only runs fixed commands",
+    "changed_from": "optional Git base revision used to derive impact paths in a clean CI checkout"
+  },
+  "outputs": {
+    "report": {
+      "artifact_path": "artifacts/quality/<mode>.json",
+      "baseline_manifest_rule": "The report identity fields (schema_version, git_sha, dirty_state, mode, and generated_at) are the baseline manifest v1; dirty_state binds Git porcelain entries, the tracked working-tree diff, and every untracked file's SHA-256 and byte size. The report path itself is excluded to avoid a self-referential fingerprint. No second mutable manifest is produced.",
+      "schema": "quality-report-v1"
+    }
+  },
+  "errors": [
+    "unknown mode",
+    "invalid or expired quarantine",
+    "git metadata unavailable",
+    "live lane missing execute flag",
+    "dirty state fingerprint mismatch",
+    "qualification command modified the pre-existing working tree",
+    "report path outside repository",
+    "invalid report shape",
+    "invalid frozen contract artifact"
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "new_lane_result_fields": "consumers ignore fields they do not require",
+    "release_rule": "conditional, environment-blocked, regression, and quarantined results are never serialized as passed"
+  },
+  "consumers": [
+    "PR",
+    "main",
+    "nightly",
+    "release candidate",
+    "scripts/quality_gate/run.py",
+    "tests/contracts/test_frozen_contract_artifacts.py"
+  ],
+  "gate_ids": [
+    "GATE-BASELINE",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ],
+  "report_schema": {
+    "type": "object",
+    "required": [
+      "schema_version",
+      "generated_at",
+      "mode",
+      "git_sha",
+      "dirty_state",
+      "lanes"
+    ],
+    "dirty_state_required": [
+      "entries",
+      "tracked_diff_sha256",
+      "untracked_files",
+      "sha256"
+    ],
+    "lane_required": [
+      "lane",
+      "capability",
+      "environment",
+      "result",
+      "detail",
+      "artifacts",
+      "waiver"
+    ],
+    "lane_capability_required": [
+      "impacts",
+      "changed_paths",
+      "components",
+      "execution_requested"
+    ],
+    "lane_results": [
+      "passed",
+      "regression",
+      "conditional",
+      "environment-blocked",
+      "quarantined"
+    ]
+  }
+}

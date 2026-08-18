@@ -592,7 +592,7 @@ async def _chat_async_terminal(
         if current is not None and hasattr(current, "__dict__"):
             payload = dict(current.__dict__)
         normalized = SecurityConfig.model_validate(payload)
-        setattr(cfg, "security", normalized)
+        cfg.security = normalized
         return normalized
 
     session_store = SessionStore(sessions_dir=_sessions_dir())
@@ -966,7 +966,6 @@ async def _handle_terminal_goal_input(
     ensure_runtime_service: object,
     intent_invoker: object,
 ) -> dict[str, object]:
-    from mochi.runtime.models import GoalCreateRequest
     from mochi.goal_intent import classify_goal_proposal_follow_up_intent
     from mochi.goal_proposal_copy import (
         build_goal_command_help_message,
@@ -975,6 +974,7 @@ async def _handle_terminal_goal_input(
         build_goal_proposal_assistant_copy_fallback,
         generate_goal_proposal_assistant_copy,
     )
+    from mochi.runtime.models import GoalCreateRequest
     from mochi.terminal_goal_helpers import (
         build_goal_proposal_state,
         build_goal_summary_from_goal,
@@ -1738,7 +1738,7 @@ async def _create_tui_runtime_service(
     if not isinstance(security, SecurityConfig):
         payload = dict(security.__dict__) if security is not None and hasattr(security, "__dict__") else {}
         security = SecurityConfig.model_validate(payload)
-        setattr(config, "security", security)
+        config.security = security
     service.update_security_config(security)
     service.bind_app_config(
         config=config,
@@ -1801,7 +1801,7 @@ async def _chat_tui_async(
         if current is not None and hasattr(current, "__dict__"):
             payload = dict(current.__dict__)
         normalized = SecurityConfig.model_validate(payload)
-        setattr(cfg, "security", normalized)
+        cfg.security = normalized
         return normalized
 
     session_store = SessionStore(
@@ -2692,6 +2692,8 @@ async def _voice_async(
             started_turns = 0
             turn_processing_done: set[int] = set()
             turn_pending_playback_chunks: dict[int, int] = {}
+            turns_idle = asyncio.Event()
+            turns_idle.set()
             utterance_buffer = bytearray()
             playback_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
 
@@ -2747,6 +2749,7 @@ async def _voice_async(
                 turn_id = next_turn_id
                 active_turn_id = turn_id
                 started_turns += 1
+                turns_idle.clear()
                 turn_pending_playback_chunks[turn_id] = 0
                 task = asyncio.create_task(_run_turn(turn_id, audio))
                 turn_tasks[turn_id] = task
@@ -2782,6 +2785,8 @@ async def _voice_async(
                 turn_processing_done.discard(turn_id)
                 turn_pending_playback_chunks.pop(turn_id, None)
                 await _maybe_start_next_turn()
+                if active_turn_id is None and not queued_utterances:
+                    turns_idle.set()
 
             async def _run_turn(turn_id: int, audio: bytes) -> None:
                 try:
@@ -2868,16 +2873,7 @@ async def _voice_async(
                         break
 
                 await _maybe_start_next_turn()
-
-                while turn_tasks:
-                    tasks_to_wait = list(turn_tasks.items())
-                    await asyncio.gather(
-                        *(task for _, task in tasks_to_wait),
-                        return_exceptions=True,
-                    )
-                    for completed_turn_id, task in tasks_to_wait:
-                        if task.done():
-                            turn_tasks.pop(completed_turn_id, None)
+                await turns_idle.wait()
                 completed_normally = True
             finally:
                 for task in list(turn_tasks.values()):
@@ -3036,7 +3032,7 @@ async def _channels_voice_settings_async(
             )
             sys.exit(1)
         if hasattr(cfg.voice, "session_mode"):
-            setattr(cfg.voice, "session_mode", normalized_session_mode)
+            cfg.voice.session_mode = normalized_session_mode
         else:
             console.print(
                 "[red]Config schema is missing voice.session_mode. "
@@ -3053,7 +3049,7 @@ async def _channels_voice_settings_async(
             )
             sys.exit(1)
         if hasattr(cfg.voice, "reply_model_mode"):
-            setattr(cfg.voice, "reply_model_mode", normalized_mode)
+            cfg.voice.reply_model_mode = normalized_mode
         else:
             console.print(
                 "[red]Config schema is missing voice.reply_model_mode. "
@@ -3063,7 +3059,7 @@ async def _channels_voice_settings_async(
 
     if reply_model is not None:
         if hasattr(cfg.voice, "reply_model_id"):
-            setattr(cfg.voice, "reply_model_id", reply_model.strip())
+            cfg.voice.reply_model_id = reply_model.strip()
         else:
             console.print(
                 "[red]Config schema is missing voice.reply_model_id. "

@@ -1,0 +1,91 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "generation-recovery-v1",
+  "producer_package": "PKG-MAIN-25-GENERATION-POLICY-SEAM",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "GenerationTerminal",
+    "GenerationTerminalDecision",
+    "ContinuationMerge",
+    "RecoveryBudget",
+    "contains_malformed_tool_markup",
+    "merge_continuation",
+    "normalize_generation_terminal"
+  ],
+  "inputs": {
+    "terminal_signal": "Provider-normalized terminal status string, or null when the transport does not supply one.",
+    "has_structured_tool_calls": "True only when the transport has emitted validated structured tool calls.",
+    "output": "The current visible assistant output used for truncation recovery or malformed-markup detection.",
+    "recovery_budget": "One shared RecoveryBudget instance for textual malformed-markup and native invalid-tool recovery paths."
+  },
+  "outputs": {
+    "terminal_decision": {
+      "fields": [
+        "terminal",
+        "normalized_reason",
+        "raw_terminal_signal",
+        "partial_output",
+        "requires_recovery"
+      ],
+      "terminal_values": [
+        "complete",
+        "tool_calls",
+        "output_truncated",
+        "invalid_tool_call",
+        "unknown"
+      ]
+    },
+    "recovery_budget": {
+      "fields": [
+        "attempts_used",
+        "tokens_used",
+        "elapsed_ms",
+        "max_attempts",
+        "max_tokens",
+        "max_elapsed_ms"
+      ],
+      "rule": "consume reserves one recovery only when attempts, tokens, and elapsed-time limits all permit it."
+    },
+    "continuation_merge": {
+      "fields": [
+        "content",
+        "overlap_chars",
+        "merge_digest"
+      ],
+      "rule": "Only a repeated full prefix or overlap of at least three characters is removed."
+    }
+  },
+  "errors": [
+    "Unknown or absent terminal metadata maps to unknown and must not be treated as normal completion.",
+    "A normalized truncation signal maps to output_truncated until a bounded recovery succeeds.",
+    "Malformed textual tool markup maps to invalid_tool_call only after non-truncated parsing fails; raw markup must not be rendered as a normal final answer.",
+    "Boolean, negative, or non-integer recovery limits and measurements are rejected."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "additional_output_fields": "Consumers ignore fields they do not require.",
+    "terminal_values": "complete, tool_calls, output_truncated, invalid_tool_call, unknown",
+    "truncation_precedence": "Structured tool calls take precedence; otherwise truncation precedes malformed textual markup.",
+    "budget_rule": "Textual and native invalid-tool repair share one budget; consumers must not create independent retry counters."
+  },
+  "consumers": [
+    "PKG-MAIN-30-GENERATION-TOOL-POLICY",
+    "PKG-WORKER-21-OPENAI-ADAPTER",
+    "PKG-WORKER-22-OLLAMA-ADAPTER",
+    "PKG-WORKER-23-PROVIDER-MATRIX",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SEAM-GENERATION",
+    "GATE-GENERATION-TOOL",
+    "GATE-OPENAI-ADAPTER",
+    "GATE-OLLAMA-ADAPTER",
+    "GATE-PROVIDER-FIXTURE",
+    "GATE-PROVIDER-MATRIX",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

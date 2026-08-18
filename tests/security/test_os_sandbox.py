@@ -182,7 +182,7 @@ def test_bubblewrap_launch_is_argument_only_and_denies_network(tmp_path: Path) -
         "--chmod",
         "0555",
         canonical_path(tmp_path.parent),
-    ) in tuple(zip(launch.args, launch.args[1:], launch.args[2:]))
+    ) in tuple(zip(launch.args, launch.args[1:], launch.args[2:], strict=False))
     assert launch.args[-4:] == ("--", canonical_path(sys.executable), "-c", "print('ok')")
     assert launch.env is None
 

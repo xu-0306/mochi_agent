@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from mochi.agents.events import (
+    FinalAnswerEvent,
+    ToolCallRequestEvent,
+    ToolCallResultEvent,
+)
 from mochi.api.server import create_app
 from mochi.config.schema import MochiConfig
 from mochi.runtime.approvals import APPROVAL_OWNER_TASK_ID_KEY
@@ -18,6 +23,62 @@ from ._support import (
     _RuntimeFileMutationFakeEngine,
     _wait_until,
 )
+
+_TWO_FILE_PATCH = "\n".join(
+    [
+        "*** Begin Patch",
+        "*** Update File: alpha.py",
+        "@@",
+        "-print('alpha')",
+        "+print('alpha selected')",
+        "*** Update File: beta.py",
+        "@@",
+        "-print('beta')",
+        "+print('beta must remain unchanged')",
+        "*** End Patch",
+    ]
+)
+
+
+class _RuntimeSubsetReplayFakeEngine:
+    """Emit a two-file approval for runtime's authoritative replay path."""
+
+    def __init__(self) -> None:
+        self._run_count = 0
+
+    async def chat(
+        self,
+        message: str,
+        session_id: str | None = None,
+        inference_overrides: dict[str, object] | None = None,
+        project_id: str | None = None,
+        workspace_dir: str | None = None,
+        task_workspace_dir: str | None = None,
+        permission_policy: dict[str, object] | None = None,
+    ) -> object:
+        _ = (message, session_id, inference_overrides, project_id, workspace_dir)
+        self._run_count += 1
+        if self._run_count == 1:
+            yield ToolCallRequestEvent(
+                call_id="call-subset-patch-1",
+                tool_name="apply_patch",
+                arguments={"patch": _TWO_FILE_PATCH},
+            )
+            yield ToolCallResultEvent(
+                call_id="call-subset-patch-1",
+                tool_name="apply_patch",
+                result=None,
+                error="Patch application requires approval.",
+                metadata={
+                    "requires_approval": True,
+                    "approval_kind": "apply_patch",
+                    "approval_scope": "workspace",
+                    "replay_safe": True,
+                },
+            )
+            return
+
+        yield FinalAnswerEvent(content="subset patch applied", trajectory_id="traj-subset")
 
 
 def test_task_and_approval_flow_with_resume(tmp_path: Path) -> None:
@@ -313,6 +374,218 @@ def test_enforced_file_approval_rejects_stale_manifest_without_writing(
     assert response.status_code == 409
     assert response.json()["detail"] == "change_set_conflicted"
     assert target.read_text(encoding="utf-8") == "print('external')\n"
+
+
+def test_subset_preview_replaces_parent_and_replays_only_selected_entries(
+    tmp_path: Path,
+) -> None:
+    app = create_app()
+    engine = _RuntimeSubsetReplayFakeEngine()
+    sessions_dir = tmp_path / "sessions"
+    project_workspace = tmp_path / "project-workspace"
+    project_workspace.mkdir()
+    app.state.engine_factory = lambda: engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "sessions_dir": str(sessions_dir),
+            "workspace_dir": str(project_workspace),
+            "security": {"change_contract_mode": "enforce"},
+        }
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/tasks",
+            json={
+                "input_message": "edit two files selectively",
+                "session_id": "runtime-subset",
+                "workspace_dir": str(project_workspace),
+            },
+        )
+        assert created.status_code == 200
+        task_id = created.json()["task_id"]
+        task_workspace = sessions_dir / "runtime-tasks" / task_id / "workspace"
+        task_workspace.mkdir(parents=True, exist_ok=True)
+        alpha = task_workspace / "alpha.py"
+        beta = task_workspace / "beta.py"
+        alpha.write_text("print('alpha')\n", encoding="utf-8")
+        beta.write_text("print('beta')\n", encoding="utf-8")
+
+        waiting = _wait_until(client, task_id, {"awaiting_approval"})
+        parent_approval_id = waiting["pending_approval"]["id"]
+        approvals = client.get("/v1/approvals?status=pending").json()
+        parent = next(
+            item
+            for item in approvals
+            if item["approval_id"] == parent_approval_id
+        )
+        entries = parent["file_changes"]
+        assert len(entries) == 2
+        alpha_entry = next(
+            entry for entry in entries if entry["relative_path"] == "alpha.py"
+        )
+        beta_entry = next(
+            entry for entry in entries if entry["relative_path"] == "beta.py"
+        )
+        alpha_entry_id = alpha_entry["entry_id"]
+        beta_entry_id = beta_entry["entry_id"]
+
+        missing_fields = client.post("/v1/workspace/patch/subset-preview", json={})
+        empty_selection = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={"approval_id": parent_approval_id, "selected_entry_ids": []},
+        )
+        duplicate_selection = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": [alpha_entry_id, alpha_entry_id],
+            },
+        )
+        unknown_selection = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": ["unknown-entry"],
+            },
+        )
+        forbidden_client_projection = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": [alpha_entry_id],
+                "patch": _TWO_FILE_PATCH,
+            },
+        )
+        assert missing_fields.status_code == 422
+        assert empty_selection.status_code == 422
+        assert duplicate_selection.status_code == 422
+        assert unknown_selection.status_code == 422
+        assert forbidden_client_projection.status_code == 422
+
+        preview = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": [alpha_entry_id],
+            },
+        )
+        assert preview.status_code == 200, preview.json()
+        payload = preview.json()
+        assert payload["type"] == "workspace_patch_subset_preview"
+        assert payload["valid"] is True
+        assert payload["parent_request_digest"] == parent["request_digest"]
+        assert payload["request_digest"] != parent["request_digest"]
+        assert payload["selected_entry_ids"] == [alpha_entry_id]
+        assert payload["approval_state"] == "replacement_pending"
+        assert payload["replacement_approval_id"] != parent_approval_id
+        assert len(payload["file_changes"]) == 1
+        assert payload["file_changes"][0]["relative_path"] == "alpha.py"
+        assert payload["file_changes"][0]["entry_id"] != alpha_entry_id
+
+        retry = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": [alpha_entry_id],
+            },
+        )
+        conflicting_retry = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": [beta_entry_id],
+            },
+        )
+        stale_parent_resolution = client.post(
+            f"/v1/approvals/{parent_approval_id}/resolve",
+            json={"decision": "approve_once"},
+        )
+        assert retry.status_code == 200, retry.json()
+        assert retry.json()["replacement_approval_id"] == payload["replacement_approval_id"]
+        assert retry.json()["request_digest"] == payload["request_digest"]
+        assert conflicting_retry.status_code == 409
+        assert stale_parent_resolution.status_code == 409
+
+        resolved = client.post(
+            f"/v1/approvals/{payload['replacement_approval_id']}/resolve",
+            json={"decision": "approve_once"},
+        )
+        assert resolved.status_code == 200, resolved.json()
+        done = _wait_until(client, task_id, {"succeeded"})
+        assert done["final_answer"] == "Applied approved file change to alpha.py."
+
+    assert alpha.read_text(encoding="utf-8") == "print('alpha selected')\n"
+    assert beta.read_text(encoding="utf-8") == "print('beta')\n"
+
+
+def test_subset_preview_conflicts_stale_parent_and_missing_approval(tmp_path: Path) -> None:
+    app = create_app()
+    engine = _RuntimeSubsetReplayFakeEngine()
+    sessions_dir = tmp_path / "sessions"
+    project_workspace = tmp_path / "project-workspace"
+    project_workspace.mkdir()
+    app.state.engine_factory = lambda: engine
+    app.state.config_factory = lambda: MochiConfig.model_validate(
+        {
+            "sessions_dir": str(sessions_dir),
+            "workspace_dir": str(project_workspace),
+            "security": {"change_contract_mode": "enforce"},
+        }
+    )
+
+    with TestClient(app) as client:
+        missing = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={"approval_id": "missing", "selected_entry_ids": ["entry"]},
+        )
+        assert missing.status_code == 404
+
+        created = client.post(
+            "/v1/tasks",
+            json={
+                "input_message": "edit two files selectively",
+                "session_id": "runtime-stale-subset",
+                "workspace_dir": str(project_workspace),
+            },
+        )
+        assert created.status_code == 200
+        task_id = created.json()["task_id"]
+        task_workspace = sessions_dir / "runtime-tasks" / task_id / "workspace"
+        task_workspace.mkdir(parents=True, exist_ok=True)
+        alpha = task_workspace / "alpha.py"
+        alpha.write_text("print('alpha')\n", encoding="utf-8")
+        (task_workspace / "beta.py").write_text("print('beta')\n", encoding="utf-8")
+
+        waiting = _wait_until(client, task_id, {"awaiting_approval"})
+        parent_approval_id = waiting["pending_approval"]["id"]
+        parent = next(
+            item
+            for item in client.get("/v1/approvals?status=pending").json()
+            if item["approval_id"] == parent_approval_id
+        )
+        alpha_entry_id = next(
+            entry["entry_id"]
+            for entry in parent["file_changes"]
+            if entry["relative_path"] == "alpha.py"
+        )
+        alpha.write_text("print('changed outside approval')\n", encoding="utf-8")
+
+        stale_preview = client.post(
+            "/v1/workspace/patch/subset-preview",
+            json={
+                "approval_id": parent_approval_id,
+                "selected_entry_ids": [alpha_entry_id],
+            },
+        )
+        stale_resolution = client.post(
+            f"/v1/approvals/{parent_approval_id}/resolve",
+            json={"decision": "approve_once"},
+        )
+
+    assert stale_preview.status_code == 409
+    assert stale_resolution.status_code == 409
+    assert alpha.read_text(encoding="utf-8") == "print('changed outside approval')\n"
 def test_controlled_subagent_execution_task_runs_in_task_workspace(tmp_path: Path) -> None:
     app = create_app()
     engine = _AgentRunModelBackedEngine()

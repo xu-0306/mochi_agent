@@ -12,6 +12,32 @@ import pytest
 from mochi.runtime.store import RuntimeStore
 
 
+def _failure_envelope(*, kind: str, diagnostics_ref: str) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "kind": kind,
+        "origin": "runtime",
+        "recoverability": "manual_retry",
+        "retry_policy": "manual",
+        "terminal": False,
+        "inject_into_model_context": False,
+        "telemetry_key": f"failure.{kind}",
+        "ui_hint": "retry",
+        "diagnostics_ref": diagnostics_ref,
+    }
+
+
+def _assert_public_failure_projection(
+    payload: dict[str, object],
+    expected_failure: dict[str, object] | None,
+) -> None:
+    summary = payload["summary"]
+    assert isinstance(summary, dict)
+    assert "failure_envelope" not in summary
+    assert "diagnostics_ref" not in summary
+    assert payload["failure"] == expected_failure
+
+
 def test_runtime_store_persists_tasks_events_and_approvals(tmp_path: Path) -> None:
     store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
     task = asyncio.run(
@@ -169,6 +195,329 @@ def test_runtime_store_persists_goals_and_attempts(tmp_path: Path) -> None:
     assert goals[0]["execution_mode"] == "single_agent"
     assert goals[0]["protocol_id"] == "multi_agent_debate"
     assert goals[0]["attempts"][0]["id"] == "goal-attempt-1"
+
+
+def test_runtime_store_metadata_mutations_round_trip_and_clear_failure_envelopes(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    envelope = _failure_envelope(
+        kind="tool_denied",
+        diagnostics_ref="diagnostics://runtime-store-metadata",
+    )
+
+    asyncio.run(
+        store.create_goal(
+            goal_id="goal-failure-metadata-1",
+            objective="Preserve a versioned Goal failure.",
+            summary={"surface": "goal-created"},
+            latest_error="raw goal diagnostic: tool refused the request",
+            failure=envelope,
+        )
+    )
+    asyncio.run(
+        store.create_goal_attempt(
+            attempt_id="goal-failure-metadata-attempt-1",
+            goal_id="goal-failure-metadata-1",
+            attempt_index=1,
+            status="queued",
+            summary={"surface": "attempt-created"},
+            latest_error="raw attempt diagnostic: tool refused the request",
+            failure=envelope,
+        )
+    )
+    asyncio.run(
+        store.create_agent_run(
+            run_id="run-failure-metadata-1",
+            protocol_id="autonomous_single_agent",
+            title="Preserve a versioned AgentRun failure.",
+            topic="failure persistence",
+            summary={"surface": "run-created"},
+            latest_error="raw run diagnostic: tool refused the request",
+            failure=envelope,
+        )
+    )
+
+    asyncio.run(
+        store.update_goal_metadata(
+            "goal-failure-metadata-1",
+            summary={"surface": "goal-replaced"},
+        )
+    )
+    asyncio.run(
+        store.update_agent_run_metadata(
+            "run-failure-metadata-1",
+            summary={"surface": "run-replaced"},
+        )
+    )
+
+    goal = asyncio.run(store.get_goal("goal-failure-metadata-1"))
+    attempt = asyncio.run(store.get_goal_attempt("goal-failure-metadata-attempt-1"))
+    run = asyncio.run(store.get_agent_run("run-failure-metadata-1"))
+    assert goal is not None
+    assert attempt is not None
+    assert run is not None
+    _assert_public_failure_projection(goal, envelope)
+    _assert_public_failure_projection(attempt, envelope)
+    _assert_public_failure_projection(run, envelope)
+
+    asyncio.run(store.update_goal_metadata("goal-failure-metadata-1", failure=None))
+    asyncio.run(
+        store.update_goal_attempt_status(
+            "goal-failure-metadata-attempt-1",
+            "queued",
+            failure=None,
+        )
+    )
+    asyncio.run(store.update_agent_run_metadata("run-failure-metadata-1", failure=None))
+
+    cleared_goal = asyncio.run(store.get_goal("goal-failure-metadata-1"))
+    cleared_attempt = asyncio.run(store.get_goal_attempt("goal-failure-metadata-attempt-1"))
+    cleared_run = asyncio.run(store.get_agent_run("run-failure-metadata-1"))
+    assert cleared_goal is not None
+    assert cleared_attempt is not None
+    assert cleared_run is not None
+    _assert_public_failure_projection(cleared_goal, None)
+    _assert_public_failure_projection(cleared_attempt, None)
+    _assert_public_failure_projection(cleared_run, None)
+
+    asyncio.run(
+        store.update_goal_metadata(
+            "goal-failure-metadata-1",
+            latest_error="raw text says this was cancelled",
+        )
+    )
+    asyncio.run(
+        store.update_goal_attempt_status(
+            "goal-failure-metadata-attempt-1",
+            "running",
+            latest_error="raw text says this was cancelled",
+        )
+    )
+    asyncio.run(
+        store.update_agent_run_metadata(
+            "run-failure-metadata-1",
+            latest_error="raw text says this was cancelled",
+        )
+    )
+
+    for payload in (
+        asyncio.run(store.get_goal("goal-failure-metadata-1")),
+        asyncio.run(store.get_goal_attempt("goal-failure-metadata-attempt-1")),
+        asyncio.run(store.get_agent_run("run-failure-metadata-1")),
+    ):
+        assert payload is not None
+        _assert_public_failure_projection(payload, payload["failure"])
+        assert payload["failure"]["kind"] == "backend_error"
+
+
+def test_runtime_store_status_only_mutations_preserve_explicit_failure_envelopes(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    envelope = _failure_envelope(
+        kind="tool_denied",
+        diagnostics_ref="diagnostics://status-only-transition",
+    )
+    asyncio.run(
+        store.create_goal(
+            goal_id="goal-status-failure-1",
+            objective="Keep a Goal failure through a status-only transition.",
+            latest_error="raw goal diagnostic says the user cancelled",
+            failure=envelope,
+        )
+    )
+    asyncio.run(
+        store.create_goal_attempt(
+            attempt_id="goal-status-failure-attempt-1",
+            goal_id="goal-status-failure-1",
+            attempt_index=1,
+            status="queued",
+            latest_error="raw attempt diagnostic says the user cancelled",
+            failure=envelope,
+        )
+    )
+    asyncio.run(
+        store.create_agent_run(
+            run_id="run-status-failure-1",
+            protocol_id="autonomous_single_agent",
+            title="Keep an AgentRun failure through status-only transitions.",
+            topic="failure persistence",
+            latest_error="raw run diagnostic says the user cancelled",
+            failure=envelope,
+        )
+    )
+
+    asyncio.run(store.update_goal_status("goal-status-failure-1", "running"))
+    asyncio.run(
+        store.update_goal_attempt_status(
+            "goal-status-failure-attempt-1",
+            "running",
+            summary={"status": "running"},
+        )
+    )
+    asyncio.run(store.update_agent_run_status("run-status-failure-1", "running"))
+    lease = asyncio.run(
+        store.acquire_agent_run_lease(
+            run_id="run-status-failure-1",
+            owner_id="runtime-status-failure",
+            expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        )
+    )
+    assert asyncio.run(
+        store.update_agent_run_status_if_lease_current(
+            "run-status-failure-1",
+            "partial",
+            owner_id="runtime-status-failure",
+            lease_epoch=int(lease["lease_epoch"]),
+        )
+    )
+
+    goal = asyncio.run(store.get_goal("goal-status-failure-1"))
+    attempt = asyncio.run(store.get_goal_attempt("goal-status-failure-attempt-1"))
+    run = asyncio.run(store.get_agent_run("run-status-failure-1"))
+    assert goal is not None
+    assert attempt is not None
+    assert run is not None
+    _assert_public_failure_projection(goal, envelope)
+    _assert_public_failure_projection(attempt, envelope)
+    _assert_public_failure_projection(run, envelope)
+
+
+def test_runtime_store_goal_projection_preserves_independent_errors_when_unset(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+    goal_envelope = _failure_envelope(
+        kind="backend_error",
+        diagnostics_ref="diagnostics://goal",
+    )
+    attempt_envelope = _failure_envelope(
+        kind="tool_denied",
+        diagnostics_ref="diagnostics://attempt",
+    )
+    asyncio.run(
+        store.create_goal(
+            goal_id="goal-failure-projection-1",
+            objective="Keep Goal and Attempt failures independent.",
+            latest_error="goal-only raw diagnostic",
+            failure=goal_envelope,
+        )
+    )
+    asyncio.run(
+        store.create_goal_attempt(
+            attempt_id="goal-failure-projection-attempt-1",
+            goal_id="goal-failure-projection-1",
+            attempt_index=1,
+            status="queued",
+            latest_error="attempt-only raw diagnostic",
+            failure=attempt_envelope,
+        )
+    )
+
+    assert asyncio.run(
+        store.update_goal_projection(
+            goal_id="goal-failure-projection-1",
+            goal_status="created",
+            attempt_id="goal-failure-projection-attempt-1",
+            attempt_status="queued",
+            current_attempt_id="goal-failure-projection-attempt-1",
+        )
+    )
+
+    goal = asyncio.run(store.get_goal("goal-failure-projection-1"))
+    attempt = asyncio.run(store.get_goal_attempt("goal-failure-projection-attempt-1"))
+    assert goal is not None
+    assert attempt is not None
+    assert goal["latest_error"] == "goal-only raw diagnostic"
+    assert attempt["latest_error"] == "attempt-only raw diagnostic"
+    _assert_public_failure_projection(goal, goal_envelope)
+    _assert_public_failure_projection(attempt, attempt_envelope)
+
+    shared_envelope = _failure_envelope(
+        kind="runtime_steering",
+        diagnostics_ref="diagnostics://shared-projection",
+    )
+    assert asyncio.run(
+        store.update_goal_projection(
+            goal_id="goal-failure-projection-1",
+            goal_status="created",
+            attempt_id="goal-failure-projection-attempt-1",
+            attempt_status="queued",
+            failure=shared_envelope,
+        )
+    )
+    goal = asyncio.run(store.get_goal("goal-failure-projection-1"))
+    attempt = asyncio.run(store.get_goal_attempt("goal-failure-projection-attempt-1"))
+    assert goal is not None
+    assert attempt is not None
+    _assert_public_failure_projection(goal, shared_envelope)
+    _assert_public_failure_projection(attempt, shared_envelope)
+
+    assert asyncio.run(
+        store.update_goal_projection(
+            goal_id="goal-failure-projection-1",
+            goal_status="created",
+            attempt_id="goal-failure-projection-attempt-1",
+            attempt_status="queued",
+            failure=None,
+        )
+    )
+    goal = asyncio.run(store.get_goal("goal-failure-projection-1"))
+    attempt = asyncio.run(store.get_goal_attempt("goal-failure-projection-attempt-1"))
+    assert goal is not None
+    assert attempt is not None
+    _assert_public_failure_projection(goal, None)
+    _assert_public_failure_projection(attempt, None)
+
+
+def test_runtime_store_rejects_stale_goal_projection_from_linked_run(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "sessions" / "runtime.db")
+
+    async def _scenario() -> bool:
+        await store.create_goal(
+            goal_id="goal-projection-1",
+            objective="Preserve a newer terminal linked-run projection.",
+        )
+        await store.create_goal_attempt(
+            attempt_id="goal-projection-attempt-1",
+            goal_id="goal-projection-1",
+            attempt_index=1,
+            status="running",
+            trigger="manual_start",
+            agent_run_id="goal-projection-run-1",
+        )
+        await store.update_goal_status(
+            "goal-projection-1",
+            "running",
+            current_attempt_id="goal-projection-attempt-1",
+        )
+        await store.create_agent_run(
+            run_id="goal-projection-run-1",
+            protocol_id="teacher_student_distill",
+            title="Projection source",
+            topic="projection source",
+        )
+        await store.update_agent_run_status("goal-projection-run-1", "running")
+        stale_source = await store.get_agent_run("goal-projection-run-1")
+        assert stale_source is not None
+        await store.update_agent_run_status("goal-projection-run-1", "succeeded")
+        return await store.update_goal_projection(
+            goal_id="goal-projection-1",
+            goal_status="running",
+            attempt_id="goal-projection-attempt-1",
+            attempt_status="running",
+            current_attempt_id="goal-projection-attempt-1",
+            agent_run_id="goal-projection-run-1",
+            source_agent_run_status=str(stale_source["status"]),
+            source_agent_run_updated_at=str(stale_source["updated_at"]),
+        )
+
+    assert asyncio.run(_scenario()) is False
+    saved_goal = asyncio.run(store.get_goal("goal-projection-1"))
+    assert saved_goal is not None
+    assert saved_goal["status"] == "running"
+    assert saved_goal["attempts"][0]["status"] == "running"
 
 
 def test_runtime_store_defaults_missing_single_agent_goal_protocol_to_autonomous_agent(

@@ -1,0 +1,56 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "skill-version-v2",
+  "producer_package": "PKG-MAIN-70-MEMORY-SKILL-GOVERNANCE",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "SkillLibrary.add",
+    "SkillLibrary.update",
+    "SkillLibrary.merge",
+    "SkillLibrary.get_version",
+    "SkillLibrary.list_versions",
+    "SkillLibrary.promote",
+    "SkillLibrary.rollback",
+    "SkillLibrary.pin_run_version"
+  ],
+  "inputs": {
+    "skill_update": "A valid legacy Skill field update. Updating an active skill appends a new immutable version instead of mutating a historical version.",
+    "promotion": "skill_id, retained version, and a non-empty evaluation evidence object with a stable evidence_id.",
+    "rollback": "skill_id, retained target version, and a non-empty reason. Rollback selects a prior retained version without deleting history.",
+    "run_pin": "run_id, skill_id, and a retained version. Existing pins are immutable."
+  },
+  "outputs": {
+    "active_skill": "Legacy get, list, search, export, and statistics return only the current active skill projection.",
+    "history": "Version rows preserve the full serialized Skill content and their creation time. Each skill version is immutable once recorded.",
+    "promotion": "A successful promotion switches only the active-version selector and retains the evidence object and promotion timestamp.",
+    "run_pin": "Recorded-run pins continue to resolve their originally pinned version after promotion or rollback."
+  },
+  "errors": [
+    "Promotion rejects missing, empty, or evidence_id-free evaluation evidence.",
+    "Promotion, rollback, or pinning rejects a missing skill or missing retained version.",
+    "Rollback rejects an empty reason.",
+    "A run_id cannot be repinned to another skill version.",
+    "Historical version updates and deletes are not exposed by the active-skill API."
+  ],
+  "compatibility": {
+    "major_version": "2",
+    "legacy_rows": "Existing skills migrate to one retained version matching their existing version and become the active selection.",
+    "legacy_api": "Existing add, get, list, search, update, merge, delete, upsert, export, and statistics call shapes remain available against the active projection.",
+    "history": "Delete removes the active projection but retained versions and immutable recorded-run pins remain queryable by the governance API.",
+    "rollback": "Rollback changes only active selection and leaves all retained version rows and run pins unchanged."
+  },
+  "consumers": [
+    "mochi.agents.context",
+    "mochi.agents.engine",
+    "PKG-WORKER-71-SKILL-API",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SKILL-GOVERNANCE-CORE",
+    "GATE-SKILL-GOVERNANCE",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

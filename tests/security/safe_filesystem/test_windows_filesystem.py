@@ -363,7 +363,7 @@ def test_windows_native_name_collision_maps_file_exists() -> None:
     from mochi.security.safe_fs_windows import _WindowsNativeAdapter
 
     adapter = object.__new__(_WindowsNativeAdapter)
-    collision = ctypes.c_long(0xC0000035).value
+    collision = ctypes.c_int32(adapter.STATUS_OBJECT_NAME_COLLISION).value
     adapter._NtCreateFile = lambda *args: collision
 
     with pytest.raises(FileExistsError):

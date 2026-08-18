@@ -172,6 +172,7 @@ class ChatCancelResponse(BaseModel):
     run_state: Literal["running", "cancelling", "cancelled", "completed"] | None = None
     cancel_outcome: Literal["cancelled", "completed", "pending"] | None = None
     cancel_reason: str | None = None
+    durable_outcome: Literal["cancelled_pre_commit", "already_committed"] | None = None
 
 
 @router.post("/chat", response_model=ChatResponse, response_model_exclude_none=True)
@@ -341,7 +342,11 @@ async def chat_stream(request: Request, payload: ChatRequest) -> StreamingRespon
     )
 
 
-@router.post("/chat/{session_id}/cancel", response_model=ChatCancelResponse)
+@router.post(
+    "/chat/{session_id}/cancel",
+    response_model=ChatCancelResponse,
+    response_model_exclude_unset=True,
+)
 async def cancel_chat_stream_run(
     request: Request,
     session_id: str,
@@ -922,14 +927,17 @@ def _serialize_event(
             fallback_turn_id=fallback_turn_id,
         )
     if isinstance(event, ErrorEvent):
+        payload = {
+            "type": event.type,
+            "error": event.message,
+            "code": event.code,
+            "metadata": jsonable_encoder(event.metadata),
+        }
+        if event.failure is not None:
+            payload["failure"] = event.failure.to_dict()
         return _attach_turn_id(
             event,
-            {
-                "type": event.type,
-                "error": event.message,
-                "code": event.code,
-                "metadata": jsonable_encoder(event.metadata),
-            },
+            payload,
             fallback_turn_id=fallback_turn_id,
         )
     if is_dataclass(event):

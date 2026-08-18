@@ -771,11 +771,11 @@ async def test_registry_factory_propagates_independent_file_scopes(tmp_path: Pat
     for tool_name in read_tool_names:
         tool = registry.get(tool_name)
         assert tool is not None
-        assert getattr(tool, "_path_scope") == "any"
+        assert tool._path_scope == "any"
     for tool_name in write_tool_names:
         tool = registry.get(tool_name)
         assert tool is not None
-        assert getattr(tool, "_path_scope") == "workspace"
+        assert tool._path_scope == "workspace"
     read_result = await reader.execute(path=str(outside))
     write_result = await writer.execute(path=str(outside), content="blocked")
 

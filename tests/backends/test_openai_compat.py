@@ -3,15 +3,34 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+import json
+from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+from mochi.agents.generation_policy import GenerationTerminal, normalize_generation_terminal
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.types import Message, ToolCall, ToolSchema
 
 from ._support import _httpx_json_response, _mock_response
+
+
+class _MockStreamContext:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self.raise_for_status = MagicMock()
+
+    async def __aenter__(self) -> _MockStreamContext:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    async def aiter_lines(self) -> AsyncIterator[str]:
+        for line in self._lines:
+            yield line
 
 
 @pytest.mark.asyncio
@@ -693,3 +712,142 @@ async def test_openai_compat_probe_marks_tools_unavailable_when_all_openai_proto
     assert metadata["tool_call_mode"] == "unavailable"
     assert metadata["tool_calling_blocked"] is True
     assert metadata["tool_protocol_probe"]["selected_protocol"] is None
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_effective_context_prefers_observed_serving_limit() -> None:
+    backend = OpenAICompatBackend(
+        "https://example.test/v1",
+        "proxy-model",
+        configured_context_length=8192,
+    )
+    models = _mock_response({"data": [{"id": "proxy-model", "context_length": 32768}]})
+    try:
+        with patch.object(backend._client, "get", new_callable=AsyncMock, return_value=models):
+            await backend._ensure_capability_discovery()  # noqa: SLF001
+        backend._parse_chat_completions_result(  # noqa: SLF001
+            {
+                "context_length": 4096,
+                "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+            }
+        )
+    finally:
+        await backend.close()
+
+    info = backend.get_model_info()
+
+    assert info.context_length == 4096
+    assert info.metadata["configured_context_length"] == 8192
+    assert info.metadata["serving_context_length"] == 4096
+    assert info.metadata["advertised_context_length"] == 32768
+    assert info.metadata["context_source"] == "serving"
+    assert info.metadata["context_confidence"] == "high"
+    assert info.metadata["context_is_hard_limit"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "chat_finish_reason", "responses_payload", "responses_event", "expected_terminal"),
+    [
+        (
+            "completion",
+            "stop",
+            {"output_text": "done", "status": "completed"},
+            {"type": "response.completed", "response": {"status": "completed"}},
+            GenerationTerminal.COMPLETE,
+        ),
+        (
+            "truncation",
+            "length",
+            {
+                "output_text": "partial",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
+            },
+            GenerationTerminal.OUTPUT_TRUNCATED,
+        ),
+        (
+            "unreliable_metadata",
+            None,
+            {"output_text": "unverified"},
+            None,
+            GenerationTerminal.UNKNOWN,
+        ),
+    ],
+)
+async def test_openai_compat_terminal_semantics_are_symmetric_for_streaming_and_blocking(
+    case: str,
+    chat_finish_reason: str | None,
+    responses_payload: dict[str, object],
+    responses_event: dict[str, object] | None,
+    expected_terminal: GenerationTerminal,
+) -> None:
+    del case
+    chat_data: dict[str, object] = {
+        "choices": [{"message": {"content": "chat output"}}],
+    }
+    if chat_finish_reason is not None:
+        chat_data["choices"] = [
+            {"message": {"content": "chat output"}, "finish_reason": chat_finish_reason}
+        ]
+
+    chat_backend = OpenAICompatBackend("https://example.test/v1", "proxy-model")
+    responses_backend = OpenAICompatBackend("https://example.test/v1/responses", "proxy-model")
+    try:
+        chat_blocking = chat_backend._parse_chat_completions_result(chat_data)  # noqa: SLF001
+        responses_blocking = responses_backend._parse_responses_result(responses_payload)  # noqa: SLF001
+
+        chat_lines = [
+            'data: {"choices":[{"delta":{"content":"prefix"},"finish_reason":null}]}',
+            f"data: {json.dumps(chat_data)}",
+        ]
+        if chat_finish_reason is None:
+            chat_lines.append("data: [DONE]")
+        with patch.object(chat_backend._client, "stream", return_value=_MockStreamContext(chat_lines)):  # noqa: SLF001
+            chat_stream = [
+                chunk
+                async for chunk in chat_backend._stream_generate(  # noqa: SLF001
+                    {"stream": True}, request_url=chat_backend._chat_completions_url  # noqa: SLF001
+                )
+            ]
+
+        responses_lines = (
+            [f"data: {json.dumps(responses_event)}"] if responses_event is not None else ["data: [DONE]"]
+        )
+        with patch.object(
+            responses_backend._client,
+            "stream",
+            return_value=_MockStreamContext(responses_lines),
+        ):  # noqa: SLF001
+            responses_stream = [
+                chunk
+                async for chunk in responses_backend._stream_generate(  # noqa: SLF001
+                    {"stream": True}, request_url=responses_backend._responses_url  # noqa: SLF001
+                )
+            ]
+    finally:
+        await chat_backend.close()
+        await responses_backend.close()
+
+    terminal_signals = [
+        chat_blocking.finish_reason,
+        responses_blocking.finish_reason,
+        next(chunk.finish_reason for chunk in reversed(chat_stream) if chunk.is_final),
+        next(chunk.finish_reason for chunk in reversed(responses_stream) if chunk.is_final),
+    ]
+    assert sum(chunk.is_final for chunk in chat_stream) == 1
+    assert sum(chunk.is_final for chunk in responses_stream) == 1
+    for terminal_signal in terminal_signals:
+        decision = normalize_generation_terminal(
+            terminal_signal=terminal_signal,
+            has_structured_tool_calls=False,
+            output="partial" if expected_terminal is GenerationTerminal.OUTPUT_TRUNCATED else "",
+        )
+        assert decision.terminal is expected_terminal

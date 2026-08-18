@@ -173,7 +173,9 @@ async def test_engine_compaction_does_not_pollute_canonical_restore(tmp_path: Pa
     _ = [event async for event in restored.chat("follow-up", session_id="s1")]
 
     restored_messages = restored_backend.calls[-1]
-    assert [message.content for message in restored_messages[1:5]] == [
+    assert [message.content for message in restored_messages[1:7]] == [
+        "u6",
+        "ok",
         "u7",
         "ok",
         "u8",

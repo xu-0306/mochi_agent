@@ -13,6 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
 
     logger = logging.getLogger(__name__)
 
+from mochi.auth.openai_codex import normalize_openai_codex_base_url
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.gguf import GGUFBackend
 from mochi.backends.llama_cpp_server import LlamaCppServerBackend
@@ -21,7 +22,6 @@ from mochi.backends.ollama import OllamaBackend
 from mochi.backends.openai_codex import OpenAICodexBackend
 from mochi.backends.openai_compat import OpenAICompatBackend
 from mochi.backends.safetensors import SafetensorsBackend
-from mochi.auth.openai_codex import normalize_openai_codex_base_url
 from mochi.config.schema import GGUFConfig, HuggingFaceConfig, LlamaCppRuntimeConfig
 
 

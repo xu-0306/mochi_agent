@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
-import re
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
+
 try:
     from loguru import logger
 except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
@@ -36,7 +37,6 @@ from mochi.backends.local_models import (
     BaseLocalModelConverter,
     LlamaCppLocalModelConverter,
     LocalModelConversionError,
-    LocalModelConvertRequest as BackendLocalModelConvertRequest,
     ManagedLlamaCppInstallError,
     _detect_hardware_summary,
     discover_hf_quantization_capabilities,
@@ -45,17 +45,36 @@ from mochi.backends.local_models import (
     install_managed_llama_cpp_runtime,
     prepare_managed_llama_cpp_install_plan,
 )
+from mochi.backends.local_models import (
+    LocalModelConvertRequest as BackendLocalModelConvertRequest,
+)
 from mochi.backends.vllm_runtime import ManagedVLLMRuntimeManager
 from mochi.backends.vllm_utils import (
     configured_vllm_launch_mode as shared_configured_vllm_launch_mode,
+)
+from mochi.backends.vllm_utils import (
     ensure_local_path_allowed,
     is_hf_safetensors_dir,
+)
+from mochi.backends.vllm_utils import (
     is_http_endpoint as shared_is_http_endpoint,
+)
+from mochi.backends.vllm_utils import (
     is_local_path_candidate as shared_is_local_path_candidate,
+)
+from mochi.backends.vllm_utils import (
     is_managed_vllm_configured_model as shared_is_managed_vllm_configured_model,
+)
+from mochi.backends.vllm_utils import (
     is_possible_managed_vllm_target as shared_is_possible_managed_vllm_target,
+)
+from mochi.backends.vllm_utils import (
     managed_vllm_base_url as shared_managed_vllm_base_url,
+)
+from mochi.backends.vllm_utils import (
     normalize_vllm_managed_model_spec as shared_normalize_vllm_managed_model_spec,
+)
+from mochi.backends.vllm_utils import (
     resolve_vllm_managed_model_spec as shared_resolve_vllm_managed_model_spec,
 )
 from mochi.config.manager import ConfigRevisionConflict, config_revision, save_config
@@ -698,7 +717,7 @@ async def install_local_model_runtime(
         message = install_result.message
 
     request.app.state.config = updated
-    setattr(request.app.state, "local_model_converter", None)
+    request.app.state.local_model_converter = None
     engine = await _get_or_create_engine(request.app)
     apply_config = getattr(engine, "apply_config", None)
     if callable(apply_config):
@@ -765,10 +784,7 @@ async def convert_local_model(
     if converted.converted and payload.persist:
         output_path = str(Path(converted.output_model_path).expanduser().resolve(strict=False))
         normalized_target_format = converted.target_format.strip().lower()
-        if normalized_target_format == "gguf":
-            backend_type = "gguf"
-        else:
-            backend_type = "safetensors"
+        backend_type = "gguf" if normalized_target_format == "gguf" else "safetensors"
         updated = config.model_copy(deep=True)
         updated.model = output_path
         saved_entry = ConfiguredModelConfig(
@@ -812,12 +828,12 @@ def _get_local_model_conversion_registry(request: Request) -> tuple[asyncio.Lock
     registry_lock = getattr(request.app.state, "local_model_conversion_registry_lock", None)
     if not isinstance(registry_lock, asyncio.Lock):
         registry_lock = asyncio.Lock()
-        setattr(request.app.state, "local_model_conversion_registry_lock", registry_lock)
+        request.app.state.local_model_conversion_registry_lock = registry_lock
 
     in_progress = getattr(request.app.state, "local_model_conversion_in_progress", None)
     if not isinstance(in_progress, set):
         in_progress = set()
-        setattr(request.app.state, "local_model_conversion_in_progress", in_progress)
+        request.app.state.local_model_conversion_in_progress = in_progress
 
     return registry_lock, in_progress
 

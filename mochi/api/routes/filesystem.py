@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import time
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from string import ascii_uppercase
 from typing import Annotated, Any
@@ -130,10 +131,8 @@ def _select_native_directory(initial_dir: Path | None, title: str | None) -> str
     root = tk.Tk()
     root.withdraw()
     try:
-        try:
+        with suppress(tk.TclError):
             root.attributes("-topmost", True)
-        except tk.TclError:
-            pass
 
         options: dict[str, Any] = {
             "title": title or "Select Project Root",

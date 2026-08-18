@@ -7,8 +7,6 @@ import contextlib
 import inspect
 import json
 import math
-import os
-import signal
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable
@@ -21,6 +19,13 @@ from mochi.runtime.exec_sessions import (
     ExecSessionStatus,
     SessionPollResult,
     utc_now,
+)
+from mochi.runtime.process_identity import (
+    DurableProcessIdentity,
+    VerifiedProcessHandle,
+    capture_process_identity,
+    open_verified_process,
+    wait_for_process_exit,
 )
 from mochi.runtime.sandbox import (
     SandboxMode,
@@ -59,6 +64,12 @@ class ExecRuntime:
             self._state_root.mkdir(parents=True, exist_ok=True)
             self._recover_detached_sessions()
         self._session_seq = count(self._next_session_sequence_start())
+
+    @property
+    def state_root(self) -> Path | None:
+        """Return the configured durable session root, when persistence is enabled."""
+
+        return self._state_root
 
     async def start_command(
         self,
@@ -128,6 +139,8 @@ class ExecRuntime:
 
         process: asyncio.subprocess.Process | None = None
         pid: int | None = None
+        durable_process_identity: DurableProcessIdentity | None = None
+        verified_process_handle: VerifiedProcessHandle | None = None
         if persisted_detached:
             if resolved_log_path is None:
                 raise RuntimeError("Detached persisted sessions require a log path.")
@@ -155,6 +168,17 @@ class ExecRuntime:
                         start_new_session=True,
                     )
             pid = detached_process.pid
+            durable_process_identity = capture_process_identity(pid)
+            verification = (
+                open_verified_process(durable_process_identity)
+                if durable_process_identity is not None
+                else None
+            )
+            if verification is None or verification.handle is None:
+                self._terminate_new_detached_process(detached_process)
+                reason = verification.reason if verification is not None else "identity_capture_failed"
+                raise RuntimeError(f"Detached process identity verification failed: {reason}")
+            verified_process_handle = verification.handle
         else:
             process = await self._process_launcher(
                 launch_executable,
@@ -184,6 +208,9 @@ class ExecRuntime:
             log_path=resolved_log_path,
             checkpoint_dir=resolved_checkpoint_dir,
             detached_persisted=persisted_detached,
+            durable_process_identity=durable_process_identity,
+            identity_state="verified" if persisted_detached else "not_required",
+            verified_process_handle=verified_process_handle,
             recovered=False,
             state_dir=str(state_dir.resolve()) if state_dir is not None else None,
             manifest_path=(
@@ -647,13 +674,40 @@ class ExecRuntime:
                 manifest_path=manifest_path,
                 recovered=True,
             )
+            if session.status is ExecSessionStatus.RUNNING:
+                self._restore_detached_session_identity(session, manifest_version=snapshot.manifest_version)
             if session.log_path:
                 with contextlib.suppress(OSError):
                     session.log_read_offset = max(
                         0,
                         Path(session.log_path).stat().st_size - self._output_tail_limit,
                     )
+            previous = self._sessions.get(session.session_id)
+            if previous is not None:
+                self._close_verified_process_handle(previous)
             self._sessions[session.session_id] = session
+            self._persist_session_state(session)
+
+    def _restore_detached_session_identity(self, session: ExecSession, *, manifest_version: int) -> None:
+        """Reattach only when the v2 durable identity yields a stable OS handle."""
+        identity = session.durable_process_identity
+        if manifest_version == 1 or session.identity_state != "verified" or identity is None:
+            session.status = ExecSessionStatus.ORPHANED
+            session.identity_state = "legacy" if manifest_version == 1 else "unknown"
+            session.mark_activity()
+            return
+        verification = open_verified_process(identity)
+        if verification.state == "verified" and verification.handle is not None:
+            session.verified_process_handle = verification.handle
+            session.identity_state = "verified"
+            return
+        if verification.state == "exited":
+            session.status = ExecSessionStatus.COMPLETED
+            session.identity_state = "exited"
+        else:
+            session.status = ExecSessionStatus.ORPHANED
+            session.identity_state = verification.state
+        session.mark_activity()
 
     async def _watch_detached_session(self, session_id: str, *, timeout_sec: float | None) -> None:
         session = self._sessions.get(session_id)
@@ -670,17 +724,18 @@ class ExecRuntime:
             while True:
                 if session.status is not ExecSessionStatus.RUNNING:
                     return
-                if not await self._is_pid_running(session.pid):
+                handle = session.verified_process_handle
+                if handle is None or not handle.is_running():
                     await self._refresh_recovered_detached_session_state(session)
                     return
                 if deadline is not None and loop.time() >= deadline:
                     async with session.lock:
                         session.timed_out = True
-                        session.status = ExecSessionStatus.TIMED_OUT
                         session.mark_activity()
-                    self._persist_session_state(session)
-                    if session.pid is not None:
-                        await self._terminate_pid(session.pid)
+                    await self._terminate_detached_session(
+                        session,
+                        terminal_status=ExecSessionStatus.TIMED_OUT,
+                    )
                     return
                 await asyncio.sleep(0.2)
         except asyncio.CancelledError:
@@ -723,30 +778,71 @@ class ExecRuntime:
     async def _refresh_recovered_detached_session_state(self, session: ExecSession) -> None:
         if session.status is not ExecSessionStatus.RUNNING:
             return
-        if await self._is_pid_running(session.pid):
+        handle = session.verified_process_handle
+        if handle is None:
+            await self._mark_detached_session_orphaned(session, identity_state="unknown")
+            return
+        if handle.is_running():
             return
         async with session.lock:
             if session.exit_code is None or session.exit_code == 0:
                 session.status = ExecSessionStatus.COMPLETED
             else:
                 session.status = ExecSessionStatus.FAILED
+            session.identity_state = "exited"
             session.mark_activity()
+        self._close_verified_process_handle(session)
         self._persist_session_state(session)
 
     async def _kill_recovered_detached_session(self, session: ExecSession) -> None:
-        if session.pid is None:
-            async with session.lock:
-                session.status = ExecSessionStatus.KILLED
-                session.mark_activity()
-            self._persist_session_state(session)
-            return
-        if not await self._is_pid_running(session.pid):
+        await self._terminate_detached_session(session, terminal_status=ExecSessionStatus.KILLED)
+
+    async def _terminate_detached_session(
+        self,
+        session: ExecSession,
+        *,
+        terminal_status: ExecSessionStatus,
+    ) -> bool:
+        """Terminate only with the handle bound to a verified durable identity."""
+        handle = session.verified_process_handle
+        if handle is None:
+            await self._mark_detached_session_orphaned(session, identity_state="unknown")
+            return False
+        if not handle.is_running():
             await self._refresh_recovered_detached_session_state(session)
-            return
-        await self._terminate_pid(session.pid)
+            return False
+        if not handle.request_termination():
+            await self._mark_detached_session_orphaned(session, identity_state="unknown")
+            return False
+        exited = await asyncio.to_thread(wait_for_process_exit, handle, timeout_seconds=2.0)
+        if not exited:
+            if not handle.force_termination():
+                await self._mark_detached_session_orphaned(session, identity_state="unknown")
+                return False
+            exited = await asyncio.to_thread(wait_for_process_exit, handle, timeout_seconds=2.0)
+        if not exited:
+            await self._mark_detached_session_orphaned(session, identity_state="unknown")
+            return False
         async with session.lock:
-            session.status = ExecSessionStatus.KILLED
+            session.status = terminal_status
+            session.identity_state = "exited"
             session.mark_activity()
+        self._close_verified_process_handle(session)
+        self._persist_session_state(session)
+        return True
+
+    async def _mark_detached_session_orphaned(
+        self,
+        session: ExecSession,
+        *,
+        identity_state: str,
+    ) -> None:
+        async with session.lock:
+            session.status = ExecSessionStatus.ORPHANED
+            if not (session.identity_state == "legacy" and identity_state == "unknown"):
+                session.identity_state = identity_state
+            session.mark_activity()
+        self._close_verified_process_handle(session)
         self._persist_session_state(session)
 
     async def _detach_session_from_runtime(self, session: ExecSession) -> None:
@@ -772,6 +868,7 @@ class ExecRuntime:
             with contextlib.suppress(Exception):
                 process.stdin.close()
         self._close_log_handle(session)
+        self._close_verified_process_handle(session)
         session.process = None
 
     def _close_log_handle(self, session: ExecSession) -> None:
@@ -781,57 +878,22 @@ class ExecRuntime:
                 log_handle.close()
             session.log_handle = None
 
-    async def _is_pid_running(self, pid: int | None) -> bool:
-        if pid is None:
-            return False
-        if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
+    @staticmethod
+    def _close_verified_process_handle(session: ExecSession) -> None:
+        handle = session.verified_process_handle
+        if handle is not None:
+            handle.close()
+            session.verified_process_handle = None
 
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            process_handle = kernel32.OpenProcess(
-                0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
-                False,
-                pid,
-            )
-            if not process_handle:
-                return False
-            try:
-                exit_code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
-                    return False
-                return exit_code.value == 259  # STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(process_handle)
+    @staticmethod
+    def _terminate_new_detached_process(process: subprocess.Popen[bytes]) -> None:
+        """Clean up a new child through its original Popen handle on failed capture."""
+        with contextlib.suppress(OSError):
+            process.terminate()
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-
-    async def _terminate_pid(self, pid: int) -> None:
-        if sys.platform == "win32":
-            import ctypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            process_handle = kernel32.OpenProcess(
-                0x0001 | 0x0400,  # PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION
-                False,
-                pid,
-            )
-            if process_handle:
-                try:
-                    kernel32.TerminateProcess(process_handle, 1)
-                finally:
-                    kernel32.CloseHandle(process_handle)
-            return
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGTERM)
-        for _ in range(20):
-            if not await self._is_pid_running(pid):
-                return
-            await asyncio.sleep(0.1)
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=2)

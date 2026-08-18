@@ -1,11 +1,13 @@
 'use client'
 
 import * as React from 'react'
-import { usePathname, useRouter } from 'next/navigation'
+import { useRouter } from 'next/navigation'
 import {
   Check,
   ChevronDown,
   ChevronRight,
+  CircleHelp,
+  Cloud,
   FolderPlus,
   FolderOpen,
   Library,
@@ -13,8 +15,8 @@ import {
   PanelLeftOpen,
   Plus,
   Search,
-  Settings,
   Trash2,
+  UserRound,
   Waypoints,
   Workflow,
   Zap,
@@ -45,6 +47,26 @@ interface ProjectDialogState {
   projectId: string | null
   name: string
   workspaceDir: string
+}
+
+const MOBILE_SIDEBAR_QUERY = '(max-width: 767px)'
+
+function useMobileSidebarViewport() {
+  const [matches, setMatches] = React.useState(false)
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return
+    }
+    const mediaQuery = window.matchMedia(MOBILE_SIDEBAR_QUERY)
+    const syncMatches = () => setMatches(mediaQuery.matches)
+
+    syncMatches()
+    mediaQuery.addEventListener('change', syncMatches)
+    return () => mediaQuery.removeEventListener('change', syncMatches)
+  }, [])
+
+  return matches
 }
 
 function basename(path: string): string {
@@ -79,10 +101,12 @@ function sortSessions(sessions: Session[]): Session[] {
 
 export function Sidebar() {
   const router = useRouter()
-  const pathname = usePathname()
   const { t } = useI18n()
-  const collapsed = useUIStore((state) => state.sidebarCollapsed)
+  const storedCollapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed)
+  const mobileViewport = useMobileSidebarViewport()
+  const [mobileExpanded, setMobileExpanded] = React.useState(false)
+  const collapsed = mobileViewport ? !mobileExpanded : storedCollapsed
   const [search, setSearch] = React.useState('')
   const [selectionMode, setSelectionMode] = React.useState(false)
   const [selectedSessionIds, setSelectedSessionIds] = React.useState<string[]>([])
@@ -93,6 +117,11 @@ export function Sidebar() {
   const [projectDialog, setProjectDialog] = React.useState<ProjectDialogState | null>(null)
   const [projectDirectoryError, setProjectDirectoryError] = React.useState<string | null>(null)
   const [isSelectingProjectDirectory, setIsSelectingProjectDirectory] = React.useState(false)
+  const [mobileNavOpen, setMobileNavOpen] = React.useState(false)
+  const [mobileNavTarget, setMobileNavTarget] = React.useState<'search' | 'projects'>('search')
+  const mobileNavDialogRef = React.useRef<HTMLElement>(null)
+  const mobileNavCloseRef = React.useRef<HTMLButtonElement>(null)
+  const mobileNavReturnFocusRef = React.useRef<HTMLElement | null>(null)
 
   const {
     sessions,
@@ -130,6 +159,70 @@ export function Sidebar() {
       void loadProjects()
     }
   }, [hasLoadedProjects, isLoadingProjects, loadProjects])
+
+  React.useEffect(() => {
+    const handleMobileNavigation = (event: Event) => {
+      const target = (event as CustomEvent<'search' | 'projects'>).detail
+      if (target !== 'search' && target !== 'projects') {
+        return
+      }
+      mobileNavReturnFocusRef.current = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null
+      setMobileNavTarget(target)
+      setMobileNavOpen(true)
+    }
+    window.addEventListener('mochi:open-mobile-navigation', handleMobileNavigation)
+    return () => window.removeEventListener('mochi:open-mobile-navigation', handleMobileNavigation)
+  }, [])
+
+  const closeMobileNavigation = React.useCallback(() => {
+    setMobileNavOpen(false)
+    window.requestAnimationFrame(() => {
+      const returnTarget = mobileNavReturnFocusRef.current
+      const fallbackTarget = document.querySelector<HTMLElement>('[aria-controls="mobile-workspace-tools"]')
+      ;(returnTarget?.isConnected ? returnTarget : fallbackTarget)?.focus()
+    })
+  }, [])
+
+  React.useEffect(() => {
+    if (!mobileNavOpen) {
+      return
+    }
+
+    mobileNavCloseRef.current?.focus()
+    const handleMobileNavigationKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeMobileNavigation()
+        return
+      }
+      if (event.key !== 'Tab') {
+        return
+      }
+
+      const dialog = mobileNavDialogRef.current
+      const focusable = dialog
+        ? Array.from(dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'))
+        : []
+      if (focusable.length === 0) {
+        return
+      }
+
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last?.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first?.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleMobileNavigationKeyDown)
+    return () => document.removeEventListener('keydown', handleMobileNavigationKeyDown)
+  }, [closeMobileNavigation, mobileNavOpen])
 
   const normalizedSearch = search.trim().toLowerCase()
   const visibleSessions = normalizedSearch
@@ -350,23 +443,43 @@ export function Sidebar() {
   return (
     <>
       <aside
+        data-mochi-sidebar
         className={cn(
           'flex h-full shrink-0 flex-col overflow-hidden border-r border-border bg-sidebar-layer',
           'transition-[width] duration-300 ease-out-smooth',
-          collapsed ? 'w-16' : 'w-[300px]'
+          mobileViewport && !collapsed
+            ? 'fixed inset-y-0 left-0 z-40 w-[min(300px,calc(100vw-3rem))] shadow-2xl'
+            : collapsed
+              ? 'w-16'
+              : 'w-[248px]'
         )}
       >
-        <div className={cn('flex h-12 items-center border-b border-border px-3 shrink-0', collapsed && 'justify-center px-0')}>
-          {!collapsed && (
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <Zap className="h-5 w-5 shrink-0 text-primary-500" />
-              <span className="truncate text-sm font-semibold text-foreground">Mochi</span>
+        <div className={cn('flex h-14 items-center border-b border-border/80 px-3 shrink-0 max-md:justify-center max-md:px-0', collapsed && 'justify-center px-0')}>
+          {!collapsed ? (
+            <div className="flex min-w-0 flex-1 items-center gap-2.5 max-md:flex-none">
+              <span data-mochi-sidebar-mark className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-foreground text-background shadow-sm">
+                <Zap className="h-3.5 w-3.5" />
+              </span>
+              <div className="sidebar-wide min-w-0">
+                <span className="block truncate text-[13px] font-semibold text-foreground">Mochi</span>
+                <span className="block truncate text-[10px] text-muted-foreground">Personal workspace</span>
+              </div>
             </div>
+          ) : (
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-foreground text-background shadow-sm">
+              <Zap className="h-4 w-4" />
+            </span>
           )}
           <Button
             variant="ghost"
             size="icon-sm"
-            onClick={() => setSidebarCollapsed(!collapsed)}
+            onClick={() => {
+              if (mobileViewport) {
+                setMobileExpanded((expanded) => !expanded)
+                return
+              }
+              setSidebarCollapsed(!collapsed)
+            }}
             aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
             className="shrink-0"
           >
@@ -376,23 +489,22 @@ export function Sidebar() {
 
         <div className={cn('flex flex-col gap-2 px-3 pb-2 pt-3', collapsed && 'items-center px-2')}>
           <Button
-            variant="primary"
+            variant="outline"
             size={collapsed ? 'icon' : 'md'}
-            className={cn('w-full', collapsed && 'w-9')}
+            className={cn(
+              'w-full border-border/80 bg-surface-layer/80 shadow-[0_1px_2px_rgba(20,20,24,0.04)] hover:border-primary-500/35 hover:bg-surface-layer',
+              collapsed && 'w-9'
+            )}
             onClick={handleNewSession}
             title={t('sidebar.newChatShortcut')}
           >
             <Plus className="h-4 w-4" />
-            {!collapsed && <span>{t('sidebar.newChat')}</span>}
+            {!collapsed && <span className="sidebar-wide max-md:hidden">{t('sidebar.newChat')}</span>}
           </Button>
 
           {!collapsed ? (
             <>
-              <Button variant="secondary" size="md" className="w-full" onClick={openCreateProject}>
-                <FolderPlus className="h-4 w-4" />
-                <span>New Project</span>
-              </Button>
-              <div className="relative">
+              <div className="sidebar-wide relative">
                 <Input
                   id="sidebar-search-input"
                   placeholder={t('sidebar.searchPlaceholder')}
@@ -403,6 +515,10 @@ export function Sidebar() {
                   className="pl-8"
                 />
               </div>
+              <Button variant="ghost" size="sm" className="sidebar-wide w-full justify-start text-muted-foreground hover:text-foreground" onClick={openCreateProject}>
+                <FolderPlus className="h-4 w-4" />
+                <span>New Project</span>
+              </Button>
               <div className="flex items-center gap-2">
                 <Button
                   variant={selectionMode ? 'secondary' : 'ghost'}
@@ -412,7 +528,7 @@ export function Sidebar() {
                   className="justify-start"
                 >
                   <Trash2 className="h-4 w-4" />
-                  <span>{selectionMode ? t('sidebar.bulkCancel') : t('sidebar.bulkDelete')}</span>
+                  <span className="sidebar-wide max-md:hidden">{selectionMode ? t('sidebar.bulkCancel') : t('sidebar.bulkDelete')}</span>
                 </Button>
                 {selectionMode ? (
                   <span className="text-xs font-medium text-muted-foreground">
@@ -422,62 +538,29 @@ export function Sidebar() {
               </div>
             </>
           ) : null}
-
-          <div className={cn('flex gap-1', collapsed ? 'flex-col' : 'grid grid-cols-2')}>
-            <Button
-              variant="ghost"
-              size={collapsed ? 'icon' : 'sm'}
-              onClick={() => router.push('/skills')}
-              title={t('sidebar.skills')}
-              className={collapsed ? 'w-9' : 'justify-start'}
-            >
-              <Library className="h-4 w-4" />
-              {!collapsed && <span>{t('sidebar.skills')}</span>}
-            </Button>
-            <Button
-              variant="ghost"
-              size={collapsed ? 'icon' : 'sm'}
-              onClick={() => router.push('/settings')}
-              title={t('sidebar.settings')}
-              className={collapsed ? 'w-9' : 'justify-start'}
-            >
-              <Settings className="h-4 w-4" />
-              {!collapsed && <span>{t('sidebar.settings')}</span>}
-            </Button>
-          </div>
         </div>
 
         <nav className="flex-1 space-y-3 overflow-y-auto px-2 py-2">
-          <SidebarSection title={t('sidebar.advancedTools')} collapsed={collapsed}>
-            {!collapsed ? (
-              <div className="mx-1 rounded-xl border border-primary-500/20 bg-primary-500/8 p-2.5">
-                <p className="text-xs font-semibold text-primary-200">
-                  {t('sidebar.primaryHintTitle')}
-                </p>
-                <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-                  {t('sidebar.primaryHintDescription')}
-                </p>
-              </div>
-            ) : null}
-            <SidebarNavButton
+          <div className="space-y-0.5">
+            <SidebarRouteButton
               collapsed={collapsed}
-              active={pathname === '/goals'}
               icon={<Waypoints className="h-4 w-4" />}
-              title={t('sidebar.goalConsole')}
-              description={t('sidebar.goalConsoleDescription')}
+              title="Goals"
               onClick={() => router.push('/goals')}
             />
-            <SidebarNavButton
+            <SidebarRouteButton
               collapsed={collapsed}
-              active={pathname === '/agent-runs' || pathname.startsWith('/agent-runs/')}
-              onClick={() => router.push('/agent-runs')}
-              title={t('sidebar.workflows')}
               icon={<Workflow className="h-4 w-4" />}
-              ariaLabel={t('sidebar.workflows')}
-              description={t('sidebar.runDeskDescription')}
+              title="Workflows"
+              onClick={() => router.push('/agent-runs')}
             />
-          </SidebarSection>
-
+            <SidebarRouteButton
+              collapsed={collapsed}
+              icon={<Library className="h-4 w-4" />}
+              title="Skills"
+              onClick={() => router.push('/skills')}
+            />
+          </div>
           {selectionMode && !collapsed ? (
             <div className="mx-1 rounded-xl border border-primary-500/20 bg-primary-500/8 p-2.5">
               <p className="text-xs font-semibold uppercase tracking-[0.14em] text-primary-300">
@@ -513,7 +596,7 @@ export function Sidebar() {
             </SidebarSection>
           ) : null}
 
-          <SidebarSection title="Projects" collapsed={collapsed}>
+          <SidebarSection title="Projects" collapsed={collapsed} mobileHidden>
             {projects.map((project) => {
               const expanded = expandedProjectIds.includes(project.id)
               const projectSessions = sortSessions(byProject[project.id] ?? [])
@@ -523,8 +606,8 @@ export function Sidebar() {
                 <div
                   key={project.id}
                   className={cn(
-                    'rounded-lg border border-border/60 bg-surface-layer/50',
-                    isActiveProject && 'border-primary-500/40 bg-primary-500/8'
+                    'rounded-lg border border-transparent',
+                    isActiveProject && 'border-primary-500/25 bg-primary-500/8'
                   )}
                 >
                   <button
@@ -547,7 +630,7 @@ export function Sidebar() {
                   </button>
 
                   {!collapsed ? (
-                    <div className="flex gap-1 px-2 pb-2">
+                    <div className="flex gap-1 border-t border-border/50 px-2 pb-2 pt-1">
                       <Button variant="ghost" size="sm" onClick={() => setActiveProjectId(project.id)}>
                         Use
                       </Button>
@@ -579,14 +662,149 @@ export function Sidebar() {
             ) : null}
           </SidebarSection>
 
-          <SidebarSection title="Unassigned Chats" collapsed={collapsed}>
+          <SidebarSection title="Unassigned Chats" collapsed={collapsed} mobileHidden>
             {sortSessions(unassigned).map(renderSession)}
             {unassigned.length === 0 && !collapsed ? (
               <p className="px-2 py-2 text-xs text-muted-foreground">No unassigned chats.</p>
             ) : null}
           </SidebarSection>
         </nav>
+
+        <div className={cn('shrink-0 border-t border-border/80 p-2', collapsed ? 'space-y-1' : 'space-y-0.5')}>
+          <div
+            className={cn('flex items-center gap-2 px-2 py-1.5 text-[11px] text-muted-foreground', collapsed && 'justify-center px-0')}
+            title="Local context synced"
+          >
+            <Cloud className="h-3.5 w-3.5 shrink-0 text-success" />
+            {!collapsed ? <span className="sidebar-wide">Local context synced</span> : null}
+          </div>
+          <Button
+            variant="ghost"
+            size={collapsed ? 'icon' : 'sm'}
+            className={collapsed ? 'mx-auto w-9' : 'w-full justify-start text-muted-foreground'}
+            title="Help"
+            aria-label="Help"
+            onClick={() => router.push('/settings')}
+          >
+            <CircleHelp className="h-4 w-4" />
+            {!collapsed ? <span className="sidebar-wide">Help</span> : null}
+          </Button>
+          <Button
+            variant="ghost"
+            size={collapsed ? 'icon' : 'sm'}
+            className={collapsed ? 'mx-auto w-9' : 'w-full justify-start'}
+            title="Profile"
+            aria-label="Profile"
+            onClick={() => router.push('/settings')}
+          >
+            <span className="flex h-6 w-6 items-center justify-center rounded-full border border-border bg-foreground text-background">
+              <UserRound className="h-3.5 w-3.5" />
+            </span>
+            {!collapsed ? <span className="sidebar-wide">Profile</span> : null}
+          </Button>
+        </div>
       </aside>
+
+      {mobileNavOpen ? (
+        <div
+          className="fixed inset-0 z-[90] bg-black/35 md:hidden"
+          role="presentation"
+          onClick={closeMobileNavigation}
+        >
+          <section
+            ref={mobileNavDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mobile-navigation-title"
+            className="absolute inset-x-3 bottom-3 top-16 flex flex-col overflow-hidden rounded-xl border border-border bg-surface-layer shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-border/80 px-4 py-3">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Workspace</p>
+                <h2 id="mobile-navigation-title" className="text-base font-semibold text-foreground">
+                  {mobileNavTarget === 'search' ? 'Search chats' : 'Projects and sessions'}
+                </h2>
+              </div>
+              <Button ref={mobileNavCloseRef} type="button" variant="ghost" size="icon-sm" title="Close navigation" aria-label="Close navigation" onClick={closeMobileNavigation}>
+                <ChevronRight className="h-4 w-4 rotate-90" />
+              </Button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4">
+              {mobileNavTarget === 'search' ? (
+                <>
+                  <Input
+                    id="mobile-sidebar-search-input"
+                    autoFocus
+                    placeholder={t('sidebar.searchPlaceholder')}
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    leftIcon={<Search className="h-3.5 w-3.5" />}
+                    size="sm"
+                    className="pl-8"
+                  />
+                  <div className="mt-3 space-y-1">
+                    {visibleSessions.length > 0 ? visibleSessions.map((session) => (
+                      <button
+                        key={session.id}
+                        type="button"
+                        className="flex w-full items-center justify-between gap-3 rounded-md border border-transparent px-3 py-2 text-left text-sm hover:border-border hover:bg-muted/45"
+                        onClick={() => { closeMobileNavigation(); handleSelectSession(session.id) }}
+                      >
+                        <span className="min-w-0 truncate">{session.title}</span>
+                        <span className="shrink-0 text-[11px] text-muted-foreground">{session.lastMessageAt.toLocaleDateString()}</span>
+                      </button>
+                    )) : <p className="py-6 text-center text-sm text-muted-foreground">No matching chats.</p>}
+                  </div>
+                </>
+              ) : (
+                <div className="space-y-2">
+                  <Button type="button" variant="outline" size="sm" className="w-full justify-start" onClick={() => { closeMobileNavigation(); openCreateProject() }}>
+                    <FolderPlus className="h-4 w-4" />
+                    New Project
+                  </Button>
+                  {projects.length > 0 ? projects.map((project) => {
+                    const projectSessions = sortSessions(byProject[project.id] ?? [])
+                    return (
+                      <div key={project.id} className="border-y border-border/70 py-2">
+                        <button
+                          type="button"
+                          className="flex w-full items-center gap-2 px-2 py-1 text-left"
+                          onClick={() => { setActiveProjectId(project.id); toggleProjectExpanded(project.id) }}
+                        >
+                          <FolderOpen className="h-4 w-4 shrink-0" />
+                          <span className="min-w-0 flex-1 truncate text-sm font-medium">{project.name}</span>
+                          <span className="text-[11px] text-muted-foreground">{projectSessions.length}</span>
+                        </button>
+                        {expandedProjectIds.includes(project.id) ? projectSessions.map((session) => (
+                          <button
+                            key={session.id}
+                            type="button"
+                            className="block w-full truncate px-8 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted/45 hover:text-foreground"
+                            onClick={() => { closeMobileNavigation(); handleSelectSession(session.id) }}
+                          >
+                            {session.title}
+                          </button>
+                        )) : null}
+                      </div>
+                    )
+                  }) : <p className="py-6 text-center text-sm text-muted-foreground">No projects yet.</p>}
+                  {unassigned.length > 0 ? (
+                    <div className="border-y border-border/70 py-2">
+                      <p className="px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Unassigned chats</p>
+                      {unassigned.map((session) => (
+                        <button key={session.id} type="button" className="block w-full truncate px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted/45 hover:text-foreground" onClick={() => { closeMobileNavigation(); handleSelectSession(session.id) }}>
+                          {session.title}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       <Dialog
         open={pendingDeleteSession !== null}
@@ -756,61 +974,52 @@ export function Sidebar() {
 function SidebarSection({
   title,
   collapsed = false,
+  mobileHidden = false,
   children,
 }: {
   title: string
   collapsed?: boolean
+  mobileHidden?: boolean
   children: React.ReactNode
 }) {
   return (
-    <div className="space-y-1">
+    <div className={cn('space-y-1', mobileHidden && 'max-md:hidden')}>
       {!collapsed ? (
-        <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        <div className="sidebar-wide px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           {title}
         </div>
       ) : null}
-      <div className="space-y-1">{children}</div>
+      <div className="space-y-0.5">{children}</div>
     </div>
   )
 }
 
-function SidebarNavButton({
+function SidebarRouteButton({
   collapsed,
-  active,
   icon,
   title,
-  ariaLabel,
-  description,
   onClick,
 }: {
   collapsed: boolean
-  active: boolean
   icon: React.ReactNode
   title: string
-  ariaLabel?: string
-  description: string
   onClick: () => void
 }) {
   return (
     <Button
-      variant={active ? 'secondary' : 'ghost'}
+      type="button"
+      variant="ghost"
       size={collapsed ? 'icon' : 'sm'}
-      onClick={onClick}
       title={title}
-      aria-label={ariaLabel ?? title}
+      aria-label={title}
+      onClick={onClick}
       className={cn(
-        collapsed ? 'mx-auto w-9' : 'h-auto w-full justify-start rounded-xl px-3 py-2.5'
+        collapsed ? 'mx-auto w-9' : 'h-auto w-full justify-start rounded-lg px-3 py-2',
+        'text-muted-foreground hover:bg-surface-layer/75 hover:text-foreground'
       )}
     >
-      <span className="shrink-0">{icon}</span>
-      {!collapsed ? (
-        <span className="min-w-0 text-left">
-          <span className="block truncate text-sm font-medium">{title}</span>
-          <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
-            {description}
-          </span>
-        </span>
-      ) : null}
+      {icon}
+      {!collapsed ? <span className="sidebar-wide min-w-0 truncate text-left text-sm font-medium">{title}</span> : null}
     </Button>
   )
 }

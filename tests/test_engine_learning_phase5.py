@@ -7,8 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from mochi.agents.conversation_resolver import (
+    BoundedConversationContext,
+    ConversationResolver,
+    IntentInterpretation,
+)
 from mochi.agents.engine import AgentEngine
 from mochi.agents.events import FinalAnswerEvent
+from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.base import BaseLLMBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo, StreamChunk, ToolCall
 from mochi.config.schema import MochiConfig
@@ -247,6 +253,21 @@ class _FakeTool(BaseTool):
         return ToolResult(output=f"observed:{kwargs.get('query', '')}")
 
 
+class _WorkspaceReadInterpreter:
+    async def interpret(
+        self,
+        context: BoundedConversationContext,
+    ) -> IntentInterpretation:
+        return IntentInterpretation(
+            current_speech_act="request_information",
+            task_relation="standalone",
+            objective=context.current_turn.content,
+            operations=frozenset({"workspace_read"}),
+            mutation_requirement="forbidden",
+            confidence=0.99,
+        )
+
+
 def _build_skill(
     *,
     skill_id: str,
@@ -285,7 +306,12 @@ async def test_engine_does_not_extract_skill_when_tool_threshold_is_not_met(tmp_
             "learning": {"min_steps_for_extraction": 3},
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=lambda backend: ConversationResolver(
+            interpreter=_WorkspaceReadInterpreter()
+        ),
+    )
 
     async def fake_load(model_spec: str) -> _LearningBackend:
         engine._router._active = backend  # noqa: SLF001
@@ -294,7 +320,20 @@ async def test_engine_does_not_extract_skill_when_tool_threshold_is_not_met(tmp_
     engine._router.load = fake_load  # type: ignore[method-assign]
     engine._tool_registry.register(_FakeTool())  # noqa: SLF001
 
-    first_events = [event async for event in engine.chat("debug this", session_id="learn-s1")]
+    first_events = [
+        event
+        async for event in engine._run_chat(  # noqa: SLF001
+            AgentInvocationRequest(
+                message="debug this",
+                session_id="learn-s1",
+                execution_profile="chat",
+                persist_session=True,
+                tool_mode="required",
+                tool_names_override=["fake_tool"],
+                tool_allowlist=["fake_tool"],
+            )
+        )
+    ]
     first_final = next(event for event in first_events if isinstance(event, FinalAnswerEvent))
 
     assert first_final.trajectory_id is not None
@@ -305,7 +344,20 @@ async def test_engine_does_not_extract_skill_when_tool_threshold_is_not_met(tmp_
     ]
     assert learned_skills == []
 
-    second_events = [event async for event in engine.chat("debug again", session_id="learn-s1")]
+    second_events = [
+        event
+        async for event in engine._run_chat(  # noqa: SLF001
+            AgentInvocationRequest(
+                message="debug again",
+                session_id="learn-s1",
+                execution_profile="chat",
+                persist_session=True,
+                tool_mode="required",
+                tool_names_override=["fake_tool"],
+                tool_allowlist=["fake_tool"],
+            )
+        )
+    ]
     assert any(isinstance(event, FinalAnswerEvent) for event in second_events)
     second_system_prompt = backend.chat_calls[-1][0].content
     assert "Debug with fake tool" not in second_system_prompt
@@ -333,7 +385,12 @@ async def test_engine_extracts_skill_when_tool_call_threshold_is_met(tmp_path: P
             },
         }
     )
-    engine = AgentEngine(config)
+    engine = AgentEngine(
+        config,
+        conversation_resolver_factory=lambda backend: ConversationResolver(
+            interpreter=_WorkspaceReadInterpreter()
+        ),
+    )
 
     async def fake_load(model_spec: str) -> _MultiToolLearningBackend:
         engine._router._active = backend  # noqa: SLF001
@@ -342,7 +399,20 @@ async def test_engine_extracts_skill_when_tool_call_threshold_is_met(tmp_path: P
     engine._router.load = fake_load  # type: ignore[method-assign]
     engine._tool_registry.register(_FakeTool())  # noqa: SLF001
 
-    events = [event async for event in engine.chat("debug this thoroughly", session_id="learn-s4")]
+    events = [
+        event
+        async for event in engine._run_chat(  # noqa: SLF001
+            AgentInvocationRequest(
+                message="debug this thoroughly",
+                session_id="learn-s4",
+                execution_profile="chat",
+                persist_session=True,
+                tool_mode="required",
+                tool_names_override=["fake_tool"],
+                tool_allowlist=["fake_tool"],
+            )
+        )
+    ]
 
     assert any(isinstance(event, FinalAnswerEvent) for event in events)
     assert backend.extraction_calls == 1

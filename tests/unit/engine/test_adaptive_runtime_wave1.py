@@ -24,6 +24,7 @@ from mochi.agents.events import (
     ToolCallRequestEvent,
     ToolCallResultEvent,
 )
+from mochi.agents.invocation import AgentInvocationRequest
 from mochi.agents.outcome_verifier import VerificationCriterion
 from mochi.agents.plan_ledger import PLAN_LEDGER_EVENT, PLAN_LEDGER_VERSION, PlanItem, PlanLedger
 from mochi.agents.tool_exposure import ToolExposurePlan
@@ -32,7 +33,6 @@ from mochi.agents.turn_intent_contract import (
     DeliverableContract,
     TurnIntentContract,
 )
-from mochi.agents.invocation import AgentInvocationRequest
 from mochi.backends.types import GenerationResult
 from mochi.config.schema import MochiConfig
 from mochi.tools.base import BaseTool, ToolExecutionContext, ToolResult

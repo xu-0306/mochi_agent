@@ -1546,9 +1546,12 @@ async def test_pre_effect_failed_receipt_requires_host_marker_for_model_replan(
     receipt = {"verification_status": "failed", "execution_status": "failed", "retry_disposition": "requires_replan", "resolved_targets": [target], "aggregate_verification_receipt": aggregate}
     class SpyReActLoop:
         calls = 0
-        def __init__(self, *args: object, **kwargs: object) -> None: del args, kwargs; self.turn_messages = []
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.turn_messages = []
         async def run(self, *args: object, **kwargs: object) -> AsyncIterator[AgentEvent]:
-            del args, kwargs; type(self).calls += 1
+            del args, kwargs
+            type(self).calls += 1
             if type(self).calls == 1:
                 yield ToolCallResultEvent(call_id="blocked", tool_name="file_write", result=None, error="pre-effect", metadata={"timeline_pre_effect_failure": host_marker})
                 yield FinalAnswerEvent(content="blocked", metadata={"artifact_verification": receipt})
@@ -1583,9 +1586,12 @@ async def test_multi_operation_recovery_selects_unique_target_or_blocks(
     receipt = {"verification_status": "failed", "execution_status": "failed", "retry_disposition": "requires_replan", "resolved_targets": [target], "aggregate_verification_receipt": aggregate}
     class SpyReActLoop:
         calls = 0
-        def __init__(self, *args: object, **kwargs: object) -> None: del args, kwargs; self.turn_messages = []
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.turn_messages = []
         async def run(self, *args: object, **kwargs: object) -> AsyncIterator[AgentEvent]:
-            del args, kwargs; type(self).calls += 1
+            del args, kwargs
+            type(self).calls += 1
             if type(self).calls == 1:
                 for operation, path in (("other", target if ambiguous else str(tmp_path / "other.md")), ("target", target)):
                     yield ToolCallResultEvent(call_id=operation, tool_name="file_write", result=path, metadata={"timeline_operation_id": operation, "timeline_result_disposition": "succeeded", "file_changes": [{"path": path}]})

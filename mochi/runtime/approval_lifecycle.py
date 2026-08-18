@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Mapping, Protocol, cast
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from mochi.runtime.approval_state_machine import (

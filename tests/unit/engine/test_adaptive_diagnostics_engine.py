@@ -163,8 +163,14 @@ async def test_engine_persists_backend_error_diagnostics_but_not_nonpersistent_t
 async def test_async_generator_close_finalizes_partial_turn_diagnostics_once(
     tmp_path,
 ) -> None:
-    engine = _engine(tmp_path, "execution")
+    engine = _engine(tmp_path, "temporal_lookup")
     backend = _ToolThenBlockingBackend()
+
+    async def fake_load(model_spec: str) -> _ToolThenBlockingBackend:
+        engine._router._active = backend  # noqa: SLF001
+        return backend
+
+    engine._router.load = fake_load  # type: ignore[method-assign]
     persist_calls: list[str] = []
     persist_contexts = []
     original_persist = engine._persist_adaptive_diagnostics  # noqa: SLF001

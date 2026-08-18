@@ -1,4 +1,5 @@
 import type { AgentRunDetail, AgentRunSummary } from '@/lib/api'
+import { presentFailure } from '@/lib/failure-presentation'
 import type {
   WorkflowAgentCard,
   WorkflowAgentStatus,
@@ -634,6 +635,16 @@ function workflowResultStatus(status: string): WorkflowProgressCardResult['statu
   return 'pending'
 }
 
+function workflowFailureDetail(run: AgentRunDetail): string {
+  try {
+    return run.failure
+      ? presentFailure(run.failure).detail
+      : 'The workflow could not complete. Review the workflow details before trying again.'
+  } catch {
+    return 'The workflow could not complete. Review the workflow details before trying again.'
+  }
+}
+
 export function buildWorkflowProgressCardView(run: AgentRunDetail | null): WorkflowProgressCardView | null {
   if (!run?.run_id) {
     return null
@@ -642,7 +653,7 @@ export function buildWorkflowProgressCardView(run: AgentRunDetail | null): Workf
   const view = buildWorkflowDeskView({ run })
   const resultStatus = workflowResultStatus(view.status)
   const finalAnswer = asString(run.summary?.final_answer)
-  const latestError = asString(run.latest_error)
+  const hasLatestError = Boolean(asString(run.latest_error))
   const activeStage = view.stages.find((stage) => stage.status === 'active' || stage.status === 'blocked')
   const completedStageCount = view.stages.filter((stage) => stage.status === 'completed').length
   const activeAgents = view.agents.filter((agent) =>
@@ -663,7 +674,9 @@ export function buildWorkflowProgressCardView(run: AgentRunDetail | null): Workf
     startedAt: view.startedAt,
     updatedAt: view.updatedAt,
     finishedAt: view.finishedAt,
-    latestError,
+    // Keep raw latest_error on the AgentRun API model only. This projection is
+    // user-facing and must not make diagnostic text available to card views.
+    latestError: null,
     roles: (activeAgents.length > 0 ? activeAgents : view.agents).slice(0, 4).map((agent) => ({
       roleId: agent.roleId,
       label: agent.label,
@@ -680,8 +693,10 @@ export function buildWorkflowProgressCardView(run: AgentRunDetail | null): Workf
       .slice(-4),
     finalResult: {
       status: resultStatus,
-      content: finalAnswer ?? (resultStatus === 'error' ? latestError : null),
-      source: finalAnswer ? 'run_summary' : latestError ? 'latest_error' : 'none',
+      content: finalAnswer ?? (resultStatus === 'error'
+        ? workflowFailureDetail(run)
+        : null),
+      source: finalAnswer ? 'run_summary' : hasLatestError ? 'latest_error' : 'none',
     },
   }
 }

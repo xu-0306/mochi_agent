@@ -30,7 +30,6 @@ from mochi.backends.base import BaseLLMBackend
 from mochi.backends.types import GenerationResult, Message, ModelInfo, StreamChunk, ToolSchema
 from mochi.config.schema import MochiConfig
 
-
 EXTERNAL_QUALIFICATION_FIXTURE_VERSION = "ordinary-chat-adaptive-wave5-fixture-v1"
 EXTERNAL_QUALIFICATION_EVIDENCE_VERSION = "ordinary-chat-adaptive-wave5-evidence-v2"
 CANARY_REVIEW_VERSION = "ordinary-chat-adaptive-wave6-review-v2"
@@ -230,7 +229,7 @@ class ExternalQualificationFixture:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ExternalQualificationFixture":
+    def from_dict(cls, value: Mapping[str, Any]) -> ExternalQualificationFixture:
         _exact_keys(
             value,
             frozenset(
@@ -368,7 +367,7 @@ class QualificationResult:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "QualificationResult":
+    def from_dict(cls, value: Mapping[str, Any]) -> QualificationResult:
         _exact_keys(
             value,
             frozenset(
@@ -471,7 +470,7 @@ class ExternalQualificationEvidence:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ExternalQualificationEvidence":
+    def from_dict(cls, value: Mapping[str, Any]) -> ExternalQualificationEvidence:
         _exact_keys(
             value,
             frozenset(
@@ -930,7 +929,7 @@ class CanaryReview:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "CanaryReview":
+    def from_dict(cls, value: Mapping[str, Any]) -> CanaryReview:
         _exact_keys(
             value,
             frozenset(

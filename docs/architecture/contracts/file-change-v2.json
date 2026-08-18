@@ -1,0 +1,111 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "file-change-v2",
+  "producer_package": "PKG-MAIN-50-FILE-WORKFLOW-SEAMS",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "FileChangeRequest.parent_request_digest",
+    "FileChangeRequest.selected_entry_ids",
+    "derive_file_change_subset",
+    "file_change_subset_entry_id",
+    "ChangeManifest.parent_request_digest",
+    "ChangeManifest.selected_entry_ids",
+    "ChangeSetStore.persist_manifest",
+    "revalidate_patch_change_contract"
+  ],
+  "inputs": {
+    "parent_request": {
+      "fields": [
+        "request_digest",
+        "entries",
+        "dependency_group"
+      ],
+      "rule": "The parent request must already be persisted and its requester, session, task, workspace identity, and policy version must match the child request."
+    },
+    "selection": {
+      "fields": [
+        "selected_entry_ids"
+      ],
+      "rule": "Selection is non-empty, references only entries in the immediate parent request, and includes every member of each selected dependency_group."
+    },
+    "approval": {
+      "fields": [
+        "request_digest",
+        "change_set_id",
+        "patch"
+      ],
+      "rule": "Every apply and retry is revalidated against its own immutable manifest, current policy, workspace identity, file identities, base content, and patch digest."
+    }
+  },
+  "outputs": {
+    "subset_request": {
+      "fields": [
+        "entries",
+        "patch_sha256",
+        "parent_request_digest",
+        "selected_entry_ids"
+      ],
+      "rule": "Each selected parent entry receives a deterministic child entry ID scoped to the parent request digest, so per-entry outcomes remain unique and durable."
+    },
+    "manifest": {
+      "fields": [
+        "change_set_id",
+        "request_digest",
+        "parent_request_digest",
+        "selected_entry_ids",
+        "entries",
+        "status"
+      ],
+      "status_values": [
+        "prepared",
+        "applied",
+        "conflicted",
+        "interference",
+        "superseded_schema"
+      ]
+    },
+    "entry_outcomes": {
+      "fields": [
+        "change_set_id",
+        "entry_id",
+        "applied_sha256",
+        "applied_identity",
+        "applied_metadata_sha256",
+        "applied_at"
+      ],
+      "rule": "Durable transaction journals and applied_change_entries record each child manifest entry independently."
+    }
+  },
+  "errors": [
+    "partial_dependency_group rejects a selection that omits any member of a selected dependency group.",
+    "parent_request_missing rejects a child manifest when its referenced parent digest is not durably persisted.",
+    "parent_request_context_changed rejects parent/child requester, session, task, workspace identity, or policy mismatches.",
+    "subset_entry_changed rejects a child entry whose immutable projection differs from its selected parent entry.",
+    "subset_reuses_parent_approval rejects an attempted child request with the parent request digest.",
+    "change_set_conflicted requires a fresh preview, subset manifest, digest, and approval after revalidation detects changed policy, workspace identity, file identity, content, or patch."
+  ],
+  "compatibility": {
+    "major_version": "2",
+    "unknown_major": "reject",
+    "legacy_request": "Requests without parent_request_digest and selected_entry_ids decode as root requests only; they cannot be interpreted as subset requests.",
+    "lineage": "A child request carries the immediate parent request digest and selected parent entry IDs in its authorization digest and manifest projection; UI metadata is not an authorization source.",
+    "approval": "Parent approvals are never valid for children because the child authorization envelope has a distinct request digest.",
+    "retry": "A conflict is terminal for that manifest. Recovery starts from a newly prepared request and repeats authorization and identity validation.",
+    "dependency_groups": "A dependency group is indivisible at every selection, persistence, and recovery boundary."
+  },
+  "consumers": [
+    "PKG-WORKER-51-FILE-WEB",
+    "mochi.runtime.change_sets",
+    "mochi.runtime.service",
+    "mochi.tools.file_ops",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-FILE-WORKFLOW-CORE",
+    "GATE-FILE-WORKFLOW",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

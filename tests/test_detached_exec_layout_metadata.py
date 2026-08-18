@@ -38,17 +38,21 @@ _SCRIPT_BY_COMMAND = {
 
 
 def test_prepare_detached_exec_layout_returns_recovery_paths(tmp_path: Path) -> None:
-    layout = _prepare_detached_exec_layout(str(tmp_path), "req-123")
+    state_root = tmp_path / "exec-state"
+    layout = _prepare_detached_exec_layout(
+        str(tmp_path),
+        "req-123",
+        runtime_state_root=state_root,
+    )
 
     assert layout is not None
     assert Path(layout["root_dir"]).is_dir()
     assert Path(layout["checkpoint_dir"]).is_dir()
     assert Path(layout["log_path"]).name == "session.log"
     assert Path(layout["session_log_path"]) == Path(layout["log_path"])
-    assert Path(layout["manifest_path"]).name == "manifest.json"
     assert Path(layout["stdout_log_path"]).name == "stdout.log"
     assert Path(layout["stderr_log_path"]).name == "stderr.log"
-    assert Path(layout["runtime_state_root"]).name == "exec-runtime"
+    assert Path(layout["runtime_state_root"]) == state_root.resolve()
 
 
 def test_collect_detached_exec_jobs_marks_recoverable_and_reattachable() -> None:
@@ -106,11 +110,16 @@ def test_collect_detached_exec_jobs_marks_recoverable_and_reattachable() -> None
 
 @pytest.mark.asyncio
 async def test_exec_command_background_metadata_includes_detached_layout(tmp_path: Path) -> None:
-    detached_layout = _prepare_detached_exec_layout(str(tmp_path), "req-bg")
+    state_root = tmp_path / "exec-state"
+    detached_layout = _prepare_detached_exec_layout(
+        str(tmp_path),
+        "req-bg",
+        runtime_state_root=state_root,
+    )
     runtime = exec_command_module.ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
-        state_root=Path(detached_layout["runtime_state_root"]),
+        state_root=state_root,
     )
     tool = ExecCommandTool(
         runtime=runtime,

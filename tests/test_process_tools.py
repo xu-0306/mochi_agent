@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -59,7 +60,10 @@ async def test_process_poll_and_stop_not_found() -> None:
 def test_process_service_records_exited_process(tmp_path: Path) -> None:
     async def _run() -> None:
         service = ProcessService()
-        payload = await service.start_shell(command='python -c "print(1)"', cwd=tmp_path)
+        payload = await service.start_shell(
+            command=f'"{sys.executable}" -c "print(1)"',
+            cwd=tmp_path,
+        )
         process_id = payload["process_id"]
         await asyncio.sleep(0.2)
         polled = await service.poll(process_id)
@@ -73,7 +77,10 @@ def test_process_service_exposes_output_tails(tmp_path: Path) -> None:
     async def _run() -> None:
         service = ProcessService()
         payload = await service.start_shell(
-            command='python -c "import sys; print(\'hello\'); sys.stderr.write(\'oops\\n\')"',
+            command=(
+                f'"{sys.executable}" -c '
+                '"import sys; print(\'hello\'); sys.stderr.write(\'oops\\n\')"'
+            ),
             cwd=tmp_path,
         )
         process_id = payload["process_id"]

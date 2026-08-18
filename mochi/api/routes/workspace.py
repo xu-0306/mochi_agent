@@ -24,7 +24,9 @@ from mochi.runtime.store import RuntimeStore
 from mochi.sessions.store import SessionStore
 from mochi.tools.file_mutations import PatchValidationError
 from mochi.tools.file_ops import (
+    FileChangeContractConflict,
     file_change_policy_version,
+    prepare_file_change_subset_contract,
     prepare_patch_change_contract,
 )
 from mochi.utils.security import (
@@ -47,6 +49,15 @@ class WorkspacePatchPreviewRequest(BaseModel):
     project_id: str | None = None
     approval_id: str | None = None
     encoding: str = "utf-8"
+
+
+class WorkspacePatchSubsetPreviewRequest(BaseModel):
+    """Server-authoritative selective preview for a pending file approval."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str = Field(min_length=1)
+    selected_entry_ids: list[str] = Field(min_length=1)
 
 
 @router.get("/tree")
@@ -443,6 +454,210 @@ async def preview_workspace_patch(
         "errors": [],
         "validation_errors": [],
         "warnings": warnings,
+    }
+
+
+@router.post("/patch/subset-preview")
+async def preview_workspace_patch_subset(
+    request: Request,
+    payload: WorkspacePatchSubsetPreviewRequest,
+) -> dict[str, Any]:
+    """Create one immutable, replacement approval for selected parent entries."""
+
+    selected_entry_ids = tuple(entry_id.strip() for entry_id in payload.selected_entry_ids)
+    if (
+        any(not entry_id for entry_id in selected_entry_ids)
+        or len(set(selected_entry_ids)) != len(selected_entry_ids)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="selected_entry_ids must be non-empty and unique",
+        )
+
+    runtime_store = await _get_runtime_store(request)
+    approval = await runtime_store.get_approval_request(payload.approval_id)
+    if approval is None:
+        raise HTTPException(status_code=404, detail="Approval not found")
+
+    task_id = approval.get("task_id")
+    task = (
+        await runtime_store.get_task_run(task_id)
+        if isinstance(task_id, str) and task_id
+        else None
+    )
+    if task is None:
+        raise HTTPException(status_code=409, detail="Approval task is unavailable")
+
+    metadata = approval.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    approval_status = str(approval.get("status") or "")
+    if approval_status == "superseded":
+        return await _existing_subset_preview_response(
+            runtime_store=runtime_store,
+            parent_approval=approval,
+            selected_entry_ids=selected_entry_ids,
+        )
+    if approval_status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="Only pending approvals can create a subset preview",
+        )
+
+    config = await _get_config(request.app)
+    try:
+        change_payload, contract = await prepare_file_change_subset_contract(
+            runtime_store=runtime_store,
+            approval=approval,
+            task=task,
+            security=config.security,
+            selected_entry_ids=selected_entry_ids,
+        )
+    except ValueError as exc:
+        if str(exc) == "partial_dependency_group":
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileChangeContractConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    arguments = approval.get("arguments")
+    if not isinstance(arguments, dict) or not isinstance(arguments.get("patch"), str):
+        raise HTTPException(status_code=409, detail="Approval patch is unavailable")
+
+    replacement_approval_id = str(uuid4())
+    requester_id = str(
+        approval.get("requester_id") or f"runtime-task:{approval.get('task_id')}"
+    )
+    replacement_metadata = {
+        **metadata,
+        **change_payload,
+        **contract,
+        "approval_state": "replacement_pending",
+    }
+    try:
+        await runtime_store.supersede_and_create_approval_request(
+            str(approval["id"]),
+            replacement_approval_id=replacement_approval_id,
+            tool_name="apply_patch",
+            arguments=dict(arguments),
+            metadata=replacement_metadata,
+            requester_id=requester_id,
+            request_digest=str(contract["request_digest"]),
+            context_digest=str(contract["context_digest"]),
+            expires_at=str(contract["expires_at"]),
+            reason="superseded_by_subset_preview",
+        )
+    except ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return _subset_preview_response(
+        task=task,
+        change_payload=change_payload,
+        contract=contract,
+        replacement_approval_id=replacement_approval_id,
+    )
+
+
+async def _existing_subset_preview_response(
+    *,
+    runtime_store: RuntimeStore,
+    parent_approval: dict[str, Any],
+    selected_entry_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return exactly one pending replacement for an idempotent retry."""
+
+    parent_metadata = parent_approval.get("metadata")
+    parent_metadata = parent_metadata if isinstance(parent_metadata, dict) else {}
+    replacement_approval_id = parent_metadata.get("superseded_by_approval_id")
+    replacement = (
+        await runtime_store.get_approval_request(replacement_approval_id)
+        if isinstance(replacement_approval_id, str) and replacement_approval_id
+        else None
+    )
+    if replacement is None or str(replacement.get("status") or "") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="Approval was superseded by another preview",
+        )
+    metadata = replacement.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    stored_selected_ids = metadata.get("selected_entry_ids")
+    if (
+        not isinstance(stored_selected_ids, list)
+        or tuple(stored_selected_ids) != tuple(sorted(selected_entry_ids))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Approval was superseded by a different subset preview",
+        )
+    task_id = replacement.get("task_id")
+    task = (
+        await runtime_store.get_task_run(task_id)
+        if isinstance(task_id, str) and task_id
+        else None
+    )
+    if task is None:
+        raise HTTPException(status_code=409, detail="Replacement approval task is unavailable")
+    return _subset_preview_response(
+        task=task,
+        change_payload={
+            "change_count": int(metadata.get("change_count") or 0),
+            "paths": list(metadata.get("paths") or []),
+            "file_changes": list(metadata.get("file_changes") or []),
+        },
+        contract={
+            "change_set_id": metadata.get("change_set_id"),
+            "request_digest": metadata.get("request_digest"),
+            "parent_request_digest": metadata.get("parent_request_digest"),
+            "selected_entry_ids": stored_selected_ids,
+            "expires_at": metadata.get("expires_at"),
+            "policy_version": metadata.get("policy_version"),
+            "change_contract_mode": metadata.get("change_contract_mode"),
+        },
+        replacement_approval_id=str(replacement_approval_id),
+    )
+
+
+def _subset_preview_response(
+    *,
+    task: dict[str, Any],
+    change_payload: dict[str, Any],
+    contract: dict[str, Any],
+    replacement_approval_id: str,
+) -> dict[str, Any]:
+    """Project only persisted child state required by the selective-preview UI."""
+
+    workspace_value = (
+        task.get("task_workspace_dir")
+        or task.get("project_workspace_dir")
+        or task.get("workspace_dir")
+    )
+    return {
+        "type": "workspace_patch_subset_preview",
+        "valid": True,
+        "workspace_dir": str(workspace_value or ""),
+        "change_set_id": contract["change_set_id"],
+        "request_digest": contract["request_digest"],
+        "parent_request_digest": contract["parent_request_digest"],
+        "selected_entry_ids": contract["selected_entry_ids"],
+        "file_changes": change_payload["file_changes"],
+        "change_count": change_payload["change_count"],
+        "paths": change_payload["paths"],
+        "replacement_approval_id": replacement_approval_id,
+        "approval_state": "replacement_pending",
+        "expires_at": contract["expires_at"],
+        "policy_version": contract["policy_version"],
+        "change_contract_mode": str(contract.get("change_contract_mode") or "enforce"),
+        "summary": (
+            "1 selected file change prepared."
+            if change_payload["change_count"] == 1
+            else f"{change_payload['change_count']} selected file changes prepared."
+        ),
+        "patch_text": None,
+        "editable_patch_text": None,
+        "errors": [],
+        "validation_errors": [],
+        "warnings": [],
+        "would_reject_edited_patch": False,
     }
 
 

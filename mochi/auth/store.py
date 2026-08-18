@@ -6,7 +6,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -70,23 +70,19 @@ class AuthStore:
                 except FileNotFoundError:
                     continue
                 if age_seconds >= AUTH_STORE_LOCK_STALE_SECONDS:
-                    try:
+                    with suppress(FileNotFoundError):
                         lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
                     continue
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
                         f"Timed out waiting for auth store lock at {lock_path.name}."
-                    )
+                    ) from None
                 time.sleep(AUTH_STORE_LOCK_POLL_SECONDS)
         try:
             yield
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 lock_path.unlink()
-            except FileNotFoundError:
-                pass
 
     def _load_path(self) -> Path | None:
         if self._path.is_file():

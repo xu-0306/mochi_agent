@@ -4,12 +4,17 @@ import * as React from 'react'
 import { useRouter } from 'next/navigation'
 import {
   AlertCircle,
+  FolderOpen,
   FolderTree,
+  Library,
   ListTodo,
   Loader2,
+  Moon,
   MoreHorizontal,
   Settings,
+  Search,
   SlidersHorizontal,
+  Sun,
   Workflow,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -1636,7 +1641,7 @@ function HeaderRuntimeIndicator({
 
 export default function ChatPage() {
   const router = useRouter()
-  const { resolvedTimeZone, t } = useI18n()
+  const { appearance, appearanceMode, resolvedTimeZone, setAppearanceMode, t } = useI18n()
   const [modelOptions, setModelOptions] = React.useState<ChatInputModelOption[]>([])
   const [currentModel, setCurrentModel] = React.useState<string | null>(null)
   const [currentModelLoaded, setCurrentModelLoaded] = React.useState<boolean | null>(null)
@@ -1646,6 +1651,9 @@ export default function ChatPage() {
   const [modelSwitchError, setModelSwitchError] = React.useState<string | null>(null)
   const [settings, setSettings] = React.useState<api.Settings | null>(null)
   const [mobileInferenceOpen, setMobileInferenceOpen] = React.useState(false)
+  const [mobileToolsOpen, setMobileToolsOpen] = React.useState(false)
+  const mobileToolsTriggerRef = React.useRef<HTMLButtonElement>(null)
+  const mobileToolsMenuRef = React.useRef<HTMLDivElement>(null)
   const [taskPanelOpen, setTaskPanelOpen] = React.useState(false)
   const [taskPanelMode, setTaskPanelMode] = React.useState<TaskPanelMode>('default')
   const [taskPanelFocusedTaskId, setTaskPanelFocusedTaskId] = React.useState<string | null>(null)
@@ -3907,18 +3915,16 @@ export default function ChatPage() {
         pending_proposal: null,
       })
 
-      const lifecycleContent =
-        nextGoal.latest_error?.trim() ||
-        buildGoalLifecycleMessage(
-          nextGoalSummary.objective || route.raw || '',
-          route.action === 'status'
-            ? 'status_fetched'
-            : route.action === 'pause'
-              ? 'goal_paused'
-              : route.action === 'resume'
-                ? 'goal_resumed'
-                : 'goal_stopped'
-        )
+      const lifecycleContent = buildGoalLifecycleMessage(
+        nextGoalSummary.objective || route.raw || '',
+        route.action === 'status'
+          ? 'status_fetched'
+          : route.action === 'pause'
+            ? 'goal_paused'
+            : route.action === 'resume'
+              ? 'goal_resumed'
+              : 'goal_stopped'
+      )
 
       await persistGoalConversation({
         sessionId,
@@ -5807,6 +5813,80 @@ export default function ChatPage() {
     setWorkspacePanelOpen(!workspacePanelOpen)
   }, [closeRightPanels, setWorkspacePanelOpen, workspacePanelOpen])
 
+  const handleMobileToolsTrigger = React.useCallback(() => {
+    if (mobileToolsOpen) {
+      setMobileToolsOpen(false)
+      return
+    }
+    setMobileToolsOpen(true)
+  }, [mobileToolsOpen])
+
+  React.useEffect(() => {
+    if (!mobileToolsOpen) {
+      return
+    }
+
+    const menu = mobileToolsMenuRef.current
+    const firstItem = menu?.querySelector<HTMLButtonElement>('[role="menuitem"]')
+    firstItem?.focus()
+
+    const handleMobileToolsKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setMobileToolsOpen(false)
+        mobileToolsTriggerRef.current?.focus()
+        return
+      }
+
+      if (!menu || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        return
+      }
+
+      const items = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+      if (items.length === 0) {
+        return
+      }
+
+      const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement)
+      let nextIndex = currentIndex
+      if (event.key === 'Home') {
+        nextIndex = 0
+      } else if (event.key === 'End') {
+        nextIndex = items.length - 1
+      } else if (event.key === 'ArrowDown') {
+        nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length
+      } else if (event.key === 'ArrowUp') {
+        nextIndex = currentIndex < 0 ? items.length - 1 : (currentIndex - 1 + items.length) % items.length
+      }
+
+      event.preventDefault()
+      items[nextIndex]?.focus()
+    }
+
+    const handleMobileToolsPointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Node)) {
+        return
+      }
+      if (menu?.contains(target) || mobileToolsTriggerRef.current?.contains(target)) {
+        return
+      }
+      setMobileToolsOpen(false)
+    }
+
+    document.addEventListener('keydown', handleMobileToolsKeyDown)
+    document.addEventListener('pointerdown', handleMobileToolsPointerDown)
+    return () => {
+      document.removeEventListener('keydown', handleMobileToolsKeyDown)
+      document.removeEventListener('pointerdown', handleMobileToolsPointerDown)
+    }
+  }, [mobileToolsOpen])
+
+  const isDarkAppearance = appearance === 'dark'
+  const handleThemeToggle = React.useCallback(() => {
+    setAppearanceMode(isDarkAppearance ? 'light' : 'dark')
+  }, [isDarkAppearance, setAppearanceMode])
+
   const headerGoal = React.useMemo<GoalHeaderChipView | null>(() => {
     if (currentSessionGoalState.pending_proposal) {
       return null
@@ -5868,11 +5948,10 @@ export default function ChatPage() {
 
     return {
       summary:
-        getString(goalDrawerHealth.recommended_next_action?.summary) ??
-        goalDrawerHealth.latest_error ??
-        null,
+        getString(goalDrawerHealth.recommended_next_action?.summary) ?? null,
       recommendedAction: getString(goalDrawerHealth.recommended_next_action?.action),
       latestError: goalDrawerHealth.latest_error,
+      failure: goalDrawerHealth.failure,
       approvalCount:
         typeof goalDrawerHealth.approval_state?.pending_count === 'number' &&
         Number.isFinite(goalDrawerHealth.approval_state.pending_count)
@@ -6115,7 +6194,7 @@ export default function ChatPage() {
             approvalCount: continuation.approvalIds.length,
             toolNames: continuation.toolNames,
             recommendedAction: continuation.recommendedAction,
-            latestError: refreshedGoal.latest_error ?? null,
+            latestError: null,
           })
 
           await persistGoalConversation({
@@ -6223,7 +6302,7 @@ export default function ChatPage() {
             approvalCount: continuation.approvalIds.length,
             toolNames: continuation.toolNames,
             recommendedAction: continuation.recommendedAction,
-            latestError: refreshedGoal.latest_error ?? null,
+            latestError: null,
           })
           await persistGoalConversation({
             sessionId,
@@ -6304,12 +6383,12 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="border-b border-border bg-canvas/95 backdrop-blur">
-        <div className="mx-auto flex h-14 w-full max-w-5xl items-center justify-between gap-4 px-4">
-          <h1 className="min-w-0 truncate text-sm font-semibold text-foreground">
+      <header className="relative z-30 border-b border-border/80 bg-canvas/95 backdrop-blur">
+        <div className="flex h-14 w-full items-center justify-between gap-3 px-3 sm:px-5 lg:px-7">
+          <h1 className="min-w-0 truncate text-sm font-semibold text-foreground min-[768px]:min-w-[12rem]">
             {displaySessionTitle(currentSession?.title, t('chat.newChat'))}
           </h1>
-          <div className="flex items-center gap-1">
+          <div className="flex shrink-0 items-center gap-1">
             {headerGoal ? (
               <div className="mr-1 flex">
                 <GoalHeaderChip
@@ -6319,7 +6398,7 @@ export default function ChatPage() {
                 />
               </div>
             ) : null}
-            <div className="mr-2 hidden max-w-[220px] items-center gap-1.5 text-xs text-muted-foreground sm:flex">
+            <div className="mr-2 hidden max-w-[220px] items-center gap-1.5 text-[11px] text-muted-foreground xl:flex">
               {isStreaming ? (
                 <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
               ) : (
@@ -6334,10 +6413,10 @@ export default function ChatPage() {
                 title={workflowShortcutTitle}
                 aria-label={workflowShortcutTitle}
                 onClick={handleWorkflowPanelToggle}
-                className="max-sm:w-8 max-sm:px-0"
+                className="max-xl:w-8 max-xl:px-0 max-md:hidden"
               >
                 <Workflow className="h-4 w-4" />
-                <span className="hidden sm:inline">{workflowShortcutLabel}</span>
+                <span className="hidden xl:inline">Workflow</span>
               </Button>
               {workflowError ? (
                 <HeaderRuntimeIndicator tone="error" pulse />
@@ -6349,37 +6428,49 @@ export default function ChatPage() {
             </div>
             <Button
               variant="ghost"
-              size="icon-sm"
+              size="sm"
               title={t('chat.moreOptions')}
+              aria-label={t('chat.moreOptions')}
               onClick={() => setExportOpen(true)}
+              className="max-xl:w-8 max-xl:px-0 max-md:hidden"
             >
               <MoreHorizontal className="h-4 w-4" />
+              <span className="hidden xl:inline">More</span>
             </Button>
+            <span className="mx-1 hidden h-5 w-px bg-border/90 xl:block" aria-hidden="true" />
             <Button
               variant={workspacePanelOpen || workspaceMobileOpen ? 'secondary' : 'ghost'}
-              size="icon-sm"
+              size="sm"
               title="Workspace"
+              aria-label="Workspace"
               onClick={handleWorkspacePanelToggle}
+              className="max-xl:w-8 max-xl:px-0 max-md:hidden"
             >
               <FolderTree className="h-4 w-4" />
+              <span className="hidden xl:inline">Workspace</span>
             </Button>
             <Button
               variant={panelOpen || mobileInferenceOpen ? 'secondary' : 'ghost'}
-              size="icon-sm"
+              size="sm"
               title="Inference"
+              aria-label="Inference"
               onClick={handleInferencePanelToggle}
+              className="max-xl:w-8 max-xl:px-0 max-md:hidden"
             >
               <SlidersHorizontal className="h-4 w-4" />
+              <span className="hidden xl:inline">Inference</span>
             </Button>
             <div className="relative shrink-0">
               <Button
                 variant={taskPanelOpen ? 'secondary' : 'ghost'}
-                size="icon-sm"
+                size="sm"
                 title={taskShortcutTitle}
                 aria-label={taskShortcutTitle}
                 onClick={handleTaskPanelToggle}
+                className="max-xl:w-8 max-xl:px-0 max-md:hidden"
               >
                 <ListTodo className="h-4 w-4" />
+                <span className="hidden xl:inline">Tasks</span>
               </Button>
               {pendingApprovalCount > 0 ? (
                 <HeaderRuntimeIndicator tone="error" count={pendingApprovalCount} pulse />
@@ -6389,16 +6480,88 @@ export default function ChatPage() {
                 <HeaderRuntimeIndicator tone="warning" count={activeTaskCount} />
               ) : null}
             </div>
+            <span className="mx-1 hidden h-5 w-px bg-border/90 xl:block" aria-hidden="true" />
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title={isDarkAppearance ? 'Switch to light theme' : 'Switch to dark theme'}
+              aria-label={isDarkAppearance ? 'Switch to light theme' : 'Switch to dark theme'}
+              aria-pressed={isDarkAppearance}
+              data-appearance-mode={appearanceMode}
+              onClick={handleThemeToggle}
+            >
+              {isDarkAppearance ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            </Button>
             <Button
               variant="ghost"
               size="icon-sm"
               title={t('chat.settingsShortcut')}
+              aria-label={t('chat.settingsShortcut')}
               onClick={() => router.push('/settings')}
+              className="max-md:hidden"
             >
               <Settings className="h-4 w-4" />
             </Button>
+            <Button
+              ref={mobileToolsTriggerRef}
+              variant={mobileToolsOpen ? 'secondary' : 'ghost'}
+              size="sm"
+              title="More tools"
+              aria-label="More tools"
+              aria-haspopup="menu"
+              aria-expanded={mobileToolsOpen}
+              aria-controls="mobile-workspace-tools"
+              onClick={handleMobileToolsTrigger}
+              className="md:hidden"
+            >
+              <MoreHorizontal className="h-4 w-4" />
+              <span className="hidden min-[360px]:inline">More</span>
+            </Button>
           </div>
         </div>
+        {mobileToolsOpen ? (
+          <div
+            ref={mobileToolsMenuRef}
+            id="mobile-workspace-tools"
+            role="menu"
+            aria-label="Workspace tools"
+            className="absolute right-3 top-[3.35rem] grid w-[min(19rem,calc(100vw-1.5rem))] gap-1 rounded-lg border border-border bg-elevated-layer p-2 shadow-xl md:hidden"
+          >
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); handleWorkflowPanelToggle() }}>
+              <Workflow className="h-4 w-4" /><span>Workflow</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); setExportOpen(true) }}>
+              <MoreHorizontal className="h-4 w-4" /><span>More / export</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); handleWorkspacePanelToggle() }}>
+              <FolderTree className="h-4 w-4" /><span>Workspace</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); handleInferencePanelToggle() }}>
+              <SlidersHorizontal className="h-4 w-4" /><span>Inference</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); handleTaskPanelToggle() }}>
+              <ListTodo className="h-4 w-4" /><span>Tasks</span>
+              {pendingApprovalCount + failedTaskCount + activeTaskCount > 0 ? (
+                <span className="ml-auto text-[11px] text-muted-foreground">{pendingApprovalCount + failedTaskCount + activeTaskCount}</span>
+              ) : null}
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); window.dispatchEvent(new CustomEvent('mochi:open-mobile-navigation', { detail: 'search' })) }}>
+              <Search className="h-4 w-4" /><span>Search</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); window.dispatchEvent(new CustomEvent('mochi:open-mobile-navigation', { detail: 'projects' })) }}>
+              <FolderOpen className="h-4 w-4" /><span>Projects and chats</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); router.push('/goals') }}>
+              <ListTodo className="h-4 w-4" /><span>Goals</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); router.push('/settings') }}>
+              <Settings className="h-4 w-4" /><span>Settings</span>
+            </button>
+            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); router.push('/skills') }}>
+              <Library className="h-4 w-4" /><span>Skills</span>
+            </button>
+          </div>
+        ) : null}
       </header>
 
       <div className="relative flex flex-1 overflow-hidden">
@@ -6406,7 +6569,7 @@ export default function ChatPage() {
           open={workspacePanelOpen}
           onOpenChange={setWorkspacePanelOpen}
           desktopSide="left"
-          desktopWidthClass="w-[min(40vw,44rem)] min-w-[24rem] max-w-[48rem]"
+          desktopWidthClass="w-[min(34vw,24rem)] min-w-[20rem] max-w-[28rem]"
           desktopBreakpoint="lg"
           mobileSide="left"
           mobileClassName="w-[92vw] max-w-[92vw] p-0 sm:max-w-[92vw]"
@@ -6498,18 +6661,19 @@ export default function ChatPage() {
         <div
           className={cn(
             'min-w-0 flex-1 transition-[padding] duration-300 ease-out-smooth',
-            workspacePanelOpen ? 'lg:pl-[calc(min(40vw,44rem)+0.75rem)]' : ''
+            workspacePanelOpen ? 'lg:pl-[calc(min(34vw,24rem)+0.75rem)]' : ''
           )}
         >
           <ScrollToBottom visible={showScrollToBottom} onClick={scrollToBottom} />
           <div ref={scrollRef} className="h-full overflow-y-auto">
-            <div className="mx-auto flex w-full max-w-4xl flex-col px-4 py-8 sm:px-6">
-              <div className="space-y-6">
+            <div className="mx-auto flex w-full max-w-5xl flex-col px-4 py-8 sm:px-8 lg:py-10">
+              <div className="space-y-7">
                 {headerGoal ? (
                   <GoalFocusPanel
                     goal={headerGoal}
                     blocker={goalDrawerBlocker}
                     callout={goalSurfaceCallout}
+                    failure={goalDrawerHealth?.failure ?? null}
                     timelineEvents={goalSurfaceTimelineEvents}
                     subagents={goalSurfaceSubagents}
                     timelineError={executionTimelineError}

@@ -85,7 +85,7 @@ def _effective_exec_policy(
 
 
 @pytest.mark.asyncio
-async def test_exec_command_hard_deny_prevents_execution() -> None:
+async def test_exec_command_hard_deny_prevents_execution(tmp_path: Path) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -93,7 +93,7 @@ async def test_exec_command_hard_deny_prevents_execution() -> None:
     tool = ExecCommandTool(
         runtime=runtime,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         command_rules=[_allow_rule("fg", shells=["test"])],
     )
 
@@ -181,7 +181,7 @@ async def test_cached_exec_command_uses_each_call_policy_snapshot(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_exec_command_foreground_success() -> None:
+async def test_exec_command_foreground_success(tmp_path: Path) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -189,7 +189,7 @@ async def test_exec_command_foreground_success() -> None:
     tool = ExecCommandTool(
         runtime=runtime,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         command_rules=[_allow_rule("fg", shells=["test"])],
     )
 
@@ -212,7 +212,7 @@ async def test_exec_command_foreground_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_command_background_returns_session_id() -> None:
+async def test_exec_command_background_returns_session_id(tmp_path: Path) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -220,7 +220,7 @@ async def test_exec_command_background_returns_session_id() -> None:
     tool = ExecCommandTool(
         runtime=runtime,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         command_rules=[_allow_rule("bg", shells=["test"])],
     )
 
@@ -237,7 +237,9 @@ async def test_exec_command_background_returns_session_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_command_foreground_cancellation_reports_cancelled_status() -> None:
+async def test_exec_command_foreground_cancellation_reports_cancelled_status(
+    tmp_path: Path,
+) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -245,7 +247,7 @@ async def test_exec_command_foreground_cancellation_reports_cancelled_status() -
     tool = ExecCommandTool(
         runtime=runtime,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         command_rules=[_allow_rule("slow", shells=["test"])],
     )
     controller = ActiveToolController()
@@ -288,7 +290,7 @@ async def test_exec_command_foreground_cancellation_reports_cancelled_status() -
 
 
 @pytest.mark.asyncio
-async def test_exec_command_returns_approval_pending_metadata() -> None:
+async def test_exec_command_returns_approval_pending_metadata(tmp_path: Path) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider(), "cmd": CmdProvider()},
         default_shell="test",
@@ -298,12 +300,12 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
         runtime=runtime,
         approval_store=approvals,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
     )
 
     result = await tool.execute(
-        command="cmd /c more notes.txt",
-        shell="cmd",
+        command="fg",
+        shell="test",
         context=ToolExecutionContext(
             permission_policy=_effective_exec_policy(
                 require_approval=True,
@@ -318,8 +320,8 @@ async def test_exec_command_returns_approval_pending_metadata() -> None:
     assert result.metadata["requires_approval"] is True
     assert result.metadata["policy_state"] == "ask"
     assert "requires approval" in result.metadata["policy_reason"]
-    assert result.metadata["rule_id"] == "cmd_c_requires_approval"
-    assert result.metadata["suggested_rule"]["tokens"] == ["cmd", "/c", "more", "notes.txt"]
+    assert result.metadata["rule_id"] == "unknown_requires_approval"
+    assert result.metadata["suggested_rule"]["tokens"] == ["fg"]
     approval_id = result.metadata["approval_id"]
     assert isinstance(approval_id, str)
     stored = approvals.get(approval_id)
@@ -397,7 +399,9 @@ async def test_exec_command_required_mode_blocks_when_backend_is_incomplete(
 
 
 @pytest.mark.asyncio
-async def test_exec_command_auto_review_allows_policy_ask_without_manual_approval() -> None:
+async def test_exec_command_auto_review_allows_policy_ask_without_manual_approval(
+    tmp_path: Path,
+) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -407,7 +411,7 @@ async def test_exec_command_auto_review_allows_policy_ask_without_manual_approva
         runtime=runtime,
         approval_store=approvals,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
     )
 
     result = await tool.execute(
@@ -439,7 +443,9 @@ async def test_exec_command_auto_review_allows_policy_ask_without_manual_approva
 
 
 @pytest.mark.asyncio
-async def test_exec_command_auto_review_still_requests_manual_approval_for_escalation() -> None:
+async def test_exec_command_auto_review_still_requests_manual_approval_for_escalation(
+    tmp_path: Path,
+) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -449,7 +455,7 @@ async def test_exec_command_auto_review_still_requests_manual_approval_for_escal
         runtime=runtime,
         approval_store=approvals,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
     )
 
     result = await tool.execute(
@@ -480,7 +486,9 @@ async def test_exec_command_auto_review_still_requests_manual_approval_for_escal
 
 
 @pytest.mark.asyncio
-async def test_exec_command_auto_review_requires_approval_for_network_credential_exposure() -> None:
+async def test_exec_command_auto_review_requires_approval_for_network_credential_exposure(
+    tmp_path: Path,
+) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -490,7 +498,7 @@ async def test_exec_command_auto_review_requires_approval_for_network_credential
         runtime=runtime,
         approval_store=approvals,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         allowed_env_vars=["API_TOKEN"],
     )
 
@@ -520,7 +528,9 @@ async def test_exec_command_auto_review_requires_approval_for_network_credential
 
 
 @pytest.mark.asyncio
-async def test_exec_command_does_not_use_legacy_shell_allowlist_for_primary_path() -> None:
+async def test_exec_command_does_not_use_legacy_shell_allowlist_for_primary_path(
+    tmp_path: Path,
+) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -528,7 +538,7 @@ async def test_exec_command_does_not_use_legacy_shell_allowlist_for_primary_path
     tool = ExecCommandTool(
         runtime=runtime,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         command_rules=[_allow_rule("fg", shells=["test"])],
     )
 
@@ -540,7 +550,7 @@ async def test_exec_command_does_not_use_legacy_shell_allowlist_for_primary_path
 
 
 @pytest.mark.asyncio
-async def test_write_read_kill_and_list_delegate_to_runtime() -> None:
+async def test_write_read_kill_and_list_delegate_to_runtime(tmp_path: Path) -> None:
     runtime = ExecRuntime(
         providers={"test": _PythonDirectProvider()},
         default_shell="test",
@@ -548,7 +558,7 @@ async def test_write_read_kill_and_list_delegate_to_runtime() -> None:
     exec_tool = ExecCommandTool(
         runtime=runtime,
         require_approval=False,
-        workspace_dir="H:/_python/agent_mochi",
+        workspace_dir=tmp_path,
         command_rules=[_allow_rule("interactive", shells=["test"])],
     )
     write_tool = WriteStdinTool(runtime=runtime)

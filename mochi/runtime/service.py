@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha1, sha256
 from pathlib import Path
 from time import monotonic
-from typing import Any, Awaitable, Callable, Mapping, cast
+from typing import Any, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -24,12 +26,16 @@ from mochi.agents.multi_agent.execution_policy import (
     execution_policy_to_dict,
     parse_subagent_execution_policy,
 )
-from mochi.agents.multi_agent.orchestrator import MultiAgentOrchestrator, MultiAgentRunRequest
+from mochi.agents.multi_agent.orchestrator import (
+    MultiAgentOrchestrator,
+    MultiAgentRunRequest,
+    MultiAgentRunResult,
+)
+from mochi.api.routes.chat import _serialize_event
 from mochi.api.tool_workflow_outbox import (
     ToolWorkflowOutboxRepository,
     ToolWorkflowOutboxVerifierDiagnostics,
 )
-from mochi.api.routes.chat import _serialize_event
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.config.manager import load_config_snapshot, save_config
 from mochi.config.schema import CommandRuleConfig, MochiConfig, SandboxConfig, SecurityConfig
@@ -49,8 +55,7 @@ from mochi.runtime.agent_run_packages import (
 )
 from mochi.runtime.approval_side_effect_worker import ApprovalSideEffectWorker
 from mochi.runtime.approval_side_effects import public_side_effect_projection
-from mochi.runtime.approval_state_machine import derive_approval_binding
-from mochi.runtime.approval_state_machine import ApprovalExpired
+from mochi.runtime.approval_state_machine import ApprovalExpired, derive_approval_binding
 from mochi.runtime.approvals import (
     APPROVAL_OWNER_TASK_ID_KEY,
     ApprovalConflict,
@@ -58,6 +63,12 @@ from mochi.runtime.approvals import (
     ApprovalRequesterMismatch,
     ApprovalStatus,
     ApprovalStore,
+)
+from mochi.runtime.cancellation import (
+    CancellationCapability,
+    CancellationCapabilityRegistry,
+    CommitFence,
+    CommitOutcome,
 )
 from mochi.runtime.change_sets import ChangeSetStore
 from mochi.runtime.collector_contracts import (
@@ -98,9 +109,19 @@ from mochi.runtime.models import (
     TaskCreateRequest,
     TaskMessageRequest,
 )
+from mochi.runtime.ordinary_chat_session_gate import (
+    OrdinaryChatSessionGate,
+    OrdinaryChatSessionGateError,
+)
 from mochi.runtime.recovery import (
     build_resource_exhaustion_report,
     classify_agent_run_recovery_issue,
+)
+from mochi.runtime.run_adoption import (
+    LeaseOwnership,
+    RunAdoptionClassification,
+    RunAdoptionReconciler,
+    RunAdoptionSnapshot,
 )
 from mochi.runtime.security_audit import (
     SecurityAuditEvent,
@@ -109,6 +130,13 @@ from mochi.runtime.security_audit import (
     security_audit_digest,
 )
 from mochi.runtime.store import RuntimeStore
+from mochi.runtime.supervision import (
+    StandaloneAgentRunLease,
+    committed_completion_status,
+    durable_resource_counters,
+    is_goal_backed_agent_run,
+    worker_identity_state,
+)
 from mochi.security import SecurityDecision
 from mochi.security.file_contract import AppliedChangeRecord
 from mochi.security.policy import (
@@ -116,10 +144,6 @@ from mochi.security.policy import (
     build_runtime_permission_policy_dict,
     effective_policy_snapshot_from_mapping,
     resolve_runtime_permission_policy,
-)
-from mochi.runtime.ordinary_chat_session_gate import (
-    OrdinaryChatSessionGate,
-    OrdinaryChatSessionGateError,
 )
 from mochi.security.rollout import project_protected_workspace_rollout
 from mochi.sessions.store import (
@@ -141,6 +165,7 @@ from mochi.tools.file_ops import (
     FileWriteTool,
     file_mutation_arguments_digest,
     file_mutation_tool_inventory_version,
+    prepare_file_change_subset_replay_arguments,
     prepare_patch_change_contract,
     revalidate_patch_change_contract,
 )
@@ -327,7 +352,7 @@ class _DelegatedSubagentLiveSubscription:
     def __init__(
         self,
         *,
-        service: "RuntimeService",
+        service: RuntimeService,
         session_id: str,
         task_ids: set[str] | None = None,
         max_queue_size: int = 100,
@@ -348,14 +373,10 @@ class _DelegatedSubagentLiveSubscription:
         if self._task_ids and task_id not in self._task_ids:
             return
         if self._queue.full():
-            try:
+            with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-        try:
+        with contextlib.suppress(asyncio.QueueFull):
             self._queue.put_nowait(dict(envelope))
-        except asyncio.QueueFull:
-            pass
 
     def close(self) -> None:
         if self._closed:
@@ -370,7 +391,7 @@ class _DelegatedSubagentMessageProvider:
     def __init__(
         self,
         *,
-        service: "RuntimeService",
+        service: RuntimeService,
         session_id: str,
         task_id: str,
     ) -> None:
@@ -579,12 +600,22 @@ class RuntimeService:
         self._runtime_tasks_root = Path("sessions") / "runtime-tasks"
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
         self._active_agent_run_jobs: dict[str, asyncio.Task[None]] = {}
+        self._standalone_agent_run_leases: dict[str, StandaloneAgentRunLease] = {}
+        self._cancellation_capabilities = CancellationCapabilityRegistry(
+            {
+                "agent_run": CancellationCapability.IMMEDIATE,
+                "detached_exec": CancellationCapability.IMMEDIATE,
+            }
+        )
+        self._agent_run_commit_fences: dict[str, CommitFence] = {}
+        self._detached_exec_stop_fences: dict[str, CommitFence] = {}
         self._security_config = SecurityConfig()
         self._sandbox_config = SandboxConfig()
         self._bound_config: MochiConfig | None = None
         self._bound_config_path: str | Path | None = None
         self._scheduler_poll_interval_seconds = self._DEFAULT_SCHEDULER_POLL_INTERVAL_SECONDS
         self._goal_lease_ttl_seconds = self._DEFAULT_GOAL_LEASE_TTL_SECONDS
+        self._agent_run_lease_ttl_seconds = self._DEFAULT_GOAL_LEASE_TTL_SECONDS
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._side_effect_stop_event = asyncio.Event()
@@ -599,6 +630,7 @@ class RuntimeService:
             side_effect_paths.append(approval_db_path)
         self._side_effect_worker = ApprovalSideEffectWorker(side_effect_paths)
         self._goal_supervision_lock = asyncio.Lock()
+        self._goal_operator_controls_lock = asyncio.Lock()
         self._runtime_owner_id = f"runtime-{uuid4()}"
         self._delegated_subagent_live_subscribers: dict[str, set[_DelegatedSubagentLiveSubscription]] = {}
         self._delegate_subagent_task_launcher = self.create_delegated_subagent_task
@@ -738,6 +770,7 @@ class RuntimeService:
         await self._recover_stale_approval_consumptions()
         await self.reconcile_tool_workflow_approval_observations()
         await self._recover_goals_on_startup()
+        await self._reconcile_agent_runs_on_startup()
         self._scheduler_stop_event = asyncio.Event()
         self._scheduler_task = asyncio.create_task(
             self._scheduler_loop(),
@@ -1016,7 +1049,9 @@ class RuntimeService:
                 current_permission_policy=current_permission_policy,
             )
             if resumed.get("status") != "continued":
-                try:
+                # A failed terminal write leaves the continuation outcome
+                # uncertain. Never expose it as a retryable failure.
+                with contextlib.suppress(Exception):
                     await asyncio.to_thread(
                         fail_continuation,
                         approval_id,
@@ -1025,34 +1060,26 @@ class RuntimeService:
                             resumed.get("reason") or "continuation_unknown_outcome"
                         ),
                     )
-                except Exception:
-                    # A failed terminal write leaves the continuation outcome
-                    # uncertain. Never expose it as a retryable failure.
-                    pass
                 return {"status": "not_available", "reason": "continuation_unknown_outcome"}
         except asyncio.CancelledError:
-            try:
+            # Cancellation must keep propagating even when its durable terminal
+            # write loses a race or the store is unavailable.
+            with contextlib.suppress(Exception):
                 await asyncio.to_thread(
                     fail_continuation,
                     approval_id,
                     lease_token=claim.lease_token,
                     reason="continuation_cancelled",
                 )
-            except Exception:
-                # Cancellation must keep propagating even when its durable
-                # terminal write loses a race or the store is unavailable.
-                pass
             raise
         except Exception as exc:
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.to_thread(
                     fail_continuation,
                     approval_id,
                     lease_token=claim.lease_token,
                     reason=f"{type(exc).__name__}: {exc}",
                 )
-            except Exception:
-                pass
             return {"status": "not_available", "reason": "continuation_unknown_outcome"}
         persisted = dict(result)
         persisted.pop("recovery_required", None)
@@ -1210,7 +1237,7 @@ class RuntimeService:
                 reason=reason,
             )
         except asyncio.CancelledError:
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.shield(
                     asyncio.to_thread(
                         fail_continuation,
@@ -1219,8 +1246,6 @@ class RuntimeService:
                         reason="continuation_cancelled",
                     )
                 )
-            except Exception:
-                pass
             raise
         except Exception:
             # A lost terminal CAS is intentionally not retryable.  The stale
@@ -1298,38 +1323,30 @@ class RuntimeService:
         if audit_task is not None and not audit_task.done():
             audit_task.cancel()
             if _awaitable_in_current_loop(audit_task):
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await audit_task
-                except asyncio.CancelledError:
-                    pass
         self._tool_workflow_outbox_audit_task = None
         self._tool_workflow_outbox_audit_binding = None
         recovery_task = self._ordinary_chat_recovery_task
         if recovery_task is not None and not recovery_task.done():
             recovery_task.cancel()
             if _awaitable_in_current_loop(recovery_task):
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await recovery_task
-                except asyncio.CancelledError:
-                    pass
         self._ordinary_chat_recovery_task = None
         scheduler_task = self._scheduler_task
         if scheduler_task is not None and not scheduler_task.done():
             scheduler_task.cancel()
             if _awaitable_in_current_loop(scheduler_task):
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await scheduler_task
-                except asyncio.CancelledError:
-                    pass
         self._scheduler_task = None
         side_effect_task = self._side_effect_task
         if side_effect_task is not None and not side_effect_task.done():
             side_effect_task.cancel()
             if _awaitable_in_current_loop(side_effect_task):
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await side_effect_task
-                except asyncio.CancelledError:
-                    pass
         self._side_effect_task = None
 
         for job in list(self._active_jobs.values()):
@@ -1341,16 +1358,12 @@ class RuntimeService:
 
         for job in list(self._active_jobs.values()):
             if _awaitable_in_current_loop(job):
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await job
-                except asyncio.CancelledError:
-                    pass
         for job in list(self._active_agent_run_jobs.values()):
             if _awaitable_in_current_loop(job):
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await job
-                except asyncio.CancelledError:
-                    pass
 
         self._active_jobs.clear()
         self._active_agent_run_jobs.clear()
@@ -1479,7 +1492,7 @@ class RuntimeService:
         *,
         session_id: str,
         task_ids: set[str] | None = None,
-    ) -> "_DelegatedSubagentLiveSubscription":
+    ) -> _DelegatedSubagentLiveSubscription:
         """Subscribe to best-effort in-process delegated subagent runtime events."""
 
         subscription = _DelegatedSubagentLiveSubscription(
@@ -1492,7 +1505,7 @@ class RuntimeService:
 
     def _unsubscribe_delegated_subagent_runtime_events(
         self,
-        subscription: "_DelegatedSubagentLiveSubscription",
+        subscription: _DelegatedSubagentLiveSubscription,
     ) -> None:
         subscribers = self._delegated_subagent_live_subscribers.get(subscription.session_id)
         if subscribers is None:
@@ -1630,6 +1643,18 @@ class RuntimeService:
             else ""
         )
         linked_run = await self._store.get_agent_run(linked_run_id) if linked_run_id else None
+        latest_error = goal.get("latest_error")
+        if not isinstance(latest_error, str) or not latest_error.strip():
+            linked_latest_error = (
+                linked_run.get("latest_error") if isinstance(linked_run, dict) else None
+            )
+            if isinstance(linked_latest_error, str) and linked_latest_error.strip():
+                latest_error = linked_latest_error
+        failure = goal.get("failure") if isinstance(goal.get("failure"), dict) else None
+        if failure is None and isinstance(current_attempt, dict) and isinstance(current_attempt.get("failure"), dict):
+            failure = current_attempt["failure"]
+        if failure is None and isinstance(linked_run, dict) and isinstance(linked_run.get("failure"), dict):
+            failure = linked_run["failure"]
         linked_approval_state = _goal_approval_state_from_agent_run(linked_run) if linked_run else {}
         linked_run_status = (
             _effective_agent_run_status_for_goal_projection(linked_run)
@@ -1732,7 +1757,8 @@ class RuntimeService:
             "run_policy": normalized_run_policy,
             "capability_policy": normalized_capability_policy,
             "operator_controls": operator_controls,
-            "latest_error": goal.get("latest_error"),
+            "latest_error": latest_error,
+            "failure": failure,
             "current_attempt": (
                 _goal_attempt_response(effective_attempt) if isinstance(effective_attempt, dict) else None
             ),
@@ -2065,7 +2091,14 @@ class RuntimeService:
         refreshed = await self._store.get_goal(goal_id)
         return _goal_response(refreshed or goal)
 
-    async def pause_goal(self, goal_id: str) -> dict[str, Any] | None:
+    async def pause_goal(
+        self,
+        goal_id: str,
+        *,
+        state_change_action: str = "manual_pause",
+        state_change_reason: str = "manual_pause",
+        state_change_metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         goal = await self._store.get_goal(goal_id)
         if goal is None:
             return None
@@ -2104,7 +2137,7 @@ class RuntimeService:
             goal_id=goal_id,
             previous_status=refreshed_status,
             status="paused",
-            action="manual_pause",
+            action=state_change_action,
             attempt_id=(
                 str(refreshed_attempt.get("id") or "").strip()
                 if isinstance(refreshed_attempt, dict)
@@ -2115,8 +2148,8 @@ class RuntimeService:
                 if isinstance(refreshed_attempt, dict)
                 else None
             ),
-            reason="manual_pause",
-            metadata={"source": "goal_pause"},
+            reason=state_change_reason,
+            metadata=dict(state_change_metadata or {"source": "goal_pause"}),
         )
         await self._store.delete_goal_lease(goal_id)
         paused_goal = await self._store.get_goal(goal_id)
@@ -2687,6 +2720,17 @@ class RuntimeService:
         if lease is None:
             return ("session_not_found", None)
         poll = await self._exec_runtime.read_session(session_id, yield_time_ms=yield_time_ms)
+        payload = _build_agent_run_exec_session_payload(
+            run_id=run_id,
+            session_id=session_id,
+            lease=lease,
+            poll=poll,
+        )
+        session_status = str(getattr(getattr(poll, "status", None), "value", "unavailable"))
+        if session_status != "running":
+            payload["reattached"] = False
+            payload["reattach_status"] = session_status
+            return payload
         await self._store.append_agent_run_event(
             run_id,
             {
@@ -2698,15 +2742,37 @@ class RuntimeService:
                 "checkpoint_dir": lease.get("checkpoint_dir"),
             },
         )
-        payload = _build_agent_run_exec_session_payload(
-            run_id=run_id,
-            session_id=session_id,
-            lease=lease,
-            poll=poll,
-        )
         payload["reattached"] = True
         payload["reattach_status"] = payload["live_status"]
         return payload
+
+    def _agent_run_commit_fence(self, run_id: str) -> CommitFence:
+        """Return the process-local view of an Agent Run's durable outcome."""
+
+        return self._agent_run_commit_fences.setdefault(run_id, CommitFence())
+
+    async def _agent_run_completion_was_committed(self, run_id: str) -> bool:
+        events = await self._store.get_agent_run_events(run_id)
+        return any(
+            isinstance(event, Mapping)
+            and event.get("type") == "run_completion_committed"
+            and event.get("durable_outcome") == CommitOutcome.COMMITTED.value
+            for event in events
+        )
+
+    @staticmethod
+    def _with_cancellation_outcome(
+        payload: dict[str, Any],
+        *,
+        capability: CancellationCapability,
+        durable_outcome: CommitOutcome | None,
+    ) -> dict[str, Any]:
+        response = dict(payload)
+        response["cancellation"] = {
+            "capability": capability.value,
+            "durable_outcome": durable_outcome.value if durable_outcome is not None else None,
+        }
+        return response
 
     async def stop_agent_run_exec_session(
         self,
@@ -2719,6 +2785,39 @@ class RuntimeService:
         lease = _find_agent_run_exec_lease(run, session_id)
         if lease is None:
             return ("session_not_found", None)
+        capability = self._cancellation_capabilities.resolve(
+            "detached_exec",
+            safe_point="detached_exec_stop",
+        ).capability
+        if capability is CancellationCapability.UNSUPPORTED:
+            return ("session_not_found", None)
+        fence = self._detached_exec_stop_fences.setdefault(session_id, CommitFence())
+        events = await self._store.get_agent_run_events(run_id)
+        prior_stop = any(
+            isinstance(event, Mapping)
+            and event.get("type") == "detached_exec_stop"
+            and event.get("session_id") == session_id
+            and event.get("durable_outcome") == CommitOutcome.COMMITTED.value
+            for event in events
+        )
+        if prior_stop:
+            fence.try_commit(safe_point="detached_exec_stop_recovered")
+        commit = fence.try_commit(safe_point="detached_exec_stop")
+        if commit.durable_outcome is CommitOutcome.ALREADY_COMMITTED:
+            poll = await self._exec_runtime.read_session(session_id)
+            payload = _build_agent_run_exec_session_payload(
+                run_id=run_id,
+                session_id=session_id,
+                lease=lease,
+                poll=poll,
+            )
+            payload["stop_status"] = "already_committed"
+            payload["cancellation"] = {
+                "capability": capability.value,
+                "durable_outcome": commit.durable_outcome.value,
+            }
+            return payload
+
         poll = await self._exec_runtime.kill_session(session_id)
         stop_status = poll.status.value if poll is not None else "unavailable"
         await self._store.append_agent_run_event(
@@ -2730,6 +2829,8 @@ class RuntimeService:
                 "status": stop_status,
                 "log_path": lease.get("log_path"),
                 "checkpoint_dir": lease.get("checkpoint_dir"),
+                "capability": capability.value,
+                "durable_outcome": commit.durable_outcome.value,
             },
         )
         payload = _build_agent_run_exec_session_payload(
@@ -2739,6 +2840,10 @@ class RuntimeService:
             poll=poll,
         )
         payload["stop_status"] = stop_status
+        payload["cancellation"] = {
+            "capability": capability.value,
+            "durable_outcome": commit.durable_outcome.value,
+        }
         return payload
 
     async def start_agent_run(self, run_id: str) -> dict[str, Any] | None:
@@ -2754,7 +2859,12 @@ class RuntimeService:
         if current_status in {"created", "paused", "partial", "awaiting_approval", "awaiting_resources", "stalled"}:
             if current_status in {"created", "partial", "awaiting_approval", "awaiting_resources", "stalled"}:
                 await self._begin_agent_run_attempt(run_id, source="manual")
-            await self._store.update_agent_run_status(run_id, "running", latest_error=None)
+            if not await self._update_agent_run_status_with_ownership(
+                run_id,
+                "running",
+                latest_error=None,
+            ):
+                return _agent_run_summary(await self._store.get_agent_run(run_id) or run)
             attempt_id = await self._get_current_attempt_id(run_id)
             await self._store.append_agent_run_event(
                 run_id,
@@ -2775,11 +2885,12 @@ class RuntimeService:
         if current_status != "running":
             return _agent_run_summary(run)
 
-        await self._store.update_agent_run_status(
+        if not await self._update_agent_run_status_with_ownership(
             run_id,
             "paused",
             latest_error=run.get("latest_error"),
-        )
+        ):
+            return _agent_run_summary(await self._store.get_agent_run(run_id) or run)
         await self._store.append_agent_run_event(run_id, {"type": "run_paused"})
         await self._sync_goal_worker_generation_from_run_status(
             run=run,
@@ -2790,10 +2901,8 @@ class RuntimeService:
         active = self._active_agent_run_jobs.get(run_id)
         if active is not None and not active.done():
             active.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await active
-            except asyncio.CancelledError:
-                pass
 
         updated = await self._store.get_agent_run(run_id)
         return _agent_run_summary(updated or run)
@@ -2864,17 +2973,53 @@ class RuntimeService:
         run = await self._store.get_agent_run(run_id)
         if run is None:
             return None
+        capability = self._cancellation_capabilities.resolve(
+            "agent_run",
+            safe_point="agent_run_cancel",
+        ).capability
+        if capability is CancellationCapability.UNSUPPORTED:
+            return self._with_cancellation_outcome(
+                _agent_run_summary(run),
+                capability=capability,
+                durable_outcome=None,
+            )
         current_status = str(run.get("status") or "created")
         if current_status in AGENT_RUN_TERMINAL_STATUS:
-            return _agent_run_summary(run)
+            fence = self._agent_run_commit_fence(run_id)
+            if current_status != "cancelled":
+                fence.try_commit(safe_point="agent_run_terminal_recovered")
+            decision = fence.request_cancellation(safe_point="agent_run_cancel")
+            return self._with_cancellation_outcome(
+                _agent_run_summary(run),
+                capability=capability,
+                durable_outcome=decision.durable_outcome,
+            )
+
+        fence = self._agent_run_commit_fence(run_id)
+        if await self._agent_run_completion_was_committed(run_id):
+            fence.try_commit(safe_point="agent_run_completion_recovered")
+        decision = fence.request_cancellation(safe_point="agent_run_cancel")
+        if decision.durable_outcome is CommitOutcome.ALREADY_COMMITTED:
+            refreshed = await self._store.get_agent_run(run_id)
+            return self._with_cancellation_outcome(
+                _agent_run_summary(refreshed or run),
+                capability=capability,
+                durable_outcome=decision.durable_outcome,
+            )
+
         active = self._active_agent_run_jobs.get(run_id)
         if active is not None and not active.done():
             active.cancel()
-        await self._store.update_agent_run_status(
+        if not await self._update_agent_run_status_with_ownership(
             run_id,
             "cancelled",
             latest_error=run.get("latest_error"),
-        )
+        ):
+            return self._with_cancellation_outcome(
+                _agent_run_summary(await self._store.get_agent_run(run_id) or run),
+                capability=capability,
+                durable_outcome=decision.durable_outcome,
+            )
         await self._sync_goal_worker_generation_from_run_status(
             run=run,
             status="cancelled",
@@ -2882,10 +3027,18 @@ class RuntimeService:
         )
         await self._store.append_agent_run_event(
             run_id,
-            {"type": "run_cancelled"},
+            {
+                "type": "run_cancelled",
+                "capability": capability.value,
+                "durable_outcome": decision.durable_outcome.value,
+            },
         )
         updated = await self._store.get_agent_run(run_id)
-        return _agent_run_summary(updated or run)
+        return self._with_cancellation_outcome(
+            _agent_run_summary(updated or run),
+            capability=capability,
+            durable_outcome=decision.durable_outcome,
+        )
 
     async def append_agent_run_guidance(
         self,
@@ -2976,12 +3129,11 @@ class RuntimeService:
                 continue
             event_type = str(event.get("type") or event.get("event") or "").strip()
             payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else event
-            if event_type not in {"final_answer", "agent_final_text", "agent_event"}:
-                if not (
-                    isinstance(payload, Mapping)
-                    and str(payload.get("type") or "").strip() == "final_answer"
-                ):
-                    continue
+            if event_type not in {"final_answer", "agent_final_text", "agent_event"} and not (
+                isinstance(payload, Mapping)
+                and str(payload.get("type") or "").strip() == "final_answer"
+            ):
+                continue
             if not isinstance(payload, Mapping):
                 continue
             if not final_answer and isinstance(payload.get("content"), str):
@@ -3504,7 +3656,7 @@ class RuntimeService:
             recovery_state=recovery_state,
         )
         await self._finalize_agent_run_schedule_partial(run_id)
-        await self._store.update_agent_run_status(
+        await self._update_agent_run_status_with_ownership(
             run_id,
             "partial",
             latest_error=run.get("latest_error"),
@@ -3572,6 +3724,143 @@ class RuntimeService:
 
     async def _recover_goals_on_startup(self) -> None:
         await self._process_goal_supervision()
+
+    async def _reconcile_agent_runs_on_startup(self) -> None:
+        """Adopt only standalone runs with a current fence and verified workers."""
+
+        runs = await self._store.list_agent_runs()
+        verified_session_ids = {
+            str(session.session_id)
+            for session in self._exec_runtime.list_sessions()
+            if str(getattr(session.status, "value", session.status)) == "running"
+            and str(getattr(session, "identity_state", "")) == "verified"
+        }
+        counters = durable_resource_counters(runs)
+        reconciler = RunAdoptionReconciler()
+        for run in runs:
+            if is_goal_backed_agent_run(run):
+                continue
+            run_id = str(run.get("id") or "").strip()
+            status = str(run.get("status") or "").strip().lower()
+            if not run_id or status not in {"queued", "running", "cancelling", "recoverable"}:
+                continue
+            lease = await self._acquire_standalone_agent_run_lease(run_id)
+            completion_status = committed_completion_status(
+                await self._store.get_agent_run_events(run_id)
+            )
+            decision = reconciler.classify(
+                RunAdoptionSnapshot(
+                    run_id=run_id,
+                    status=status,
+                    owner_lease=(LeaseOwnership.OWNED if lease is not None else LeaseOwnership.UNKNOWN),
+                    worker_identity=worker_identity_state(
+                        run,
+                        verified_session_ids=verified_session_ids,
+                    ),
+                    checkpoint_revision=0,
+                    projection_sequence=0,
+                    durable_outcome=(
+                        CommitOutcome.ALREADY_COMMITTED
+                        if completion_status is not None
+                        else None
+                    ),
+                )
+            )
+            if decision.classification is RunAdoptionClassification.PROJECT_COMPLETION:
+                if completion_status is not None and await self._update_agent_run_status_with_ownership(
+                    run_id,
+                    completion_status,
+                    latest_error=run.get("latest_error"),
+                ):
+                    await self._release_standalone_agent_run_lease(run_id)
+                continue
+            if not decision.may_schedule:
+                continue
+            await self._store.append_agent_run_event(
+                run_id,
+                {
+                    "type": "run_adopted",
+                    "source": "startup_reconciler",
+                    "lease_epoch": lease.lease_epoch if lease is not None else None,
+                    "active_runs": counters.active_runs,
+                    "detached_execs": counters.detached_execs,
+                },
+            )
+            await self._ensure_agent_run_job(run_id, job_name=f"runtime-agent-run-adopted-{run_id}")
+
+    async def _acquire_standalone_agent_run_lease(
+        self,
+        run_id: str,
+    ) -> StandaloneAgentRunLease | None:
+        """Acquire the durable fencing token required for standalone execution."""
+
+        current = self._standalone_agent_run_leases.get(run_id)
+        if current is not None:
+            expires_at = _to_iso_utc(
+                _utcnow() + timedelta(seconds=self._agent_run_lease_ttl_seconds)
+            )
+            renewal = await self._store.renew_agent_run_lease(
+                run_id=run_id,
+                owner_id=current.owner_id,
+                lease_epoch=current.lease_epoch,
+                expires_at=expires_at,
+            )
+            if renewal.get("status") == "renewed":
+                return current
+            self._standalone_agent_run_leases.pop(run_id, None)
+
+        acquired = await self._store.acquire_agent_run_lease(
+            run_id=run_id,
+            owner_id=self._runtime_owner_id,
+            expires_at=_to_iso_utc(
+                _utcnow() + timedelta(seconds=self._agent_run_lease_ttl_seconds)
+            ),
+            metadata={"source": "runtime_service", "runtime_owner_id": self._runtime_owner_id},
+        )
+        if acquired.get("status") not in {"acquired", "renewed", "taken_over"}:
+            return None
+        lease = StandaloneAgentRunLease(
+            run_id=run_id,
+            owner_id=self._runtime_owner_id,
+            lease_epoch=int(acquired["lease_epoch"]),
+        )
+        self._standalone_agent_run_leases[run_id] = lease
+        return lease
+
+    async def _update_agent_run_status_with_ownership(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        latest_error: str | None,
+    ) -> bool:
+        """Fence standalone status transitions while preserving Goal lease ownership."""
+
+        run = await self._store.get_agent_run(run_id)
+        if run is None:
+            return False
+        if is_goal_backed_agent_run(run):
+            await self._store.update_agent_run_status(run_id, status, latest_error=latest_error)
+            return True
+        lease = await self._acquire_standalone_agent_run_lease(run_id)
+        if lease is None:
+            return False
+        return await self._store.update_agent_run_status_if_lease_current(
+            run_id,
+            status,
+            owner_id=lease.owner_id,
+            lease_epoch=lease.lease_epoch,
+            latest_error=latest_error,
+        )
+
+    async def _release_standalone_agent_run_lease(self, run_id: str) -> None:
+        lease = self._standalone_agent_run_leases.pop(run_id, None)
+        if lease is not None:
+            await self._store.release_agent_run_lease(
+                run_id=run_id,
+                owner_id=lease.owner_id,
+                lease_epoch=lease.lease_epoch,
+            )
 
     async def _process_goal_supervision(self) -> None:
         async with self._goal_supervision_lock:
@@ -4541,7 +4830,7 @@ class RuntimeService:
             summary=summary,
             latest_error=reason,
         )
-        await self._store.update_agent_run_status(
+        await self._update_agent_run_status_with_ownership(
             run_id,
             "stalled",
             latest_error=reason,
@@ -4712,18 +5001,27 @@ class RuntimeService:
             else:
                 goal_summary.pop("latest_goal_memory_snapshot_id", None)
 
-        await self._store.update_goal_projection(
+        projection_applied = await self._store.update_goal_projection(
             goal_id=goal_id,
             goal_status=goal_status,
             attempt_id=attempt_id,
             attempt_status=attempt_status,
             current_attempt_id=attempt_id,
             agent_run_id=str(run["id"]),
+            source_agent_run_status=str(run.get("status") or "created"),
+            source_agent_run_updated_at=str(run.get("updated_at") or ""),
             latest_error=latest_error,
             attempt_summary=attempt_summary,
             goal_summary=goal_summary,
             reset_goal_finished_at=goal_status not in GOAL_TERMINAL_STATUS,
+            **(
+                {"failure": run["failure"]}
+                if isinstance(run.get("failure"), dict)
+                else {}
+            ),
         )
+        if not projection_applied:
+            return
         if goal_status not in GOAL_ACTIVE_STATUS:
             await self._store.delete_goal_lease(goal_id)
 
@@ -6007,52 +6305,43 @@ class RuntimeService:
         return True
 
     async def _pause_running_goals_for_operator_controls(self, reason: str) -> None:
-        goals = await self._store.list_goals()
-        for goal in goals:
-            goal_id = str(goal.get("id") or "").strip()
-            if not goal_id:
-                continue
-            if str(goal.get("status") or "").strip() not in GOAL_ACTIVE_STATUS:
-                continue
-            paused = await self.pause_goal(goal_id)
-            if paused is None:
-                continue
-            paused_status = str(paused.get("status") or "paused") if isinstance(paused, dict) else "paused"
-            await self._store.update_goal_metadata(
-                goal_id,
-                latest_error=reason,
-            )
-            current_attempt = _current_goal_attempt(paused)
-            await self._append_goal_state_changed_event(
-                goal_id=goal_id,
-                previous_status=str(goal.get("status") or ""),
-                status=paused_status,
-                action="operator_pause",
-                attempt_id=(
-                    str(current_attempt.get("attempt_id") or current_attempt.get("id") or "").strip()
-                    if isinstance(current_attempt, dict)
-                    else None
-                ),
-                agent_run_id=(
+        async with self._goal_operator_controls_lock:
+            goals = await self._store.list_goals()
+            for goal in goals:
+                goal_id = str(goal.get("id") or "").strip()
+                if not goal_id:
+                    continue
+                if str(goal.get("status") or "").strip() not in GOAL_ACTIVE_STATUS:
+                    continue
+                paused = await self.pause_goal(
+                    goal_id,
+                    state_change_action="operator_pause",
+                    state_change_reason=reason,
+                    state_change_metadata={"source": "operator_controls"},
+                )
+                if paused is None:
+                    continue
+                await self._store.update_goal_metadata(
+                    goal_id,
+                    latest_error=reason,
+                )
+                current_attempt = _current_goal_attempt(paused)
+                if current_attempt is not None:
+                    attempt_id = str(current_attempt.get("attempt_id") or current_attempt.get("id") or "").strip()
+                    if attempt_id:
+                        await self._store.update_goal_attempt_status(
+                            attempt_id,
+                            str(current_attempt.get("status") or "paused"),
+                            latest_error=reason,
+                        )
+                agent_run_id = (
                     str(current_attempt.get("agent_run_id") or "").strip()
                     if isinstance(current_attempt, dict)
-                    else None
-                ),
-                reason=reason,
-                metadata={"source": "operator_controls"},
-            )
-            if current_attempt is not None:
-                attempt_id = str(current_attempt.get("attempt_id") or current_attempt.get("id") or "").strip()
-                if attempt_id:
-                    await self._store.update_goal_attempt_status(
-                        attempt_id,
-                        str(current_attempt.get("status") or "paused"),
-                        latest_error=reason,
-                    )
-                agent_run_id = str(current_attempt.get("agent_run_id") or "").strip()
+                    else ""
+                )
                 if agent_run_id:
                     linked_run = await self._store.get_agent_run(agent_run_id)
-                    await self._store.update_agent_run_status(
+                    await self._update_agent_run_status_with_ownership(
                         agent_run_id,
                         str((linked_run or {}).get("status") or "paused"),
                         latest_error=reason,
@@ -6070,7 +6359,7 @@ class RuntimeService:
                     timeout=self._scheduler_poll_interval_seconds,
                 )
                 return
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except asyncio.CancelledError:
                 raise
@@ -6081,7 +6370,7 @@ class RuntimeService:
                         timeout=self._scheduler_poll_interval_seconds,
                     )
                     return
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
 
     async def _process_due_agent_runs(self) -> None:
@@ -6109,17 +6398,18 @@ class RuntimeService:
         now: datetime,
     ) -> None:
         run_id = str(run["id"])
+        if not is_goal_backed_agent_run(run) and await self._acquire_standalone_agent_run_lease(run_id) is None:
+            return
         scheduled_for = schedule.get("next_run_at")
         next_schedule = _advance_agent_run_schedule(schedule, triggered_at=now)
         next_schedule["current_attempt_id"] = _new_attempt_id(run_id)
         await self._store.update_agent_run_schedule(run_id, next_schedule)
-        await self._store.update_agent_run_status(
+        if not await self._update_agent_run_status_with_ownership(
             run_id,
             "running",
             latest_error=None,
-            reset_started_at=True,
-            reset_finished_at=True,
-        )
+        ):
+            return
         await self._store.append_agent_run_event(
             run_id,
             {
@@ -6252,6 +6542,9 @@ class RuntimeService:
         run = await self.get_agent_run(run_id)
         if run is None:
             return
+        standalone_run = not is_goal_backed_agent_run(run)
+        if standalone_run and await self._acquire_standalone_agent_run_lease(run_id) is None:
+            return
         active_resume_strategy = _resolve_agent_run_resume_strategy(None, run)
         normalized_summary = _ensure_agent_run_resume_payload(
             run=run,
@@ -6358,7 +6651,7 @@ class RuntimeService:
             )
             persisted_collector_record_keys = {
                 (
-                    _string(record.get("attempt_id")) or attempt_id,
+                    _clean_text(record.get("attempt_id")) or attempt_id,
                     collector_dataset_record_identity(record),
                 )
                 for record in persisted_collector_dataset_records
@@ -6642,6 +6935,34 @@ class RuntimeService:
                 strategy=active_resume_strategy,
             )
             evidence_status = _build_evidence_status_payload(result)
+            completion_status = _resolve_agent_run_completion_status(result)
+            if completion_status in AGENT_RUN_TERMINAL_STATUS - {"cancelled"}:
+                fence = self._agent_run_commit_fence(run_id)
+                commit = fence.try_commit(safe_point="agent_run_result_commit")
+                if not commit.commit_permitted:
+                    await self._store.append_agent_run_event(
+                        run_id,
+                        {
+                            "type": "run_completion_cancelled_pre_commit",
+                            "attempt_id": attempt_id,
+                            "durable_outcome": commit.durable_outcome.value,
+                        },
+                    )
+                    await self._finalize_goal_worker_generation(
+                        current_generation_id,
+                        status="cancelled",
+                        latest_error="Cancelled before durable completion",
+                    )
+                    return
+                await self._store.append_agent_run_event(
+                    run_id,
+                    {
+                        "type": "run_completion_committed",
+                        "attempt_id": attempt_id,
+                        "completion_status": completion_status,
+                        "durable_outcome": commit.durable_outcome.value,
+                    },
+                )
             await self._store.update_agent_run_metadata(
                 run_id,
                 summary=summary,
@@ -6676,14 +6997,13 @@ class RuntimeService:
                 run_id,
                 attempt_id=attempt_id,
             )
-            completion_status = _resolve_agent_run_completion_status(result)
             await self._update_agent_run_schedule_completion(
                 run_id,
                 completion_status=completion_status,
                 attempt_id=attempt_id,
                 package_summary=package_summary,
             )
-            await self._store.update_agent_run_status(
+            await self._update_agent_run_status_with_ownership(
                 run_id,
                 completion_status,
                 latest_error=_agent_run_latest_error(result),
@@ -6707,7 +7027,7 @@ class RuntimeService:
                     attempt_id=attempt_id,
                     package_summary=package_summary,
                 )
-                await self._store.update_agent_run_status(
+                await self._update_agent_run_status_with_ownership(
                     run_id,
                     "cancelled",
                     latest_error="Cancelled by user",
@@ -6759,7 +7079,7 @@ class RuntimeService:
                     attempt_id=attempt_id,
                     package_summary=package_summary,
                 )
-                await self._store.update_agent_run_status(
+                await self._update_agent_run_status_with_ownership(
                     run_id,
                     "awaiting_resources",
                     latest_error=latest_error,
@@ -6792,7 +7112,7 @@ class RuntimeService:
                 attempt_id=attempt_id,
                 package_summary=package_summary,
             )
-            await self._store.update_agent_run_status(
+            await self._update_agent_run_status_with_ownership(
                 run_id,
                 "failed",
                 latest_error=str(exc),
@@ -6819,6 +7139,8 @@ class RuntimeService:
             if active is not None and (active is current or active.done()):
                 self._active_agent_run_jobs.pop(run_id, None)
             await self._sync_goal_from_agent_run_by_run_id(run_id)
+            if standalone_run:
+                await self._release_standalone_agent_run_lease(run_id)
 
     async def _persist_agent_run_artifacts(
         self,
@@ -6837,7 +7159,7 @@ class RuntimeService:
         ]
         persisted_collector_record_keys = {
             (
-                _string(record.get("attempt_id")) or attempt_id,
+                _clean_text(record.get("attempt_id")) or attempt_id,
                 collector_dataset_record_identity(record),
             )
             for record in extract_persisted_collector_dataset_records(
@@ -8286,16 +8608,14 @@ class RuntimeService:
         approval: Any,
     ) -> None:
         """Quarantine a stale consuming lease without replaying its tool call."""
-        try:
+        # A prior worker may have crossed the boundary immediately before it
+        # died. The result transition below proves whether it remained
+        # unresolved; never treat this duplicate start as permission to run.
+        with contextlib.suppress(ValueError):
             await self._begin_ordinary_chat_timeline_operation(
                 approval_id=approval_id,
                 approval=approval,
             )
-        except ValueError:
-            # A prior worker may have crossed the boundary immediately before
-            # it died. The result transition below proves whether it remained
-            # unresolved; never treat this duplicate start as permission to run.
-            pass
         await self._record_ordinary_chat_timeline_operation_result(
             approval_id=approval_id,
             approval=approval,
@@ -8740,7 +9060,7 @@ class RuntimeService:
                 },
             },
         )
-        await self._store.update_agent_run_status(
+        await self._update_agent_run_status_with_ownership(
             str(run["id"]),
             "failed",
             latest_error=error_message,
@@ -8809,9 +9129,17 @@ class RuntimeService:
                 ToolResult(error="Associated task not found for file-mutation approval."),
             )
 
-        if self._security_config.change_contract_mode == "enforce":
+        approval_metadata = current.get("metadata")
+        approval_metadata = (
+            approval_metadata if isinstance(approval_metadata, Mapping) else {}
+        )
+        validated_manifest = None
+        if (
+            self._security_config.change_contract_mode == "enforce"
+            or approval_metadata.get("parent_request_digest") is not None
+        ):
             try:
-                await revalidate_patch_change_contract(
+                validated_manifest = await revalidate_patch_change_contract(
                     runtime_store=self._store,
                     approval=current,
                     task=task,
@@ -8846,6 +9174,19 @@ class RuntimeService:
         )
         context.state["approval_replay"] = True
         arguments = dict(approved_call.get("arguments") or {})
+        if (
+            validated_manifest is not None
+            and validated_manifest.parent_request_digest is not None
+        ):
+            try:
+                arguments = await prepare_file_change_subset_replay_arguments(
+                    runtime_store=self._store,
+                    approval=current,
+                    task=task,
+                    security=self._security_config,
+                )
+            except FileChangeContractConflict as exc:
+                raise ApprovalConflict("change_set_conflicted") from exc
         result = await tool.execute(**arguments, approved=True, context=context)
         return tool_name, result
 
@@ -9470,7 +9811,7 @@ class RuntimeService:
                 },
             },
         )
-        await self._store.update_agent_run_status(
+        await self._update_agent_run_status_with_ownership(
             run_id,
             "failed",
             latest_error=error_message,
@@ -10382,7 +10723,7 @@ class RuntimeService:
             return _agent_run_summary(run)
         if current_status not in allowed_current:
             return _agent_run_summary(run)
-        await self._store.update_agent_run_status(
+        await self._update_agent_run_status_with_ownership(
             run_id,
             target_status,
             latest_error=None if target_status in AGENT_RUN_ACTIVE_STATUS else run.get("latest_error"),
@@ -10835,6 +11176,7 @@ def _goal_response(goal: dict[str, Any]) -> dict[str, Any]:
         "summary": goal.get("summary") or {},
         "metadata": goal.get("metadata") or {},
         "latest_error": goal.get("latest_error"),
+        "failure": goal.get("failure") if isinstance(goal.get("failure"), dict) else None,
         "attempts": [
             _goal_attempt_response(attempt)
             for attempt in goal.get("attempts") or []
@@ -10858,6 +11200,7 @@ def _goal_attempt_response(attempt: dict[str, Any]) -> dict[str, Any]:
         "summary": attempt.get("summary") or {},
         "metadata": attempt.get("metadata") or {},
         "latest_error": attempt.get("latest_error"),
+        "failure": attempt.get("failure") if isinstance(attempt.get("failure"), dict) else None,
         "created_at": attempt["created_at"],
         "updated_at": attempt["updated_at"],
         "started_at": attempt.get("started_at"),
@@ -11195,13 +11538,11 @@ def _goal_approval_state_from_agent_run(run: dict[str, Any]) -> dict[str, Any]:
     controlled_runtime = _latest_agent_run_artifact_content(run, "controlled_execution_runtime")
     pending_count = len(approval_pending)
     if isinstance(controlled_runtime, dict):
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             pending_count = max(
                 pending_count,
                 int(controlled_runtime.get("approval_pending_count") or 0),
             )
-        except (TypeError, ValueError):
-            pass
     if pending_count <= 0:
         return {}
     payload = {
@@ -12920,27 +13261,7 @@ def _is_active_goal_turn_steer(text: str) -> bool:
     if _is_active_goal_turn_question(text):
         return False
     stripped = _strip_active_goal_turn_polite_prefix(text)
-    if _starts_with_any_phrase(
-        stripped,
-        (
-            "focus on",
-            "prioritize ",
-            "continue with ",
-            "go deeper on ",
-            "keep going on ",
-            "keep working on ",
-            "proceed with ",
-            "use ",
-            "avoid ",
-            "include ",
-            "exclude ",
-            "next, ",
-            "next focus on ",
-            "next prioritize ",
-        )
-    ):
-        return True
-    return False
+    return bool(_starts_with_any_phrase(stripped, ("focus on", "prioritize ", "continue with ", "go deeper on ", "keep going on ", "keep working on ", "proceed with ", "use ", "avoid ", "include ", "exclude ", "next, ", "next focus on ", "next prioritize ")))
 
 
 def _is_active_goal_turn_explain_state(text: str, *, health: Mapping[str, Any]) -> bool:
@@ -14922,9 +15243,7 @@ def _goal_operator_audit_log_matches_goal(
     details = item.get("details") if isinstance(item.get("details"), dict) else {}
     if str(details.get("goal_id") or "").strip() == goal_id:
         return True
-    if subject_type == "goal_operator_controls" and subject_id == "global":
-        return True
-    return False
+    return bool(subject_type == "goal_operator_controls" and subject_id == "global")
 
 
 def _goal_lease_health_payload(
@@ -16129,6 +16448,7 @@ def _agent_run_summary(run: dict[str, Any]) -> dict[str, Any]:
         "recovery_state": summary.get("recovery_state") if isinstance(summary.get("recovery_state"), dict) else {},
         "degraded": bool(summary.get("degraded", False)),
         "latest_error": run.get("latest_error"),
+        "failure": run.get("failure") if isinstance(run.get("failure"), dict) else None,
         "evidence_status": run.get("evidence_status") or {},
         "artifacts": run.get("artifacts") or [],
         "created_at": run["created_at"],

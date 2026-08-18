@@ -1,0 +1,101 @@
+{
+  "schema_name": "mochi.contract",
+  "schema_version": "1.0",
+  "contract_id": "run-adoption-v1",
+  "producer_package": "PKG-MAIN-55-RUN-ADOPTION-SEAM",
+  "git_revision": "f45a0c631ec9c18b13849ddf18a93a5dbb0f63bc",
+  "status": "frozen",
+  "symbols": [
+    "LeaseOwnership",
+    "WorkerIdentityState",
+    "RunAdoptionClassification",
+    "RunAdoptionSnapshot",
+    "RunAdoptionDecision",
+    "RunAdoptionReconciler",
+    "ResourceAction",
+    "ResourceDecision",
+    "ResourcePolicy"
+  ],
+  "inputs": {
+    "run_adoption_snapshot": {
+      "fields": [
+        "run_id",
+        "status",
+        "owner_lease",
+        "worker_identity",
+        "checkpoint_revision",
+        "projection_sequence",
+        "durable_outcome"
+      ],
+      "rule": "Revisions are non-negative integers. owner_lease and worker_identity are explicit durable-state assessments, not inferred from a PID."
+    },
+    "resource_policy": {
+      "fields": [
+        "max_active_runs",
+        "max_detached_execs",
+        "active_runs",
+        "detached_execs",
+        "requires_detached_exec"
+      ],
+      "rule": "Limits are positive integers and observed counts are non-negative integers."
+    }
+  },
+  "outputs": {
+    "run_adoption_decision": {
+      "fields": [
+        "run_id",
+        "classification",
+        "operator_action",
+        "reason"
+      ],
+      "classification_values": [
+        "adopt",
+        "project_completion",
+        "cancelled",
+        "terminal",
+        "operator_required",
+        "unknown"
+      ],
+      "rule": "Only an active run with an owned lease and verified worker identity may be adopted. Missing, stale, unknown, or unverifiable ownership is operator_required and never schedulable."
+    },
+    "resource_decision": {
+      "fields": [
+        "action",
+        "reason"
+      ],
+      "action_values": [
+        "admit",
+        "defer"
+      ],
+      "rule": "Capacity exhaustion defers the run; the policy never starts a process or owns a scheduler handle."
+    }
+  },
+  "errors": [
+    "Empty run IDs or statuses and boolean, negative, or non-integer revisions are rejected.",
+    "Unknown run statuses are not adopted.",
+    "A cancelled_pre_commit outcome is never reactivated; already_committed is projected instead of rerun.",
+    "Invalid resource limits or observed counts are rejected."
+  ],
+  "compatibility": {
+    "major_version": "1",
+    "unknown_major": "reject",
+    "additional_output_fields": "Consumers ignore fields they do not require.",
+    "ownership_rule": "Only owner_lease=owned and worker_identity=verified may produce adopt.",
+    "cancellation_rule": "cancelled_pre_commit maps to cancelled and already_committed maps to project_completion.",
+    "scheduling_boundary": "The seam returns decisions only; RuntimeService owns lease acquisition, persistence, scheduling, and process handles."
+  },
+  "consumers": [
+    "PKG-MAIN-60-SUPERVISOR-EXEC-RESOURCE",
+    "PKG-WORKER-61-SUPERVISOR-RESTART",
+    "PKG-WORKER-62-EXEC-RESTART",
+    "PKG-MAIN-90-INTEGRATE-QUALIFY-RELEASE"
+  ],
+  "gate_ids": [
+    "GATE-SEAM-ADOPTION",
+    "GATE-SUPERVISOR-RESTART",
+    "GATE-SUPERVISOR-ADOPTION",
+    "GATE-EXEC-RESTART",
+    "GATE-CONTRACT-FREEZE",
+    "GATE-RELEASE"
+  ]
+}

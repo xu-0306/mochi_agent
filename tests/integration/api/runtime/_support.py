@@ -302,27 +302,24 @@ class _RuntimeExecLinkedBackgroundFakeEngine:
             return
         yield FinalAnswerEvent(content="done after background exec approval", trajectory_id="traj-exec-bg")
 
-_BACKGROUND_SMOKE_COMMAND = (
-    "(__import__('sys').stdout.write('bg-start\\\\n'), "
-    "__import__('sys').stdout.flush(), "
-    "__import__('time').sleep(5))"
-)
+_BACKGROUND_SMOKE_COMMAND = "(print('bg-start', flush=True), __import__('time').sleep(5))"
 
 _BACKGROUND_SMOKE_COMMAND_RULE = {
     "tokens": [
-        "n),",
-        "__import__(sys).stdout.flush(),",
+        "(print(bg-start,",
+        "flush=true),",
         "__import__(time).sleep(5))",
     ],
     "decision": "allow",
     "match": "exact",
 }
 
+_CONTROLLED_SMOKE_COMMAND = "pass"
+
 _CONTROLLED_SMOKE_COMMAND_RULE = {
-    "tokens": ["echo", "controlled-ok"],
+    "tokens": ["pass"],
     "decision": "allow",
     "match": "exact",
-    "shells": ["powershell"],
 }
 
 class _AgentRunModelBackedEngine:
@@ -440,8 +437,8 @@ class _AgentRunModelBackedEngine:
         if model_id == "controlled-executor-model":
             return GenerationResult(
                 content=(
-                    '{"execution_requests":[{"request_id":"req-1","command":"echo controlled-ok",'
-                    '"shell":"powershell","timeout":30,"rationale":"smoke test",'
+                    f'{{"execution_requests":[{{"request_id":"req-1","command":"{_CONTROLLED_SMOKE_COMMAND}",'
+                    '"shell":"test","timeout":30,"rationale":"smoke test",'
                     '"expected_artifacts":["stdout"],"success_metric":"stdout contains controlled-ok"}]}'
                 ),
                 model=model_id,
@@ -450,7 +447,7 @@ class _AgentRunModelBackedEngine:
             return GenerationResult(
                 content=(
                     '{"status":"approved","reason":"bounded smoke command",'
-                    '"command":"echo controlled-ok","shell":"powershell","timeout":30}'
+                    f'"command":"{_CONTROLLED_SMOKE_COMMAND}","shell":"test","timeout":30}}'
                 ),
                 model=model_id,
             )

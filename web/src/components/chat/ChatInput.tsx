@@ -853,8 +853,8 @@ export function ChatInput({
   }
 
   return (
-    <div className="relative border-t border-border bg-canvas pt-3 pb-4">
-      <div className="mx-auto w-full max-w-[960px] px-4">
+    <div className="relative border-t border-border/80 bg-canvas/95 pt-4 pb-5">
+      <div className="mx-auto w-full max-w-[780px] px-4 sm:px-6">
         <CommandPalette
           open={paletteOpen}
           query={paletteQuery}
@@ -866,10 +866,10 @@ export function ChatInput({
         />
         <div
           className={cn(
-            'flex flex-col rounded-xl border border-border bg-surface-layer',
+            'flex flex-col rounded-2xl border border-border/90 bg-surface-layer shadow-[0_6px_24px_rgba(20,20,24,0.05)]',
             'transition-all duration-150',
-            'focus-within:border-primary-500 focus-within:ring-[3px] focus-within:ring-primary-500/20',
-            dragActive && 'border-primary-500 ring-[3px] ring-primary-500/20'
+            'focus-within:border-primary-500/60 focus-within:ring-2 focus-within:ring-primary-500/12',
+            dragActive && 'border-primary-500/70 ring-2 ring-primary-500/12'
           )}
           onDragEnter={(event) => {
             event.preventDefault()
