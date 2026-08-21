@@ -55,7 +55,11 @@
     ".next-fixture-evaluator-failure-mobile-20260809-185202/types/**/*.ts",
     ".next-fixture-evaluator-failure-mobile-20260809-185202/dev/types/**/*.ts",
     ".next-fixture-evaluator-failure-responsive-rerun-20260809/types/**/*.ts",
-    ".next-fixture-evaluator-failure-responsive-rerun-20260809/dev/types/**/*.ts"
+    ".next-fixture-evaluator-failure-responsive-rerun-20260809/dev/types/**/*.ts",
+    ".next-fixture-goal-drawer/types/**/*.ts",
+    ".next-fixture-goal-drawer/dev/types/**/*.ts",
+    ".next-fixture-hydration/types/**/*.ts",
+    ".next-fixture-hydration/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"
