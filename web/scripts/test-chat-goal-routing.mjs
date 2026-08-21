@@ -126,16 +126,6 @@ for (const { label, text, hasActiveGoal } of [
     hasActiveGoal: false,
   },
   {
-    label: 'english timed research request',
-    text: 'Research this for 30 minutes and come back with progress',
-    hasActiveGoal: false,
-  },
-  {
-    label: 'english background-work request',
-    text: 'Keep working on this in the background for the next 30 minutes.',
-    hasActiveGoal: false,
-  },
-  {
     label: 'spanish timed research request',
     text: 'Investiga este tema durante 20 minutos y resume los hallazgos.',
     hasActiveGoal: false,
@@ -276,6 +266,61 @@ assert.deepEqual(
     kind: 'goal_revision',
     requestText: 'yes',
   }
+)
+
+const slashNaturalGoal = resolveChatGoalWorkflowRouting({
+  text: '/goal Research this for 20 minutes',
+  attachmentCount: 0,
+  hasPendingProposal: false,
+  hasActiveGoal: false,
+})
+const naturalTimedGoal = resolveChatGoalWorkflowRouting({
+  text: 'Research this for 20 minutes',
+  attachmentCount: 0,
+  hasPendingProposal: false,
+  hasActiveGoal: false,
+})
+assert.deepEqual(slashNaturalGoal.route, {
+  kind: 'goal_proposal',
+  content: 'Research this for 20 minutes',
+  raw: '/goal Research this for 20 minutes',
+})
+assert.deepEqual(naturalTimedGoal.route, {
+  kind: 'goal_proposal',
+  content: 'Research this for 20 minutes',
+  raw: 'Research this for 20 minutes',
+})
+assert.equal(
+  naturalTimedGoal.route.kind === 'goal_proposal' && naturalTimedGoal.route.content,
+  slashNaturalGoal.route.kind === 'goal_proposal' && slashNaturalGoal.route.content,
+  'slash and natural timed activation must normalize to the same objective'
+)
+
+for (const [text, content] of [
+  ['Start a goal: Review the release checklist', 'Review the release checklist'],
+  ['\u8acb\u5efa\u7acb\u4e00\u500b\u76ee\u6a19\uff1a\u6574\u7406\u767c\u5e03\u6aa2\u67e5\u6e05\u55ae', '\u6574\u7406\u767c\u5e03\u6aa2\u67e5\u6e05\u55ae'],
+]) {
+  assert.deepEqual(
+    resolveChatGoalWorkflowRouting({
+      text,
+      attachmentCount: 0,
+      hasPendingProposal: false,
+      hasActiveGoal: false,
+    }).route,
+    { kind: 'goal_proposal', content, raw: text },
+    `${text} must use the same session-bound goal proposal route`
+  )
+}
+
+assert.deepEqual(
+  resolveChatGoalWorkflowRouting({
+    text: 'Research this today',
+    attachmentCount: 0,
+    hasPendingProposal: false,
+    hasActiveGoal: false,
+  }).route,
+  { kind: 'direct_chat' },
+  'ordinary non-time-bounded research remains chat'
 )
 
 console.log('ok')

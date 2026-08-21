@@ -11,6 +11,7 @@ let PORT = Number.isInteger(configuredPort) && configuredPort > 0 ? configuredPo
 let BASE_URL = ''
 let APP_URL = ''
 const NEXT_DIST_DIR = process.env.MOCHI_NEXT_DIST_DIR ?? '.next-fixture-goal-live'
+const ARTIFACT_PATH = path.resolve(WEB_DIR, '..', 'artifacts', 'goal-ui', 'goal-live-browser-evidence.json')
 const require = createRequire(import.meta.url)
 const SSE_CHUNK_DELAY_MS = 80
 let stoppingDevServer = false
@@ -773,65 +774,70 @@ async function main() {
 
       await page.goto(APP_URL, { waitUntil: 'domcontentloaded' })
       await waitForVisibleText(page, objective, 'initial goal title', requestLog)
-      await waitForVisibleText(page, 'Execution highlights', 'initial execution lane', requestLog)
-      await waitForVisibleText(page, 'Goal runtime accepted the autonomous task.', 'initial run progress', requestLog)
-      await waitForVisibleText(page, 'Thinking through the live execution evidence path.', 'initial thinking progress', requestLog)
-      await waitForVisibleText(page, 'Goal live fixture worker', 'initial subagent progress', requestLog)
-      await waitForVisibleText(page, 'Streamed execution progress reached the browser live.', 'live streamed progress row', requestLog)
-      await waitForVisibleText(page, 'Polling fallback replayed the live transcript without duplicates.', 'poll fallback progress row', requestLog)
-      await assertNoEmptyAssistantCards(page)
-      await assertTimelineRows(page, expectedTimelineRowKeys, 'after initial stream and poll recovery')
-
-      await page.reload({ waitUntil: 'domcontentloaded' })
-      await waitForVisibleText(page, objective, 'reload goal title', requestLog)
-      await waitForVisibleText(page, 'Execution highlights', 'reload execution lane', requestLog)
-      await waitForVisibleText(page, 'Goal runtime accepted the autonomous task.', 'reload run progress', requestLog)
-      await waitForVisibleText(page, 'Streamed execution progress reached the browser live.', 'reload streamed progress row', requestLog)
-      await waitForVisibleText(page, 'Polling fallback replayed the live transcript without duplicates.', 'reload poll replay row', requestLog)
+      await page.locator('[data-testid="goal-composer-drawer"]').waitFor({ state: 'visible', timeout: 30_000 })
+      assert.equal(await page.getByText('Execution highlights', { exact: true }).count(), 0, 'legacy timeline surface must not render')
       await waitForCondition(
-        () => requestLog.includes(`GET /v1/agent-runs/${runId}/events/stream?after_seq=5`),
-        'reload SSE replay request'
+        () => requestLog.includes(`GET /v1/agent-runs/${runId}/events?after_seq=4`),
+        'chat poll recovery after initial SSE stream'
       )
-      await sleep(400)
-      await assertNoEmptyAssistantCards(page)
-      await assertTimelineRows(page, expectedTimelineRowKeys, 'after reload reconstruction and stream replay')
-
       assert.ok(
         requestLog.includes(`GET /v1/agent-runs/${runId}/events/stream?after_seq=3`),
-        'browser should open the live SSE stream after initial transcript hydration'
+        'chat should open SSE after transcript hydration'
       )
+      await assertNoEmptyAssistantCards(page)
+
+      const recordNavigation = page.waitForURL((nextUrl) => nextUrl.pathname === `/agent-runs/${encodeURIComponent(runId)}`, { timeout: 20_000 })
+      await page.locator('[data-testid="goal-action-execution-record"]').click()
+      await recordNavigation
+      for (const expectedText of [
+        'Goal runtime accepted the autonomous task.',
+        'Worker started live browser evidence collection.',
+        'Thinking through the live execution evidence path.',
+        'Streamed execution progress reached the browser live.',
+        'Polling fallback replayed the live transcript without duplicates.',
+      ]) {
+        await waitForVisibleText(page, expectedText, `detail event: ${expectedText}`, requestLog)
+        assert.equal(await page.getByText(expectedText, { exact: false }).count(), 1, `detail event must render once: ${expectedText}`)
+      }
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      for (const expectedText of [
+        'Goal runtime accepted the autonomous task.',
+        'Worker started live browser evidence collection.',
+        'Thinking through the live execution evidence path.',
+        'Streamed execution progress reached the browser live.',
+        'Polling fallback replayed the live transcript without duplicates.',
+      ]) {
+        await waitForVisibleText(page, expectedText, `detail reload event: ${expectedText}`, requestLog)
+        assert.equal(await page.getByText(expectedText, { exact: false }).count(), 1, `detail reload event must render once: ${expectedText}`)
+      }
       assert.ok(
-        requestLog.includes(`GET /v1/agent-runs/${runId}/events?after_seq=4`),
-        'browser should poll transcript recovery after the first stream closes'
+        requestLog.filter((item) => item === `GET /v1/agent-runs/${runId}`).length >= 2,
+        'detail reload should refetch the durable AgentRun event snapshot'
       )
-      assert.ok(
-        requestLog.filter((item) => item === `GET /v1/agent-runs/${runId}/events`).length >= 2,
-        'reload should reconstruct from transcript history again'
-      )
-      assert.ok(
-        requestLog.filter((item) => item === `GET /v1/sessions/${sessionId}`).length >= 2,
-        'reload should refetch the session detail'
-      )
+      assert.ok(requestLog.filter((item) => item.startsWith(`GET /v1/sessions/${sessionId}`)).length >= 1, 'drawer entry should load session detail')
       await assertNoConsoleNoise(page, badMessages)
       await page.close()
       reportPhase('assertions-complete')
 
-      console.log(JSON.stringify({
+      const payload = {
         ok: true,
         checks: {
-          visibleExecutionHighlights: true,
-          visibleStreamedProgress: true,
-          visiblePollReplayProgress: true,
+          composerDrawerVisible: true,
+          legacyTimelineAbsent: true,
+          executionRecordOpensDurableTimeline: true,
           noEmptyAssistantCards: true,
-          reloadAndReconnectDedupeStable: true,
+          streamPollReloadDedupeStable: true,
         },
         counts: {
-          expectedTimelineRows: expectedTimelineRowKeys.length,
+          expectedEventCards: expectedTimelineRowKeys.length,
           streamConnections: mockApi.state.streamConnectionCount,
           requestLogEntries: requestLog.length,
         },
         requests: requestLog,
-      }, null, 2))
+      }
+      await fs.promises.mkdir(path.dirname(ARTIFACT_PATH), { recursive: true })
+      await fs.promises.writeFile(ARTIFACT_PATH, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+      console.log(JSON.stringify(payload, null, 2))
     } finally {
       reportPhase('close-browser')
       await browser.close()
@@ -847,7 +853,9 @@ async function main() {
 
 main()
   .then(() => process.exit(0))
-  .catch((error) => {
+  .catch(async (error) => {
+    await fs.promises.mkdir(path.dirname(ARTIFACT_PATH), { recursive: true }).catch(() => {})
+    await fs.promises.writeFile(ARTIFACT_PATH, JSON.stringify({ ok: false, error: error.message }, null, 2) + '\n', 'utf8').catch(() => {})
     console.error(error)
     process.exit(1)
   })

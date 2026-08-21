@@ -1,0 +1,40 @@
+{
+    "schema_name":  "agent-foreman/gate-evidence",
+    "schema_version":  "1.0",
+    "plan_id":  "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+    "package_id":  "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+    "gate_id":  "GATE-GOAL-DRAWER-MODEL",
+    "actor_role":  "main",
+    "command":  "rtk proxy node --experimental-strip-types tests/frontend/test_goal_drawer_model.mjs",
+    "exit_code":  0,
+    "observed":  "goal drawer model: 21 assertions passed",
+    "supplemental_gates":  [
+                               {
+                                   "command":  "rtk npm --prefix web run type-check",
+                                   "exit_code":  0,
+                                   "observed":  "tsc --noEmit completed without diagnostics"
+                               },
+                               {
+                                   "command":  "rtk git diff --check",
+                                   "exit_code":  0,
+                                   "observed":  "no tracked whitespace diagnostics; both package files remain untracked additions"
+                               },
+                               {
+                                   "command":  "rtk proxy git diff --no-index --check NUL \u003cowned-path\u003e",
+                                   "exit_code":  1,
+                                   "observed":  "no whitespace-error diagnostics; exit 1 denotes the expected added-file difference, with only LF-to-CRLF warnings"
+                               }
+                           ],
+    "scope_observed":  [
+                           "tests/frontend/test_goal_drawer_model.mjs",
+                           "web/src/lib/goal-drawer-model.ts"
+                       ],
+    "git_object_hashes":  {
+                              "web/src/lib/goal-drawer-model.ts":  "e994e2a1fe5f7ea2455a82940cefceadd0fb3df8",
+                              "tests/frontend/test_goal_drawer_model.mjs":  "60ea809cfd4691cb44bf11fa75f9e7579b0f42f5"
+                          },
+    "delta_guard":  {
+                        "status":  "not_run",
+                        "reason":  "No pre-execution fingerprint manifest existed before the manually dispatched Terra run; Root instead verified git status scope, inspected both complete files, and recorded their current hashes."
+                    }
+}

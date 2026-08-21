@@ -17,7 +17,6 @@ import {
   Search,
   Trash2,
   UserRound,
-  Waypoints,
   Workflow,
   Zap,
 } from 'lucide-react'
@@ -542,12 +541,6 @@ export function Sidebar() {
 
         <nav className="flex-1 space-y-3 overflow-y-auto px-2 py-2">
           <div className="space-y-0.5">
-            <SidebarRouteButton
-              collapsed={collapsed}
-              icon={<Waypoints className="h-4 w-4" />}
-              title="Goals"
-              onClick={() => router.push('/goals')}
-            />
             <SidebarRouteButton
               collapsed={collapsed}
               icon={<Workflow className="h-4 w-4" />}

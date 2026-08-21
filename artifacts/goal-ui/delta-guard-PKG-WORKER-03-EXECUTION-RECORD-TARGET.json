@@ -1,0 +1,30 @@
+{
+  "schema_name": "agent-foreman/delta-guard",
+  "schema_version": "1.0",
+  "method": "audited-equivalent",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "package_id": "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+  "guard_delta_executed": false,
+  "non_execution_reason": "The whole-workspace native fingerprint is blocked by the pre-existing Windows-invalid ignored .tmp path; this audit compares the frozen two-path worker scope directly against the baseline commit and current Git-visible additions.",
+  "exact_commands": [
+    "rtk git cat-file -e 1f08da287e96bcce4e75005ceedfaa0927f84b3d:<owned-path>",
+    "rtk proxy node --input-type=module -e <sha256 declared owned files>",
+    "rtk git status --short --untracked-files=all"
+  ],
+  "evidence_artifacts": [
+    "artifacts/goal-ui/dispatch-manifest-PKG-WORKER-03.json",
+    "artifacts/goal-ui/handoff-manifest-PKG-WORKER-03-EXECUTION-RECORD-TARGET.json",
+    "artifacts/goal-ui/gate-execution-record-target.json"
+  ],
+  "owned_path_audit": {
+    "deterministic": true,
+    "attributed_worker_paths": [
+      "web/src/lib/goal-execution-record-target.ts",
+      "tests/frontend/test_goal_execution_record_target.mjs"
+    ],
+    "attributed_worker_out_of_scope_paths": []
+  },
+  "passed": true,
+  "result": "passed_audited_equivalent_only",
+  "not_a_claim": "This is not a successful execution of agent-foreman/scripts/guard_delta.py and does not establish Main acceptance or integration."
+}

@@ -1,0 +1,255 @@
+{
+  "schema_name": "agent-foreman/closure-audit",
+  "schema_version": "1.0",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "actor_role": "advisor",
+  "status": "implemented",
+  "scope": "read-only closure audit; production, tests, config, canonical plan, and existing artifacts were not modified",
+  "observed_state": {
+    "plan_status": "frozen",
+    "package_statuses": {
+      "PKG-WORKER-02-GOAL-DRAWER-MODEL": "implemented",
+      "PKG-WORKER-03-EXECUTION-RECORD-TARGET": "frozen",
+      "PKG-MAIN-04-GOAL-UI-HYDRATION-INTEGRATION": "frozen"
+    },
+    "canonical_integration_records": 0,
+    "canonical_evidence_entries": 0,
+    "blocking_gate_results": "all 12 remain not_run in the canonical plan",
+    "existing_observation_artifacts": [
+      "artifacts/goal-ui/gate-goal-drawer-model.json",
+      "artifacts/goal-ui/goal-drawer-browser-evidence.json",
+      "artifacts/goal-ui/goal-live-browser-evidence.json",
+      "artifacts/goal-ui/hydration-no-mismatch.json"
+    ],
+    "existing_evaluation": "artifacts/goal-ui/evaluation-goal-ui-fresh.json is a fresh, read-only REVISE/failed evaluation and cannot be overwritten or used as final acceptance."
+  },
+  "mandatory_before_main_marks_integrated_or_verified": [
+    {
+      "id": "M-01-PKG03-HANDOFF-AND-ACCEPTANCE",
+      "requirement": "PKG-WORKER-03 has a dispatch but no canonical implemented handoff or Main acceptance. It cannot advance from frozen.",
+      "create": [
+        {
+          "path": "docs/architecture/handoffs/handoff-PKG-WORKER-03-EXECUTION-RECORD-TARGET.json",
+          "minimum": {
+            "schema_name": "agent-foreman/handoff",
+            "schema_version": "1.0",
+            "profile": "full",
+            "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+            "package_id": "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+            "status": "implemented",
+            "requested_selector": "terra",
+            "resolved_model_id": null,
+            "model_verification": "unavailable",
+            "reasoning_effort": "unavailable",
+            "changed_paths": [
+              "web/src/lib/goal-execution-record-target.ts",
+              "tests/frontend/test_goal_execution_record_target.mjs"
+            ],
+            "diff_artifact": "artifacts/goal-ui/gate-execution-record-target.json",
+            "test_artifacts": [
+              "artifacts/goal-ui/gate-execution-record-target.json"
+            ],
+            "gate_results": [
+              {
+                "gate_id": "GATE-EXECUTION-RECORD-TARGET",
+                "exit_code": 0,
+                "observed": "exact focused-test output"
+              }
+            ],
+            "blocked_record": null
+          }
+        }
+      ],
+      "main_action": "Inspect the diff and focused evidence, then record acceptance only through Main-owned integration material."
+    },
+    {
+      "id": "M-02-OWNERSHIP-REPLAN",
+      "requirement": "The git-visible Main delta includes paths not owned by PKG-MAIN-04: .gitignore; tests/frontend/test_agent_run_route_id.mjs; web/scripts/test-chat-goal-routing.mjs; web/scripts/test-chat-goal-workflow-routing.mjs; web/src/app/agent-runs/[runId]/page.tsx; web/src/lib/agent-run-route-id.ts; and web/src/lib/chat-goal-routing.ts. The temporary web/tsconfig.json fixture entries must be removed before the final delta is assessed.",
+      "minimum_plan_change": "Record an affected-subgraph/Main scope replan before acceptance: add each retained path to an explicitly Main-owned package, add GATE-AGENT-RUN-ROUTE-ID with command `rtk proxy node --experimental-strip-types tests/frontend/test_agent_run_route_id.mjs`, link it to INV-EXECUTION-RECORD-DIRECT, and revalidate/refreeze the amended plan. Do not attribute these Main seam changes to either worker.",
+      "supporting_artifact": {
+        "path": "artifacts/goal-ui/replan-main-04-scope-delta.json",
+        "minimum": {
+          "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+          "actor_role": "main",
+          "affected_packages": [
+            "PKG-MAIN-04-GOAL-UI-HYDRATION-INTEGRATION"
+          ],
+          "reason": "post-freeze integration required route decoding and activation-path fixes",
+          "added_owned_paths": "all retained paths listed above",
+          "added_gate_ids": [
+            "GATE-AGENT-RUN-ROUTE-ID"
+          ],
+          "validation_required": true
+        }
+      }
+    },
+    {
+      "id": "M-03-FINGERPRINT-HANDOFF-DELTA-GUARDS",
+      "requirement": "No accepted handoff manifest or guard_delta result is present for either worker package. PKG-02 also has no standalone dispatch fingerprint. A dispatch fingerprint alone is not acceptance evidence; its broad snapshot also does not replace per-package ownership comparison.",
+      "create": [
+        {
+          "path": "artifacts/goal-ui/dispatch-manifest-PKG-WORKER-02-GOAL-DRAWER-MODEL.json",
+          "minimum": {
+            "schema_name": "agent-foreman/fingerprint",
+            "schema_version": "1.0",
+            "stage": "dispatch",
+            "package_id": "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+            "baseline_commit": "1f08da287e96bcce4e75005ceedfaa0927f84b3d",
+            "coverage": "audited-equivalent tracked/nonignored scope",
+            "limitation": "post-hoc reconstruction; disclose that no pre-execution standalone fingerprint was retained"
+          }
+        },
+        {
+          "path": "artifacts/goal-ui/handoff-manifest-PKG-WORKER-02-GOAL-DRAWER-MODEL.json",
+          "minimum": {
+            "schema_name": "agent-foreman/fingerprint",
+            "schema_version": "1.0",
+            "stage": "handoff",
+            "package_id": "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+            "coverage": "audited-equivalent tracked/nonignored scope",
+            "exclusions": "only the known Windows-invalid ignored .tmp path, with reason"
+          }
+        },
+        {
+          "path": "artifacts/goal-ui/handoff-manifest-PKG-WORKER-03-EXECUTION-RECORD-TARGET.json",
+          "minimum": {
+            "schema_name": "agent-foreman/fingerprint",
+            "schema_version": "1.0",
+            "stage": "handoff",
+            "package_id": "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+            "coverage": "audited-equivalent tracked/nonignored scope",
+            "exclusions": "only the known Windows-invalid ignored .tmp path, with reason"
+          }
+        },
+        {
+          "path": "artifacts/goal-ui/delta-guard-PKG-WORKER-02-GOAL-DRAWER-MODEL.json",
+          "minimum": {
+            "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+            "package_id": "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+            "command": "rtk proxy python C:/Users/Xu/.codex/skills/agent-foreman/scripts/guard_delta.py ...",
+            "passed": true,
+            "owned_only": true
+          }
+        },
+        {
+          "path": "artifacts/goal-ui/delta-guard-PKG-WORKER-03-EXECUTION-RECORD-TARGET.json",
+          "minimum": {
+            "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+            "package_id": "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+            "command": "rtk proxy python C:/Users/Xu/.codex/skills/agent-foreman/scripts/guard_delta.py ...",
+            "passed": true,
+            "owned_only": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "M-04-CANONICAL-GATE-EVIDENCE",
+      "requirement": "Observed pass artifacts do not change canonical `not_run` gate states. Rerun or preserve authoritative command output for every blocking gate and create the missing planned artifacts before setting results to passed.",
+      "missing_artifacts": [
+        "artifacts/goal-ui/gate-execution-record-target.json",
+        "artifacts/goal-ui/gate-agent-run-route-id.json",
+        "artifacts/goal-ui/gate-frontend-typecheck.txt",
+        "artifacts/goal-ui/gate-frontend-lint.txt",
+        "artifacts/goal-ui/gate-chat-goal-routing.txt",
+        "artifacts/goal-ui/gate-goal-continuation.txt",
+        "artifacts/goal-ui/gate-goal-timeline.txt",
+        "artifacts/goal-ui/gate-python-goal-api.txt",
+        "artifacts/goal-ui/gate-diff-check.txt"
+      ],
+      "existing_artifacts_requiring_ledger_and_plan_indexing": [
+        "artifacts/goal-ui/gate-goal-drawer-model.json",
+        "artifacts/goal-ui/goal-drawer-browser-evidence.json",
+        "artifacts/goal-ui/goal-live-browser-evidence.json",
+        "artifacts/goal-ui/hydration-no-mismatch.json"
+      ],
+      "required_result": "Every blocking acceptance_gates entry, plus the replan-added route-ID gate, has integer exit code 0, exact observation, artifact hash, and canonical result passed."
+    },
+    {
+      "id": "M-05-EVIDENCE-LEDGER",
+      "requirement": "The canonical plan has an empty evidence_ledger. Evidence must be appended, never reconstructed by replacing older entries.",
+      "create": [
+        {
+          "path": "artifacts/goal-ui/evidence-ledger.jsonl",
+          "minimum": "one immutable agent-foreman/evidence-entry JSON line per executed deterministic gate and the final evaluator, each with stable evidence_id, timestamp, actor_role, invariant_ids, gate_id, command, exit_code, observed, artifact_path, sha256, and deterministic/advisory classification"
+        }
+      ],
+      "plan_action": "Append matching entries to plan.evidence_ledger in order; do not alter the failed first evaluator record."
+    },
+    {
+      "id": "M-06-MAIN-INTEGRATION-RECORD",
+      "requirement": "integration_records is empty. Only Main may create the record that moves implemented packages to integrated.",
+      "create": [
+        {
+          "path": "artifacts/goal-ui/integration-PHASE-GOAL-CHAT-SCOPED-UI.json",
+          "minimum": {
+            "schema_name": "agent-foreman/integration",
+            "schema_version": "1.0",
+            "profile": "full",
+            "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+            "phase_id": "PHASE-GOAL-CHAT-SCOPED-UI",
+            "actor_role": "main",
+            "packages": [
+              "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+              "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+              "PKG-MAIN-04-GOAL-UI-HYDRATION-INTEGRATION"
+            ],
+            "delta_guard": "references both passed per-worker guards and the Main ownership/replan record",
+            "focused_gates": "GATE-GOAL-DRAWER-MODEL, GATE-EXECUTION-RECORD-TARGET, GATE-AGENT-RUN-ROUTE-ID",
+            "aggregate_gates": "all remaining blocking plan gates",
+            "deterministic_result": "passed only after all blocking gates pass",
+            "evaluator_recommendation": "must name the new evaluator result, not the failed earlier evaluation",
+            "status": "integrated",
+            "rework": "actual worker_changed_lines and main_changed_lines_in_worker_scope"
+          }
+        }
+      ],
+      "plan_action": "Append the same Main integration record and then update package statuses in state-machine order."
+    },
+    {
+      "id": "M-07-FRESH-FALSIFICATION-EVALUATION",
+      "requirement": "The only evaluator artifact is REVISE/failed. After integration, a new fresh read-only evaluator must independently probe the repaired state; it must not overwrite the first artifact or modify production.",
+      "create": [
+        {
+          "path": "artifacts/goal-ui/evaluation-goal-ui-fresh-recheck.json",
+          "minimum": {
+            "schema_name": "agent-foreman/evaluation",
+            "schema_version": "1.0",
+            "profile": "full",
+            "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+            "context_freshness": "fresh",
+            "model_diversity": "authoritative value or same-model-fresh-context/unknown",
+            "production_access": "read-only",
+            "new_probes": "at least one newly executed falsification probe for each critical invariant: activation identity, composer surface, session isolation, action semantics, direct execution record, and hydration parity; record setup, fault injection, trigger, oracle, anti-oracle, command, exit code, and artifact",
+            "recommendation": "pass only when all probes pass",
+            "deterministic_result": "passed only when the probes and referenced runtime gates pass"
+          }
+        }
+      ],
+      "restriction": "A fresh context is required; different verified model family is preferred but unavailable identity must be disclosed rather than invented."
+    },
+    {
+      "id": "M-08-PLAN-VALIDATE-RENDER-STATUS",
+      "requirement": "After the scope replan, handoffs, gate results, ledger, integration record, and fresh evaluation are appended, canonical JSON must be the only semantic source and Markdown must be regenerated.",
+      "commands": [
+        "rtk proxy python C:/Users/Xu/.codex/skills/agent-foreman/scripts/validate_plan.py docs/architecture/2026-08-20-chat-scoped-goal-ui-subagent-execution-plan.json --ledger artifacts/goal-ui/evidence-ledger.jsonl",
+        "rtk proxy python C:/Users/Xu/.codex/skills/agent-foreman/scripts/render_plan.py docs/architecture/2026-08-20-chat-scoped-goal-ui-subagent-execution-plan.json --out docs/architecture/2026-08-20-chat-scoped-goal-ui-subagent-execution-plan.md",
+        "rtk git diff --check"
+      ],
+      "status_order": "worker packages implemented -> integrated; Main package integrated; only after every blocking gate and fresh evaluator evidence pass may Main mark packages and metadata verified."
+    }
+  ],
+  "mandatory_cleanup": [
+    {
+      "path": "web/tsconfig.json",
+      "action": "Remove only the four generated .next-fixture-hydration and .next-fixture-goal-drawer include entries after browser gates; they are runner residue, not intentional source configuration."
+    }
+  ],
+  "optional_cleanup": [
+    {
+      "path": "web/scripts/test-goal-live-browser-evidence.mjs",
+      "action": "Remove unused readTimelineRowKeys/assertTimelineRows helpers only if a focused syntax/lint check remains green; this is not a closure prerequisite."
+    }
+  ],
+  "next_action": "Main should perform the affected-subgraph scope replan and cleanup first, then create PKG-03 handoff/guard evidence and run the canonical gates before integration and a new fresh evaluation."
+}

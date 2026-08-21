@@ -1,4 +1,4 @@
-'use client'
+﻿'use client'
 
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
@@ -23,13 +23,7 @@ import {
   type ChatComposerSeed,
   type ChatInputModelOption,
 } from '@/components/chat/ChatInput'
-import {
-  GoalDrawerContent,
-  GoalHeaderChip,
-  type GoalDrawerBlockerView,
-  type GoalHeaderChipView,
-} from '@/components/chat/GoalHeaderChip'
-import { GoalFocusPanel } from '@/components/chat/GoalFocusPanel'
+import { GoalComposerDrawer } from '@/components/chat/GoalComposerDrawer'
 import { ExecutionTimeline } from '@/components/chat/ExecutionTimeline'
 import { SubagentDrawer } from '@/components/chat/SubagentDrawer'
 import { SubagentTimelineCard } from '@/components/chat/SubagentTimelineCard'
@@ -50,6 +44,7 @@ import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
 import {
   buildOptimisticConversationTurnMessages,
 } from '@/lib/chat-send-contract'
+import { createClientBackendErrorMessage } from '@/lib/chat-error-projection'
 import {
   resolveChatGoalWorkflowRouting,
   type ChatGoalWorkflowRoute,
@@ -62,21 +57,20 @@ import {
   layoutShowsExecutionHighlights,
   resolveGoalConversationBodyLayout,
 } from '@/lib/goal-execution-surface'
-import { buildGoalFocusCallout } from '@/lib/goal-focus-surface'
+import { projectGoalDrawerState, type GoalDrawerStatus } from '@/lib/goal-drawer-model'
+import { resolveGoalExecutionRecordTarget } from '@/lib/goal-execution-record-target'
 import {
   applyGoalProposalModelReadiness,
   buildGoalProposalProbeCandidates,
   type GoalProposalModelReadinessById,
 } from '@/lib/goal-proposal-models'
 import {
-  buildGoalChromeCopy,
   buildGoalCommandHelpMessage,
   buildGoalFollowUpMessage,
   buildGoalLifecycleMessage,
   buildGoalOpenWorkflowLabel,
   buildGoalPendingApprovalNotice,
   buildGoalReviewApprovalsLabel,
-  buildGoalUiErrorMessage,
   buildLocalGoalProposalAssistantExplanation,
 } from '@/lib/goal-proposal-copy'
 import { resolvePreferredCurrentModelId } from '@/lib/current-model-selection'
@@ -931,6 +925,44 @@ function isGoalBlockedStatus(status: string | null | undefined): boolean {
   )
 }
 
+function mapGoalStatusToDrawerStatus(value: string | null | undefined): GoalDrawerStatus | null {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'proposed':
+    case 'created':
+    case 'pending':
+      return 'proposed'
+    case 'active':
+    case 'started':
+    case 'in_progress':
+    case 'processing':
+    case 'queued':
+    case 'resumed':
+    case 'running':
+    case 'working':
+      return 'running'
+    case 'blocked':
+    case 'paused':
+    case 'awaiting_approval':
+    case 'waiting_approval':
+    case 'awaiting_resources':
+    case 'stalled':
+      return 'paused'
+    case 'stopped':
+    case 'cancelled':
+    case 'canceled':
+      return 'stopped'
+    case 'completed':
+    case 'done':
+    case 'succeeded':
+    case 'partial':
+      return 'completed'
+    case 'failed':
+    case 'error':
+      return 'failed'
+    default:
+      return null
+  }
+}
 function isAgentRunTerminalStatus(status: string | null | undefined): boolean {
   const normalized = (status ?? '').toLowerCase()
   return (
@@ -1020,18 +1052,6 @@ function resolveGoalWorkflowRouteUserContent(
     case 'goal_lifecycle':
       return route.raw
   }
-}
-
-function buildAutonomousGoalSystemPrompt(basePrompt: string, objective: string): string {
-  const trimmedBase = basePrompt.trim()
-  const goalInstruction = [
-    'Autonomous goal mode is active for this turn.',
-    `Goal objective: ${objective.trim()}`,
-    'Work like a long-running coding/research agent inside the normal chat transcript.',
-    'Use available tools when they are helpful, continue without asking for confirmation unless safety or missing critical information requires it, and stop only when the objective is complete or genuinely blocked.',
-    'Do not create or describe a separate goal proposal card; report progress and final results as normal assistant messages.',
-  ].join('\n')
-  return trimmedBase ? `${trimmedBase}\n\n${goalInstruction}` : goalInstruction
 }
 
 function getGoalAttemptRunId(goal: api.GoalSummary): string | null {
@@ -1658,15 +1678,8 @@ export default function ChatPage() {
   const [taskPanelMode, setTaskPanelMode] = React.useState<TaskPanelMode>('default')
   const [taskPanelFocusedTaskId, setTaskPanelFocusedTaskId] = React.useState<string | null>(null)
   const [taskPanelFocusedApprovalIds, setTaskPanelFocusedApprovalIds] = React.useState<string[] | null>(null)
-  const [goalDrawerOpen, setGoalDrawerOpen] = React.useState(false)
-  const [goalDrawerBusyAction, setGoalDrawerBusyAction] = React.useState<'status' | 'pause' | 'resume' | 'stop' | null>(null)
-  const [goalDrawerHealth, setGoalDrawerHealth] = React.useState<api.GoalHealthSummary | null>(null)
-  const [goalDrawerHealthLoading, setGoalDrawerHealthLoading] = React.useState(false)
-  const [goalDrawerHealthError, setGoalDrawerHealthError] = React.useState<string | null>(null)
-  const [goalDrawerApprovals, setGoalDrawerApprovals] = React.useState<api.ApprovalSummary[]>([])
-  const [goalDrawerApprovalsLoading, setGoalDrawerApprovalsLoading] = React.useState(false)
-  const [goalDrawerApprovalError, setGoalDrawerApprovalError] = React.useState<string | null>(null)
-  const [goalDrawerResolvingApprovalKey, setGoalDrawerResolvingApprovalKey] = React.useState<string | null>(null)
+  const [clearedGoalPresentationBySessionId, setClearedGoalPresentationBySessionId] = React.useState<Record<string, string>>({})
+  const [goalDrawerBusyAction, setGoalDrawerBusyAction] = React.useState<'pause' | 'resume' | 'stop' | 'steer' | null>(null)
   const [executionTimelineEvents, setExecutionTimelineEvents] = React.useState<api.ExecutionTranscriptEvent[]>([])
   const [executionTimelineError, setExecutionTimelineError] = React.useState<string | null>(null)
   const [sessionSubagents, setSessionSubagents] = React.useState<api.SubagentTranscriptSummary[]>([])
@@ -1732,6 +1745,9 @@ export default function ChatPage() {
     chatRunId: null,
   })
   const pendingChatCancelRef = React.useRef<api.ChatCancelResponse | null>(null)
+  const goalDrawerSessionRef = React.useRef<string | null>(null)
+  const goalDrawerActionRequestIdRef = React.useRef(0)
+  const goalDrawerActionInFlightRef = React.useRef<{ requestId: number; sessionId: string } | null>(null)
 
   const {
     sessions,
@@ -1835,6 +1851,12 @@ export default function ChatPage() {
     () => normalizeGoalSessionState(currentSessionDetail?.goal ?? currentSession?.goal ?? null),
     [currentSession?.goal, currentSessionDetail?.goal]
   )
+  React.useEffect(() => {
+    goalDrawerSessionRef.current = currentSessionId
+    goalDrawerActionInFlightRef.current = null
+    setGoalDrawerBusyAction(null)
+  }, [currentSessionId])
+
   const workflowEnabled = Boolean(workflowState.enabled)
   const workflowBoundRunId = workflowState.bound_run_id ?? null
   const goalBoundRunId =
@@ -1871,7 +1893,6 @@ export default function ChatPage() {
   const {
     allVisibleSubagents,
     goalSurfaceTimelineEvents,
-    goalSurfaceTimelineEventsById,
     goalSurfaceSubagents,
     subagentTimelineEventsById,
   } = goalExecutionProjection
@@ -1986,31 +2007,6 @@ export default function ChatPage() {
     }
     return contextualPendingApprovals.length
   }, [contextualPendingApprovals, contextualRuntimeTaskIds])
-  const pendingGoalApprovalIds = React.useMemo(
-    () =>
-      Array.from(
-        new Set(
-          contextualPendingApprovals
-            .map((approval) => approval.approval_id.trim())
-            .filter((approvalId) => approvalId.length > 0)
-        )
-      ),
-    [contextualPendingApprovals]
-  )
-  const goalHealthPendingApprovalCount = React.useMemo(() => {
-    if (!goalDrawerHealth) {
-      return 0
-    }
-    const pendingCount = goalDrawerHealth.approval_state?.pending_count
-    if (typeof pendingCount === 'number' && Number.isFinite(pendingCount) && pendingCount > 0) {
-      return pendingCount
-    }
-    return getStringArray(goalDrawerHealth.approval_state?.approval_ids).length
-  }, [goalDrawerHealth])
-  const goalSurfacePendingApprovalCount = React.useMemo(
-    () => Math.max(pendingApprovalCount, goalHealthPendingApprovalCount),
-    [goalHealthPendingApprovalCount, pendingApprovalCount]
-  )
   const activeTaskCount = React.useMemo(
     () => contextualRuntimeTasks.filter((task) => isActiveTaskStatus(task.status)).length,
     [contextualRuntimeTasks]
@@ -2110,13 +2106,6 @@ export default function ChatPage() {
 
     return createInitialMessages(t)
   }, [currentSessionDetail, currentSessionId, currentSessionMessages, isLoadingDetail, t])
-  const resolveGoalSurfaceCopySource = React.useCallback((
-    goalId: string | null,
-    objective: string | null | undefined
-  ): string => {
-    void goalId
-    return (objective ?? '').trim()
-  }, [])
   const delegatedSubagentToolResultCount = React.useMemo(
     () =>
       messages.reduce((count, message) => (
@@ -4405,10 +4394,7 @@ export default function ChatPage() {
           ...prev.filter((message) => message.turnKey !== turnKey),
           {
             id: `error-${Date.now()}`,
-            type: 'error',
-            eventType: 'error',
-            content: t('chat.requestFailed'),
-            errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+            ...createClientBackendErrorMessage(error, t('chat.requestFailed')),
             timestamp: new Date(),
           },
         ])
@@ -4588,24 +4574,6 @@ export default function ChatPage() {
         setWorkflowPanelOpen(true)
       }
 
-      if (route.kind === 'goal_proposal') {
-        await submitDirectChatTurn({
-          targetSessionId,
-          requestText: route.content,
-          attachments,
-          selectedSkillIds,
-          toolMode: 'auto',
-          normalizedWorkflow,
-          sessionScope,
-          expectedPolicyVersion,
-          systemPromptOverride: buildAutonomousGoalSystemPrompt(
-            effectiveInference.systemPrompt,
-            route.content
-          ),
-        })
-        return
-      }
-
       if (shouldHandleGoalWorkflowRouting && route.kind !== 'direct_chat') {
         const routeTurnKey = `turn-${Date.now()}`
         const routeUserContent = resolveGoalWorkflowRouteUserContent(route, requestText)
@@ -4635,10 +4603,7 @@ export default function ChatPage() {
             ...prev.filter((message) => message.turnKey !== routeTurnKey),
             {
               id: `error-${Date.now()}`,
-              type: 'error',
-              eventType: 'error',
-              content: t('chat.requestFailed'),
-              errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+              ...createClientBackendErrorMessage(error, t('chat.requestFailed')),
               timestamp: new Date(),
             },
           ])
@@ -4693,7 +4658,6 @@ export default function ChatPage() {
       effectiveInference,
       handleGoalWorkflowRouting,
       hasActiveStream,
-      persistGoalConversation,
       persistSessionGoalState,
       persistWorkflowState,
       setPanelOpen,
@@ -5013,7 +4977,7 @@ export default function ChatPage() {
     setEditState(null)
     void selectSession(currentSessionId)
     await handleSend(nextContent, {
-      forceSessionId: currentSessionId,
+      forceSessionId: currentSessionId ?? undefined,
       attachments,
       selectedSkillIds,
       expectedPolicyVersion: options?.expectedPolicyVersion,
@@ -5313,11 +5277,8 @@ export default function ChatPage() {
     }
   }, [activeAgentSettings, effectiveInference, selectedPresetName])
 
-  const closeRightPanels = React.useCallback((except?: 'goal' | 'inference' | 'tasks' | 'workflow' | 'subagent') => {
+  const closeRightPanels = React.useCallback((except?: 'inference' | 'tasks' | 'workflow' | 'subagent') => {
     setWorkspaceMobileOpen(false)
-    if (except !== 'goal') {
-      setGoalDrawerOpen(false)
-    }
     if (except !== 'subagent') {
       setSubagentDrawerOpen(false)
     }
@@ -5335,12 +5296,6 @@ export default function ChatPage() {
       setWorkflowPanelOpen(false)
     }
   }, [setPanelOpen])
-
-  const handleGoalDrawerToggle = React.useCallback(() => {
-    const nextOpen = !goalDrawerOpen
-    closeRightPanels('goal')
-    setGoalDrawerOpen(nextOpen)
-  }, [closeRightPanels, goalDrawerOpen])
 
   const loadSubagentDetail = React.useCallback(async (
     target: api.SubagentTranscriptSummary,
@@ -5533,192 +5488,6 @@ export default function ChatPage() {
     subagentGuidance,
   ])
 
-  const refreshCurrentGoalBinding = React.useCallback(async (goalId: string) => {
-    if (!currentSessionId) {
-      return null
-    }
-
-    const refreshedGoal = await api.fetchGoal(goalId)
-    const refreshedGoalSummary = buildGoalSummaryFromGoal(
-      refreshedGoal,
-      currentSessionGoalState.last_goal_summary
-    )
-    const refreshedRunId = getGoalAttemptRunId(refreshedGoal)
-
-    await syncWorkflowStateForGoal({
-      sessionId: currentSessionId,
-      baseWorkflow: workflowState,
-      executionMode: refreshedGoal.execution_mode,
-      interactionMode: refreshedGoal.interaction_mode,
-      executionTopology: refreshedGoal.execution_topology,
-      goalStatus: refreshedGoal.status,
-      runId: refreshedRunId,
-    })
-    await persistSessionGoalState(currentSessionId, {
-      active_goal_id: isGoalTerminalStatus(refreshedGoal.status) ? null : refreshedGoal.goal_id,
-      active_goal_status: refreshedGoal.status,
-      execution_mode: refreshedGoal.execution_mode,
-      interaction_mode: refreshedGoal.interaction_mode,
-      execution_topology: refreshedGoal.execution_topology,
-      bound_run_id: refreshedGoalSummary.bound_run_id,
-      protocol_selection: refreshedGoalSummary.protocol_selection,
-      selection_rationale: refreshedGoalSummary.selection_rationale,
-      default_route: isGoalTerminalStatus(refreshedGoal.status)
-        ? 'chat'
-        : refreshedGoal.execution_mode === 'workflow'
-          ? 'workflow'
-          : 'goal',
-      last_goal_summary: refreshedGoalSummary,
-      pending_proposal: null,
-    })
-
-    return refreshedGoal
-  }, [
-    buildGoalSummaryFromGoal,
-    currentSessionGoalState.last_goal_summary,
-    currentSessionId,
-    persistSessionGoalState,
-    syncWorkflowStateForGoal,
-    workflowState,
-  ])
-
-  const loadGoalDrawerContext = React.useCallback(async (goalId: string) => {
-    const copySource = resolveGoalSurfaceCopySource(
-      goalId,
-      currentSessionGoalState.last_goal_summary?.objective ?? null
-    )
-    const drawerCopy = buildGoalChromeCopy(copySource)
-    setGoalDrawerHealthLoading(true)
-    setGoalDrawerHealthError(null)
-    setGoalDrawerApprovalError(null)
-    setGoalDrawerApprovalsLoading(false)
-
-    try {
-      const health = await api.fetchGoalHealth(goalId)
-      setGoalDrawerHealth(health)
-
-      const approvalIds = getStringArray(health.approval_state?.approval_ids)
-      if (approvalIds.length === 0) {
-        setGoalDrawerApprovals([])
-        setGoalDrawerApprovalsLoading(false)
-        return health
-      }
-
-      setGoalDrawerApprovalsLoading(true)
-      try {
-        const approvals = await api.fetchApprovals()
-        const approvalIdSet = new Set(approvalIds)
-        setGoalDrawerApprovals(
-          approvals.filter((approval) => approvalIdSet.has(approval.approval_id))
-        )
-      } catch (error) {
-        const detail = buildGoalUiErrorMessage(
-          copySource,
-          error instanceof Error ? error.message : null,
-          drawerCopy.pendingApprovalsLoadFailedLabel
-        )
-        setGoalDrawerApprovalError(detail)
-        setGoalDrawerApprovals([])
-      } finally {
-        setGoalDrawerApprovalsLoading(false)
-      }
-
-      return health
-    } catch (error) {
-      const detail = buildGoalUiErrorMessage(
-        copySource,
-        error instanceof Error ? error.message : null,
-        drawerCopy.goalStatusLoadFailedLabel
-      )
-      setGoalDrawerHealthError(detail)
-      setGoalDrawerHealth(null)
-      setGoalDrawerApprovals([])
-      setGoalDrawerApprovalsLoading(false)
-      return null
-    } finally {
-      setGoalDrawerHealthLoading(false)
-    }
-  }, [currentSessionGoalState.last_goal_summary, resolveGoalSurfaceCopySource])
-
-  const handleGoalDrawerRefresh = React.useCallback(async () => {
-    const goalId =
-      currentSessionGoalState.active_goal_id ??
-      currentSessionGoalState.last_goal_summary?.goal_id ??
-      null
-    if (!goalId) {
-      return
-    }
-    setGoalDrawerBusyAction('status')
-    try {
-      await Promise.all([
-        refreshCurrentGoalBinding(goalId),
-        loadGoalDrawerContext(goalId),
-      ])
-    } catch (error) {
-      const copySource = resolveGoalSurfaceCopySource(
-        goalId,
-        currentSessionGoalState.last_goal_summary?.objective ?? null
-      )
-      const detail = buildGoalUiErrorMessage(
-        copySource,
-        error instanceof Error ? error.message : null,
-        buildGoalChromeCopy(copySource).goalStatusRefreshFailedLabel
-      )
-      setGoalDrawerHealthError(detail)
-    } finally {
-      setGoalDrawerBusyAction(null)
-    }
-  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding, resolveGoalSurfaceCopySource])
-
-  const handleGoalDrawerResolveApproval = React.useCallback(async (
-    approvalId: string,
-    decision: 'approve_once' | 'reject'
-  ) => {
-    const goalId =
-      currentSessionGoalState.active_goal_id ??
-      currentSessionGoalState.last_goal_summary?.goal_id ??
-      null
-    setGoalDrawerResolvingApprovalKey(`${approvalId}:${decision}`)
-    setGoalDrawerApprovalError(null)
-    try {
-      await api.resolveApproval(approvalId, { decision })
-      if (goalId) {
-        await Promise.all([
-          refreshCurrentGoalBinding(goalId),
-          loadGoalDrawerContext(goalId),
-        ])
-      }
-    } catch (error) {
-      const copySource = resolveGoalSurfaceCopySource(
-        goalId,
-        currentSessionGoalState.last_goal_summary?.objective ?? null
-      )
-      const detail = buildGoalUiErrorMessage(
-        copySource,
-        error instanceof Error ? error.message : null,
-        buildGoalChromeCopy(copySource).approvalResolveFailedLabel
-      )
-      setGoalDrawerApprovalError(detail)
-    } finally {
-      setGoalDrawerResolvingApprovalKey(null)
-    }
-  }, [currentSessionGoalState.active_goal_id, currentSessionGoalState.last_goal_summary, loadGoalDrawerContext, refreshCurrentGoalBinding, resolveGoalSurfaceCopySource])
-
-  const runGoalDrawerCommand = React.useCallback(async (
-    action: 'status' | 'pause' | 'resume' | 'stop'
-  ) => {
-    const sessionId = currentSessionId
-    if (!sessionId) {
-      return
-    }
-    setGoalDrawerBusyAction(action)
-    try {
-      await handleSend(`/goal ${action}`, { forceSessionId: sessionId })
-    } finally {
-      setGoalDrawerBusyAction(null)
-    }
-  }, [currentSessionId, handleSend])
-
   const handleWorkflowPanelToggle = React.useCallback(() => {
     const nextOpen = !workflowPanelOpen
     closeRightPanels('workflow')
@@ -5887,7 +5656,7 @@ export default function ChatPage() {
     setAppearanceMode(isDarkAppearance ? 'light' : 'dark')
   }, [isDarkAppearance, setAppearanceMode])
 
-  const headerGoal = React.useMemo<GoalHeaderChipView | null>(() => {
+  const chatScopedGoal = React.useMemo(() => {
     if (currentSessionGoalState.pending_proposal) {
       return null
     }
@@ -5898,16 +5667,14 @@ export default function ChatPage() {
     }
 
     const status = (currentSessionGoalState.active_goal_status ?? summary.status ?? '').trim()
-    if (!status) {
+    const goalId = currentSessionGoalState.active_goal_id ?? summary.goal_id ?? null
+    if (!status || !goalId) {
       return null
     }
 
     const isCompleted = isGoalCompletedStatus(status)
     const isBlocked = isGoalBlockedStatus(status)
-    const hasTerminalIssue =
-      isGoalTerminalStatus(status) &&
-      !isCompleted
-
+    const hasTerminalIssue = isGoalTerminalStatus(status) && !isCompleted
     const isActiveGoalBound =
       currentSessionGoalState.active_goal_id !== null &&
       !isGoalTerminalStatus(status)
@@ -5916,134 +5683,132 @@ export default function ChatPage() {
       return null
     }
 
-    const goalId = currentSessionGoalState.active_goal_id ?? summary.goal_id ?? null
-    const copySource = resolveGoalSurfaceCopySource(goalId, summary.objective)
-
     return {
-      title: summary.objective,
       goalId,
+      snapshotGoalId: summary.goal_id,
+      title: summary.objective,
       status,
-      executionMode: summary.execution_mode,
-      copySource,
-      protocolId: summary.protocol_id,
-      modelCount: summary.models.length,
-      runtimeMode: summary.runtime_mode,
-      pendingApprovalCount: isCompleted ? pendingApprovalCount : goalSurfacePendingApprovalCount,
-      displayState:
-        isCompleted ? 'completed' : isBlocked ? 'blocked' : hasTerminalIssue ? 'failed' : 'active',
+      boundRunId: summary.bound_run_id,
     }
-  }, [currentSessionGoalState, goalSurfacePendingApprovalCount, pendingApprovalCount, resolveGoalSurfaceCopySource])
+  }, [currentSessionGoalState])
 
-  const goalSurfaceCopySource =
-    headerGoal?.copySource ??
-    resolveGoalSurfaceCopySource(
-      currentSessionGoalState.active_goal_id ?? currentSessionGoalState.last_goal_summary?.goal_id ?? null,
-      currentSessionGoalState.last_goal_summary?.objective ?? null
-    )
-
-  const goalDrawerBlocker = React.useMemo<GoalDrawerBlockerView | null>(() => {
-    if (!goalDrawerHealth) {
+  const goalDrawerModel = React.useMemo(() => {
+    if (!chatScopedGoal) {
       return null
     }
 
-    return {
-      summary:
-        getString(goalDrawerHealth.recommended_next_action?.summary) ?? null,
-      recommendedAction: getString(goalDrawerHealth.recommended_next_action?.action),
-      latestError: goalDrawerHealth.latest_error,
-      failure: goalDrawerHealth.failure,
-      approvalCount:
-        typeof goalDrawerHealth.approval_state?.pending_count === 'number' &&
-        Number.isFinite(goalDrawerHealth.approval_state.pending_count)
-          ? goalDrawerHealth.approval_state.pending_count
-          : getStringArray(goalDrawerHealth.approval_state?.approval_ids).length,
-      approvalIds: getStringArray(goalDrawerHealth.approval_state?.approval_ids),
-      approvalToolNames: getStringArray(goalDrawerHealth.approval_state?.tool_names),
-      blockedTools: goalDrawerHealth.operator_controls.blocked_tools,
-      blockedDomains: goalDrawerHealth.operator_controls.blocked_domains,
-      blockNetworkUsage: goalDrawerHealth.operator_controls.block_network_usage,
+    const status = mapGoalStatusToDrawerStatus(chatScopedGoal.status)
+    if (!status) {
+      return null
     }
-  }, [goalDrawerHealth])
 
-  const goalPendingApprovalIds = React.useMemo(
-    () =>
-      Array.from(
-        new Set([
-          ...pendingGoalApprovalIds,
-          ...(goalDrawerBlocker?.approvalIds ?? []),
-        ])
-      ),
-    [goalDrawerBlocker, pendingGoalApprovalIds]
-  )
+    return projectGoalDrawerState({
+      goalId: chatScopedGoal.goalId,
+      title: chatScopedGoal.title,
+      status,
+      hasLinkedAgentRun: Boolean(chatScopedGoal.boundRunId),
+    })
+  }, [chatScopedGoal])
 
-  const handleOpenGoalApprovals = React.useCallback(() => {
-    if (goalPendingApprovalIds.length > 0) {
-      handleOpenSubagentApprovals(goalPendingApprovalIds)
-      return
-    }
-    handleOpenTaskPanel()
-  }, [goalPendingApprovalIds, handleOpenSubagentApprovals, handleOpenTaskPanel])
+  const goalExecutionRecordTarget = React.useMemo(() => {
+    const selectedGoalId = chatScopedGoal?.goalId
+    const snapshotGoalId = chatScopedGoal?.snapshotGoalId
+    const boundRunId =
+      selectedGoalId && selectedGoalId === snapshotGoalId
+        ? chatScopedGoal?.boundRunId
+        : null
 
-  React.useEffect(() => {
-    if (!headerGoal) {
-      setGoalDrawerOpen(false)
-      setGoalDrawerHealth(null)
-      setGoalDrawerHealthLoading(false)
-      setGoalDrawerHealthError(null)
-      setGoalDrawerApprovals([])
-      setGoalDrawerApprovalsLoading(false)
-      setGoalDrawerApprovalError(null)
-      setGoalDrawerResolvingApprovalKey(null)
-    }
-  }, [headerGoal])
+    return resolveGoalExecutionRecordTarget({
+      selectedGoalId,
+      snapshotGoalId,
+      currentAttemptId: boundRunId ? 'session-bound-run' : null,
+      attempts: boundRunId
+        ? [{
+            goalId: snapshotGoalId ?? '',
+            attemptId: 'session-bound-run',
+            attemptIndex: 0,
+            agentRunId: boundRunId,
+          }]
+        : [],
+    })
+  }, [chatScopedGoal])
 
-  React.useEffect(() => {
-    if (!subagentDrawerOpen) {
-      setSubagentGuidance('')
-    }
-  }, [subagentDrawerOpen])
+  const clearedGoalPresentationId = currentSessionId
+    ? clearedGoalPresentationBySessionId[currentSessionId] ?? null
+    : null
+  const goalDrawerVisible =
+    Boolean(chatScopedGoal && goalDrawerModel) &&
+    clearedGoalPresentationId !== chatScopedGoal?.goalId
 
-  React.useEffect(() => {
-    const goalId = headerGoal?.goalId
-    if (!goalId) {
-      return
-    }
-    const needsGoalSurfaceContext =
-      goalDrawerOpen ||
-      headerGoal.displayState === 'blocked' ||
-      headerGoal.displayState === 'failed' ||
-      headerGoal.pendingApprovalCount > 0
-    if (!needsGoalSurfaceContext) {
+  const runGoalDrawerCommand = React.useCallback(async (
+    action: 'pause' | 'resume' | 'stop'
+  ) => {
+    const sessionId = currentSessionId
+    if (!sessionId || !chatScopedGoal?.goalId || goalDrawerActionInFlightRef.current) {
       return
     }
 
-    void loadGoalDrawerContext(goalId)
-  }, [goalDrawerOpen, headerGoal, loadGoalDrawerContext])
+    const requestId = ++goalDrawerActionRequestIdRef.current
+    goalDrawerActionInFlightRef.current = { requestId, sessionId }
+    setGoalDrawerBusyAction(action)
+    try {
+      await handleSend(`/goal ${action}`, { forceSessionId: sessionId })
+    } finally {
+      const activeRequest = goalDrawerActionInFlightRef.current
+      if (activeRequest?.requestId === requestId) {
+        goalDrawerActionInFlightRef.current = null
+      }
+      if (
+        goalDrawerActionRequestIdRef.current === requestId &&
+        goalDrawerSessionRef.current === sessionId
+      ) {
+        setGoalDrawerBusyAction(null)
+      }
+    }
+  }, [chatScopedGoal?.goalId, currentSessionId, handleSend])
 
-  const goalSurfaceCallout = React.useMemo(
-    () =>
-      headerGoal
-        ? buildGoalFocusCallout({
-            userMessage: goalSurfaceCopySource,
-            pendingApprovalCount: goalSurfacePendingApprovalCount,
-            blocker: goalDrawerBlocker,
-            errorMessage:
-              goalDrawerHealthError ??
-              goalDrawerApprovalError ??
-              (headerGoal.executionMode === 'workflow' ? workflowError : null),
-            goalDisplayState: headerGoal.displayState,
-          })
-        : null,
-    [
-      goalDrawerApprovalError,
-      goalDrawerBlocker,
-      goalDrawerHealthError,
-      goalSurfacePendingApprovalCount,
-      goalSurfaceCopySource,
-      headerGoal,
-      workflowError,
-    ]
-  )
+  const handleGoalDrawerSteer = React.useCallback(async (instruction: string) => {
+    const sessionId = currentSessionId
+    if (!sessionId || !chatScopedGoal?.goalId || goalDrawerActionInFlightRef.current) {
+      return
+    }
+
+    const requestId = ++goalDrawerActionRequestIdRef.current
+    goalDrawerActionInFlightRef.current = { requestId, sessionId }
+    setGoalDrawerBusyAction('steer')
+    try {
+      // A plain message for a bound Goal follows the existing continuation path in handleSend.
+      await handleSend(instruction, { forceSessionId: sessionId })
+    } finally {
+      const activeRequest = goalDrawerActionInFlightRef.current
+      if (activeRequest?.requestId === requestId) {
+        goalDrawerActionInFlightRef.current = null
+      }
+      if (
+        goalDrawerActionRequestIdRef.current === requestId &&
+        goalDrawerSessionRef.current === sessionId
+      ) {
+        setGoalDrawerBusyAction(null)
+      }
+    }
+  }, [chatScopedGoal?.goalId, currentSessionId, handleSend])
+
+  const handleClearGoalDrawer = React.useCallback(() => {
+    const sessionId = currentSessionId
+    const goalId = chatScopedGoal?.goalId
+    if (!sessionId || !goalId || goalDrawerSessionRef.current !== sessionId) {
+      return
+    }
+
+    setClearedGoalPresentationBySessionId((current) => ({
+      ...current,
+      [sessionId]: goalId,
+    }))
+  }, [chatScopedGoal?.goalId, currentSessionId])
+
+  const goalSurfaceCopySource = (
+    currentSessionGoalState.last_goal_summary?.objective ?? ''
+  ).trim()
 
   const handleActiveGoalDirectTurnDecision = React.useCallback(
     async ({
@@ -6215,10 +5980,7 @@ export default function ChatPage() {
             ...prev,
             {
               id: `error-${Date.now()}`,
-              type: 'error',
-              eventType: 'error',
-              content: t('chat.requestFailed'),
-              errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+              ...createClientBackendErrorMessage(error, t('chat.requestFailed')),
               timestamp: new Date(),
             },
           ])
@@ -6322,10 +6084,7 @@ export default function ChatPage() {
             ...prev,
             {
               id: `error-${Date.now()}`,
-              type: 'error',
-              eventType: 'error',
-              content: t('chat.requestFailed'),
-              errorCode: detail ?? 'CHAT_REQUEST_FAILED',
+              ...createClientBackendErrorMessage(error, t('chat.requestFailed')),
               timestamp: new Date(),
             },
           ])
@@ -6355,14 +6114,14 @@ export default function ChatPage() {
   }, [handleActiveGoalDirectTurnDecision])
 
   const footerRuntimeNotice =
-    !headerGoal && pendingApprovalCount > 0
+    !chatScopedGoal && pendingApprovalCount > 0
       ? {
           tone: 'warning' as const,
           message: buildGoalPendingApprovalNotice(goalSurfaceCopySource, pendingApprovalCount),
           actionLabel: buildGoalReviewApprovalsLabel(goalSurfaceCopySource),
           onAction: handleOpenTaskPanel,
         }
-      : !headerGoal && workflowError
+      : !chatScopedGoal && workflowError
         ? {
             tone: 'error' as const,
             message: workflowError,
@@ -6389,15 +6148,6 @@ export default function ChatPage() {
             {displaySessionTitle(currentSession?.title, t('chat.newChat'))}
           </h1>
           <div className="flex shrink-0 items-center gap-1">
-            {headerGoal ? (
-              <div className="mr-1 flex">
-                <GoalHeaderChip
-                  goal={headerGoal}
-                  open={goalDrawerOpen}
-                  onClick={handleGoalDrawerToggle}
-                />
-              </div>
-            ) : null}
             <div className="mr-2 hidden max-w-[220px] items-center gap-1.5 text-[11px] text-muted-foreground xl:flex">
               {isStreaming ? (
                 <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
@@ -6551,9 +6301,6 @@ export default function ChatPage() {
             <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); window.dispatchEvent(new CustomEvent('mochi:open-mobile-navigation', { detail: 'projects' })) }}>
               <FolderOpen className="h-4 w-4" /><span>Projects and chats</span>
             </button>
-            <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); router.push('/goals') }}>
-              <ListTodo className="h-4 w-4" /><span>Goals</span>
-            </button>
             <button type="button" role="menuitem" className="mochi-mobile-tool" onClick={() => { setMobileToolsOpen(false); router.push('/settings') }}>
               <Settings className="h-4 w-4" /><span>Settings</span>
             </button>
@@ -6580,56 +6327,6 @@ export default function ChatPage() {
             onClose={() => setWorkspacePanelOpen(false)}
           />
         </FloatingPanelShell>
-        {headerGoal ? (
-          <FloatingPanelShell
-            open={goalDrawerOpen}
-            onOpenChange={setGoalDrawerOpen}
-            desktopSide="right"
-            desktopWidthClass="w-[min(34vw,26rem)] min-w-[22rem] max-w-[30rem]"
-            desktopBreakpoint="lg"
-            mobileSide="right"
-            mobileClassName="w-[92vw] max-w-[92vw] p-0 sm:max-w-[28rem]"
-          >
-            <GoalDrawerContent
-              goal={headerGoal}
-              busyAction={goalDrawerBusyAction}
-              blocker={goalDrawerBlocker}
-              approvals={goalDrawerApprovals}
-              approvalLoading={goalDrawerHealthLoading || goalDrawerApprovalsLoading}
-              approvalError={goalDrawerHealthError ?? goalDrawerApprovalError}
-              resolvingApprovalKey={goalDrawerResolvingApprovalKey}
-              onRefresh={() => {
-                void handleGoalDrawerRefresh()
-              }}
-              onPause={
-                headerGoal.goalId
-                  ? () => {
-                      void runGoalDrawerCommand('pause')
-                    }
-                  : undefined
-              }
-              onResume={
-                headerGoal.goalId
-                  ? () => {
-                      void runGoalDrawerCommand('resume')
-                    }
-                  : undefined
-              }
-              onStop={
-                headerGoal.goalId
-                  ? () => {
-                      void runGoalDrawerCommand('stop')
-                    }
-                  : undefined
-              }
-              onResolveApproval={(approvalId, decision) => {
-                void handleGoalDrawerResolveApproval(approvalId, decision)
-              }}
-              onOpenConsole={() => router.push('/goals')}
-              onClose={() => setGoalDrawerOpen(false)}
-            />
-          </FloatingPanelShell>
-        ) : null}
         <SubagentDrawer
           open={subagentDrawerOpen}
           onOpenChange={setSubagentDrawerOpen}
@@ -6668,35 +6365,7 @@ export default function ChatPage() {
           <div ref={scrollRef} className="h-full overflow-y-auto">
             <div className="mx-auto flex w-full max-w-5xl flex-col px-4 py-8 sm:px-8 lg:py-10">
               <div className="space-y-7">
-                {headerGoal ? (
-                  <GoalFocusPanel
-                    goal={headerGoal}
-                    blocker={goalDrawerBlocker}
-                    callout={goalSurfaceCallout}
-                    failure={goalDrawerHealth?.failure ?? null}
-                    timelineEvents={goalSurfaceTimelineEvents}
-                    subagents={goalSurfaceSubagents}
-                    timelineError={executionTimelineError}
-                    activeSubagentId={activeSubagentId}
-                    expandedSubagentIds={expandedSubagentIds}
-                    onExpandedChange={(subagentId, expanded) => {
-                      setExpandedSubagentIds((current) => {
-                        const next = new Set(current)
-                        if (expanded) {
-                          next.add(subagentId)
-                        } else {
-                          next.delete(subagentId)
-                        }
-                        return next
-                      })
-                    }}
-                    onOpenSubagent={handleOpenSubagent}
-                    onReviewApprovals={handleOpenGoalApprovals}
-                    onOpenDetails={handleGoalDrawerToggle}
-                    onOpenConsole={() => router.push('/goals')}
-                  />
-                ) : null}
-                {!headerGoal && layoutShowsExecutionHighlights(goalConversationBodyLayout) ? (
+                {!chatScopedGoal && layoutShowsExecutionHighlights(goalConversationBodyLayout) ? (
                   <section className="space-y-4">
                     {executionTimelineError ? (
                       <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
@@ -6859,6 +6528,23 @@ export default function ChatPage() {
         </div>
       ) : null}
 
+      {goalDrawerVisible && goalDrawerModel ? (
+        <GoalComposerDrawer
+          busyAction={goalDrawerBusyAction}
+          executionRecord={goalExecutionRecordTarget}
+          model={goalDrawerModel}
+          onClear={handleClearGoalDrawer}
+          onOpenExecutionRecord={() => {
+            if (goalExecutionRecordTarget.kind === 'agent_run') {
+              router.push(goalExecutionRecordTarget.href)
+            }
+          }}
+          onPause={() => { void runGoalDrawerCommand('pause') }}
+          onResume={() => { void runGoalDrawerCommand('resume') }}
+          onSteer={(instruction) => { void handleGoalDrawerSteer(instruction) }}
+          onStop={() => { void runGoalDrawerCommand('stop') }}
+        />
+      ) : null}
       <ChatInput
         sessionId={currentSessionId}
         projectId={effectiveProjectId}

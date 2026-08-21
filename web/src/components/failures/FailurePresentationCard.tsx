@@ -2,7 +2,7 @@
 
 import { AlertCircle, AlertTriangle, Info } from 'lucide-react'
 import type { FailureEnvelopeInput, FailurePresentation } from '@/lib/failure-presentation'
-import { presentFailure } from '@/lib/failure-presentation'
+import { presentFailure, sanitizeFailureDetail } from '@/lib/failure-presentation'
 import { cn } from '@/lib/utils'
 
 const FALLBACK_PRESENTATION: FailurePresentation = {
@@ -21,12 +21,18 @@ const ACTION_LABELS: Record<string, string> = {
   resume: 'Resume',
 }
 
-function safePresentation(failure: FailureEnvelopeInput | null | undefined): FailurePresentation {
+function safePresentation(
+  failure: FailureEnvelopeInput | null | undefined,
+  detail: string | null | undefined
+): FailurePresentation {
   if (!failure) {
     return FALLBACK_PRESENTATION
   }
   try {
-    return presentFailure(failure)
+    const presentation = presentFailure(failure)
+    const safeDetail =
+      failure.kind === 'backend_error' ? sanitizeFailureDetail(detail) : null
+    return safeDetail ? { ...presentation, detail: safeDetail } : presentation
   } catch {
     return FALLBACK_PRESENTATION
   }
@@ -53,19 +59,21 @@ function ToneIcon({ tone }: { tone: FailurePresentation['tone'] }) {
 }
 
 /**
- * Renders only the versioned, user-safe failure presentation.  Raw error text
- * and diagnostics references deliberately never enter this component.
+ * Renders a versioned user-safe failure presentation. Backend error text may
+ * be shown only after credential redaction and length limiting.
  */
 export function FailurePresentationCard({
   failure,
+  detail,
   className,
   testId = 'failure-presentation',
 }: {
   failure: FailureEnvelopeInput | null | undefined
+  detail?: string | null
   className?: string
   testId?: string
 }) {
-  const presentation = safePresentation(failure)
+  const presentation = safePresentation(failure, detail)
   const kind = typeof failure?.kind === 'string' ? failure.kind : 'unknown'
 
   return (

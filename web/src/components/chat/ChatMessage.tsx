@@ -121,7 +121,7 @@ export function ChatMessage({
   if (type === 'error') {
     return (
       <div className="flex justify-start animate-slide-up">
-        <FailurePresentationCard failure={message.failure} className="max-w-[560px]" testId="chat-failure-presentation" />
+        <FailurePresentationCard failure={message.failure} detail={content} className="max-w-[560px]" testId="chat-failure-presentation" />
       </div>
     )
   }

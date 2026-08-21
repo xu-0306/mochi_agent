@@ -1,0 +1,12 @@
+{
+  "schema_name": "agent-foreman/gate-evidence",
+  "schema_version": "1.0",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "package_id": "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+  "gate_id": "GATE-EXECUTION-RECORD-TARGET",
+  "command": "rtk proxy node --experimental-strip-types tests/frontend/test_goal_execution_record_target.mjs",
+  "exit_code": 0,
+  "observed": "goal execution record target: 12 assertions passed",
+  "classification": "deterministic",
+  "status": "passed"
+}

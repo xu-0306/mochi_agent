@@ -1,0 +1,30 @@
+{
+  "schema_name": "agent-foreman/delta-guard",
+  "schema_version": "1.0",
+  "method": "audited-equivalent",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "package_id": "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+  "guard_delta_executed": false,
+  "non_execution_reason": "The retained pre-execution standalone dispatch fingerprint is unavailable; a whole-workspace native fingerprint is blocked by the pre-existing Windows-invalid ignored .tmp path.",
+  "exact_commands": [
+    "rtk git cat-file -e 1f08da287e96bcce4e75005ceedfaa0927f84b3d:<owned-path>",
+    "rtk proxy node --input-type=module -e <sha256 declared owned files>",
+    "rtk git status --short --untracked-files=all"
+  ],
+  "evidence_artifacts": [
+    "artifacts/goal-ui/dispatch-manifest-PKG-WORKER-02-GOAL-DRAWER-MODEL.json",
+    "artifacts/goal-ui/handoff-manifest-PKG-WORKER-02-GOAL-DRAWER-MODEL.json",
+    "artifacts/goal-ui/gate-goal-drawer-model.json"
+  ],
+  "owned_path_audit": {
+    "deterministic": true,
+    "attributed_worker_paths": [
+      "web/src/lib/goal-drawer-model.ts",
+      "tests/frontend/test_goal_drawer_model.mjs"
+    ],
+    "attributed_worker_out_of_scope_paths": []
+  },
+  "passed": true,
+  "result": "passed_audited_equivalent_only",
+  "not_a_claim": "This is not a successful execution of agent-foreman/scripts/guard_delta.py and does not establish integration."
+}

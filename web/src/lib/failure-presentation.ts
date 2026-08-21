@@ -1,4 +1,4 @@
-export const FAILURE_ENVELOPE_V1_KINDS = [
+﻿export const FAILURE_ENVELOPE_V1_KINDS = [
   'backend_error',
   'tool_error',
   'tool_denied',
@@ -60,6 +60,58 @@ const REDUCE_CONTEXT: readonly FailurePresentationAction[] = ['reduce_context']
 const RESUME: readonly FailurePresentationAction[] = ['resume']
 const NO_ACTIONS: readonly FailurePresentationAction[] = []
 
+const MAX_FAILURE_DETAIL_CHARS = 1_200
+
+const CLIENT_BACKEND_FAILURE: FailureEnvelopeInput = Object.freeze({
+  schema_version: '1.0',
+  kind: 'backend_error',
+  origin: 'backend',
+  recoverability: 'manual_retry',
+  retry_policy: 'manual',
+  terminal: true,
+  inject_into_model_context: false,
+  telemetry_key: 'failure.backend_error',
+  ui_hint: 'retry',
+  diagnostics_ref: null,
+})
+
+export function createClientBackendFailure(): FailureEnvelopeInput {
+  return CLIENT_BACKEND_FAILURE
+}
+
+/**
+ * Retain actionable backend details without rendering credentials, URL query
+ * secrets, or unbounded upstream response bodies in the chat timeline.
+ */
+export function sanitizeFailureDetail(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  let detail = value.replace(/\u0000/g, '').trim()
+  if (!detail) {
+    return null
+  }
+
+  detail = detail
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{8,}/gi, 'Bearer [REDACTED]')
+    .replace(
+      /\b(api[_-]?key|token|secret|password|authorization)\s*([:=])\s*([^\s,;"'}\]]+)/gi,
+      '$1$2 [REDACTED]'
+    )
+    .replace(
+      /([?&](?:api[_-]?key|token|secret|password|key)=)[^&#\s]+/gi,
+      '$1[REDACTED]'
+    )
+    .replace(
+      /(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi,
+      '$1[REDACTED]@'
+    )
+
+  return detail.length > MAX_FAILURE_DETAIL_CHARS
+    ? detail.slice(0, MAX_FAILURE_DETAIL_CHARS - 1).trimEnd() + '…'
+    : detail
+}
 const PRESENTATIONS: Readonly<Record<FailureEnvelopeV1Kind, FailurePresentation>> = {
   backend_error: {
     tone: 'error',

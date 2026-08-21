@@ -1,0 +1,1 @@
+{"schema_name":"agent-foreman/gate-evidence","schema_version":"1.0","gate_id":"GATE-PYTHON-GOAL-API","timestamp":"2026-08-20T19:38:43.2534715+08:00","command":"rtk pytest -q tests/integration/api/goals tests/test_goal_copy.py","exit_code":0,"observed_result":"Pytest: 152 passed","source_aggregate_artifact":"artifacts/goal-ui/terra-final-gates/2026-08-20-aggregate-gates.json"}

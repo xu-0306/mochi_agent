@@ -25,32 +25,6 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode
 }>) {
-  const themeBootstrapScript = `
-    try {
-      var storageKey = 'mochi.ui.preferences.v1';
-      var raw = window.localStorage.getItem(storageKey);
-      var parsed = raw ? JSON.parse(raw) : null;
-      var mode = parsed && typeof parsed === 'object'
-        ? (parsed.appearanceMode ?? parsed.appearance_mode ?? parsed.appearance ?? parsed.theme ?? parsed.colorScheme)
-        : null;
-      var theme = mode === 'dark' || mode === 'light'
-        ? mode
-        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-      var codeTheme = parsed && typeof parsed === 'object'
-        ? (parsed.codeTheme ?? parsed.code_theme ?? parsed.syntaxTheme)
-        : null;
-      if (typeof codeTheme !== 'string' || !codeTheme) {
-        codeTheme = 'vscode-dark-plus';
-      }
-      document.documentElement.dataset.theme = theme;
-      document.documentElement.dataset.codeTheme = codeTheme;
-      document.documentElement.style.colorScheme = theme;
-      var metaTheme = document.querySelector('meta[name="theme-color"]');
-      if (metaTheme) {
-        metaTheme.setAttribute('content', theme === 'dark' ? '#0B0B0F' : '#FBFBFC');
-      }
-    } catch {}
-  `
   const serviceWorkerCleanupScript = process.env.NODE_ENV !== 'production'
     ? `
       try {
@@ -81,15 +55,10 @@ export default function RootLayout({
       lang="en"
       data-theme="light"
       data-code-theme="vscode-dark-plus"
-      suppressHydrationWarning
     >
       <body
         className="h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
-        suppressHydrationWarning
       >
-        <Script id="mochi-theme-bootstrap" strategy="beforeInteractive">
-          {themeBootstrapScript}
-        </Script>
         {serviceWorkerCleanupScript ? (
           <Script id="mochi-dev-service-worker-cleanup" strategy="beforeInteractive">
             {serviceWorkerCleanupScript}

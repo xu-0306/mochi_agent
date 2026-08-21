@@ -900,6 +900,107 @@ def test_models_configured_patch_updates_remote_entry_without_leaking_api_key() 
     assert "sk-new-secret" not in response.text
     assert "sk-old-secret" not in response.text
 
+
+def test_models_configured_patch_switches_runtime_when_editing_active_remote_entry() -> None:
+    """Editing the active saved model must update the live backend selection."""
+    config = MochiConfig.model_validate(
+        {
+            "model": "https://cdn.coderelay.cn/v1",
+            "openai_compat": {
+                "provider": "openai_compat",
+                "base_url": "https://cdn.coderelay.cn/v1",
+                "model": "gpt-5.6-luna",
+                "api_key": "sk-active-secret",
+            },
+            "model_setup": {
+                "configured_models": [
+                    {
+                        "id": "openai_compat:https://cdn.coderelay.cn/v1:gpt-5.6-luna",
+                        "provider": "openai_compat",
+                        "model": "gpt-5.6-luna",
+                        "model_spec": "https://cdn.coderelay.cn/v1",
+                        "base_url": "https://cdn.coderelay.cn/v1",
+                        "label": "gpt-5.6-luna (openai_compat)",
+                        "backend_type": "openai_compat",
+                        "api_key": "sk-active-secret",
+                    }
+                ]
+            },
+        }
+    )
+    app, engine = _build_app()
+    app.state.config_factory = lambda: config
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/v1/models/configured/openai_compat%3Ahttps%3A%2F%2Fcdn.coderelay.cn%2Fv1%3Agpt-5.6-luna",
+            json={
+                "provider": "openai_compat",
+                "model": "gpt-5.6-terra",
+                "model_spec": "https://cdn.coderelay.cn/v1",
+                "base_url": "https://cdn.coderelay.cn/v1",
+                "persist": False,
+            },
+        )
+        status = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert engine.openai_switch_calls == [
+        ("https://cdn.coderelay.cn/v1", "gpt-5.6-terra", "sk-active-secret", "openai_compat")
+    ]
+    assert status.status_code == 200
+    assert status.json()["active_model"]["name"] == "gpt-5.6-terra"
+
+
+def test_models_switch_repairs_stale_runtime_endpoint_for_active_remote_entry() -> None:
+    """Switching the configured active id must repair a stale live backend endpoint."""
+    config = MochiConfig.model_validate(
+        {
+            "model": "https://cdn.coderelay.cn/v1",
+            "openai_compat": {
+                "provider": "openai_compat",
+                "base_url": "https://cdn.coderelay.cn/v1",
+                "model": "gpt-5.6-terra",
+                "api_key": "sk-active-secret",
+            },
+            "model_setup": {
+                "configured_models": [
+                    {
+                        "id": "openai_compat:https://cdn.coderelay.cn/v1:gpt-5.6-terra",
+                        "provider": "openai_compat",
+                        "model": "gpt-5.6-terra",
+                        "model_spec": "https://cdn.coderelay.cn/v1",
+                        "base_url": "https://cdn.coderelay.cn/v1",
+                        "label": "gpt-5.6-terra (openai_compat)",
+                        "backend_type": "openai_compat",
+                        "api_key": "sk-active-secret",
+                    }
+                ]
+            },
+        }
+    )
+    app, engine = _build_app()
+    app.state.config_factory = lambda: config
+    engine.model_info = ModelInfo(
+        name="gpt-5.6-terra",
+        provider="openai_compat",
+        backend_type="openai_compat",
+        metadata={"base_url": "https://stale.coderelay.cn/v1"},
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/models/switch",
+            json={
+                "model": "openai_compat:https://cdn.coderelay.cn/v1:gpt-5.6-terra"
+            },
+        )
+
+    assert response.status_code == 200
+    assert engine.openai_switch_calls == [
+        ("https://cdn.coderelay.cn/v1", "gpt-5.6-terra", "sk-active-secret", "openai_compat")
+    ]
+
 def test_models_configured_patch_updates_local_entry_path(tmp_path: Path) -> None:
     """`PATCH /v1/models/configured/{id}` 應可更新 local entry 路徑。"""
     first = tmp_path / "first.gguf"

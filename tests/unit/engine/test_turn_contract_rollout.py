@@ -19,6 +19,7 @@ from mochi.agents.conversation_state_store import TurnCheckpoint
 from mochi.agents.engine import AgentEngine
 from mochi.agents.events import (
     AgentEvent,
+    ErrorEvent,
     FinalAnswerEvent,
     StatusEvent,
     ToolCallRequestEvent,
@@ -79,6 +80,20 @@ class _UnavailableInterpreter:
             },
         )
 
+class _ForbiddenInterpreter:
+    async def interpret(
+        self,
+        context: BoundedConversationContext,
+    ) -> IntentInterpretation:
+        del context
+        raise BackendRequestError(
+            'OpenAI-compatible API error 403: {"error":{"message":"This API key is not allowed to use any enabled OpenAI provider."}}',
+            metadata={
+                "backend_name": "openai_compat",
+                "status_code": 403,
+                "model": "gpt-5.6-luna",
+            },
+        )
 
 def _config(tmp_path: Path, *, mode: str) -> MochiConfig:
     return MochiConfig.model_validate(
@@ -2303,3 +2318,39 @@ def test_recovery_operation_selects_only_unique_failed_target() -> None:
         preferred_targets=("report.md",),
     )
     assert selected is None and error == "timeline_operation_evidence_ambiguous"
+
+@pytest.mark.asyncio
+async def test_interpreter_access_denial_emits_a_backend_error_event(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(metadata={"effective_context_length": 32768})
+    engine = AgentEngine(
+        _config(tmp_path, mode="enforce"),
+        conversation_resolver_factory=lambda _: ConversationResolver(
+            interpreter=_ForbiddenInterpreter()
+        ),
+    )
+    await _bind_backend(engine, backend)
+
+    try:
+        result = await engine._invoke_shared_runtime(  # noqa: SLF001
+            AgentInvocationRequest(
+                message="Look up the current weather.",
+                session_id="provider-access-denied",
+                turn_id="provider-access-denied-turn",
+                tool_mode="auto",
+                execution_profile="chat",
+                persist_session=False,
+                persist_turn_events=False,
+                persist_learning=False,
+            )
+        )
+    finally:
+        await engine.close()
+
+    assert result.diagnostics.fallback_reason == "turn_contract_interpreter_backend_error"
+    assert result.content.startswith("OpenAI-compatible API error 403:")
+    assert len(result.events) == 1
+    assert isinstance(result.events[0], ErrorEvent)
+    assert result.events[0].failure is not None
+    assert result.events[0].failure.kind == "backend_error"

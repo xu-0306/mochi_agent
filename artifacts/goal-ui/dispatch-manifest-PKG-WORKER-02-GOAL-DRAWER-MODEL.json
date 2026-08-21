@@ -1,0 +1,51 @@
+{
+  "schema_name": "agent-foreman/fingerprint",
+  "schema_version": "1.0",
+  "stage": "dispatch",
+  "method": "audited-equivalent-post-hoc",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "package_id": "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+  "repo_root": "H:/_python/agent_mochi",
+  "baseline_commit": "1f08da287e96bcce4e75005ceedfaa0927f84b3d",
+  "path_policy": {
+    "owned": [
+      "web/src/lib/goal-drawer-model.ts",
+      "tests/frontend/test_goal_drawer_model.mjs"
+    ],
+    "prohibited": "all other paths for worker attribution",
+    "read_first": "as frozen in the canonical package"
+  },
+  "baseline_evidence": {
+    "command": "rtk git cat-file -e 1f08da287e96bcce4e75005ceedfaa0927f84b3d:<owned-path>",
+    "results": [
+      {
+        "path": "web/src/lib/goal-drawer-model.ts",
+        "exit_code": 128,
+        "observed": "exists on disk, but not in baseline commit",
+        "baseline_status": "absent"
+      },
+      {
+        "path": "tests/frontend/test_goal_drawer_model.mjs",
+        "exit_code": 128,
+        "observed": "exists on disk, but not in baseline commit",
+        "baseline_status": "absent"
+      }
+    ]
+  },
+  "current_files": [
+    {
+      "path": "web/src/lib/goal-drawer-model.ts",
+      "git_status": "untracked_added",
+      "sha256": "efd257bf612d2d63f0345a3abdc1ac601e6c83727f08ecf51821f008c7ff294f"
+    },
+    {
+      "path": "tests/frontend/test_goal_drawer_model.mjs",
+      "git_status": "untracked_added",
+      "sha256": "0c3823093bfa31241fb4e47b13180db3da028a7e33dae3091d9211f7eb55748a"
+    }
+  ],
+  "limitations": [
+    "No retained pre-execution standalone dispatch fingerprint exists for PKG-WORKER-02; this artifact is a disclosed post-hoc reconstruction, not proof of pre-dispatch state.",
+    "A whole-workspace native fingerprint is blocked by a pre-existing Windows-invalid ignored .tmp path; coverage is therefore audited-equivalent over the declared worker-owned paths and Git-visible status."
+  ]
+}

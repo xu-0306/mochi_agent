@@ -29,6 +29,8 @@
     "test:goal-execution-timeline-projection": "node --experimental-strip-types ./scripts/test-goal-execution-timeline-projection.mjs",
     "test:goal-focus-surface": "node --experimental-strip-types ./src/lib/goal-focus-surface.test.ts",
     "test:goal-live-browser-evidence": "node ./scripts/run-browser-fixture.mjs ./scripts/test-goal-live-browser-evidence.mjs .next-fixture-goal-live",
+    "test:goal-drawer-browser-evidence": "node ./scripts/run-browser-fixture.mjs ./scripts/test-goal-drawer-browser-evidence.mjs .next-fixture-goal-drawer",
+    "test:hydration-no-mismatch": "node ./scripts/run-browser-fixture.mjs ./scripts/test-hydration-no-mismatch.mjs .next-fixture-hydration",
     "test:chat-send-contract": "node --experimental-strip-types ./scripts/test-chat-send-contract.mjs",
     "test:current-model-selection": "node --experimental-strip-types ./scripts/test-current-model-selection.mjs",
     "test:goal-proposal-models": "node --experimental-strip-types ./scripts/test-goal-proposal-models.mjs",

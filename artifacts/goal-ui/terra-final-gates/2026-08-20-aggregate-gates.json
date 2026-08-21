@@ -1,0 +1,65 @@
+{
+  "artifact_type": "goal-ui/terra-final-gates",
+  "timestamp": "2026-08-20T19:35:00+08:00",
+  "executor": "terra_final_gate_runner",
+  "status": "implemented",
+  "scope": "Read-only production/config/test gate execution. This artifact is the only file created by this runner.",
+  "canonical_plan": "docs/architecture/2026-08-20-chat-scoped-goal-ui-subagent-execution-plan.json",
+  "preflight": {
+    "canonical_plan_status_observed": "frozen",
+    "live_browser_unused_helpers": [
+      {
+        "path": "web/scripts/test-goal-live-browser-evidence.mjs",
+        "symbols": ["readTimelineRowKeys", "assertTimelineRows"],
+        "finding": "Both helpers remain declared but have no observed call sites. Report-only; no edit made."
+      }
+    ],
+    "tsconfig_fixture_residue": {
+      "path": "web/tsconfig.json",
+      "observed_before_browser_runs": [
+        ".next-fixture-hydration/types/**/*.ts",
+        ".next-fixture-hydration/dev/types/**/*.ts",
+        ".next-fixture-goal-drawer/types/**/*.ts",
+        ".next-fixture-goal-drawer/dev/types/**/*.ts"
+      ],
+      "observed_after_browser_runs": [
+        ".next-fixture-hydration/types/**/*.ts",
+        ".next-fixture-hydration/dev/types/**/*.ts",
+        ".next-fixture-goal-drawer/types/**/*.ts",
+        ".next-fixture-goal-drawer/dev/types/**/*.ts"
+      ],
+      "delta_from_this_runner": "No observed change: the four entries were present before and after. `rtk git diff -- web/tsconfig.json` still reports these four fixture lines as pre-existing worktree changes against HEAD; not modified or cleaned by this runner."
+    }
+  },
+  "command_name_mismatch": {
+    "requested_aliases": [
+      "rtk npm --prefix web run test:goal-drawer-browser",
+      "rtk npm --prefix web run test:goal-live-browser"
+    ],
+    "exit_code": 1,
+    "observed_output": "npm error Missing script for each alias. web/package.json instead exposes test:goal-drawer-browser-evidence and test:goal-live-browser-evidence.",
+    "disposition": "Malformed brief command names, not a product failure. Equivalent package scripts were run and passed. No package.json edit made."
+  },
+  "gates": [
+    {"command": "rtk proxy node --experimental-strip-types tests/frontend/test_goal_drawer_model.mjs", "exit_code": 0, "observed_output": "goal drawer model: 21 assertions passed"},
+    {"command": "rtk proxy node --experimental-strip-types tests/frontend/test_goal_execution_record_target.mjs", "exit_code": 0, "observed_output": "goal execution record target: 12 assertions passed"},
+    {"command": "rtk proxy node --experimental-strip-types tests/frontend/test_agent_run_route_id.mjs", "exit_code": 0, "observed_output": "agent run route id: 6 assertions passed"},
+    {"command": "rtk npm --prefix web run type-check", "exit_code": 0, "observed_output": "tsc --noEmit passed"},
+    {"command": "rtk npm --prefix web run lint", "exit_code": 0, "observed_output": "0 errors; 2 warnings: legacy-goal-card-projection.ts _legacyGoalCard and session-materialization.test.ts draftOverride are unused"},
+    {"command": "rtk npm --prefix web run test:chat-goal-routing", "exit_code": 0, "observed_output": "ok"},
+    {"command": "rtk npm --prefix web run test:chat-goal-workflow-routing", "exit_code": 0, "observed_output": "ok"},
+    {"command": "rtk npm --prefix web run test:chat-active-goal-turn-decision", "exit_code": 0, "observed_output": "ok"},
+    {"command": "rtk npm --prefix web run test:goal-execution-timeline-projection", "exit_code": 0, "observed_output": "goal execution timeline projection assertions passed"},
+    {"command": "rtk npm --prefix web run test:goal-drawer-browser-evidence", "exit_code": 0, "observed_output": "ok=true; oneComposerDrawer, legacyGoalUiAbsent, lifecycleRequestsNonDestructive, clearPreservesHistory, encodedDirectExecutionRecord, delayedSessionIsolation, goalsRedirect, consoleClean all true", "produced_artifact": "artifacts/goal-ui/goal-drawer-browser-evidence.json"},
+    {"command": "rtk npm --prefix web run test:goal-live-browser-evidence", "exit_code": 0, "observed_output": "ok=true; composer drawer visible, legacy timeline absent, execution record durable timeline, no empty assistant cards, stream/poll/reload dedupe stable; expectedEventCards=5", "produced_artifact": "artifacts/goal-ui/goal-live-browser-evidence.json"},
+    {"command": "rtk npm --prefix web run test:hydration-no-mismatch", "exit_code": 0, "observed_output": "ok=true; 8 clean/persisted first-navigation-and-reload scenarios across /, /agent-runs, encoded AgentRun detail, and /goals redirect; no warning/error/hydration messages", "produced_artifact": "artifacts/goal-ui/hydration-no-mismatch.json"},
+    {"command": "rtk pytest -q tests/integration/api/goals tests/test_goal_copy.py", "exit_code": 0, "observed_output": "Pytest: 152 passed"},
+    {"command": "rtk git diff --check", "exit_code": 0, "observed_output": "no whitespace errors"}
+  ],
+  "result": {
+    "implemented": true,
+    "integrated": false,
+    "verified": false,
+    "next_action": "Main may clean the pre-existing fixture entries from web/tsconfig.json, remove the two unused live-browser helpers, then update plan/integration records; those mutations were explicitly out of scope for this runner."
+  }
+}

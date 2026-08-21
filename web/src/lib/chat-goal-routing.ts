@@ -79,6 +79,39 @@ export function parseGoalCommand(value: string): GoalCommand | null {
   }
 }
 
+export function parseNaturalLanguageGoalActivation(
+  value: string
+): Pick<GoalCommand, 'content' | 'raw'> | null {
+  const raw = value.trim()
+  if (!raw || raw.startsWith('/')) {
+    return null
+  }
+
+  const englishMatch = raw.match(
+    /^(?:please\s+)?(?:create|start|set|activate)\s+(?:a\s+)?goal(?:\s*(?::|-|for)\s*|\s+to\s+)(.+)$/i
+  )
+  if (englishMatch?.[1]?.trim()) {
+    return { content: englishMatch[1].trim(), raw }
+  }
+
+  const traditionalChineseMatch = raw.match(
+    /^(?:\u8acb\s*)?(?:\u5efa\u7acb|\u555f\u52d5|\u8a2d\u5b9a|\u958b\u59cb)\s*(?:\u4e00\u500b\s*)?(?:goal|\u76ee\u6a19)\s*(?:\u70ba|\u662f|\uff1a|:)?\s*(.+)$/i
+  )
+  if (traditionalChineseMatch?.[1]?.trim()) {
+    return { content: traditionalChineseMatch[1].trim(), raw }
+  }
+
+  // Existing routing tests already recognize an English, explicitly time-bounded
+  // research/background-work request as a durable task intent.
+  if (
+    /^(?:research|investigate)\b[\s\S]*\bfor\s+(?:the\s+next\s+)?\d+\s+(?:minutes?|hours?)\b/i.test(raw) ||
+    /^keep\s+working\b[\s\S]*\bin\s+the\s+background\b[\s\S]*\bfor\s+(?:the\s+next\s+)?\d+\s+(?:minutes?|hours?)\b/i.test(raw)
+  ) {
+    return { content: raw, raw }
+  }
+
+  return null
+}
 export function isPlainGreeting(value: string): boolean {
   const normalized = value.trim().toLowerCase().replace(/[\s!\uFF01.\u3002?\uFF1F,\uFF0C~\uFF5E]+/g, '')
   return ['hi', 'hello', 'hey', '\u4f60\u597d', '\u60a8\u597d', '\u55e8'].includes(normalized)
@@ -88,12 +121,13 @@ export function resolveChatGoalWorkflowRouting(
 ): ChatGoalWorkflowRoutingDecision {
   const modeCommand = parseChatModeCommand(input.text)
   const goalCommand = parseGoalCommand(input.text)
+  const naturalGoalActivation = modeCommand ? null : parseNaturalLanguageGoalActivation(input.text)
   const requestText =
     modeCommand
       ? modeCommand.content
       : goalCommand?.action === 'proposal'
         ? goalCommand.content
-        : input.text
+        : naturalGoalActivation?.content ?? input.text
   const workflowModeRequested = modeCommand?.mode === 'workflow'
   const workflowProposalRequested = workflowModeRequested && requestText.length > 0
   const pendingProposalFollowUpRequested =
@@ -136,6 +170,12 @@ export function resolveChatGoalWorkflowRouting(
       kind: 'goal_proposal',
       content: goalCommand.content,
       raw: goalCommand.raw,
+    }
+  } else if (naturalGoalActivation) {
+    route = {
+      kind: 'goal_proposal',
+      content: naturalGoalActivation.content,
+      raw: naturalGoalActivation.raw,
     }
   } else if (pendingProposalFollowUpRequested) {
     route = {

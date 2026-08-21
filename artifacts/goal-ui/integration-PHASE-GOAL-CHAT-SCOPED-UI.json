@@ -1,0 +1,50 @@
+{
+    "schema_name":  "agent-foreman/integration",
+    "schema_version":  "1.0",
+    "profile":  "full",
+    "plan_id":  "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+    "phase_id":  "PHASE-GOAL-CHAT-SCOPED-UI",
+    "actor_role":  "main",
+    "timestamp":  "2026-08-20T19:59:21.4795845+08:00",
+    "packages":  [
+                     "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+                     "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+                     "PKG-MAIN-04-GOAL-UI-HYDRATION-INTEGRATION"
+                 ],
+    "delta_guard":  {
+                        "passed":  true,
+                        "method":  "audited-equivalent worker guards plus Main affected-subgraph ownership replan",
+                        "artifacts":  [
+                                          "artifacts/goal-ui/delta-guard-PKG-WORKER-02-GOAL-DRAWER-MODEL.json",
+                                          "artifacts/goal-ui/delta-guard-PKG-WORKER-03-EXECUTION-RECORD-TARGET.json",
+                                          "artifacts/goal-ui/replan-main-04-scope-delta.json"
+                                      ]
+                    },
+    "focused_gates":  [
+                          "GATE-GOAL-DRAWER-MODEL",
+                          "GATE-EXECUTION-RECORD-TARGET",
+                          "GATE-AGENT-RUN-ROUTE-ID"
+                      ],
+    "aggregate_gates":  [
+                            "GATE-FRONTEND-TYPECHECK",
+                            "GATE-FRONTEND-LINT",
+                            "GATE-CHAT-GOAL-ROUTING",
+                            "GATE-CHAT-GOAL-WORKFLOW-ROUTING",
+                            "GATE-GOAL-CONTINUATION",
+                            "GATE-GOAL-TIMELINE",
+                            "GATE-GOAL-LIVE-BROWSER",
+                            "GATE-GOAL-DRAWER-BROWSER",
+                            "GATE-HYDRATION-RUNTIME",
+                            "GATE-PYTHON-GOAL-API",
+                            "GATE-DIFF-CHECK"
+                        ],
+    "deterministic_result":  "passed",
+    "evaluator_recommendation":  "pass",
+    "evaluator_artifact":  "artifacts/goal-ui/evaluation-goal-ui-fresh-recheck.json",
+    "status":  "integrated",
+    "rework":  {
+                   "worker_changed_lines":  428,
+                   "main_changed_lines_in_worker_scope":  0,
+                   "rework_ratio":  0
+               }
+}

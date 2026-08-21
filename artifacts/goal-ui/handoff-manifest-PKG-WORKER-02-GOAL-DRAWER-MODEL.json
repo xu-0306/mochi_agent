@@ -1,0 +1,33 @@
+{
+  "schema_name": "agent-foreman/fingerprint",
+  "schema_version": "1.0",
+  "stage": "handoff",
+  "method": "audited-equivalent",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "package_id": "PKG-WORKER-02-GOAL-DRAWER-MODEL",
+  "baseline_commit": "1f08da287e96bcce4e75005ceedfaa0927f84b3d",
+  "owned_path_audit": {
+    "deterministic": true,
+    "baseline_absent_paths": [
+      "web/src/lib/goal-drawer-model.ts",
+      "tests/frontend/test_goal_drawer_model.mjs"
+    ],
+    "current_added_paths": [
+      {
+        "path": "web/src/lib/goal-drawer-model.ts",
+        "sha256": "efd257bf612d2d63f0345a3abdc1ac601e6c83727f08ecf51821f008c7ff294f"
+      },
+      {
+        "path": "tests/frontend/test_goal_drawer_model.mjs",
+        "sha256": "0c3823093bfa31241fb4e47b13180db3da028a7e33dae3091d9211f7eb55748a"
+      }
+    ],
+    "attributed_worker_out_of_scope_paths": []
+  },
+  "evidence": {
+    "baseline_command": "rtk git cat-file -e 1f08da287e96bcce4e75005ceedfaa0927f84b3d:<owned-path>",
+    "current_hash_command": "rtk proxy node --input-type=module -e <sha256 declared owned files>",
+    "git_status_command": "rtk git status --short --untracked-files=all"
+  },
+  "limitations": "Post-hoc audited-equivalent handoff; whole-workspace native fingerprint is blocked by the pre-existing Windows-invalid ignored .tmp path."
+}

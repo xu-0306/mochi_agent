@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 
 import { formatChatErrorDiagnostics } from './chat-error-display.ts'
+import { sanitizeFailureDetail } from './failure-presentation.ts'
 
 assert.equal(
   formatChatErrorDiagnostics('MODEL_PROVIDER_ACCESS_DENIED', {
@@ -25,4 +26,11 @@ assert.equal(
   undefined
 )
 
+const serverError = "Server error '503 Service Unavailable' for url 'https://cdn.coderelay.cn/v1/chat/completions'"
+assert.equal(sanitizeFailureDetail(serverError), serverError)
+
+assert.equal(
+  sanitizeFailureDetail('OpenAI-compatible API error 403: Bearer secret-value'),
+  'OpenAI-compatible API error 403: Bearer [REDACTED]'
+)
 console.log('ok')

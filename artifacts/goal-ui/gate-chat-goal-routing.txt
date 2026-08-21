@@ -1,0 +1,1 @@
+{"schema_name":"agent-foreman/gate-evidence","schema_version":"1.0","gate_id":"GATE-CHAT-GOAL-ROUTING","timestamp":"2026-08-20T19:38:43.2534715+08:00","command":"rtk npm --prefix web run test:chat-goal-routing","exit_code":0,"observed_result":"ok","source_aggregate_artifact":"artifacts/goal-ui/terra-final-gates/2026-08-20-aggregate-gates.json"}

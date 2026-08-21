@@ -1,0 +1,33 @@
+{
+  "schema_name": "agent-foreman/fingerprint",
+  "schema_version": "1.0",
+  "stage": "handoff",
+  "method": "audited-equivalent",
+  "plan_id": "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+  "package_id": "PKG-WORKER-03-EXECUTION-RECORD-TARGET",
+  "baseline_commit": "1f08da287e96bcce4e75005ceedfaa0927f84b3d",
+  "owned_path_audit": {
+    "deterministic": true,
+    "baseline_absent_paths": [
+      "web/src/lib/goal-execution-record-target.ts",
+      "tests/frontend/test_goal_execution_record_target.mjs"
+    ],
+    "current_added_paths": [
+      {
+        "path": "web/src/lib/goal-execution-record-target.ts",
+        "sha256": "3418bfea23428a1872cda554d65cec9144f17e7d5392d9feed35e5eb130e20bc"
+      },
+      {
+        "path": "tests/frontend/test_goal_execution_record_target.mjs",
+        "sha256": "2a19b754a064d2cff73b41f47c421856785a46d386e60f6021545388adf90f0d"
+      }
+    ],
+    "attributed_worker_out_of_scope_paths": []
+  },
+  "evidence": {
+    "baseline_command": "rtk git cat-file -e 1f08da287e96bcce4e75005ceedfaa0927f84b3d:<owned-path>",
+    "current_hash_command": "rtk proxy node --input-type=module -e <sha256 declared owned files>",
+    "git_status_command": "rtk git status --short --untracked-files=all"
+  },
+  "limitations": "Audited-equivalent ownership evidence; whole-workspace native fingerprint is blocked by the pre-existing Windows-invalid ignored .tmp path."
+}

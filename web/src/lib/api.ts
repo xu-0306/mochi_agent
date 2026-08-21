@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Mochi FastAPI client.
  * Most requests use relative /v1/* paths and rely on Next.js rewrites in development.
  * Long-running local model operations can bypass the dev proxy and hit the backend directly.
@@ -13,7 +13,8 @@ import type {
   TokenStats,
 } from '@/lib/chat'
 import { formatChatErrorDiagnostics } from '@/lib/chat-error-display'
-import { presentFailure, type FailureEnvelopeInput } from '@/lib/failure-presentation'
+import { createClientBackendFailure, type FailureEnvelopeInput } from '@/lib/failure-presentation'
+import { createTimelineErrorMessage, getErrorEventContent } from '@/lib/chat-error-projection'
 import { decodeSseJsonFrames, normalizeAdaptiveRuntimeEnvelope } from './ordinary-chat-runtime-stream'
 import {
   normalizeToolExposureDiagnostics,
@@ -806,7 +807,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
     return {
       kind: 'turn_event',
       phase,
-      content: getPayloadContent(payload),
+      content: phase === 'error' ? getErrorEventContent(payload) : getPayloadContent(payload),
       timestamp,
       turnKey,
       toolCallId: getString(payload.call_id) ?? getString(payload.toolCallId) ?? undefined,
@@ -827,7 +828,10 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getPayloadNumber(payload, 'output_tokens', 'outputTokens'),
       generationTimeMs: getPayloadNumber(payload, 'generation_time_ms', 'generationTimeMs'),
       finishReason,
-      failure: normalizeFailureEnvelope(payload.failure) ?? normalizeFailureEnvelope(event.failure),
+      failure:
+        normalizeFailureEnvelope(payload.failure) ??
+        normalizeFailureEnvelope(event.failure) ??
+        (phase === 'error' ? createClientBackendFailure() : undefined),
     }
   }
 
@@ -859,11 +863,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
     return {
       kind: 'turn_event',
       phase: type,
-      content:
-        getNonEmptyString(event.content) ??
-        (type === 'error'
-          ? getNonEmptyString(event.error) ?? getNonEmptyString(event.message) ?? ''
-          : ''),
+      content: type === 'error' ? getErrorEventContent(event) : getNonEmptyString(event.content) ?? '',
       timestamp,
       turnKey,
       toolCallId: getString(event.call_id) ?? undefined,
@@ -878,7 +878,7 @@ function normalizeTimelineEvent(event: Record<string, unknown>): NormalizedTimel
       outputTokens: getNumber(event.output_tokens) ?? undefined,
       generationTimeMs: getNumber(event.generation_time_ms) ?? undefined,
       finishReason: getNonEmptyString(event.finish_reason) ?? undefined,
-      failure: normalizeFailureEnvelope(event.failure),
+      failure: normalizeFailureEnvelope(event.failure) ?? (type === 'error' ? createClientBackendFailure() : undefined),
     }
   }
 
@@ -976,10 +976,9 @@ function buildReasoningStep(
       return {
         id,
         type: 'error',
-        // Failure event content can contain transport diagnostics. Keep it in
-        // the API event for compatibility, but never carry it into the chat
-        // timeline where reasoning steps are rendered to the user.
-        content: failurePresentationDetail(event.failure),
+        // ChatMessage renders this only through FailurePresentationCard, which
+        // limits and redacts credential-shaped content before display.
+        content: event.content,
         timestamp,
         toolMeta: event.toolMeta,
         toolExposure,
@@ -1322,6 +1321,18 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
       return
     }
 
+    if (step.type === 'error') {
+      messages.push(createTimelineErrorMessage({
+        id: buildMessageId('timeline-error', index, turnKey, event.timestamp),
+        content: step.content,
+        timestamp: toMessageTimestamp(event.timestamp),
+        turnKey,
+        errorCode: formatChatErrorDiagnostics(step.errorCode, step.toolMeta),
+        failure: step.failure,
+      }))
+      return
+    }
+
     if (existingIndex !== undefined) {
       const target = messages[existingIndex]
       messages[existingIndex] = {
@@ -1333,20 +1344,17 @@ export function buildMessagesFromTimelineEvents(events: ReadonlyArray<unknown>):
 
     messages.push({
       id: buildMessageId('timeline-assistant-turn', index, turnKey, event.timestamp),
-      type: step.type === 'error' ? 'error' : 'assistant',
-      content: step.type === 'error' ? step.content : '',
+      type: 'assistant',
+      content: '',
       timestamp: toMessageTimestamp(event.timestamp),
-      eventType: step.type === 'error' ? 'error' : undefined,
+      eventType: undefined,
       turnKey,
       turnId: turnKey,
       reasoningSteps: [step],
-      errorCode:
-        step.type === 'error'
-          ? formatChatErrorDiagnostics(step.errorCode, step.toolMeta)
-          : step.errorCode,
+      errorCode: step.errorCode,
       failure: step.failure,
-      isStreaming: step.type !== 'error',
-      reasoningBuffer: step.type === 'error' ? undefined : createInlineReasoningBuffer(),
+      isStreaming: true,
+      reasoningBuffer: createInlineReasoningBuffer(),
       inlineReasoningStepId: undefined,
     })
     assistantIndexByTurn.set(turnKey, messages.length - 1)
@@ -4260,17 +4268,6 @@ export interface WorkspaceDiffResult extends WorkspaceChange {
 export interface WorkspacePatchPreviewRequest extends Omit<WorkspaceQueryOptions, 'path'> {
   approvalId?: string | null
   patchText: string
-}
-
-function failurePresentationDetail(failure: FailureEnvelopeInput | undefined): string {
-  if (!failure) {
-    return 'The task could not be completed. Review it before starting another attempt.'
-  }
-  try {
-    return presentFailure(failure).detail
-  } catch {
-    return 'The task could not be completed. Review it before starting another attempt.'
-  }
 }
 
 export interface WorkspaceSubsetPreviewRequest {

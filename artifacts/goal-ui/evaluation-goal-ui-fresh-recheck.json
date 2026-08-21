@@ -1,0 +1,259 @@
+{
+    "schema_name":  "agent-foreman/evaluation",
+    "schema_version":  "1.0",
+    "profile":  "full",
+    "plan_id":  "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+    "phase_id":  "PHASE-GOAL-UI-INTEGRATION",
+    "context_freshness":  "fresh",
+    "model_diversity":  "unknown",
+    "model_diversity_note":  "No authoritative host model readback was provided; requested selectors are not identity verification.",
+    "production_access":  "read-only",
+    "evaluator_authority":  "advisory recommendation only; no production repair or integration declaration",
+    "evaluator_production_delta":  "none",
+    "probe_command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+    "probe_artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json",
+    "source_hashes":  {
+                          "page":  "7b3a682ce0f7964f54da08b50ab362f89fbf47fa149bb1cf46efd86aa89bf119",
+                          "drawer":  "31b1b0ba943930cc0c963a0e2543fb1ffcd4e9f7c29376a1020fea4f00106c50",
+                          "routing":  "e071b6a7718c975358e8db46e9ab3df88e6291129d4cbc56332b6e2e7f2064ca",
+                          "target":  "3418bfea23428a1872cda554d65cec9144f17e7d5392d9feed35e5eb130e20bc",
+                          "routeId":  "463537e23c939cc7d3386799c3bb2f7c3189af2b96e2734caf3b092d590eed80",
+                          "agentRunDetail":  "4a4df1ecbf827e9888158355c8064efba422780c462f457f96a6d218c52f3c32",
+                          "api":  "28e172d327b0eb4fc23d6be29f3f86b90e58304a1d67c7b4da8aabb58fca1122",
+                          "drawerBrowser":  "730b765365963252e166e556c0b6aabe0bdf3a302cca411aac9b5493177d0df2",
+                          "liveBrowser":  "86353c8d97ad733c430290bf7814685198ae7ca02e854b104081d08a134c032e",
+                          "hydration":  "5afe631dbbc0550c7091e245559766aa87343345689ea87c960d46e7f1eacd85",
+                          "layout":  "4d75a1ebc6681702ddc0268d34e4699b793196b649a7f2a126d047619ac7a52c",
+                          "i18n":  "7c9b2b4e2b01d82fb5dacd7d8d82a4f153dc101169e1df9000487b54089ae519",
+                          "goals":  "ebdc22f5eb4e08ba3810a53ecc90eb2a0dd7e8ecaa91833b1f16324f7e8b4624",
+                          "sidebar":  "1a978ab29f35ba987b94ff5b4f56718ebda11843ca285e2c22ca658675d1ab00"
+                      },
+    "new_probes":  [
+                       {
+                           "probe_id":  "PROBE-RECHECK-ACTIVATION-IDENTITY",
+                           "invariant_id":  "INV-GOAL-ACTIVATION-IDENTITY",
+                           "setup":  "Load the current production routing export and the public composer fixture source.",
+                           "fault_injection":  "Submit /goal Research this for 20 minutes and the equivalent natural-language Research this for 20 minutes into the real routing export.",
+                           "production_trigger_or_boundary":  "ChatPage::handleSend -\u003e resolveChatGoalWorkflowRouting -\u003e handleGoalWorkflowRouting -\u003e api.createGoal.",
+                           "oracle":  "Both inputs produce the same goal_proposal content; the shared handler boundary is the only page-level createGoal site; the public-composer fixture asserts one create payload.",
+                           "anti_oracle":  "Different routing kinds/content, bypassing handleGoalWorkflowRouting, or two create payloads falsifies convergence.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "slashRoute":  {
+                                                               "kind":  "goal_proposal",
+                                                               "content":  "Research this for 20 minutes",
+                                                               "raw":  "/goal Research this for 20 minutes"
+                                                           },
+                                            "naturalRoute":  {
+                                                                 "kind":  "goal_proposal",
+                                                                 "content":  "Research this for 20 minutes",
+                                                                 "raw":  "Research this for 20 minutes"
+                                                             },
+                                            "pageCreateGoalCalls":  1,
+                                            "publicFixtureSingleCreateAssertion":  true
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       },
+                       {
+                           "probe_id":  "PROBE-RECHECK-COMPOSER-SURFACE",
+                           "invariant_id":  "INV-GOAL-COMPOSER-SURFACE",
+                           "setup":  "Read the integrated ChatPage render tree and current drawer component.",
+                           "fault_injection":  "Search for a second Goal surface or a legacy Goal header/focus/floating render while a drawer exists.",
+                           "production_trigger_or_boundary":  "ChatPage composer footer render immediately before ChatInput.",
+                           "oracle":  "Exactly one \u003cGoalComposerDrawer render precedes \u003cChatInput, with no legacy Goal surface references in ChatPage.",
+                           "anti_oracle":  "A component merely existing on disk is not a render proof; any extra render/reference in ChatPage fails.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "drawerRenders":  1,
+                                            "chatInputRenders":  1,
+                                            "drawerBeforeComposer":  true,
+                                            "legacyChatPageReferences":  0
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       },
+                       {
+                           "probe_id":  "PROBE-RECHECK-SESSION-ISOLATION",
+                           "invariant_id":  "INV-GOAL-SESSION-ISOLATION",
+                           "setup":  "Read the selected-session guards and the real deferred-response browser fixture.",
+                           "fault_injection":  "Hold session A response, select no-Goal B, release A while B remains selected, then inspect the no-drawer assertion.",
+                           "production_trigger_or_boundary":  "ChatPage selectedSessionId effect and drawer action request-generation guards; browser fixture session switch.",
+                           "oracle":  "The fixture releases A only after B selection and waits for delivery before asserting B hidden; production resets action state on session switch and clears busy state only when request/session identities still match.",
+                           "anti_oracle":  "A timer that resolves before B is selected, reselecting A before delivery, or missing session/request identity guards fails.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "deferredResponseHeldUntilB":  true,
+                                            "bAssertedAfterRelease":  true,
+                                            "guardedActionCompletions":  2
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       },
+                       {
+                           "probe_id":  "PROBE-RECHECK-ACTION-SEMANTICS",
+                           "invariant_id":  "INV-GOAL-ACTION-SEMANTICS",
+                           "setup":  "Execute the current drawer model export and inspect the Clear UI/handler boundary.",
+                           "fault_injection":  "Attempt Clear on a running linked Goal, then cancel and confirm; scan the confirmed handler for durable/network/navigation effects.",
+                           "production_trigger_or_boundary":  "GoalComposerDrawer Clear -\u003e disclosure/cancel/confirm -\u003e ChatPage::handleClearGoalDrawer.",
+                           "oracle":  "Clear first opens retained-history disclosure, cancel closes it, confirm alone calls a presentation-only handler; the handler only writes session-keyed local detachment state and has no API/fetch/router/delete/send token.",
+                           "anti_oracle":  "Single-click hiding, missing disclosure/cancel control, or a durable side effect in Clear fails.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "running":  {
+                                                            "goalId":  "goal-a",
+                                                            "title":  "A",
+                                                            "status":  "running",
+                                                            "canPause":  true,
+                                                            "canResume":  false,
+                                                            "canStop":  true,
+                                                            "canEdit":  true,
+                                                            "canClear":  true,
+                                                            "canOpenExecutionRecord":  true
+                                                        },
+                                            "paused":  {
+                                                           "goalId":  "goal-a",
+                                                           "title":  "A",
+                                                           "status":  "paused",
+                                                           "canPause":  false,
+                                                           "canResume":  true,
+                                                           "canStop":  true,
+                                                           "canEdit":  true,
+                                                           "canClear":  true,
+                                                           "canOpenExecutionRecord":  true
+                                                       },
+                                            "clearRequiresConfirmation":  true,
+                                            "clearHandlerDurableSideEffectTokens":  [
+
+                                                                                    ]
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       },
+                       {
+                           "probe_id":  "PROBE-RECHECK-EXECUTION-RECORD-DIRECT",
+                           "invariant_id":  "INV-EXECUTION-RECORD-DIRECT",
+                           "setup":  "Execute the real target resolver and dynamic-route normalizer using run / linked?\u0026.",
+                           "fault_injection":  "Supply the encoded Next route segment and a foreign higher-index attempt.",
+                           "production_trigger_or_boundary":  "Goal drawer href -\u003e /agent-runs/[runId] -\u003e normalizeAgentRunRouteId -\u003e api.fetchAgentRun/fetchAgentRunHealth.",
+                           "oracle":  "The selected Goal produces one encoded direct href; the encoded route decodes once to the raw ID; detail code passes raw routeRunId to API helpers, whose single encode produces no %25.",
+                           "anti_oracle":  "A /goals target, foreign attempt, unnormalized encoded segment, or %25 request-equivalent fails.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "target":  {
+                                                           "kind":  "agent_run",
+                                                           "runId":  "run / linked?\u0026",
+                                                           "href":  "/agent-runs/run%20%2F%20linked%3F%26"
+                                                       },
+                                            "encoded":  "run%20%2F%20linked%3F%26",
+                                            "normalized":  "run / linked?\u0026",
+                                            "onceEncodedRequest":  "/agent-runs/run%20%2F%20linked%3F%26",
+                                            "containsPercent25":  false
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       },
+                       {
+                           "probe_id":  "PROBE-RECHECK-HYDRATION-PARITY",
+                           "invariant_id":  "INV-HYDRATION-PARITY",
+                           "setup":  "Read RootLayout, i18n, and the current runtime hydration fixture.",
+                           "fault_injection":  "Require clean and persisted-preference first navigation plus reload at /, /agent-runs, special-character detail, and /goals redirect.",
+                           "production_trigger_or_boundary":  "Next server layout/first hydration and test-hydration-no-mismatch.mjs::navigateAndCapture.",
+                           "oracle":  "Neither layout nor i18n suppresses hydration warnings; the fixture uses the real preference key, enumerates all four routes, executes clean and persisted scenarios, reloads each, and fails on captured warnings/errors.",
+                           "anti_oracle":  "Root-only coverage, a suppressed hydration warning, omitted reload, or a fixture that ignores console errors fails.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "suppressionSites":  0,
+                                            "routeCount":  4,
+                                            "contextCountPerRoute":  2,
+                                            "reloadPerScenario":  true,
+                                            "capturedConsoleFailures":  true
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       },
+                       {
+                           "probe_id":  "PROBE-RECHECK-LIVE-TIMELINE",
+                           "invariant_id":  "INV-REGRESSION-QUALITY",
+                           "setup":  "Read the current live browser gate at its durable transcript consumer assertions.",
+                           "fault_injection":  "Require SSE after_seq=3, polling recovery after_seq=4, five unique events before and after reload, and no empty assistant cards.",
+                           "production_trigger_or_boundary":  "test-goal-live-browser-evidence.mjs live SSE/poll/reload browser flow.",
+                           "oracle":  "The gate has explicit SSE, poll, no-empty-card, direct detail, and reload exact-one-card assertions for every expected event.",
+                           "anti_oracle":  "Defined-but-unused helpers alone, missing poll recovery, or no post-reload uniqueness assertion fails.",
+                           "command":  "rtk proxy node --experimental-strip-types artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                           "exit_code":  0,
+                           "status":  "passed",
+                           "observed":  {
+                                            "sseAfterSeq":  3,
+                                            "pollRecoveryAfterSeq":  4,
+                                            "noEmptyAssistantCardsInvocation":  1,
+                                            "fiveEventsAssertedBeforeAndAfterReload":  true
+                                        },
+                           "artifact_path":  "artifacts/goal-ui/evaluation-recheck/probe-results.json"
+                       }
+                   ],
+    "independent_rechecks":  [
+                                 {
+                                     "scope":  "real /goal and equivalent natural-language activation boundary",
+                                     "status":  "passed",
+                                     "prior_finding_id":  "FINDING-ACTIVATION-ORACLE-FALSE-GREEN",
+                                     "evidence_probe_id":  "PROBE-RECHECK-ACTIVATION-IDENTITY",
+                                     "observation":  "Both inputs route to goal_proposal with identical content, use the common handler, and the public-composer fixture asserts exactly one create payload."
+                                 },
+                                 {
+                                     "scope":  "delayed A response while B stays selected",
+                                     "status":  "passed",
+                                     "prior_finding_id":  "FINDING-SESSION-DELAY-FALSE-GREEN",
+                                     "evidence_probe_id":  "PROBE-RECHECK-SESSION-ISOLATION",
+                                     "observation":  "The fixture holds A, selects B, releases A, waits for delivery, then asserts B has no drawer; action completions are session/request guarded."
+                                 },
+                                 {
+                                     "scope":  "exact-once special-character AgentRun routing",
+                                     "status":  "passed",
+                                     "prior_finding_id":  "FINDING-RUN-ID-DOUBLE-ENCODE",
+                                     "evidence_probe_id":  "PROBE-RECHECK-EXECUTION-RECORD-DIRECT",
+                                     "observation":  "run / linked?\u0026 encodes in the drawer, decodes once at the route boundary, then re-encodes once in API helpers without %25."
+                                 },
+                                 {
+                                     "scope":  "hydration on /, /agent-runs, encoded detail and /goals redirect for clean/persisted/reload",
+                                     "status":  "passed",
+                                     "prior_finding_id":  "FINDING-HYDRATION-SUPPRESSED-AND-UNDERCOVERED",
+                                     "evidence_probe_id":  "PROBE-RECHECK-HYDRATION-PARITY",
+                                     "observation":  "No suppression sites remain in layout/i18n; fixture enumerates four routes, clean and persisted contexts, reload, and console/error capture."
+                                 },
+                                 {
+                                     "scope":  "Clear disclosure/cancel/confirm with no durable deletion",
+                                     "status":  "passed",
+                                     "prior_finding_id":  "FINDING-CLEAR-CONTRACT-OMISSION",
+                                     "evidence_probe_id":  "PROBE-RECHECK-ACTION-SEMANTICS",
+                                     "observation":  "Clear opens retained-history disclosure, cancel preserves visibility, confirm reaches a local session-keyed detachment handler with no durable side-effect tokens."
+                                 },
+                                 {
+                                     "scope":  "live SSE+poll+reload timeline dedupe and no empty assistant cards",
+                                     "status":  "passed",
+                                     "prior_finding_id":  "FINDING-LIVE-GATE-ORACLE-WEAKENED",
+                                     "evidence_probe_id":  "PROBE-RECHECK-LIVE-TIMELINE",
+                                     "observation":  "The live gate requires stream after_seq=3, poll recovery after_seq=4, no empty cards, and exact-one rendered assertions for five events before and after reload."
+                                 }
+                             ],
+    "runtime_artifact_policy":  "No immutable browser/runtime artifact was used as the sole new probe; fresh probes executed current production exports and static deterministic checks of runtime triggers.",
+    "recommendation":  "pass",
+    "deterministic_result":  "passed",
+    "findings":  [
+
+                 ],
+    "residual_risks":  [
+                           "The evaluator did not run production browser fixtures because their configured artifact destinations are outside the evaluator-only write scope. The fresh evidence is deterministic export/source falsification, not a completion or integration declaration."
+                       ],
+    "created_paths":  [
+                          "artifacts/goal-ui/evaluation-recheck/goal-ui-recheck-probe.mjs",
+                          "artifacts/goal-ui/evaluation-recheck/probe-results.json",
+                          "artifacts/goal-ui/evaluation-goal-ui-fresh-recheck.json"
+                      ]
+}

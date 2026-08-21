@@ -14,6 +14,7 @@ import {
   Square,
 } from 'lucide-react'
 import * as api from '@/lib/api'
+import { normalizeAgentRunRouteId } from '@/lib/agent-run-route-id'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -346,7 +347,7 @@ type RunAction = 'start' | 'pause' | 'resume' | 'cancel' | 'finalize_partial'
 export default function AgentRunDetailPage() {
   const params = useParams<{ runId: string }>()
   const { t } = useI18n()
-  const routeRunId = Array.isArray(params.runId) ? params.runId[0] : params.runId
+  const routeRunId = normalizeAgentRunRouteId(params.runId)
 
   const [run, setRun] = React.useState<api.AgentRunDetail | null>(null)
   const [loading, setLoading] = React.useState(true)

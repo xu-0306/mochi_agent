@@ -143,7 +143,9 @@ web/scripts/*
 !web/scripts/test-diff-viewer-lines.mjs
 !web/scripts/test-execution-transcript-chat-projection.mjs
 !web/scripts/test-goal-execution-timeline-projection.mjs
+!web/scripts/test-goal-drawer-browser-evidence.mjs
 !web/scripts/test-goal-live-browser-evidence.mjs
+!web/scripts/test-hydration-no-mismatch.mjs
 !web/scripts/test-reasoning-display-policy.mjs
 !web/scripts/test-workflow-panel-positioning.mjs
 web/README.md

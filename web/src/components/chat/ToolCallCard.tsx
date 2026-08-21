@@ -1,4 +1,4 @@
-'use client'
+﻿'use client'
 
 import * as React from 'react'
 import {
@@ -22,6 +22,7 @@ import {
 } from '@/lib/subagent-tasks'
 import { projectConcreteToolWorkflow } from '@/lib/tool-workflow-observability'
 import { useToolWorkflowAggregateCall } from '@/lib/tool-workflow-aggregate'
+import { sanitizeFailureDetail } from '@/lib/failure-presentation'
 
 interface ToolCallCardProps {
   toolName: string
@@ -76,6 +77,7 @@ export function ToolCallCard({
   const { t } = useI18n()
   const isResult = type === 'tool_result' || type === 'tool_call_result'
   const isError = status === 'error'
+  const safeErrorMessage = sanitizeFailureDetail(errorMessage)
   const evidenceNotice = getEvidenceNotice(metadata)
   const delegatedSubagent =
     toolName === DELEGATE_SUBAGENT_TOOL_NAME && isResult
@@ -302,16 +304,16 @@ export function ToolCallCard({
               </pre>
             </div>
           )}
-          {errorMessage ? (
+          {safeErrorMessage ? (
             <div className={!isResult && args ? 'mt-2' : ''}>
               <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">{t('chat.tool.error')}</p>
               <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-canvas p-2 text-xs text-error">
-                {errorMessage}
+                {safeErrorMessage}
               </pre>
             </div>
           ) : null}
           {evidenceNotice ? (
-            <div className={(!isResult && args) || errorMessage ? 'mt-2' : ''}>
+            <div className={(!isResult && args) || safeErrorMessage ? 'mt-2' : ''}>
               <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Evidence</p>
               <p className="rounded border border-amber-400/30 bg-amber-400/10 p-2 text-xs text-amber-100">
                 {evidenceNotice}
@@ -319,7 +321,7 @@ export function ToolCallCard({
             </div>
           ) : null}
           {result !== undefined && (
-            <div className={(!isResult && args) || errorMessage || evidenceNotice ? 'mt-2' : ''}>
+            <div className={(!isResult && args) || safeErrorMessage || evidenceNotice ? 'mt-2' : ''}>
               <p className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">{t('chat.tool.result')}</p>
               <pre className="text-xs text-foreground/80 whitespace-pre-wrap break-all overflow-auto max-h-48 bg-canvas rounded p-2">
                 {typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
@@ -327,7 +329,7 @@ export function ToolCallCard({
             </div>
           )}
           {metadata && (
-            <div className={(result !== undefined) || errorMessage || evidenceNotice ? 'mt-2' : ''}>
+            <div className={(result !== undefined) || safeErrorMessage || evidenceNotice ? 'mt-2' : ''}>
               <p className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">Metadata</p>
               <pre className="text-xs text-foreground/70 whitespace-pre-wrap break-all overflow-auto max-h-48 bg-canvas rounded p-2">
                 {JSON.stringify(metadata, null, 2)}

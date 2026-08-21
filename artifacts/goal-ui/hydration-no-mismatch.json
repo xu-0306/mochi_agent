@@ -1,0 +1,165 @@
+{
+  "ok": true,
+  "scenarios": [
+    {
+      "label": "clean:root:first-navigation-and-reload",
+      "actualPath": "/",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": null,
+      "firstNavigationAttributes": null,
+      "reloadAttributes": null,
+      "pass": true
+    },
+    {
+      "label": "persisted:root:first-navigation-and-reload",
+      "actualPath": "/",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light"
+      },
+      "firstNavigationAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "reloadAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "pass": true
+    },
+    {
+      "label": "clean:agent-runs:first-navigation-and-reload",
+      "actualPath": "/agent-runs",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": null,
+      "firstNavigationAttributes": null,
+      "reloadAttributes": null,
+      "pass": true
+    },
+    {
+      "label": "persisted:agent-runs:first-navigation-and-reload",
+      "actualPath": "/agent-runs",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light"
+      },
+      "firstNavigationAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "reloadAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "pass": true
+    },
+    {
+      "label": "clean:agent-run-detail:first-navigation-and-reload",
+      "actualPath": "/agent-runs/run%20%2F%20linked%3F%26",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": null,
+      "firstNavigationAttributes": null,
+      "reloadAttributes": null,
+      "pass": true
+    },
+    {
+      "label": "persisted:agent-run-detail:first-navigation-and-reload",
+      "actualPath": "/agent-runs/run%20%2F%20linked%3F%26",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light"
+      },
+      "firstNavigationAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "reloadAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "pass": true
+    },
+    {
+      "label": "clean:goals-redirect:first-navigation-and-reload",
+      "actualPath": "/agent-runs",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": null,
+      "firstNavigationAttributes": null,
+      "reloadAttributes": null,
+      "pass": true
+    },
+    {
+      "label": "persisted:goals-redirect:first-navigation-and-reload",
+      "actualPath": "/agent-runs",
+      "messages": [],
+      "hydrationMessages": [],
+      "expectedHtmlAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light"
+      },
+      "firstNavigationAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "reloadAttributes": {
+        "lang": "zh-TW",
+        "fontSize": "large",
+        "theme": "light",
+        "codeTheme": "github-light",
+        "colorScheme": "light",
+        "bodyClass": "h-screen overflow-hidden bg-canvas text-foreground font-sans antialiased"
+      },
+      "pass": true
+    }
+  ]
+}

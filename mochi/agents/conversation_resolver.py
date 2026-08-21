@@ -116,6 +116,7 @@ class ConversationResolution:
     context: BoundedConversationContext
     diagnostics: dict[str, Any]
     resolution_source: ResolutionSource
+    interpreter_backend_error: BackendRequestError | None = None
 
 
 class ConversationResolver:
@@ -166,6 +167,7 @@ class ConversationResolver:
         contract: TurnIntentContract | None = None
         next_active_task: ActiveTaskState | None = None
         resolution_source: ResolutionSource = "fallback"
+        interpreter_backend_error: BackendRequestError | None = None
         if self._interpreter is not None:
             try:
                 candidate = await self._interpreter.interpret(context)
@@ -184,10 +186,11 @@ class ConversationResolver:
             except BackendRequestError as exc:
                 # Intent interpretation is an optimization for capability
                 # selection, never a prerequisite for an ordinary response.
-                # Fall back to a capability-denying conversation contract so
-                # the main model can answer while mutation remains blocked.
+                # Keep the typed failure so callers can distinguish a denied
+                # provider credential from an ordinary capability fallback.
                 diagnostics["interpreter_status"] = "unavailable"
                 diagnostics["interpreter_error"] = f"{type(exc).__name__}: {exc}"
+                interpreter_backend_error = exc
             except Exception as exc:
                 diagnostics["interpreter_status"] = "rejected"
                 diagnostics["interpreter_error"] = f"{type(exc).__name__}: {exc}"
@@ -228,6 +231,7 @@ class ConversationResolver:
             context=context,
             diagnostics=diagnostics,
             resolution_source=resolution_source,
+            interpreter_backend_error=interpreter_backend_error,
         )
 
     def _bound_context(

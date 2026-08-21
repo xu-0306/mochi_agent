@@ -1086,6 +1086,11 @@ async def update_configured_model(
     is_active_entry = _is_configured_model_active(config, existing)
     if is_active_entry:
         updated = _apply_configured_model_to_config(updated, replacement)
+        engine = await _get_or_create_engine(request.app)
+        try:
+            await _switch_configured_model(request, engine, config, replacement)
+        except (RuntimeError, ValueError) as exc:
+            raise _translate_model_switch_error(exc) from exc
 
     api_key_configured = False
     if next_provider == "openai_codex":
@@ -1204,12 +1209,14 @@ async def switch_model_runtime(request: Request, model_id: str) -> Any:
                 model_info = await _switch_configured_model(request, engine, config, effective_entry)
                 request.app.state.config = _apply_configured_model_to_config(config, effective_entry)
                 return model_info
-            if model_entry.provider != "local":
+            if model_entry.provider == "ollama":
+                return current
+            if model_entry.provider != "local" and _active_runtime_matches_configured_model(current, model_entry):
                 return current
             active_model_name = _model_info_name(current)
             if active_model_name and _local_model_specs_equivalent(active_model_name, model_entry.model_spec):
                 return current
-            # local model ??config ??????殉次蹌?active?? runtime ??????鈭????????????            model_info = await _switch_configured_model(request, engine, config, model_entry)
+            model_info = await _switch_configured_model(request, engine, config, model_entry)
             return model_info
         model_info = await _switch_configured_model(request, engine, config, effective_entry)
         updated = _apply_configured_model_to_config(config, effective_entry)
@@ -2012,6 +2019,54 @@ def _model_info_name(info: Any) -> str | None:
         return value if isinstance(value, str) and value else None
     value = getattr(info, "name", None)
     return value if isinstance(value, str) and value else None
+
+
+def _model_info_provider(info: Any) -> str | None:
+    if isinstance(info, dict):
+        value = info.get("provider")
+        return value if isinstance(value, str) and value else None
+    value = getattr(info, "provider", None)
+    return value if isinstance(value, str) and value else None
+
+
+def _model_info_base_url(info: Any) -> str | None:
+    if isinstance(info, dict):
+        direct = info.get("base_url")
+        metadata = info.get("metadata")
+    else:
+        direct = getattr(info, "base_url", None)
+        metadata = getattr(info, "metadata", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip().rstrip("/")
+    if isinstance(metadata, dict):
+        value = metadata.get("base_url")
+        if isinstance(value, str) and value.strip():
+            return value.strip().rstrip("/")
+    return None
+
+
+def _active_runtime_matches_configured_model(
+    info: Any,
+    configured_model: ConfiguredModelConfig,
+) -> bool:
+    if _model_info_name(info) != configured_model.model:
+        return False
+
+    runtime_provider = _model_info_provider(info)
+    if runtime_provider is not None and runtime_provider != configured_model.provider:
+        return False
+
+    runtime_backend = _model_info_backend_type(info)
+    if (
+        runtime_backend is not None
+        and configured_model.backend_type
+        and runtime_backend != configured_model.backend_type
+    ):
+        return False
+
+    runtime_base_url = _model_info_base_url(info)
+    expected_base_url = (configured_model.base_url or configured_model.model_spec).rstrip("/")
+    return runtime_base_url is None or runtime_base_url == expected_base_url
 
 
 def _upsert_configured_model(

@@ -1,4 +1,4 @@
-"""AgentEngine — 頂層入口，協調所有子系統。"""
+﻿"""AgentEngine — 頂層入口，協調所有子系統。"""
 
 from __future__ import annotations
 
@@ -3314,11 +3314,23 @@ class AgentEngine:
                 schema["function"]["name"] for schema in tool_registry.get_schemas()
             ],
         )
+        interpreter_backend_error = (
+            turn_contract_rollout.resolution.interpreter_backend_error
+            if turn_contract_rollout is not None
+            else None
+        )
         if controlled_recovery_reentry_blocker is not None:
             enforce_blocker = (
                 controlled_recovery_reentry_blocker,
                 "A prior corrective recovery was reserved before this turn stopped. "
                 "For safety, it will not be replayed automatically.",
+            )
+        elif self._is_access_denied_interpreter_backend_error(
+            interpreter_backend_error
+        ):
+            enforce_blocker = (
+                "turn_contract_interpreter_backend_error",
+                interpreter_backend_error.message,
             )
         if enforce_blocker is not None:
             blocker_reason, final_text = enforce_blocker
@@ -3343,39 +3355,59 @@ class AgentEngine:
                     blocker_metadata["turn_checkpoint_persist_error"] = checkpoint_error
                 else:
                     turn_checkpoint = transitioned_checkpoint
-            final_event = FinalAnswerEvent(
-                content=final_text,
-                finish_reason=blocker_reason,
-                input_tokens=0,
-                output_tokens=0,
-                metadata=blocker_metadata,
-            )
-            final_event.turn_id = turn_id
+            terminal_event: AgentEvent
+            if (
+                blocker_reason == "turn_contract_interpreter_backend_error"
+                and interpreter_backend_error is not None
+            ):
+                blocker_metadata.update(
+                    {
+                        "runtime_category": "backend",
+                        "error_type": "backend_request_error",
+                        "recoverability": "retryable_after_repair",
+                        "backend": dict(interpreter_backend_error.metadata),
+                    }
+                )
+                terminal_event = ErrorEvent(
+                    message=interpreter_backend_error.message,
+                    code="BACKEND_REQUEST_FAILED",
+                    metadata=blocker_metadata,
+                )
+            else:
+                terminal_event = FinalAnswerEvent(
+                    content=final_text,
+                    finish_reason=blocker_reason,
+                    input_tokens=0,
+                    output_tokens=0,
+                    metadata=blocker_metadata,
+                )
+            terminal_event.turn_id = turn_id
             if persist_turn_events:
                 await self._persist_turn_event(
                     session_key,
-                    final_event,
+                    terminal_event,
                     turn_id=turn_id,
                     seq=1,
                 )
             if event_callback is not None:
-                callback_result = event_callback(final_event)
+                callback_result = event_callback(terminal_event)
                 if inspect.isawaitable(callback_result):
                     await cast(Awaitable[None], callback_result)
             if persist_learning:
                 await self._finish_learning_cycle(trajectory_id)
             if request.persist_session:
                 context.add_message(user_msg)
-                assistant_msg = Message(role="assistant", content=final_text)
-                context.add_message(assistant_msg)
-                if request.timeline_user_message_admitted:
-                    request.timeline_transcript = [assistant_msg]
-                else:
-                    await self._persist_session_message(
-                        session_key,
-                        assistant_msg,
-                        turn_id=turn_id,
-                    )
+                if isinstance(terminal_event, FinalAnswerEvent):
+                    assistant_msg = Message(role="assistant", content=final_text)
+                    context.add_message(assistant_msg)
+                    if request.timeline_user_message_admitted:
+                        request.timeline_transcript = [assistant_msg]
+                    else:
+                        await self._persist_session_message(
+                            session_key,
+                            assistant_msg,
+                            turn_id=turn_id,
+                        )
                 if not request.timeline_user_message_admitted:
                     await self._persist_context_lifecycle_snapshot(
                         session_id=session_key,
@@ -3393,10 +3425,9 @@ class AgentEngine:
             )
             return AgentInvocationResult(
                 content=final_text,
-                events=[final_event],
+                events=[terminal_event],
                 diagnostics=diagnostics,
             )
-
         tool_schemas = tool_registry.get_schemas()
         prompt_budget = self._estimate_prompt_budget(
             system_prompt=system_prompt,
@@ -8388,11 +8419,14 @@ class AgentEngine:
                 "metadata": copy.deepcopy(event.metadata),
             }
         if isinstance(event, ErrorEvent):
-            return "error", {
+            payload = {
                 "message": event.message,
                 "code": event.code,
                 "metadata": copy.deepcopy(event.metadata),
             }
+            if event.failure is not None:
+                payload["failure"] = event.failure.to_dict()
+            return "error", payload
         return None, {}
 
     @staticmethod
@@ -9434,6 +9468,18 @@ class AgentEngine:
             )
         return None
 
+    @staticmethod
+    def _is_access_denied_interpreter_backend_error(
+        error: BackendRequestError | None,
+    ) -> bool:
+        if error is None:
+            return False
+        raw_status_code = error.metadata.get("status_code")
+        try:
+            status_code = int(raw_status_code)
+        except (TypeError, ValueError):
+            return False
+        return status_code in {401, 403}
     @staticmethod
     def _attachment_count(attachments: list[AttachmentRef] | None) -> int:
         return len(attachments or [])

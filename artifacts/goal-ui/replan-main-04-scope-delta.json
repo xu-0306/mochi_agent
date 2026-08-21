@@ -1,0 +1,29 @@
+{
+    "schema_name":  "agent-foreman/replan",
+    "schema_version":  "1.0",
+    "profile":  "full",
+    "plan_id":  "PLAN-GOAL-CHAT-SCOPED-UI-HYDRATION-20260820",
+    "actor_role":  "main",
+    "timestamp":  "2026-08-20T19:59:21.4795845+08:00",
+    "affected_packages":  [
+                              "PKG-MAIN-04-GOAL-UI-HYDRATION-INTEGRATION"
+                          ],
+    "reason":  "Fresh evaluator findings required activation-path repairs, exact-once AgentRun route decoding, routing probes, and Git-visible browser gates after the original freeze.",
+    "added_owned_paths":  [
+                              ".gitignore",
+                              "tests/frontend/test_agent_run_route_id.mjs",
+                              "web/scripts/test-chat-goal-routing.mjs",
+                              "web/scripts/test-chat-goal-workflow-routing.mjs",
+                              "web/src/app/agent-runs/[runId]/page.tsx",
+                              "web/src/lib/agent-run-route-id.ts",
+                              "web/src/lib/chat-goal-routing.ts"
+                          ],
+    "added_gate_ids":  [
+                           "GATE-AGENT-RUN-ROUTE-ID",
+                           "GATE-CHAT-GOAL-WORKFLOW-ROUTING"
+                       ],
+    "worker_contracts_changed":  false,
+    "status":  "validated_and_refrozen",
+    "validation_required":  false,
+    "validation_result":  "agent-foreman validator passed after ownership and gate amendment"
+}
