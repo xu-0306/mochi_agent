@@ -18,6 +18,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { modelTargetId } from '@/lib/model-target-id'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/lib/i18n'
@@ -39,6 +40,7 @@ import type { ChatAttachment } from '@/lib/chat'
 
 export interface ChatInputModelOption {
   id: string
+  targetId?: string
   label: string
   detail?: string | null
   status?: 'connected' | 'configured' | 'disconnected'
@@ -505,7 +507,7 @@ export function ChatInput({
         : null
     }
     return (
-      availableModels.find((model) => model.id === currentModel) ?? availableModels[0]
+      availableModels.find((model) => modelTargetId(model) === currentModel) ?? availableModels[0]
     )
   }, [availableModels, currentModel])
 
@@ -1202,18 +1204,19 @@ export function ChatInput({
                   >
                     {availableModels.map((model) => (
                       <button
-                        key={model.id}
+                        key={modelTargetId(model)}
                         type="button"
                         onClick={() => {
                           setShowModelMenu(false)
-                          if (model.id !== selectedModel?.id) {
-                            void onSwitchModel?.(model.id)
+                          const targetId = modelTargetId(model)
+                          if (targetId !== modelTargetId(selectedModel)) {
+                            void onSwitchModel?.(targetId)
                           }
                         }}
                         className={cn(
                           'flex w-full items-center gap-2 px-3 py-1.5 text-sm',
                           'hover:bg-muted transition-colors duration-100',
-                          selectedModel?.id === model.id
+                          modelTargetId(selectedModel) === modelTargetId(model)
                             ? 'text-foreground'
                             : 'text-muted-foreground'
                         )}
@@ -1234,7 +1237,7 @@ export function ChatInput({
                             </span>
                           ) : null}
                         </span>
-                        {selectedModel?.id === model.id ? (
+                        {modelTargetId(selectedModel) === modelTargetId(model) ? (
                           <Check className="h-3.5 w-3.5 shrink-0 text-primary-400" />
                         ) : null}
                       </button>

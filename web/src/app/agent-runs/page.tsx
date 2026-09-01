@@ -32,6 +32,7 @@ import {
   type ThinkingLevel,
 } from '@/lib/reasoning-presets'
 import { cn } from '@/lib/utils'
+import { modelTargetId } from '@/lib/model-target-id'
 
 interface SubagentDraft {
   id: string
@@ -598,10 +599,11 @@ export default function AgentRunsPage() {
       const deduped: api.ModelInfo[] = []
       const seen = new Set<string>()
       for (const model of data) {
-        if (!model.id || seen.has(model.id)) {
+        const targetId = modelTargetId(model)
+        if (!targetId || seen.has(targetId)) {
           continue
         }
-        seen.add(model.id)
+        seen.add(targetId)
         deduped.push(model)
       }
       setModels(deduped)
@@ -1575,7 +1577,7 @@ export default function AgentRunsPage() {
                         </SelectTrigger>
                         <SelectContent>
                           {models.map((model) => (
-                            <SelectItem key={model.id} value={model.id}>
+                            <SelectItem key={modelTargetId(model)} value={modelTargetId(model)}>
                               {modelOptionLabel(model)}
                             </SelectItem>
                           ))}
@@ -1597,7 +1599,7 @@ export default function AgentRunsPage() {
                         </SelectTrigger>
                         <SelectContent>
                           {models.map((model) => (
-                            <SelectItem key={model.id} value={model.id}>
+                            <SelectItem key={modelTargetId(model)} value={modelTargetId(model)}>
                               {modelOptionLabel(model)}
                             </SelectItem>
                           ))}
@@ -1733,7 +1735,7 @@ export default function AgentRunsPage() {
                         </SelectTrigger>
                         <SelectContent>
                           {models.map((model) => (
-                            <SelectItem key={model.id} value={model.id}>
+                            <SelectItem key={modelTargetId(model)} value={modelTargetId(model)}>
                               {modelOptionLabel(model)}
                             </SelectItem>
                           ))}

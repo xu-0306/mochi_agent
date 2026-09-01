@@ -24,6 +24,7 @@ from mochi.config.defaults import (
     DEFAULT_UI_LOCALE,
     DEFAULT_UI_LOCALE_FALLBACK,
 )
+from mochi.config.identity import model_target_id
 from mochi.security.policy import autonomy_mode_defaults, infer_autonomy_mode
 from mochi.tools.web_search_providers import normalize_web_search_provider
 
@@ -277,6 +278,8 @@ class ConfiguredModelConfig(BaseModel):
     """WebGUI 可選模型清單中的非敏感模型設定。"""
 
     id: str = Field(min_length=1)
+    target_id: str | None = Field(default=None, min_length=1)
+    """Canonical runtime target identity; never derive UI keys from label."""
     """模型清單項目的穩定識別碼；可由 `/v1/models/switch` 使用。"""
 
     provider: Literal[
@@ -319,6 +322,19 @@ class ConfiguredModelConfig(BaseModel):
 
     api_key: SecretStr | None = None
     """Per-model API key for remote providers. Never expose this through API payloads."""
+
+    @model_validator(mode="after")
+    def _ensure_target_id(self) -> ConfiguredModelConfig:
+        if not self.target_id:
+            self.target_id = model_target_id(
+                provider=self.provider,
+                model=self.model,
+                model_spec=self.model_spec,
+                base_url=self.base_url,
+                backend_type=self.backend_type,
+                auth_profile_id=self.auth_profile_id,
+            )
+        return self
 
 
 class ModelSetupConfig(BaseModel):

@@ -19,6 +19,7 @@ import { PanelSectionCard } from '@/components/chat/PanelSectionCard'
 import { ThinkingLevelPanelControl } from '@/components/chat/ThinkingLevelControls'
 import { Switch } from '@/components/ui/switch'
 import { fetchGoalStrategies } from '@/lib/api'
+import { modelTargetId } from '@/lib/model-target-id'
 import type {
   AgentRunProtocolId,
   AgentRunRunPolicy,
@@ -1133,7 +1134,7 @@ function WorkflowPanelBody({
                       <SelectContent>
                         <SelectItem value="__unassigned__">Unassigned</SelectItem>
                         {modelOptions.map((model) => (
-                          <SelectItem key={model.id} value={model.id}>
+                          <SelectItem key={modelTargetId(model)} value={modelTargetId(model)}>
                             {model.label}
                           </SelectItem>
                         ))}
@@ -1162,7 +1163,7 @@ function WorkflowPanelBody({
                       <SelectContent>
                         <SelectItem value="__unassigned__">Unassigned</SelectItem>
                         {modelOptions.map((model) => (
-                          <SelectItem key={model.id} value={model.id}>
+                          <SelectItem key={modelTargetId(model)} value={modelTargetId(model)}>
                             {model.label}
                           </SelectItem>
                         ))}
@@ -1517,7 +1518,7 @@ function WorkflowPanelBody({
                               <SelectContent>
                                 <SelectItem value="__unassigned__">Unassigned</SelectItem>
                                 {modelOptions.map((model) => (
-                                  <SelectItem key={model.id} value={model.id}>
+                                  <SelectItem key={modelTargetId(model)} value={modelTargetId(model)}>
                                     {model.label}
                                   </SelectItem>
                                 ))}

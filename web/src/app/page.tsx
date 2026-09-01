@@ -40,6 +40,7 @@ import { WorkspacePanel } from '@/components/chat/WorkspacePanel'
 import { VoiceOverlay } from '@/components/voice/VoiceOverlay'
 import { buildWorkflowProgressCardView } from '@/components/workflow/utils'
 import * as api from '@/lib/api'
+import { modelTargetId } from '@/lib/model-target-id'
 import type { ChatAttachment, Message, ReasoningStep } from '@/lib/chat'
 import {
   buildOptimisticConversationTurnMessages,
@@ -1221,34 +1222,11 @@ function resolveModelId(model: Record<string, unknown> | null | undefined): stri
   if (!model) {
     return null
   }
-  return (
-    getString(model.id) ??
-    getString(model.model_spec) ??
-    getString(model.name) ??
-    getString(model.model) ??
-    getString(model.label)
-  )
-}
-
-function normalizeResolvedModelId(
-  model: Record<string, unknown> | null | undefined,
-  modelId: string | null
-): string | null {
-  if (!modelId) {
-    return null
-  }
-
-  const provider = getString(model?.provider)
-  const backendType = getString(model?.backend_type)
-  if ((provider === 'ollama' || backendType === 'ollama') && !modelId.startsWith('ollama:')) {
-    return `ollama:${modelId}`
-  }
-
-  return modelId
+  return modelTargetId(model) || null
 }
 
 function resolveModelOptionId(model: Record<string, unknown> | null | undefined): string | null {
-  return normalizeResolvedModelId(model, resolveModelId(model))
+  return resolveModelId(model)
 }
 
 function resolveModelLabel(model: Record<string, unknown>, modelId: string): string {
