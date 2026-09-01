@@ -3192,7 +3192,7 @@ export async function updateModelEntry(input: UpdateModelEntryInput): Promise<Up
       model: input.model,
       model_spec: input.modelSpec,
       base_url: input.baseUrl ?? null,
-      api_key: input.apiKey ?? null,
+      ...(input.apiKey !== undefined ? { api_key: input.apiKey } : {}),
       auth_profile_id: input.authProfileId ?? null,
       persist: input.persist,
     }),

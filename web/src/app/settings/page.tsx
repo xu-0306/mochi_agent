@@ -2511,6 +2511,7 @@ function ModelConnectionForm({
   const [editingModelSpec, setEditingModelSpec] = React.useState('')
   const [editingBaseUrl, setEditingBaseUrl] = React.useState('')
   const [editingApiKey, setEditingApiKey] = React.useState('')
+  const [editingApiKeyClearRequested, setEditingApiKeyClearRequested] = React.useState(false)
   const [entrySubmitting, setEntrySubmitting] = React.useState(false)
   const [testingSavedModelId, setTestingSavedModelId] = React.useState<string | null>(null)
   const [entryMessage, setEntryMessage] = React.useState<FormMessage>(null)
@@ -3519,12 +3520,14 @@ function ModelConnectionForm({
     setEditingModelSpec(entry.modelSpec || modelInfoId(entry))
     setEditingBaseUrl(baseUrlFromModelInfo(entry) ?? '')
     setEditingApiKey('')
+    setEditingApiKeyClearRequested(false)
     setEntryMessage(null)
   }
 
   const cancelEditSavedModel = () => {
     setEditingModelId(null)
     setEditingApiKey('')
+    setEditingApiKeyClearRequested(false)
     setEntryMessage(null)
   }
 
@@ -3550,7 +3553,11 @@ function ModelConnectionForm({
         model: editingModelName.trim(),
         modelSpec: payloadModelSpec,
         baseUrl: editingProvider === 'local' ? null : editingBaseUrl.trim(),
-        apiKey: editingProvider === 'openai_codex' ? null : (editingApiKey.trim() || null),
+        apiKey: editingProvider === 'openai_codex'
+          ? null
+          : editingApiKeyClearRequested
+            ? null
+            : (editingApiKey.trim() || undefined),
         authProfileId: editingProvider === 'openai_codex' ? openAICodexStatus?.activeProfileId ?? null : null,
         persist: true,
       })
@@ -3561,6 +3568,7 @@ function ModelConnectionForm({
       setEntryMessage({ type: 'success', text: t('settings.savedModels.successUpdate') })
       setEditingModelId(null)
       setEditingApiKey('')
+      setEditingApiKeyClearRequested(false)
     } catch (updateError) {
       setEntryMessage({
         type: 'error',
