@@ -121,6 +121,7 @@ type ApiModule = typeof api & {
 const settingsApi = api as ApiModule
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|api[_-]?key|credential|authorization)/i
 const MODELS_UPDATED_EVENT = 'mochi:models-updated'
+const TRANSIENT_SUCCESS_MESSAGE_MS = 5000
 const VOICE_ROUTE_UNAVAILABLE_STATUSES = new Set([404, 405])
 
 function isVoiceRouteUnavailable(error: unknown): boolean {
@@ -1584,6 +1585,19 @@ function dedupeVoiceBackendOptions(options: string[], kind: 'stt' | 'tts', curre
 
 type FormMessage = { type: 'success' | 'error'; text: string } | null
 
+function useTransientSuccessMessage(
+  message: FormMessage,
+  setMessage: React.Dispatch<React.SetStateAction<FormMessage>>,
+) {
+  React.useEffect(() => {
+    if (message?.type !== 'success') {
+      return
+    }
+    const timeoutId = window.setTimeout(() => setMessage(null), TRANSIENT_SUCCESS_MESSAGE_MS)
+    return () => window.clearTimeout(timeoutId)
+  }, [message, setMessage])
+}
+
 function InferenceSettingsForm({
   agent,
   settings,
@@ -2518,6 +2532,8 @@ function ModelConnectionForm({
   const [toolProbeBusy, setToolProbeBusy] = React.useState(false)
   const [toolProbeMessage, setToolProbeMessage] = React.useState<FormMessage>(null)
   const [toolProbeResult, setToolProbeResult] = React.useState<Record<string, unknown> | null>(null)
+  useTransientSuccessMessage(discoverMessage, setDiscoverMessage)
+  useTransientSuccessMessage(entryMessage, setEntryMessage)
   const savedModels = React.useMemo(() => configuredModelsFromSettings(settings), [settings])
   const discoveryKeyRef = React.useRef(`${initialProvider}:${baseUrl}`)
   const openAICodexPopupRef = React.useRef<Window | null>(null)
