@@ -4245,14 +4245,31 @@ function ModelConnectionForm({
                       )}
                       {editingProvider !== 'local' && editingProvider !== 'ollama' && editingProvider !== 'openai_codex' ? (
                         <>
-                          <Input
-                            type="password"
-                            autoComplete="off"
-                            value={editingApiKey}
-                            onChange={(event) => setEditingApiKey(event.target.value)}
-                            placeholder={t('settings.form.apiKey')}
-                            className="font-mono text-xs"
-                          />
+                          <div className="flex items-center gap-2">
+                            <Input
+                              type="password"
+                              autoComplete="off"
+                              value={editingApiKey}
+                              onChange={(event) => {
+                                setEditingApiKey(event.target.value)
+                                setEditingApiKeyClearRequested(false)
+                              }}
+                              placeholder={t('settings.form.apiKey')}
+                              className="min-w-0 flex-1 font-mono text-xs"
+                            />
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => {
+                                setEditingApiKey('')
+                                setEditingApiKeyClearRequested(true)
+                              }}
+                              disabled={entrySubmitting || editingApiKeyClearRequested}
+                            >
+                              {t('settings.savedModels.clearApiKey')}
+                            </Button>
+                          </div>
                           <p className="text-[11px] text-muted-foreground">{t('settings.savedModels.apiKeyHint')}</p>
                         </>
                       ) : null}
