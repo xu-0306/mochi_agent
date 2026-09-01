@@ -77,6 +77,7 @@ from mochi.backends.vllm_utils import (
 from mochi.backends.vllm_utils import (
     resolve_vllm_managed_model_spec as shared_resolve_vllm_managed_model_spec,
 )
+from mochi.config.identity import configured_model_target_id, model_target_alias
 from mochi.config.manager import ConfigRevisionConflict, config_revision, save_config
 from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.diagnostics.fallbacks import append_fallback_diagnostic
@@ -910,8 +911,11 @@ async def update_configured_model(
 
     updated = config.model_copy(deep=True)
     models = list(updated.model_setup.configured_models)
+    # `_find_configured_model` resolves an exact object from the pre-copy
+    # config. Preserve that list position so duplicate legacy ids cannot make
+    # a PATCH edit the first sibling instead of the selected target.
     target_index = next(
-        (index for index, item in enumerate(models) if item.id == existing.id),
+        (index for index, item in enumerate(config.model_setup.configured_models) if item is existing),
         None,
     )
     if target_index is None:
@@ -1872,10 +1876,44 @@ def _find_matching_remote_configured_model(
     return None
 
 
-def _serialize_configured_model_entry(model: ConfiguredModelConfig) -> dict[str, Any]:
-    payload = model.model_dump(exclude_none=True, exclude={"api_key"})
+def _serialize_configured_model_entry(
+    model: ConfiguredModelConfig,
+    *,
+    include_target_id: bool = False,
+) -> dict[str, Any]:
+    payload = model.model_dump(exclude_none=True, exclude={"api_key", "target_id"})
+    if include_target_id:
+        payload["target_id"] = configured_model_target_id(model)
     payload["api_key_configured"] = model.api_key is not None
     return payload
+
+
+def _target_id_is_ambiguous(
+    model: ConfiguredModelConfig,
+    models: list[ConfiguredModelConfig],
+) -> bool:
+    """Whether a legacy id needs an explicit target id in a response."""
+
+    target_ids = {
+        configured_model_target_id(candidate)
+        for candidate in models
+        if candidate.id == model.id
+    }
+    return len(target_ids) > 1
+
+
+def _serialize_configured_model_entries(
+    models: list[ConfiguredModelConfig],
+) -> list[dict[str, Any]]:
+    """Serialize entries without secrets, exposing IDs only when ambiguous."""
+
+    return [
+        _serialize_configured_model_entry(
+            model,
+            include_target_id=_target_id_is_ambiguous(model, models),
+        )
+        for model in models
+    ]
 
 
 def _serialize_tested_model_info(
@@ -2246,12 +2284,13 @@ def _serialize_configured_models(config: MochiConfig) -> list[dict[str, Any]]:
             models,
             _configured_model_from_config(config),
         )
-    return [_serialize_configured_model_entry(model) for model in models]
+    return _serialize_configured_model_entries(models)
 
 
 def _dump_saved_configured_models(config: MochiConfig) -> list[dict[str, Any]]:
     """?豯止齒???踐????config.model_setup ???????畾???? runtime fallback??"""
-    return [_serialize_configured_model_entry(model) for model in config.model_setup.configured_models]
+    models = list(config.model_setup.configured_models)
+    return _serialize_configured_model_entries(models)
 
 
 def _configured_model_from_config(config: MochiConfig) -> ConfiguredModelConfig:
@@ -2614,7 +2653,20 @@ def _configured_model_matches_identifier(
     model_id: str,
 ) -> bool:
     """???????梱???秋??撖? API ??喉?朱?瞏汕?"""
-    if model.id == model_id or model.model_spec == model_id:
+    if (
+        model.id == model_id
+        or model.target_id == model_id
+        or configured_model_target_id(model) == model_id
+        or model_target_alias(
+            provider=model.provider,
+            model=model.model,
+            model_spec=model.model_spec,
+            base_url=model.base_url,
+            backend_type=model.backend_type,
+            auth_profile_id=model.auth_profile_id,
+        ) == model_id
+        or model.model_spec == model_id
+    ):
         return True
     if model.provider != "local":
         return False
@@ -2633,15 +2685,10 @@ def _configured_models_equivalent(
         return False
     if left.provider == "local":
         return _local_model_specs_equivalent(left.model_spec, right.model_spec)
-    return (
-        left.id == right.id
-        or (
-            left.model == right.model
-            and left.model_spec == right.model_spec
-            and (left.base_url or "") == (right.base_url or "")
-            and (left.auth_profile_id or "") == (right.auth_profile_id or "")
-        )
-    )
+    # For remote targets the canonical target id is the identity. A legacy
+    # display-shaped `id` may be shared by two endpoints serving the same
+    # model, so it must never collapse otherwise distinct entries.
+    return configured_model_target_id(left) == configured_model_target_id(right)
 
 
 def _local_model_specs_equivalent(left: str, right: str) -> bool:

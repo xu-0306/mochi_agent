@@ -14,6 +14,7 @@ from mochi.auth.openai_codex import OpenAICodexAuthService, normalize_openai_cod
 from mochi.backends.inference_capabilities import ReasoningEffort
 from mochi.backends.vllm_utils import configured_vllm_launch_mode
 from mochi.config.defaults import DEFAULT_EDGE_TTS_VOICE_PRESETS
+from mochi.config.identity import configured_model_target_id
 from mochi.config.manager import (
     EMPTY_CONFIG_REVISION,
     ConfigRevisionConflict,
@@ -566,6 +567,31 @@ def _preflight_sessions_dir(
         ) from exc
 
 
+def _serialize_settings_model_entries(
+    models: list[Any],
+) -> list[dict[str, Any]]:
+    """Serialize configured models without secrets.
+
+    Legacy clients identify entries by id. Only expose the canonical target
+    id when that legacy id is ambiguous, keeping the response shape compatible
+    while giving clients an unambiguous value to use as a key.
+    """
+
+    ids_to_targets: dict[str, set[str]] = {}
+    for model in models:
+        model_id = getattr(model, "id", "")
+        ids_to_targets.setdefault(model_id, set()).add(configured_model_target_id(model))
+
+    serialized: list[dict[str, Any]] = []
+    for model in models:
+        payload = model.model_dump(exclude={"api_key", "target_id"})
+        if len(ids_to_targets.get(model.id, set())) > 1:
+            payload["target_id"] = configured_model_target_id(model)
+        payload["api_key_configured"] = model.api_key is not None
+        serialized.append(payload)
+    return serialized
+
+
 def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> dict[str, Any]:
     """建立 WebGUI 使用的非敏感設定 payload。"""
     trajectory_path = Path(config.workspace_dir).expanduser() / "trajectories.jsonl"
@@ -608,13 +634,9 @@ def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> di
             "default_model_spec": config.model_setup.default_model_spec,
             "setup_required": config.model_setup.setup_required,
             "fallback_chain": list(config.model_setup.fallback_chain),
-            "configured_models": [
-                {
-                    **model.model_dump(exclude={"api_key"}),
-                    "api_key_configured": model.api_key is not None,
-                }
-                for model in config.model_setup.configured_models
-            ],
+            "configured_models": _serialize_settings_model_entries(
+                list(config.model_setup.configured_models)
+            ),
         },
         "locale_defaults": {
             "region_profile": config.locale_defaults.region_profile,

@@ -44,6 +44,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import * as api from '@/lib/api'
+import { modelTargetId } from '@/lib/model-target-id'
 import { InferenceControls } from '@/components/chat/InferenceControls'
 import {
   AUTO_LANGUAGE,
@@ -659,7 +660,7 @@ function modelReasoningMetadata(modelInfo: api.ModelInfo | null | undefined): {
 }
 
 function modelInfoId(modelInfo: api.ModelInfo): string {
-  return modelInfo.id || modelInfo.modelSpec || modelInfo.name
+  return modelTargetId(modelInfo) || modelInfo.modelSpec || modelInfo.name
 }
 
 function modelInfoLabel(modelInfo: api.ModelInfo): string {
@@ -763,10 +764,12 @@ function stringField(record: Record<string, unknown>, key: string): string | nul
 }
 
 function modelInfoFromRecord(record: Record<string, unknown>): api.ModelInfo | null {
+  const targetId = modelTargetId(record)
   const id =
-    stringField(record, 'id') ??
-    stringField(record, 'model_spec') ??
-    stringField(record, 'name') ??
+    targetId ||
+    stringField(record, 'id') ||
+    stringField(record, 'model_spec') ||
+    stringField(record, 'name') ||
     stringField(record, 'model')
   if (!id) {
     return null
@@ -780,6 +783,7 @@ function modelInfoFromRecord(record: Record<string, unknown>): api.ModelInfo | n
 
   return {
     id,
+    targetId: targetId || undefined,
     name,
     label: stringField(record, 'label') ?? name,
     provider: stringField(record, 'provider') ?? inferProviderChoice(id),
@@ -826,6 +830,7 @@ function mergeModelInfos(primary: api.ModelInfo[], secondary: api.ModelInfo[]): 
 function configuredModelRecordFromModelInfo(modelInfo: api.ModelInfo): Record<string, string | null> {
   return {
     id: modelInfoId(modelInfo),
+    target_id: modelInfoId(modelInfo),
     label: modelInfoLabel(modelInfo),
     provider: modelInfo.provider ?? null,
     model: modelInfo.name || null,

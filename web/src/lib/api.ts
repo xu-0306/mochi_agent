@@ -16,6 +16,7 @@ import { formatChatErrorDiagnostics } from '@/lib/chat-error-display'
 import { createClientBackendFailure, type FailureEnvelopeInput } from '@/lib/failure-presentation'
 import { createTimelineErrorMessage, getErrorEventContent } from '@/lib/chat-error-projection'
 import { decodeSseJsonFrames, normalizeAdaptiveRuntimeEnvelope } from './ordinary-chat-runtime-stream'
+import { modelTargetId } from './model-target-id'
 import {
   normalizeToolExposureDiagnostics,
   normalizeToolWorkflowProjection,
@@ -2738,6 +2739,7 @@ export async function deleteProject(projectId: string): Promise<void> {
 
 interface BackendModelInfo extends Record<string, ApiValue | undefined> {
   id?: string
+  target_id?: string
   name?: string
   label?: string
   model?: string
@@ -2745,6 +2747,8 @@ interface BackendModelInfo extends Record<string, ApiValue | undefined> {
   provider?: string
   base_url?: string | null
   backend_type?: string
+  auth_profile_id?: string | null
+  auth_mode?: string | null
   context_length?: number
   supports_tool_calling?: boolean
   metadata?: Record<string, ApiValue>
@@ -2771,6 +2775,7 @@ interface BackendToolCallingProbeResponse {
 
 export interface ModelInfo {
   id: string
+  targetId?: string
   name: string
   label: string
   provider: string | null
@@ -2779,6 +2784,7 @@ export interface ModelInfo {
   backendType: string
   authProfileId: string | null
   authMode: string | null
+  apiKeyConfigured?: boolean
   contextLength: number | null
   supportsToolCalling: boolean | null
   metadata: Record<string, ApiValue>
@@ -3064,8 +3070,17 @@ function normalizeModelInfo(model: BackendModelInfo | Record<string, unknown> | 
     }
   }
 
+  const targetId = modelTargetId(model)
+  const normalizedId =
+    targetId ||
+    getString(model.id) ||
+    getString(model.model_spec) ||
+    getString(model.name) ||
+    getString(model.model) ||
+    ''
   return {
-    id: getString(model.id) ?? getString(model.model_spec) ?? getString(model.name) ?? getString(model.model) ?? '',
+    id: normalizedId,
+    targetId: targetId || undefined,
     name: getString(model.name) ?? getString(model.model) ?? getString(model.model_spec) ?? '',
     label: getString(model.label) ?? getString(model.name) ?? getString(model.model) ?? '',
     provider: getString(model.provider),
@@ -3074,6 +3089,7 @@ function normalizeModelInfo(model: BackendModelInfo | Record<string, unknown> | 
     backendType: getString(model.backend_type) ?? '',
     authProfileId: getString(model.auth_profile_id),
     authMode: getString(model.auth_mode),
+    apiKeyConfigured: getBoolean(model.api_key_configured) ?? undefined,
     contextLength: getNumber(model.context_length) ?? null,
     supportsToolCalling: getBoolean(model.supports_tool_calling) ?? null,
     metadata,
