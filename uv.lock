@@ -1516,6 +1516,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "loguru" },
@@ -1583,6 +1584,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.33" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "discord-ext-voice-recv", marker = "extra == 'channels'", specifier = ">=0.5.2a179" },
     { name = "discord-py", extras = ["voice"], marker = "extra == 'channels'", specifier = ">=2.3" },
     { name = "edge-tts", marker = "extra == 'voice'", specifier = ">=6.1" },

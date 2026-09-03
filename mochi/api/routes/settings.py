@@ -45,6 +45,7 @@ from mochi.config.schema import (
 from mochi.learning.skill_library_factory import resolve_skills_db_path
 from mochi.security.policy import autonomy_mode_defaults
 from mochi.security.rollout import project_sandbox_rollout
+from mochi.security.secret_store import SecretStoreError
 from mochi.sessions.store import (
     SessionsDirectoryRestartRequired,
     ensure_sessions_dir_unchanged,
@@ -443,6 +444,7 @@ async def update_settings(
             updated,
             payload.persist,
             expected_revision=expected_revision,
+            clear_secret_scopes=_secret_clear_scopes(payload),
         )
     except ConfigRevisionConflict as exc:
         raise HTTPException(
@@ -451,6 +453,11 @@ async def update_settings(
                 "code": "settings_revision_conflict",
                 "current_revision": exc.current_revision,
             },
+        ) from exc
+    except SecretStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Encrypted secret storage is unavailable; credentials were not written.",
         ) from exc
 
     request.app.state.config = updated
@@ -564,6 +571,11 @@ def _preflight_sessions_dir(
                 "current_root": exc.current_root,
                 "requested_root": exc.requested_root,
             },
+        ) from exc
+    except SecretStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Encrypted secret storage is unavailable; credentials were not written.",
         ) from exc
 
 
@@ -821,6 +833,34 @@ def _settings_payload(config: MochiConfig, *, revision: str | None = None) -> di
     }
 
 
+_SECRET_PATCH_FIELDS = {
+    "stt_openai_api_key",
+    "tts_openai_api_key",
+    "web_search_tavily_api_key",
+    "web_search_serper_api_key",
+    "web_search_jina_api_key",
+    "web_search_exa_api_key",
+    "web_search_brave_api_key",
+    "web_fetch_jina_api_key",
+}
+
+
+def _secret_clear_scopes(payload: UpdateSettingsRequest) -> list[str]:
+    """Return config scopes explicitly set to null by a settings patch."""
+
+    scopes: list[str] = []
+    for section_name in ("voice", "tools"):
+        section = getattr(payload, section_name, None)
+        if section is None:
+            continue
+        for field_name in section.model_fields_set:
+            value = getattr(section, field_name, None)
+            is_empty_secret = isinstance(value, SecretStr) and not value.get_secret_value().strip()
+            if field_name in _SECRET_PATCH_FIELDS and (value is None or is_empty_secret):
+                scopes.append(f"{section_name}/{field_name}")
+    return scopes
+
+
 def _apply_settings_patch(config: MochiConfig, payload: UpdateSettingsRequest) -> MochiConfig:
     updates: dict[str, Any] = {}
     if payload.agent is not None:
@@ -1075,6 +1115,7 @@ def _persist_config_if_enabled(
     persist: bool,
     *,
     expected_revision: str | None,
+    clear_secret_scopes: list[str] | None = None,
 ) -> Path | None:
     if not persist:
         return None
@@ -1083,7 +1124,18 @@ def _persist_config_if_enabled(
         return None
     if expected_revision is None:
         raise RuntimeError("Persistent settings updates require an expected revision.")
-    path = save_config(config, config_path, expected_revision=expected_revision)
+    try:
+        path = save_config(
+            config,
+            config_path,
+            expected_revision=expected_revision,
+            clear_secret_scopes=clear_secret_scopes or (),
+        )
+    except SecretStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Encrypted secret storage is unavailable; credentials were not written.",
+        ) from exc
     request.app.state.config_revision = config_revision(path)
     return path
 

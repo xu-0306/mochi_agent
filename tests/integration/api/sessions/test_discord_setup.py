@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from mochi.config.manager import load_config
 from mochi.config.schema import MochiConfig
 
 from ._support import _create_test_app
@@ -72,7 +73,16 @@ def test_discord_setup_persists_secret_without_exposing_it(tmp_path: Path) -> No
     assert "discord-super-secret-token" not in response.text
 
     saved_text = config_path.read_text(encoding="utf-8")
-    assert "discord-super-secret-token" in saved_text
+    assert "discord-super-secret-token" not in saved_text
+    assert "bot_token:" not in saved_text
+    assert (config_path.parent / "secrets.enc").is_file()
+
+    reloaded = load_config(config_path)
+    assert reloaded.channels.discord.bot_token is not None
+    assert (
+        reloaded.channels.discord.bot_token.get_secret_value()
+        == "discord-super-secret-token"
+    )
 
 
 

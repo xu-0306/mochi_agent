@@ -78,14 +78,14 @@ via `trafilatura`.
 
 The default config lookup order is:
 
-1. Platform user config: `mochi/config.yaml` on Windows, `~/.mochi/config.yaml` on Linux/macOS
+1. Platform user config: `.mochi/config.yaml` on Windows, `~/.mochi/config.yaml` on Linux/macOS
 2. `configs/default.yaml`
 
 To create a user config:
 
 ```bash
 # Windows
-copy configs\default.yaml mochi\config.yaml
+copy configs\default.yaml .mochi\config.yaml
 
 # Linux/macOS
 mkdir -p ~/.mochi

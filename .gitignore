@@ -25,6 +25,8 @@ env/
 .coverage
 htmlcov/
 .tox/
+tmp
+tmp-research-render
 
 # Type checking
 .mypy_cache/
@@ -89,6 +91,10 @@ mochi/sessions/*
 mochi/skills/
 mochi/plugins/
 mochi/memory/
+
+# Encrypted local credential store; never track credentials or their DPAPI-protected key.
+secrets.enc
+secrets.enc.key
 
 # Local scratch files
 1.txt

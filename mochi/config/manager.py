@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +23,9 @@ from pydantic import SecretStr
 
 from mochi.config import defaults
 from mochi.config.schema import MochiConfig
+from mochi.config.secrets import hydrate_config_secrets, persist_config_secrets
 from mochi.runtime.security_audit import register_known_secrets
+from mochi.security.secret_store import SecretStoreError
 
 if os.name == "nt":
     import ctypes
@@ -287,6 +289,45 @@ def _should_persist_windows_migration(
     )
 
 
+def _hydrate_and_migrate_secrets(
+    config: MochiConfig,
+    config_path: str | Path | None,
+) -> bool:
+    """Hydrate encrypted credentials and clean legacy plaintext on disk."""
+
+    path = Path(config_path).expanduser() if config_path is not None else None
+    secret_path = path.parent / "secrets.enc" if path is not None else None
+    key_path = path.parent / "secrets.enc.key" if path is not None else None
+    secret_before = secret_path.read_bytes() if secret_path is not None and secret_path.exists() else None
+    key_before = key_path.read_bytes() if key_path is not None and key_path.exists() else None
+    migrated = hydrate_config_secrets(config, config_path)
+    if not migrated or config_path is None:
+        return False
+    assert path is not None
+    if not path.is_file() or path.resolve(strict=False) == PROJECT_DEFAULT_CONFIG_PATH.resolve(strict=False):
+        return False
+    try:
+        expected_revision = _revision(path.read_bytes())
+        save_config(config, path, expected_revision=expected_revision)
+        return True
+    except SecretStoreError:
+        assert secret_path is not None and key_path is not None
+        _restore_secret_file(secret_path, secret_before)
+        _restore_secret_file(key_path, key_before)
+        raise
+    except ConfigRevisionConflict:
+        assert secret_path is not None and key_path is not None
+        _restore_secret_file(secret_path, secret_before)
+        _restore_secret_file(key_path, key_before)
+        _safe_debug_log(f"Skipped legacy secret migration because config changed: {path}")
+    except Exception as exc:  # pragma: no cover - defensive startup logging
+        assert secret_path is not None and key_path is not None
+        _restore_secret_file(secret_path, secret_before)
+        _restore_secret_file(key_path, key_before)
+        _safe_debug_log(f"Skipped legacy secret migration for {path}: {exc}")
+    return False
+
+
 def load_config(config_path: str | Path | None = None) -> MochiConfig:
     """從 YAML 檔案載入設定，找不到時回傳預設值。
 
@@ -315,6 +356,12 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
             prepared = _apply_env_overrides(_apply_platform_path_defaults(raw))
             normalized = _normalize_windows_runtime_paths(prepared)
             config = MochiConfig.model_validate(normalized)
+            secret_path = (
+                user_config_path()
+                if path.resolve(strict=False) == PROJECT_DEFAULT_CONFIG_PATH.resolve(strict=False)
+                else path
+            )
+            _hydrate_and_migrate_secrets(config, secret_path)
             register_known_secrets(config)
             if config_path is None and _should_persist_windows_migration(
                 source_path=path,
@@ -335,6 +382,7 @@ def load_config(config_path: str | Path | None = None) -> MochiConfig:
             _apply_env_overrides(_apply_platform_path_defaults({}))
         )
     )
+    _hydrate_and_migrate_secrets(config, config_path or user_config_path())
     register_known_secrets(config)
     return config
 
@@ -358,6 +406,9 @@ def load_config_snapshot(config_path: str | Path | None = None) -> ConfigSnapsho
         raw = b""
         exists = False
     config = _config_from_bytes(raw) if exists else fallback_config or _config_from_bytes(b"")
+    migrated = _hydrate_and_migrate_secrets(config, path)
+    if migrated and exists and path.exists():
+        raw = path.read_bytes()
     register_known_secrets(config)
     return ConfigSnapshot(
         config=config,
@@ -381,17 +432,17 @@ def save_config(
     config_path: str | Path | None = None,
     *,
     expected_revision: str,
+    clear_secret_scopes: Iterable[str] = (),
 ) -> Path:
     """將設定保存成 YAML，預設寫入使用者設定檔。
 
-    `SecretStr` 會以原始值寫入本機檔案；呼叫端仍需避免將檔案內容回傳到 API。
+    SecretStr values are persisted in the encrypted local secret store and
+    omitted from YAML. If no protected key source is available, this operation
+    fails closed instead of writing plaintext credentials.
     """
     path = Path(config_path) if config_path is not None else user_config_path()
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    register_known_secrets(config)
-    data = _serialize_for_yaml(config.model_dump(mode="python"))
-    encoded = yaml.safe_dump(data, allow_unicode=True, sort_keys=False).encode("utf-8")
     with _config_path_lock(path):
         current_revision = config_revision(path)
         if current_revision != expected_revision:
@@ -400,9 +451,48 @@ def save_config(
                 current_revision=current_revision,
                 path=path,
             )
-        _atomic_write_config(path, encoded)
+        # Keep secret persistence behind the same CAS check. Restore the prior
+        # encrypted bytes if YAML persistence fails, so a failed save cannot
+        # leave a credential that the old YAML will hydrate later.
+        secret_path = path.parent / "secrets.enc"
+        key_path = path.parent / "secrets.enc.key"
+        config_before = path.read_bytes() if path.exists() else None
+        secret_before = secret_path.read_bytes() if secret_path.exists() else None
+        key_before = key_path.read_bytes() if key_path.exists() else None
+        try:
+            persist_config_secrets(config, path, clear_scopes=clear_secret_scopes)
+            register_known_secrets(config)
+            data = _serialize_for_yaml(config.model_dump(mode="python"))
+            encoded = yaml.safe_dump(data, allow_unicode=True, sort_keys=False).encode("utf-8")
+            _atomic_write_config(path, encoded)
+        except BaseException:
+            _restore_config_file(path, config_before)
+            _restore_secret_file(secret_path, secret_before)
+            _restore_secret_file(key_path, key_before)
+            raise
     _safe_debug_log("Saved config to {}", path)
     return path
+
+
+def _restore_secret_file(path: Path, previous: bytes | None) -> None:
+    """Restore a secret-store file after a failed paired config save."""
+    if previous is None:
+        with suppress(FileNotFoundError):
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(previous)
+    with suppress(OSError):
+        path.chmod(0o600)
+
+
+def _restore_config_file(path: Path, previous: bytes | None) -> None:
+    """Restore YAML bytes after a paired persistence failure."""
+    if previous is None:
+        with suppress(FileNotFoundError):
+            path.unlink()
+        return
+    path.write_bytes(previous)
 
 
 def _selected_config_path(config_path: str | Path | None) -> Path:
@@ -555,16 +645,44 @@ def _fsync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
-def _serialize_for_yaml(value: Any) -> Any:
+_OMIT_FROM_YAML = object()
+_SECRET_FIELD_NAMES = {
+    "api_key",
+    "stt_openai_api_key",
+    "tts_openai_api_key",
+    "web_search_tavily_api_key",
+    "web_search_serper_api_key",
+    "web_search_jina_api_key",
+    "web_search_exa_api_key",
+    "web_search_brave_api_key",
+    "web_fetch_jina_api_key",
+    "semantic_scholar_api_key",
+    "pubmed_api_key",
+    "bot_token",
+}
+
+
+def _serialize_for_yaml(value: Any, *, key: str | None = None) -> Any:
     """轉換 Pydantic dump 結果為 PyYAML 可安全輸出的基本型別。"""
-    if isinstance(value, SecretStr):
-        return value.get_secret_value()
+    if isinstance(value, SecretStr) or (
+        key in _SECRET_FIELD_NAMES and value is None
+    ):
+        return _OMIT_FROM_YAML
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
         mapping = cast(dict[Any, Any], value)
-        return {key: _serialize_for_yaml(item) for key, item in mapping.items()}
+        serialized: dict[Any, Any] = {}
+        for key, item in mapping.items():
+            normalized = _serialize_for_yaml(item, key=str(key))
+            if normalized is not _OMIT_FROM_YAML:
+                serialized[key] = normalized
+        return serialized
     if isinstance(value, list):
         items = cast(list[Any], value)
-        return [_serialize_for_yaml(item) for item in items]
+        return [
+            normalized
+            for item in items
+            if (normalized := _serialize_for_yaml(item)) is not _OMIT_FROM_YAML
+        ]
     return value

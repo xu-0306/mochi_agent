@@ -18,6 +18,7 @@ from mochi.auth.openai_codex import (
 )
 from mochi.config.manager import ConfigRevisionConflict, config_revision, save_config
 from mochi.config.schema import MochiConfig
+from mochi.security.secret_store import SecretStoreError
 
 router = APIRouter(prefix="/v1/model-auth")
 
@@ -107,6 +108,11 @@ def _persist_config_if_possible(request: Request, config: MochiConfig) -> Path |
                 "current_revision": exc.current_revision,
             },
         ) from exc
+    except SecretStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Encrypted secret storage is unavailable; credentials were not written.",
+        ) from exc
     request.app.state.config_revision = config_revision(path)
     return path
 
@@ -114,8 +120,8 @@ def _persist_config_if_possible(request: Request, config: MochiConfig) -> Path |
 def _set_active_profile(request: Request, config: MochiConfig, profile_id: str | None) -> MochiConfig:
     updated = config.model_copy(deep=True)
     updated.openai_codex.auth_profile_id = profile_id
-    request.app.state.config = updated
     _persist_config_if_possible(request, updated)
+    request.app.state.config = updated
     return updated
 
 
