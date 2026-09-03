@@ -1,5 +1,5 @@
 # Mochi 預設設定檔
-# Windows 預設使用 mochi/config.yaml；Linux/macOS 預設使用 ~/.mochi/config.yaml。
+# Windows 預設使用 .mochi/config.yaml；Linux/macOS 預設使用 ~/.mochi/config.yaml。
 # 可複製此檔案到對應位置後依需求修改。
 
 # 預設模型規格
@@ -209,8 +209,8 @@ web:
 
 # 路徑設定
 # 未設定時會依平台選擇：
-#   Windows: mochi/config.yaml, mochi/workspace, mochi/sessions,
-#            mochi/skills, mochi/plugins, mochi/memory/memory.db
+#   Windows: .mochi/config.yaml, .mochi/workspace, .mochi/sessions,
+#            .mochi/skills, .mochi/plugins, .mochi/memory.db
 #   Linux/macOS: ~/.mochi/config.yaml, ~/.mochi, ~/.mochi/sessions,
 #                ~/.mochi/skills, ~/.mochi/plugins, ~/.mochi/memory.db
 # 可用 MOCHI_WORKSPACE_DIR / MOCHI_SESSIONS_DIR / MOCHI_SKILLS_DIR /

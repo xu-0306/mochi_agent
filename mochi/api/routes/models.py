@@ -81,6 +81,7 @@ from mochi.config.identity import configured_model_target_id, model_target_alias
 from mochi.config.manager import ConfigRevisionConflict, config_revision, save_config
 from mochi.config.schema import ConfiguredModelConfig, MochiConfig
 from mochi.diagnostics.fallbacks import append_fallback_diagnostic
+from mochi.security.secret_store import SecretStoreError
 
 router = APIRouter(prefix="/v1")
 
@@ -717,13 +718,13 @@ async def install_local_model_runtime(
         warnings.extend(install_result.warnings)
         message = install_result.message
 
+    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
     request.app.state.config = updated
     request.app.state.local_model_converter = None
     engine = await _get_or_create_engine(request.app)
     apply_config = getattr(engine, "apply_config", None)
     if callable(apply_config):
         await _maybe_await(apply_config(updated, reload_voice=False))
-    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
     runtime_status = _serialize_local_runtime_status(_discover_local_runtime_status(request, updated))
 
     return LocalModelRuntimeInstallResponse(
@@ -800,8 +801,8 @@ async def convert_local_model(
             updated.model_setup.configured_models,
             saved_entry,
         )
-        request.app.state.config = updated
         persisted_path = _persist_config_if_enabled(request, updated, True)
+        request.app.state.config = updated
         saved_as_model = _serialize_configured_model_entry(saved_entry)
         available_models = _serialize_configured_models(updated)
         active_model = saved_as_model
@@ -1059,9 +1060,16 @@ async def update_configured_model(
     api_key_changed = "api_key" in payload.model_fields_set
     next_entry_api_key: SecretStr | None = existing.api_key
     if next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS:
-        incoming_api_key = (payload.api_key or "").strip() if api_key_changed else None
-        if incoming_api_key is not None:
+        if api_key_changed:
+            incoming_api_key = (payload.api_key or "").strip()
             next_entry_api_key = SecretStr(incoming_api_key) if incoming_api_key else None
+        elif next_entry_api_key is None:
+            # Legacy entries may have inherited the global OpenAI-compatible
+            # credential. Materialize that value into the replacement so an
+            # unrelated edit does not accidentally clear it.
+            inherited_api_key = _configured_model_api_key(existing, config)
+            if inherited_api_key:
+                next_entry_api_key = SecretStr(inherited_api_key)
     else:
         next_entry_api_key = None
 
@@ -1088,14 +1096,22 @@ async def update_configured_model(
     updated.model_setup.configured_models = deduped_models
 
     is_active_entry = _is_configured_model_active(config, existing)
+    engine: Any | None = None
     if is_active_entry:
         updated = _apply_configured_model_to_config(updated, replacement)
+        if next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS:
+            # Ensure the runtime switch observes an explicit clear/new value,
+            # rather than falling back to the previous global credential.
+            updated.openai_compat.api_key = next_entry_api_key
+        elif next_provider not in {"openai_codex"}:
+            updated.openai_compat.api_key = None
         engine = await _get_or_create_engine(request.app)
         try:
-            await _switch_configured_model(request, engine, config, replacement)
+            await _switch_configured_model(request, engine, updated, replacement)
         except (RuntimeError, ValueError) as exc:
             raise _translate_model_switch_error(exc) from exc
 
+    clear_global_secret = False
     api_key_configured = False
     if next_provider == "openai_codex":
         updated.openai_codex.base_url = (next_base_url or next_model_spec).rstrip("/")
@@ -1111,9 +1127,29 @@ async def update_configured_model(
             updated.openai_compat.api_key = next_entry_api_key
     else:
         api_key_configured = False
+        if is_active_entry:
+            # A remote active model was replaced by a local target. Do not
+            # leave its global credential in memory or in the encrypted store.
+            updated.openai_compat.api_key = None
+            clear_global_secret = True
 
+    if is_active_entry and next_provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS:
+        clear_global_secret = api_key_changed and next_entry_api_key is None
+
+    clear_scopes: list[str] = []
+    if api_key_changed and not next_entry_api_key:
+        clear_scopes.extend([_model_secret_scope(existing), _model_secret_scope(replacement)])
+    if clear_global_secret:
+        clear_scopes.append(_global_model_secret_scope())
+    persisted_path = await _persist_model_config_with_rollback(
+        request,
+        updated,
+        payload.persist,
+        engine=engine,
+        previous_config=config,
+        clear_secret_scopes=clear_scopes,
+    )
     request.app.state.config = updated
-    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
     return UpdateConfiguredModelResponse(
         updated_model=_serialize_configured_model_entry(replacement),
         available_models=_dump_saved_configured_models(updated),
@@ -1149,10 +1185,14 @@ async def delete_configured_model(
     ]
     updated.model_setup.configured_models = remaining
 
-    if _is_configured_model_active(config, existing):
+    active_deleted = _is_configured_model_active(config, existing)
+    active_deleted_remote = active_deleted and existing.provider in _OPENAI_COMPAT_EXTERNAL_PROVIDERS
+    if active_deleted:
         if remaining:
             fallback = remaining[0]
             updated = _apply_configured_model_to_config(updated, fallback)
+            if active_deleted_remote and fallback.provider not in _OPENAI_COMPAT_EXTERNAL_PROVIDERS:
+                updated.openai_compat.api_key = None
             append_fallback_diagnostic(
                 diagnostics,
                 category="model_selection",
@@ -1169,6 +1209,8 @@ async def delete_configured_model(
             )
         else:
             updated.model = updated.model_setup.default_model_spec
+            if active_deleted_remote:
+                updated.openai_compat.api_key = None
             append_fallback_diagnostic(
                 diagnostics,
                 category="model_selection",
@@ -1181,14 +1223,21 @@ async def delete_configured_model(
                 metadata={"from_model_spec": existing.model_spec},
             )
 
+    should_persist = True if payload is None else payload.persist
+    scopes = [_model_secret_scope(existing)]
+    if active_deleted_remote and updated.openai_compat.api_key is None:
+        scopes.append(_global_model_secret_scope())
+    persisted_path = _persist_config_if_enabled(
+        request,
+        updated,
+        should_persist,
+        clear_secret_scopes=scopes,
+    )
     request.app.state.config = updated
     engine = await _get_or_create_engine(request.app)
     apply_config = getattr(engine, "apply_config", None)
     if callable(apply_config):
         await _maybe_await(apply_config(updated, reload_voice=False))
-
-    should_persist = True if payload is None else payload.persist
-    persisted_path = _persist_config_if_enabled(request, updated, should_persist)
     return DeleteConfiguredModelResponse(
         deleted_model_id=existing.id,
         available_models=_dump_saved_configured_models(updated),
@@ -1267,8 +1316,10 @@ async def configure_model(
                 active_model=model_info,
             ),
         )
+        persisted_path = await _persist_model_config_with_rollback(
+            request, updated, payload.persist, engine=engine, previous_config=config
+        )
         request.app.state.config = updated
-        persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
             active_model=_serialize_active_model_info(
@@ -1307,8 +1358,10 @@ async def configure_model(
                 active_model=model_info,
             ),
         )
+        persisted_path = await _persist_model_config_with_rollback(
+            request, updated, payload.persist, engine=engine, previous_config=config
+        )
         request.app.state.config = updated
-        persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
             active_model=_serialize_active_model_info(
@@ -1371,8 +1424,10 @@ async def configure_model(
                 auth_mode="oauth",
             ),
         )
+        persisted_path = await _persist_model_config_with_rollback(
+            request, updated, payload.persist, engine=engine, previous_config=config
+        )
         request.app.state.config = updated
-        persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
             active_model=_serialize_active_model_info(
@@ -1442,8 +1497,10 @@ async def configure_model(
                 api_key=SecretStr(effective_api_key) if effective_api_key else None,
             ),
         )
+        persisted_path = await _persist_model_config_with_rollback(
+            request, updated, payload.persist, engine=engine, previous_config=config
+        )
         request.app.state.config = updated
-        persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
         return ConfigureModelResponse(
             provider=payload.provider,
             active_model=_serialize_active_model_info(
@@ -1504,8 +1561,10 @@ async def configure_model(
             api_key=SecretStr(effective_api_key) if effective_api_key else None,
         ),
     )
+    persisted_path = await _persist_model_config_with_rollback(
+        request, updated, payload.persist, engine=engine, previous_config=config
+    )
     request.app.state.config = updated
-    persisted_path = _persist_config_if_enabled(request, updated, payload.persist)
 
     return ConfigureModelResponse(
         provider=payload.provider,
@@ -2350,21 +2409,71 @@ def _serialize_model_info(info: Any) -> dict[str, Any]:
     """??ModelInfo-like ??麾?改? JSON-safe dict??"""
     if is_dataclass(info):
         payload = asdict(info)
-        return jsonable_encoder({key: value for key, value in payload.items() if value is not None})
-    if hasattr(info, "model_dump"):
+    elif hasattr(info, "model_dump"):
         payload = info.model_dump()
-        return jsonable_encoder({key: value for key, value in payload.items() if value is not None})
-    if isinstance(info, dict):
-        return jsonable_encoder({key: value for key, value in info.items() if value is not None})
-    return jsonable_encoder(
-        {
+    elif isinstance(info, dict):
+        payload = info
+    else:
+        payload = {
             "name": getattr(info, "name", ""),
             "backend_type": getattr(info, "backend_type", ""),
             "context_length": getattr(info, "context_length", None),
             "supports_tool_calling": getattr(info, "supports_tool_calling", None),
             "metadata": getattr(info, "metadata", {}),
         }
+    sanitized = _strip_sensitive_model_info(payload)
+    if isinstance(sanitized, dict):
+        return jsonable_encoder({key: value for key, value in sanitized.items() if value is not None})
+    return jsonable_encoder(sanitized)
+
+
+_SENSITIVE_MODEL_INFO_KEYS = {
+    "api_key",
+    "apikey",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "id_token",
+    "idtoken",
+    "authorization",
+    "password",
+    "secret",
+}
+
+
+def _is_sensitive_model_info_key(key: str) -> bool:
+    normalized = re.sub(r"[-\s]", "_", key).casefold()
+    return (
+        normalized in _SENSITIVE_MODEL_INFO_KEYS
+        or normalized.endswith("_api_key")
+        or normalized.endswith("apikey")
+        or normalized.endswith("_token")
+        or normalized.endswith("token")
     )
+
+
+def _strip_sensitive_model_info(value: Any) -> Any:
+    """Remove credential-shaped fields before model info reaches an API response."""
+
+    if isinstance(value, SecretStr):
+        return None
+    if isinstance(value, dict):
+        sanitized: dict[Any, Any] = {}
+        for key, item in value.items():
+            if _is_sensitive_model_info_key(str(key)):
+                continue
+            cleaned = _strip_sensitive_model_info(item)
+            if cleaned is not None:
+                sanitized[key] = cleaned
+        return sanitized
+    if isinstance(value, list):
+        return [
+            cleaned
+            for item in value
+            if (cleaned := _strip_sensitive_model_info(item)) is not None
+        ]
+    return value
 
 
 def _serialize_active_model_info(
@@ -2394,6 +2503,8 @@ def _persist_config_if_enabled(
     request: Request,
     config: MochiConfig,
     persist: bool,
+    *,
+    clear_secret_scopes: list[str] | None = None,
 ) -> Path | None:
     if not persist:
         return None
@@ -2404,7 +2515,12 @@ def _persist_config_if_enabled(
     if not isinstance(expected, str) or not expected:
         expected = config_revision(config_path)
     try:
-        path = save_config(config, config_path, expected_revision=expected)
+        path = save_config(
+            config,
+            config_path,
+            expected_revision=expected,
+            clear_secret_scopes=clear_secret_scopes or (),
+        )
     except ConfigRevisionConflict as exc:
         raise HTTPException(
             status_code=409,
@@ -2413,8 +2529,59 @@ def _persist_config_if_enabled(
                 "current_revision": exc.current_revision,
             },
         ) from exc
+    except SecretStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Encrypted secret storage is unavailable; credentials were not written.",
+        ) from exc
     request.app.state.config_revision = config_revision(path)
     return path
+
+
+async def _persist_model_config_with_rollback(
+    request: Request,
+    updated: MochiConfig,
+    persist: bool,
+    *,
+    engine: Any | None,
+    previous_config: MochiConfig,
+    clear_secret_scopes: list[str] | None = None,
+) -> Path | None:
+    """Persist a model change and restore the prior runtime if persistence fails."""
+    try:
+        return _persist_config_if_enabled(
+            request,
+            updated,
+            persist,
+            clear_secret_scopes=clear_secret_scopes,
+        )
+    except Exception:
+        if engine is not None:
+            try:
+                apply_config = getattr(engine, "apply_config", None)
+                if callable(apply_config):
+                    await _maybe_await(apply_config(previous_config, reload_voice=False))
+                switch_model = getattr(engine, "switch_model", None)
+                if callable(switch_model):
+                    await _maybe_await(switch_model(previous_config.model))
+            except Exception as exc:  # pragma: no cover - best-effort runtime recovery
+                logger.warning(
+                    f"Unable to restore model runtime after persistence failure: {exc}"
+                )
+        raise
+
+
+def _model_secret_scope(model: ConfiguredModelConfig) -> str:
+    return (
+        "model_setup/configured_models/target:"
+        f"{configured_model_target_id(model)}/api_key"
+    )
+
+
+def _global_model_secret_scope() -> str:
+    """Scope for the legacy/global OpenAI-compatible credential."""
+
+    return "openai_compat/api_key"
 
 
 def _should_use_managed_vllm_mode(payload: ConfigureModelRequest) -> bool:

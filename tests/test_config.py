@@ -904,8 +904,8 @@ def test_load_config_applies_env_overrides(
     assert cfg.tools.web_fetch_jina_api_key.get_secret_value() == "jina-fetch-env-key"
 
 
-def test_save_config_preserves_secret_values(tmp_path: Path) -> None:
-    """保存本機 YAML 時應寫入 SecretStr 原始值，而不是遮罩字串。"""
+def test_save_config_encrypts_secret_values_outside_yaml(tmp_path: Path) -> None:
+    """SecretStr values stay usable but never appear in YAML plaintext."""
     config_path = tmp_path / "config.yaml"
     cfg = MochiConfig.model_validate(
         {
@@ -927,9 +927,17 @@ def test_save_config_preserves_secret_values(tmp_path: Path) -> None:
     save_config(cfg, config_path, expected_revision=EMPTY_CONFIG_REVISION)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-    assert raw["openai_compat"]["api_key"] == "sk-local-secret"
-    assert raw["channels"]["discord"]["bot_token"] == "discord-local-secret"
-    assert "**********" not in config_path.read_text(encoding="utf-8")
+    assert "api_key" not in raw["openai_compat"]
+    assert "bot_token" not in raw["channels"]["discord"]
+    assert "sk-local-secret" not in config_path.read_text(encoding="utf-8")
+    assert "discord-local-secret" not in config_path.read_text(encoding="utf-8")
+    assert (config_path.parent / "secrets.enc").is_file()
+
+    reloaded = load_config(config_path)
+    assert reloaded.openai_compat.api_key is not None
+    assert reloaded.openai_compat.api_key.get_secret_value() == "sk-local-secret"
+    assert reloaded.channels.discord.bot_token is not None
+    assert reloaded.channels.discord.bot_token.get_secret_value() == "discord-local-secret"
 
 
 def test_config_snapshot_revision_uses_exact_file_bytes(tmp_path: Path) -> None:
